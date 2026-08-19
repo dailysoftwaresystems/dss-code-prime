@@ -9,8 +9,8 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-19 — cycles **P14 + P15 + P16**. **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P14 final). ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
+**Last updated:** 2026-08-19 — cycles **P14 + P15 + P16 + P17**. **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P17). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
 
@@ -27,12 +27,22 @@ commit that lands it, and never delete a ticked row.
       written and fixed in the same commit. The windirent row closed because its central claim is measured false:
       DSS **and MSVC** both compile `ext/misc/fileio.c`; only mingw-on-Windows does not, which is a configuration
       upstream never claims. ⇒ nothing to report upstream for THAT one.
-- [ ] **P17 — `D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` (label half).** Trigger FIRED. The operand half and
+- [x] **P17 — OPERATOR-INSERTED, not from this list: the `scripts/` consolidation + the script index. ✅ DONE 2026-08-19.**
+      Six rows, all BORN CLOSED, net 0 — two of them opened by the INDEPENDENT AUDITS at the end of the
+      cycle rather than by the work itself, and a third rewritten because an audit measured its central
+      claim false. `tools/` (24 tracked files) merged into `scripts/` one-directory-per-script;
+      **17 repo-root derivations** were one level short afterwards and each was repaired and asserted;
+      every script declares a `PURPOSE:` line; `scripts/README.md` and `references/scripts.md` are GENERATED
+      from those declarations and held to the tree by `scripts_index_guard` (11 red-on-disable arms).
+      `/dss-cycle` now MANDATES that a script added/renamed/deleted/repurposed updates the reference in the
+      same commit. Also: the gate ran **serially on every host** — `run-gate` and `local-build` now default
+      `CTEST_PARALLEL_LEVEL=8` (✔9741 ms → 2648 ms on six tests; the full suite was 899 tests / 2602 s).
+- [ ] **P18 — `D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` (label half).** Trigger FIRED. The operand half and
       the `%%` half are DONE; this is the asm-goto BLOCK-binding design and the last piece of the feature.
       Expect a real design fork — bring it as a §B rather than guessing.
-- [ ] **P18 — `D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM`.** Trigger FIRED. AP5/AP6's `dependsOn` path has
+- [ ] **P19 — `D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM`.** Trigger FIRED. AP5/AP6's `dependsOn` path has
       never been touched by the release optimizer on ANY leg, so a release-only fault in it is invisible today.
-- [ ] **P19 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
+- [ ] **P20 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
       family, and it gates the pe64 sqlite CLI. ✔Measured to shrink to ONE library for the CLI case.
 - [x] **OPERATOR CALL — ✅ FILED 2026-08-19: <https://sqlite.org/bugs/forumpost/97cd29ca44624113c73b30f5d2504729e6ffc5c5ebcba137078ea1a868cd97c9>.**
       The `%p` half only, which is the half that warranted it. ✔The toolchain table is what makes it
@@ -66,6 +76,73 @@ SHIPPED design record, and `D-TEST-MACOS-LEG-EMSDK-PROFILE-REPLACES-PATH-HIDING-
 pre-existing environment fact.
 
 ---
+
+## 0.000000000000000000 ★★★ CYCLE P17 — THE REPOSITORY NOW HAS AN INDEX OF ITS OWN SCRIPTS, AND THE GATE STOPPED RUNNING ONE TEST AT A TIME
+
+**Six rows, all born CLOSED, net 0.** Operator-inserted. Two of the six were opened by the INDEPENDENT
+AUDITS at the end of the cycle rather than by the work itself — see the audit paragraph below.
+
+**HALF ONE — `tools/` AND `scripts/` BECAME ONE DIRECTORY, WITH AN INDEX.** ✔MEASURED before: 24 tracked
+files in `tools/`, 4 script directories in `scripts/`, **408 references across 49 files**, no rule saying
+which directory a new script belonged in, and — the actual defect — **no index of any kind**. Eighteen
+scripts, named only piecemeal across EIGHT reference files wherever a gate step happened to need one.
+★★ That makes the operator's rule unreachable: *"if a tool has a problem, fix before using again, not
+workaround an own tool"* cannot be followed if nothing lists the tools. Now: every script lives at
+`scripts/<name>/<name>.{sh,ps1,py}` with its siblings and assets inside its own directory; each declares
+its purpose ONCE in a `PURPOSE:` line; `scripts/README.md` and `.claude/skills/dss-cycle/references/scripts.md`
+are **GENERATED** from those declarations; and `scripts_index_guard` reds when the tree and either index
+disagree. ⚠ A hand-written pair would have been two copies of one fact — the failure the whole
+deferred-anchor discipline exists to answer — so the index is derived, never authored.
+
+⚠⚠ **THE PART THAT WOULD HAVE FAILED SILENTLY:** **17 repo-root derivations** walked up from a script's
+own location and were all one level short after the move. A wrong root does not throw — the guard scans a
+smaller tree and reports a clean pass. Each was repaired and each edit asserted to apply exactly once;
+✔all six ctest-wired guard twins then re-ran green from their new homes, `check-orphan-tests`'s own 12-arm
+self-test included. ★ **Six** `tools/` strings were deliberately NOT rewritten and ALL are named in the row so a
+future sweep does not "fix" them (a spec example for a USER's project, a synthetic spawn fixture, an
+operator's `.dotnet/tools/pwsh.exe`).
+
+★ **AND THE MOVE FOUND A GUARD THAT ASSERTED NOTHING.** The wsl-invocation rule in
+`test_sqlite_harness_legs.cpp` says its coverage is BY DIRECTORY so a new script is governed the day it
+lands — and enumerated that directory with a `directory_iterator` that **swallowed its error_code and
+checked no count**. Moving the directory would have emptied the range while the test kept passing. It is
+now recursive over `scripts/` with a floor, and the retarget WIDENED coverage to four scripts the rule had
+never governed (✔none mentions `wsl`, so no new red).
+
+**HALF THREE — THE AUDITS, AND THEY CHANGED THE CYCLE.** Three independent read-only audits ran over the
+finished work. They found a HIGH break the migration had caused and hidden (`profile-compile-support.py` built
+its gate path from COMPONENTS, so `tools/` appeared nowhere in the file, the sweep could not see it, and
+`timed-gate` died on every leg while its diagnostic named a file that was fine); they measured **six** of this
+cycle's own numeric claims wrong, including three wearing a ✔MEASURED label; and they got the new
+`scripts_index_guard` to report GREEN over six conditions it claimed to refuse. ⚠⚠ **The most important finding
+was that the guard's red-on-disable claim in its own row was FALSE** — deleting the floor outright left the
+self-test printing *"PROVEN able to fail"*, because the floor arm asserted only an exit code that several
+refusals share. The guard was rebuilt: **28 arms**, every red arm asserting the MESSAGE of the refusal it names,
+and nine refusals sabotage-tested one at a time.
+
+★★★ **AND THE OPERATOR CORRECTED THE CYCLE'S ANSWER TO ITS OWN WORST FINDING.** Inserting a `# PURPOSE:` line
+moved **16** plan citations off their subjects; the rows written to record that then shipped three more wrong
+numbers. The plan here was to build a checker that re-resolved citations against `HEAD` — keeping the fragile
+reference and detecting its breakage after the fact. The operator's rule instead removes the fragility:
+*"we must never document line numbers, we must document method names, comment ids or defined anchors."*
+`plan_citations_guard` now refuses a new positional citation, as a ratchet over the **2376** that already exist
+(2074 in the registry alone, nearly all in closed historical rows). ✔This cycle burned its own down, **2376 →
+2365**, converting all eleven citations it had authored.
+
+**HALF TWO — THE *LOCAL* GATE RAN SERIALLY ON EVERY HOST, BECAUSE NOTHING SUPPLIED A LEVEL.**
+⚠ *Local*, and the qualifier is a correction: `.github/workflows/pipeline-pr.yml` (its `ctest --stop-time` step) has passed
+`--parallel 4` all along and is untouched by this cycle, so "everywhere" was false. ✔MEASURED:
+`local-build.{sh,ps1}` invoked `ctest --output-on-failure` with no `-j`, and `run-gate`'s own usage example
+showed the same form, so the form propagated by being copied. The full Windows suite: **899 tests / 2602 s,
+one at a time, on a 16C/32T box.** Six example tests: no level **9741 ms**; `CTEST_PARALLEL_LEVEL=8`
+**2648 ms**; explicit `-j 8` **2446 ms**; env 8 with an explicit `-j 1` **9669 ms** — so the env var is
+honoured *and* a caller's flag still wins, which is what makes this a DEFAULT rather than a policy.
+`run-gate` and `local-build` now default it to **8** (operator's number: the Windows and WSL legs run
+concurrently here by design, so the default leaves headroom instead of claiming the box). ✔**THE WHOLE-SUITE FIGURE IS MEASURED, NOT EXTRAPOLATED:** through `run-gate` at the new default the
+suite ran **900 tests in 803.1 s** against serial **899 / 2602.6 s** — **3.24×**, while a clean WSL build
+and three reasoning agents competed for the same box, so it is pessimistic. ⓘ The floor under any
+parallelism is `integrated_tests` at **566.56 s** (both figures from this cycle's own P16 serial gate log), a quarter of the serial total in one entry — which is why
+the speedup is ~3× and not ~8×.
 
 ## 0.0000000000000000 ★★★ READ THIS FIRST — CYCLE P14 (COMPLETE): THE pe64 "MISCOMPILE" DOES NOT EXIST. IT IS AN UPSTREAM SQLITE PORTABILITY BUG, AND THE REASON WE BELIEVED OTHERWISE IS ITS OWN DEFECT.
 
@@ -364,7 +441,7 @@ carries the full measurement table and the two §B rulings).
 `release-unit` = `[ConstFold, Mem2Reg, SimplifyCfg, Dce, Inlining]×2` per CU, full release at the
 program stage. Against the incumbent: **exe −5.6%** (6,904,848 vs 7,314,848), **compile time
 neutral** (38.4s median vs 38.7s), **runtime FASTER** (0.453s vs 0.470s median, 7 repeats —
-`tools/sqlite-runtime-bench.py`, the standing runtime-differential instrument). The control arm
+`scripts/sqlite-runtime-bench/sqlite-runtime-bench.py`, the standing runtime-differential instrument). The control arm
 (unit key removed) measured **byte-identical to pre-P10**, proving the restructure behavior-neutral.
 ⚠ The FIRST rule (inline counts + exe-vs-A′) picked A′ and its cheapness premise was refuted
 (+60% compile); the operator amended the rule toward direct measures BEFORE the runtime column was
@@ -423,7 +500,7 @@ less then a minute... and if rederiveStructCfMarkers is slow, lets fix it"*.
    `SKIP_DSS_BUILD=1`, offers a three-state `DSS_ALLOW_NONRELEASE_COMPILER` (typos refused) that
    opts out of the refusal, never the statement. [[D-HARNESS-PS1-TIMES-A-DEBUG-COMPILER-WHILE-THE-SH-TWIN-TIMES-A-RELEASE-ONE]]
    ✅ born-closed, its selector probed by AST-extracting the real function text.
-   `tools/profile-compile*.sh` + `-support.py` ship as the cross-leg profiling kit — ONE script,
+   `scripts/profile-compile/profile-compile*.sh` + `-support.py` ship as the cross-leg profiling kit — ONE script,
    no `.ps1` twin, BY DECISION (a profiler whose value is "the host is the only variable" must
    not have a per-host implementation). ⚠ Two Windows-leg defects in the kit were found and fixed
    by RUNNING it: `os.path.join` backslashes eaten by bash, and bare-name `bash` resolved by
@@ -649,7 +726,7 @@ of one fact, and the one that runs first wins silently.
   (`src/core/substrate/path_identity.{hpp,cpp}`) has exactly one constructor, `of()`; the 14
   containers are keyed on it, so a raw `fs::path` **does not compile** as a key. Converting OUT is
   free; construction IN is the one gate.
-- **Upgrade 2 — THE LINT DEFINES A COMPLEMENT.** `tools/check-path-identity.py`: rule 1 refuses
+- **Upgrade 2 — THE LINT DEFINES A COMPLEMENT.** `scripts/check-path-identity/check-path-identity.py`: rule 1 refuses
   `#include <filesystem>` in `src/` outside a 50-file allowlist (so a NEW file doing path work is a
   decision on the record); rule 2 is the enumeration underneath. Comment/string-stripped so it fires
   on CALLS not mentions, with a 4-control `--selftest`.
@@ -695,7 +772,7 @@ token the pin now searches for.
   every one of those assertions was invisible on the CLI-subprocess side. Implemented (parse + allow
   + **read**) — whitelisting alone would have re-created, inside the fix, the exact defect the closed
   key set exists to prevent.
-- **The macOS leg could not be staged at all.** ✔MEASURED: `printf 'X' \| tools/ssh-macos.sh cat`
+- **The macOS leg could not be staged at all.** ✔MEASURED: `printf 'X' \| scripts/ssh-macos/ssh-macos.sh cat`
   returns **nothing** — the Mac's login profile CONSUMES STDIN, so tar-over-ssh arrives truncated.
   The VPS survived the identical path only because its profile is quiet. Both `.sh` carriages gained
   a `--rsync` transport that never touches stdin; ✔verified by execution, not by exit code.
@@ -703,7 +780,7 @@ token the pin now searches for.
 ⚠ **AND THE MISTAKE I KEPT REPEATING, RECORDED BECAUSE IT COST FOUR ROUND TRIPS:** a `\| tail` after
 a build or a gate replaces the status that matters with `tail`'s. It produced a "green" Windows leg
 over a red ctest, a "successful" build that had failed on a brace error, and two "completed" legs
-that had died on a path. **Take rc DIRECTLY; use `tools/run-gate.sh`, which exists for this.**
+that had died on a path. **Take rc DIRECTLY; use `scripts/run-gate/run-gate.sh`, which exists for this.**
 
 ## 0.000001 ★★★ CYCLE P7 — pe64 GETS A POSIX LAYER, AND AN IDENTITY CLAIM BECOMES CHECKABLE
 
@@ -946,7 +1023,7 @@ disagree are still refused.
 
 **Operator argument: *"I WANT NO FAILURES, NO BLOCKERS, ADDRESS EVERYTHING."*** Lanes on disjoint
 file sets. ✔**GATE, ALL THREE LEGS ON THE FINAL TREE: Windows 887/887 · WSL x86_64 887/887 · arm64
-887/887** — the arm64 leg on the **REAL VPS hardware, not qemu**, each via `tools/run-gate.sh` with
+887/887** — the arm64 leg on the **REAL VPS hardware, not qemu**, each via `scripts/run-gate/run-gate.sh` with
 its tool-emitted `100% tests passed` witness. Everything below is MEASURED by the lane that reports it.
 
 ### ★★★ THE HEADLINE: DSS NOW SHIPS THE IMPLEMENTATION HALF OF A TOOLCHAIN
@@ -1253,7 +1330,7 @@ arm that was working correctly is the one that destroyed the evidence.**
 (`tests/test_support/repo_root.hpp:59` — *"`std::abort()` kills the whole test BINARY … `repoRoot()`
 throws instead"*), and it did not propagate. **A recorded lesson is not a fixed defect: nothing makes
 a call site read a neighbour's comment.**
-⇒ So it got a guard: **`tools/check-no-abort-in-tests.py`**, wired into the gate battery, 14 stripper
+⇒ So it got a guard: **`scripts/check-no-abort-in-tests/check-no-abort-in-tests.py`**, wired into the gate battery, 14 stripper
 self-tests + a line-number-preservation test. ★★ It strips comments/strings/raw-strings BEFORE
 matching because **a bare token grep reds on the very file that documents the fix** — the same
 merely-present-marker shape as the retired-id check above.
@@ -1581,7 +1658,7 @@ If you are picking this up cold: the work is real but unlanded. **Run the baseli
 **860/860** · anchors **982 OPEN** (registry 657 + plans 325).
 **Re-measured mid-flight on the dirty tree:** ctest **862 / 863**, rc **8**. Sole failure =
 `anchor_registry_guard`, EXPECTED (see "OWED" below). Anchor balance still **982 → 982, net 0**.
-⚠ **Never pipe `tools/run-gate.sh` into `tail`** — the harness then reports the PIPE's rc. It said
+⚠ **Never pipe `scripts/run-gate/run-gate.sh` into `tail`** — the harness then reports the PIPE's rc. It said
 "exit code 0" over that rc=8 run. The script logged `rc : 8` correctly; the pipe hid it. Read the log.
 
 ### 0.1 ★★★ OPERATOR RULINGS TAKEN 2026-08-14 — full text in [plan 29](29-inline-asm-plan%20-%20tbd.md) §4.4/§4.5/§4.6. DO NOT RE-LITIGATE.
@@ -2134,7 +2211,7 @@ clobbers. It is an `if`, **not** a `switch` — the compiler forces nothing. Shi
   passes, so a green run alone is a partial run rounded up.
 - ★ **From PowerShell always `wsl.exe -e`**; from Git Bash never `wsl.exe bash -c` with a variable.
   **Quoted heredocs eat backslashes** ⇒ write the script to a FILE and run the file.
-- ★ Use `tools/run-gate.sh` with a **TOOL-EMITTED** witness (`'ninja: no work to do|^\[[0-9]+/[0-9]+\]'`,
+- ★ Use `scripts/run-gate/run-gate.sh` with a **TOOL-EMITTED** witness (`'ninja: no work to do|^\[[0-9]+/[0-9]+\]'`,
   `'100% tests passed'`). It correctly REFUSES a caller-authored `BUILD OK` — a watcher polling for a
   self-written success string once span until killed **over a build that had succeeded**.
 
@@ -2162,9 +2239,9 @@ stray build artifacts (`*.preMutant`, `*.orig`) left by tooling.
 
 | Date | Commit | What shipped | Gate |
 |---|---|---|---|
-| 2026-08-18 | *(this cycle, P8)* | **Path identity becomes a TYPE.** `core::PathIdentity` + 14 containers re-keyed + `tools/check-path-identity.py`; the 8.3 blindness of `weakly_canonical` under libstdc++ measured and closed. Plus `mustDifferFromBaseline` on the CLI runner (455 manifests / 548 arms armed) and a `--rsync` transport on both ssh carriages (the Mac's profile eats stdin) | Win **898/898** · WSL **898/898** · arm64 + macOS below |
+| 2026-08-18 | *(this cycle, P8)* | **Path identity becomes a TYPE.** `core::PathIdentity` + 14 containers re-keyed + `scripts/check-path-identity/check-path-identity.py`; the 8.3 blindness of `weakly_canonical` under libstdc++ measured and closed. Plus `mustDifferFromBaseline` on the CLI runner (455 manifests / 548 arms armed) and a `--rsync` transport on both ssh carriages (the Mac's profile eats stdin) | Win **898/898** · WSL **898/898** · arm64 + macOS below |
 | 2026-08-16 | *(P7 predecessor)* | **`module` corpus example** — `project_module_standalone_build`, the first corpus proof that a `module` project builds standalone (B.13.3). Closed on the standalone half only; artifact-content and must-not-exist assertions are inexpressible in the corpus and stay in unit pins | Win **866/866** · ⚠ example not re-run on the 3 non-Windows legs |
-| 2026-08-16 | `f0695b7` | **AP5/AP6 close-out**, 509 files: `tools/check-diagnostic-codes.py` (the ordinal-allocation gate, built after two lanes both took `0xD029`) · `-Werror=switch` tree-wide at one chokepoint (closes G-711) · the ISA-mismatch diagnostic + its unsuppressable row · corpus arming | **All four legs 865/865**: Win · WSL gcc · qemu-aarch64 strict · macOS arm64 |
+| 2026-08-16 | `f0695b7` | **AP5/AP6 close-out**, 509 files: `scripts/check-diagnostic-codes/check-diagnostic-codes.py` (the ordinal-allocation gate, built after two lanes both took `0xD029`) · `-Werror=switch` tree-wide at one chokepoint (closes G-711) · the ISA-mismatch diagnostic + its unsuppressable row · corpus arming | **All four legs 865/865**: Win · WSL gcc · qemu-aarch64 strict · macOS arm64 |
 | 2026-08-14 | `867fa81` | **AP6 in flight.** Resolver + driver wiring landed (the `D_PlanNotLanded` reject is gone); git acquisition; per-target library channel; wrong-format guard at both binders; 3 latent spawn defects fixed; recursive corpus staging. **Two reds found by the merged-tree baseline and fixed**, one of them a test its authoring lane never compiled | merged-tree build **rc=0, 0 warnings** · ctest **859/861** → both reds fixed · balance **982→982 OK** |
 | 2026-08-12 | `ca2c6721` | DSS Axis + DSS HIR plan rework | — |
 | 2026-08-14 | *(in flight, session 2)* | **Inline-asm P5 wave 2.** Operator rulings taken (§0.1): reuse `ReturnPiece`, ZERO new value-producing opcodes; producer-declared piece source; the `ResultPiece` rename; **`asm goto` WITH outputs BUILDS this cycle**; `%N` is structural. ★ The ruling's own §8 contingency **FIRED** — `ReturnPiece`'s payload carries two facts with one stored (§0.2). ✔MEASURED the four constraint forms vs the core (§0.3): `"=r"` already works, `"+r"` and `"=&r"` are core gaps. ★ Found by reading, not by report: **regalloc cannot see the per-instruction pool at all** — 3 hand-rolled per-opcode-only union sites. Lane V (7 diagnostics) DONE; Lanes 1/G/T killed mid-flight by a context exhaustion and resumed. | ⬜ **not run — UNCOMMITTED**; dirty-tree ctest was **862/863**, sole red `anchor_registry_guard` |

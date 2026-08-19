@@ -83,7 +83,7 @@ disagree with what's in `src/` — agents and contributors read it as canonical.
 - **Substrate hardening (SH1–SH4): done.** SH2 confirmed the multi-OS CI matrix (Linux/GCC,
   Linux/Clang+ASan, Windows/MSVC, macOS/AppleClang). SH3 closed the cross-tree `NodeId` caveat
   (`NodeId.arenaTag` + tag validation in `NodeAttribute<T>` and `Tree::node_`). SH1 ships
-  `tools/refresh_landing_log.py` for plan-doc hygiene; SH4a wires its `--check` into CI. SH4b
+  `scripts/refresh_landing_log/refresh_landing_log.py` for plan-doc hygiene; SH4a wires its `--check` into CI. SH4b
   adopted `switch`/`case`/`default`/`break` in c-subset via shape-based positioning. SH4c
   pinned multi-level AltChoice routing.
 - **Three shipped `.lang.json` configs**: `toy.lang.json`, `c-subset.lang.json`,

@@ -1163,7 +1163,7 @@ TEST(ShippedLibDescriptor, ClosureCycleTerminates) {
 //
 // ★★★ `validateShippedIncludeClosure` shipped in cycle P7 with NO test, and the
 // two diagnostic codes it owns were therefore pinned by nothing. That was not
-// caught for a cycle because `tools/check-diagnostic-codes.py` stops at its
+// caught for a cycle because `scripts/check-diagnostic-codes/check-diagnostic-codes.py` stops at its
 // FIRST failing category, and a cross-branch reservation collision was firing
 // above it — so the uncovered-code report never printed. A gate that reports one
 // category at a time hides everything behind it.

@@ -33,6 +33,34 @@ config vs `examples/` corpus vs `tests/` — launch those agents IN ONE MESSAGE 
 concurrently, and tell each agent explicitly which paths it owns and which it must not
 touch.
 
+### ★★★ AT MOST **4** REASONING AGENTS AT A TIME (operator instruction, 2026-08-19)
+
+**The cap is on CONCURRENCY, not on the total per cycle.** Run more than four lanes' worth of
+work by running it in **waves of at most four**, each wave launched in one message, each wave
+joined before the next starts.
+
+**What counts against the cap: a REASONING agent** — anything spawned through the Agent tool
+that thinks for itself (`Explore`, `Plan`, `general-purpose`, `feature-dev:code-architect`, the
+reviewers, the independent design- and code-auditors). One `Agent` call = one slot, for as long
+as it is live.
+
+**What does NOT count: pure script execution.** Builds, `ctest` runs, the guard scripts, `rsync`,
+a remote leg over a carriage, a watcher — background or foreground, however many are in flight.
+They consume machine, not judgment, so run as many as the machine and the tree can take.
+
+⚠ **Why a cap at all, and it is not politeness to the host.** Two costs rise with lane count and
+neither is visible from inside a lane:
+- **The shared tree.** The section above measures it: ownership partitions WRITES, not the
+  compiler, the build directory, or the scratchpad. Every additional live lane multiplies the
+  window in which a sibling's half-written state makes some other lane's measurement false.
+- **The orchestrator.** It must hold every live lane's brief, its owned paths, and its returned
+  result well enough to judge them. Past four, the orchestrator stops judging and starts
+  relaying — which is exactly the failure `⚠⚠ A LANE BRIEF THAT PRESCRIBES THE FIX` warns about,
+  arriving from the other direction.
+
+★ **Fewer is often right.** Four is a ceiling, not a target: two well-briefed lanes on genuinely
+independent file sets beat four lanes that have to be told about each other.
+
 ⚠⚠ **DISJOINTNESS IS NOT ENOUGH, AND THIS LINE USED TO CLAIM IT WAS.** It said *"overlapping
 writes are the only real hazard; disjointness removes it."* ✔MEASURED 2026-08-15 and that is
 false: a lane writing **only to files it owns** still breaks every sibling, because the shared

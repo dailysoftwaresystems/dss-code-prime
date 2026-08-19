@@ -447,34 +447,92 @@ if(DSS_BUILD_TESTS)
             NAME anchor_registry_guard
             COMMAND ${POWERSHELL_EXE}
                     -NoProfile -ExecutionPolicy Bypass
-                    -File "${CMAKE_SOURCE_DIR}/tools/check-anchor-registry.ps1"
+                    -File "${CMAKE_SOURCE_DIR}/scripts/check-anchor-registry/check-anchor-registry.ps1"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         add_test(
             NAME line_endings_guard
             COMMAND ${POWERSHELL_EXE}
                     -NoProfile -ExecutionPolicy Bypass
-                    -File "${CMAKE_SOURCE_DIR}/tools/check-line-endings.ps1"
+                    -File "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.ps1"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         add_test(
             NAME orphan_tests_guard
             COMMAND ${POWERSHELL_EXE}
                     -NoProfile -ExecutionPolicy Bypass
-                    -File "${CMAKE_SOURCE_DIR}/tools/check-orphan-tests.ps1"
+                    -File "${CMAKE_SOURCE_DIR}/scripts/check-orphan-tests/check-orphan-tests.ps1"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     else()
         add_test(
             NAME anchor_registry_guard
-            COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-anchor-registry.sh"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-anchor-registry/check-anchor-registry.sh"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         add_test(
             NAME line_endings_guard
-            COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-line-endings.sh"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.sh"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         add_test(
             NAME orphan_tests_guard
-            COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-orphan-tests.sh"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-orphan-tests/check-orphan-tests.sh"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     endif()
+
+    # Script-index guard (2026-08-19 — D-SCRIPTS-NO-INDEX-OF-THE-REPOSITORYS-OWN-TOOLING).
+    # Every directory under `scripts/` must be documented in BOTH indexes
+    # (`scripts/README.md` and the `/dss-cycle` skill's `references/scripts.md`),
+    # with a purpose byte-identical to the script's own `PURPOSE:` declaration.
+    # ✔MEASURED 2026-08-19: this repository had eighteen scripts and no index of
+    # any kind, so a cycle could not be told to prefer an existing tool over
+    # writing a new one — nothing listed the existing tools. The operator's rule
+    # the guard makes reachable: "if a tool has a problem, fix before using
+    # again, not workaround an own tool."
+    #
+    # ★ NOT DISPATCHED BY PLATFORM, unlike the three guards above: this one is a
+    # single Python implementation rather than a `.sh`/`.ps1` twin pair. The
+    # twins exist so a shell-only host can run those guards; the trade they make
+    # is one contract expressed twice, and this guard's whole subject is a fact
+    # expressed in two places drifting apart. Paying that cost inside the guard
+    # against it would be the joke it sounds like. Python is already a
+    # development dependency here — five of the eight `check-*` scripts are
+    # Python, including `check-anchor-balance`, which every cycle must run — so
+    # the interpreter is REQUIRED rather than optional: a guard that silently
+    # skips when a tool is missing is the vacuous pass this entry exists to
+    # refuse (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    #
+    # ★★ AND IT SELF-TESTS ON EVERY RUN. The no-argument form used here verifies
+    # the real tree and then runs 28 arms against a MIRROR — every refusal the
+    # guard has, each asserting the MESSAGE and not merely a non-zero exit — so
+    # this entry cannot pass without also proving the guard can fail.
+    # ⚠ The message assertions are load-bearing: an independent audit found the
+    # first draft's floor arm passing with the floor DELETED, because it
+    # collapsed on a different refusal that happened to share the exit code.
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(
+        NAME scripts_index_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-scripts-index/check-scripts-index.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Citation-stability guard (2026-08-19 — D-PLANS-CITATION-LINE-NUMBERS-SILENTLY-INVALIDATED).
+    # A `path:line` citation is a claim about a file that nothing rechecks: insert
+    # one line above it and it silently points at unrelated prose while still
+    # reading as evidence. Operator rule, 2026-08-19: cite a method name, a
+    # comment id, or a defined anchor — never a line number.
+    #
+    # ★ A RATCHET, NOT A BAN, and the numbers are why: 2376 positional citations
+    # already exist across 20 documents, overwhelmingly inside CLOSED registry
+    # rows describing what was true at some long-past commit. Rewriting those
+    # wholesale would be a vast edit that also destroys the record's precision.
+    # So the inventory holds per-document ceilings that may only come DOWN — a
+    # new citation reds at once, and a converted one reds until its ceiling is
+    # lowered in the same commit, because unclaimed headroom is where the next
+    # one hides. Same shape as check-no-abort-in-tests' abort() inventory.
+    # ⚠ Green here means NO NEW positional citation landed. It never means the
+    # plans cite stably; the inventory is DEBT.
+    add_test(
+        NAME plan_citations_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-plan-citations/check-plan-citations.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()
 
 # ── The install set (D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE) ──

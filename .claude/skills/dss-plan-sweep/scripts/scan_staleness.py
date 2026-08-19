@@ -16,7 +16,7 @@ SCOPE, and why it differs per class:
     scanning them matches the documentation rather than a stale claim.
 
 DELIBERATELY NOT CHECKED HERE:
-  * anchor open/closed COUNTS — `tools/check-anchor-registry.{ps1,sh}` owns that.
+  * anchor open/closed COUNTS — `scripts/check-anchor-registry/check-anchor-registry.{ps1,sh}` owns that.
     This script never re-derives them; a second counting instrument is exactly how
     that number has gone wrong before.
   * whether a ctest claim is CORRECT — that needs a live run. Claims are listed so

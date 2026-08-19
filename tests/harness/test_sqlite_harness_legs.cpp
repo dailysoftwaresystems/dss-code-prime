@@ -3632,7 +3632,7 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 // `-e`. That is why `--` is called out by name below instead of being lumped in
 // with "some other token" — it reads like the safe spelling and is not.
 //
-// WHAT IT COST, so nobody re-litigates the severity: tools/ssh-arm64-vps.ps1 ran
+// WHAT IT COST, so nobody re-litigates the severity: scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 ran
 // `wsl.exe bash -lc "ssh … $Command"`, so `-Command 'hostname; uname -m'`
 // printed the VPS hostname and then the LOCAL WSL architecture — x86_64 for an
 // aarch64 box — while exiting 0. A cross-host verification instrument answering
@@ -3659,11 +3659,12 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 //     regex, `build-wsl/` and `$wslKey` out of it without naming any of them;
 //   · a PowerShell SPLAT (`& wsl.exe @a`) is the correct fix's own shape — there
 //     is no string left to escape — so it is accepted only when the array it
-//     splats is bound to `-e` nearby. That is how tools/ssh-arm64-vps.ps1 passes.
+//     splats is bound to `-e` nearby. That is how scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 passes.
 //
 // COVERAGE IS BY DIRECTORY, NOT BY LIST: both sqlite drivers plus every
-// `tools/*.ps1` and `tools/*.sh`, so a NEW tools script is governed the day it
-// lands. The catalogue's launcher argv and the resolver's translator argv are
+// `.ps1` and `.sh` anywhere under `scripts/`, so a NEW script is governed the
+// day it lands. The walk is RECURSIVE because scripts/ is one directory per
+// script with the siblings inside it, so every script sits one level down. The catalogue's launcher argv and the resolver's translator argv are
 // held to the same rule from their DATA, in the second test — and those are the
 // two places that actually carried `--`.
 //
@@ -3681,20 +3682,41 @@ struct Script {
     bool     powershell;
 };
 
-// Every script this rule governs. `tools/` is enumerated rather than listed so
-// a new script there cannot land outside the rule.
+// Every script this rule governs. `scripts/` is ENUMERATED rather than listed
+// so a new script there cannot land outside the rule.
+//
+// ★★★ AND THE ENUMERATION HAS A FLOOR, which is not defensive clutter: the
+// walk swallows its error_code, so a directory that is missing or renamed
+// yields an EMPTY range and every assertion below iterates nothing. This test
+// would then pass while governing only the two sqlite drivers — a guard that
+// reads exactly like a guard that found nothing. ✔That is not hypothetical:
+// this walk said `tools/` until 2026-08-19, when that directory was merged
+// into scripts/, and nothing here would have reported the loss.
 [[nodiscard]] std::vector<Script> shellScriptsUnderTest() {
     std::vector<Script> out;
     out.push_back({harnessDir() / "build-and-test.ps1", true});
     out.push_back({harnessDir() / "build-and-test.sh", false});
     std::error_code       ec;
+    auto const            scriptsDir = repoRoot() / "scripts";
     std::vector<fs::path> tools;
-    for (auto const& e : fs::directory_iterator(repoRoot() / "tools", ec)) {
+    for (auto const& e : fs::recursive_directory_iterator(scriptsDir, ec)) {
         if (!e.is_regular_file()) continue;
         auto const ext = e.path().extension().string();
         if (ext == ".ps1" || ext == ".sh") tools.push_back(e.path());
     }
     std::sort(tools.begin(), tools.end());   // a stable failure order
+
+    // The floor. Far below the live figure (22 on 2026-08-19) so ordinary
+    // churn never trips it, and high enough that a collapsed walk cannot pass.
+    constexpr std::size_t kScriptFloor = 16;
+    EXPECT_GE(tools.size(), kScriptFloor)
+        << "only " << tools.size() << " .sh/.ps1 scripts were found under "
+        << scriptsDir.string()
+        << (ec ? " (walk error: " + ec.message() + ")" : "")
+        << ".\nThe enumeration COLLAPSED — this test would then govern only the"
+           " two sqlite drivers and still report a pass. Fix the walk; do not"
+           " lower the floor.";
+
     for (auto const& p : tools) {
         out.push_back({p, p.extension() == ".ps1"});
     }
@@ -3857,7 +3879,7 @@ TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
                         << " but nothing within 12 live lines above binds `$"
                         << var << "` to an argv naming '-e':\n  " << line
                         << "\nA real argv is the RIGHT fix for this defect — it"
-                           " is what tools/ssh-arm64-vps.ps1 does — but only if"
+                           " is what scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 does — but only if"
                            " `-e` is actually in it.";
                     continue;
                 }
@@ -3874,7 +3896,7 @@ TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
                        " [echo A=x86_64] without `-e` and [echo A=$(uname -m)]"
                        " with it, and a SINGLE-QUOTED $HOME in a payload still"
                        " expanded. Quoting cannot fix it — pass `-e`, or build a"
-                       " real argv and splat it as tools/ssh-arm64-vps.ps1 does.";
+                       " real argv and splat it as scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 does.";
             }
         }
     }

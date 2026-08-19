@@ -146,6 +146,18 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
 
+      # DECLARED, NOT INHERITED. `DSS_BUILD_TESTS=ON` now runs
+      # `find_package(Python3 COMPONENTS Interpreter REQUIRED)` for the
+      # scripts_index_guard entry, which makes a Python interpreter a
+      # CONFIGURE-TIME requirement rather than a convenience. The runner images
+      # happen to ship one, so this job would pass without this step — which is
+      # exactly why it is here: a dependency that works by accident of the image
+      # breaks on the day the image changes, and the failure would surface as a
+      # CMake error in an unrelated-looking job.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
       - name: Configure Git for private dependencies
         run: git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/".insteadOf "git@github.com:"
 
@@ -520,6 +532,6 @@ jobs:
         with:
           python-version: "3.x"
       - name: Run unit tests
-        run: python tools/test_refresh_landing_log.py
+        run: python scripts/refresh_landing_log/test_refresh_landing_log.py
       - name: Check landing-log hash anchors
-        run: python tools/refresh_landing_log.py --check
+        run: python scripts/refresh_landing_log/refresh_landing_log.py --check

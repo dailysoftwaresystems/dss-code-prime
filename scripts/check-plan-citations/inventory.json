@@ -1,0 +1,31 @@
+{
+  "_comment": [
+    "Per-document ceilings for POSITIONAL citations (`path:line`).",
+    "A ceiling may only come DOWN. Convert citations to a stable reference -- a",
+    "symbol name, a comment id, or a [[D-ANCHOR]] -- and lower the ceiling in the",
+    "same commit. A raised ceiling is a new unreliable citation and reds the gate.",
+    "This file is DEBT, not a pass: green means no NEW positional citation landed."
+  ],
+  "ceilings": {
+    ".claude/skills/dss-code-prime/references/repo-map.md": 2,
+    ".plans/00-compiler-implementation-plan - tbd.md": 56,
+    ".plans/05-parser-plan - ok.md": 6,
+    ".plans/06-artifact-profile-plan - tbd.md": 12,
+    ".plans/07-production-readiness-plan - tbd.md": 1,
+    ".plans/08.55-pre-se1-cleanup-plan - ok.md": 7,
+    ".plans/11-ffi-plan - tbd.md": 5,
+    ".plans/13-assembler-plan - tbd.md": 2,
+    ".plans/14-linker-plan - tbd.md": 66,
+    ".plans/17-shader-gpu-plan - tbd.md": 6,
+    ".plans/22-optimizer-plan - tbd.md": 3,
+    ".plans/23-full-c-plan - tbd.md": 12,
+    ".plans/24-dss-axis-language-reserved-plan - tbd.md": 2,
+    ".plans/24-iterative-expression-traversal - tbd.md": 5,
+    ".plans/25-posix-per-target-structs - tbd.md": 6,
+    ".plans/28-driver-builder-plan.md": 6,
+    ".plans/29-inline-asm-plan - tbd.md": 42,
+    ".plans/_deferred-anchor-registry.md": 2064,
+    ".plans/_handoff.md": 60,
+    ".plans/_next-session-brief.md": 2
+  }
+}

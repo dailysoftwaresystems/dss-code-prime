@@ -249,7 +249,7 @@ TEST(DiagnosticCode, DependsOnBandContinuationAfterTheSuppressSlot) {
     //
     // ⓘ THIS LITERAL IS NO LONGER THE ONLY THING STANDING BETWEEN AN ALLOCATION
     // AND AN UNPINNED CODE, and that is the point of the change that raised it
-    // to 8. `tools/check-diagnostic-codes.py` reads the ENUM itself and fails on
+    // to 8. `scripts/check-diagnostic-codes/check-diagnostic-codes.py` reads the ENUM itself and fails on
     // any code no compiled test names — a hand-maintained table can only check
     // rows somebody remembered to add, which is precisely how 0xD02A shipped
     // engine code while appearing in zero test files. Keep raising this literal;
@@ -308,7 +308,7 @@ TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
 //       inherits this guarantee automatically instead of silently escaping a
 //       hand-maintained list, which is how the original defect survived.
 //
-// The scan carries a FLOOR (same reasoning as tools/check-anchor-registry.sh's
+// The scan carries a FLOOR (same reasoning as scripts/check-anchor-registry/check-anchor-registry.sh's
 // per-root floors): a scan that discovers nothing would otherwise pass while
 // checking nothing.
 TEST(DiagnosticCode, PrefixOptimizerBandRendersAsXWithNibbleStripped) {

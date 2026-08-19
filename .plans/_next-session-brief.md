@@ -66,7 +66,7 @@ because some plan's prose mentions them. The guard reports `OK (1154)` over that
 📄 Operator ruling: *"THE GUARD BUG OUTRANKS THE BALANCE… the balance gate forbids a cycle that OPENS
 NEW debt; it does not forbid a cycle that DISCLOSES PRE-EXISTING debt. Fix the counting rule, do not
 take the §B shrug and do not suppress the rows."*
-1. **Counting rule** — teach `tools/check-anchor-balance.py` to count DISCLOSED-pre-existing rows
+1. **Counting rule** — teach `scripts/check-anchor-balance/check-anchor-balance.py` to count DISCLOSED-pre-existing rows
    separately from CREATED ones. Until this lands, honest disclosure is penalised.
 2. **Row-vs-prose predicate** — ⚠ **THE TRAP IS ENTIRELY HERE.** The 203 wrapped fragments pass
    *because* matching is by SUBSTRING. A naive "every citation needs a row" check **reds all 203**.
@@ -75,7 +75,7 @@ take the §B shrug and do not suppress the rows."*
    one WITHOUT (must fail).** If both cannot hold, the wrap FORMAT is the defect — different row.
 3. **Then register the 219** under the new counting rule.
 4. Also finish `D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS`: ✔`tests/` +
-   `integrated_tests/` widening LANDED this cycle; **`tools/` and `scripts/` are still unscanned** —
+   `integrated_tests/` widening LANDED this cycle; **`scripts/` and `tests/` are still unscanned** —
    that half keeps the row open. ⚠ `D-32-BIT-WORD` is NOT an instance: it only ever appears inside
    the longer phrase `FIXED-32-BIT-WORD`, which the guard's `\b` correctly skips.
 
@@ -96,7 +96,7 @@ take the §B shrug and do not suppress the rows."*
 ✔MEASURED: **ZERO** of these appear in this PR's registry diff. All pre-date the branch.
 ⚠ The list came from a keyword match over row text, so it is an UPPER BOUND — at least one
 (`D-HARNESS-PS1-WINDOWS-LEG-UNEXECUTED`) matched on wording and is not Mac-blocked at all.
-**Triage first; do not cost it at face value.** A Mac is now reachable (`tools/ssh-macos.sh`, and
+**Triage first; do not cost it at face value.** A Mac is now reachable (`scripts/ssh-macos/ssh-macos.sh`, and
 mDNS may not resolve from Git Bash — pass a literal IP via `DSS_MACOS_HOST`).
 
 `D-HARNESS-CROSS-HOST-ANY-TARGET` · `D-CSUBSET-ATTRIBUTE-ACCESS-NO-CLANG-CLEAN-WITNESS` ·

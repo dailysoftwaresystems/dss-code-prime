@@ -110,7 +110,10 @@ hand-typing every edit or reading every subsystem.
    self-check; new engine mechanism → full independent review **and** a §B pause to the user.
 5. **Implement** — delegate in parallel by **disjoint file sets** (engine `.cpp/.hpp` vs
    `src/dss-config/**.json` vs `examples/` vs `tests/`), one agent per set, launched in one message.
-   Name each agent's owned and forbidden paths. Build the best long-term agnostic solution: extend
+   Name each agent's owned and forbidden paths. ★★ **At most FOUR reasoning agents live at once**
+   (operator instruction 2026-08-19) — more work than that runs in waves of four. Script execution
+   (builds, `ctest`, the guards, a remote leg) does **not** count against the cap; see
+   `references/delegation.md`. Build the best long-term agnostic solution: extend
    config vocabulary, never branch the engine on identity. Any new `D-*` cited in `src/` is
    registered in the same commit.
 6. **Review and fold** — `/pr-review-toolkit:review-pr`, plus the agnosticism pass and the CI-hazard
@@ -193,6 +196,82 @@ next: <one line, matching the top NEXT entry in .plans/_handoff.md>
 what the gate exists to make impossible to say. If the report and the handoff disagree about what
 comes next, fix the handoff: it is the one a future reader will find.
 
+## ★★★ USE THE SCRIPT THAT EXISTS — AND FIX IT RATHER THAN ROUTING AROUND IT
+
+**Operator instruction 2026-08-19, verbatim:** *"if a tool has a problem, fix before using again, not
+workaround an own tool. reusable tools exists to avoid bunch of problems like mangling or edge cases"*.
+
+- **Look in `references/scripts.md` first.** It indexes every script under `scripts/`, each with its
+  purpose. If one covers the job, invoke it — not "something like it" typed inline.
+- **A defect in one of them is FIXED in the cycle that hits it.** A workaround at the call site leaves
+  the defect for the next caller and forks the behaviour silently. This is a FIX, so by the 2026-08-15
+  ruling **no hard stop gates it**, whatever subsystem it lands in.
+- ⚠ **The reason is measured, not aesthetic.** These scripts hold this project's accumulated edge
+  cases: a `wsl.exe bash -c` with a variable that once became `rsync -a --delete / /` and reported
+  exit 0; quoted heredocs eating backslashes; unanchored rsync excludes that silently skipped a
+  changed `.cpp`; `command -v` lying over non-interactive ssh on macOS. Re-typing the pipeline inline
+  re-opens all of them at once.
+
+### ★★ MANDATORY: a script added, renamed, deleted, or REPURPOSED updates the reference
+
+In the **same commit**, exactly like `.plans/_handoff.md` — a reference that ships one commit late is
+a reference the next reader cannot trust. This is enforced rather than asked: each script declares its
+purpose once in a `PURPOSE:` line in its own header, both indexes (`scripts/README.md` and
+`references/scripts.md`) are generated from those declarations, and the `scripts_index_guard` ctest
+entry reds when the tree and the indexes disagree.
+
+```bash
+python scripts/check-scripts-index/check-scripts-index.py --write
+```
+
+⚠ A new script also inherits the repository's layout, and the guard checks it: one directory per
+script named for the script, every sibling implementation inside it (`scripts/<name>/<name>.{sh,ps1,py}`),
+assets alongside, and no script loose at the top or buried in a subdirectory.
+⚠ **What the guard does NOT check is `.sh`/`.ps1` PAIRING**, and this line used to assert it did —
+*"the pairing is a contract, not a courtesy"* — which was false in two directions at once: nothing
+enforces it, and eight script directories are Python-only by design. Pairing matters where a
+capability must reach the Windows leg, and where it does, the two siblings must not drift — the
+guard now refuses a sibling whose `PURPOSE:` contradicts its primary. Full enforcement is
+[[D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED]], which is open and measured, not something to assert here.
+
+## ★★★ NEVER CITE A LINE NUMBER — CITE SOMETHING THE FILE CARRIES
+
+**Operator rule, 2026-08-19, verbatim:** *"we must never document line numbers, we must document
+method names, comment ids or defined anchors. everything that changes is unreliable. so it's just a
+matter of, when finding the path:line, replace the line number by a fixed reference."*
+
+Applies to **every** artifact a cycle writes — registry rows, the handoff, plans, skill references,
+commit messages, and code comments alike.
+
+```
+✗  src/mir/lowering.cpp  + a line number    <- moves the instant anything above it changes
+✓  src/mir/lowering.cpp — lowerCallArgs()
+✓  tests/CMakeLists.txt — the `no RUN_SERIAL` rationale block
+✓  [[D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES]]
+```
+
+**A symbol survives every edit above it; a line number survives none** — and the failure mode is the
+bad one: a citation that BREAKS gets noticed, while one that silently becomes WRONG still resolves,
+still reads as evidence, and now points at unrelated prose.
+
+⚠ **✔MEASURED twice inside one cycle (P17), which is why this is a rule and not advice.** Inserting a
+one-line header into eighteen scripts moved **16** plan citations off their subjects. The rows then
+written to RECORD that defect shipped **three more** wrong numbers of their own, each naming the
+first line of an explanatory comment instead of the code it explained. Independent audit caught both;
+no gate saw either.
+
+**Enforced** by `plan_citations_guard` (ctest) over `.plans/**` and `.claude/**` as a **ratchet** —
+the ~2365 pre-existing citations sit in a per-document inventory whose ceilings may only come
+**DOWN**. A new one reds immediately; converting one reds until its ceiling is lowered in the same
+commit, because unclaimed headroom is where the next one hides.
+
+```bash
+python scripts/check-plan-citations/check-plan-citations.py --write
+```
+
+⚠ **Green there means no NEW positional citation landed — never that the plans cite stably.** The
+inventory is DEBT: burn it down in whatever document you are already editing.
+
 ## Hard stops — always route through the pause gate
 
 ★★★ **OPERATOR RULING 2026-08-15 — A HARD STOP GATES *OPENING A CAPABILITY*, NEVER *FIXING A DEFECT*.
@@ -243,7 +322,11 @@ never lowers the bar.
 - Read `references/anchors-and-deferrals.md` at step 8, and whenever pinning a deferral or judging
   whether an anchor is eligible.
 - Read `references/operator-discipline.md` when reporting or claiming anything — the bar applies to
-  the operator, not only to the code.
+  the operator, not only to the code, and it opens with the **never-cite-a-line-number** rule.
+- Read `references/scripts.md` **before writing any script, probe, or one-off shell pipeline** —
+  the index of every script this repository already ships, each with its purpose. Most of what a
+  cycle needs is already there, and re-typing it inline re-opens the edge cases it was taught
+  (`wsl.exe` quoting, heredocs eating backslashes, unanchored rsync excludes, ssh dropping PATH).
 - Read `references/worktrees.md` before any byte-changing measurement or agent worktree operation.
 - Read `references/build-layout.md` before creating ANY build tree (step 5) and before reporting a
   cycle complete (step 11) — **one root `build/`, subdirectories for distinct builds, and lane builds

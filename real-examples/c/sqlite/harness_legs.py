@@ -11102,7 +11102,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # handed straight to an assertion.
     # ⚠ THE FIXTURE ANCHOR NAMES ARE DELIBERATELY INERT, AND THAT IS NOT STYLE.
     # ✔MEASURED (TF-C124): `real-examples/` is a SCANNED ROOT of the anchor guard
-    # (tools/check-anchor-registry.sh, over *.sh *.ps1 *.py — added by
+    # (scripts/check-anchor-registry/check-anchor-registry.sh, over *.sh *.ps1 *.py — added by
     # [[D-HARNESS-ANCHOR-GUARD-SKIPS-HARNESS-DRIVERS]]), so ANY anchor-shaped
     # literal in THIS file — test data, sample output, docstring — is a CITATION
     # as far as the guard is concerned, and a first draft of this fixture failed

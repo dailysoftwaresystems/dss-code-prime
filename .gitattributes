@@ -54,7 +54,7 @@ tests/lsp/sessions/** text eol=lf
 # been measured in this repo, which is why this is a pin and not a convention.
 *.probes text eol=lf
 
-# The REPO GUARD DRIVERS in tools/ — the twin `.sh`/`.ps1` pairs that ctest runs
+# THE SCRIPTS IN scripts/ — including the twin `.sh`/`.ps1` guard pairs ctest runs
 # as `anchor_registry_guard`, `line_endings_guard` and `orphan_tests_guard`.
 # Pinned for the same reason `real-examples/**` is: these run on Windows, WSL,
 # macOS and arm64, and a CRLF `.sh` fails on a POSIX leg at the shebang with a
@@ -65,9 +65,15 @@ tests/lsp/sessions/** text eol=lf
 # twins were LF by an author's care rather than by mechanism, which is the
 # distinction this repo's own wiring comment draws: "an invariant nothing
 # executes is a convention."
-tools/**/*.sh  text eol=lf
-tools/**/*.ps1 text eol=lf
-tools/**/*.py  text eol=lf
+# ⓘ 2026-08-19: these three globs said `tools/**` until the whole directory
+# was merged into `scripts/` (one directory per script, siblings inside).
+# Retargeting them WIDENED the pin: cmake-import, corpus-census,
+# pragma-profile-census and local-build already lived under scripts/ and had
+# never been pinned at all — they were LF by an author's care, which is the
+# exact distinction this comment draws against.
+scripts/**/*.sh  text eol=lf
+scripts/**/*.ps1 text eol=lf
+scripts/**/*.py  text eol=lf
 
 # The real-example HARNESS DRIVERS (real-examples/c/sqlite/). Their whole promise
 # is "clone the repo and run ONE command", on ANY host — so a fresh clone must
@@ -98,7 +104,7 @@ real-examples/**/*.json text eol=lf
 # tree had a pinned line ending.
 #
 # That is not a hypothetical: the defect had ALREADY LANDED SIX TIMES.
-# `git grep -I -l -P '\r$' HEAD -- src tests real-examples tools` returned
+# `git grep -I -l -P '\r$' HEAD -- src tests real-examples scripts` returned
 # src/CMakeLists.txt, src/core/compiler.{cpp,hpp}, src/core/export.hpp,
 # src/main.cpp and tests/ffi/test_shipped_lib_descriptor.cpp — the last
 # WHOLLY CRLF (6206 CRs). They are normalised in their own dedicated commit;

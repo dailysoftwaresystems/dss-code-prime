@@ -107,7 +107,12 @@ target/
 # from the manifest's pins, and committing it would vendor someone else's
 # history into this repo. (See docs/project-config-spec.md §2.6.)
 .dss-deps/
-!scripts/build/
+# ⓘ 2026-08-19: `!scripts/build/` stood here, because the unanchored `build/`
+# rule above matches at ANY depth and swallowed the local-build script's
+# directory. The scripts/ consolidation renamed that directory to
+# `scripts/local-build/`, which no ignore rule matches, so the negation was
+# removed rather than retargeted: a negation that negates nothing reads as
+# protection and provides none.
 
 # CTest leftover when ctest is invoked from the repo root (e.g. inside
 # a CI step that cd's wrong) — these are throwaway run artifacts.
@@ -118,7 +123,7 @@ Testing/
 # happen to land at repo-root when ctest runs without a build-dir cwd.
 test-scratch/
 
-# Python bytecode cache (e.g. tools/refresh_landing_log.py)
+# Python bytecode cache (e.g. scripts/refresh_landing_log/refresh_landing_log.py)
 __pycache__/
 *.pyc
 
@@ -140,7 +145,7 @@ __pycache__/
 
 #.plans/ -- Not for now, but will be used when first minimal implementation is done and we start working on the next steps.
 
-# Operator connection data for tools/ssh-*.{ps1,sh} — hosts, logins, key PATHS.
+# Operator connection data for scripts/ssh-*/ — hosts, logins, key PATHS.
 # NEVER tracked: this repo is slated to go public (PR #37) and these name real machines.
 # ★ Connection data + key material for the cross-host tooling.
 #   ⚠ THE ORIGINAL RULE HERE WAS "PATHS ONLY, no private key material" — that changed

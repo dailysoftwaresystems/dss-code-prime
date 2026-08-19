@@ -1,0 +1,105 @@
+# The repository's scripts — what exists, and the rule for using it
+
+**Read this before writing a script, a probe, or a one-off shell pipeline.** The
+cycle's most common self-inflicted wound is re-implementing something that is
+already here, in a form that has not yet been taught the edge case the original
+learned the hard way.
+
+## ★★★ THE RULE (operator instruction, 2026-08-19)
+
+> *"if a tool has a problem, fix before using again, not workaround an own tool.
+> reusable tools exists to avoid bunch of problems like mangling or edge cases"*
+
+Three clauses, and all three are load-bearing:
+
+1. **Check this list first.** If a script covers the job, use it. Not "something
+   like it" typed inline — the script.
+2. **A defect in one of these is FIXED, not routed around.** A workaround at the
+   call site leaves the defect in place for the next caller and silently forks
+   the behaviour. Fixing a shared script is ordinary in-scope cycle work; by the
+   2026-08-15 ruling **no hard stop gates a fix**, anywhere.
+3. **The fix carries the usual bar** — the script is one of the shared surfaces,
+   so a repair gets a real diagnostic, a test that fails without it, and an
+   anchor if anything is left undone.
+
+⚠ These scripts hold this project's accumulated edge cases: `wsl.exe` quoting
+(a variable once became `rsync -a --delete / /` and reported exit 0), heredocs
+eating backslashes, `/mnt/c` clock skew, `rsync` excludes that must be anchored,
+non-interactive ssh dropping `/opt/homebrew/bin`, `command -v` lying over ssh on
+macOS. Re-typing the pipeline inline re-opens all of them at once.
+
+## ★★ MANDATORY: creating, changing, or deleting a script updates this file
+
+A cycle that adds a script, removes one, renames one, or changes what one is
+**for** updates this reference **in the same commit** — the same rule the handoff
+follows, and for the same reason: a reference that ships one commit late is a
+reference the next reader cannot trust.
+
+This is enforced, not merely asked. Each script declares its purpose once in a
+`PURPOSE:` line in its own header; the table below and the one in
+`scripts/README.md` are generated from those declarations and verified against
+them by the `scripts_index_guard` ctest entry. A script whose purpose drifts from
+its index entry is a **red gate**.
+
+```bash
+python scripts/check-scripts-index/check-scripts-index.py --write
+```
+
+## Layout
+
+One directory per script, named for the script, siblings inside it:
+`scripts/<name>/<name>.{sh,ps1,py}`, plus that script's own assets. The
+**primary** script — the one to invoke — is `<name>.sh`, else `<name>.py`, else
+`<name>.ps1`. Pairs are **capability-paired**: a change to one sibling lands in
+the other in the same commit.
+
+<!-- BEGIN GENERATED SCRIPT INDEX -->
+| Script | Runs as | Purpose |
+| --- | --- | --- |
+| **`check-anchor-balance`** | `check-anchor-balance.py` | refuse a cycle that ends with more OPEN deferral-registry rows than it began. |
+| **`check-anchor-registry`** | `check-anchor-registry.ps1`, `check-anchor-registry.sh` | refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells. |
+| **`check-diagnostic-codes`** | `check-diagnostic-codes.py` | refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal. |
+| **`check-line-endings`** | `check-line-endings.ps1`, `check-line-endings.sh` | refuse a tracked text blob that carries a CR. |
+| **`check-ninja-deps`** | `check-ninja-deps.py` | refuse a gate over a build directory whose objects recorded no header dependencies. |
+| **`check-no-abort-in-tests`** | `check-no-abort-in-tests.py` | refuse a new live `abort()` call site in test or test-support code. |
+| **`check-orphan-tests`** | `check-orphan-tests.ps1`, `check-orphan-tests.sh` | refuse a test source that no CMake target compiles and no ctest entry runs. |
+| **`check-path-identity`** | `check-path-identity.py` | refuse a second path canonicalizer -- path resolution lives in exactly one place. |
+| **`check-plan-citations`** | `check-plan-citations.py` | refuse a new `path:line` citation in the plans -- a citation names a stable reference, never a line number. |
+| **`check-scripts-index`** | `check-scripts-index.py` | refuse a script that no index documents, and an index entry that no script backs. |
+| **`cmake-import`** | `cmake-import.ps1`, `cmake-import.py`, `cmake-import.sh` | convert a CMake project into a DSS `.dss-project.json` manifest. |
+| **`corpus-census`** | `corpus-census.ps1`, `corpus-census.py`, `corpus-census.sh` | census the real-example corpus into a run-identified report instead of one overwritten log. |
+| **`local-build`** | `local-build.ps1`, `local-build.sh` | build dss-code-prime incrementally on this host, and optionally run ctest. |
+| **`pragma-profile-census`** | `pragma-profile-census.ps1`, `pragma-profile-census.py`, `pragma-profile-census.sh` | census `#pragma` usage across the corpus and hold the profile to its expected shape. |
+| **`profile-compile`** | `profile-compile-dispatch.sh`, `profile-compile-support.py`, `profile-compile.sh` | compile one fixed subject with a RELEASE dss-code-prime on this host and report where the time went, so the HOST is the only variable across legs. |
+| **`refresh_landing_log`** | `refresh_landing_log.py`, `test_refresh_landing_log.py` | regenerate the PR landing-log hash anchors in the plans from git log. |
+| **`run-gate`** | `run-gate.ps1`, `run-gate.sh` | run a gate command and REFUSE to report success without evidence that it ran. |
+| **`sqlite-runtime-bench`** | `sqlite-runtime-bench.py` | measure the RUNTIME of an emitted sqlite3 binary, the standing runtime-differential instrument. |
+| **`ssh-arm64-vps`** | `ssh-arm64-vps.ps1`, `ssh-arm64-vps.sh` | reach the native aarch64 Linux VPS (the carriage; WSL only). |
+| **`ssh-macos`** | `ssh-macos.ps1`, `ssh-macos.sh` | reach the operator's physical macOS host (the carriage). |
+| **`wsl-leg`** | `wsl-leg.sh` | run a DSS gate leg inside WSL -- sync the Windows checkout, build clean, and run ctest through run-gate. |
+<!-- END GENERATED SCRIPT INDEX -->
+
+## The ones a cycle reaches for most
+
+- **`run-gate`** — wrap any gate command. It refuses to report success on exit 0
+  alone; the output must also carry a **tool-emitted** witness. Use
+  `'100% tests passed'` for ctest. ★ It correctly refuses a witness the caller
+  wrote themselves, which is the whole point: a `BUILD OK` you echoed is not
+  evidence. It also defaults `CTEST_PARALLEL_LEVEL` to 8.
+- **`check-anchor-balance`** — the mandatory end-of-cycle receipt. The report
+  line's numbers come from here; never from a previous message.
+- **`check-anchor-registry`**, **`check-line-endings`**, **`check-orphan-tests`**,
+  **`check-scripts-index`** — the four ctest-wired guards. They run anyway; run
+  them early when a change touches plans, scripts, or test wiring.
+- **`ssh-arm64-vps`**, **`ssh-macos`** — the carriages to the non-native legs.
+  ⚠ `ssh-arm64-vps` works **from WSL only** (the key lives there; `ssh dss`
+  resolves nowhere else), and the macOS carriage needs absolute paths because a
+  non-interactive shell drops `/opt/homebrew/bin`.
+- **`local-build`** — incremental build plus optional ctest, for this host.
+
+## Where the rest of the gate battery is documented
+
+`references/gate-and-cross-plan.md` gives the full fail-loud battery in the order
+a cycle runs it, including which of these scripts each step invokes and what a
+green line from it looks like. This file answers *what exists*; that one answers
+*when to run it*.

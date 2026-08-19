@@ -68,7 +68,7 @@ dss_add_test(NAME program/test_asm_data_directives
 # for its payload flag. Self-spawn (rather than a second `add_executable`) keeps
 # the fixture available on every host in the matrix with no PATH assumptions, and
 # needs no `$<TARGET_FILE:…>` define, no `add_dependencies` edge, and no
-# allowlist row in the two `tools/check-orphan-tests` twins.
+# allowlist row in the two `scripts/check-orphan-tests/check-orphan-tests` twins.
 dss_add_test(NAME program/test_build_scripts
              SOURCES test_build_scripts.cpp)
 
@@ -107,7 +107,7 @@ dss_add_test(NAME program/test_dependency_git_cache
 # TO ITS OWN WORKING DIRECTORY, and the binary re-execs ITSELF as that fixture.
 # Self-spawn keeps the fixture available on every host with no PATH assumption,
 # and needs no second target, no `$<TARGET_FILE:…>` define and no allowlist row
-# in the two `tools/check-orphan-tests` twins.
+# in the two `scripts/check-orphan-tests/check-orphan-tests` twins.
 dss_add_test(NAME program/test_dependency_resolver
              SOURCES test_dependency_resolver.cpp)
 

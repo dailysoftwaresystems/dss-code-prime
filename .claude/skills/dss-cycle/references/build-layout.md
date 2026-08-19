@@ -62,7 +62,7 @@ not folded — finish the fold.
 ## Migration status — NOT yet done, and it is not a `mv`
 
 ⚠ The live tree still uses the flat layout. **✔MEASURED 2026-08-17 (corrected): 19 files carry 33
-reference lines** — `tools/run-gate.{sh,ps1}`, `tools/check-ninja-deps.py`, `tests/CMakeLists.txt`,
+reference lines** — `scripts/run-gate/run-gate.{sh,ps1}`, `scripts/check-ninja-deps/check-ninja-deps.py`, `tests/CMakeLists.txt`,
 `tests/core/native_c_probe.hpp`, `tests/core/test_header_name_matching.cpp`,
 `tests/harness/test_sqlite_harness_legs.cpp`, `real-examples/c/sqlite/build-and-test.ps1` (9 lines,
 `build-rel`), plus narrative mentions in `src/core/types/parse_diagnostic.hpp`, a `.format.json`, a
@@ -89,13 +89,13 @@ at all — they are sentences like *"MEASURED 2026-08-10 (`build-dbg` at `3e86a1
 `$comment`s. **That measurement was taken in a directory called `build-dbg`, and it still was.**
 Renaming it inside the record would falsify the provenance to tidy a path — the opposite of what
 those sentences are for. Change *configuration*; leave *history*. The same applies to the incident
-narration in `tools/run-gate.{sh,ps1}`, which recounts a `cd build-dbg` that actually failed.
+narration in `scripts/run-gate/run-gate.{sh,ps1}`, which recounts a `cd build-dbg` that actually failed.
 
 **2. EVERY EDIT MUST BE TRANSITION-SAFE — there is no flag day.** A reference rewritten to the new
 path alone breaks every run made before the physical move; one left on the old path alone silently
 follows a tree that is being deleted. So each site spans BOTH layouts with the new path FIRST, and
 **existence decides, never a version flag** — the list follows the tree instead of having to be kept
-in sync with it. ✔Applied: `tools/check-ninja-deps.py` picks `build/dbg` if it exists else
+in sync with it. ✔Applied: `scripts/check-ninja-deps/check-ninja-deps.py` picks `build/dbg` if it exists else
 `build-dbg` (and returns the NEW path when neither does, so it fails loud on a missing tree rather
 than sending the reader after a deliberately removed one — both arms measured); the sqlite harness
 searches `build/rel`, `build/dbg`, then the three legacy roots, and a from-scratch build lands in the

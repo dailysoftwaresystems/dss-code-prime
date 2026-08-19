@@ -79,7 +79,7 @@
 //      `add_executable` fixture would need a `$<TARGET_FILE:…>` compile
 //      definition, an `add_dependencies` edge (nothing links it, so a fresh
 //      `ctest` could otherwise run against a fixture that was never built), and
-//      a row in BOTH `tools/check-orphan-tests.sh` and its `.ps1` twin — whose
+//      a row in BOTH `scripts/check-orphan-tests/check-orphan-tests.sh` and its `.ps1` twin — whose
 //      allowlist is machine-checked and must stay byte-identical between them.
 //      That is three cross-cutting files to keep in sync for a program whose
 //      entire job is to write down its argv.

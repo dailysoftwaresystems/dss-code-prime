@@ -6,7 +6,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - **★★★ THE BUILD IS VERIFIABLE — run this BEFORE trusting any ctest result:**
 
   ```bash
-  python tools/check-ninja-deps.py build-dbg
+  python scripts/check-ninja-deps/check-ninja-deps.py build-dbg
   ```
 
   A green ctest proves nothing about the current source if the objects it linked were never
@@ -49,7 +49,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - **no NEW `abort()` in test code:**
 
   ```bash
-  python tools/check-no-abort-in-tests.py
+  python scripts/check-no-abort-in-tests/check-no-abort-in-tests.py
   ```
 
   `std::abort()` in a fixture kills the whole test PROCESS, so every sibling test in that
@@ -64,14 +64,20 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   ceiling is lowered, because unclaimed headroom is where the next regression hides. ⚠ Do not
   confuse `INVENTORY` with `ALLOWLIST` — the latter is by PROOF and is empty. Burn-down is
   `D-TEST-ABORT-IN-A-FIXTURE-HAS-NO-GUARD`, which stays OPEN until the inventory is.
-  ⓘ Self-tests: `python tools/check-no-abort-in-tests.py --selftest` (the comment/string stripper is
+  ⓘ Self-tests: `python scripts/check-no-abort-in-tests/check-no-abort-in-tests.py --selftest` (the comment/string stripper is
   the whole correctness — a bare token grep would red on the very file that documents the fix).
-- anchor-registry guard OK: `tools/check-anchor-registry.ps1` (or `.sh`).
+- anchor-registry guard OK: `scripts/check-anchor-registry/check-anchor-registry.ps1` (or `.sh`).
   ⓘ Exit **4** now means *a citation names a RETIRED anchor id* — a name whose registry row opens
   with the `RETIRED-ID` marker. Resolution is substring-anywhere (load-bearing: it is what lets a
   line-wrapped citation resolve), so it cannot otherwise tell a live name from a dead one — a stale
   id resolved for weeks on the strength of the row written to report it as stale
   (`D-GATE-ANCHOR-CITATION-RESOLVES-VIA-ITS-OWN-BUG-REPORT`).
+- script-index guard OK: `python scripts/check-scripts-index/check-scripts-index.py`.
+  Rides ctest as `scripts_index_guard`, so it runs anyway — run it directly when this cycle
+  added, renamed, deleted or REPURPOSED a script. It reds when the tree and the two indexes
+  (`scripts/README.md`, `references/scripts.md`) disagree, or when a script's own `PURPOSE:`
+  line differs from its index row. Regenerate both with `--write`; never hand-edit the block
+  between the generated-index markers.
 - agnosticism scan clean (no hardcoded language/CPU/format in shared substrate).
 - CI-hazard screen clean (from Step 5): no GCC-vs-MSVC portability traps. Local green ≠ CI green.
 - review folded clean.
@@ -85,7 +91,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   a gate item with a number, checked exactly like ctest. Count before and after and report both:
 
   ```bash
-  python tools/check-anchor-balance.py
+  python scripts/check-anchor-balance/check-anchor-balance.py
   ```
 
   It prints OPEN-at-base, OPEN-now, and **the name of every row that opened or closed** — the count
@@ -157,7 +163,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - **★★ THE DIAGNOSTIC-CODE ALLOCATION GATE — the ordinal space has no lock, so this is the lock.**
 
   ```bash
-  python tools/check-diagnostic-codes.py
+  python scripts/check-diagnostic-codes/check-diagnostic-codes.py
   ```
 
   `DiagnosticCode` is one flat ordinal space whose values are PUBLISHED identities (`error[D0029]`,
@@ -166,7 +172,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   - ✔**Two concurrent lanes allocated `0xD029`.** One lane was told the slot was free; another had
     already taken it for `D_DependencyBuildFailed`. Nothing mechanical noticed — it was caught only
     because the second lane RE-MEASURED the header instead of trusting its brief. That is diligence,
-    not a mechanism, and it is the same non-mechanism `tools/run-gate.sh` exists to replace.
+    not a mechanism, and it is the same non-mechanism `scripts/run-gate/run-gate.sh` exists to replace.
   - ✔**A code shipped with no test at all.** `D-AP6-NEW-DIAGNOSTIC-CODES-HAD-NO-VALUE-PIN` closed on
     exactly this and **re-opened one cycle later**: `D_LanguageTargetIsaMismatch` (0xD02A) landed
     engine code in `src/` while appearing in ZERO test files.
@@ -289,6 +295,6 @@ what makes "two cycles running shipped on one leg" visible as a pattern instead 
   cannot be compressed, that is a signal the project has more open fronts than priorities, and
   saying so IS the handoff.
 - ⚠ **A handoff written from memory is worse than none.** Re-measure the numbers at cycle end
-  (`ctest`, `tools/check-anchor-balance.py`, `git log --oneline -1`) and paste what they printed.
+  (`ctest`, `scripts/check-anchor-balance/check-anchor-balance.py`, `git log --oneline -1`) and paste what they printed.
   This repo has recorded three counts written from memory that all erred LOW; the handoff is the
   single most-quoted document in the project, so a wrong number there propagates furthest.

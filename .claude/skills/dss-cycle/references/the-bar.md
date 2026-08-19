@@ -315,7 +315,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      - **REPORT THE OPEN COUNT AT STEP 10, EVERY CYCLE, WITH ITS DELTA.** A cycle that closes
        fewer rows than it opens is not automatically wrong — a real investigation legitimately
        opens rows — but a sustained positive delta means the quick-fix rule is being skipped, and
-       the number is what makes that visible instead of arguable. `tools/check-anchor-registry.sh`
+       the number is what makes that visible instead of arguable. `scripts/check-anchor-registry/check-anchor-registry.sh`
        already prints the total; the per-cycle honest line is "opened N, closed M, net ±K".
    A workaround that *hides* an issue (excluding a failing test, catch-and-swallow, "it's green
    on the other leg so ignore it here") is the exact silent-failure the bar exists to prevent —

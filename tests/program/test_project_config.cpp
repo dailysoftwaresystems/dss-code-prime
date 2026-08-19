@@ -3495,7 +3495,7 @@ TEST(CompileProjectGlob, OverlappingLiteralAndGlobDedupByNormalizedPath) {
 // and `tests/program/test_build_scripts.cpp` both do it, and the reasoning is
 // recorded at length in the latter: no external dependency (Windows has no
 // `/bin/echo`), no new build target (hence no `$<TARGET_FILE:…>` define, no
-// `add_dependencies` edge, and no row in the two `tools/check-orphan-tests`
+// `add_dependencies` edge, and no row in the two `scripts/check-orphan-tests/check-orphan-tests`
 // twins), and an EXACT path via `argv[0]`.
 //
 // The RELATIVE write path is not a convenience — it is half the subject. A

@@ -18,7 +18,7 @@
 // host". The ELF sibling has qemu and the PE sibling has link.exe; a Mach-O has
 // no off-Mac consumer at all, so this witness could not be written, only
 // deferred. It is written here because the operator's Apple Silicon machine
-// became scriptable (tools/ssh-macos.ps1, SKILL.md §3.1), which is the
+// became scriptable (scripts/ssh-macos/ssh-macos.ps1, SKILL.md §3.1), which is the
 // prerequisite the row named and nothing else about the fix has changed.
 //
 // TWO TIERS, AND NEITHER REPLACES THE OTHER.

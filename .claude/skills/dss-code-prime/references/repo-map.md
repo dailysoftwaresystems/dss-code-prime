@@ -21,7 +21,7 @@
 | `integrated_tests/` | The CLI-subprocess examples runner (live ctest entry `integrated_tests`) — sibling of the in-process `tests/examples/examples_runner.cpp`; **a capability added to one MUST be added to the other** |
 | `docs/` | User-facing onboarding docs |
 | `.plans/` | Internal design records, roadmap, and `_deferred-anchor-registry.md` |
-| `tools/`, `scripts/`, `packaging/` | Anchor guard + build/publish tooling |
+| `scripts/`, `packaging/` | Every repo script — one directory per script, siblings inside — plus build/publish tooling. Index: `scripts/README.md` |
 | `build*/` | CMake build dirs (gitignored). Windows Debug gate dir is **`build-dbg`** |
 
 ### 2.1 `real-examples/` — the real-world repository registry
@@ -77,7 +77,7 @@ Non-negotiable rules for anything under `real-examples/`:
 ### 3.1 Real non-x86-Windows hardware is reachable over SSH (added 2026-08-04)
 
 Two physical machines are now scriptable, which changes what "verified" can mean for the
-non-native targets. Both are reached through **capability-paired** helpers in `tools/`:
+non-native targets. Both are reached through **capability-paired** helpers in `scripts/`:
 `ssh-arm64-vps.{sh,ps1}` and `ssh-macos.{sh,ps1}`.
 
 | host | what it is | why it matters |
