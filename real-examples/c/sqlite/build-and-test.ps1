@@ -6162,7 +6162,8 @@ foreach ($lbl in $LegOrder) {
                                '--reference-path', "$RefOracle",
                                '--leg-oracle', "$(if ($lr) { $lr.Oracle })",
                                '--leg-oracle-cc', "$(if ($lr) { $lr.OracleCc })",
-                               '--leg-oracle-triple', "$(if ($lr) { $lr.OracleTriple })")
+                               '--leg-oracle-triple', "$(if ($lr) { $lr.OracleTriple })",
+                               '--oracle-status', "$(if ($lr) { $lr.OracleStatus })")
   foreach ($l in ($orep.Text -split "`n")) { if ($l.Trim()) { Info "oracle   : $l" } }
   # ★★ AND WHAT THE ORACLE WAS *FOR*, on the same shelf as the oracle line itself.
   # [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] An attribution that appears

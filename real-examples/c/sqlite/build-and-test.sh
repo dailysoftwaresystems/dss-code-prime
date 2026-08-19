@@ -7012,7 +7012,8 @@ for leg in "${LEG_DECLARED[@]}"; do
              --reference-path "${REF_FIXTURE:-}" \
              --leg-oracle "${LEG_ORACLE[$leg]:-}" \
              --leg-oracle-cc "${LEG_ORACLE_CC[$leg]:-}" \
-             --leg-oracle-triple "${LEG_ORACLE_TRIPLE[$leg]:-}" 2>&1)
+             --leg-oracle-triple "${LEG_ORACLE_TRIPLE[$leg]:-}" \
+             --oracle-status "${LEG_ORACLE_STATUS[$leg]:-}" 2>&1)
   # ★★ AND WHAT THE ORACLE WAS *FOR*, on the same shelf as the oracle line itself.
   # [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] A build that failed and was
   # ATTRIBUTED, whose attribution appears only in the per-leg build chatter 2,000

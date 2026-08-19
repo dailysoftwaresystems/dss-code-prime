@@ -3656,11 +3656,42 @@ def resolve_target_cc(leg, runner=None, which=None):
 
 # The verdict vocabulary. Closed, because "the oracle is sort of available" is
 # the state this whole anchor is about.
+# ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE
+#
+# ★★★ `--build-reference-oracle` HAS ALWAYS REPORTED WHICH OF THESE HAPPENED, AND
+# THE CLASSIFIER THREW IT AWAY. The statuses below are that command's own return
+# vocabulary; `attribute_build_failure` already reads them, and this constant now
+# OWNS them so the two readers cannot drift. A second spelling of a fact that has
+# an owner is the defect this file's own header argues against.
+ORACLE_STATUS_BUILT = "built"
+ORACLE_STATUS_BUILD_FAILED = "build-failed"
+ORACLE_STATUS_NO_COMPILER = "no-reference-compiler"
+ORACLE_STATUS_NOT_CALLED = ""
+ORACLE_STATUSES = (ORACLE_STATUS_BUILT, ORACLE_STATUS_BUILD_FAILED,
+                   ORACLE_STATUS_NO_COMPILER, ORACLE_STATUS_NOT_CALLED)
+# The two that mean the control RAN. Named once, read by the classifier AND by
+# attribute_build_failure, because "did the control run?" is one question.
+ORACLE_STATUSES_ATTEMPTED = (ORACLE_STATUS_BUILT, ORACLE_STATUS_BUILD_FAILED)
+
 ORACLE_CLASSES = {
     "same-platform": "a reference binary built for THIS LEG'S OWN TARGET — run "
                      "it on the same input to attribute a failure",
     "cross-platform": "a reference binary exists, but for a DIFFERENT PLATFORM "
                       "— it is NOT an oracle for this leg",
+    # ★★ THE THREE STATES `absent` USED TO SPELL AS ONE. They differ in what the
+    # READER should do next, which is the only test that matters for a verdict
+    # line: fix the harness's reader / accept there is no control on this host /
+    # go find out why it was never attempted. Collapsing them cost cycles P13 and
+    # P14, which spent two full passes hunting a dss miscompile that was upstream,
+    # because "the leg reports NO ORACLE" read as "no control was possible" when
+    # the truth was "the control ran, failed, and its log is on disk".
+    "build-failed": "the leg's OWN same-platform reference compiler RAN AND "
+                    "FAILED to build this leg's manifest — a control was "
+                    "attempted, its log exists, and reading it is the next step",
+    "no-reference-compiler": "no declared targetCc candidate both exists on this "
+                             "host AND targets this leg, so no same-platform "
+                             "control can be built HERE — an environment limit, "
+                             "not a finding about this leg",
     "absent": "no reference binary survived this run at all",
 }
 
@@ -3680,7 +3711,7 @@ ORACLE_FALLBACK_CONTROL = (
 )
 
 
-def oracle_class_for_leg(leg, ref_target, ref_path):
+def oracle_class_for_leg(leg, ref_target, ref_path, oracle_status=""):
     """(class, why) — is the run's reference binary an oracle for THIS leg?
 
     PURE: no filesystem, no process, no host. `ref_target` is the triple
@@ -3688,8 +3719,35 @@ def oracle_class_for_leg(leg, ref_target, ref_path):
     empty when no reference survived the run. The comparison is the same
     arch+OS rule `machine_matches_spec` applies to a compiler's `-dumpmachine`,
     because "does this binary belong to that target" and "does this compiler
-    produce that target" are one question asked of two artefacts."""
+    produce that target" are one question asked of two artefacts.
+
+    `oracle_status` is `--build-reference-oracle`'s own reported status for THIS
+    leg, verbatim from ORACLE_STATUSES. It only ever refines the no-binary case:
+    a binary that exists is classified by its TARGET and nothing else, because a
+    status cannot make a cross-platform binary into an oracle.
+    [D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE]
+
+    ⚠ An UNRECOGNISED status RAISES rather than degrading to `absent`. A verdict
+    line is exactly where a typo'd flag value must not buy silence: it would
+    print the most pessimistic class and read as a measured fact."""
+    if oracle_status not in ORACLE_STATUSES:
+        raise LegError(
+            "oracle status %r is not one this catalogue declares (known: %s). "
+            "The status is `--build-reference-oracle`'s OWN return vocabulary "
+            "and this classifier will not guess at a value it has never heard "
+            "of — a wrong verdict line is worse than a refused one."
+            % (oracle_status, ", ".join(repr(s) for s in ORACLE_STATUSES)))
     if not ref_path:
+        if oracle_status == ORACLE_STATUS_BUILD_FAILED:
+            return ("build-failed",
+                    "this leg's own same-platform reference compiler RAN and "
+                    "FAILED — the control was ATTEMPTED and its build log is on "
+                    "disk, so this is a lead, not a dead end")
+        if oracle_status == ORACLE_STATUS_NO_COMPILER:
+            return ("no-reference-compiler",
+                    "no declared targetCc candidate both exists on this host and "
+                    "targets this leg, so no same-platform control can be built "
+                    "HERE — the leg is fine; this host cannot check it")
         return ("absent", "no reference binary was produced or preserved")
     if not ref_target:
         return ("absent",
@@ -3720,7 +3778,7 @@ def oracle_class_for_leg(leg, ref_target, ref_path):
 
 
 def oracle_report_lines(leg, ref_target, ref_path, leg_oracle=None,
-                        resolver=None):
+                        resolver=None, oracle_status=""):
     """The per-leg oracle verdict, as the lines a driver PRINTS verbatim.
 
     ONE implementation of the prose, called by both drivers — the same argument
@@ -3748,7 +3806,8 @@ def oracle_report_lines(leg, ref_target, ref_path, leg_oracle=None,
                      % (spec, leg_oracle.get("cc", "<unnamed cc>"),
                         leg_oracle.get("triple", "<unmeasured triple>")))
         return lines
-    cls, why = oracle_class_for_leg(leg, ref_target, ref_path)
+    cls, why = oracle_class_for_leg(leg, ref_target, ref_path,
+                                    oracle_status)
     if cls == "same-platform":
         lines.append("%s: SAME-PLATFORM (the run reference) — %s"
                      % (label, ref_path))
@@ -4077,7 +4136,7 @@ def attribute_build_failure(dss_log_text, reference_log_text, oracle_status,
     Returns a report dict. Never raises for a LOG it cannot read: an unreadable
     log is a REPORTED finding (`parserGap`), because raising would take the whole
     leg's account down with it and the harness must survive everything."""
-    attempted = oracle_status in ("built", "build-failed")
+    attempted = oracle_status in ORACLE_STATUSES_ATTEMPTED
     sources = {normalise_tu_path(s) for s in (manifest_sources or [])}
     dss_rows = [r for r in dss_build_diagnostics(dss_log_text)
                 if r["severity"] == "error"]
@@ -4090,7 +4149,7 @@ def attribute_build_failure(dss_log_text, reference_log_text, oracle_status,
     # every amnesty AND hides that the reader is the reason. It fails in the safe
     # direction and it still has to say so out loud.
     parser_gap = ""
-    if oracle_status == "build-failed" and not ref_rows:
+    if oracle_status == ORACLE_STATUS_BUILD_FAILED and not ref_rows:
         parser_gap = (
             "the reference build FAILED and this harness parsed ZERO diagnostics "
             "out of its log. Nothing can be attributed and the shape of that log "
@@ -11320,6 +11379,82 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           _cls == "absent")
     check("no reference at all is not an oracle",
           oracle_class_for_leg(legs[0], _elf_ref, "")[0] == "absent")
+    # ── D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE ───────────
+    # ★★★ THE THREE STATES `absent` USED TO SPELL AS ONE. The defect was never
+    # that the harness lacked the fact — `--build-reference-oracle` returns it
+    # and `attribute_build_failure` reads it — it was that the VERDICT LINE threw
+    # it away, so "the control ran and failed" and "no control was possible" came
+    # out as the same sentence. That cost P13 and P14 two full cycles hunting a
+    # dss miscompile that was upstream. These assert the CLASS and the WORDS,
+    # because the words are what a reader acts on.
+    _no_bin = ""
+    check("a control that RAN AND FAILED is its own class, never 'absent'",
+          oracle_class_for_leg(legs[0], _elf_ref, _no_bin,
+                               ORACLE_STATUS_BUILD_FAILED)[0] == "build-failed")
+    check("'no compiler on this host' is its own class, never 'absent'",
+          oracle_class_for_leg(legs[0], _elf_ref, _no_bin,
+                               ORACLE_STATUS_NO_COMPILER)[0]
+          == "no-reference-compiler")
+    check("a control that was never called is still 'absent'",
+          oracle_class_for_leg(legs[0], _elf_ref, _no_bin,
+                               ORACLE_STATUS_NOT_CALLED)[0] == "absent")
+    # ★ THE THREE MUST NOT SHARE A SENTENCE. Asserting the classes differ is not
+    # enough — the defect was in the PROSE, so the prose is what must differ.
+    _whys = {oracle_class_for_leg(legs[0], _elf_ref, _no_bin, _s)[1]
+             for _s in (ORACLE_STATUS_BUILD_FAILED, ORACLE_STATUS_NO_COMPILER,
+                        ORACLE_STATUS_NOT_CALLED)}
+    check("...and each states a DIFFERENT next step, in different words",
+          len(_whys) == 3, sorted(_whys))
+    # ★★ A STATUS CANNOT PROMOTE A BINARY. The status only ever refines the
+    # NO-BINARY case; a cross-platform binary stays cross-platform however the
+    # build went, or a green status would launder another platform's reference
+    # into this leg's oracle — the exact defect the sibling row closed.
+    _cross = [_l for _l in legs if _l["spec"] != _elf_ref]
+    check("a status never re-classifies a binary that EXISTS",
+          all(oracle_class_for_leg(_l, _elf_ref, "/out/ref", _s)[0]
+              == "cross-platform"
+              for _l in _cross
+              for _s in ORACLE_STATUSES))
+    # ⚠ AN UNKNOWN STATUS RAISES rather than degrading to the pessimistic class.
+    # A typo'd driver flag must not buy a quiet, plausible, wrong verdict line.
+    check("an unrecognised oracle status is REFUSED, never guessed",
+          _raises(lambda: oracle_class_for_leg(legs[0], _elf_ref, _no_bin,
+                                               "build-faild")))
+    # THE REPORT'S WORDS on the build-failed leg: it must still say NO ORACLE
+    # (there is genuinely no binary to run) while naming the log as the lead, and
+    # it must NOT be readable as "no control was possible here".
+    _bf = "\n".join(oracle_report_lines(
+        legs[0], _elf_ref, _no_bin, None, ("", "", ["<fixture>"]),
+        ORACLE_STATUS_BUILD_FAILED))
+    check("a build-failed leg still says NO ORACLE — there is no binary to run",
+          ": NO ORACLE" in _bf and ": SAME-PLATFORM" not in _bf, _bf)
+    check("...but says the control was ATTEMPTED and points at its log",
+          "RAN and" in _bf and "log" in _bf, _bf)
+    check("...and never claims no control was possible",
+          "no reference binary was produced or preserved" not in _bf, _bf)
+    # ★ ONE VOCABULARY, TWO READERS. `attribute_build_failure` and the classifier
+    # must agree on what "the control ran" means; a second literal list is how
+    # they would drift apart silently.
+    # ★★ THE SAFETY PROPERTY, and it is the one worth having: NO status may
+    # conjure an oracle out of a MISSING BINARY. A `built` status with nothing on
+    # disk is still `absent` — the binary is the control, the status is only its
+    # provenance, and a green status must never be able to launder an absent
+    # control into an available one.
+    check("no oracle status can conjure a control out of a missing binary",
+          all(oracle_class_for_leg(legs[0], _elf_ref, _no_bin, _s)[0]
+              != "same-platform" for _s in ORACLE_STATUSES))
+    check("a 'built' status with no surviving binary is still absent",
+          oracle_class_for_leg(legs[0], _elf_ref, _no_bin,
+                               ORACLE_STATUS_BUILT)[0] == "absent")
+    # ONE VOCABULARY, TWO READERS: the attributor's notion of "the control ran"
+    # is a SUBSET of the declared statuses and excludes both no-control states.
+    check("'attempted' is a subset of the declared statuses, excluding both no-control states",
+          set(ORACLE_STATUSES_ATTEMPTED) <= set(ORACLE_STATUSES)
+          and ORACLE_STATUS_NO_COMPILER not in ORACLE_STATUSES_ATTEMPTED
+          and ORACLE_STATUS_NOT_CALLED not in ORACLE_STATUSES_ATTEMPTED)
+    check("every declared oracle status is a class this catalogue can render",
+          all(oracle_class_for_leg(legs[0], _elf_ref, _no_bin, _s)[0]
+              in ORACLE_CLASSES for _s in ORACLE_STATUSES))
     # A leg that DID get its own same-platform oracle claims it, and says by what.
     _own = "\n".join(oracle_report_lines(
         _pe_leg_for_oracle, _elf_ref, "/out/reference-testfixture",
@@ -15101,12 +15236,13 @@ def main(argv=None):
             resolver = None
             if not leg_oracle:
                 cls, _why = oracle_class_for_leg(leg, args.reference_target,
-                                                 args.reference_path)
+                                                 args.reference_path,
+                                                 args.oracle_status)
                 if cls != "same-platform":
                     resolver = resolve_target_cc(leg)
             for line in oracle_report_lines(leg, args.reference_target,
                                             args.reference_path, leg_oracle,
-                                            resolver):
+                                            resolver, args.oracle_status):
                 sys.stdout.write("%s\n" % line)
             return 0
         if args.build_reference_oracle:

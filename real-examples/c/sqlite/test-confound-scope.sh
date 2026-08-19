@@ -125,7 +125,7 @@ fails='writecrash-1.1.1 walsetlk-2.1.3 zipfile-25.0 sometest-9.9'
 # a pass over work it did not do.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN,
 # by design. One line to update, against an instrument that would otherwise lie.
-TOTAL_ASSERTIONS=150     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+TOTAL_ASSERTIONS=152     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
                          # + 28 loadext staging + 6 staged sqlite_cfg.h (this driver)
                          # + 4 launcher argv form (this driver, 2 of them behavioural)
                          # + 46 driver-pairing (.ps1-gated): 12 original + 28 for
@@ -804,6 +804,18 @@ check "...validating the value against the RESOLVER's vocabulary" "--run-fidelit
 # and this asserts the driver actually supplies it.
 check "...and supplies the oracle STATUS, so a stale log cannot buy an amnesty" \
       "--oracle-status" "$SHCODE"
+# ── THE VERDICT LINE MUST CARRY THE STATUS TOO ──────────────────────────
+# [D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE] The assertion
+# above only proves the ATTRIBUTION path is handed the status. The oracle
+# REPORT is a SECOND reader of the same fact and it is the one a human reads:
+# for two cycles it printed "NO ORACLE - no reference binary was produced or
+# preserved" over a control that had RUN AND FAILED with its log on disk.
+# ★ THE NEEDLE IS THE WHOLE ARGUMENT AS THE REPORT CALL SPELLS IT, never the
+# bare option name: the bare name is ALREADY satisfied by the attribution call
+# a few thousand lines up, so it would stay green over a report call that was
+# never wired -- a pin whose witness is not unique in its own subject.
+check "the .sh hands the oracle STATUS to the oracle REPORT, not only to the attributor" \
+      '--oracle-status "${LEG_ORACLE_STATUS[$leg]:-}" 2>&1)' "$SHCODE"
 
 # ── BOTH DRIVERS, OR THE CAPABILITY IS A SILENT HARNESS BUG ──────────────────
 # D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED existed because
@@ -812,8 +824,8 @@ check "...and supplies the oracle STATUS, so a stale log cannot buy an amnesty" 
 # and not the other, and THIS is the assertion that keeps it that way.
 PS1="$(dirname "$SH")/build-and-test.ps1"
 if [ ! -f "$PS1" ]; then
-  echo "  SKIP build-and-test.ps1 not found beside the .sh — 48 pairing assertions not run"
-  skip=$((skip+48))
+  echo "  SKIP build-and-test.ps1 not found beside the .sh — 49 pairing assertions not run"
+  skip=$((skip+49))
 else
   PS1TXT="$(cat "$PS1")"
   # Same comment-stripped view as $SHCODE above, and for the same measured reason.
@@ -828,6 +840,12 @@ else
   check "the .ps1 marks the build-attribution region too" "dss:build-attribution" "$PS1TXT"
   check "the .ps1 ASKS whose build failure it is too"     "--attribute-build"     "$PS1CODE"
   check "...and supplies the oracle STATUS too"           "--oracle-status"       "$PS1CODE"
+  # The SAME second reader, on the .ps1 side. Its call spells the value as a
+  # subexpression rather than a brace-expansion, so the needle differs in FORM
+  # while asserting the identical property -- which is exactly why it has to be
+  # written out per driver instead of shared.
+  check "...and hands it to the .ps1's oracle REPORT too" \
+        "--oracle-status', \"\$(if (\$lr) { \$lr.OracleStatus })\")" "$PS1CODE"
   # ★★ AN OPERATOR SWITCH HONOURED BY ONE DRIVER AND IGNORED BY THE OTHER is the
   # worst shape available: the ignoring side runs legs the operator excluded and
   # reports them as covered — a FALSE claim of coverage, not a missing one.

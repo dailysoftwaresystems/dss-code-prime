@@ -28,7 +28,7 @@ function Warn($m) { "      WARN: $m" }
 # host's "OK (N assertions)". This file now has a skippable block of its own, so it
 # inherits the same hazard and the same cure.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN.
-$TotalAssertions = 109    # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
+$TotalAssertions = 111    # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
                           # + 5 structural + 8 staged sqlite_cfg.h (5 this driver, 3 .sh pairing)
                           # + 6 launcher argv form (4 structural + 2 behavioural, python-gated)
                           # + 6 BOTH-DRIVERS pairing for the BUILD-ATTRIBUTION
@@ -504,6 +504,13 @@ Check "the .sh asks it too"                             ($shCode  -match '--attr
 # a PREVIOUS run must never buy an amnesty this run did not earn, which is why the
 # resolver refuses to default the flag.
 Check "the .ps1 supplies the oracle STATUS"             ($ps1Code -match '--oracle-status')
+# [D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE] The bare option
+# name above is ALREADY satisfied by the attribution call. The oracle REPORT is
+# a second reader of the same fact and the one a human reads, so it is asserted
+# by the whole argument as each call spells it -- escaped, because these needles
+# are full of regex metacharacters.
+Check "the .ps1 hands the oracle STATUS to its oracle REPORT" ($ps1Code -match [regex]::Escape("'--oracle-status', `"`$(if (`$lr) { `$lr.OracleStatus })`")"))
+Check "the .sh hands the oracle STATUS to its oracle REPORT" ($shCode -match [regex]::Escape('--oracle-status "${LEG_ORACLE_STATUS[$leg]:-}" 2>&1)'))
 Check "the .sh supplies it too"                         ($shCode  -match '--oracle-status')
 # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
 # ★★ AN OPERATOR SWITCH HONOURED BY ONE DRIVER AND IGNORED BY THE OTHER is the
