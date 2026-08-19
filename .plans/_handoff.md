@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-19 — cycle **P14 COMPLETE, and it OVERTURNS its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. The defect P14 *did* find is `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE` (HIGH) — its §B was RAISED AND ANSWERED the same day: **✔MSVC compiles the construct, so DSS compiling it is REQUIRED and gcc's failure is a NON-DSS CONFOUND** (new bar §A.3b). Operator has scheduled it for the NEXT cycle **paired with** `D-UPSTREAM-SQLITE-FILEIO-WINDIRENT-IS-MSVC-ONLY`. P13/P12/P11 below.
+**Last updated:** 2026-08-19 — cycles **P14 + P15**. **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
 **Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P14 final). ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
@@ -57,103 +57,64 @@ is correct.** The `r15`-as-sixth-argument reading is retracted for the second an
 
 ---
 
-## 0.000000000000000 ★★★ THE DEFECT P14 ACTUALLY FOUND — A CONFORMANCE REVERSAL, AND IT IS A §B WAITING ON THE OPERATOR
+## 0.000000000000000 ★★★ CYCLE P15 — P14's OWN NEW ANCHOR WAS WITHDRAWN: ITS CENTRAL CLAIM WAS FALSE
 
-`D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE` (**OPEN, HIGH, §B**). **The finding is a reversal,
-which is why it matters more than the header chain itself.** On 2026-08-17 `D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-
-GNUC` closed by DELETING `_MSC_VER` from `c-subset.lang.json`, on the explicit reasoning that pe64 must claim ONE
-identity and that *"agreeing with gcc is the conformance outcome, not the defect"*. `D-UPSTREAM-SQLITE-FILEIO-
-WINDIRENT-IS-MSVC-ONLY` then recorded the consequence: `ext/misc/fileio.c` failed on DSS with **66** diagnostics
-and on mingw-gcc with **31**, the same undeclared names.
+`D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE` is **CLOSED / WITHDRAWN**. P14 opened it asserting
+that hop 2 of the pe descriptor chain (`<dirent.h>` → `<windows.h>`) was an *unlabelled* superset deviation.
+**It is labelled, and thoroughly.** ✔MEASURED by reading the file P14 never opened: `dirent.json`'s `$comment`
+is 8,187 chars and its FIRST SENTENCE is *"★★ LANE-CFG EDIT 2/4 — `includes: [{header: windows.h, when:
+{format: pe}}]`. THIS EDGE IS NOT A CONVENIENCE: IT STATES A DEPENDENCY THAT ALREADY EXISTS IN THE SHIPPED
+BODY"* — because DSS's own pe realization `src/dss-config/runtime/platform/src/dirent.c:62` **is**
+`#include <windows.h>`, driving `_wfindfirst64i32`/`MultiByteToWideChar`/`WideCharToMultiByte` over the Win32
+find-file primitives. A pe consumer of `<dirent.h>` is already, unavoidably, a Win32 consumer; the edge makes
+that visible in the descriptor graph instead of implicit in a source file. It even records its own CONDITIONAL
+marginal (0 of 65 `fileio.c` errors alone, 41 on leave-one-out) and warns against double-counting with hop 1.
+`direct.json` does the same for hop 1 in 6,575 chars, with a MEASURED compatibility cost and an existing corpus
+witness `examples/c-subset/pe_direct_dirent_superset`. ⇒ **both hops are deliberate, declared, bounded and
+example-witnessed — edits 2/4 and 3/4 of a four-edit set.** The remedy P14 proposed was already done, better.
 
-**⚠⚠ THAT DSS HALF IS NO LONGER REPRODUCIBLE.** ✔MEASURED 2026-08-19 on the current tree: DSS compiles that TU
-through the sqlite pe64 leg's own manifest with **zero** `S0001`/`S0006` diagnostics (only
-`K_ProgramEntryUndefined`/`K_SymbolUndefined`, both expected of a TU with no `main` and no sqlite core), while
-mingw-gcc on the identical define+include set still fails. **The acceptance came back — by a different route than
-the identity claim that was deliberately removed.**
+⚠⚠ **THE REUSABLE FAILURE:** P14 checked that `direct.json`'s comment did not mention hop 2 and concluded hop 2
+was undeclared — **without opening `dirent.json`**, where hop 2 is the first sentence. §A.1b says *grep the
+pipeline for the concept and report what you found*. **A per-file absence is not a per-concept absence, and the
+descriptor that OWNS an edge is the one that declares it.**
 
-**THE ROUTE, ✔MEASURED.** On a `pe` format the shipped descriptors chain **`<direct.h>` → `<dirent.h>` →
-`<windows.h>`**, so a TU including only `<direct.h>` receives DSS's whole shipped Win32 vocabulary (`HANDLE`,
-`WCHAR`, `CP_UTF8`, `LPFILETIME`, `WIN32_FIND_DATAW`, `MultiByteToWideChar`, `FindFirstFileW`); `fileio.c`'s
-`_WIN32` branch includes `<direct.h>`. Discriminating probe, on the current Windows tree and again through the
-leg's own manifest: `#include <direct.h>` + `HANDLE h;` → **rc=0**; the same TU with no include / `<stdio.h>` /
-`<sys/stat.h>` / `"windirent.h"` → correctly refused with `error[S0006]`. 🧠The chain landed in `41a320ad`
-(2026-08-18, *"pe64 gets a POSIX layer"*) — the SAME DAY as the 66-diagnostic measurement, so the two rows record
-opposite states of one day and only one can describe the tree now. **mingw provably does not do this** (its real
-`<direct.h>` is on `fileio.c`'s include list and gcc still calls all five names undeclared); 🧠MSVC is expected to
-match and was **NOT probed** — probe before quoting. `direct.json` labels hop 1 as a deliberate declared superset
-deviation; **hop 2 is unlabelled**, and hop 2 is where it stops being narrow.
+**WHAT SURVIVED, and it is why the row was corrected rather than deleted:** (1) ✔`cl` (VS 18 Enterprise) compiles
+the `windirent.h` gate shape **rc=0 clean** — that retires the "MSVC-only, unprobed" uncertainty and is folded
+into `D-UPSTREAM-SQLITE-FILEIO-WINDIRENT-IS-MSVC-ONLY`; (2) ✔`cl` on `#include <direct.h>` + `HANDLE h;` FAILS
+(`error C2065`), so the deviation is real — which is exactly what both descriptors already say; (3) the operator
+ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED;
+a failing reference is a NON-DSS CONFOUND, never a reason to break what works.*
 
-**THE MEASURED COST.** The pe64 leg's same-platform oracle **does not build** precisely because the leg's manifest
-is compilable by DSS and not by the reference — so the whole pe64 corpus ran with no attribution control. ★★ **A
-leg whose manifest only DSS can compile has no oracle by construction** — invisible to every green build, and the
-direct cause of the two cycles above.
+**THE OTHER HALF IS ALSO LARGELY DONE.** `D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION` CLOSED 2026-08-18
+and added the `build-tu` confound kind with a five-clause amnesty; it does not fire on `fileio.c` because DSS now
+emits ZERO diagnostics in that TU. ✔And gcc is NOT mandatory for the units leg — `legs.json`'s own
+`$loadExtHelperBuilderComment` records that since 2026-08-05 no host needs a third-party cross-compiler for any
+leg; `targetCc` governs the OPTIONAL control arm only. ⇒ the pe64 oracle's absence costs a **control**, never the
+build or the run.
 
-**⇒ THE §B WAS RAISED AND ANSWERED THE SAME DAY, AND THE ANSWER REVERSED THE RECOMMENDATION.** Operator ruling,
-2026-08-19, verbatim: *"we must never crash on correct code, even if gcc fails, we must do it right. … If we have
-a reference that works, we must too (of course, with the implementation always following our project's best
-practices)."* This is now **bar §A.3b** in the `dss-cycle` skill (SKILL.md + `references/the-bar.md`): **the test
-is the DISJUNCTION, not the consensus — one working reference makes the behaviour REQUIRED**, a reference's
-failure is never evidence against DSS, and "accepting what no reference accepts is a defect" turns on the word
-**NO**, not one.
+★ **THE ONE REAL RESIDUE, measured, small, and NOT yet fixed:** `oracle_class_for_leg`
+(`real-examples/c/sqlite/harness_legs.py:3683`) still returns `("absent", "no reference binary was produced or
+preserved")` whenever `ref_path` is empty — so a control that **RAN AND FAILED** renders in the leg verdict
+identically to one that was **never attempted**. The driver's stderr *does* say it accurately (*"did NOT build
+… exited 1"*), which is why P14's diagnosis was recoverable at all, but the verdict line is still wrong. This is
+precisely the defect `D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE` names — **and that anchor is
+CITED by `D-UPSTREAM-SQLITE-FILEIO-WINDIRENT-IS-MSVC-ONLY` as its own closing dependency while HAVING NO ROW
+ANYWHERE.** A dangling anchor naming a defect nothing records. Write it or retire the citation — the fix is to
+thread the oracle STATUS (`built`/`build-failed`/`no-reference-compiler`, which `--build-reference-oracle`
+already returns) into the class so `build-failed` renders distinctly.
 
-**✔THE MEASUREMENT THAT DECIDES IT — taken after the ruling, and NOT on file when this handoff first recommended
-narrowing: MSVC COMPILES IT.** `cl` (VS 18 Enterprise, Hostx64) on the `windirent.h` gate shape
-(`#if defined(_WIN32) && defined(_MSC_VER)` → `<windows.h>` → `HANDLE`/`WCHAR`/`CP_UTF8`/`MultiByteToWideChar`)
-builds **rc=0, clean**. So `ext/misc/fileio.c` is CORRECT CODE a reference compiles — MSVC through its `_MSC_VER`
-shim, DSS through the descriptor chain — and **only mingw-gcc fails**, because the shim is gated out for it.
-⇒ **Option (1) (narrow the chain so DSS fails too) is REFUTED: it would break code MSVC builds.** DSS working is
-the required outcome and the gcc oracle's failure on that TU is a **NON-DSS CONFOUND** to attribute.
-⚠ **The row is NOT thereby closed**, and this is the honest half: ✔`cl` on `#include <direct.h>` + `HANDLE h;`
-also fails (`error C2065: 'HANDLE': undeclared identifier`), so **no** reference surfaces the Win32 API from
-`<direct.h>` alone. Hop 2 of the chain is a real, still-UNLABELLED superset deviation. The remaining subject is
-**bound and declare it — do not remove it.**
-
-**Also required whichever way it goes:** `D-UPSTREAM-SQLITE-FILEIO-WINDIRENT-IS-MSVC-ONLY` now carries a
-stale-marker; its DSS half must be RE-MEASURED, never re-quoted. Its upstream half stands.
-
-**TWO THINGS THIS CYCLE DELIBERATELY DID NOT DO**, both operator calls: **reporting the defects to upstream
-sqlite** (outward-facing), and **anything that would make the pe64 corpus leg green** — the standing rule forbids
-patching the staged tree or excluding the file, so the leg **remains RED at `scanstatus2-5.1` with a named,
-non-DSS cause**.
-
-**SHIPPED THIS CYCLE:** `examples/c-subset/outparam_shortcircuit_merge/` (main.c + helper.c), registered and green
-as ctest `examples/c-subset/outparam_shortcircuit_merge`. It is a **POSITIVE** cross-CU guard and says so in its
-own files — address-taken local written only through the out-param of a cross-CU call in the LEFT arm of a
-short-circuit `or`, read back as argument 1 of a FIVE-argument call, two TUs so it routes through `mergeCuMirs`
-(N≥2). ✔Exit 42 on DSS pe64, elf64-x86_64 and elf64-arm64 (qemu) — each at debug AND release — and on gcc `-O0`
-AND `-O2` on both Windows and Linux. (The two macho arms are `runOn: darwin`; the Mac was off.) ⚠ The version
-staged uncommitted by the previous session had a **source bug** (`objv[objc-2]` indexed a NULL) that made gcc
-segfault too — caught only by running the reference control, which is the same lesson as above.
-
-**NEXT — OPERATOR-SCHEDULED, and the first item is a PAIR that must not be split:**
-1. **`D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE` TOGETHER WITH
-   `D-UPSTREAM-SQLITE-FILEIO-WINDIRENT-IS-MSVC-ONLY`** — operator instruction 2026-08-19: *"please check
-   D-UPSTREAM-SQLITE-FILEIO-WINDIRENT-IS-MSVC-ONLY along with D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-
-   SURFACE using /dss-cycle (next cycle)"*. They are one problem seen from two ends. The direction is DECIDED
-   (bound-and-declare, never narrow); the work is:
-   **(a)** extend `direct.json`'s labelled-deviation `$comment` to cover hop two and give `dirent.json` its own —
-   enumerate exactly which names the chain may surface and why, so the deviation is NAMED and BOUNDED;
-   **(b)** ★ the half that actually unblocks pe64 — make the harness ATTRIBUTE a TU rejected by the leg's own
-   same-platform oracle but accepted by another reference to **NON-DSS CONFOUND**, so a gcc-only failure stops
-   poisoning the leg (harness work, not descriptor work);
-   **(c)** ship a corpus example pinning the construct with the three-way verdict recorded IN the example —
-   **gcc FAILS, MSVC SUCCEEDS, DSS SUCCEEDS** (operator: *"just put in our example that gcc fails but msvc
-   succeeds"*). ⚠ Do NOT narrow the chain; do NOT patch or exclude the staged sqlite tree.
-   ✔**ANSWERED, so (b) does not have to assume it — gcc is NOT mandatory for the sqlite units/linking leg.**
-   The operator asked; `real-examples/c/sqlite/legs.json` answers it in its own `$loadExtHelperBuilderComment`:
-   since 2026-08-05 (*operator: "why do we need mingw? since dss code prime should not have dependencies?"*)
-   **the compiler this repository ships builds the corpus's `dlopen()`ed helper, and NO host needs a third-party
-   cross-compiler for ANY leg**; `build.targetCc` governs *the optional CONTROL arm*, not a required build input,
-   and a leg whose `targetCc` resolves to nothing still builds its helper with DSS and still runs its corpus.
-   ⇒ the pe64 oracle's failure costs us a **CONTROL**, never the build or the run — which is exactly why (b) is
-   an attribution fix and not a toolchain dependency.
-2. **Operator decision still owed: report upstream to sqlite?** (a) the `%p` vs `format "ptr:0x%llx"` handle
-   mismatch in `test/test1.c` + `test/scanstatus2.test`; (b) `fileio.c`/`windirent.h`'s `_MSC_VER` interlock.
+**NEXT — OPERATOR-SCHEDULED (2026-08-19), in this order:**
+1. **The remaining residue above**: `D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE` — write the row
+   (or retire the citation) and thread the oracle status into `oracle_class_for_leg` so *"the control ran and
+   failed"* stops rendering as *"there is no control"*. Small, self-contained, and it is the last live piece of
+   the pe64-attribution story.
+2. **Operator conversation, then a cycle: grab the important anchors from the AP5/AP6 commit + the asm feature
+   (this PR) pending deferrals.** Operator's stated ORDER: **pending feature completion → production errors →
+   harness/test errors → others.**
+3. **Operator decision still owed: report upstream to sqlite?** (a) the `%p` vs `format "ptr:0x%llx"` handle
+   mismatch (`test/test1.c` + `test/scanstatus2.test`); (b) `fileio.c`/`windirent.h`'s `_MSC_VER` interlock.
    Both outward-facing, so neither was filed.
-3. **Then the loop continues:** TLS-dylib corpus arm (P12 residual); asm remainder
-   (`D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` label half; `D-ASM-TEMPLATE-IS-LEXED-TWICE` LOW;
-   `D-ASM-ARM64-GAS-SURFACE-INCOMPLETE` — re-measure, it predates the CFI producer); C1 diagnostic coordinates
+4. Then the standing loop: TLS-dylib corpus arm (P12 residual); asm remainder; C1 diagnostic coordinates
    (`D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED`, HIGH).
 
 ⚠ **Housekeeping seen but NOT done this cycle** (no anchor — it is the already-open
