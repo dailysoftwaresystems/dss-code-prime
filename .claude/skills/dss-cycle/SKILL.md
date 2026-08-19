@@ -227,12 +227,26 @@ python scripts/check-scripts-index/check-scripts-index.py --write
 ⚠ A new script also inherits the repository's layout, and the guard checks it: one directory per
 script named for the script, every sibling implementation inside it (`scripts/<name>/<name>.{sh,ps1,py}`),
 assets alongside, and no script loose at the top or buried in a subdirectory.
-⚠ **What the guard does NOT check is `.sh`/`.ps1` PAIRING**, and this line used to assert it did —
-*"the pairing is a contract, not a courtesy"* — which was false in two directions at once: nothing
-enforces it, and eight script directories are Python-only by design. Pairing matters where a
-capability must reach the Windows leg, and where it does, the two siblings must not drift — the
-guard now refuses a sibling whose `PURPOSE:` contradicts its primary. Full enforcement is
-[[D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED]], which is open and measured, not something to assert here.
+### `.sh`/`.ps1` pairing is a JUDGEMENT THE AUTHOR MAKES AND WRITES DOWN — never a gate
+
+**Operator ruling 2026-08-19:** *"some scripts are posix executed only, and don't have a .ps1 pair. so
+we must just enforce the dss cycle and dss code prime skills to always create the pair, except when the
+execution is posix only."*
+
+- **Create the `.ps1` twin whenever the capability must reach the Windows leg.** That leg is where this
+  project's primary ctest runs; a bash-only capability is one the main gate cannot use.
+- **Omit it — and say so in the header — when either holds:** the script is already cross-platform (a
+  `.py` runs on both hosts, so a twin would be a second implementation of something never split), or
+  execution is POSIX-ONLY BY NATURE (`wsl-leg` runs inside a WSL distro where PowerShell is not the
+  shell; `profile-compile` drives a POSIX toolchain over a carriage).
+- **Where a pair DOES exist, the two must not drift.** A change to one sibling lands in the other in the
+  same commit: pairing by EXISTENCE is not pairing by BEHAVIOUR.
+
+⚠ **This is deliberately NOT enforced by a guard, and the reason is measured:** ✔11 of 21 script
+directories carry no `.ps1` and every one is correct. A gate cannot tell a deliberate POSIX-only script
+from a forgotten twin, so it would need an allowlist of eleven exceptions — the convention written twice,
+in the place least likely to be read, reddening honest work by default. The anchor that demanded such a
+gate was WITHDRAWN on that ruling.
 
 ## ★★★ NEVER CITE A LINE NUMBER — CITE SOMETHING THE FILE CARRIES
 

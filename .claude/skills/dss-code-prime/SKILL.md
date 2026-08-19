@@ -63,6 +63,34 @@ Everything else — strongly-typed IDs, immutable post-build `Tree`, `DSS_EXPORT
 `[[nodiscard]]`, comment policy, move semantics, no abbreviations — is in
 `references/testing-and-conventions.md` and is equally mandatory, just less explosive.
 
+### Script conventions (`scripts/`)
+
+**Layout.** One directory per script, named for the script, every sibling implementation inside it:
+`scripts/<name>/<name>.{sh,ps1,py}`, assets alongside. Nothing loose at the top of `scripts/`, nothing
+buried a level deeper. Each script declares its purpose once in a `PURPOSE:` line; both indexes
+(`scripts/README.md`, `dss-cycle/references/scripts.md`) are generated from it and held to the tree by
+`scripts_index_guard`.
+
+**`.sh`/`.ps1` pairing — a judgement the author makes and writes down, never a gate.**
+Operator ruling 2026-08-19: *"some scripts are posix executed only, and don't have a .ps1 pair. so we
+must just enforce the dss cycle and dss code prime skills to always create the pair, except when the
+execution is posix only."*
+
+- **Create the `.ps1` twin whenever the capability must reach the Windows leg** — that is where this
+  project's primary ctest runs, so a bash-only capability is one the main gate cannot use.
+- **Omit it, and say so in the header, when either holds:** the script is already cross-platform (a
+  `.py` runs on both hosts; a twin would be a second implementation of something never split), or its
+  execution is POSIX-ONLY BY NATURE (`wsl-leg` runs inside a WSL distro where PowerShell is not the
+  shell; `profile-compile` drives a POSIX toolchain over a carriage).
+- **Where a pair exists, the two must not drift.** A change to one lands in the other in the same
+  commit — pairing by EXISTENCE is not pairing by BEHAVIOUR.
+
+⚠ **Deliberately not gated, and the reason is measured:** ✔11 of 21 script directories carry no `.ps1`
+and every one is correct. A guard cannot tell a deliberate POSIX-only script from a forgotten twin, so
+it would need an allowlist of eleven exceptions — the convention written twice, in the place least
+likely to be read, reddening honest work by default. The anchor that demanded such a guard was
+WITHDRAWN on that ruling.
+
 ## Workflow
 
 1. Identify which subsystem the question touches, and read that reference file (see file map).

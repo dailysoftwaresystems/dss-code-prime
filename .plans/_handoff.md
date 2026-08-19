@@ -9,8 +9,8 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-19 — cycles **P14 + P15 + P16 + P17**. **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P17). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
+**Last updated:** 2026-08-19 — cycles **P14 + P15 + P16 + P17 + P18**. **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P18). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
 
@@ -37,12 +37,19 @@ commit that lands it, and never delete a ticked row.
       `/dss-cycle` now MANDATES that a script added/renamed/deleted/repurposed updates the reference in the
       same commit. Also: the gate ran **serially on every host** — `run-gate` and `local-build` now default
       `CTEST_PARALLEL_LEVEL=8` (✔9741 ms → 2648 ms on six tests; the full suite was 899 tests / 2602 s).
-- [ ] **P18 — `D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` (label half).** Trigger FIRED. The operand half and
+- [x] **P18 — OPERATOR RULING: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` WITHDRAWN. ✅ DONE 2026-08-19.**
+      The anchor asked for a gate that every `.sh` carry a `.ps1`. ✔MEASURED: **11 of 21 script directories
+      have no `.ps1` and every one is correct** — eight are Python (cross-platform already), two are POSIX-only
+      by nature (`wsl-leg` runs inside a WSL distro; `profile-compile` drives a POSIX toolchain). A gate cannot
+      tell a deliberate POSIX-only script from a forgotten twin, so it would need an eleven-entry allowlist —
+      the convention written twice, reddening honest work by default. Rule now lives in `dss-cycle/SKILL.md`
+      and the `dss-code-prime` skill (conventions authority). Net −1.
+- [ ] **P19 — `D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` (label half).** Trigger FIRED. The operand half and
       the `%%` half are DONE; this is the asm-goto BLOCK-binding design and the last piece of the feature.
       Expect a real design fork — bring it as a §B rather than guessing.
-- [ ] **P19 — `D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM`.** Trigger FIRED. AP5/AP6's `dependsOn` path has
+- [ ] **P20 — `D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM`.** Trigger FIRED. AP5/AP6's `dependsOn` path has
       never been touched by the release optimizer on ANY leg, so a release-only fault in it is invisible today.
-- [ ] **P20 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
+- [ ] **P21 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
       family, and it gates the pe64 sqlite CLI. ✔Measured to shrink to ONE library for the CLI case.
 - [x] **OPERATOR CALL — ✅ FILED 2026-08-19: <https://sqlite.org/bugs/forumpost/97cd29ca44624113c73b30f5d2504729e6ffc5c5ebcba137078ea1a868cd97c9>.**
       The `%p` half only, which is the half that warranted it. ✔The toolchain table is what makes it
@@ -76,6 +83,34 @@ SHIPPED design record, and `D-TEST-MACOS-LEG-EMSDK-PROFILE-REPLACES-PATH-HIDING-
 pre-existing environment fact.
 
 ---
+
+## 0.00000000000000000000 ★★★ CYCLE P18 — AN ANCHOR WITHDRAWN BECAUSE WHAT IT ASKED FOR WOULD HAVE BEEN WRONG
+
+**One row closed, net −1. No code changed.**
+
+`D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` had been OPEN since 2026-07-29 demanding a guard that every `.sh`
+carry a `.ps1` twin. **Operator ruling 2026-08-19:** *"some scripts are posix executed only, and don't have
+a .ps1 pair. so we must just enforce the dss cycle and dss code prime skills to always create the pair,
+except when the execution is posix only. and this enforcement D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED must not
+exist."*
+
+⭐⭐ **THE ROW'S PREMISE IS MEASURABLY FALSE.** It reads an unpaired `.sh` as a missing twin. ✔At closure
+**11 of 21 script directories carry no `.ps1`, and every one is correct**: eight are Python — a `.py`
+already runs on both hosts, so a twin would be a second implementation of something never split — and two
+are POSIX-ONLY BY NATURE (`wsl-leg` runs inside a WSL distro where PowerShell is not the shell;
+`profile-compile` drives a POSIX toolchain over a carriage).
+
+★★ **A GATE CANNOT TELL A DELIBERATE POSIX-ONLY SCRIPT FROM A FORGOTTEN TWIN**, so an existence check
+would have to be fed an allowlist of eleven exceptions — the convention written twice, in the place least
+likely to be read, reddening honest work by default. **The rule is now a judgement the author makes and
+writes down**, stated in `dss-cycle/SKILL.md` and in the `dss-code-prime` skill (the conventions
+authority): create the twin whenever the capability must reach the Windows leg; omit it — and say so in
+the header — when the script is already cross-platform or POSIX-only by nature; and where a pair does
+exist, the two must not drift.
+
+ⓘ **The row's second half survives as a rule rather than a gate:** pairing by EXISTENCE is not pairing by
+BEHAVIOUR. `scripts_index_guard` covers the sharp edge (a sibling whose `PURPOSE:` contradicts its primary
+is refused); the rest is the same-commit discipline the skills state.
 
 ## 0.000000000000000000 ★★★ CYCLE P17 — THE REPOSITORY NOW HAS AN INDEX OF ITS OWN SCRIPTS, AND THE GATE STOPPED RUNNING ONE TEST AT A TIME
 
