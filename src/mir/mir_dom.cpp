@@ -255,15 +255,43 @@ computeMirDomTree(Mir const&                                  mir,
     return scratch.tree;
 }
 
-MirPostDomTree
-computeMirPostDomTree(Mir const& mir, MirFuncId f) {
+namespace {
+
+// Every buffer the reverse-graph CHK walk needs, held BY REFERENCE so the
+// fresh-allocation path can point at locals and the scratch path at its own
+// retained storage. ONE implementation writes through this — that is what
+// makes the two public overloads byte-identical by construction rather than
+// by two bodies kept in sync by hand.
+//
+// Entry contract (both paths satisfy it — fresh by allocation, scratch by the
+// touched-slot reset): every array is sized `blockCount + 1` and holds the
+// fresh-allocation default in EVERY slot this call may touch — revPreds /
+// revSuccs empty, visited 0, coreIdom / rpoIndex kUnsetSlot, coreGaveUp 0,
+// tree.ipdom MirBlockId{}, tree.gaveUp 0. `order`, `touchedRev` and
+// `touchedNodes` are cleared here.
+struct PostDomBuffers {
+    std::vector<std::vector<std::uint32_t>>& revPreds;
+    std::vector<std::vector<std::uint32_t>>& revSuccs;
+    std::vector<std::uint8_t>&               visited;
+    std::vector<std::uint32_t>&              order;
+    std::vector<std::uint32_t>&              coreIdom;
+    std::vector<std::uint8_t>&               coreGaveUp;
+    std::vector<std::uint32_t>&              rpoIndex;
+    MirPostDomTree&                          tree;
+    // Self-recorded write sets, so the NEXT call on a scratch can restore the
+    // defaults by touching only what this call dirtied.
+    std::vector<std::uint32_t>&              touchedRev;
+    std::vector<std::uint32_t>&              touchedNodes;
+};
+
+void computePostDomInto(Mir const& mir, MirFuncId f, PostDomBuffers b) {
     std::size_t const n = mir.blockCount();
     std::uint32_t const virtualSlot = static_cast<std::uint32_t>(n);
-    MirPostDomTree st;
-    st.virtualExit = virtualSlot;
-    st.ipdom.assign(n + 1, MirBlockId{});
-    st.gaveUp.assign(n + 1, 0);
-    if (mir.funcBlockCount(f) == 0) return st;
+    b.order.clear();
+    b.touchedRev.clear();
+    b.touchedNodes.clear();
+    b.tree.virtualExit = virtualSlot;
+    if (mir.funcBlockCount(f) == 0) return;
 
     // Forward-reachability gates the exit set: an UNREACHABLE
     // Return-terminated block (dead code) must not define the join
@@ -272,78 +300,163 @@ computeMirPostDomTree(Mir const& mir, MirFuncId f) {
     auto const rpo = mirReversePostOrder(mir, entry);
     std::unordered_set<std::uint32_t> reachable;
     reachable.reserve(rpo.size());
-    for (MirBlockId const b : rpo) reachable.insert(b.v);
+    for (MirBlockId const bb : rpo) reachable.insert(bb.v);
 
     // Reverse graph over slots [0, n]; slot n is the virtual exit.
     //   reverse-preds(b)  = forward successors of b (+ virtual for exits)
     //   reverse-succs(b)  = forward predecessors of b
     //   reverse-succs(virtual) = the exit blocks (reverse-graph root edges)
-    std::vector<std::vector<std::uint32_t>> revPreds(n + 1);
-    std::vector<std::vector<std::uint32_t>> revSuccs(n + 1);
+    auto pushRevPred = [&](std::uint32_t slot, std::uint32_t v) {
+        if (b.revPreds[slot].empty()) b.touchedRev.push_back(slot);
+        b.revPreds[slot].push_back(v);
+    };
+    auto pushRevSucc = [&](std::uint32_t slot, std::uint32_t v) {
+        if (b.revSuccs[slot].empty()) b.touchedRev.push_back(slot);
+        b.revSuccs[slot].push_back(v);
+    };
     std::uint32_t const nb = mir.funcBlockCount(f);
     for (std::uint32_t bi = 0; bi < nb; ++bi) {
-        MirBlockId const b = mir.funcBlockAt(f, bi);
-        for (MirBlockId const s : mir.blockSuccessors(b)) {
+        MirBlockId const blk = mir.funcBlockAt(f, bi);
+        for (MirBlockId const s : mir.blockSuccessors(blk)) {
             if (!s.valid() || s.v >= n) continue;  // verifier owns the diagnostic
-            revPreds[b.v].push_back(s.v);
-            revSuccs[s.v].push_back(b.v);
+            pushRevPred(blk.v, s.v);
+            pushRevSucc(s.v, blk.v);
         }
-        if (!reachable.contains(b.v)) continue;
-        std::uint32_t const ni = mir.blockInstCount(b);
+        if (!reachable.contains(blk.v)) continue;
+        std::uint32_t const ni = mir.blockInstCount(blk);
         if (ni == 0) continue;  // unterminated — verifier owns the diagnostic
-        MirOpcode const term = mir.instOpcode(mir.blockInstAt(b, ni - 1));
+        MirOpcode const term = mir.instOpcode(mir.blockInstAt(blk, ni - 1));
         if (term == MirOpcode::Return || term == MirOpcode::Unreachable) {
-            revPreds[b.v].push_back(virtualSlot);
-            revSuccs[virtualSlot].push_back(b.v);
+            pushRevPred(blk.v, virtualSlot);
+            pushRevSucc(virtualSlot, blk.v);
         }
     }
 
     // Reverse-RPO from the virtual exit (iterative post-order, reversed
     // — the same traversal shape as mirReversePostOrder, over revSuccs).
-    std::vector<std::uint32_t> order;
     {
-        std::vector<std::uint8_t> visited(n + 1, 0);
         struct Frame { std::uint32_t slot; std::size_t nextSucc; };
         std::vector<Frame> stack;
-        visited[virtualSlot] = 1;
+        b.visited[virtualSlot] = 1;
         stack.push_back({virtualSlot, 0});
         while (!stack.empty()) {
             Frame& top = stack.back();
-            auto const& succs = revSuccs[top.slot];
+            auto const& succs = b.revSuccs[top.slot];
             if (top.nextSucc < succs.size()) {
                 std::uint32_t const s = succs[top.nextSucc++];
-                if (!visited[s]) {
-                    visited[s] = 1;
+                if (!b.visited[s]) {
+                    b.visited[s] = 1;
                     stack.push_back({s, 0});
                 }
             } else {
-                order.push_back(top.slot);
+                b.order.push_back(top.slot);
                 stack.pop_back();
             }
         }
-        std::reverse(order.begin(), order.end());
+        std::reverse(b.order.begin(), b.order.end());
     }
+    // `order` IS the visited set, the CHK core's write set (the core writes
+    // only `order ∪ {entry}`, and entry == virtualSlot == order[0]) and the
+    // result-conversion write set below — one list covers all four.
+    b.touchedNodes.assign(b.order.begin(), b.order.end());
 
-    // Same templated core as the forward tree (uint32 slot elements here);
-    // fresh arrays per call — post-dom is only on the (now-3×/compile)
-    // rederive path, its scratch treatment is the gated
-    // D-OPT-POSTDOM-SCRATCH-REUSE follow-up.
-    std::vector<std::uint32_t> coreIdom(n + 1, kUnsetSlot);
-    std::vector<std::uint8_t>  coreGaveUp(n + 1, 0);
-    std::vector<std::uint32_t> rpoIndex(n + 1, kUnsetSlot);
-    runChkCoreInto(n + 1, virtualSlot, order, revPreds,
-                   coreIdom, coreGaveUp, rpoIndex);
-    st.gaveUp = std::move(coreGaveUp);
-    for (std::size_t i = 0; i <= n; ++i) {
+    // Same templated core as the forward tree (uint32 slot elements here).
+    runChkCoreInto(n + 1, virtualSlot, b.order, b.revPreds,
+                   b.coreIdom, b.coreGaveUp, b.rpoIndex);
+    for (std::uint32_t const slot : b.touchedNodes) {
+        b.tree.gaveUp[slot] = b.coreGaveUp[slot];
         // Three-valued mapping (see MirPostDomTree): kUnsetSlot →
         // INVALID (reverse-unreachable: no path to any exit); the
         // virtual slot maps to a SYNTHETIC id callers must compare,
-        // never dereference.
-        st.ipdom[i] = (coreIdom[i] == kUnsetSlot)
+        // never dereference. Slots outside the write set keep the
+        // MirBlockId{} / 0 defaults, which is exactly what the
+        // kUnsetSlot arm would have produced for them.
+        b.tree.ipdom[slot] = (b.coreIdom[slot] == kUnsetSlot)
             ? MirBlockId{}
-            : MirBlockId{coreIdom[i], mir.id().v};
+            : MirBlockId{b.coreIdom[slot], mir.id().v};
     }
+}
+
+} // namespace
+
+MirPostDomTree
+computeMirPostDomTree(Mir const& mir, MirFuncId f) {
+    std::size_t const n = mir.blockCount();
+    MirPostDomTree st;
+    st.virtualExit = static_cast<std::uint32_t>(n);
+    st.ipdom.assign(n + 1, MirBlockId{});
+    st.gaveUp.assign(n + 1, 0);
+    // Fresh whole-module buffers for ONE function's walk — the cost the
+    // scratch overload exists to remove (D-OPT-POSTDOM-SCRATCH-REUSE).
+    std::vector<std::vector<std::uint32_t>> revPreds(n + 1);
+    std::vector<std::vector<std::uint32_t>> revSuccs(n + 1);
+    std::vector<std::uint8_t>  visited(n + 1, 0);
+    std::vector<std::uint32_t> order;
+    std::vector<std::uint32_t> coreIdom(n + 1, kUnsetSlot);
+    std::vector<std::uint8_t>  coreGaveUp(n + 1, 0);
+    std::vector<std::uint32_t> rpoIndex(n + 1, kUnsetSlot);
+    std::vector<std::uint32_t> touchedRev;
+    std::vector<std::uint32_t> touchedNodes;
+    computePostDomInto(mir, f, PostDomBuffers{revPreds, revSuccs, visited,
+                                              order, coreIdom, coreGaveUp,
+                                              rpoIndex, st, touchedRev,
+                                              touchedNodes});
     return st;
+}
+
+MirPostDomTree const&
+computeMirPostDomTree(Mir const& mir, MirFuncId f, MirPostDomScratch& scratch) {
+    // Bind-or-verify (the MirDomScratch / MirMemoryClobbers stale-guard
+    // pattern): the optimizer mints a fresh MirModuleId per rebuild, so a
+    // scratch reused across a rebuild fails loud here instead of silently
+    // mixing modules.
+    std::uint32_t const bc = static_cast<std::uint32_t>(mir.blockCount());
+    std::size_t const n1 = static_cast<std::size_t>(bc) + 1;
+    if (scratch.blockCount == 0 && scratch.moduleIdV == 0) {
+        scratch.moduleIdV  = mir.id().v;
+        scratch.blockCount = bc;
+        scratch.revPreds.assign(n1, {});
+        scratch.revSuccs.assign(n1, {});
+        scratch.visited.assign(n1, 0);
+        scratch.coreIdom.assign(n1, kUnsetSlot);
+        scratch.coreGaveUp.assign(n1, 0);
+        scratch.rpoIndex.assign(n1, kUnsetSlot);
+        scratch.tree.ipdom.assign(n1, MirBlockId{});
+        scratch.tree.gaveUp.assign(n1, 0);
+    } else if (scratch.moduleIdV != mir.id().v || scratch.blockCount != bc) {
+        std::fprintf(stderr,
+            "dss::computeMirPostDomTree fatal: MirPostDomScratch bound to "
+            "module id=%u blocks=%u used with module id=%u blocks=%u — stale "
+            "scratch across a rebuild (D-OPT-POSTDOM-SCRATCH-REUSE "
+            "contract).\n",
+            scratch.moduleIdV, scratch.blockCount, mir.id().v, bc);
+        std::abort();
+    }
+
+    // Reset-at-entry from the PREVIOUS call's self-recorded write sets,
+    // restoring exactly the fresh-allocation defaults. Two lists because the
+    // adjacency write set (successor slots of the previous function's blocks)
+    // and the reverse-RPO order are different sets.
+    for (std::uint32_t const slot : scratch.touchedRev) {
+        scratch.revPreds[slot].clear();
+        scratch.revSuccs[slot].clear();
+    }
+    for (std::uint32_t const slot : scratch.touchedNodes) {
+        scratch.visited[slot]         = 0;
+        scratch.coreIdom[slot]        = kUnsetSlot;
+        scratch.coreGaveUp[slot]      = 0;
+        scratch.rpoIndex[slot]        = kUnsetSlot;
+        scratch.tree.ipdom[slot]      = MirBlockId{};
+        scratch.tree.gaveUp[slot]     = 0;
+    }
+    scratch.touchedRev.clear();
+    scratch.touchedNodes.clear();
+
+    computePostDomInto(mir, f, PostDomBuffers{
+        scratch.revPreds, scratch.revSuccs, scratch.visited, scratch.order,
+        scratch.coreIdom, scratch.coreGaveUp, scratch.rpoIndex, scratch.tree,
+        scratch.touchedRev, scratch.touchedNodes});
+    return scratch.tree;
 }
 
 MirDomResult
@@ -480,14 +593,22 @@ mirDomTreeChildren(Mir const& mir, MirDomTree const& dom,
     return scratch.children;
 }
 
+namespace {
+
+// The natural-loop forest over a caller-chosen back-edge SOURCE sweep. ONE
+// implementation; the two public overloads differ only in `forEachCandidate`
+// (every module slot vs. a caller-supplied ascending list) — see the scoped
+// overload's docblock in mir_dom.hpp for why a scoped sweep can be complete.
+template <typename ForEachCandidate>
 std::vector<MirNaturalLoop>
-mirNaturalLoops(Mir const& mir,
-                MirDomTree const& dom,
-                std::vector<std::vector<MirBlockId>> const& preds) {
+naturalLoopsCore(Mir const& mir,
+                 MirDomTree const& dom,
+                 std::vector<std::vector<MirBlockId>> const& preds,
+                 ForEachCandidate&& forEachCandidate) {
     // Group back-edges by header.
     std::unordered_map<std::uint32_t, std::vector<MirBlockId>> byHeader;
-    for (std::uint32_t i = 1; i < mir.blockCount(); ++i) {
-        if (i < dom.gaveUp.size() && dom.gaveUp[i]) continue;
+    forEachCandidate([&](std::uint32_t i) {
+        if (i < dom.gaveUp.size() && dom.gaveUp[i]) return;
         MirBlockId const u{i, mir.id().v};
         for (MirBlockId const s : mir.blockSuccessors(u)) {
             if (!s.valid() || s.v >= mir.blockCount()) continue;
@@ -496,7 +617,7 @@ mirNaturalLoops(Mir const& mir,
                 byHeader[s.v].push_back(u);
             }
         }
-    }
+    });
     std::vector<MirNaturalLoop> loops;
     loops.reserve(byHeader.size());
     for (auto const& [headerSlot, backSources] : byHeader) {
@@ -576,6 +697,49 @@ mirNaturalLoops(Mir const& mir,
                   return a.header.v < b.header.v;
               });
     return loops;
+}
+
+} // namespace
+
+std::vector<MirNaturalLoop>
+mirNaturalLoops(Mir const& mir,
+                MirDomTree const& dom,
+                std::vector<std::vector<MirBlockId>> const& preds) {
+    return naturalLoopsCore(mir, dom, preds, [&](auto&& visit) {
+        for (std::uint32_t i = 1; i < mir.blockCount(); ++i) visit(i);
+    });
+}
+
+std::vector<MirNaturalLoop>
+mirNaturalLoops(Mir const& mir,
+                MirDomTree const& dom,
+                std::vector<std::vector<MirBlockId>> const& preds,
+                std::span<std::uint32_t const> candidateSources) {
+    // Ascending + unique + in-range is the contract that makes this overload
+    // byte-identical to the whole-module sweep (it fixes `backEdgeSources`
+    // order). A violation is a caller bug, never a tolerable input.
+    std::uint32_t const bc = static_cast<std::uint32_t>(mir.blockCount());
+    for (std::size_t k = 0; k < candidateSources.size(); ++k) {
+        std::uint32_t const s = candidateSources[k];
+        if (s < 1u || s >= bc) {
+            std::fprintf(stderr,
+                "dss::mirNaturalLoops fatal: candidateSources[%zu] = %u is "
+                "outside [1, blockCount=%u) — the scoped overload's contract "
+                "(D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN).\n", k, s, bc);
+            std::abort();
+        }
+        if (k > 0 && s <= candidateSources[k - 1]) {
+            std::fprintf(stderr,
+                "dss::mirNaturalLoops fatal: candidateSources is not strictly "
+                "ascending at index %zu (%u after %u) — back-edge source order "
+                "would diverge from the whole-module sweep.\n",
+                k, s, candidateSources[k - 1]);
+            std::abort();
+        }
+    }
+    return naturalLoopsCore(mir, dom, preds, [&](auto&& visit) {
+        for (std::uint32_t const s : candidateSources) visit(s);
+    });
 }
 
 std::vector<MirBlockId>

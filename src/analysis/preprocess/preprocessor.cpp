@@ -6243,7 +6243,24 @@ UserDefineSplit splitUserDefine(std::string_view entry) noexcept {
 TranslationTimestamp translationTimestamp() {
     TranslationTimestamp out;
     const std::time_t now = std::time(nullptr);
-    const std::tm*    lt  = std::localtime(&now);
+    // ★★ THREAD-SAFE BY CONSTRUCTION — `std::localtime` IS NOT, AND THIS IS NOW
+    // CALLED CONCURRENTLY. `std::localtime` returns a pointer into a SHARED
+    // process-wide `std::tm`, so two translation units expanding `__DATE__` /
+    // `__TIME__` at the same instant read a buffer the other is overwriting —
+    // a silent wrong-spelling race, not a crash. Since D-PERF-4 the driver
+    // builds the front half of every TU on a thread pool, so that is a real
+    // interleaving rather than a theoretical one, and c-subset declares BOTH
+    // macros (`c-subset.lang.json`), so the path is live for every C compile.
+    // The reentrant spelling fills a CALLER-OWNED `tm`; the `_WIN32` / POSIX
+    // split is pure host portability (which name the host libc gives the
+    // reentrant function), never a target or format identity.
+    std::tm       tmBuf{};
+    const std::tm* lt = nullptr;
+#ifdef _WIN32
+    if (::localtime_s(&tmBuf, &now) == 0) lt = &tmBuf;
+#else
+    lt = ::localtime_r(&now, &tmBuf);
+#endif
     // Defensive: a null `localtime` leaves BOTH strings empty -> a synth `""`
     // literal and a dump that says the value is empty, never a fabricated date.
     if (lt == nullptr) return out;

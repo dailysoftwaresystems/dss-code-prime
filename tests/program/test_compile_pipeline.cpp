@@ -285,7 +285,51 @@ TEST(Program_CompileFiles, PhaseTimersRecordEveryPipelinePhase) {
     }
 
     // (c) plausible nonzero attributed total.
-    EXPECT_GT(PhaseTimers::attributedNanoseconds(), 0u);
+    EXPECT_GT(PhaseTimers::attributedCpuNanoseconds(), 0u);
+
+    // (d) THE TWO-CLOCK INVARIANTS, on a real single-TU compile. This is a
+    // 1-CU build, so every phase ran on one thread at a time: `peak` must be
+    // 1 and the two time columns must AGREE for every phase that ran. That
+    // equality is what makes the parallel build's divergence between them
+    // meaningful rather than noise.
+    //
+    // RED-on-disable: make `wallNanoseconds` an ENVELOPE (first-start to
+    // last-end) instead of a UNION of self-intervals and (d3) fails — an
+    // envelope charges `preprocess` for the whole span between its first and
+    // last burst, which on any multi-phase compile exceeds its own cpu.
+    std::uint64_t sumWall = 0;
+    for (std::size_t i = 0; i < kCompilePhaseCount; ++i) {
+        auto const p   = static_cast<CompilePhase>(i);
+        auto const row = PhaseTimers::read(p);
+        sumWall += row.wallNanoseconds;
+        // (d1) a phase's timeline occupancy can never exceed its own thread-time.
+        EXPECT_LE(row.wallNanoseconds, row.cpuNanoseconds)
+            << "phase '" << compilePhaseName(p) << "' reports more wall than cpu";
+        // (d2) a phase that never ran contributes nothing to either column.
+        if (row.runs == 0) {
+            EXPECT_EQ(row.cpuNanoseconds, 0u);
+            EXPECT_EQ(row.wallNanoseconds, 0u);
+            EXPECT_EQ(row.peakConcurrency, 0u);
+        } else {
+            EXPECT_EQ(row.peakConcurrency, 1u)
+                << "phase '" << compilePhaseName(p)
+                << "': a single-TU compile has no concurrency to report";
+        }
+    }
+    // (d3) with peak==1 everywhere, cpu and wall must be the SAME total.
+    EXPECT_EQ(sumWall, PhaseTimers::attributedCpuNanoseconds())
+        << "on a serial compile the two columns must agree exactly";
+
+    // (e) THE REMAINDER CANNOT UNDERFLOW. The all-phase union is a subset of
+    // the process's lifetime, so it is bounded by the sum of the per-phase
+    // unions and is nonzero after a real compile. This is the property that
+    // lets the driver subtract it from the process wall without clamping.
+    auto const busy = PhaseTimers::busyWallNanoseconds();
+    EXPECT_GT(busy, 0u);
+    EXPECT_LE(busy, sumWall)
+        << "a union over every phase cannot exceed the sum of the per-phase unions";
+    // (f) no scope may outlive the compile — otherwise `busy` is incomplete.
+    EXPECT_EQ(PhaseTimers::liveScopeCount(), 0u);
 }
 
 TEST(Program_CompileFiles, MultiTargetWiresDistinctArtifactDirs) {
@@ -2733,6 +2777,180 @@ TEST(Program_CuParallelism, MultiTuArtifactBytesIdenticalPoolVsSynchronous) {
         << "the pool-built image must be BYTE-IDENTICAL to the single-threaded "
            "build — the only observable difference parallelism may introduce is "
            "speed, never bytes";
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// D-PERF-4-CU-PARALLELISM, THE FRONT HALF — preprocess / splice /
+// tokenize / expand / parse / resolve-imports now run one job per TU on
+// the same pool (`Program::compileUnits`'s `buildCus`). The pins above
+// inject the executor and therefore now exercise BOTH halves; the ones
+// below exist because the front half fails DIFFERENTLY:
+//
+//   * its diagnostics never pass through a scratch reporter at all —
+//     each lands inside the `CompilationUnit` being built, and the drain
+//     walks the CU vector — so what must be pinned is that the CU VECTOR
+//     is assembled in index order, not that a merge is;
+//   * its diagnostics are produced STRICTLY EARLIER than any semantic
+//     error, so a front-half ordering bug is invisible to a fixture
+//     whose markers are undeclared identifiers (the pins above);
+//   * it mints BufferId / TreeId / CompilationUnitId from process-global
+//     monotonic counters (`substrate::mintMonotonicId`), so the IDS a
+//     parallel run assigns genuinely DO depend on completion order. No
+//     driver output is keyed on their values — these pins are what makes
+//     that a measured fact rather than a reading of the code.
+// ═══════════════════════════════════════════════════════════════════
+
+// THE front-half determinism pin, and the one fixture that carries every
+// axis at once: SIX TUs, each emitting a DISTINCT `#warning` — a
+// PREPROCESS-phase diagnostic, produced inside `buildCus` itself, and
+// non-fatal, so the same run ALSO produces a linkable artifact. Pool vs
+// SynchronousExecutor must agree on (1) the diagnostic sequence exactly,
+// (2) the marker order being CU order, and (3) the artifact BYTES.
+//
+// RED-on-disable: collect the CUs in completion order instead of index
+// order (or drain into `rep` from inside a job) and (1)/(2) diverge from
+// the always-CU-ordered synchronous baseline.
+TEST(Program_CuParallelism, FrontHalfMultiTuDiagnosticsAndBytesPoolVsSynchronous) {
+    constexpr int kTus = 6;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    std::vector<std::string> files;
+    for (int i = 0; i < kTus; ++i) {
+        // The `#warning` is the front-half marker; the function body makes
+        // the unit contribute real code so the link has something to merge.
+        auto const body = "#warning zzfront_cu" + std::to_string(i) + "\n"
+                        + "int frontf" + std::to_string(i)
+                        + "(void) { return " + std::to_string(i) + "; }\n";
+        files.push_back(writeCSubsetSource(
+            scratch.path(), "front" + std::to_string(i) + ".c", body)
+                            .generic_string());
+    }
+    scratch.useAsCwd();
+
+    struct RunResult {
+        std::vector<std::pair<DiagnosticCode, std::string>> diags;
+        std::vector<std::uint8_t>                           bytes;
+    };
+    auto runAndCollect = [&](substrate::IExecutor* exec,
+                             fs::path const&       outDir) {
+        Program prog;
+        prog.setExecutor(exec);
+        prog.setOutputDir(outDir);
+        DiagnosticReporter rep;
+        int const rc = prog.compileUnits(
+            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+        EXPECT_EQ(rc, 0) << "#warning must not fail the build";
+        RunResult out;
+        for (auto const& d : rep.all()) out.diags.emplace_back(d.code, d.actual);
+        out.bytes = readAllBytes(outDir / "front0.o");
+        return out;
+    };
+
+    substrate::SynchronousExecutor sync;
+    substrate::ThreadPool          pool{kTus};   // force real concurrency
+    auto const seq = runAndCollect(&sync, scratch.path() / "front_sync");
+    auto const par = runAndCollect(&pool, scratch.path() / "front_pool");
+
+    // (0) the fixture must actually produce the markers it pins — otherwise
+    // every equality below is vacuously true.
+    auto markerText = [](std::vector<std::pair<DiagnosticCode, std::string>> const& v) {
+        std::string s;
+        for (auto const& d : v) { s += d.second; s += '\n'; }
+        return s;
+    };
+    std::string const seqText = markerText(seq.diags);
+    for (int i = 0; i < kTus; ++i) {
+        ASSERT_NE(seqText.find("zzfront_cu" + std::to_string(i)), std::string::npos)
+            << "the fixture produced no front-half diagnostic for CU " << i
+            << " — this pin would assert nothing. Diagnostics seen:\n" << seqText;
+    }
+
+    // (1) the pool's diagnostic stream is element-for-element the sync stream.
+    ASSERT_EQ(seq.diags.size(), par.diags.size())
+        << "pool + synchronous must surface the SAME number of front-half "
+           "diagnostics";
+    EXPECT_EQ(seq.diags, par.diags)
+        << "pool front-half diagnostics must match the single-threaded "
+           "reference EXACTLY — a mismatch means the CUs were collected in "
+           "completion order, not index order";
+
+    // (2) the markers appear in CU (source) ORDER.
+    std::string const parText = markerText(par.diags);
+    std::size_t       prev    = 0;
+    for (int i = 0; i < kTus; ++i) {
+        auto const pos = parText.find("zzfront_cu" + std::to_string(i));
+        ASSERT_NE(pos, std::string::npos) << "CU " << i << "'s marker is missing";
+        if (i > 0) {
+            EXPECT_GT(pos, prev)
+                << "CU " << i << "'s front-half diagnostic must FOLLOW CU "
+                << (i - 1) << "'s — the CU vector must be index-ordered";
+        }
+        prev = pos;
+    }
+
+    // (3) byte-identical artifacts, from the very same run.
+    ASSERT_FALSE(seq.bytes.empty()) << "the artifact must be non-empty";
+    EXPECT_EQ(seq.bytes, par.bytes)
+        << "the pool-built object must be BYTE-IDENTICAL to the "
+           "single-threaded build — parallelism may change speed, never bytes";
+}
+
+// Repeat-stability for the FRONT half (a probabilistic race catcher). One
+// parallel run proves nothing about a schedule-dependent bug: the pool can
+// happen to run jobs in submission order. K=20 runs of a multi-TU build
+// must agree on BOTH the artifact bytes and the full diagnostic sequence.
+//
+// This is also the pin that covers the process-global id counters: the
+// BufferIds / TreeIds / CompilationUnitIds handed out differ between these
+// runs (the pool interleaves differently each time), so if any of them
+// reached the output, these 20 runs would not agree.
+TEST(Program_CuParallelism, FrontHalfMultiTuPoolIsRepeatStable) {
+    constexpr int kTus = 6;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    std::vector<std::string> files;
+    for (int i = 0; i < kTus; ++i) {
+        auto const body = "#warning zzrepeat_cu" + std::to_string(i) + "\n"
+                        + "int repeatf" + std::to_string(i)
+                        + "(void) { return " + std::to_string(i) + "; }\n";
+        files.push_back(writeCSubsetSource(
+            scratch.path(), "repeat" + std::to_string(i) + ".c", body)
+                            .generic_string());
+    }
+    scratch.useAsCwd();
+
+    substrate::ThreadPool pool{kTus};
+    auto const            outDir = scratch.path() / "repeat_out";
+
+    std::vector<std::uint8_t>                           firstBytes;
+    std::vector<std::pair<DiagnosticCode, std::string>> firstDiags;
+    for (int k = 0; k < 20; ++k) {
+        Program prog;
+        prog.setExecutor(&pool);
+        prog.setOutputDir(outDir);
+        DiagnosticReporter rep;
+        int const rc = prog.compileUnits(
+            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+        ASSERT_EQ(rc, 0) << "run " << k << " must succeed";
+        std::vector<std::pair<DiagnosticCode, std::string>> diags;
+        for (auto const& d : rep.all()) diags.emplace_back(d.code, d.actual);
+        auto const bytes = readAllBytes(outDir / "repeat0.o");
+        ASSERT_FALSE(bytes.empty()) << "run " << k << " produced no artifact";
+        if (k == 0) {
+            firstBytes = bytes;
+            firstDiags = diags;
+            ASSERT_EQ(firstDiags.size(), static_cast<std::size_t>(kTus))
+                << "each TU must contribute exactly one front-half diagnostic "
+                   "— otherwise the sequence comparison below is not pinning "
+                   "per-CU ordering";
+        } else {
+            EXPECT_EQ(diags, firstDiags)
+                << "run " << k << "'s front-half diagnostic SEQUENCE diverged "
+                   "from run 0 — the per-CU front-end build is schedule-"
+                   "dependent";
+            EXPECT_EQ(bytes, firstBytes)
+                << "run " << k << " diverged from run 0 — a data race in the "
+                   "per-CU front-end build perturbed the image";
+        }
+    }
 }
 
 // Repeat-stability (a probabilistic race catcher): the SAME multi-TU input

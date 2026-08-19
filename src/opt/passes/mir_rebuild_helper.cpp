@@ -328,7 +328,50 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     };
     std::vector<DeferredPhi> deferredPhis;
     rewrite_.clear();
-    rewrite_.reserve(src_.instCount());
+    // ★★★ THE RESERVE IS SIZED TO THIS FUNCTION, NOT TO THE MODULE, AND THE
+    // DIFFERENCE WAS THE SINGLE LARGEST COST IN THE WHOLE OPTIMIZER
+    // (D-OPT-REBUILD-REWRITE-MAP-RESERVES-THE-WHOLE-MODULE).
+    //
+    // This line used to read `rewrite_.reserve(src_.instCount())`. `instCount()`
+    // is the MODULE's instruction arena size — every function's instructions,
+    // not this one's — while `rewrite_` only ever holds entries for the function
+    // being rebuilt. On the merged whole-program module (3992 functions) every
+    // pass therefore asked, 3992 times per pass per iteration, for a hash table
+    // big enough to hold the ENTIRE PROGRAM in order to store one function's
+    // couple of hundred entries.
+    //
+    // ★★ WHY THAT COSTS SECONDS RATHER THAN BYTES. A right-sized table is a few
+    // hundred bytes; a module-sized one is megabytes, which is past every
+    // allocator's mmap/VirtualAlloc threshold. So each of those 3992 calls took a
+    // fresh multi-megabyte mapping from the OS, zeroed it (touching every page —
+    // a hard fault each), stored ~200 entries in it, and unmapped it. The work
+    // was quadratic in the module (functions × module size) to do something
+    // linear in the function.
+    //
+    // ★★ THE NATURAL EXPERIMENT THAT NAMED IT. ✔MEASURED on the merged sqlite
+    // module before this fix: ConstFold — the ONE pass that hoists its
+    // `MirFunctionRebuilder` out of the per-function loop, so it pays the
+    // oversized allocation ONCE and re-clears it — ran the same full-module
+    // rebuild in ~500 ms, while every pass that constructs the rebuilder inside
+    // the loop (Cse, Licm, Dce, Mem2Reg, CopyProp, SimplifyCfg, Inlining) took
+    // 3100–3900 ms. The passes differ in what they DECIDE, not in how much they
+    // EMIT, and the emit is the same walk in all of them; the ~2.5 s spread was
+    // the allocator, not the optimizer. That is also why the phase's cost varied
+    // 4.4× across host operating systems while every other phase varied under 3×
+    // — mapping and fault costs are the most OS-divergent thing a compiler can do.
+    //
+    // ★ THE COUNT IS A SUM OVER THE SELECTED BLOCKS, AND IT IS A HINT RATHER THAN
+    // A BOUND. Policies legitimately add entries the source blocks do not account
+    // for — Mem2Reg's inserted phis, LICM's hoisted instructions, and the
+    // instructions of any block reached through `absorbSuccessor` (which is NOT
+    // in `blocks` by contract). All of those simply rehash, which is correct and
+    // cheap at this size. Undershooting a few hundred entries costs one rehash;
+    // overshooting by the whole module cost the seconds described above.
+    std::size_t reserveHint = 0;
+    for (MirBlockId const oldB : blocks) {
+        reserveHint += src_.blockInstCount(oldB);
+    }
+    rewrite_.reserve(reserveHint);
 
     for (MirBlockId const oldB : blocks) {
         MirBlockId const newB = blockMap_.at(oldB.v);

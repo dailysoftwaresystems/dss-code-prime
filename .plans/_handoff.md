@@ -9,8 +9,172 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-18 — cycle **P8** complete (ONE path-identity chokepoint; the rebase onto `origin/main` is DONE); P7 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** `41a320ad` ✔MEASURED (Cycle P7, post-rebase), this cycle's work on top and NOT PUSHED.
+**Last updated:** 2026-08-18 — cycle **P9 COMPLETE** (compile-time: four-leg profile, four measured causes fixed, output byte-identical). P8/P7 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P9); parent `d62405ba` (Cycle P8, PUSHED).
+
+---
+
+## 0.0000000 ★★★ READ THIS FIRST — CYCLE P9 (COMPLETE): COMPILE TIME — PROFILED ON FOUR LEGS, FOUR MEASURED CAUSES FIXED, OUTPUT BYTE-IDENTICAL
+
+Operator instruction that opened the cycle, verbatim: *"now we need a comprehensive profiling
+across the WHOLE pipeline compiler and with ALL available legs (windows, linux arm and x86, macos).
+The compiled object will be the sqlite cli. We'll use D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX
+anchor but the goal here is to make a first class compiling time (and, of course, the code must be
+correct!)"*. Later, verbatim: *"even 2 minutes is bad... gcc and msvc timing on sqlite cli would be
+less then a minute... and if rederiveStructCfMarkers is slow, lets fix it"*.
+
+### ✅ WHAT LANDED — every cause below was measured first, then fixed, then pinned
+
+1. **`rederiveStructCfMarkers` was O(functions × module blocks).** Fixed three ways, one per row:
+   the module self-loop index is computed ONCE per module; the back-edge sweep is scoped to the
+   function's own candidate range (`mirNaturalLoops(…, candidateSources)`, fail-loud ascending
+   contract, completeness = order ∪ {module self-loops}); and the post-dominator scratch
+   (`MirPostDomScratch`) reuses the eight whole-module buffers via two self-recorded touched lists,
+   one `computePostDomInto` core keeping fresh and scratch byte-identical BY CONSTRUCTION.
+   ✔29.0 s → **1.2 s** across the 320 whole-module calls of one sqlite release compile
+   (5.3–6.6 s → 0.19–0.22 s per call). Rows: [[D-OPT-POSTDOM-SCRATCH-REUSE]] ✅ (the gated trigger
+   FIRED at 28.3 s vs its ~10 s bar), [[D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN]] ✅ born-closed,
+   [[D-MIR-STRUCTCF-UNREACHABLE-BLOCK-CLAIMED]] ✅ born-closed (spec text reconciled to pinned
+   behaviour), and [[D-MIR-STRUCTCF-DERIVATION-REACHES-PAST-THE-FUNCTION]] 🟠 OPEN — the derivation's
+   cross-function reach is CANON, pinned, and narrowing it is a deliberate future decision, not a
+   tidy-up.
+2. **Every pass reserved a module-sized rewrite map per function.** Per-function `reserveHint`;
+   the natural experiment that sized it: ConstFold ~500 ms vs 3,100–3,900 ms for the
+   per-function-rebuilding passes. [[D-OPT-REBUILD-REWRITE-MAP-RESERVES-THE-WHOLE-MODULE]] ✅.
+3. **The front half was strictly serial and the `--time` report lied about it.** `buildCus` now
+   runs the pool with index-order slot collection (determinism from CU index, never completion
+   order), a `std::latch` join, fail-loud on a disengaged slot, n≤1 inline; `kMaxAutoWorkers`
+   16→32 with RSS measured at both (5.0 GB @16, 8.6 GB @32 — the raise is a memory decision, on
+   the record). Phase timing is TWO-CLOCK (`cpuNanoseconds` Σ-thread vs `wallNanoseconds` interval
+   union, `peakConcurrency`, `liveScopeCount`) and an invariant violation FAILS the run — the old
+   `[other] 0ms` row was a negative remainder clamped to zero. `std::localtime` →
+   `localtime_s`/`localtime_r` (thread safety under the now-parallel front half).
+   [[D-PERF-4-CU-PARALLELISM]] carries the addendum.
+4. **The harness timed a Debug compiler against Release twins.** `build-and-test.ps1` now READS
+   the compiler's build type from its tree's `CMakeCache.txt`, refuses non-Release under
+   `SKIP_DSS_BUILD=1`, offers a three-state `DSS_ALLOW_NONRELEASE_COMPILER` (typos refused) that
+   opts out of the refusal, never the statement. [[D-HARNESS-PS1-TIMES-A-DEBUG-COMPILER-WHILE-THE-SH-TWIN-TIMES-A-RELEASE-ONE]]
+   ✅ born-closed, its selector probed by AST-extracting the real function text.
+   `tools/profile-compile*.sh` + `-support.py` ship as the cross-leg profiling kit — ONE script,
+   no `.ps1` twin, BY DECISION (a profiler whose value is "the host is the only variable" must
+   not have a per-host implementation). ⚠ Two Windows-leg defects in the kit were found and fixed
+   by RUNNING it: `os.path.join` backslashes eaten by bash, and bare-name `bash` resolved by
+   CreateProcess to an extensionless PATH shadow that `shutil.which` never saw — the gate now
+   passes the absolute shell and forward-slash paths.
+
+### ✅ ACCEPTANCE — "the code must be correct!" ✔ALL GREEN, witness on disk
+
+- **Byte-identity vs the PRE-P9 compiler**: pristine `d62405ba` worktree, Release, built this cycle
+  (`C:\Source\DailySoftware\dss-p9-baseline`, deleted after) vs the P9 merged tree — same kit, same
+  target, **image trees both sha256 `1d117b1aafce2e2c1f52b789fdf49f71bb3fe97cab3f4a39a1d2f46bb4f3a813`**
+  (path-keyed hash over every emitted file; the sqlite3 binary itself `932cbdaf…` on both).
+- **≥20× repeat determinism**: **20/20** parallel repeats of the P9 compiler, every image tree
+  byte-identical (`ACCEPT-OK … repeats=20`, captured at `build/perf/accept-p9-result.log`).
+- **Cross-host byte-identity**: the WSL-built P9 compiler emits the SAME `932cbdaf…` sqlite3 binary
+  for the same kit+target — the determinism property holds across hosts, not just runs.
+- **Post-fix timing (the point of the cycle)**, 103-TU sqlite CLI kit, `--config=release`:
+  **Windows median 40.7 s** (20 repeats, 38.6–45.4 s) vs pre-fix 3m32.1 s; **WSL 33.6 s** vs
+  pre-fix 1m40.8 s. The Windows-vs-WSL residual collapsed **2.1× → 1.2×** — the quadratic and
+  allocation-churn work was exactly what Windows' allocator amplified. gcc yardstick stays
+  21.5 s `-j1` / 4.8 s `-j32` on WSL.
+- **sqlite re-probe**: the emitted CLI, FILE db, release config — CRUD `sum(x)=42` ✔.
+- **3-leg gate**: Windows **898/898** · WSL **898/898** · arm64 VPS **898/898** — all three
+  through the run-gate witness (`'100% tests passed'`).
+
+### ✅ THE PRE-FIX PROFILE — settled measurements, re-quotable as the BEFORE record
+
+**★★★ THE ANCHOR'S HEADLINE FIGURE WAS AN ARTEFACT OF THE HARNESS, NOT A PROPERTY OF WINDOWS.**
+`D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX` compared a **Debug** compiler against a
+**Release** one. ✔MEASURED: `build/real-examples/win-probe.log:64` shows the Windows run used
+`build\dbg\bin\dss\dss-code-prime.exe`; that tree is `CMAKE_BUILD_TYPE=Debug` with `-g`, and its
+`build.ninja` contains **zero** `-O` flags and **zero** `NDEBUG`. Meanwhile `build-and-test.sh:2767`
+*unconditionally* builds `build/rel` with `-DCMAKE_BUILD_TYPE=Release`, while `build-and-test.ps1:2721`
+takes the **newest existing** binary from five roots regardless of build type — and on a developer box
+`build/dbg` is always newest. ⇒ anchored + fixed as
+[[D-HARNESS-PS1-TIMES-A-DEBUG-COMPILER-WHILE-THE-SH-TWIN-TIMES-A-RELEASE-ONE]].
+⚠ The trap that hid it: the harness's `Config` parameter says `release` and means **the artifact's
+optimizer pipeline**; the **compiler binary's own build type** was never stated anywhere. Both read as
+"release" in the log and only one was ever controlled.
+
+**✅ THE FOUR-LEG PROFILE.** Identical sources (SQLite CLI, 103 TUs, copied — NOT re-staged, because
+the harness pulls upstream every run and a re-staged subject is a different subject), identical target
+`x86_64:elf64-x86_64-linux-exec`, Release compiler built on each host, each host reading **its own**
+config tree:
+
+| host | cores | wall | optimize | front half | semantic | everything else |
+|---|---|---|---|---|---|---|
+| WSL x86_64 | 32 | **1m40.8s** | 1m03.6s | 29.6s | 16.7s | 37s |
+| arm64 VPS | 4 | **3m18.1s** | 1m50.7s | 66.8s | 12.2s | 87s |
+| Windows x86_64 | 32 | **3m32.1s** | 2m24.2s | 41.3s | 21.6s | 68s |
+| macOS arm64 | 10 | **5m10.0s** | 4m42.9s | 27.4s | 5.2s | **27s** |
+
+★★ **READ THE macOS ROW BEFORE CONCLUDING ANYTHING ABOUT HOSTS.** It is the SLOWEST overall and has
+the FASTEST front end of the four — its semantic phase is **5.2 s against Windows' 21.6 s**. The whole
+of its deficit is `optimize`. Across the four hosts `optimize` varies **4.4×** while every other phase
+varies under 3×. That is the signature of allocator behaviour under high churn, not of computation —
+and the churn has a named source (below).
+⚠ Windows-vs-WSL on the SAME hardware is **2.1×**, real but a fraction of the anchor's 8×.
+
+**✅ THE YARDSTICK.** ✔MEASURED on WSL, the SAME 103 TUs, gcc 13 `-O2`, on a **monotonic** clock:
+**`-j1` 21.5 s · `-j32` 4.8 s** — against DSS's 1m40.8 s on that host. So DSS is **4.7× serial gcc**
+and **21× parallel gcc**. ⚠ The first attempt at this number used `date +%s%N` (CLOCK_REALTIME) and
+reported a compile that took **minus 11.7 seconds** — see [[project_wsl2_clock_realtime_broken_2026_08_01]].
+The compiler's own `--time` uses `steady_clock` and was never affected.
+
+**✅ WHERE THE TIME GOES — four independent causes, each measured, none of them host-specific:**
+1. **The merged whole-program optimize is 107.7 s of passes + 6.3 s of marker rederivation, on ONE
+   thread, while 31 cores idle.** ✔Process sampling showed a ~2-minute stretch at exactly 1.0
+   CPU-second per wall-second with `threads=1`. Four iterations, **never converged**, and the cost per
+   iteration is FLAT — 25.6 / 26.3 / 27.6 / 28.2 s. It gets *slower*, not cheaper.
+2. **Every pass clones the whole module whether or not it changes anything.** Every one of the nine
+   passes is `for (i<nf) { policy.analyze(f); MirFunctionRebuilder rb{mir,builder,policy};
+   rb.rebuildFunction(f); }` — ~3,900 functions rebuilt per pass per iteration. `Cse rebuild=9.94s vs
+   analyze=0.73s`; `Licm rebuild=9.68s`. ★ Trace lines include `pass=Mem2Reg done 3454ms mutated=0` and
+   `pass=Licm done 6129ms mutated=0` — **19.0 s of the 107.7 s is spent by passes that provably changed
+   nothing.** This is the allocation churn that explains the 4.4× host spread.
+3. **`rederiveStructCfMarkers` cost 28.3 s over 319 calls** — more than every per-CU pass combined.
+   ✔MECHANISM FOUND BY READING: `deriveStructCfMarkers` (`mir_struct_markers.cpp:44`) opens with
+   `std::vector<StructCfMarker> out(mir.blockCount(), ...)` — `Mir::blockCount()` is the **WHOLE
+   MODULE's** block count — and the whole-module driver calls it **once per function**, while
+   `applyDerived` reads back only that function's slots. O(functions × module blocks): quadratic.
+4. **The front half is strictly serial.** preprocess → splice → tokenize → expand → parse →
+   resolve-imports runs one TU at a time at `program.cpp:3206`; sampling showed 1.0× throughout. And
+   `resolveCuPoolWidth` (`program.cpp:358-371`) caps the back half at `kMaxAutoWorkers = 16`, so a
+   32-core host uses half the machine — though observed back-half concurrency was only ~3.7×, well
+   under even that cap, so worker count is **not** the whole story there and the bump must not be
+   claimed as its fix.
+
+**✅ THE `--time` REPORT WAS LYING, AND IT HID EXACTLY THIS WORK.** Its `[other]` row printed **`0ms`
+on all four legs** — not "nothing unaccounted" but `program.cpp:2374-2376` **clamping a negative
+remainder to zero**. `PhaseTimers` sums self-time across every thread with relaxed atomics while the
+back half runs 16 workers, so attributed time routinely exceeds process wall time. The header still
+asserted the opposite (`phase_timers.hpp:29-31`: *"The pipeline itself is synchronous"*), stale since
+`D-PERF-4`. ★ The per-pass numbers above had to be reconstructed from an env-gated `fprintf` that
+prints and discards — duplicated in **five** files.
+
+### ⚙️ THE LANES' FOLD — where the four lanes' work lives now
+
+All four lanes merged into the working tree and were reviewed; their build trees
+(`build/lane-{markers,opt,driver,harness}{,-rel}`) are CLEARED once the gate is green. The
+merged tree was accepted as ONE subject: the byte-identity + repeat acceptance below was run
+against the merged compiler, not per-lane binaries. ⚠ Two unattributable byte-identical sqlite
+binaries found in `build/perf/{lane-before,scratch}` during fold review were NOT used as
+acceptance evidence — the baseline below is a pristine `d62405ba` worktree built this cycle.
+
+### ⚖️ NEXT CYCLE'S MANDATE — `D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE` (operator-promoted)
+
+I recommended leaving it (deleting the redundant per-CU optimize buys ~5-10 s of a 213 s build and can
+move codegen). **The operator overrode that**, verbatim: *"address it properly, long term solution, no
+workarounds, 100% config driven. first class LTO implementation"*.
+★★★ **MY SIZING MEASURED THE WRONG THING** — it priced *deleting the second call*, when the
+deliverable is *the topology*. Today both call sites resolve **the same pipeline document**, so
+`release.pipeline.json`'s 9 passes × 4 iterations run over every CU and then again over the merged
+program; real toolchains run a per-TU pipeline and a link-time pipeline that are DIFFERENT. The
+topology is hardcoded in the driver, and that — not the duplicated work — is the defect.
+⚠ **THAT ROW'S OWN PREMISE IS UNDER CHALLENGE**: it says the per-CU pass *"changes no output"*, but
+`Inlining`'s legality gate is a hard size cutoff (`inlineThreshold`, 50 MIR instructions), so per-CU
+`ConstFold`/`Dce`/`Mem2Reg` can shrink a callee **under** that threshold before the merged pass sees
+it. Default stage contents are therefore a MEASUREMENT, not an analogy. Full detail is in the row.
 
 ---
 
@@ -1521,28 +1685,29 @@ clobbers. It is an `if`, **not** a `switch` — the compiler forces nothing. Shi
 
 ## 5. PRIORITIES
 
-0. **`NEXT` — MAKE THE WINDOWS COMPILE FAST, *THEN* RE-RUN THE FULL MATRIX.**
-   [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]]. Operator instruction 2026-08-18,
-   verbatim: *"we'll re run everything once our compile is fast enough"* — so the matrix re-run is
-   BLOCKED ON THIS, deliberately, and is not a separate item anyone should pick up first.
-   ✔THE NUMBERS THAT DECIDED IT, same source set, same release pipeline, same day: Windows host
-   **18m59s / 18m26s / 18m09s / 16m25s / 17m04s** per leg for the testfixture and a further
-   **~11 min per leg** for the CLI — against WSL's **~2m20s** on the SAME machine and a small
-   arm64 VPS's **~5 min**. ⚠ **The 3.6× loss to the VPS is the damning one**, because WSL shares
-   this hardware and the VPS does not.
-   ★ **STEP ONE IS AN EXPERIMENT, NOT AN EDIT** — the row lists four unseparated candidates
-   (Defender over a 9 GB working set · Windows heap/page-fault behaviour under one huge arena ·
-   NTFS vs ext4 on many small reads · a real codegen/IO cost in the MinGW build). Naming one
-   without measuring is the guess the registry exists to prevent.
-   ⚠ **DO NOT MEASURE A SYNTHETIC BENCHMARK.** The number that matters is the one the operator
-   waits for: a full-source `--project` build.
+0. **`NEXT` — FIRST-CLASS, CONFIG-DRIVEN LTO.** [[D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE]], promoted
+   by operator ruling during P9 (verbatim: *"address it properly, long term solution, no
+   workarounds, 100% config driven. first class LTO implementation"*). The deliverable is the
+   TOPOLOGY — a per-TU pipeline and a link-time pipeline that are DIFFERENT documents — not
+   deleting the second call. The row carries the full closing work, including the measurement
+   obligation the old premise hid (per-CU passes can shrink a callee under `Inlining`'s size
+   cutoff, so default stage contents are a MEASUREMENT, not an analogy).
+   ⚠ P9's compile-time work made the merged optimize CHEAPER per call but did NOT touch the
+   duplicated topology — the residual optimize cost is now dominated by running the same pipeline
+   twice, which is exactly this row.
+   ✅ **DONE 2026-08-18 (Cycle P9): MAKE THE COMPILE FAST.** The four measured causes are fixed
+   with byte-identical output (see §0.0000000); [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]]
+   stays 🟠 OPEN against a re-measured **~2.1×** Windows-vs-WSL residual (the 8× was a Debug-vs-Release
+   harness artefact, closed as [[D-HARNESS-PS1-TIMES-A-DEBUG-COMPILER-WHILE-THE-SH-TWIN-TIMES-A-RELEASE-ONE]]),
+   candidates still unseparated — the row says step one is an experiment, not an edit.
+   The full-matrix re-run stays BLOCKED on the operator's *"we'll re run everything once our
+   compile is fast enough"* — the LTO cycle changes codegen, so the matrix belongs after it, not
+   before.
    Then land the prioritized backlog in **plan-00 §0.1** (asm → ap → production errors → the rest)
    so the stepper and the operator read one list rather than two that drift.
    ⚠ **RE-DERIVE IT FROM THE REGISTRY, NEVER FROM THE PREVIOUS LIST.** ✔The list handed to the
    operator in an earlier cycle named `D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED` as the top asm
    priority; it had been **CLOSED earlier in that same cycle**. Recalling a row is not measuring it.
-   ✅ **THE REBASE THIS ITEM USED TO ORDER IS DONE** — HEAD `41a320ad` sits on `origin/main`'s
-   `fe031376`; see §0.000000.
 
 1. **FINISH THE P5 CYCLE.** Wave 2 is unstarted: the typed inline-asm view, the four
    semantic gates re-expressed, HIR/MIR carriage, the MIR→LIR expansion, `asm goto`'s CFG, the

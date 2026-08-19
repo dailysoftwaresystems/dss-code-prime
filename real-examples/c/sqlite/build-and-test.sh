@@ -110,6 +110,7 @@
 #                      DSS_MAX_RESUMES  DSS_SEGMENT_STALL  DSS_SEGMENT_TIMEOUT
 #                      ARM64_LIBDIR  DSS_TCL_VERSION  DSS_STRICT_ARM_VERDICTS
 #                      DSS_BRANCH  DSS_COMMIT  DSS_ALLOW_FRESH_CLONE
+#                      DSS_ALLOW_NONRELEASE_COMPILER
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
@@ -333,6 +334,14 @@ DSS_KILL_SETTLE="${DSS_KILL_SETTLE:-20}"
 # Parsed and VALIDATED at Step 1 (cheap) rather than at Step 9 (hours later) —
 # an unreadable gate setting must stop the run before it costs anything.
 DSS_STRICT_ARM_VERDICTS="${DSS_STRICT_ARM_VERDICTS:-}"
+# DSS_ALLOW_NONRELEASE_COMPILER: proceed with a dss-code-prime whose own tree does
+# NOT say Release, instead of refusing at Step 5. It silences nothing — the run
+# then states the actual build type on the Step-5 banner and again in the Step-9
+# verdict, so a log from such a run cannot later be quoted as a controlled
+# measurement. PARITY with build-and-test.ps1, where the same variable governs the
+# same gate; see Step 5 for the defect that put a gate there at all.
+# Same three-state parse and the same Step-1 validation as the variable above.
+DSS_ALLOW_NONRELEASE_COMPILER="${DSS_ALLOW_NONRELEASE_COMPILER:-}"
 
 # ── host identification (OS + arch) ──────────────────────────────────────────
 # ★ IDENTITY ONLY. These two variables answer "what machine am I standing on",
@@ -1443,6 +1452,20 @@ case "${DSS_STRICT_ARM_VERDICTS}" in
 esac
 [[ "$STRICT_VERDICTS" -eq 0 ]] || \
   warn "DSS_STRICT_ARM_VERDICTS=1 — every ENVIRONMENTAL skip (a missing launcher, a missing declared build input) will FAIL this run."
+
+# Same three states, same refusal of a value that is neither, and validated here
+# rather than at Step 5 — Step 5 sits AFTER the sqlite clone + configure + stage,
+# so a typo found there costs the staging run instead of a second.
+ALLOW_NONRELEASE_DSS=0
+case "${DSS_ALLOW_NONRELEASE_COMPILER}" in
+  1|true|TRUE|yes)        ALLOW_NONRELEASE_DSS=1 ;;
+  ''|0|false|FALSE|no)    ALLOW_NONRELEASE_DSS=0 ;;
+  *) die "DSS_ALLOW_NONRELEASE_COMPILER='${DSS_ALLOW_NONRELEASE_COMPILER}' is not a value this harness recognises.
+      Accepted: 1 / true / TRUE / yes  (allow)  ·  0 / false / FALSE / no / empty (default: REFUSE).
+      Refused rather than read as 'off' even though 'off' is the SAFE direction here — a flag
+      whose typo means something is a flag nobody can read back out of a log. Same rule, same
+      spellings, as DSS_STRICT_ARM_VERDICTS directly above." ;;
+esac
 
 # ── WHAT EACH LAUNCHER NEEDS BEYOND ITS OWN argv[0] ─────────────────────────
 # >>> dss:launcher-prereq >>>
@@ -2781,7 +2804,99 @@ if [[ -z "$DSS_BIN" ]]; then
   [[ -n "$DSS_BIN" ]] && warn "no dss-code-prime under $_dss_bdir; widened to a root-wide search and took $DSS_BIN"
 fi
 [[ -n "$DSS_BIN" && -x "$DSS_BIN" ]] || die "dss-code-prime binary not found under $_dss_bdir (nor anywhere under $SRC_DIR/build)."
-pass "dss-code-prime built: $DSS_BIN"
+
+# ★★ THE COMPILER'S OWN BUILD TYPE IS READ FROM THE TREE THAT PRODUCED IT, AND
+# PRINTED NEXT TO ITS PATH — even here, where the two lines above are what set it.
+# PARITY with build-and-test.ps1's Step 5, and the parity is the entire point:
+# that driver used to take the NEWEST binary under any root with no regard for how
+# it was built (on a developer box, always `build/dbg`), while this one builds
+# `-DCMAKE_BUILD_TYPE=Release` unconditionally. TWO DRIVERS, ONE CONTRACT, TWO
+# ANSWERS — and neither log ever named the variable, so the difference was
+# published as a property of the HOST
+# (D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX, ~8x) when it was -O0 against
+# -O3 (~2.1x once controlled). This side was RIGHT and still said nothing, which
+# is exactly what made the other side's silence unnoticeable.
+# ⚠ AND THIS SIDE IS NOT UNCONDITIONALLY RIGHT EITHER: the widened search above
+# reaches the WHOLE of $SRC_DIR/build, which holds other people's trees (build/dbg
+# is one), so what this step ends up holding is not guaranteed to be what the
+# cmake line asked for. The answer is READ, never inferred from the invocation
+# that precedes it and never from the directory's name.
+# Echoes TYPE on line 1 and PROVENANCE on line 2 — two lines rather than a
+# delimiter because both halves are free text that can contain anything.
+dss_build_type() {                      # <binary>
+  local bin="$1" dir="" cache="" btype="" cfgs="" gen="" rel="" part="" c="" hit=""
+  local -a parts=() cfglist=()
+  dir="$(cd "$(dirname "$bin")" 2>/dev/null && pwd)" || dir=""
+  # Walk UP to the build tree: the nearest ancestor holding a CMakeCache.txt.
+  while [[ -n "$dir" ]]; do
+    if [[ -f "$dir/CMakeCache.txt" ]]; then cache="$dir/CMakeCache.txt"; break; fi
+    [[ "$dir" == "/" ]] && break
+    dir="$(dirname "$dir")"
+  done
+  if [[ -z "$cache" ]]; then
+    printf '%s\n' '<unknown>' "NO CMakeCache.txt in any ancestor of $bin — nothing on this machine states how it was built"
+    return 0
+  fi
+  btype="$(sed -n 's/^CMAKE_BUILD_TYPE:[^=]*=//p'          "$cache" | sed -n 1p)"
+  cfgs="$( sed -n 's/^CMAKE_CONFIGURATION_TYPES:[^=]*=//p' "$cache" | sed -n 1p)"
+  gen="$(  sed -n 's/^CMAKE_GENERATOR:[^=]*=//p'           "$cache" | sed -n 1p)"
+  if [[ -n "$cfgs" ]]; then
+    # MULTI-config (Xcode is the one that reaches this on a POSIX host). The cache
+    # CANNOT answer: one tree holds every config and CMAKE_BUILD_TYPE is an entry
+    # the generator IGNORES, so `-DCMAKE_BUILD_TYPE=Release` + `--build --config
+    # Debug` leaves a cache saying Release over a Debug binary. What the generator
+    # DOES state is the config it built, written into the OUTPUT PATH — so the
+    # answer is the path component naming one of the configs the cache DECLARES.
+    # Two facts the tree states about itself, cross-checked; a component matching
+    # nothing declared is not an answer.
+    rel="${bin#"$dir"/}"
+    IFS='/' read -r -a parts   <<< "$rel"
+    IFS=';' read -r -a cfglist <<< "$cfgs"
+    for part in "${parts[@]}"; do
+      for c in "${cfglist[@]}"; do
+        if [[ -n "$c" && "$part" == "$c" ]]; then hit="$part"; fi   # DEEPEST wins
+      done
+    done
+    if [[ -n "$hit" ]]; then
+      printf '%s\n' "$hit" "the multi-config generator's own output subdirectory '$hit', cross-checked against CMAKE_CONFIGURATION_TYPES=$cfgs in $cache (generator '$gen')"
+    else
+      printf '%s\n' '<unknown>' "$cache is a MULTI-CONFIG tree (generator '$gen' declares CMAKE_CONFIGURATION_TYPES=$cfgs) and no component of '$rel' names one of them"
+    fi
+  elif [[ -n "$btype" ]]; then
+    printf '%s\n' "$btype" "CMAKE_BUILD_TYPE in $cache (single-config generator '$gen')"
+  else
+    # EMPTY is an answer, not a gap: it is CMake's default of no optimisation
+    # flags at all. Rounding it up to Release is the whole class of defect here.
+    printf '%s\n' '<none>' "$cache declares NO CMAKE_BUILD_TYPE (single-config generator '$gen') — CMake's default of no optimisation flags"
+  fi
+}
+_dss_bt="$(dss_build_type "$DSS_BIN")"
+DSS_BUILD_TYPE="$(printf '%s\n' "$_dss_bt"    | sed -n 1p)"
+DSS_BUILD_TYPE_SRC="$(printf '%s\n' "$_dss_bt" | sed -n 2p)"
+DSS_BUILD_TYPE_NOTE="  (compiler build type: $DSS_BUILD_TYPE)"
+info "compiler  : $DSS_BIN"
+info "build type: $DSS_BUILD_TYPE"
+info "  read from: $DSS_BUILD_TYPE_SRC"
+# Case-insensitive on purpose: CMake uppercases the build type to look up
+# CMAKE_<LANG>_FLAGS_<CFG>, so `-DCMAKE_BUILD_TYPE=release` selects the identical
+# flags as `Release` and refusing it would be this check failing on a spelling.
+if [[ "${DSS_BUILD_TYPE,,}" != "release" ]]; then
+  if [[ "$ALLOW_NONRELEASE_DSS" -eq 0 ]]; then
+    die "this run would be timed against a NON-RELEASE compiler, and it REFUSES rather than proceed quietly.
+      compiler   : $DSS_BIN
+      build type : $DSS_BUILD_TYPE
+      read from  : $DSS_BUILD_TYPE_SRC
+      A Debug dss-code-prime is -g, no -O and no NDEBUG: it compiles the same program correctly
+      and takes several times as long, and that difference lands in whatever this run is read for.
+      The .ps1 twin holds the identical gate, so a number from either driver is comparable only
+      because both of them state this.
+      Fix the tree ($_dss_bdir) — cmake -B '$_dss_bdir' -DCMAKE_BUILD_TYPE=Release — or set
+      DSS_ALLOW_NONRELEASE_COMPILER=1 to proceed with THIS binary, with every report line saying so."
+  fi
+  DSS_BUILD_TYPE_NOTE="  (compiler build type: $DSS_BUILD_TYPE — NOT Release, DSS_ALLOW_NONRELEASE_COMPILER=1)"
+  warn "DSS_ALLOW_NONRELEASE_COMPILER=1 — proceeding with a $DSS_BUILD_TYPE compiler. TIMINGS FROM THIS RUN ARE NOT COMPARABLE with build-and-test.ps1 or with any other run of this driver, which always times a Release compiler."
+fi
+pass "dss-code-prime built: $DSS_BIN  ($DSS_BUILD_TYPE)"
 
 # ── Step 6 — stage third-party headers + obtain per-leg libs ─────────────────
 step "6/9  Third-party headers (parsed agnostically) + per-leg tcl/zlib libraries"
@@ -6830,7 +6945,7 @@ step "9/9  Results"
 # sqlite gets no divergence count on purpose: Steps 3-6 run configure/make INSIDE
 # that clone and generate sources there, so its working tree always differs from
 # HEAD by construction and a number would carry no information.
-printf '   compiler : %s @ %s%s\n' "$DSS_BIN" "$SRC_HEAD" "$SRC_DIVERGE_NOTE"
+printf '   compiler : %s @ %s%s%s\n' "$DSS_BIN" "$SRC_HEAD" "$SRC_DIVERGE_NOTE" "$DSS_BUILD_TYPE_NOTE"
 printf '   sqlite   : %s @ %s\n' "$SQLITE_DIR" "$(git_head_short "$SQLITE_DIR")"
 printf '   recipe   : %s TUs, %s defines (%s)\n' "${#TUS[@]}" "${#RECIPE_DEFS[@]}" "$RECIPE"
 printf '   cli recipe: %s TUs, %s defines (%s)\n' "${#CLI_TUS[@]}" "${#CLI_DEFS[@]}" "$CLI_RECIPE"

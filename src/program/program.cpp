@@ -40,14 +40,18 @@
 #include <cctype>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <format>
 #include <functional>
 #include <iostream>
 #include <latch>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <ostream>
 #include <set>
 #include <span>
 #include <string>
@@ -68,6 +72,9 @@ namespace dss {
 // anonymous namespace instead would MINT a second overload and make every later
 // call ambiguous.
 void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar);
+// Same seam, resolution only — see the definition for why the multi-TU CU
+// build resolves once instead of per file.
+[[nodiscard]] std::vector<fs::path> resolveSystemDirs(GrammarSchema const& grammar);
 
 namespace {
 
@@ -349,15 +356,36 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
                + ".format.json).");
 }
 
-// D-PERF-4-CU-PARALLELISM: worker count for the INTERNAL per-CU build pool
+// D-PERF-4-CU-PARALLELISM: worker count for the INTERNAL per-CU build pools
 // (only consulted when NO executor is injected). Never more workers than there
-// are CUs — extra workers would just block on the empty job queue. An explicit
+// are jobs — extra workers would just block on the empty job queue. An explicit
 // `--jobs` (jobsOverride > 0) pins the count within that ceiling; auto (0) uses
-// min(hardware_concurrency, kMaxAutoWorkers) so a 64-core host doesn't spawn 64
-// threads for a handful of TUs. Only ever called on the N>1 path (cuCount >= 2).
+// min(hardware_concurrency, kMaxAutoWorkers). Called on both N>1 batch paths
+// (the front-half CU build and the back-half per-CU MIR build).
+//
+// ★ WHY THE AUTO CEILING IS 32 AND NOT `hardware_concurrency()` ITSELF.
+// The bound here is a MEMORY bound, not a CPU one: each in-flight CU owns its
+// own interner, symbol table and arenas, so peak RSS scales with the number of
+// CONCURRENT units, not with the core count. ✔MEASURED on the SQLite corpus
+// (103 CUs, release config, this host): peak working set 5.0 GB at width 16 and
+// 8.6 GB at width 32 — sublinear, because the pool's steady state is bounded by
+// how many units are simultaneously at their peak rather than by the width. 32
+// is chosen as the largest width whose measured peak still fits the 16 GB
+// machine class this compiler ships to with room for the OS and a linker; the
+// old value of 16 left half of a 32-core host idle for no memory benefit it
+// could point at. `--jobs N` remains the operator's override in BOTH directions
+// — `--jobs 64` opts a big-memory host in, `--jobs 8` opts a small one out —
+// and it is deliberately NOT clamped to this ceiling, because an operator who
+// names a width has measured their own machine and this constant has not.
+//
+// ⚠ NOT A WORKER-COUNT FIX FOR THE BACK HALF. The back half's achieved
+// concurrency was ~3.7x while the cap already allowed 16, so its width was
+// never the binding constraint; raising the cap does not address that, and the
+// `--time` job-batch rows exist to give the next tuning pass the per-job wall
+// distribution instead of another guess.
 [[nodiscard]] std::size_t resolveCuPoolWidth(std::size_t cuCount,
                                              unsigned    jobsOverride) noexcept {
-    constexpr std::size_t kMaxAutoWorkers = 16;
+    constexpr std::size_t kMaxAutoWorkers = 32;
     std::size_t const ceiling = std::max<std::size_t>(std::size_t{1}, cuCount);
     if (jobsOverride > 0) {
         return std::min<std::size_t>(jobsOverride, ceiling);
@@ -366,6 +394,51 @@ void emitObjectFormatSchemaLoadFailed(DiagnosticReporter&               rep,
     std::size_t const autoWidth =
         std::min<std::size_t>(hw == 0 ? std::size_t{1} : hw, kMaxAutoWorkers);
     return std::min<std::size_t>(autoWidth, ceiling);
+}
+
+// ══ PER-JOB WALL TIMING FOR THE CU BATCHES ═══════════════════════════════════
+//
+// The `--time` phase table says how long each pipeline VERB took; it cannot say
+// whether a batch's workers were busy or blocked, because a phase's numbers are
+// summed over whichever threads happened to run it. These records close that
+// gap: one row per BATCH of per-CU jobs, carrying the width the batch actually
+// ran with, the batch's own wall time, and EVERY job's individual wall time.
+//
+// ★ WHY PER-JOB AND NOT JUST AN AGGREGATE. The back half's measured concurrency
+// was ~3.7x against a cap of 16 — so the interesting question is the SHAPE of
+// the job-duration distribution (a long tail of one huge translation unit
+// serializes the batch's ending no matter how many workers exist), and an
+// average cannot show a tail. The report prints the batch wall, the sum of job
+// walls, their ratio (achieved concurrency) and the slowest job, which is the
+// minimum needed to tell "not enough workers" from "one job is the critical
+// path".
+//
+// AGNOSTIC: `stage` is a PIPELINE-STAGE label — the same vocabulary class as a
+// CompilePhase verb — never a language, CPU or object-format identity.
+struct JobBatchRecord {
+    std::string_view           stage;
+    std::size_t                width       = 0;
+    std::uint64_t              batchWallNs = 0;
+    std::vector<std::uint64_t> jobWallNs;   // index-parallel to the batch's jobs
+};
+
+// Appended once per batch, by the thread that joined it. The driver's batch
+// sites are serial with respect to one another (the per-key CU build loop and
+// the per-target compile loop both run on one thread), so contention is nil —
+// the mutex is here because `Program` is a library type an embedder may drive
+// from several threads, and an unguarded `push_back` would then be a race in
+// somebody else's process rather than a visible one in ours.
+std::mutex                  gJobBatchMutex;
+std::vector<JobBatchRecord> gJobBatches;
+
+void recordJobBatch(JobBatchRecord rec) {
+    std::lock_guard const lk{gJobBatchMutex};
+    gJobBatches.push_back(std::move(rec));
+}
+
+[[nodiscard]] std::vector<JobBatchRecord> readJobBatches() {
+    std::lock_guard const lk{gJobBatchMutex};
+    return gJobBatches;
 }
 
 // The DIRECTORY one target's artifact is written into — BOTH arms stated in one
@@ -814,8 +887,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // in place (ThreadPool is not movable); it joins its workers at end-of-scope.
         std::optional<substrate::ThreadPool> localPool;
         substrate::IExecutor* executor = injectedExecutor;
+        std::size_t const     poolWidth = resolveCuPoolWidth(cus.size(), jobsOverride);
         if (executor == nullptr) {
-            localPool.emplace(resolveCuPoolWidth(cus.size(), jobsOverride));
+            localPool.emplace(poolWidth);
             executor = &*localPool;
         }
 
@@ -825,6 +899,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // then logs the throw), so a throwing job can never DEADLOCK `done.wait()` — the slot
         // just stays nullopt and fails the compile below. `i` is captured BY VALUE so each job
         // owns its index; everything else is captured by reference and outlives `done.wait()`.
+        // `jobWallNs[i]` is written by index for the same reason every other per-CU datum is
+        // (see `JobBatchRecord`): it is per-job instrumentation, so it must not be able to
+        // perturb the ORDER of anything the compile observes.
+        std::vector<std::uint64_t> jobWallNs(cus.size(), 0);
+        auto const                 batchStart = std::chrono::steady_clock::now();
         std::latch done{static_cast<std::ptrdiff_t>(cus.size())};
         for (std::size_t i = 0; i < cus.size(); ++i) {
             executor->submit([&, i] {
@@ -832,11 +911,26 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                     std::latch& latch;
                     ~CountDownGuard() { latch.count_down(); }
                 } const guard{done};
+                auto const jobStart = std::chrono::steady_clock::now();
                 cuMirSlots[i] = buildCuMir(cus[i], grammar, **targetR, **formatR,
                                            ccIndex, cuScratch[i], perCuOpts);
+                jobWallNs[i] = static_cast<std::uint64_t>(
+                    std::max<long long>(0, std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - jobStart).count()));
             });
         }
         done.wait();
+        recordJobBatch(JobBatchRecord{
+            "back-half cu mir",
+            // An INJECTED executor's width is the injector's business and is
+            // not knowable from here; report 0 rather than the width this
+            // driver would have chosen, which it did not use.
+            injectedExecutor != nullptr ? std::size_t{0} : poolWidth,
+            static_cast<std::uint64_t>(std::max<long long>(
+                0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - batchStart).count())),
+            std::move(jobWallNs)});
 
         // Merge each CU's diagnostics into `reporter` in CU (index) ORDER — deterministic,
         // independent of which CU finished first. Merge EVERY CU BEFORE the failure check so a
@@ -2279,6 +2373,172 @@ int runCusToTargets(
     return exitCode;
 }
 
+// ══ THE `--time` REPORT ══════════════════════════════════════════════════════
+//
+// ★★★ TWO CLOCKS, TWO COLUMNS, AND A REMAINDER THAT CANNOT LIE.
+//
+// The old report printed ONE time column per phase and defined its trailing
+// `[other]` row as `processWall - Σ(phase times)`. Both halves of that were
+// wrong the moment the driver grew a thread pool. The per-phase number is
+// THREAD-time summed over every worker, so on the SQLite corpus the attributed
+// sum came to 226.7 s against a 212.2 s wall — the subtraction went 14.5 s
+// NEGATIVE and a `std::max`-style clamp printed `[other] 0ms`. A row that reads
+// "nothing is unaccounted for" while the accounting is 14.5 s inconsistent is
+// not a rounding artifact; it is the report telling the operator a fact that is
+// false, and it is why nobody noticed the front half was still serial.
+//
+// So the table now prints, per phase:
+//   cpu   — Σ self-time over every thread. Answers "what did this cost".
+//   wall  — the UNION of that phase's self-intervals on the timeline. Answers
+//           "how much of the build's duration did this occupy". <= cpu ALWAYS.
+//   peak  — high-water mark of simultaneously-active scopes. 1 ⇒ the phase
+//           never overlapped itself, so cpu and wall are the same number and
+//           the reader can compare them directly.
+//   runs  — unchanged; disambiguates multi-CU / multi-target accumulation.
+//
+// and, below it, `[other] = processWall - pipelineBusyWall`, where the
+// subtrahend is the union over ALL phases — a set of intervals measured on the
+// process's own steady clock, hence a subset of the process's lifetime. That
+// subtraction cannot underflow. If it ever does, the substrate is broken, and
+// this function says so LOUDLY and FAILS THE RUN rather than clamping.
+//
+// ★ WHY AN INVARIANT VIOLATION FAILS THE RUN. `--time` is an explicit request
+// for a MEASUREMENT. Printing a violation banner and still exiting 0 would let
+// a CI job scroll past it exactly the way the clamped `0ms` was scrolled past
+// for the whole life of this flag. The compiled OUTPUT is unaffected — the
+// violation says the instrumentation disagrees with itself, never that the
+// artifact is wrong — but a run whose requested measurement is self-
+// contradictory has not delivered what was asked for. Runs WITHOUT `--time`
+// cannot be affected: this function is not called.
+//
+// EVERY phase prints (zero-run phases included) so the report's shape stays
+// deterministic and pin-able. Phase names are pipeline verbs (see
+// `compilePhaseName`) — lang/target/format-neutral, like everything here.
+[[nodiscard]] int emitPhaseTimeReport(
+    std::chrono::steady_clock::time_point start, int dispatchRc,
+    std::ostream& os) {
+    auto const totalNs = static_cast<std::uint64_t>(
+        std::max<long long>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - start).count()));
+    auto const ms = [](std::uint64_t ns) {
+        return formatWallTime(static_cast<long long>(ns / 1'000'000u));
+    };
+    constexpr char const* kPfx = "dss-code-prime:   ";
+
+    os << "dss-code-prime: compile time " << ms(totalNs) << "  (process wall)\n";
+    os << kPfx << std::format("{:<21}{:>12}{:>12}{:>7}{:>8}", "phase", "cpu",
+                              "wall", "peak", "runs")
+       << "\n";
+
+    // Collected first, printed second: the violation check below needs every
+    // row, and a report that printed half a table and then announced the table
+    // was invalid would be worse than either.
+    std::vector<substrate::PhaseTimers::Row> rows(substrate::kCompilePhaseCount);
+    std::uint64_t attributedCpuNs = 0;
+    std::uint64_t sumPhaseWallNs  = 0;
+    for (std::size_t i = 0; i < substrate::kCompilePhaseCount; ++i) {
+        auto const p = static_cast<substrate::CompilePhase>(i);
+        rows[i] = substrate::PhaseTimers::read(p);
+        attributedCpuNs += rows[i].cpuNanoseconds;
+        sumPhaseWallNs  += rows[i].wallNanoseconds;
+        os << kPfx
+           << std::format("{:<21}{:>12}{:>12}{:>7}{:>8}",
+                          substrate::compilePhaseName(p),
+                          ms(rows[i].cpuNanoseconds), ms(rows[i].wallNanoseconds),
+                          rows[i].peakConcurrency, rows[i].runs)
+           << "\n";
+    }
+
+    auto const busyNs = substrate::PhaseTimers::busyWallNanoseconds();
+    auto const live   = substrate::PhaseTimers::liveScopeCount();
+
+    // ── The invariants. Each is impossible under correct accounting. ──────────
+    std::vector<std::string> violations;
+    if (live != 0) {
+        violations.push_back(std::format(
+            "{} phase scope(s) are still LIVE at report time — a worker "
+            "outlived the measurement window, so the wall-clock union below is "
+            "missing an interval that is still open",
+            live));
+    }
+    if (busyNs > totalNs) {
+        violations.push_back(std::format(
+            "pipeline busy wall ({}) EXCEEDS process wall ({}) by {} — a union "
+            "of intervals measured on this process's own steady clock cannot "
+            "outlast the process",
+            ms(busyNs), ms(totalNs), ms(busyNs - totalNs)));
+    }
+    if (sumPhaseWallNs < busyNs) {
+        violations.push_back(std::format(
+            "the sum of the per-phase wall columns ({}) is LESS than the "
+            "all-phase union ({}) — a union over the whole set cannot exceed "
+            "the sum of its parts",
+            ms(sumPhaseWallNs), ms(busyNs)));
+    }
+    for (std::size_t i = 0; i < substrate::kCompilePhaseCount; ++i) {
+        if (rows[i].wallNanoseconds > rows[i].cpuNanoseconds) {
+            violations.push_back(std::format(
+                "phase '{}': wall ({}) exceeds cpu ({}) — a phase's occupancy "
+                "of the timeline cannot exceed the thread-time spent in it",
+                substrate::compilePhaseName(static_cast<substrate::CompilePhase>(i)),
+                ms(rows[i].wallNanoseconds), ms(rows[i].cpuNanoseconds)));
+        }
+    }
+
+    os << kPfx << std::format("{:<21}{:>12}{:>12}", "attributed", ms(attributedCpuNs),
+                              ms(busyNs))
+       << "   (cpu = Σ threads; wall = all-phase union)\n";
+    if (violations.empty()) {
+        os << kPfx
+           << std::format("{:<21}{:>24}", "[other]", ms(totalNs - busyNs))
+           << "   (process wall not inside any phase)\n";
+        // Achieved parallelism, printed only when it is meaningful. `busy` is
+        // the wall time the pipeline was doing instrumented work, so cpu/busy
+        // is the average number of threads that work occupied.
+        if (busyNs > 0) {
+            os << kPfx
+               << std::format("{:<21}{:>24.2f}x", "parallelism",
+                              static_cast<double>(attributedCpuNs)
+                                  / static_cast<double>(busyNs))
+               << "   (attributed cpu / busy wall)\n";
+        }
+    } else {
+        // ★ NEVER CLAMPED. The remainder is not printed at all when it cannot
+        // be computed honestly — a `0ms` in its place is precisely the defect
+        // being removed.
+        os << "dss-code-prime: *** --time INVARIANT VIOLATION — the phase "
+              "accounting is inconsistent with itself, so the unattributed "
+              "remainder is NOT reported ***\n";
+        for (auto const& v : violations) {
+            os << "dss-code-prime:   ! " << v << "\n";
+        }
+    }
+
+    // ── Per-job wall timing for the CU batches (see `JobBatchRecord`). ───────
+    for (auto const& b : readJobBatches()) {
+        std::uint64_t sumJobNs = 0;
+        std::uint64_t maxJobNs = 0;
+        for (auto const n : b.jobWallNs) {
+            sumJobNs += n;
+            maxJobNs = std::max(maxJobNs, n);
+        }
+        os << kPfx << std::format("{:<21}", b.stage)
+           << std::format("width {:<4} jobs {:<5} batch {:>10}  Σjobs {:>10}",
+                          b.width, b.jobWallNs.size(), ms(b.batchWallNs),
+                          ms(sumJobNs))
+           << std::format("  conc {:>5.2f}x  slowest {:>10}",
+                          b.batchWallNs > 0
+                              ? static_cast<double>(sumJobNs)
+                                    / static_cast<double>(b.batchWallNs)
+                              : 0.0,
+                          ms(maxJobNs))
+           << "\n";
+    }
+
+    if (violations.empty()) return dispatchRc;
+    return dispatchRc != 0 ? dispatchRc : 1;
+}
+
 } // namespace
 
 int Program::run(int argc, char* argv[]) {
@@ -2333,54 +2593,26 @@ int Program::run(int argc, char* argv[]) {
     // name, D-FFI-DECLARED-IMPORT-NAME), so this is a straight stamp — no
     // re-parse, and no layer in between can drop the declared name.
     setResolveLibraries(args.resolveLibraries);
-    // `--time`: report the compilation's wall-clock to stderr when this run
+    // `--time`: report the compilation's timings to stderr when this run
     // returns — covers EVERY compile-producing mode (project / transpile /
-    // directory / compile) via ONE scoped reporter, no per-mode duplication.
+    // directory / compile) through ONE report site, no per-mode duplication.
     // A zero-arg run never reaches here with time==true (parseCliArgs rejects
-    // options without a mode → NoModeSelected), so the destructor only emits a
-    // line for a real compile. Universal driver concern — lang/target/format-neutral.
+    // options without a mode → NoModeSelected), so the report only ever
+    // describes a real compile. Universal driver concern — lang/target/
+    // format-neutral.
     //
-    // c97 (compile-time-performance arc): below the total, a per-phase
-    // breakdown from the always-on `substrate::PhaseTimers` accumulators.
-    // EVERY phase prints (zero-run phases included) so the report's shape is
-    // deterministic and pin-able; the `runs` count disambiguates multi-CU /
-    // multi-target accumulation (e.g. `parse ... (2 runs)` for a 2-TU build)
-    // and makes the oracle-reparse multiplier visible as its own row. The
-    // trailing `[other]` row is the wall total minus the attributed sum —
-    // driver/config-load/IO time no phase claims. Phase names are pipeline
-    // verbs (see compilePhaseName) — lang/target/format-neutral.
-    struct WallTimeReporter {
-        bool const                                  enabled;
-        std::chrono::steady_clock::time_point const start;
-        ~WallTimeReporter() {
-            if (!enabled) return;
-            auto const ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               std::chrono::steady_clock::now() - start).count();
-            auto const ms = ns / 1'000'000;
-            std::cerr << "dss-code-prime: compile time " << formatWallTime(ms) << "\n";
-            std::uint64_t attributedNs = 0;
-            for (std::size_t i = 0; i < substrate::kCompilePhaseCount; ++i) {
-                auto const p   = static_cast<substrate::CompilePhase>(i);
-                auto const row = substrate::PhaseTimers::read(p);
-                attributedNs += row.nanoseconds;
-                std::cerr << "dss-code-prime:   phase "
-                          << std::format("{:<16}", substrate::compilePhaseName(p))
-                          << std::format("{:>12}", formatWallTime(
-                                 static_cast<long long>(row.nanoseconds / 1'000'000u)))
-                          << std::format("  ({} run{})", row.runs,
-                                         row.runs == 1 ? "" : "s")
-                          << "\n";
-            }
-            auto const otherNs = ns > 0 && static_cast<std::uint64_t>(ns) > attributedNs
-                                     ? static_cast<std::uint64_t>(ns) - attributedNs
-                                     : 0u;
-            std::cerr << "dss-code-prime:   phase "
-                      << std::format("{:<16}", "[other]")
-                      << std::format("{:>12}", formatWallTime(
-                             static_cast<long long>(otherNs / 1'000'000u)))
-                      << "\n";
-        }
-    } const wallTimeReporter{args.time, std::chrono::steady_clock::now()};
+    // ★ THE DISPATCH FORK IS AN IIFE SO THE REPORT CAN CHANGE THE EXIT CODE.
+    // This used to be an RAII guard whose DESTRUCTOR printed, which covered
+    // every `return` below but ran strictly after the return value was fixed —
+    // so a report that detects its own numbers are inconsistent had no way to
+    // say so in the process's status. `emitPhaseTimeReport` returns the exit
+    // code, and an invariant violation turns a clean compile into a failed run
+    // (see there for why that is the right trade). Coverage of every return
+    // path is preserved by wrapping the fork rather than by the destructor.
+    // Nothing is lost on the exceptional path: `main` installs no handler, so
+    // an escaping exception was never going to unwind through here anyway.
+    auto const timedRunStart = std::chrono::steady_clock::now();
+    int const  dispatchRc    = [&]() -> int {
     if (args.projectPath.has_value()) {
         return compileProject(*args.projectPath, cfg);
     }
@@ -2420,6 +2652,9 @@ int Program::run(int argc, char* argv[]) {
     std::cout << "DSS Code Prime compiler ready.\n"
               << "Run `dss-code-prime --help` for usage.\n";
     return 0;
+    }();
+    if (!args.time) return dispatchRc;
+    return emitPhaseTimeReport(timedRunStart, dispatchRc, std::cerr);
 }
 
 namespace {
@@ -2959,9 +3194,23 @@ int Program::transpile(
 // stdio.h`. The shipped CLI could not resolve an angle include from any
 // working directory outside its own source tree. Do not re-open a local
 // walk here.
-void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
-    auto const& dirs = grammar.semantics().shippedLibDirs;
-    if (dirs.empty()) return;
+// The resolved system-include dirs for `grammar`, as absolute paths in the
+// language's declared order.
+//
+// ★ SPLIT OUT OF `applySystemDirs` SO THE ANSWER CAN BE COMPUTED ONCE. Every
+// call walks the filesystem: `findShippedConfigDir` reads the environment and
+// probes up to eight ancestor directories PER declared dir. That was being
+// re-done for every source file, and the answer is identical for every file
+// built under one `CuBuildKey` — a language's `shippedLibDirs` and the config
+// root are both fixed for the whole invocation. The multi-TU CU build now
+// resolves once and hands the result to each unit, which is both less work and
+// one less piece of ambient filesystem state consulted from inside a
+// concurrent job.
+[[nodiscard]] std::vector<fs::path> resolveSystemDirs(GrammarSchema const& grammar) {
+    std::vector<fs::path> out;
+    auto const&           dirs = grammar.semantics().shippedLibDirs;
+    if (dirs.empty()) return out;
+    out.reserve(dirs.size());
     std::error_code ec;
     for (std::string const& sub : dirs) {
         auto const resolved = findShippedConfigDir(sub);
@@ -2972,9 +3221,14 @@ void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
         // would not. Same idiom as `applyIncludeDirs` below: on an `absolute`
         // failure keep the raw path rather than drop the dir.
         fs::path const abs = fs::absolute(*resolved, ec);
-        builder.addSystemDir(ec ? *resolved : abs);
+        out.push_back(ec ? *resolved : abs);
         ec.clear();
     }
+    return out;
+}
+
+void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
+    for (auto const& d : resolveSystemDirs(grammar)) builder.addSystemDir(d);
 }
 
 // SQLite-testfixture arc C3: thread the CLI `-I` dirs (the C quote-include
@@ -3194,6 +3448,45 @@ int Program::compileUnits(
     // c9 (Phase-2): build N single-file CUs once per distinct object-format-kind
     // (the closure `runCusToTargets` invokes), so `__has_include` is per-target
     // truthful. `setActiveFormat(kind)` is the only addition vs the pre-c9 build.
+    //
+    // ══ D-PERF-4-CU-PARALLELISM, THE FRONT HALF ══════════════════════════════
+    //
+    // ★★★ THE WHOLE FRONT END WAS SERIAL ON EVERY CORE OF THE MACHINE.
+    // This loop is preprocess + splice + tokenize + expand + parse +
+    // resolve-imports for every translation unit, and it ran one file at a
+    // time: ✔MEASURED 39.6 s of a 212 s SQLite build (103 TUs), at 1.0 CPU-
+    // second per wall-second throughout. `callOnLargeStack` made that easy to
+    // miss — it DOES spawn a thread, but it spawns it and immediately JOINS
+    // it, so it buys stack depth, never concurrency.
+    //
+    // The batch below is the SAME SHAPE the back half has used since D-PERF-4
+    // (see `compileOneTarget`), deliberately reused rather than reinvented:
+    //   • write BY INDEX into a pre-sized slot vector — no shared container is
+    //     mutated, so there is nothing to lock and nothing to order;
+    //   • a `std::latch` with an RAII count-down guard, so a job that throws
+    //     (the pool logs and swallows it) can never DEADLOCK `done.wait()` —
+    //     its slot simply stays disengaged and fails the build loudly below;
+    //   • collect the results in CU (index) ORDER after the join, NEVER in
+    //     completion order.
+    //
+    // ★★ WHY THE OUTPUT IS BYTE-IDENTICAL AND THE DIAGNOSTICS KEEP THEIR ORDER.
+    // The vector this returns is assembled by walking `i = 0..n-1` after the
+    // join, so it is the same sequence of CUs the serial loop produced, for any
+    // schedule. Diagnostics need no merge step at all here — unlike the back
+    // half, a front-half job writes NOTHING into `rep`: it only reads
+    // `rep.config()` for the diagnostic budget, and every diagnostic it
+    // produces lands inside the `CompilationUnit` it is building
+    // (`driverDiagnostics()` and each `Tree`'s own). `runCusToTargets` then
+    // drains those by walking the same index order. So diagnostic ORDER and
+    // COUNT are a pure function of CU index, and CU index is a pure function of
+    // `sourceFiles` — neither can observe the schedule.
+    //
+    // ⚠ WHAT IS *NOT* PARALLELIZED HERE, AND WHY. `buildShippedSourceCus`
+    // (called by `runCusToTargets` right after this) walks a DISCOVERY work
+    // list: which runtime unit is reached depends on what the previously-parsed
+    // units included. Its iteration order is part of its result, so it stays
+    // serial until it has a shape that does not conflate discovery with
+    // traversal — refusing to parallelize it is not an oversight.
     auto buildCus = [&](CuBuildKey const&                   key,
                         std::span<PredefinedMacroDef const> targetPredefines,
                         std::span<PredefinedMacroDef const> formatPredefines,
@@ -3201,18 +3494,30 @@ int Program::compileUnits(
                         // resolved grammar (see the `compileFiles` twin).
                         std::shared_ptr<GrammarSchema const> const& keyGrammar)
         -> std::vector<CompilationUnit> {
-        std::vector<CompilationUnit> cus;
-        cus.reserve(sourceFiles.size());
-        for (auto const& path : sourceFiles) {
+        std::size_t const n = sourceFiles.size();
+        // Resolved ONCE for the whole batch rather than once per file: the
+        // answer is fixed for this key, and it is a filesystem walk (see
+        // `resolveSystemDirs`).
+        std::vector<fs::path> const systemDirs = resolveSystemDirs(*keyGrammar);
+
+        std::vector<std::optional<CompilationUnit>> slots(n);
+        auto buildOne = [&](std::size_t i) {
             // D-PARSE-DEEP-FRONTEND-STACK: build each CU on the 64 MiB worker
             // stack (see compileFiles for the rationale) so a deeply-nested
-            // expression parses without overflowing the host main stack.
-            cus.push_back(substrate::callOnLargeStack(
+            // expression parses without overflowing the host main stack. Under
+            // the pool this nests a large-stack thread inside a worker — the
+            // same nesting the back half already runs, and the reason
+            // `large_stack_call.hpp` documents the primitive as concurrent.
+            slots[i] = substrate::callOnLargeStack(
                 substrate::kDeepRecursionStackBytes, [&] {
                     // Same budget hop as `compileFiles` above
                     // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE).
+                    // ⚠ `rep` is READ here and NEVER WRITTEN — see the batch
+                    // note above; writing it from a job would reintroduce
+                    // exactly the completion-order dependence this shape
+                    // exists to prevent.
                     UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}};
-                    applySystemDirs(builder, *keyGrammar);
+                    for (auto const& d : systemDirs) builder.addSystemDir(d);
                     if (key.format) builder.setActiveFormat(*key.format);
                     // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
                     // header-name case rule (NOT derived from the format kind).
@@ -3225,9 +3530,73 @@ int Program::compileUnits(
                         {formatPredefines.begin(), formatPredefines.end()});
                     builder.setUserDefines(userDefines());  // c105: --define
                     applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
-                    builder.addFile(fs::path{path});
+                    builder.addFile(fs::path{sourceFiles[i]});
                     return std::move(builder).finish();
-                }));
+                });
+        };
+
+        if (n <= 1) {
+            // One TU has no batch to form; keep it off the pool entirely so the
+            // single-file path spawns nothing it did not spawn before.
+            if (n == 1) buildOne(0);
+        } else {
+            std::optional<substrate::ThreadPool> localPool;
+            substrate::IExecutor* exec  = executor_;
+            std::size_t const     width = resolveCuPoolWidth(n, jobs_);
+            if (exec == nullptr) {
+                localPool.emplace(width);
+                exec = &*localPool;
+            }
+            std::vector<std::uint64_t> jobWallNs(n, 0);
+            auto const                 batchStart = std::chrono::steady_clock::now();
+            std::latch                 done{static_cast<std::ptrdiff_t>(n)};
+            for (std::size_t i = 0; i < n; ++i) {
+                exec->submit([&, i] {
+                    struct CountDownGuard {
+                        std::latch& latch;
+                        ~CountDownGuard() { latch.count_down(); }
+                    } const guard{done};
+                    auto const jobStart = std::chrono::steady_clock::now();
+                    buildOne(i);
+                    jobWallNs[i] = static_cast<std::uint64_t>(
+                        std::max<long long>(0, std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - jobStart).count()));
+                });
+            }
+            done.wait();
+            recordJobBatch(JobBatchRecord{
+                "front-half cu build",
+                // An injected executor's width belongs to the injector; report
+                // 0 rather than a width this driver computed but did not use.
+                executor_ != nullptr ? std::size_t{0} : width,
+                static_cast<std::uint64_t>(std::max<long long>(
+                    0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - batchStart).count())),
+                std::move(jobWallNs)});
+        }
+
+        // Collect IN INDEX ORDER. A disengaged slot means that job threw and
+        // the pool swallowed the exception after logging it — the CU does not
+        // exist, so it FAILS THE BUILD naming the file rather than returning a
+        // short vector that would silently compile a program missing a
+        // translation unit. Every other CU is still returned so the run
+        // surfaces all of their diagnostics too; `runCusToTargets` stops on
+        // `rep.hasErrors()` immediately after its drain.
+        std::vector<CompilationUnit> cus;
+        cus.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!slots[i].has_value()) {
+                emitDriver(rep, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
+                           "internal: the front-end build of translation unit '"
+                           + sourceFiles[i]
+                           + "' produced no compilation unit — its build job "
+                             "terminated abnormally (the executor logs the "
+                             "throw). The build stops rather than linking a "
+                             "program that is silently missing this unit.");
+                continue;
+            }
+            cus.push_back(std::move(*slots[i]));
         }
         return cus;
     };
