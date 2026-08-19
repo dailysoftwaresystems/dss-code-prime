@@ -31,6 +31,12 @@ Multi-host matrix → `dss-cross-leg-test`.
 
 **Conventions authority:** the `dss-code-prime` skill wins on any conflict.
 
+## ★★★ THE GOAL IS TO *WORK* — one working reference makes the behaviour REQUIRED
+
+Operator ruling 2026-08-19: *"we must never crash on correct code, even if gcc fails, we must do it right. … If we have a reference that works, we must too (of course, with the implementation always following our project's best practices)."*
+
+**The test is the DISJUNCTION, not the consensus.** If ANY reference (gcc, clang, MSVC, …) compiles and runs a correct construct, DSS must too. A reference's FAILURE is therefore never evidence against DSS — when DSS accepts what one reference rejects and another accepts, DSS is **right**, and the divergence is a **NON-DSS CONFOUND** to attribute and record. **Never make DSS fail in order to match a failing reference.** This bounds the bidirectional rule: "accepting what no reference accepts is a defect" turns on **NO** — not one. The implementation still owes the full bar (agnostic, config-driven, best-long-term, fail-loud, strictly tested): "it works" is the requirement, not the excuse. ⚠ Probe references **separately** — "the reference" is not one voice, and P14 nearly narrowed a working header chain because only gcc's failure was on file and MSVC's success was not. Full case: `references/the-bar.md` §A.3b.
+
 ## The pause-and-ask gate — the most important behavioral rule
 
 The loop is autonomous for **execution** and escalates **decisions**. When any of these appears,

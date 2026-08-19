@@ -9,29 +9,160 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-19 — cycle **P14 IN FLIGHT, paused by operator at the root cause's threshold** (the pe64 scanstatus2 miscompile: root cause pinned to the merge-path lowering, one instrument from the defect's exact MIR shape). P13/P12/P11 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P14 WIP); the P14 WIP chain `8f1b3963`→`96dcfa3d` is PUSHED.
+**Last updated:** 2026-08-19 — cycle **P14 COMPLETE, and it OVERTURNS its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. The defect P14 *did* find is `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE` (HIGH) — its §B was RAISED AND ANSWERED the same day: **✔MSVC compiles the construct, so DSS compiling it is REQUIRED and gcc's failure is a NON-DSS CONFOUND** (new bar §A.3b). Operator has scheduled it for the NEXT cycle **paired with** `D-UPSTREAM-SQLITE-FILEIO-WINDIRENT-IS-MSVC-ONLY`. P13/P12/P11 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P14 final). ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
 
-## 0.0000000000000000 ★★★ READ THIS FIRST — CYCLE P14 PAUSED: THE pe64 MISCOMPILE, EVERY EXONERATION MEASURED, ONE INSTRUMENT FROM THE FIX
+## 0.0000000000000000 ★★★ READ THIS FIRST — CYCLE P14 (COMPLETE): THE pe64 "MISCOMPILE" DOES NOT EXIST. IT IS AN UPSTREAM SQLITE PORTABILITY BUG, AND THE REASON WE BELIEVED OTHERWISE IS ITS OWN DEFECT.
 
-**Mandate**: FIX `D-HARNESS-PE64-CORPUS-WINE-ABORT-SCANSTATUS2` (best long-term, no workarounds; the pin must be an examples entry running on ALL legs — operator instruction). The registry row carries the COMPLETE evidence chain; this block is the working state.
+**✔MEASURED, and it overturns the two cycles above this line.** `D-HARNESS-PE64-CORPUS-WINE-ABORT-SCANSTATUS2`
+is **CLOSED / DISCHARGED**: there is no DSS codegen defect at `scanstatus2-5.1`. Do not spend another cycle
+hunting one.
 
-**Exonerated by measurement (each took instruments, all recorded in the row)**: wine (native Windows crashes identically) · the optimizer (debug/Identity crashes identically) · the Tcl handle registry (string→entry→clientData all valid ON THE CRASHING CALL) · the caller's C source semantics (gcc reference, same 189 TUs + defines, passes 5.1 clean — `reference-testfixture`) · single-TU codegen (both `tss.c` AND the real `test1.c` .obj: all ten call sites load the slot correctly) · callee-side register/lowering (store+reload statically correct, three aligned verifications) · stack imbalance (rsp identical store→reload, measured live).
+**THE ROOT CAUSE.** `testPointerToString` (sqlite `src/test1.c`) registers every handle in a `Tcl_HashTable`
+under a key built with **`sprintf(aKey, "ptr:%p", pPtr)`**. `scanstatus2.test`'s test-5.x `trace` proc rebuilds
+that handle in Tcl as **`format "ptr:0x%llx" $stmt`**. Those agree only where the C library's `%p` emits
+`0x`-prefixed minimal-width lowercase hex — glibc and macOS, not Windows. On Windows the lookup MISSES,
+`testStringToPointer` returns 0, and `sqlite3_stmt_scanstatus_v2(NULL, …)` dereferences `[NULL+0x88]`.
 
-**THE PINNED DEFECT SHAPE**: the crash is REAL only in the **full-project (merged, N>1 CU) compile**. In the probe build (merged, with fprintf probes) the first scanstatus_v2 argument statically receives a register last written by `mov $0x0,%r12d` — a STALE VALUE on the call-argument path — while a use of the same local BETWEEN the `a||b` merge and the call reloads it correctly (the probe prints it valid). The runtime callee got rcx=0 (r15=0 after its entry move) on the crashing call with the slot valid. Trigger path: the objc==5 (`-flags`) arm — every crashing call passes `-flags`, every passing call is objc==3.
+**THE FOUR MEASUREMENTS** (each re-runnable; full detail in the registry row):
+1. **The discriminating pair, on the SAME crashing binary.** Registry spelling `ptr:00007FFFFF925998` → **rc=0,
+   no crash**. Test spelling for the SAME pointer, `ptr:0x7fffff925998` → `wine: Unhandled page fault on read
+   access to 0000000000000088 at address 00000001405E0BC2` — address and RIP both identical to the recorded
+   fault. One binary, one pointer, two spellings, opposite outcomes.
+2. **The `%p` spellings.** DSS pe64 under wine: `ptr:00007FFFFF924B88`. DSS elf64: `ptr:0x386bd348`.
+3. **The reference control, on the RIGHT platform.** `x86_64-w64-mingw32-gcc` under wine prints
+   `ptr:00007ffffe2ffedc` (default ANSI stdio) and `ptr:00007FFFFE2FFEDC` (`-D__USE_MINGW_ANSI_STDIO=0`) —
+   **neither carries `0x`**. Any Windows build of upstream hits this, DSS or not.
+4. **The other leg.** The DSS-built **elf64-x86_64** testfixture runs `scanstatus2.test` to **0 errors out of 24
+   tests**, 5.1 included — same C, same optimizer, same MIR→LIR.
 
-**INSTRUMENTS READY (all on disk)**:
-- `build/perf/p13/` — probe scripts (`probe*.sh`), watchpoint scripts, `tss.c` (the standalone shape reproducer), the MIR-dump diagnostic patch (`mir-dump-diagnostic.patch` — 34 lines, applied+compiled into the WSL gate tree at `~/src/dss-code-prime/build/gate`; ⚠ `emitMir` SEGFAULTS on the 189-TU merged module — the dump-before-optimize needs a per-function emit or a fix to emitMir).
-- **THE LIR DUMP EXISTS**: `~/p14/lir2.txt` on WSL (390 functions ≥800 insts, post-rewrite, via the standing `DSS_DUMP_LIR_MIN_INSTS` hook) — the merged LIR of the probe fixture. **NEXT SESSION'S FIRST MOVE**: locate `test_stmt_scanstatus` in it (the probe build's fprintf call sites are recognizable; calls print as `call _ pN...` without symbols — identify by structure: ~10 calls to one target in one function) and diff the arg1 vreg's def chain between the call sites — the stale def (a `mov $0` / constant) instead of a slot load IS the bug, visible pre-regalloc.
-- `~/sqlite-probe/` (WSL) — the patched sqlite tree + `proj.json`; builds the probe fixture in ~90 s.
-- The operator's two wine crash dumps (r15=0 at entry; the second with the full stack) — recorded in the row.
+**⚠⚠ WHY WE BELIEVED IT WAS OURS, AND THIS IS THE PART WORTH CARRYING FORWARD.** The exoneration P14 recorded —
+*"the gcc reference … passes 5.1 clean"* — was run against **`reference-testfixture`, a LINUX ELF binary**, to
+clear a divergence that exists **only on Windows**. A control built for a different platform than the leg under
+test cannot discriminate, and it read as exculpatory. The leg's own same-platform oracle never existed:
+`pe64-x86_64/reference-oracle.stderr` says *"the same-platform oracle for leg 'pe64-x86_64' did NOT build
+(x86_64-w64-mingw32-gcc exited 1). The leg reports NO ORACLE"*. The harness said so **loudly**; two cycles read
+past it. ★ **The rule that falls out: a reference control is not a control until you have checked WHICH TARGET
+IT WAS BUILT FOR.**
 
-**UNCOMMITTED on disk**: `examples/c-subset/outparam_shortcircuit_merge/` (cu_a.c + cu_b.c + expected.json) — the two-TU construct pin. ⚠ NOT YET WORKING: `--compile a.c b.c` emitted only `cu_a.exe` (multi-TU artifact naming needs the examples-runner/project path, not bare `--compile`) — next session: make it build through the runner's manifest path, confirm it exercises the merge, THEN verify whether it reds on the current build (if it passes, the merge trigger needs more ingredients — extract them from the LIR dump diff).
+**⚠ ALSO CORRECTED, so it is not re-quoted from the commits above.** The *"first scanstatus_v2 argument
+statically receives a register last written by `mov $0x0,%r12d`"* reading is **FALSE for the shipped binary**.
+Aligned (`.pdata`-bounded) disassembly shows arg1 is `mov 0x138(%rsp),%rcx` — a load from its home slot — at all
+ten call sites; the store to that slot (`0x1404d0e2d`) **dominates** every one of them (CFG built from the dump,
+reachability re-tested with the store's block removed); the `a||b` phi chain writes its carrying register on
+every predecessor edge; arg5 correctly occupies the Win64 shadow slot at `[rsp+0x20]`. **That function's codegen
+is correct.** The `r15`-as-sixth-argument reading is retracted for the second and last time.
 
-**THEN**: fix in shared code (the stale-operand path is MIR→LIR call-arg materialization or the merge's value renumbering), red-on-disable pin, pe64 corpus leg green (`wine testfixture.exe test/scanstatus2.test` is the oracle; crashing fixture at `~/src/dss-code-prime/build/real-examples/c/sqlite/pe64-x86_64/`), 3-leg gate, close the row, remove the diagnostic patch. ⚠ The Windows `build/dbg` was rebuilt WITH the diagnostic (env-gated no-op; safe); `src/program/program.cpp` itself is REVERTED to HEAD.
+---
 
+## 0.000000000000000 ★★★ THE DEFECT P14 ACTUALLY FOUND — A CONFORMANCE REVERSAL, AND IT IS A §B WAITING ON THE OPERATOR
+
+`D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE` (**OPEN, HIGH, §B**). **The finding is a reversal,
+which is why it matters more than the header chain itself.** On 2026-08-17 `D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-
+GNUC` closed by DELETING `_MSC_VER` from `c-subset.lang.json`, on the explicit reasoning that pe64 must claim ONE
+identity and that *"agreeing with gcc is the conformance outcome, not the defect"*. `D-UPSTREAM-SQLITE-FILEIO-
+WINDIRENT-IS-MSVC-ONLY` then recorded the consequence: `ext/misc/fileio.c` failed on DSS with **66** diagnostics
+and on mingw-gcc with **31**, the same undeclared names.
+
+**⚠⚠ THAT DSS HALF IS NO LONGER REPRODUCIBLE.** ✔MEASURED 2026-08-19 on the current tree: DSS compiles that TU
+through the sqlite pe64 leg's own manifest with **zero** `S0001`/`S0006` diagnostics (only
+`K_ProgramEntryUndefined`/`K_SymbolUndefined`, both expected of a TU with no `main` and no sqlite core), while
+mingw-gcc on the identical define+include set still fails. **The acceptance came back — by a different route than
+the identity claim that was deliberately removed.**
+
+**THE ROUTE, ✔MEASURED.** On a `pe` format the shipped descriptors chain **`<direct.h>` → `<dirent.h>` →
+`<windows.h>`**, so a TU including only `<direct.h>` receives DSS's whole shipped Win32 vocabulary (`HANDLE`,
+`WCHAR`, `CP_UTF8`, `LPFILETIME`, `WIN32_FIND_DATAW`, `MultiByteToWideChar`, `FindFirstFileW`); `fileio.c`'s
+`_WIN32` branch includes `<direct.h>`. Discriminating probe, on the current Windows tree and again through the
+leg's own manifest: `#include <direct.h>` + `HANDLE h;` → **rc=0**; the same TU with no include / `<stdio.h>` /
+`<sys/stat.h>` / `"windirent.h"` → correctly refused with `error[S0006]`. 🧠The chain landed in `41a320ad`
+(2026-08-18, *"pe64 gets a POSIX layer"*) — the SAME DAY as the 66-diagnostic measurement, so the two rows record
+opposite states of one day and only one can describe the tree now. **mingw provably does not do this** (its real
+`<direct.h>` is on `fileio.c`'s include list and gcc still calls all five names undeclared); 🧠MSVC is expected to
+match and was **NOT probed** — probe before quoting. `direct.json` labels hop 1 as a deliberate declared superset
+deviation; **hop 2 is unlabelled**, and hop 2 is where it stops being narrow.
+
+**THE MEASURED COST.** The pe64 leg's same-platform oracle **does not build** precisely because the leg's manifest
+is compilable by DSS and not by the reference — so the whole pe64 corpus ran with no attribution control. ★★ **A
+leg whose manifest only DSS can compile has no oracle by construction** — invisible to every green build, and the
+direct cause of the two cycles above.
+
+**⇒ THE §B WAS RAISED AND ANSWERED THE SAME DAY, AND THE ANSWER REVERSED THE RECOMMENDATION.** Operator ruling,
+2026-08-19, verbatim: *"we must never crash on correct code, even if gcc fails, we must do it right. … If we have
+a reference that works, we must too (of course, with the implementation always following our project's best
+practices)."* This is now **bar §A.3b** in the `dss-cycle` skill (SKILL.md + `references/the-bar.md`): **the test
+is the DISJUNCTION, not the consensus — one working reference makes the behaviour REQUIRED**, a reference's
+failure is never evidence against DSS, and "accepting what no reference accepts is a defect" turns on the word
+**NO**, not one.
+
+**✔THE MEASUREMENT THAT DECIDES IT — taken after the ruling, and NOT on file when this handoff first recommended
+narrowing: MSVC COMPILES IT.** `cl` (VS 18 Enterprise, Hostx64) on the `windirent.h` gate shape
+(`#if defined(_WIN32) && defined(_MSC_VER)` → `<windows.h>` → `HANDLE`/`WCHAR`/`CP_UTF8`/`MultiByteToWideChar`)
+builds **rc=0, clean**. So `ext/misc/fileio.c` is CORRECT CODE a reference compiles — MSVC through its `_MSC_VER`
+shim, DSS through the descriptor chain — and **only mingw-gcc fails**, because the shim is gated out for it.
+⇒ **Option (1) (narrow the chain so DSS fails too) is REFUTED: it would break code MSVC builds.** DSS working is
+the required outcome and the gcc oracle's failure on that TU is a **NON-DSS CONFOUND** to attribute.
+⚠ **The row is NOT thereby closed**, and this is the honest half: ✔`cl` on `#include <direct.h>` + `HANDLE h;`
+also fails (`error C2065: 'HANDLE': undeclared identifier`), so **no** reference surfaces the Win32 API from
+`<direct.h>` alone. Hop 2 of the chain is a real, still-UNLABELLED superset deviation. The remaining subject is
+**bound and declare it — do not remove it.**
+
+**Also required whichever way it goes:** `D-UPSTREAM-SQLITE-FILEIO-WINDIRENT-IS-MSVC-ONLY` now carries a
+stale-marker; its DSS half must be RE-MEASURED, never re-quoted. Its upstream half stands.
+
+**TWO THINGS THIS CYCLE DELIBERATELY DID NOT DO**, both operator calls: **reporting the defects to upstream
+sqlite** (outward-facing), and **anything that would make the pe64 corpus leg green** — the standing rule forbids
+patching the staged tree or excluding the file, so the leg **remains RED at `scanstatus2-5.1` with a named,
+non-DSS cause**.
+
+**SHIPPED THIS CYCLE:** `examples/c-subset/outparam_shortcircuit_merge/` (main.c + helper.c), registered and green
+as ctest `examples/c-subset/outparam_shortcircuit_merge`. It is a **POSITIVE** cross-CU guard and says so in its
+own files — address-taken local written only through the out-param of a cross-CU call in the LEFT arm of a
+short-circuit `or`, read back as argument 1 of a FIVE-argument call, two TUs so it routes through `mergeCuMirs`
+(N≥2). ✔Exit 42 on DSS pe64, elf64-x86_64 and elf64-arm64 (qemu) — each at debug AND release — and on gcc `-O0`
+AND `-O2` on both Windows and Linux. (The two macho arms are `runOn: darwin`; the Mac was off.) ⚠ The version
+staged uncommitted by the previous session had a **source bug** (`objv[objc-2]` indexed a NULL) that made gcc
+segfault too — caught only by running the reference control, which is the same lesson as above.
+
+**NEXT — OPERATOR-SCHEDULED, and the first item is a PAIR that must not be split:**
+1. **`D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE` TOGETHER WITH
+   `D-UPSTREAM-SQLITE-FILEIO-WINDIRENT-IS-MSVC-ONLY`** — operator instruction 2026-08-19: *"please check
+   D-UPSTREAM-SQLITE-FILEIO-WINDIRENT-IS-MSVC-ONLY along with D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-
+   SURFACE using /dss-cycle (next cycle)"*. They are one problem seen from two ends. The direction is DECIDED
+   (bound-and-declare, never narrow); the work is:
+   **(a)** extend `direct.json`'s labelled-deviation `$comment` to cover hop two and give `dirent.json` its own —
+   enumerate exactly which names the chain may surface and why, so the deviation is NAMED and BOUNDED;
+   **(b)** ★ the half that actually unblocks pe64 — make the harness ATTRIBUTE a TU rejected by the leg's own
+   same-platform oracle but accepted by another reference to **NON-DSS CONFOUND**, so a gcc-only failure stops
+   poisoning the leg (harness work, not descriptor work);
+   **(c)** ship a corpus example pinning the construct with the three-way verdict recorded IN the example —
+   **gcc FAILS, MSVC SUCCEEDS, DSS SUCCEEDS** (operator: *"just put in our example that gcc fails but msvc
+   succeeds"*). ⚠ Do NOT narrow the chain; do NOT patch or exclude the staged sqlite tree.
+   ✔**ANSWERED, so (b) does not have to assume it — gcc is NOT mandatory for the sqlite units/linking leg.**
+   The operator asked; `real-examples/c/sqlite/legs.json` answers it in its own `$loadExtHelperBuilderComment`:
+   since 2026-08-05 (*operator: "why do we need mingw? since dss code prime should not have dependencies?"*)
+   **the compiler this repository ships builds the corpus's `dlopen()`ed helper, and NO host needs a third-party
+   cross-compiler for ANY leg**; `build.targetCc` governs *the optional CONTROL arm*, not a required build input,
+   and a leg whose `targetCc` resolves to nothing still builds its helper with DSS and still runs its corpus.
+   ⇒ the pe64 oracle's failure costs us a **CONTROL**, never the build or the run — which is exactly why (b) is
+   an attribution fix and not a toolchain dependency.
+2. **Operator decision still owed: report upstream to sqlite?** (a) the `%p` vs `format "ptr:0x%llx"` handle
+   mismatch in `test/test1.c` + `test/scanstatus2.test`; (b) `fileio.c`/`windirent.h`'s `_MSC_VER` interlock.
+   Both outward-facing, so neither was filed.
+3. **Then the loop continues:** TLS-dylib corpus arm (P12 residual); asm remainder
+   (`D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` label half; `D-ASM-TEMPLATE-IS-LEXED-TWICE` LOW;
+   `D-ASM-ARM64-GAS-SURFACE-INCOMPLETE` — re-measure, it predates the CFI producer); C1 diagnostic coordinates
+   (`D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED`, HIGH).
+
+⚠ **Housekeeping seen but NOT done this cycle** (no anchor — it is the already-open
+`D-BUILD-LAYOUT-FLAT-ROOT-BUILD-DIRS-NOT-MIGRATED`'s neighbourhood): ✔MEASURED, **five** stale lane worktrees
+survive — `.claude/worktrees/{agent-a33bf76aa1baf2e04, agent-aa5ee5ab409b3c519, dss-no-repo-ancestry-cwd}` plus the
+SIBLING-DIRECTORY ones `C:/Source/DailySoftware/{dss-lane-m, dss-wt-bitwise, dss-wt-movzw}` (detached HEADs).
+⚠ `agent-aa5ee5ab409b3c519` is on disk with its own `build/` but is **absent from `git worktree list`** — an
+orphaned copy, which is the worst of the set: it answers repo-wide greps and nothing tracks it. Both
+`.claude/worktrees` copies were hit while searching this cycle.
 ---
 
 ## 0.00000000000 ★★★ READ THIS FIRST — CYCLE P13: THE CROSS-HOST MATRIX RAN — AND FOUND A MISCOMPILE

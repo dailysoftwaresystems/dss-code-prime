@@ -59,6 +59,38 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    ONLY for work behind a genuine named blocker or an unfired trigger, pinned per §F/§D. If
    the hard part truly cannot land now, that is a **decision gate** (§B): bring the options,
    do not quietly defer.
+3b. **★★★ THE GOAL IS TO *WORK*. A REFERENCE THAT FAILS IS NOT A LICENCE TO FAIL — AND NEVER A
+   REASON TO BREAK SOMETHING THAT WORKS.** Operator ruling, 2026-08-19, verbatim: *"we must never
+   crash on correct code, even if gcc fails, we must do it right. […] If we have a reference that
+   works, we must too (of course, with the implementation always following our project's best
+   practices)."*
+   - **The test is the DISJUNCTION, not the consensus:** if **any** reference compiler (gcc, clang,
+     MSVC, …) compiles and runs the construct correctly, **DSS must too**. One working reference is
+     enough to make the behaviour required. Unanimity among references is not needed, and a majority
+     that fails does not excuse us.
+   - **Therefore a reference's FAILURE is never evidence against DSS.** When DSS accepts something a
+     particular reference rejects, the question is *"does some reference accept it, and is the
+     construct correct?"* — not *"do we match the one that failed?"*. If the answer is yes, DSS is
+     **right**, and the divergence is a **NON-DSS CONFOUND**: attribute it away from DSS, record it,
+     and move on. Never "fix" DSS by teaching it to fail in company.
+   - ⚠ **THIS BOUNDS §A.4's BIDIRECTIONALITY — read them together.** "Accepting what no reference
+     accepts is also a defect" still holds, and the operative word is **NO**: the defect is accepting
+     what **not one** reference accepts. It was never a rule that DSS must reproduce every
+     reference's failure, and reading it that way inverts the project's purpose.
+   - ★ **The implementation still has to be ours**: the whole bar applies to *how* it works —
+     agnostic, config-driven, best-long-term, fail-loud, strictly tested. "It works" is the
+     requirement, not the excuse.
+   ✔**THE CASE THAT PRODUCED THIS RULING** (cycle P14, and it nearly went the wrong way): sqlite's
+   `ext/misc/fileio.c` compiles under **MSVC** (its `_MSC_VER` activates `windirent.h`'s shim, which
+   pulls in `<windows.h>`) and **fails under mingw-gcc** (the shim is gated out). DSS compiles it, by
+   a third route — its shipped `<direct.h>` → `<dirent.h>` → `<windows.h>` descriptor chain. A cycle
+   was about to *narrow that chain so DSS would fail too*, on the reasoning that DSS should agree
+   with gcc. ⇒ **That would have broken working code to match a reference's bug.** MSVC works, so DSS
+   working is the correct outcome; the gcc oracle's failure on that TU is a confound to attribute,
+   not a defect to import. ⚠ Note what the measurement had to be to see this: **each reference
+   probed separately**, not "the reference" as one voice — gcc's failure and MSVC's success are
+   different facts, and only one of them was on file when the wrong conclusion was drawn.
+
 4. **Fail loud.** Every unsupported construct emits a real diagnostic, never a silent
    miscompile or a swallowed error. Follow the `*Fatal` + `X_*`/`D-*` patterns already in
    `src/`.
