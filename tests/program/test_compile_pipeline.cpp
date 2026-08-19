@@ -2894,6 +2894,62 @@ TEST(Program_CuParallelism, FrontHalfMultiTuDiagnosticsAndBytesPoolVsSynchronous
            "single-threaded build — parallelism may change speed, never bytes";
 }
 
+// The two-clock substrate's PAYOFF pin: on a multi-TU pool build the front
+// half must ACTUALLY overlap. Every pin above proves the parallel path equals
+// the serial one — bytes, order, stability — and a `submit` that silently
+// regressed to inline execution keeps ALL of them green while shipping the
+// cycle's headline property unguarded. `peakConcurrency` is the direct
+// witness: two scopes of one phase simultaneously alive is thread-level
+// concurrency regardless of how many cores the host actually schedules them
+// onto (the inverse of invariant (d2), which pins peak==1 on a serial
+// compile in the two-clock test above).
+TEST(Program_CuParallelism, FrontHalfActuallyRunsConcurrently) {
+    constexpr int kTus = 8;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    std::vector<std::string> files;
+    for (int i = 0; i < kTus; ++i) {
+        auto const body = "#warning zzconc_cu" + std::to_string(i) + "\n"
+                        + "int concf" + std::to_string(i)
+                        + "(void) { return " + std::to_string(i) + "; }\n";
+        files.push_back(writeCSubsetSource(
+            scratch.path(), "conc" + std::to_string(i) + ".c", body)
+                            .generic_string());
+    }
+    scratch.useAsCwd();
+
+    substrate::PhaseTimers::reset();
+    substrate::ThreadPool pool{kTus};   // force real concurrency, as above
+    Program prog;
+    prog.setExecutor(&pool);
+    prog.setOutputDir(scratch.path() / "conc_out");
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileUnits(files, "c-subset",
+                                {"x86_64:elf64-x86_64-linux"}, rep),
+              0);
+
+    // Some FRONT-half phase (preprocess … resolve-imports … semantic) must
+    // have seen two of its own scopes alive at once. The front phases are
+    // named, not inferred, so a future phase renumbering cannot silently
+    // point this pin at the (already-parallel) back half and keep it green
+    // for the wrong reason.
+    static substrate::CompilePhase const kFront[] = {
+        substrate::CompilePhase::Preprocess,      substrate::CompilePhase::PreprocessSplice,
+        substrate::CompilePhase::PreprocessTokenize, substrate::CompilePhase::PreprocessExpand,
+        substrate::CompilePhase::Tokenize,        substrate::CompilePhase::Parse,
+        substrate::CompilePhase::Reparse,         substrate::CompilePhase::ResolveImports,
+        substrate::CompilePhase::Semantic,
+    };
+    bool anyFrontOverlap = false;
+    for (substrate::CompilePhase const p : kFront) {
+        auto const row = substrate::PhaseTimers::read(p);
+        if (row.runs > 0 && row.peakConcurrency >= 2u) anyFrontOverlap = true;
+    }
+    EXPECT_TRUE(anyFrontOverlap)
+        << "no front-half phase ever reported two concurrent scopes — the "
+           "front half ran SERIALLY through the pool (a regressed submit "
+           "stays green on every byte-identity pin; only this test sees it)";
+}
+
 // Repeat-stability for the FRONT half (a probabilistic race catcher). One
 // parallel run proves nothing about a schedule-dependent bug: the pool can
 // happen to run jobs in submission order. K=20 runs of a multi-TU build

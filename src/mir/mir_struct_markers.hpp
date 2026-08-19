@@ -117,7 +117,10 @@ deriveStructCfMarkers(Mir const& mir, MirFuncId f);
 // tree is the only addition, computed internally).
 //
 // COST: O(function) for the derivation itself, plus ONE O(module) scan
-// for the self-loop index the cross-function rule above needs. A caller
+// for the self-loop index the cross-function rule above needs, plus the
+// returned module-SIZED `out` vector this call fills (a fresh allocation
+// per call — measured 0.15% of a whole-module rederive and deliberately
+// NOT reused; see mir_struct_markers.cpp before changing that). A caller
 // that derives EVERY function should use the module-wide applier below,
 // which hoists that scan (and the post-dominator scratch) out of its
 // per-function loop instead of paying them per call.

@@ -2854,7 +2854,12 @@ dss_build_type() {                      # <binary>
     IFS=';' read -r -a cfglist <<< "$cfgs"
     for part in "${parts[@]}"; do
       for c in "${cfglist[@]}"; do
-        if [[ -n "$c" && "$part" == "$c" ]]; then hit="$part"; fi   # DEEPEST wins
+        # Case-INSENSITIVE, matching the .ps1 twin (-contains) and
+        # profile-compile-support.py (.lower()): CMake uppercases the build
+        # type to look up CMAKE_<LANG>_FLAGS_<CFG>, so `release` selects the
+        # identical flags as `Release` and a lowercase spelling is not a
+        # different answer.
+        if [[ -n "$c" && "${part,,}" == "${c,,}" ]]; then hit="$part"; fi   # DEEPEST wins
       done
     done
     if [[ -n "$hit" ]]; then

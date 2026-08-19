@@ -765,8 +765,30 @@ AdversarialModule buildAdversarialModule(TypeInterner& interner) {
         mb.beginBlock(gTail); mb.addReturn(mb.addConst(i32Lit(2), i32));
     }
 
+    // f5 — LATCH-LAST: a reachable do-while whose back-edge SOURCE is the
+    // function's FINAL block in the arena. The production candidate builder
+    // enumerates the function's contiguous range [first, first+nb); an
+    // off-by-one at the range END silently drops exactly this latch, the
+    // whole-module sweep still finds its loop, and every scoped-vs-whole
+    // differential in this file goes red. Until this function existed the
+    // clause was UNEXERCISED: f1's latch is mid-function, and f2's last
+    // block is a self-loop the module index covers regardless of the range.
+    MirFuncId const f5 = mb.addFunction(fnSig, SymbolId{6});
+    {
+        MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const header = mb.createBlock();
+        MirBlockId const body   = mb.createBlock();
+        MirBlockId const exit   = mb.createBlock();
+        MirBlockId const latch  = mb.createBlock();   // arena-LAST on purpose
+        mb.beginBlock(entry);  mb.addBr(header);
+        mb.beginBlock(header); mb.addCondBr(mb.addArg(0, boolT), body, exit);
+        mb.beginBlock(body);   mb.addBr(latch);
+        mb.beginBlock(latch);  mb.addBr(header);      // back edge from the LAST block
+        mb.beginBlock(exit);   mb.addReturn(mb.addConst(i32Lit(5), i32));
+    }
+
     out.m = std::move(mb).finish();
-    out.funcs = {f0, f1, f2, f3, f4};
+    out.funcs = {f0, f1, f2, f3, f4, f5};
     out.trivialFunc  = f0;
     out.selfLoopFunc = f4;
     out.gSelf = gSelf;
@@ -1009,6 +1031,52 @@ TEST(MirNaturalLoopsScopedSweepDeathTest, UnsortedCandidatesAbort) {
 }
 
 // ── the derivation's CROSS-FUNCTION reach (behaviour, not aspiration) ───────
+
+// The production candidate builder (collectBackEdgeCandidates) had NO
+// differential of its own: every scoped-vs-whole comparison in this file
+// feeds the TEST's independent candidate set, and both appliers share the
+// production builder, so a range-enumeration bug agreed with itself
+// everywhere. ✔PROVEN: with the range end mutated to `s < lastEx - 1` the
+// whole differential suite stayed GREEN. This pin closes that gap with a
+// VALUE pin through the public per-function overload (the production
+// path): f5's do-while derives LoopHeader on the header via the back edge
+// from the arena-LAST block — drop that block from the candidate range and
+// the loop vanishes from the scoped sweep, the header falls through to the
+// if/switch rules, and exactly this assertion goes red.
+TEST(StructCfDerivation, LatchLastBlocksBackEdgeIsInTheCandidateRange) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule a = buildAdversarialModule(interner);
+
+    // f5 is the module's LAST function; its latch is the module's LAST block.
+    ASSERT_EQ(a.funcs.back().v, a.m.funcCount() - 1u);
+    auto const& f5   = a.funcs.back();
+    auto const  last = a.m.funcBlockAt(f5, a.m.funcBlockCount(f5) - 1u);
+    // entry, header, body, exit, latch — creation order; latch is arena-last.
+    MirBlockId const entry  = a.m.funcBlockAt(f5, 0);
+    MirBlockId const header = a.m.funcBlockAt(f5, 1);
+    MirBlockId const body   = a.m.funcBlockAt(f5, 2);
+    MirBlockId const exit   = a.m.funcBlockAt(f5, 3);
+    MirBlockId const latch  = a.m.funcBlockAt(f5, 4);
+    EXPECT_GT(latch.v, exit.v);
+    EXPECT_EQ(latch.v, last.v);
+    // latch → header is the back edge; the natural loop is {header, body,
+    // latch}; exit is the only way out.
+    auto const derived = deriveStructCfMarkers(a.m, f5);
+    EXPECT_EQ(derived[entry.v],  StructCfMarker::EntryBlock);
+    EXPECT_EQ(derived[header.v], StructCfMarker::LoopHeader)
+        << "the back edge from the arena-LAST block must reach the sweep — "
+           "an off-by-one at the candidate range END drops exactly it";
+    EXPECT_EQ(derived[body.v],   StructCfMarker::Linear);
+    EXPECT_EQ(derived[latch.v],  StructCfMarker::Linear)
+        << "the latch is IN the loop body (its successor is the header, not "
+           "an exit)";
+    // Rule 3: `exit` is the target of the loop-EXITING edge (header→exit,
+    // a body block to a non-body block) — the same rule that claims gTail in
+    // ForeignSelfLoopPseudoLoopClaimIsPreserved. Under the range-end mutant
+    // the natural loop vanishes, so BOTH this and the LoopHeader claim above
+    // fall through to the if/linear vocabulary.
+    EXPECT_EQ(derived[exit.v],   StructCfMarker::LoopExit);
+}
 
 // `mirDominatesBlock(s, u, dom)` short-circuits to Dominates when s.v == u.v,
 // BEFORE consulting the tree — so a SELF-LOOPING block registers as a
