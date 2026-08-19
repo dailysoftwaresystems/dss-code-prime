@@ -106,6 +106,29 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
     capMarkerIndex_ = snap.capMarkerIndex;
 }
 
+void DiagnosticReporter::reanchorFrom(std::size_t      from,
+                                      BufferId         newBuffer,
+                                      SourceSpan       newSpan,
+                                      std::string_view note) {
+    // Post-admission, in place: no insert, no erase, so `capMarkerIndex_`
+    // stays valid and the dedup window (which tracked the ORIGINAL keys at
+    // admission) is left alone — `remapBuffers`' contract, verbatim.
+    if (from > all_.size()) return;
+    for (std::size_t i = from; i < all_.size(); ++i) {
+        ParseDiagnostic& d = all_[i];
+        // The BUFFER, never the span, decides whether there was a locus to
+        // demote: a zero-width span at a real buffer is a genuine position
+        // (a Missing node at a byte), while no buffer means the diagnostic
+        // was raised text-only and has nothing to hand down.
+        if (d.buffer.valid()) {
+            d.related.push_back(
+                RelatedLocation{d.buffer, d.span, std::string{note}});
+        }
+        d.buffer = newBuffer;
+        d.span   = newSpan;
+    }
+}
+
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
     // D-FF2-UNSUPP refined contract (eb2c6c7 audit-fold 2026-06-01):
     // unsuppressable codes bypass SILENCING (`--suppress` drops +

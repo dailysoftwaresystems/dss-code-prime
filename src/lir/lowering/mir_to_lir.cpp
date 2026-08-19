@@ -2965,12 +2965,51 @@ struct Lowerer {
                                : AsmTemplateSurface::Basic;
     }
 
+    // ★★★ EVERY DIAGNOSTIC AN ASM EXPANSION RAISES NAMES THE EMBEDDING
+    // STATEMENT AS ITS PRIMARY LOCUS (D-ASM-TEMPLATE-DIAGNOSTIC-DOES-NOT-NAME-
+    // THE-C-STATEMENT). The template's own diagnostics point into the
+    // mid-compile-minted `<inline asm>` buffer — they name the BYTE inside the
+    // template but never the source statement, so a file with three `__asm__`
+    // blocks cannot tell which one is being refused. ✔MEASURED, gcc 13.3 and
+    // clang 18: BOTH references make the C statement primary (clang: `gt.c:3:13:
+    // error: …` then `<inline asm>:1:2: note: instantiated into assembly here`;
+    // gcc: `gt.c:3: Error: …` with the text echoed) — neither has
+    // template-primary. The fragment locus is DEMOTED to a related note, never
+    // dropped; text-only refusals (no locus at all today) gain the primary.
+    //
+    // ★ A DESTRUCTOR, NOT CALLS AT THE RETURNS, because the expansion refuses
+    // from a dozen sites and the next one added would silently miss the call —
+    // the drift shape this codebase has been burned by before. Everything
+    // reportable inside the scope IS this statement's business (bind failures,
+    // the clobber invariant, the forwarded parse diagnostics, the engine's own
+    // refusals), so whole-scope reanchoring over-reports nothing. The
+    // post-admission mutation is `remapBuffers`' precedent: the dedup window
+    // already ran on the original keys and no element is inserted or removed.
+    //
+    // ⚠ NO LOCUS, NO GUESS. `hasStatementLocus` is false exactly when HIR→MIR
+    // had no source map (LSP, FFI header parser, direct-API callers); the
+    // diagnostics then render exactly as they did before this guard —
+    // template-primary, still fail-loud, never a fabricated location.
+    struct AsmStatementLocusGuard {
+        DiagnosticReporter&         rep;
+        MirAsmDescriptor const&     d;
+        std::size_t const           base;
+        ~AsmStatementLocusGuard() {
+            if (!d.hasStatementLocus) return;
+            rep.reanchorFrom(base, d.statementBuffer, d.statementSpan,
+                             "the assembly template this statement embedded");
+        }
+    };
+
     // ★★★ THE EXPANSION. `succs` is empty for the non-terminator form.
     // Returns false on any refusal (already reported).
     [[nodiscard]] bool expandInlineAsm(MirInstId id) {
         MirAsmDescriptor const& desc = mir.asmDescriptor(id);
         GrammarSchema const* dialect = asmDialect();
         if (dialect == nullptr) return false;
+
+        AsmStatementLocusGuard const asmLocus{reporter, desc,
+                                              reporter.all().size()};
 
         auto const operands = mir.instOperands(id);
         if (operands.size() != desc.inputs.size()) {
@@ -3367,6 +3406,11 @@ struct Lowerer {
     // ordinary non-terminator form, which this build lowers.)
     [[nodiscard]] bool lowerInlineAsmGoto(MirInstId id,
                                           std::span<MirBlockId const> succs) {
+        // Same locus rule as `expandInlineAsm` — the refusal names the MIR inst
+        // and the dialect but not the source statement, and the descriptor
+        // carries the statement's locus for exactly this.
+        AsmStatementLocusGuard const asmLocus{
+            reporter, mir.asmDescriptor(id), reporter.all().size()};
         dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
             DiagnosticSeverity::Error,
             std::format(

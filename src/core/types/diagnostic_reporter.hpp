@@ -162,6 +162,39 @@ public:
         for (ParseDiagnostic& d : all_) fn(d.buffer, d.span);
     }
 
+    // ★★★ RE-ANCHOR A RANGE OF ALREADY-ADMITTED DIAGNOSTICS ONTO A NEW PRIMARY
+    // LOCUS, demoting each one's current locus to a related location.
+    //
+    // WHY THIS EXISTS (D-ASM-TEMPLATE-DIAGNOSTIC-DOES-NOT-NAME-THE-C-STATEMENT):
+    // an embedded-assembly template's diagnostics are raised against the
+    // mid-compile-minted `<inline asm>` fragment buffer by code the CALLER
+    // cannot intercept (the grammar machinery and the asm engine report through
+    // the shared `DiagnosticReporter&`). Post-admission mutation is the only
+    // interception point that adds no interface — the precedent `remapBuffers`
+    // set for the preprocessor's line-map. ✔MEASURED, gcc 13.3 and clang 18:
+    // BOTH references make the C statement the PRIMARY locus of an inline-asm
+    // error (clang keeps the template as a `note:` block; gcc echoes its text),
+    // so the fragment locus is DEMOTED, never dropped.
+    //
+    // `from` is an index into `all()`: every diagnostic at index >= `from` gets
+    // (a) its current (buffer, span) appended to `related` with `note` — ONLY IF
+    // the buffer is valid; the buffer, not the span, is the discriminator,
+    // because a zero-width span at a real buffer is a genuine locus (a Missing
+    // node at a position) that must demote, while an invalid buffer means the
+    // diagnostic never had a locus and there is nothing to demote — and then
+    // (b) its primary set to (`newBuffer`, `newSpan`).
+    //
+    // Runs AFTER admission, exactly like `remapBuffers`: the dedup window is
+    // not rebuilt (duplicates were already coalesced on their original keys),
+    // no element is inserted or removed (so the cap marker's index stays
+    // valid), and `from > all().size()` is a no-op — a caller snapshots
+    // `all().size()` before a phase and reanchors after it, whatever the phase
+    // reported in between.
+    void reanchorFrom(std::size_t     from,
+                      BufferId        newBuffer,
+                      SourceSpan      newSpan,
+                      std::string_view note);
+
     // ★★★ THE BUFFERS THIS REPORTER'S OWN DIAGNOSTICS POINT INTO — the
     // retention that makes a MID-PIPELINE fragment renderable.
     //

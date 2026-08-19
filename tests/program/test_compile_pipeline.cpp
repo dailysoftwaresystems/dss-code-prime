@@ -1419,6 +1419,134 @@ TEST(Program_CompileFiles, MalformedAsmTemplateRendersTheOffendingTemplateLine) 
            "got:\n" << err2;
 }
 
+// ★★★ D-ASM-TEMPLATE-DIAGNOSTIC-DOES-NOT-NAME-THE-C-STATEMENT close. The
+// parent test above pinned that the OFFENDING TEMPLATE LINE renders; this one
+// pins the OTHER half the row was opened for: the diagnostic also names the C
+// STATEMENT that embedded the template — and names it as the PRIMARY locus.
+//
+// ✔MEASURED, both references, before the form was chosen (the row demanded it):
+//   gcc 13.3   `gt.c:3: Error: no such instruction: 'frobnicate %eax'`
+//   clang 18   `gt.c:3:13: error: invalid instruction mnemonic 'frobnicate'` with
+//              `<inline asm>:1:2: note: instantiated into assembly here`
+// BOTH make the C statement primary and NEITHER has template-primary, so the
+// reference-conforming shape is: C statement primary, template locus DEMOTED to
+// a related note (never dropped — the parent test's assertions stay green, the
+// `<inline asm>` header now renders under the note). The text-only wrapper
+// refusals this tier raises itself (`L_UnsupportedLoweringForOpcode`, no locus
+// at all before) gain the C primary.
+//
+// ★★ THE ASSERTIONS ARE EXACT, MEASURED STRINGS, not substrings-of-convenience:
+// the primary header `--> <file>.c:3:5` (col 5 = the statement start the HIR
+// span carries), the C line in the renderer's gutter, the note text that glues
+// the two loci into ONE diagnostic, and the template header/line in their
+// gutter. Asserting "the file name appears" alone would pass over a diagnostic
+// that named the file in prose and rendered no location — the exact vacuity
+// species the parent row shipped with.
+//
+// ⚠ RED-ON-DISABLE, demonstrated at authoring time: deleting the
+// `AsmStatementLocusGuard` instantiation in `expandInlineAsm` (or emptying
+// `reanchorFrom`) leaves every assertion on `bad_template.c:3:5` unsatisfied
+// while the parent test above stays green — the two tests pin orthogonal
+// halves of one render, which is why neither subsumes the other.
+TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // ARM 1 — template does not PARSE: the forwarded dialect diagnostic must
+    // carry the C statement as primary and the template as a related note.
+    auto const src = writeCSubsetSource(
+        scratch.path(), "bad_template.c",
+        "int main(void) {\n"
+        "    int r = 0;\n"
+        "    __asm__(\"movl $42, %0 @@@\" : \"=r\"(r));\n"
+        "    return r;\n"
+        "}\n");
+    // ARM 2 — template PARSES, the LOWERING refuses it (`frobnicate` is not in
+    // the instruction table): the engine's own refusal must render the same
+    // two-locus shape.
+    auto const src2 = writeCSubsetSource(
+        scratch.path(), "unlowerable_template.c",
+        "int main(void) {\n"
+        "    int r = 0;\n"
+        "    __asm__(\"frobnicate %0\" : \"=r\"(r));\n"
+        "    return r;\n"
+        "}\n");
+    scratch.useAsCwd();
+    Program prog;
+    testing::internal::CaptureStderr();
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc, 0) << "a template that does not parse must fail the build";
+    EXPECT_NE(err.find("bad_template.c:3:5"), std::string::npos)
+        << "expected the C statement as the PRIMARY locus (both reference "
+           "compilers lead with it); got:\n" << err;
+    EXPECT_NE(err.find(" 3 |     __asm__(\"movl $42, %0 @@@\" : \"=r\"(r));"),
+              std::string::npos)
+        << "expected the C statement line echoed in the renderer's gutter; "
+           "got:\n" << err;
+    EXPECT_NE(err.find("note: the assembly template this statement embedded"),
+              std::string::npos)
+        << "expected the related-note text that binds the two loci into one "
+           "diagnostic; got:\n" << err;
+    EXPECT_NE(err.find("--> <inline asm>:1:14"), std::string::npos)
+        << "expected the template locus, DEMOTED to a related note, still "
+           "rendering its header; got:\n" << err;
+    EXPECT_NE(err.find(" 1 | movl $42, %0 @@@"), std::string::npos)
+        << "expected the template line still echoed under the note; got:\n"
+        << err;
+
+    Program prog2;
+    testing::internal::CaptureStderr();
+    int const rc2 = prog2.compileFiles(
+        {src2.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err2 = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc2, 0) << "an unlowerable template must fail the build";
+    EXPECT_NE(err2.find("unlowerable_template.c:3:5"), std::string::npos)
+        << "expected the C statement as primary on the LOWERING refusal too; "
+           "got:\n" << err2;
+    EXPECT_NE(err2.find(" 3 |     __asm__(\"frobnicate %0\" : \"=r\"(r));"),
+              std::string::npos)
+        << "expected the C statement line echoed; got:\n" << err2;
+    EXPECT_NE(err2.find("--> <inline asm>:1:1"), std::string::npos)
+        << "expected the template locus as a related note at the mnemonic; "
+           "got:\n" << err2;
+    EXPECT_NE(err2.find(" 1 | frobnicate %0"), std::string::npos)
+        << "expected the template line echoed under the note — the caret run "
+           "alone is a substring of the C-primary statement's ~43-caret "
+           "underline and pins nothing by itself; got:\n" << err2;
+
+    // ARM 3 — `asm goto` with a label edge: refused at the TERMINATOR site
+    // (`lowerInlineAsmGoto`), a refusal that names the MIR inst and the
+    // dialect but never the statement — and its guard instance is a SEPARATE
+    // instantiation from expandInlineAsm's, so it needs its own witness
+    // (audit finding 2026-08-19: this arm shipped only as a CLI probe).
+    auto const src3 = writeCSubsetSource(
+        scratch.path(), "goto_template.c",
+        "int main(void) {\n"
+        "    int x = 1;\n"
+        "    __asm__ goto (\"jmp %l[done]\" : : \"r\"(x) : : done);\n"
+        "    x = 2;\n"
+        "done:\n"
+        "    return x;\n"
+        "}\n");
+    Program prog3;
+    testing::internal::CaptureStderr();
+    int const rc3 = prog3.compileFiles(
+        {src3.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err3 = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc3, 0) << "an `asm goto` with label edges must fail the build "
+                         "(the refusal is the correct current answer)";
+    EXPECT_NE(err3.find("goto_template.c:3:5"), std::string::npos)
+        << "expected the C statement as primary on the asm-goto refusal too; "
+           "got:\n" << err3;
+    EXPECT_NE(err3.find(
+                  " 3 |     __asm__ goto (\"jmp %l[done]\" : : \"r\"(x) : : done);"),
+              std::string::npos)
+        << "expected the C statement line echoed; got:\n" << err3;
+}
+
 // D-CAP-MARKER-MULTI-TARGET-E2E-PIN close (e4508b9 → next 2026-06-01):
 // the prior anchor was reserved because `D_TargetMachineCodeMismatch`
 // joined `kUnsuppressableCodes` and bypasses all cap/dedup gates —

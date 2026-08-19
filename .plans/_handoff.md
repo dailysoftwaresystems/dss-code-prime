@@ -9,8 +9,76 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-18 — cycle **P10 COMPLETE** (first-class config-driven LTO: schedule grammar + two-stage topology, shipped split decided by a runtime-measured rule). P9/P8/P7 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P10); parents `a0370fde` (P10 step 1) → `2557a717` (P10 pre-step) → `be0e883b` (Cycle P9, PUSHED).
+**Last updated:** 2026-08-19 — cycle **P11 COMPLETE**, the first cycle of the operator's standing **backlog loop** (*"/loop the /dss-cycle until all opened are fixed. all closed by the best long term implementation with no workarounds"*). P10/P9/P8 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P11); parent `bab8e008` (Cycle P10, PUSHED).
+
+---
+
+## 0.000000000 ★★★ READ THIS FIRST — CYCLE P11 (COMPLETE) + THE STANDING BACKLOG LOOP
+
+**The loop mandate (operator, 2026-08-19, verbatim):** *"/loop the /dss-cycle until all opened are
+fixed. all closed by the best long term implementation with no workarounds."* The queue is the
+operator's prioritized backlog (asm+miscompiles+errors → ap5/ap6 → tools → the rest), **verified
+against the registry before P11 picked** — and that verification changed the top of the queue:
+
+- **The operator's A1 and B1 cycles were already GONE**: `D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED`
+  ✅ 2026-08-17, `D-DEPS-DEPENDENCY-CANNOT-DECLINE-A-TARGET` ✅ 2026-08-15 (operator decision),
+  plus 4 more closed rows named in the backlog (P0016-detail, CRLF-divergence, PKG-config-tree,
+  BUILD-LAYOUT) — all confirmed by measurement, not recalled.
+- ⚠ **One correction to the answer I gave the operator:** I recommended
+  `D-ASM-PATCH-PARTIAL-OUTPUT-FAILLOUD` as the new top priority reading it OPEN HIGH — it has been
+  **✅ CLOSED since 2026-06-03**; its closure record sat in the WRONG TABLE CELL (see below), which
+  is why the balance gate and every list derived from it counted it open. Measured before P11
+  picked; the recommendation is withdrawn.
+
+**P11's deliverable — `D-ASM-TEMPLATE-DIAGNOSTIC-DOES-NOT-NAME-THE-C-STATEMENT` ✅ CLOSED:**
+an inline-asm template diagnostic now names the **C statement as its PRIMARY locus** with the
+template locus demoted to a related note. ✔Both references measured first (the row demanded it):
+clang 18 (`gt.c:3:13: error: …` + `<inline asm>:1:2: note: instantiated into assembly here`) and
+gcc 13.3 (`gt.c:3: Error: …`) **both lead with the C statement, neither has template-primary** —
+so DSS's old template-primary shape was itself the divergence. Mechanism: `MirAsmDescriptor`
+carries the statement locus (populated at HIR→MIR from the optional source map; sourceMap-less
+callers degrade to the old render, nothing fabricated); `DiagnosticReporter::reanchorFrom`
+(the `remapBuffers` post-admission precedent; demotes iff `buffer.valid()`) applied by an RAII
+guard over the whole `expandInlineAsm` body and around `lowerInlineAsmGoto`'s refusal, so no
+refusal site (or future one) can miss it; the text-only wrapper refusals gain the C primary
+(they had no locus at all). Witness: `AsmTemplateDiagnosticNamesTheEmbeddingCStatement` — both
+arms, exact rendered strings, red-on-disable demonstrated (guard deleted → new test RED, parent
+test GREEN). Design audit (independent): 3 CONCUR + 1 objection adopted (demote discriminator =
+buffer validity, not span emptiness — a zero-width span at a real buffer is a real locus).
+
+**The registry sweep that fell out — `D-PLANS-REGISTRY-CLOSURE-MARK-IN-WRONG-CELL` ✅ born-closed:**
+a closure record can sit in the Closing-work cell while the status cell (the one the balance gate
+reads) carries only the description — the row then counts OPEN forever. Full-registry pass found
+**8 rows with a cell-3 ✅ lead: 2 genuinely closed-but-miscounted, both repaired**
+(`D-ASM-PATCH-PARTIAL-OUTPUT-FAILLOUD` 2026-06-03, `D-LK10-ENTRY-RESOLVE-ENTRY-FN-IDX` 2026-06-02);
+2 genuinely OPEN rows whose cell-3 ✅ is a stale over-claimed closure (left as live work, cell 2
+authoritative); 4 🟢 design-record rows that stay counted OPEN by the gate's only-✅-closes
+contract (reclassifying them is an operator semantics decision — **flagged in the P11 report**).
+
+**Anchor delta: closed 3, opened 0, net −3** (balance gate OK; 707 → 704 registry-side).
+Gates: Win 898/898 baseline + full battery, WSL + arm64 VPS legs (this commit).
+
+**NEXT — the loop continues, this order (operator bands):**
+1. **asm remainder**: `D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` (narrowed to the `%l` label
+   half — real design work: a binding that names a BLOCK, the asm-goto refusal names the blocker)
+   · `D-ASM-TEMPLATE-IS-LEXED-TWICE` (LOW; ownership precondition ✅ landed; its consumer needs
+   designing) · `D-ASM-ARM64-GAS-SURFACE-INCOMPLETE` (vocabulary rows; check trigger) ·
+   `D-CSUBSET-ASM-LABEL-ON-SYNTHESIZED-SHIM-SYMBOL` (LOW).
+2. **the Mac-awake window, C5+C6+C7 TOGETHER** (all gated on Mac availability):
+   `D-LK-MACHO-X8664-DYLIB-RUNTIME` · `D-LK3-DYLIB-TLS-MODEL` · `D-LK3-DYLIB-WEAK-EXPORT` ·
+   `D-HARNESS-CROSS-HOST-ANY-TARGET` (macho leg inputs) · `D-TEST-MACOS-HOST-SPAWNS-FOREIGN-BINARY`
+   (over-claimed close, genuinely open) · `D-CODEGEN-MACHO-ARM64-X29` (SUSPECT — verify or
+   discharge). The Mac is usually OFF — never wake it; run the window when the operator has it on.
+3. **production errors**: C1 diagnostic coordinates
+   (`D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED`, HIGH, unconditional) → symbol tables ×5 →
+   dynamic linking ×2 → arch identity ×2 → diagnostic quality ×2 → `D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD`.
+4. **§B-gated, bring as decisions, do not build**: `D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER` +
+   `D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL` (the §5.4 operator-decision pair) ·
+   `D-MIR-SEH-FILTER-CLONER` (SUSPECT — verify or discharge, don't patch on suspicion).
+5. **Still queued behind the loop**: the full sqlite matrix re-run (operator: *"we'll re run
+   everything once our compile is fast enough"* — it is; P11 changes diagnostics only, not
+   codegen), then FC18.
 
 ---
 
@@ -1724,36 +1792,25 @@ clobbers. It is an `if`, **not** a `switch` — the compiler forces nothing. Shi
 
 ## 5. PRIORITIES
 
+0. **`NEXT` — THE STANDING BACKLOG LOOP (operator 2026-08-19).** One `/dss-cycle` per invocation,
+   working the operator's bands (asm+miscompiles+errors → ap5/ap6 → tools → the rest) **until all
+   OPEN rows are fixed, best long-term, no workarounds**. THE LIVE QUEUE IS §0.000000000's "NEXT"
+   list — read it there, never here; this item exists so the stepper finds the loop.
+   ⚠ **RE-DERIVE THE QUEUE FROM THE REGISTRY AT EVERY PICK, NEVER FROM A PREVIOUS LIST.** ✔Proved
+   twice: an earlier cycle's list named `D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED` (already closed),
+   and the 2026-08-19 backlog review — mine — recommended `D-ASM-PATCH-PARTIAL-OUTPUT-FAILLOUD`
+   reading it OPEN HIGH off the gate's count when it had been closed since 2026-06-03 with its
+   mark in the wrong cell. Recalling a row is not measuring it.
+0. **QUEUED BEHIND THE LOOP — the full sqlite MATRIX RE-RUN, now UNBLOCKED.** Operator sequencing:
+   *"we'll re run everything once our compile is fast enough"* — it is (Windows 38–41 s, WSL 33.6 s,
+   macOS 23.0 s on the CLI kit). Re-run when a loop cycle changes CODEGEN (diagnostics-only cycles
+   do not trigger it). Then FC18 ([[D-DIAG-CORPUS-EVERY-CODE]], sole remaining C23 phase — read its
+   BLOCKED note first; prerequisite `D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED`, which is also
+   the loop's C1 head).
 0. ✅ **DONE 2026-08-18 (Cycle P10): FIRST-CLASS, CONFIG-DRIVEN LTO** — [[D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE]] CLOSED (see §0.00000000). The grammar + two-stage topology shipped; the split decided by the runtime-measured rule; runtime-differential is a standing instrument.
-0. **`NEXT` — THE FULL sqlite MATRIX RE-RUN, now UNBLOCKED.** Operator sequencing 2026-08-18:
-   *"we'll re run everything once our compile is fast enough"* — it now is (Windows 38–41 s,
-   WSL 33.6 s, macOS 23.0 s on the CLI kit). The matrix (4 legs × build+run of both artifacts,
-   `dss-cross-leg-test` / the sqlite harness) re-runs against the P10 tree; per [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]]
-   the post-P9/P10 numbers are the honest baseline now. Then FC18
-   ([[D-DIAG-CORPUS-EVERY-CODE]], sole remaining C23 phase — read its BLOCKED note first).
-0. **(was) FIRST-CLASS, CONFIG-DRIVEN LTO.** [[D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE]], promoted
-   by operator ruling during P9 (verbatim: *"address it properly, long term solution, no
-   workarounds, 100% config driven. first class LTO implementation"*). The deliverable is the
-   TOPOLOGY — a per-TU pipeline and a link-time pipeline that are DIFFERENT documents — not
-   deleting the second call. The row carries the full closing work, including the measurement
-   obligation the old premise hid (per-CU passes can shrink a callee under `Inlining`'s size
-   cutoff, so default stage contents are a MEASUREMENT, not an analogy).
-   ⚠ P9's compile-time work made the merged optimize CHEAPER per call but did NOT touch the
-   duplicated topology — the residual optimize cost is now dominated by running the same pipeline
-   twice, which is exactly this row.
-   ✅ **DONE 2026-08-18 (Cycle P9): MAKE THE COMPILE FAST.** The four measured causes are fixed
-   with byte-identical output (see §0.0000000); [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]]
-   stays 🟠 OPEN against a re-measured **~2.1×** Windows-vs-WSL residual (the 8× was a Debug-vs-Release
-   harness artefact, closed as [[D-HARNESS-PS1-TIMES-A-DEBUG-COMPILER-WHILE-THE-SH-TWIN-TIMES-A-RELEASE-ONE]]),
-   candidates still unseparated — the row says step one is an experiment, not an edit.
-   The full-matrix re-run stays BLOCKED on the operator's *"we'll re run everything once our
-   compile is fast enough"* — the LTO cycle changes codegen, so the matrix belongs after it, not
-   before.
-   Then land the prioritized backlog in **plan-00 §0.1** (asm → ap → production errors → the rest)
-   so the stepper and the operator read one list rather than two that drift.
-   ⚠ **RE-DERIVE IT FROM THE REGISTRY, NEVER FROM THE PREVIOUS LIST.** ✔The list handed to the
-   operator in an earlier cycle named `D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED` as the top asm
-   priority; it had been **CLOSED earlier in that same cycle**. Recalling a row is not measuring it.
+0. ✅ **DONE 2026-08-18 (Cycle P9): MAKE THE COMPILE FAST.** Four measured causes fixed,
+   byte-identical output (§0.0000000). [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]] stays
+   🟠 OPEN at a ~2.1× residual — the row says step one is an experiment, not an edit.
 
 1. **FINISH THE P5 CYCLE.** Wave 2 is unstarted: the typed inline-asm view, the four
    semantic gates re-expressed, HIR/MIR carriage, the MIR→LIR expansion, `asm goto`'s CFG, the

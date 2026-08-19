@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/source_span.hpp"
+#include "core/types/strong_ids.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -98,6 +100,29 @@ struct DSS_EXPORT MirAsmDescriptor {
     // The assembly template, verbatim. Parsed by the dialect's own grammar at
     // expansion time (plan 29 §4.6: `%N` binding is STRUCTURAL) — never here.
     std::string templateText;
+
+    // ★★★ THE EMBEDDING STATEMENT'S LOCUS — CARRIED, NEVER RECONSTRUCTED
+    // (D-ASM-TEMPLATE-DIAGNOSTIC-DOES-NOT-NAME-THE-C-STATEMENT). A template
+    // diagnostic renders against the mid-compile-minted `<inline asm>` buffer,
+    // which names the byte INSIDE the template but never the source statement
+    // that embedded it — so a reader with three `__asm__` blocks in one file
+    // cannot tell which one is being refused. ✔MEASURED, both references:
+    // gcc 13.3 reports `gt.c:3: Error: no such instruction: …` and clang 18
+    // reports `gt.c:3:13: error: …` with a `note: instantiated into assembly
+    // here` block — BOTH make the C statement the primary locus, neither has
+    // template-primary. HIR→MIR is the last tier that can see the statement's
+    // span (MIR→LIR has no source map), so the locus travels on the descriptor
+    // exactly as `isExtended` does: a fact only the front end can see, carried
+    // rather than re-derived. `statementBuffer` is the strong id's invalid
+    // sentinel (`.valid() == false`) for the span-less callers — the LSP, the
+    // FFI header parser and direct-API tests bind no source map, and there the
+    // consumer omits the locus rather than guessing one.
+    bool        hasStatementLocus = false;
+    BufferId    statementBuffer{};
+    // `SourceSpan` is factory-only (`of`/`empty`), so the span-less default is
+    // the empty span at byte 0 — meaningless until `hasStatementLocus` says
+    // otherwise, exactly the `regClassResolved` rule one field up.
+    SourceSpan  statementSpan = SourceSpan::empty(0);
     // `__asm__ volatile` — the block may not be moved or elided even when its
     // outputs are unused. (Both asm opcodes are `hasSideEffects` +
     // `opcodeClobbersMemory` regardless, so this records the SOURCE's word; it

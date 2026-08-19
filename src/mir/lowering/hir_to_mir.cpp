@@ -9430,6 +9430,21 @@ struct Lowerer {
         desc.clobbersMemory         = src.clobbersMemory;
         desc.clobbersConditionCodes = src.clobbersConditionCodes;
 
+        // ★ THE STATEMENT'S LOCUS, same `unsupported` lookup, for a reader one
+        // tier down: every template diagnostic the LIR expansion raises will
+        // name this statement as its primary location, the shape both reference
+        // compilers emit (see the descriptor field's own banner). No source map
+        // (LSP, FFI header parser, direct-API callers) ⇒ no locus, and the
+        // consumer omits it rather than guessing — the `regClassResolved` rule
+        // two blocks below, applied to a span.
+        if (sourceMap != nullptr) {
+            if (auto const* loc = sourceMap->tryGet(node); loc != nullptr) {
+                desc.hasStatementLocus = true;
+                desc.statementBuffer   = loc->buffer;
+                desc.statementSpan     = loc->span;
+            }
+        }
+
         for (std::size_t i = 0; i < src.operands.size(); ++i) {
             HirInlineAsmOperand const& o = src.operands[i];
             if (!o.regClassResolved) {
