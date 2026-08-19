@@ -551,13 +551,14 @@ TEST(MachoDylibFormatPolicy, ImageFlavorTrueUndefinedImportsFalse) {
     // nothing to resolve it later -- reject at build time (unlike
     // the ELF .so's flat global scope).
     EXPECT_FALSE(loaded.format->allowsUndefinedImports());
-    // lib profile served; tdata/tbss NOT accepted
-    // (D-LK3-DYLIB-TLS-MODEL rejects by absence).
+    // lib profile served; tdata/tbss ACCEPTED since the P12 TLS opt-in
+    // (D-LK3-DYLIB-TLS-MODEL closed 2026-08-19: the dlopen TLV path is
+    // MEASURED on real Apple Silicon — see the format's $tlsAccessComment).
     EXPECT_TRUE(loaded.format->acceptsDataSection(DataSectionKind::Data));
     EXPECT_TRUE(
         loaded.format->acceptsDataSection(DataSectionKind::RelRoConst));
-    EXPECT_FALSE(loaded.format->acceptsDataSection(DataSectionKind::Tdata));
-    EXPECT_FALSE(loaded.format->acceptsDataSection(DataSectionKind::Tbss));
+    EXPECT_TRUE(loaded.format->acceptsDataSection(DataSectionKind::Tdata));
+    EXPECT_TRUE(loaded.format->acceptsDataSection(DataSectionKind::Tbss));
 }
 
 TEST(MachoDylibFormatPolicy, OutputExtensionIsDylib) {
@@ -1055,25 +1056,67 @@ TEST(MachoDylibWriter, ImageEntryOverrideFailsLoud) {
     EXPECT_TRUE(sawDiagnosticContaining(rep, "imageEntryOverride"));
 }
 
-TEST(MachoDylibWriter, LinkerGateRejectsThreadLocalByAbsence) {
-    // D-LK3-DYLIB-TLS-MODEL: tdata is not in supportedDataSections,
-    // so the linker's pre-walker gate rejects a thread-local loudly.
+// ── (6b) D-LK3-DYLIB-TLS-MODEL CLOSED 2026-08-19 (cycle P12): the TLS
+// opt-in, witnessed POSITIVELY. The row opened because the dlopen TLV path
+// was unverifiable off-Mac; it is now MEASURED on real Apple Silicon (arm64,
+// macOS 26.5.2: a worker thread dlopen'ing a TLV image and a MAIN thread
+// alive before the load BOTH observe fresh, initialized instances — the
+// format's $tlsAccessComment carries the probe). Mach-O TLV descriptors are
+// per-image, so the dylib shares the exec's walker machinery unchanged; the
+// format-level declaration is what un-gates it. This test replaces the
+// rejection pin that used to sit here (the absence it pinned is gone).
+TEST(MachoDylibWriter, ThreadLocalDylibLinksAndCarriesTLV) {
     auto loaded = loadShippedDylib();
     ASSERT_TRUE(loaded.target && loaded.format);
     AssembledModule mod = makeExportModule();
     AssembledData t;
     t.symbol    = SymbolId{9};
     t.section   = DataSectionKind::Tdata;
-    t.bytes     = {1, 0, 0, 0};
+    t.bytes     = {7, 0, 0, 0};
     t.alignment = Alignment::of<4>();
     mod.dataItems.push_back(std::move(t));
     mod.symbols.push_back(ModuleSymbol{SymbolId{9}, "_tls_var",
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
+    // The ZERO-INIT half (`static thread_local int c;`) — exercises the
+    // S_THREAD_LOCAL_ZEROFILL arm and its contiguity rule, not just tdata.
+    AssembledData z;
+    z.symbol    = SymbolId{10};
+    z.section   = DataSectionKind::Tbss;
+    z.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(z));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_tls_zero",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
     DiagnosticReporter rep;
     auto img = linker::link(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_GT(rep.errorCount(), 0u);
-    EXPECT_TRUE(sawDiagnosticContaining(rep, "supportedDataSections"));
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    // Links CLEAN — the pre-walker gate now ADMITS tdata/tbss (the old
+    // rejection was the absence this row existed for).
+    ASSERT_TRUE(img.ok());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    auto const& bytes = img.bytes;
+
+    // The three TLV sections ship, exactly as on the exec arm.
+    ASSERT_TRUE(findSection(bytes, "__DATA", "__thread_data").has_value());
+    ASSERT_TRUE(findSection(bytes, "__DATA", "__thread_bss").has_value());
+    auto const tv = findSection(bytes, "__DATA", "__thread_vars");
+    ASSERT_TRUE(tv.has_value());
+
+    // TWO thread-locals ⇒ TWO 24-byte descriptors (section_64.size at +40).
+    EXPECT_EQ(readU64LE(bytes, *tv + 40), 48u)
+        << "expected exactly two tlv_descriptors, one per thread-local";
+
+    // The descriptor's word0 thunk is the libSystem bind: the bind stream
+    // carries __tlv_bootstrap by name (dyld overwrites word0 at load).
+    auto const di = readDyldInfo(bytes);
+    ASSERT_TRUE(di.found);
+    ASSERT_GT(di.bindSize, 0u);
+    std::string const bindStr(
+        reinterpret_cast<char const*>(&bytes[di.bindOff]), di.bindSize);
+    EXPECT_NE(bindStr.find("__tlv_bootstrap"), std::string::npos)
+        << "the TLV descriptor's word0 must bind the libSystem bootstrap "
+           "thunk, exactly as the exec arm does";
 }
 
 // ── (7) validate() shape rules ───────────────────────────────────

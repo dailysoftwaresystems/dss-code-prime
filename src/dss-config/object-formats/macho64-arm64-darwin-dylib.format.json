@@ -1,5 +1,5 @@
 {
-  "$comment": "Mach-O DYNAMIC LIBRARY (MH_DYLIB, .dylib) for ARM64 Darwin/macOS (Apple Silicon) -- c153, the D-LK3-3 anchor (plan 14 / roadmap A3): the Mach-O mirror of the c150 ELF .so + c152 PE .dll. Consumed by `src/link/format/macho.cpp` via the format-blind linker engine: `macho.filetype = dylib` routes UNCONDITIONALLY through the SAME `encodeExecDynamic` substrate the exec image uses (even with zero externs -- the export trie needs the dynamic arm), with the dylib divergences: mach_header filetype MH_DYLIB (6) + no MH_PIE, NO __PAGEZERO (base-0 image dyld slides at load -- `image.pageZeroSize` = 0 and __TEXT.vmaddr = 0), NO LC_LOAD_DYLINKER (mapped by the already-running dyld), NO LC_MAIN (a dylib has no process entry; validate() rejects the entry cluster here exactly as the ELF dyn + PE dll schemas do), an LC_ID_DYLIB carrying `image.installName`, the EXPORT TRIE in LC_DYLD_INFO_ONLY.export_off (every externally-visible defined function + data global, real prefix-compressed radix nodes dlsym walks), real-named nlist entries for externally-visible functions, internal absolute data slots (fn-ptr tables / &global initializers / relro rows) REBASE-opcoded so dyld adds the load slide (the ELF R_X86_64_RELATIVE mirror), extern-targeted data slots emitted as SYMBOL-BASED dyld BIND opcodes with the slot zeroed (D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR Mach-O half -- the ELF c150 symbol-based-Rela mirror; never the baked got-slot/stub address), and an ad-hoc code signature with execSegFlags = 0 (NOT CS_EXECSEG_MAIN_BINARY -- codesign ground truth for a non-main image; Apple Silicon refuses to dlopen unsigned native code, so DSS self-signs). The macOS loader consumes the output: `dlopen(\"./libdss.dylib\") + dlsym(\"dss_add\")` on Apple Silicon. Differs from macho64-arm64-darwin-exec.format.json in: `macho.filetype` (dylib vs execute), `macho.flags` 0x100085 = MH_NOUNDEFS|MH_DYLDLINK|MH_TWOLEVEL|MH_NO_REEXPORTED_DYLIBS (the ld64 dylib convention -- NO MH_PIE, an executable-only flag; NO_REEXPORTED_DYLIBS is safe: DSS emits no LC_REEXPORT_DYLIB), `image.pageZeroSize` 0, NO `image.dylinkerPath`, NEW `image.installName`, text `virtualAddress` = segmentPageSize (base-0 image by construction -- validate() pins the equality, the ELF dyn text-VA==pageAlign mirror), NO `entryPoint`/`processExit`/`entryCallingConvention`/`processArgs`, NO `tlsAccess` and NO tdata/tbss rows (thread-locals in a dlopen'd dylib are an UNVERIFIED form on this no-Mac host even though Mach-O TLV descriptors are per-image -- D-LK3-DYLIB-TLS-MODEL; every thread_local fails loud at the linker's supportedDataSections gate by this set's absence, mirroring D-LK-DYN-TLS-MODEL / D-LK-DLL-TLS-MODEL), NO `librarySynthesis` (the pthread <threads.h> shim inside a dylib is an untested form -- the c152 dll precedent), and `artifactProfiles` [\"lib\"].",
+  "$comment": "Mach-O DYNAMIC LIBRARY (MH_DYLIB, .dylib) for ARM64 Darwin/macOS (Apple Silicon) -- c153, the D-LK3-3 anchor (plan 14 / roadmap A3): the Mach-O mirror of the c150 ELF .so + c152 PE .dll. Consumed by `src/link/format/macho.cpp` via the format-blind linker engine: `macho.filetype = dylib` routes UNCONDITIONALLY through the SAME `encodeExecDynamic` substrate the exec image uses (even with zero externs -- the export trie needs the dynamic arm), with the dylib divergences: mach_header filetype MH_DYLIB (6) + no MH_PIE, NO __PAGEZERO (base-0 image dyld slides at load -- `image.pageZeroSize` = 0 and __TEXT.vmaddr = 0), NO LC_LOAD_DYLINKER (mapped by the already-running dyld), NO LC_MAIN (a dylib has no process entry; validate() rejects the entry cluster here exactly as the ELF dyn + PE dll schemas do), an LC_ID_DYLIB carrying `image.installName`, the EXPORT TRIE in LC_DYLD_INFO_ONLY.export_off (every externally-visible defined function + data global, real prefix-compressed radix nodes dlsym walks), real-named nlist entries for externally-visible functions, internal absolute data slots (fn-ptr tables / &global initializers / relro rows) REBASE-opcoded so dyld adds the load slide (the ELF R_X86_64_RELATIVE mirror), extern-targeted data slots emitted as SYMBOL-BASED dyld BIND opcodes with the slot zeroed (D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR Mach-O half -- the ELF c150 symbol-based-Rela mirror; never the baked got-slot/stub address), and an ad-hoc code signature with execSegFlags = 0 (NOT CS_EXECSEG_MAIN_BINARY -- codesign ground truth for a non-main image; Apple Silicon refuses to dlopen unsigned native code, so DSS self-signs). The macOS loader consumes the output: `dlopen(\"./libdss.dylib\") + dlsym(\"dss_add\")` on Apple Silicon. Differs from macho64-arm64-darwin-exec.format.json in: `macho.filetype` (dylib vs execute), `macho.flags` 0x100085 = MH_NOUNDEFS|MH_DYLDLINK|MH_TWOLEVEL|MH_NO_REEXPORTED_DYLIBS (the ld64 dylib convention -- NO MH_PIE, an executable-only flag; NO_REEXPORTED_DYLIBS is safe: DSS emits no LC_REEXPORT_DYLIB), `image.pageZeroSize` 0, NO `image.dylinkerPath`, NEW `image.installName`, text `virtualAddress` = segmentPageSize (base-0 image by construction -- validate() pins the equality, the ELF dyn text-VA==pageAlign mirror), NO `entryPoint`/`processExit`/`entryCallingConvention`/`processArgs`, `tlsAccess` + tdata/tbss rows OPTED IN 2026-08-19 (cycle P12): the dlopen TLV path is MEASURED on real Apple Silicon and dylib thread-locals work through the SAME per-image TLV descriptors the exec uses (D-LK3-DYLIB-TLS-MODEL, CLOSED -- see $tlsAccessComment), NO `librarySynthesis` (the pthread <threads.h> shim inside a dylib is an untested form -- the c152 dll precedent), and `artifactProfiles` [\"lib\"].",
 
   "dssObjectFormatVersion": 1,
 
@@ -37,8 +37,13 @@
   "$dataImportBindingComment": "c153 (D-LK3-3 + D-LK-EXTERN-DATA-IMPORT): extern library DATA objects bind via Mach-O __got non-lazy pointers exactly as on the exec image (the import machinery is dyld's, not the artifact flavor's -- the c152 PE precedent): the walker reserves a __got slot per imported object, the bind stream names the symbol + owning dylib ordinal, dyld writes the object's address at load, and the c117 GotIndirect lowering (lea-of-slot + deref) reads it.",
   "dataImportBinding": "got-indirect",
 
-  "$supportedDataSectionsComment": "rodata (read-only __TEXT,__const -- reloc-FREE items only: a reloc-bearing const item routes to relro at the producer, and a hand-built reloc-bearing rodata item fails loud at the walker's __const rebase guard), data (mutable initialized globals, __DATA,__data), bss (zero-init, __DATA,__bss S_ZEROFILL), relro (reloc-bearing CONST data, c145 -- merged into __data by the image arm so its rebase/bind slots land in dyld-writable pages, the same fold the exec makes). NO tdata/tbss: thread-locals in a dlopen'd dylib are an unverified form (D-LK3-DYLIB-TLS-MODEL); the linker's pre-walker gate rejects them loudly by this set's absence.",
-  "supportedDataSections": ["rodata", "data", "bss", "relro"],
+  "$supportedDataSectionsComment": "rodata (read-only __TEXT,__const -- reloc-FREE items only: a reloc-bearing const item routes to relro at the producer, and a hand-built reloc-bearing rodata item fails loud at the walker's __const rebase guard), data (mutable initialized globals, __DATA,__data), bss (zero-init, __DATA,__bss S_ZEROFILL), relro (reloc-bearing CONST data, c145 -- merged into __data by the image arm so its rebase/bind slots land in dyld-writable pages, the same fold the exec makes). tdata/tbss: OPTED IN 2026-08-19 (cycle P12, D-LK3-DYLIB-TLS-MODEL) -- the dlopen TLV path is now MEASURED on real Apple Silicon (see $tlsAccessComment); the linker's pre-walker gate admits thread-local items exactly as the exec arm does.",
+  "supportedDataSections": ["rodata", "data", "bss", "tdata", "tbss", "relro"],
+
+  "$tlsAccessComment": "D-LK3-DYLIB-TLS-MODEL closed 2026-08-19 (cycle P12): the `macho-tlv` model, IDENTICAL to the exec sibling's (see that file's $tlsAccessComment for the descriptor-call access sequence and the writer machinery -- all shared). The open question this row existed for was whether dyld's TLV setup runs for a dlopen'd (vs launch-time) image and how threads existing BEFORE the dlopen observe the new image's thread-locals. MEASURED on real Apple Silicon (arm64, macOS 26.5.2, a clang-built TLV dylib + dlopen client, probe in the cycle's artifact log): a WORKER thread dlopen'ing the image reads its own instance (bump 7->8) and the MAIN thread -- alive before the load -- observes a FRESH, INITIALIZED instance (initial 7, bump 8). Mach-O TLV descriptors are per-image (each image carries its own __thread_vars and dyld rewires at image load), so NO dylib-specific access machinery exists to declare: the exec's model IS the dylib's model. The format-level declaration is what un-gates the MIR->LIR access lowering and the linker's section gate for the `lib` artifact profile.",
+  "tlsAccess": {
+    "model": "macho-tlv"
+  },
 
   "$artifactProfilesComment": "This format SERVES the shared-library profile (plan 06 AP3), mirroring elf64-x86_64-linux-dyn + pe64-x86_64-windows-dll. The cli profile is NOT served (a .dylib is not a runnable console binary). \u2605 `module` JOINED THIS SET 2026-08-15 (plan 06 \u00a75.1 B.12, as CORRECTED): a module IS a library, so it is served by every format that serves `lib` or `staticlib` and by nothing else. `artifactProfile` says what a project builds ITSELF as; `DependencyComposition` says how it is CONSUMED (`module` is SourceMerge \u2014 a consumer takes its SOURCES and ignores its artifact). Those are orthogonal, so a module builds standalone like any other library and the static-vs-dynamic choice is made by the `<target>:<format>` spec the author writes in `targets[]`, exactly as it already is for `lib` vs `staticlib` \u2014 no new rule and no engine change.",
   "artifactProfiles": ["lib", "module"],
@@ -117,7 +122,41 @@
       "addrAlign": 8,
       "entrySize": 0,
       "virtualAddress": 0
+    },
+    {
+      "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C4): __thread_data within __DATA — the INITIALIZED thread-local TEMPLATE (`thread_local int g = 7;`). `type` (section_64.flags) = S_THREAD_LOCAL_REGULAR = 0x11 = 17: dyld COPIES this section's bytes into every thread's freshly-allocated TLS block (the per-thread initial image). File-backed (contributes __DATA file bytes). It is the LOW address of the per-thread TLV template region [__thread_data, __thread_bss-end); each descriptor's word2 (offset) is measured from here (CRIT-2, 0-based). addrAlign=1 is the FLOOR (member-driven, gcc/ld64 parity — a larger floor would inflate every thread's block); the walker H1-raises it to the strictest thread-local's alignment (capped at 16 by the over-align gate). virtualAddress=0 — walker-computed after __data.",
+      "kind": "tdata",
+      "name": "__thread_data",
+      "segment": "__DATA",
+      "type": 17,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C4): __thread_bss within __DATA — the ZERO-INIT thread-local TEMPLATE extent (`static thread_local int c;`). `type` (section_64.flags) = S_THREAD_LOCAL_ZEROFILL = 0x12 = 18: like S_ZEROFILL it occupies VM but stores NO file bytes (section_64.offset=0; excluded from __DATA.filesize) and MUST follow __thread_data CONTIGUOUSLY so the TLV region is one span (dyld calloc's the block, so the zero-fill tail reads 0 in every thread). addrAlign=1 FLOOR (H1-raised, <=16). virtualAddress=0 — walker places it at __thread_data-VA + alignUp(tdataSpan, tbssAlign) so a tbss var's descriptor offset is block-relative. reuses the shared isZeroFill predicate.",
+      "kind": "tbss",
+      "name": "__thread_bss",
+      "segment": "__DATA",
+      "type": 18,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C4): __thread_vars within __DATA — the thread-local variable DESCRIPTORS. `type` (section_64.flags) = S_THREAD_LOCAL_VARIABLES = 0x13 = 19. Each 24-byte `tlv_descriptor` = { word0 thunk (a bind to the undefined libSystem `__tlv_bootstrap`; dyld overwrites it with its tlv_get_addr at load), word1 key (0; dyld fills the pthread key), word2 offset (the variable's 0-based offset into the [__thread_data,__thread_bss] block) }. WRITER-synthesized (not AssembledData) — the writer mints one per thread-local and stores symbolVa[sym]=descriptorVA so the access adrp/add resolves here (F3). File-backed. addrAlign=8 (three u64 words). entrySize could be 24 but the writer emits it as 0 (matching __got's table convention). virtualAddress=0 — walker-computed; the descriptors are NOT part of the per-thread copied template.",
+      "kind": "tvars",
+      "name": "__thread_vars",
+      "segment": "__DATA",
+      "type": 19,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
     }
+
   ],
 
   "relocations": [

@@ -2807,22 +2807,18 @@ encodeExecDynamic(AssembledModule const&    module,
     bool const hasTbss  = !tbssLayout.empty();
     bool const hasTls   = hasTdata || hasTbss;
     // c153 F4 fold -- the D-LK3-DYLIB-TLS-MODEL walker belt (the
-    // elf.cpp `isDyn && hasTls` sibling): thread-locals in a dlopen'd
-    // dylib are an UNVERIFIED form on this no-Mac host (dlopen-time
-    // TLV setup + pre-existing-thread access unwitnessed). The shipped
-    // dylib schema advertises no tdata/tbss, so the linker's section
-    // gate rejects first; THIS belt catches a hand-built module / a
-    // future schema opting in without a Mac witness -- never a
-    // silently-shipped unverified TLV image.
-    if (isDylib && hasTls) {
-        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
-             "macho::encodeExecDynamic: thread-local items in an "
-             "MH_DYLIB -- the dlopen-time TLV path is unverified on "
-             "this host; the dylib format must not opt into "
-             "tdata/tbss until a Mac witness exists "
-             "(D-LK3-DYLIB-TLS-MODEL).");
-        return {};
-    }
+    // elf.cpp `isDyn && hasTls` sibling) -- REMOVED 2026-08-19 (cycle P12):
+    // the belt existed to keep a schema from opting into tdata/tbss "until a
+    // Mac witness exists", and that witness now DOES (✔MEASURED on real
+    // Apple Silicon, arm64 macOS 26.5.2: a worker thread dlopen'ing a TLV
+    // image reads its own instance, and a MAIN thread alive BEFORE the load
+    // observes a FRESH, INITIALIZED instance — the per-image TLV descriptor
+    // model dyld documents, now witnessed rather than inferred). The shipped
+    // arm64 dylib schema opts in via supportedDataSections + tlsAccess in the
+    // same commit; `ThreadLocalDylibLinksAndCarriesTLV` pins the positive
+    // path, and the x86_64 dylib sibling still declines (its own Rosetta-gated
+    // arm, D-LK-MACHO-X8664-DYLIB-RUNTIME, now run-witnessed exit-42 — its
+    // TLS half rides the x86_64 EXEC's own opt-in, still declined).
     // Each present section's schema row is MANDATORY (the format opted into
     // tdata/tbss via supportedDataSections; a missing row is a config bug),
     // the tlsAccess model must be macho-tlv, and each section type MUST be the

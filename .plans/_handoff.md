@@ -9,8 +9,65 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-19 — cycle **P11 COMPLETE**, the first cycle of the operator's standing **backlog loop** (*"/loop the /dss-cycle until all opened are fixed. all closed by the best long term implementation with no workarounds"*). P10/P9/P8 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P11); parent `bab8e008` (Cycle P10, PUSHED).
+**Last updated:** 2026-08-19 — cycle **P12 COMPLETE** (the Mac-awake window: four rows closed on real-Apple-Silicon measurements). P11/P10/P9 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P12); parent `b144e05e` (Cycle P11, PUSHED).
+
+---
+
+## 0.0000000000 ★★★ READ THIS FIRST — CYCLE P12 (COMPLETE): THE MAC-AWAKE WINDOW — FOUR ROWS CLOSED ON REAL HARDWARE
+
+The operator turned the Mac on (*"mac is on. you can try it"*), which made the availability-gated
+window the pick. **Every closure below was MEASURED on the Mac (arm64, macOS 26.5.2) before
+anything was declared**, and the window's queue was RE-DERIVED at pick time — half of it had
+CLOSED UNDERNEATH the list (C6 done TF-C109; C7's named blockers done TF-C117/C121/C124):
+
+1. **`D-LK-MACHO-X8664-DYLIB-RUNTIME` ✅** — the Rosetta run leg: DSS-built x86_64 `.dylib` +
+   client, `arch -x86_64` → **exit 42**. Detail recorded in the row: macOS strips `DYLD_*` env
+   for these processes (measured), so the client links with the carriage's documented import-name
+   override — the clang equivalent of linking by path.
+2. **`D-CODEGEN-MACHO-ARM64-X29-ALLOCATED-WITH-NO-FRAME-RECORD` ✅ DISCHARGED** — the crash
+   reporter walks a DSS arm64 image's mid-function fault **fully symbolicated**
+   (`leaf←middle←outer←main`), identical to the clang control. The ABI inference was refuted on
+   the exact surface the row named; x29 stays allocatable, no config change (a register saved
+   from a non-defect).
+3. **`D-LK1-MACHO-X8664-DARWIN-DATA-SECTION` ✅** — its config half shipped 2026-08-05 (the row
+   was STALE — the exact class `D-FORMAT-MACHO-X86_64-EXEC-DECLARES-NO-DATA-SECTIONS` warned
+   about); the Rosetta run leg landed now: rodata/data/bss TU → **exit 42**.
+4. **`D-LK3-DYLIB-TLS-MODEL` ✅** — witnessed → declared → run end-to-end: (a) the clang probe
+   measured the row's exact unknown (a thread alive BEFORE a dlopen sees a FRESH, INITIALIZED
+   TLV instance); (b) the arm64 dylib format opts in (three `__thread_*` rows from the exec
+   sibling + `tlsAccess` + `supportedDataSections`; x86_64 sibling gets its absent-rationale);
+   (c) the walker belt removed — its own trigger ("until a Mac witness exists") fired; (d) the
+   rejection pin replaced by `ThreadLocalDylibLinksAndCarriesTLV` (strict: 48 B of descriptors,
+   `__tlv_bootstrap` in the bind stream); (e) a DSS `_Thread_local` dylib + client, run NATIVELY
+   → **exit 42**.
+
+Gates: Windows 898/898 · Mac full ctest green (both on the final tree) · WSL + arm64 VPS legs
+(this commit). Anchor delta: **closed 4, opened 0, net −4**. Independent code audit: CLEAN on
+correctness; its MEDIUM finding (no in-suite corpus arm builds a `_Thread_local` dylib — the
+two-file client shape is needed) is recorded as the STATED RESIDUAL in the D-LK3 row and queued
+below; its LOW stale-citation finding folded same-cycle; MH_HAS_TLV_DESCRIPTORS covered
+structurally at the shared flag site (both polarities pinned exec-side).
+
+⚠ **The Mac window is STILL OPEN and the queue for it is NOT empty** — remaining Mac-gated work,
+next window: the C7 provider conversions (`D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-
+ONE-DRIVER` PARTIALLY CLOSED: generalize `ubuntu-ports` onto pinned-archive + declare routes for
+`elf64-x86_64`/`pe64-x86_64` + the `.ps1` dispatch arm for elf64-arm64 — the four red BUILD-matrix
+cells) — then validate the macOS×{elf64-x86_64, pe64-x86_64} cells ON the Mac. `D-LK3-DYLIB-WEAK-
+EXPORT`'s validation also wants the Mac (implementation is format-side).
+
+**NEXT — the loop continues:** (1) the C7 provider conversions above while the Mac is up;
+(1b) the TLS-dylib CORPUS ARM (audit residual): a two-file `_Thread_local` dylib + client
+example/integrated arm so a `lib`-profile regression reds in-tree (`test_ffi_resolve_library`'s
+two-TU pattern);
+(2) if the window closes: asm remainder (`D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` label
+half — the asm-goto BLOCK binding design; `D-ASM-TEMPLATE-IS-LEXED-TWICE` LOW;
+`D-ASM-ARM64-GAS-SURFACE-INCOMPLETE` — re-measure, it predates the CFI producer landing);
+(3) C1 diagnostic coordinates (`D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED`, HIGH);
+(4) §B pairs stay decisions (`D-ASM-RIP-RELATIVE…` + `D-ASM-ADDRESS-OPERAND…`;
+`D-MIR-SEH-FILTER-CLONER` SUSPECT — verify or discharge). sqlite matrix re-run still queued for
+the next codegen-changing cycle (P12 changes the DYLIB code path — a `lib`-profile corpus leg
+would re-run it; the CLI/units corpus is unaffected).
 
 ---
 
@@ -1794,8 +1851,8 @@ clobbers. It is an `if`, **not** a `switch` — the compiler forces nothing. Shi
 
 0. **`NEXT` — THE STANDING BACKLOG LOOP (operator 2026-08-19).** One `/dss-cycle` per invocation,
    working the operator's bands (asm+miscompiles+errors → ap5/ap6 → tools → the rest) **until all
-   OPEN rows are fixed, best long-term, no workarounds**. THE LIVE QUEUE IS §0.000000000's "NEXT"
-   list — read it there, never here; this item exists so the stepper finds the loop.
+   OPEN rows are fixed, best long-term, no workarounds**. THE LIVE QUEUE IS the TOP cycle block's
+   "NEXT" list — read it there, never here; this item exists so the stepper finds the loop.
    ⚠ **RE-DERIVE THE QUEUE FROM THE REGISTRY AT EVERY PICK, NEVER FROM A PREVIOUS LIST.** ✔Proved
    twice: an earlier cycle's list named `D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED` (already closed),
    and the 2026-08-19 backlog review — mine — recommended `D-ASM-PATCH-PARTIAL-OUTPUT-FAILLOUD`
