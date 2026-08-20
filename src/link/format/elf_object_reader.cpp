@@ -1,4 +1,5 @@
 #include "link/format/elf_object_reader.hpp"
+#include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
@@ -458,6 +459,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // byte, with a residual addend. This is how gcc names string literals / jump
     // tables / local objects; without the redirect the merge cannot bind them.
     std::unordered_set<std::uint32_t> atomSymIdx;
+    // Every DEFINED symbol recorded WITHOUT an atom, staged for the shared
+    // coverage guard -- see `link/format/object_atom_coverage.hpp`.
+    std::vector<link::format::BodilessDefinedSymbol> bodilessDefined;
 
     auto sliceInBounds = [&](Shdr const& sec, std::uint64_t off, std::uint64_t len)
         -> bool {
@@ -582,6 +586,29 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                                                    sy.name, stbToBinding(stBind(sy.info)),
                                                    stvToVisibility(stVis(sy.other))});
         };
+        // Stage a BODILESS defined symbol for the shared coverage guard
+        // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM) --
+        // called at every site below that records a ModuleSymbol WITHOUT
+        // reconstructing an atom for it. Only a KIND-RESOLVED section is staged:
+        // a DWARF/metadata symbol reconstructs no body BY DESIGN and is not a
+        // dropped body. `st_size` is passed through, so the guard's own
+        // "zero extent is a MARKER, not a body" rule covers this reader's
+        // mapping symbols (`$d`/`$x`) and size-less text labels -- the SAME
+        // judgment the slicing arms below already make, expressed once.
+        //
+        // ⓘ ELF is the reader this defect does NOT affect: it slices any
+        // STT_FUNC with a non-empty extent regardless of BINDING, so a
+        // file-local function is an atom here. The staging exists so the guard
+        // is genuinely reader-agnostic rather than a COFF/Mach-O special case --
+        // and so a future ELF arm that starts demoting bodies cannot do it
+        // quietly.
+        auto stageBodiless = [&] {
+            if (sy.name.empty() || !rk.has_value()) return;
+            bodilessDefined.push_back(link::format::BodilessDefinedSymbol{
+                /*sectionKey=*/sy.shndx, /*sectionOffset=*/sy.value,
+                /*declaredSize=*/sy.size, /*name=*/sy.name,
+                /*sectionName=*/sec.name});
+        };
 
         // A function MUST live in an executable section. A STT_FUNC anywhere
         // else is corrupt -- fail loud (never mis-slice code as data).
@@ -616,6 +643,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     Interval{sy.value, sy.size, mod.functions.size()});
                 atomSymIdx.insert(static_cast<std::uint32_t>(i));
                 mod.functions.push_back(std::move(fn));
+            } else {
+                stageBodiless();   // no atom -- the guard decides (see above)
             }
             pushModuleSym();
             continue;
@@ -633,6 +662,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // an empty item and fail loud. ModuleSymbol only -- and NO
             // interval. (Agnostic: keyed on the zero extent, never the `$`
             // name.) Not a dropped body -- there are no bytes.
+            stageBodiless();       // st_size == 0 -- the guard skips it as a MARKER
             pushModuleSym();
             continue;
         }
@@ -689,6 +719,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                   "silently drop a code/data body. Add the section's kind (a "
                   "format schema row or a resolveSectionKind arm).");
         }
+        stageBodiless();   // self-gates on a RESOLVED kind (see above)
         pushModuleSym();
     }
 
@@ -794,6 +825,30 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             cursor = std::max(cursor, iv.start + iv.len);
         }
         if (cursor < sec.size) emitGap(cursor, sec.size);
+    }
+
+    // -- (6.6) Coverage guard: no defined symbol's body was dropped -------
+    //
+    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM. Placed
+    // AFTER the gap-atom pass, not before it: a `.LC` string literal owned by no
+    // symbol becomes an atom there, and asking the coverage question before that
+    // would judge the reconstruction half-finished. The check itself is shared
+    // and format-neutral -- see `link/format/object_atom_coverage.hpp`.
+    {
+        std::vector<link::format::ReconstructedAtomExtent> extents;
+        for (auto const* bySec : {&funcIntervalsBySec, &dataIntervalsBySec}) {
+            for (auto const& [secIdx, ivs] : *bySec) {
+                for (auto const& iv : ivs) {
+                    extents.push_back(link::format::ReconstructedAtomExtent{
+                        secIdx, iv.start, iv.len});
+                }
+            }
+        }
+        if (!link::format::everyDefinedSymbolIsCoveredByAnAtom(
+                bodilessDefined, extents, "elf::readRelocatableObject",
+                reporter)) {
+            return std::nullopt;
+        }
     }
 
     // -- (7) Reconstruct relocations from every SHT_RELA section -----

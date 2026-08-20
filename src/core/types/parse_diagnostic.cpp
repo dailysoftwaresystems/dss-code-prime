@@ -485,6 +485,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "F_HeaderNameCaseAmbiguous";
         case DiagnosticCode::F_ShippedCorpusInvariantBroken:
             return "F_ShippedCorpusInvariantBroken";
+        case DiagnosticCode::F_ObjectReaderSymbolBodyDropped:
+            return "F_ObjectReaderSymbolBodyDropped";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch

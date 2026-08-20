@@ -194,6 +194,30 @@ dss_add_test(NAME link/test_macho_object_reader SOURCES test_macho_object_reader
 # schema fail-loud, and the DTYPE_FUNCTION extern isData inference.
 dss_add_test(NAME link/test_coff_object_reader SOURCES test_coff_object_reader.cpp)
 
+# D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM -- the
+# ATOM-COVERAGE guard shared by all three relocatable-object readers
+# (`link/format/object_atom_coverage.hpp`). The COFF/Mach-O readers demote every
+# non-external defined section symbol to a bodiless ModuleSymbol, which is right
+# for an `&&label` and wrong for a file-local (`static`) function; a CALLED one
+# failed loud downstream, an UNCALLED one linked GREEN with its bytes dropped.
+# The pins assert SIZES rather than success -- "a green read accounts for every
+# byte of the section" is the assertion that sees the defect, because the link
+# succeeding was the problem. Also pins ELF (unaffected -- st_size makes a local
+# function an atom) and the interior block label that must NOT trip the guard.
+dss_add_test(NAME link/test_object_atom_coverage SOURCES test_object_atom_coverage.cpp)
+
+# D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT (OPEN,
+# HIGH) -- the OBJECT-vs-IMAGE relocation-vocabulary census. `readArchiveMemberModule`
+# reads a member against the FINAL IMAGE's format, which is harmless only because
+# most families' object and image vocabularies happen to declare the same
+# `nativeId` per `kind`. This derives the census from the shipped configs at run
+# time and pins the divergent set EXACTLY, so the one family where the
+# coincidence already fails cannot become two without a red. It pins a KNOWN
+# DEFECT'S BLAST RADIUS, not desired behaviour -- a red here may mean the defect
+# was REPAIRED (see the file header).
+dss_add_test(NAME link/test_archive_member_format_vocabulary
+             SOURCES test_archive_member_format_vocabulary.cpp)
+
 # D-LK-ELF-EMITS-ONE-DT-NEEDED-WHEN-TWO-LIBRARIES-ARE-REFERENCED: the
 # cross-format dependency-table pin. ONE two-library import set through the
 # ELF, PE, and Mach-O writers; each format's real dependency table (DT_NEEDED

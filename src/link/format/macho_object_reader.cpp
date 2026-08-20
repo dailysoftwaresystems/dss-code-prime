@@ -1,4 +1,5 @@
 #include "link/format/macho_object_reader.hpp"
+#include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
@@ -519,6 +520,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // below. A NAMELESS or LOCAL (block) N_SECT symbol is NOT an atom
     // boundary (see the loop) -- so it never splits a function.
     std::unordered_map<std::uint8_t, std::vector<DefSym>> defsBySection;
+    // The DEMOTED half of that split, staged for the shared coverage guard --
+    // see `link/format/object_atom_coverage.hpp`.
+    std::vector<link::format::BodilessDefinedSymbol> bodilessDefined;
 
     for (std::uint32_t i = 0; i < nsyms; ++i) {
         Nlist const& s = syms[i];
@@ -591,6 +595,23 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // reader treating interior text labels as ModuleSymbol only).
             mod.symbols.push_back(ModuleSymbol{SymbolId{i}, s.name,
                 SymbolBinding::Local, machoVisibility(s.type)});
+            // ...and STAGE it for the coverage guard
+            // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
+            // The reasoning above is right for a LABEL and wrong for a whole
+            // file-local (`static`) FUNCTION, and nlist_64 carries no size field
+            // to tell them apart. A label lies INSIDE the function that contains
+            // it, so the enclosing atom covers its offset and the guard stays
+            // silent; a demoted whole function is covered by nothing, and the
+            // guard names it rather than letting its bytes vanish. Only a
+            // KIND-RESOLVED section is staged -- a symbol in an unmodeled
+            // metadata section reconstructs no body BY DESIGN and is not a
+            // dropped body.
+            if (sec.kind.has_value()) {
+                bodilessDefined.push_back(link::format::BodilessDefinedSymbol{
+                    /*sectionKey=*/s.sect, /*sectionOffset=*/secRelOff,
+                    /*declaredSize=*/std::nullopt, /*name=*/s.name,
+                    /*sectionName=*/sec.segName + "," + sec.sectName});
+            }
         }
     }
 
@@ -707,6 +728,33 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 Interval{off, len, mod.dataItems.size()});
             mod.dataItems.push_back(std::move(di));
             pushModuleSym(defs[k]);
+        }
+    }
+
+    // -- (6.5) Coverage guard: no defined symbol's body was dropped -------
+    //
+    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM. The
+    // demotion above is the ONLY place this reader turns a defined body-bearing
+    // symbol into a bodiless one, so this is the first point at which the
+    // question "did any named bytes end up in no atom?" is answerable. Asked
+    // BEFORE the relocation pass so the refusal names the SYMBOL rather than
+    // surfacing later as a reloc that routes to nothing (or, worse, not at all).
+    // The check itself is shared and format-neutral -- see
+    // `link/format/object_atom_coverage.hpp`.
+    {
+        std::vector<link::format::ReconstructedAtomExtent> extents;
+        for (auto const* bySec : {&funcIntervalsBySec, &dataIntervalsBySec}) {
+            for (auto const& [ordinal, ivs] : *bySec) {
+                for (auto const& iv : ivs) {
+                    extents.push_back(link::format::ReconstructedAtomExtent{
+                        ordinal, iv.start, iv.len});
+                }
+            }
+        }
+        if (!link::format::everyDefinedSymbolIsCoveredByAnAtom(
+                bodilessDefined, extents, "macho::readRelocatableObject",
+                reporter)) {
+            return std::nullopt;
         }
     }
 

@@ -92,7 +92,14 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>  // std::istreambuf_iterator (do not rely on a transitive include)
+#include <map>       // std::map (dependency artifacts, keyed — do not rely on a
+                     // transitive include)
 #include <optional>  // std::optional (per-target exitCode override)
+#include <set>       // std::set (dependency-identity distinctness pin — do not
+                     // rely on a transitive include)
+#include <sstream>   // std::ostringstream (the closed-key-set pin CAPTURES the
+                     // refusal this runner writes to std::cerr, so it can
+                     // assert the message NAMES the offending key)
 #include <stdexcept>     // std::runtime_error (scratch-root setup fails loud)
 #include <string>
 #include <system_error>  // std::error_code (do not rely on a transitive include)
@@ -298,7 +305,41 @@ struct DependsOnArtifact {
     // the produced exec fault-loaded at runtime). Empty (the default) ⇒ a
     // single-level dependency, EXACTLY the pre-nesting behavior.
     std::vector<DependsOnArtifact> dependsOn;
+    // THE ESCALATION LEVER, SCOPED TO THIS PREREQUISITE'S OWN IMAGE. Mirrors
+    // the in-process examples_runner's `DependsOnArtifact::mustDifferFromBase-
+    // line` field-for-field so BOTH harnesses accept the same manifests: false
+    // (the default) ⇒ report-only, true ⇒ a byte-identical dependency image is
+    // a hard FAIL for that arm. The arm-level key compares the EXECUTABLE, and
+    // on a `dependsOn` example the exec can differ for reasons that say nothing
+    // about the library — so without this key the library half is witnessed
+    // only while every `main.c` in the corpus happens to be trivial. See the
+    // long rationale on the in-process sibling's field.
+    bool                     mustDifferFromBaseline = false;
 };
+
+// The IDENTITY of one prerequisite within an arm's build — the SAME spelling
+// the in-process sibling's `dependencyImageKey` produces, so a failure line
+// from either harness names a dependency the same way.
+//
+// ★ KEYED, NEVER POSITIONAL: the baseline arm's image for a dependency is
+// matched to an optimized arm's image for THAT dependency by identity, not by
+// walk position, so a walk order that changed on one side only would fail loud
+// instead of silently comparing two unrelated libraries.
+[[nodiscard]] std::string dependencyImageKey(DependsOnArtifact const& dep) {
+    return dep.spec + "|" + dep.artifact;
+}
+
+// Flatten a `dependsOn` forest into BUILD ORDER — nested prerequisites before
+// the entry that resolves them, exactly the order `buildDependsOnArtifactCli`
+// builds them in. Mirrors the in-process sibling's `flattenDependencies`; the
+// traversal is what lets the comparison reach a NESTED dependency's opt-in.
+void flattenDependencies(std::vector<DependsOnArtifact> const&  deps,
+                         std::vector<DependsOnArtifact const*>& out) {
+    for (auto const& d : deps) {
+        flattenDependencies(d.dependsOn, out);
+        out.push_back(&d);
+    }
+}
 
 // D-TEST-INTEGRATED-RUNNER-HAS-NO-OPTIMIZATION-ARM-CONCEPT +
 // D-TEST-INTEGRATED-RUNNER-IGNORES-THE-RELEASE-ARM-AND-STDOUT-PINS: one declared
@@ -463,6 +504,50 @@ struct ExampleManifest {
     if (out.sources.empty() || out.spec.empty() || out.artifact.empty()) {
         std::cerr << "  'dependsOn' entry needs non-empty 'sources', 'spec', "
                      "and 'artifact' in " << path.generic_string() << "\n";
+        return false;
+    }
+    // The per-dependency escalation lever. STRICTLY TYPED — a JSON `"true"` or
+    // `1` is a manifest defect, and reading it as a silent `false` would leave
+    // the author believing a red is armed when it is not, which is the exact
+    // failure direction this key exists to remove. Absent ⇒ report-only,
+    // matching the arm-level default. Applies to NESTED entries for free: this
+    // helper IS the recursion.
+    if (d.contains("mustDifferFromBaseline")) {
+        if (!d.at("mustDifferFromBaseline").is_boolean()) {
+            std::cerr << "  'dependsOn' entry '" << out.artifact
+                      << "' key 'mustDifferFromBaseline' must be a boolean in "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        out.mustDifferFromBaseline =
+            d.at("mustDifferFromBaseline").get<bool>();
+    }
+    // ★ THE CLOSED PER-DEPENDENCY KEY SET, mirroring the `optimizedPipelines`
+    // arm parser above (same loop, same `$`-prefix carve-out, same rule) and
+    // the in-process sibling's copy field-for-field — both runners must accept
+    // and REJECT the same manifests.
+    //
+    // ⚠ WHY IT MATTERS NOW: `mustDifferFromBaseline` arms a hard failure, so a
+    // typo — `mustDifferFromBaseLine`, or the key written one nesting level off
+    // — used to produce a SILENTLY UNARMED assertion and a green run that
+    // witnessed nothing, which is the exact failure direction the key exists to
+    // remove. Placed BEFORE the nested recursion so a malformed entry is named
+    // before the walk descends, and living in THIS helper means it applies at
+    // EVERY depth for free — the helper IS the recursion.
+    for (auto const& [k, unusedV] : d.items()) {
+        (void)unusedV;
+        if (k == "sources" || k == "spec" || k == "artifact" || k == "multiCu"
+            || k == "dependsOn" || k == "mustDifferFromBaseline"
+            || k.starts_with("$")) {
+            continue;
+        }
+        std::cerr << "  'dependsOn' entry '" << out.artifact
+                  << "' declares unknown key '" << k
+                  << "' — the runner reads sources / spec / artifact / multiCu"
+                     " / dependsOn / mustDifferFromBaseline (plus $comment"
+                     " keys). An expectation the runner does not read is an"
+                     " assertion that never fires: "
+                  << path.generic_string() << "\n";
         return false;
     }
     // Nested `dependsOn`: this entry's OWN prerequisites (built first, resolved
@@ -672,6 +757,28 @@ struct ExampleManifest {
                 }
                 ed.positioned = d.at("positioned").get<bool>();
             }
+            // The CLOSED per-entry key set, mirroring the in-process sibling's
+            // exactly — the fourth and last of this vocabulary's closed sets.
+            // Included for CONSISTENCY rather than to stop a live
+            // silent-disarm: `code`/`line`/`col` are REQUIRED (a typo already
+            // fails loud above) and `positioned` defaults to TRUE, so a typo
+            // leaves the STRONGER assertion standing and reds rather than
+            // passing. This is the one scope whose gap failed safe — but a rule
+            // applied at three of four levels is one an author cannot rely on.
+            for (auto const& [k, unusedV] : d.items()) {
+                (void)unusedV;
+                if (k == "code" || k == "line" || k == "col"
+                    || k == "positioned" || k.starts_with("$")) {
+                    continue;
+                }
+                std::cerr << "  expectDiagnostics entry '" << ed.code
+                          << "' declares unknown key '" << k
+                          << "' — the runner reads code / line / col /"
+                             " positioned (plus $comment keys). An expectation"
+                             " the runner does not read is an assertion that"
+                             " never fires: " << path.generic_string() << "\n";
+                return false;
+            }
             out.expectDiagnostics.push_back(std::move(ed));
         }
     }
@@ -723,6 +830,25 @@ struct ExampleManifest {
         et.spec     = t.value("spec", "");
         et.artifact = t.value("artifact", "");
         et.emulator = t.value("emulator", "");
+        // THE CLOSED PER-TARGET KEY SET, mirroring the in-process sibling's
+        // set EXACTLY — see the ★★ rationale on the top-level set at the end
+        // of this function for why the two may share one rejection set.
+        // Placed after `spec` is read so the diagnostic can NAME the target.
+        for (auto const& [k, unusedV] : t.items()) {
+            (void)unusedV;
+            if (k == "spec" || k == "artifact" || k == "runOn"
+                || k == "emulator" || k == "expectedStdout" || k == "exitCode"
+                || k == "dependsOn" || k.starts_with("$")) {
+                continue;
+            }
+            std::cerr << "  target '" << et.spec << "' declares unknown key '"
+                      << k << "' — the runner reads spec / artifact / runOn /"
+                         " emulator / expectedStdout / exitCode / dependsOn"
+                         " (plus $comment keys). An expectation the runner does"
+                         " not read is an assertion that never fires: "
+                      << path.generic_string() << "\n";
+            return false;
+        }
         if (t.contains("runOn") && t.at("runOn").is_array()) {
             for (auto const& s : t.at("runOn")) {
                 if (s.is_string()) et.runOn.push_back(s.get<std::string>());
@@ -885,6 +1011,48 @@ struct ExampleManifest {
             OptimizationObservable{oo.at("clause").get<std::string>()};
     }
     if (!validateOptimizationObservable(out, path)) return false;
+    // ★★ THE CLOSED TOP-LEVEL KEY SET — the outermost of this runner's three
+    // (top level, per target, per `dependsOn` entry), all sharing one rule: A
+    // KEY THE RUNNER CANNOT READ MUST NOT PASS IN SILENCE. The failure it ends
+    // is a typo in a key that ARMS something — `optimizedPipeline` (singular)
+    // builds no arm and silently stops witnessing the optimizer;
+    // `expectedStdOut` never asserts the stdout pin. Both used to parse clean.
+    //
+    // ★ WHY THIS RUNNER MAY SHARE THE SIBLING'S REJECTION SET, and it had to be
+    // MEASURED rather than assumed. A rejection set is only safe if the two
+    // runners READ the same keys: refusing here a key the sibling honours would
+    // be a FALSE RED on a manifest that is entirely correct for that runner.
+    // ⚠ `[Test 6]` does NOT establish this. It compares the UNION of keys each
+    // FILE mentions, so it would stay green if a key were read at top level in
+    // one runner and at target level in the other. ✔MEASURED 2026-08-20 per
+    // SCOPE instead, from the read sites inside each runner's `readManifest`:
+    // both read the same 10 top-level keys and the same 7 per-target keys, so
+    // one shared rejection set is sound at both levels. Re-measure per scope
+    // before adding a key to either side.
+    //
+    // ✔MEASURED 2026-08-20, all 611 corpus manifests parsed (not grepped): the
+    // corpus declares exactly these 10 non-`$` top-level keys and nothing else.
+    // The `$` carve-out is `starts_with`, never a literal `$comment` match —
+    // 13 distinct `$…` spellings live at this level, so a literal allowlist
+    // would red 12 of them.
+    for (auto const& [k, unusedV] : j.items()) {
+        (void)unusedV;
+        if (k == "language" || k == "source" || k == "sources"
+            || k == "project" || k == "exitCode" || k == "expectedStdout"
+            || k == "targets" || k == "optimizedPipelines"
+            || k == "optimizationObservable" || k == "expectDiagnostics"
+            || k.starts_with("$")) {
+            continue;
+        }
+        std::cerr << "  manifest declares unknown top-level key '" << k
+                  << "' — the runner reads language / source / sources /"
+                     " project / exitCode / expectedStdout / targets /"
+                     " optimizedPipelines / optimizationObservable /"
+                     " expectDiagnostics (plus $comment keys). An expectation"
+                     " the runner does not read is an assertion that never"
+                     " fires: " << path.generic_string() << "\n";
+        return false;
+    }
     return true;
 }
 
@@ -1060,19 +1228,39 @@ struct CwdGuard {
 // build / artifact-missing failure. A dep with NO nested `dependsOn` is
 // byte-identical to the pre-nesting single-level build (every existing example
 // unchanged).
+//
+// ★ THE PREREQUISITE IS BUILT UNDER THE ARM'S OWN CONFIGURATION. `configName`
+// is the arm's `shippedPipeline`, threaded VERBATIM and passed down the
+// recursion, and it obeys the SAME empty-means-omit convention as the main
+// build in `compileAndRunArmViaCli`: EMPTY appends no `--config` token at all,
+// which is the BASELINE arm and is deliberately not `--config=debug` (that
+// note explains why the CLI's own default is worth exercising).
+//
+// [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]] — this used to take no
+// config at all, so every prerequisite was built at the CLI default no matter
+// which arm asked for it, and a `release` arm on a `dependsOn` example would
+// optimize the EXECUTABLE while leaving every static library it links on the
+// baseline pipeline. Same defect, same shape, and it had to be fixed in BOTH
+// runners at once: [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] — one runner
+// threading the arm while its sibling shrugs is a SILENT harness bug, and here
+// it would have been invisible, because a half-optimized program still builds,
+// still runs, and still returns the baseline's exit code.
 [[nodiscard]] std::optional<fs::path>
 buildDependsOnArtifactCli(std::string const&       compiler,
                           DependsOnArtifact const& dep,
                           fs::path const&          exampleDir,
                           fs::path const&          outDir,
                           std::string const&       language,
-                          std::string const&       exampleName) {
+                          std::string const&       exampleName,
+                          std::string const&       configName,
+                          std::map<std::string, fs::path>* builtImages) {
     // Nested prerequisites FIRST (order-correct): each must exist on disk
     // before this dep's own build resolves against it.
     std::string resolveArgs;
     for (auto const& nested : dep.dependsOn) {
         auto nestedPath = buildDependsOnArtifactCli(
-            compiler, nested, exampleDir, outDir, language, exampleName);
+            compiler, nested, exampleDir, outDir, language, exampleName,
+            configName, builtImages);
         if (!nestedPath.has_value()) return std::nullopt;  // check already fired
         resolveArgs += " --resolve-library " + quote(nestedPath->string());
     }
@@ -1081,12 +1269,21 @@ buildDependsOnArtifactCli(std::string const&       compiler,
     for (auto const& s : dep.sources) {
         depCompileArgs += " " + quote((exampleDir / s).string());
     }
+    // Built EXACTLY as the main build spells it (the `configArg` in
+    // `compileAndRunArmViaCli`): empty ⇒ no token, so the baseline arm still
+    // spawns the byte-for-byte command it always did. An unrecognised name is
+    // the CLI's to reject — `parseCompileConfig` owns that vocabulary and
+    // fails loud naming the bad value, so a typo surfaces as this dep's failed
+    // build rather than as a silent default library wearing the arm's label.
+    std::string const depConfigArg =
+        configName.empty() ? std::string{} : (" --config=" + configName);
     auto const depLog = outDir / (dep.artifact + ".buildlog");
     std::string const depCmd = quote(compiler)
         + " --compile"   + depCompileArgs
         + " --language " + language
         + " --target "   + dep.spec
         + resolveArgs
+        + depConfigArg
         + " --output "   + quote(outDir.string())
         + " > " + quote(depLog.string()) + " 2>&1";
     int const depRc = std::system(shellWrap(depCmd).c_str());
@@ -1107,6 +1304,31 @@ buildDependsOnArtifactCli(std::string const&       compiler,
           + depArtifact.generic_string() + ", buildlog: "
           + depLog.generic_string() + ")", depOk, depWhy);
     if (!depOk) return std::nullopt;
+    // RECORD THE PREREQUISITE'S PATH for the optimized-vs-baseline dependency
+    // comparison. The `check` above has already established the file exists and
+    // is non-empty, so what is recorded here is always a readable image.
+    if (builtImages != nullptr) {
+        auto const key = dependencyImageKey(dep);
+        // A COLLIDING KEY IS A REAL DEFECT, not a tie to break. Every
+        // dependency of one arm builds into this one `outDir`, so two entries
+        // sharing a `spec|artifact` identity have already overwritten each
+        // other's file — the second build silently won. Letting the map take
+        // the second path would hide a manifest error behind a comparison that
+        // still looked well-formed. This is the ONLY `check` this helper can
+        // emit beyond the one above, and it fires exclusively on that malformed
+        // manifest — a healthy corpus run emits exactly the checks it always
+        // did, so the reported pass count does not move.
+        if (builtImages->contains(key)) {
+            check(exampleName + ": dependsOn entries have distinct identities",
+                  false,
+                  "two dependsOn entries share the identity '" + key
+                      + "' — they build into the same output directory, so the"
+                        " second has overwritten the first on disk and neither"
+                        " image can be attributed to its entry");
+            return std::nullopt;
+        }
+        builtImages->emplace(key, depArtifact);
+    }
     return depArtifact;
 }
 
@@ -1127,6 +1349,15 @@ struct CliArmOutcome {
     // arm's image with the baseline's, and that comparison is host-independent.
     fs::path    artifactPath;
     bool        compiled = false;
+    // Every PREREQUISITE image this arm produced, keyed by
+    // `dependencyImageKey`. PATHS rather than bytes — unlike the in-process
+    // sibling, whose arms build inside an RAII scratch dir that is gone before
+    // the comparison, each arm here builds into its own PERSISTENT out dir, so
+    // the files survive and `filesDiffer` can read them in place. Keyed so the
+    // baseline's entry for a dependency is matched to this arm's entry for that
+    // same dependency by identity. Includes nested prerequisites, because
+    // `buildDependsOnArtifactCli` recurses.
+    std::map<std::string, fs::path> dependencyArtifacts;
 };
 
 // ── THE INSTRUMENT THAT KEEPS THE OPTIMIZED ARM FROM GOING INERT ────────────
@@ -1165,6 +1396,18 @@ std::size_t optimizedArmsNotExpressibleOnCli   = 0;
 // compare, and only a NON-EMPTY pin proves the drain actually happened.
 std::size_t stdoutPinsAsserted         = 0;
 std::size_t stdoutPinsAssertedNonEmpty = 0;
+// The DEPENDENCY half of the optimized-arm instrument
+// ([[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]]). Counted separately from
+// the executable's tallies above because they answer different questions: an
+// arm's exec can differ from its baseline for reasons that have nothing to do
+// with whether the prerequisite LIBRARIES were built under the arm's pipeline,
+// which is the half the `dependsOn` corpus exists to cover. `Expected` is
+// incremented where the walk decides an image is owed a comparison and
+// `Compared` where a comparison actually happens, so a comparison that stopped
+// being performed shows up as a mismatch rather than as a quiet zero.
+std::size_t dependencyImagesExpected  = 0;
+std::size_t dependencyImagesCompared  = 0;
+std::size_t dependencyImagesDiffered  = 0;
 
 // Byte-compare two files. A negative answer carries its REASON for the same
 // reason `fileExists`/`fileNonEmpty` do: "same size, different bytes" and
@@ -1283,10 +1526,17 @@ std::size_t stdoutPinsAssertedNonEmpty = 0;
     // first — the fat-archive merge chain) and thread the produced path into
     // this target's `--resolve-library`. A dep build failure is a test failure
     // (buildDependsOnArtifactCli fired the strict `check`).
+    // THIS ARM'S `configName` goes down with them, under the same
+    // empty-means-omit convention the main build uses below: a prerequisite
+    // built at the CLI default while the dependent build is optimized would
+    // leave the arm witnessing the pipeline over only part of its own program.
+    // See the ★ note on buildDependsOnArtifactCli.
     std::string resolveArgs;
+    std::map<std::string, fs::path> builtDependencyImages;
     for (auto const& dep : target->dependsOn) {
         auto depArtifact = buildDependsOnArtifactCli(
-            compiler, dep, exampleDir, outDir, m.language, armName);
+            compiler, dep, exampleDir, outDir, m.language, armName, configName,
+            &builtDependencyImages);
         if (!depArtifact.has_value()) {  // check already fired
             return {ArmVerdict::Poisoned,
                     "dependsOn library " + dep.spec + " did not build"};
@@ -1515,6 +1765,11 @@ std::size_t stdoutPinsAssertedNonEmpty = 0;
         o.detail       = std::move(why);
         o.artifactPath = artifactPath;
         o.compiled     = true;
+        // Carried on the SAME reasoning as `artifactPath` directly above: the
+        // prerequisite images are a fact about the COMPILE, so a box that
+        // cannot spawn the binary can still answer whether the arm's pipeline
+        // reached the libraries.
+        o.dependencyArtifacts = builtDependencyImages;
         return o;
     };
 
@@ -1798,6 +2053,104 @@ void runSelectedTargetViaCli(std::string const& compiler,
                               " pipeline to transform (give it one: an inlinable"
                               " helper, an accumulator, a loop) or the pipeline"
                               " regressed");
+        }
+
+        // ── THE DEPENDENCY HALF OF THE SAME QUESTION ────────────────────────
+        //
+        // [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]]. The comparison
+        // above asked whether the pipeline changed the EXECUTABLE. On a
+        // `dependsOn` example that is only part of the program — the
+        // prerequisite libraries were compiled too, and an arm that optimized
+        // the exec while leaving them at the CLI default is exactly the defect
+        // the `--config` threading in `buildDependsOnArtifactCli` fixed. Asking
+        // per dependency is what keeps that fix WITNESSED rather than resting
+        // on the incidental thinness of any example's `main.c`.
+        //
+        // Compared BEFORE the `baseline.verdict != Ran` gate below, for the
+        // same reason the exec comparison is: two pipelines producing different
+        // library code is a fact about the COMPILER and needs no machine to run
+        // the result.
+        {
+            std::vector<DependsOnArtifact const*> flatDeps;
+            flattenDependencies(target->dependsOn, flatDeps);
+            for (auto const* dep : flatDeps) {
+                auto const key = dependencyImageKey(*dep);
+                ++dependencyImagesExpected;
+                auto const baseIt = baseline.dependencyArtifacts.find(key);
+                auto const armIt  = armOut.dependencyArtifacts.find(key);
+                // BOTH ARMS BUILD THE SAME MANIFEST, so a key present in one
+                // and absent in the other is a HARNESS defect, never a manifest
+                // one — and it must fail rather than degrade into a silent
+                // skip, because a skipped comparison is indistinguishable from
+                // a passing one in the summary.
+                if (baseIt == baseline.dependencyArtifacts.end()
+                    || armIt == armOut.dependencyArtifacts.end()) {
+                    check(exampleName + " [arm=" + arm.label
+                              + "]: dependency '" + key
+                              + "' has an image on both sides to compare",
+                          false,
+                          std::string{"no captured image on the "}
+                              + (baseIt == baseline.dependencyArtifacts.end()
+                                     ? "BASELINE" : "OPTIMIZED")
+                              + " side — both arms build the same declared"
+                                " dependencies, so this is a capture defect in"
+                                " the harness, and an uncompared dependency"
+                                " must never read as a compared one");
+                    continue;
+                }
+                // FAIL-CLOSED BEFORE COMPARING, and it reds whether or not the
+                // dependency opted in. `filesDiffer` answers "did not differ"
+                // for BOTH a byte-identical pair and a pair it could not read,
+                // so an image that vanished between its build and this point
+                // would otherwise be counted as a performed comparison that
+                // witnessed nothing — the same shape as two empty captures
+                // comparing equal on the in-process side. Probed through this
+                // runner's own `fileNonEmpty` rather than by matching
+                // `filesDiffer`'s wording, so the guard does not rest on a
+                // literal reason string.
+                auto const baseReadable = fileNonEmpty(baseIt->second);
+                auto const armReadable  = fileNonEmpty(armIt->second);
+                if (!baseReadable.ok || !armReadable.ok) {
+                    check(exampleName + " [arm=" + arm.label
+                              + "]: dependency image '" + dep->artifact
+                              + "' is readable on both sides",
+                          false,
+                          (baseReadable.ok ? armReadable.why
+                                           : baseReadable.why)
+                              + " — the dependency build already checked this"
+                                " image exists and is non-empty, so it has"
+                                " gone missing since; an uncomparable image"
+                                " must never be counted as a compared one");
+                    continue;  // NOT counted as compared — the tally reds too
+                }
+                auto const depDiffers =
+                    filesDiffer(armIt->second, baseIt->second);
+                ++dependencyImagesCompared;
+                if (depDiffers.ok) ++dependencyImagesDiffered;
+                // `depDiffers.why` carries "byte-identical" when the images
+                // matched and a REASON when the comparison could not run at
+                // all; both are failures for a dependency that declares it must
+                // differ, because an uncomparable image must never be read as a
+                // compared one.
+                if (dep->mustDifferFromBaseline) {
+                    check(exampleName + " [arm=" + arm.label
+                              + "]: dependency image '" + dep->artifact
+                              + "' (spec=" + dep->spec
+                              + ") differs from the baseline"
+                                " (manifest declares mustDifferFromBaseline)",
+                          depDiffers.ok,
+                          depDiffers.ok
+                              ? ""
+                              : "the dependency declares"
+                                " \"mustDifferFromBaseline\": true but the"
+                                " comparison did not witness a difference ("
+                                    + depDiffers.why
+                                    + ") — either the source has nothing for the"
+                                      " pipeline to transform (give it one: an"
+                                      " inlinable helper, an accumulator, a"
+                                      " loop) or the pipeline regressed");
+                }
+            }
         }
 
         if (baseline.verdict != ArmVerdict::Ran) continue;  // nothing to compare
@@ -2348,6 +2701,31 @@ void runOptimizedArmInstrument() {
               + " stdout pin(s) asserted on this host, NONE was non-empty — an"
                 " empty pin is satisfied by a capture that never happened, so"
                 " this host proved nothing about the capture path");
+    // ── THE DEPENDENCY HALF'S OWN RECONCILIATION ───────────────────────────
+    //
+    // [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]]. Counted at TWO
+    // DIFFERENT SITES on purpose — `Expected` where the walk decides an image
+    // is owed a comparison, `Compared` where one is actually performed — so a
+    // dependency comparison that stopped happening (a capture that went
+    // missing, a walk that stopped reaching nested entries) shows up as a
+    // MISMATCH rather than as a quiet zero. Deliberately NOT a `> 0` floor:
+    // most of the corpus declares no `dependsOn` at all, so zero owed is the
+    // honest and expected reading on nearly every leg, and a floor here would
+    // be a guard that reds for the wrong reason.
+    check("every dependency image owed a comparison actually got one",
+          dependencyImagesCompared == dependencyImagesExpected,
+          std::to_string(dependencyImagesExpected)
+              + " dependency image(s) were owed a comparison but only "
+              + std::to_string(dependencyImagesCompared)
+              + " were compared. A prerequisite built at the CLI default while"
+                " its dependent build was optimized is the defect this"
+                " comparison exists to catch, so an uncompared dependency must"
+                " never present as a passing run");
+    std::cout << "  " << dependencyImagesExpected
+              << " dependency image(s) owed a comparison; "
+              << dependencyImagesCompared << " compared; "
+              << dependencyImagesDiffered
+              << " differed from their baseline\n";
     std::cout << "  " << stdoutPinsAsserted << " stdout pin(s) asserted ("
               << stdoutPinsAssertedNonEmpty << " non-empty)\n";
     std::cout << "  " << optimizedArmsDeclaredOnBoundTarget
@@ -2373,24 +2751,409 @@ void runOptimizedArmInstrument() {
 // prose. Fixing only the six would leave the seventh to happen exactly the same
 // way.
 //
-// WHAT IT ASSERTS: the set of manifest keys each runner READS — every
-// `contains("k")` / `.at("k")` / `.value("k", …)` outside a comment — is
-// IDENTICAL in the two sources. ✔MEASURED 2026-08-17 after this change: 25 keys,
-// zero difference in either direction.
+// WHAT IT ASSERTS, stated as narrowly as it is actually true: the set of key
+// names each source MENTIONS AS A STRING LITERAL at a `contains("k")` /
+// `.at("k")` / `.value("k", …)` site, outside comments, is IDENTICAL in the two
+// files. ✔MEASURED 2026-08-20: 26 keys, zero difference in either direction.
+// (This note used to say 25, ✔MEASURED 2026-08-17 at a different commit. The
+// figure drifted because the runners grew — RE-MEASURE, never re-quote.)
 //
-// ⚠ ITS SCOPE, stated so nobody mistakes it for more than it is. This reads
-// SOURCE TEXT, so it proves the key is MENTIONED, not that it is honoured; and
-// it knows the three nlohmann accessor spellings both files actually use
-// (neither uses `operator[]` — ✔MEASURED). It is a guard against the specific
-// failure that occurred: a key one runner has never heard of. A runner that
-// reads a key and ignores it is a different defect, and the load-time closed
-// key sets plus [Test 5]'s instrument are what stand against that one.
+// ⚠ ITS THREE BOUNDARIES, stated so nobody mistakes this for more than it
+// checks. A pin whose whole purpose is to be BELIEVED about coverage must not
+// claim an inch more than it delivers.
+//
+//   1. IT SEES STRING LITERALS ONLY. A key read through a variable, an array of
+//      `char const*`, a loop, or any other non-literal spelling is INVISIBLE to
+//      it. Not hypothetical — `readProjectFacts` in both runners reads its hook
+//      arrays as
+//          for (char const* key : {"preBuildScripts", "postBuildScripts"})
+//              if (!j.contains(key)) …
+//      and ✔MEASURED, neither name appears in this pin's set. A key spelled
+//      that way could be added to ONE runner and this pin would stay green:
+//      precisely the failure it exists to catch, in the one spelling it cannot
+//      read. Deliberately NOT fixed by making the matcher cleverer — an
+//      over-clever matcher is how a guard like this starts producing findings
+//      nobody trusts, and an honest boundary is worth more than the coverage.
+//   2. IT PROVES *MENTIONED*, NEVER *HONOURED*. This reads SOURCE TEXT, so a
+//      runner that reads a key and then ignores it satisfies it completely.
+//      That is a different defect; what stands against it is the load-time
+//      closed key sets (top level, per target, per `dependsOn` entry, per
+//      `expectDiagnostics` entry, per arm) plus [Test 5]'s instrument.
+//   3. IT IS ONE SET PER FILE — NOT PER SCOPE, AND NOT PER MANIFEST KIND. The
+//      scan is whole-file, so the set MIXES the two vocabularies these runners
+//      parse: `run` in it belongs to `.dss-project.json`, never to
+//      `expected.json`. And being unscoped, it would stay green if a key were
+//      read at TOP LEVEL in one runner and PER TARGET in the other ⇒ it does
+//      NOT by itself license the two runners to share one closed key set. That
+//      needed its own per-scope measurement, recorded at the top-level closed
+//      set in `readManifest`.
+//
+// It knows the three nlohmann accessor spellings both files actually use
+// (neither uses `operator[]` — ✔RE-MEASURED 2026-08-20, still true). Within
+// boundary 1 it is exact: a key one runner has never heard of, spelled
+// literally, cannot survive it.
 //
 // If a key is ever LEGITIMATELY one-sided, this pin reds and the remedy is to
 // say so where a reader will see it — not to widen the matcher until it stops
 // asking.
+// ── Harness self-test: this runner's OWN dependsOn parser behaves ──────────
+//
+// TWO properties, because they fail in opposite directions: the per-dependency
+// opt-in must be HONOURED (a key that is read but ignored arms nothing), and an
+// unknown key must be REFUSED (a key that cannot be read must not pass in
+// silence). A parser can satisfy either one alone and still be useless.
+//
+// [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]] +
+// [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]]. `dependsOn` entries carry a
+// `mustDifferFromBaseline` opt-in scoping the escalation lever to ONE
+// prerequisite's own image, and this runner has its OWN parser for it — a
+// second implementation, which is a second place the rule can be wrong.
+//
+// ⚠ WHY [Test 6] IS NOT ENOUGH, and it says so itself: the vocabulary pin
+// compares SOURCE TEXT, so it proves the key is MENTIONED by both runners, not
+// that either HONOURS it. A parser that read every entry as `false` — or that
+// reached top-level entries but not NESTED ones — would sail through it while
+// silently disarming every dependency red in the corpus. So the parse is
+// pinned against a planted fixture, at both depths, for all three spellings.
+//
+// The in-process sibling pins the same property from its gtest suite
+// (`ExamplesCorpusLint.DependencyMustDifferFromBaselineIsWiredEndToEnd`); a
+// capability exercised in one corpus harness and merely present in the other is
+// the silent harness bug this file's ★ notes keep pointing at.
+void runDependsOnParserPin(fs::path const& scratch) {
+    std::cout << "[Harness self-test] dependsOn parser: the opt-in is HONOURED"
+                 " and an unknown key is REFUSED (top-level AND nested)\n";
+    std::error_code ec;
+    fs::create_directories(scratch, ec);
+    if (ec) {
+        check("create the scratch dir for the dependency opt-in parse pin",
+              false, ec.message());
+        std::cout << "\n";
+        return;
+    }
+    // AGNOSTIC BY CONSTRUCTION: language and target spellings are obvious
+    // placeholders. `readManifest` stores them as opaque strings, so naming a
+    // real arch or object format here would put target identity into a file
+    // that has none.
+    auto const mp = scratch / "expected.json";
+    {
+        std::ofstream mf(mp.string(), std::ios::binary);
+        mf << R"({
+  "language": "<fixture-language>",
+  "source": "<fixture-source>",
+  "exitCode": 0,
+  "targets": [{"spec": "<fixture-arch>:<fixture-format>",
+               "artifact": "<fixture-artifact>", "runOn": ["<fixture-host>"],
+               "dependsOn": [
+                 {"sources": ["a.c"], "spec": "<fixture-libspec>",
+                  "artifact": "opted-in.lib", "mustDifferFromBaseline": true,
+                  "dependsOn": [
+                    {"sources": ["n1.c"], "spec": "<fixture-libspec>",
+                     "artifact": "nested-in.lib",
+                     "mustDifferFromBaseline": true},
+                    {"sources": ["n2.c"], "spec": "<fixture-libspec>",
+                     "artifact": "nested-out.lib",
+                     "mustDifferFromBaseline": false}
+                  ]},
+                 {"sources": ["b.c"], "spec": "<fixture-libspec>",
+                  "artifact": "opted-out.lib", "mustDifferFromBaseline": false},
+                 {"sources": ["c.c"], "spec": "<fixture-libspec>",
+                  "artifact": "unstated.lib"}
+               ]}]
+})";
+        mf.close();
+        if (!mf.good()) {
+            check("plant the fixture manifest at " + mp.generic_string(), false,
+                  "the stream reported a write failure — with no fixture on"
+                  " disk every assertion below would read a manifest that is"
+                  " not the one this pin describes");
+            std::cout << "\n";
+            return;
+        }
+    }
+    ExampleManifest m;
+    if (!readManifest(mp, m) || m.targets.size() != 1u
+        || m.targets[0].dependsOn.size() != 3u) {
+        check("the fixture manifest parses into 3 top-level dependsOn entries",
+              false,
+              "parsed " + std::to_string(m.targets.size()) + " target(s); the"
+              " assertions below would otherwise be reading"
+              " default-constructed entries and would pass on nothing");
+        std::cout << "\n";
+        return;
+    }
+    auto const& deps = m.targets[0].dependsOn;
+    check("a dependsOn entry declaring mustDifferFromBaseline:true arrives"
+          " opted-IN",
+          deps[0].mustDifferFromBaseline,
+          "'opted-in.lib' parsed as report-only — the lever is decorative on"
+          " this runner");
+    check("a dependsOn entry declaring mustDifferFromBaseline:false arrives"
+          " opted-OUT",
+          !deps[1].mustDifferFromBaseline, "'opted-out.lib' parsed as opted-in");
+    // ABSENT must mean report-only, matching the arm-level default. If this
+    // ever flipped, every dependency in the corpus would red at once.
+    check("a dependsOn entry that omits the key defaults to REPORT-ONLY",
+          !deps[2].mustDifferFromBaseline,
+          "'unstated.lib' parsed as opted-in — an absent key must never arm a"
+          " red");
+    // The NESTED half — the fat-archive input, which is exactly the entry
+    // worth arming, and the one a parser that only walked the top level would
+    // silently never reach.
+    if (deps[0].dependsOn.size() != 2u) {
+        check("the fixture's nested dependsOn entries parsed", false,
+              "expected 2 nested entries, got "
+                  + std::to_string(deps[0].dependsOn.size()));
+        std::cout << "\n";
+        return;
+    }
+    check("the key is honoured on a NESTED dependsOn entry (true)",
+          deps[0].dependsOn[0].mustDifferFromBaseline,
+          "'nested-in.lib' parsed as report-only — a nested opt-in that never"
+          " arrives makes the fat-archive input unpinnable");
+    check("the key is honoured on a NESTED dependsOn entry (false)",
+          !deps[0].dependsOn[1].mustDifferFromBaseline,
+          "'nested-out.lib' parsed as opted-in");
+    // The identity key is what makes the baseline-to-arm match BY IDENTITY
+    // rather than by walk position, and the walk is what lets a nested opt-in
+    // be enforced at all. Both are pinned here because both are this runner's
+    // own copies of a rule the sibling also implements.
+    std::vector<DependsOnArtifact const*> flat;
+    flattenDependencies(m.targets[0].dependsOn, flat);
+    bool const orderOk = flat.size() == 5u
+                      && flat[0]->artifact == "nested-in.lib"
+                      && flat[1]->artifact == "nested-out.lib"
+                      && flat[2]->artifact == "opted-in.lib"
+                      && flat[3]->artifact == "opted-out.lib"
+                      && flat[4]->artifact == "unstated.lib";
+    check("the dependency walk reaches every entry, nested BEFORE the entry"
+          " that resolves it",
+          orderOk,
+          "walked " + std::to_string(flat.size())
+              + " entries in the wrong order — build order is what lets a"
+                " nested prerequisite exist before its dependent build, and a"
+                " walk that misses an entry cannot enforce its opt-in");
+    std::set<std::string> ids;
+    for (auto const* d : flat) ids.insert(dependencyImageKey(*d));
+    check("every dependency in one target has a DISTINCT identity",
+          ids.size() == flat.size(),
+          "two entries share a spec|artifact identity — they build into the"
+          " same output directory, so one overwrites the other on disk and"
+          " neither image can be attributed to its entry");
+
+    // ── AN UNREADABLE KEY MUST NOT BE A SILENT ONE ─────────────────────────
+    //
+    // ★★ `mustDifferFromBaseline` ARMS A HARD FAILURE, so an author who typed
+    // `mustDifferFromBaseLine` — or who put the key one nesting level off —
+    // used to get a silently unarmed assertion and a green run that witnessed
+    // nothing. A guard a typo can disarm asserts nothing, so this runner's
+    // `dependsOn` parser now REFUSES a key it cannot read. Three directions,
+    // because the refusal has three ways to be wrong: miss a top-level entry,
+    // fail to recurse (the depth the fat-archive input lives at), or be
+    // over-eager and reject the corpus's own `$…` documentation keys.
+    //
+    // The refusal goes to `std::cerr`, so it is CAPTURED here and asserted on:
+    // "it returned false" alone would pass for a parser that refused for the
+    // wrong reason and never named the key an author has to fix.
+    auto const planted = [&scratch](char const* depBody) {
+        auto const p = scratch / "closed-keys.json";
+        std::ofstream f(p.string(), std::ios::binary);
+        f << R"({
+  "language": "<fixture-language>",
+  "source": "<fixture-source>",
+  "exitCode": 0,
+  "targets": [{"spec": "<fixture-arch>:<fixture-format>",
+               "artifact": "<fixture-artifact>", "runOn": ["<fixture-host>"],
+               "dependsOn": [)" << depBody << R"(]}]
+})";
+        f.close();
+        return p;
+    };
+    // Returns {parsed-ok, whatever the parser wrote to stderr}. The rdbuf is
+    // restored unconditionally on the straight-line path below — there is no
+    // early return inside the capture window, deliberately, because a stolen
+    // `std::cerr` that was never given back would silence every later
+    // diagnostic in this process.
+    auto const parseCapturingStderr = [](fs::path const& p) {
+        ExampleManifest      mm;
+        std::ostringstream   captured;
+        auto* const          saved = std::cerr.rdbuf(captured.rdbuf());
+        bool const           ok    = readManifest(p, mm);
+        std::cerr.rdbuf(saved);
+        return std::pair<bool, std::string>{ok, captured.str()};
+    };
+
+    // DIRECTION 1 — unknown key on a TOP-LEVEL entry. The spelling is the
+    // realistic typo (capital-L `BaseLine`), not a nonsense word.
+    {
+        auto const [ok, msg] = parseCapturingStderr(planted(
+            R"({"sources": ["a.c"], "spec": "<fixture-libspec>",
+                "artifact": "typo.lib", "mustDifferFromBaseLine": true})"));
+        check("a dependsOn entry declaring an UNKNOWN key is REFUSED"
+              " (top-level)",
+              !ok,
+              "the manifest parsed clean — an unreadable key was ignored in"
+              " silence, which is how a typo'd mustDifferFromBaseline becomes a"
+              " green run that asserts nothing");
+        check("the top-level refusal NAMES the offending key",
+              msg.find("mustDifferFromBaseLine") != std::string::npos,
+              "stderr did not name 'mustDifferFromBaseLine' — an author cannot"
+              " read the fix off a message that does not say what was wrong."
+              " Got: " + msg);
+    }
+    // DIRECTION 2 — the SAME refusal on a NESTED entry. Pinned separately
+    // because "the loop exists" and "the loop is inside the recursion" are
+    // different properties, and the nested level is where the fat-archive
+    // input — the entry most worth arming — actually lives.
+    {
+        auto const [ok, msg] = parseCapturingStderr(planted(
+            R"({"sources": ["a.c"], "spec": "<fixture-libspec>",
+                "artifact": "outer.lib",
+                "dependsOn": [{"sources": ["n.c"], "spec": "<fixture-libspec>",
+                               "artifact": "nested.lib",
+                               "mustDifferFromBaseLine": true}]})"));
+        check("a NESTED dependsOn entry declaring an UNKNOWN key is REFUSED",
+              !ok,
+              "a nested entry's unknown key was ignored — the closed set is not"
+              " inside the recursion, so the fat-archive input is unprotected");
+        check("the nested refusal NAMES the offending key",
+              msg.find("mustDifferFromBaseLine") != std::string::npos,
+              "stderr did not name 'mustDifferFromBaseLine'. Got: " + msg);
+    }
+    // DIRECTION 3 — `$`-prefixed keys are ACCEPTED at BOTH depths and cost the
+    // entry nothing. This is what makes the fix safe rather than merely strict.
+    // ✔MEASURED 2026-08-20 over all 611 corpus manifests: 13 distinct `$…`
+    // spellings at top level (`$comment` on 488), `$comment` on 6 targets and
+    // `$commentByteIdentical` on 97 arms — so the rule is `starts_with("$")`,
+    // never a literal `$comment` match, which would red 12 of those spellings.
+    {
+        auto const [ok, msg] = parseCapturingStderr(planted(
+            R"({"sources": ["a.c"], "spec": "<fixture-libspec>",
+                "artifact": "documented.lib",
+                "$comment": "why this dependency exists",
+                "$commentWhyNotArmed": "its body is a bare return",
+                "mustDifferFromBaseline": false,
+                "dependsOn": [{"sources": ["n.c"], "spec": "<fixture-libspec>",
+                               "artifact": "nested.lib",
+                               "$commentNested": "documented at depth",
+                               "mustDifferFromBaseline": true}]})"));
+        check("a `$`-prefixed key is ACCEPTED on a dependsOn entry, at any"
+              " depth",
+              ok,
+              "the parser refused a `$` documentation key — the corpus"
+              " documents itself with these at every level, so this would red"
+              " manifests that are entirely correct. stderr: " + msg);
+    }
+    std::cout << "\n";
+}
+
+// ── Harness self-test: the manifest's OUTER closed key sets ────────────────
+//
+// ★★ The `dependsOn` pin above closes the innermost of this runner's three
+// closed key sets; this covers the other two, where MORE expectations live — a
+// manifest's exit code, stdout pin and optimizer arms sit at the top level, and
+// its per-target overrides on each target. Every one arms something, so every
+// one has a typo that used to parse clean and pass green: `optimizedPipeline`
+// (singular) builds no arm and silently stops witnessing the optimizer;
+// `expectedStdOut` on a target never asserts the pin.
+//
+// The refusal goes to `std::cerr`, so it is CAPTURED and asserted on — "it
+// returned false" alone would pass for a parser that refused for the wrong
+// reason and never told the author which key to fix.
+void runManifestClosedKeySetPin(fs::path const& scratch) {
+    std::cout << "[Harness self-test] manifest parser: an unknown key is"
+                 " REFUSED at top level AND per target\n";
+    std::error_code ec;
+    fs::create_directories(scratch, ec);
+    if (ec) {
+        check("create the scratch dir for the manifest closed-key-set pin",
+              false, ec.message());
+        std::cout << "\n";
+        return;
+    }
+    auto const planted = [&scratch](char const* topExtra,
+                                    char const* targetExtra) {
+        auto const p = scratch / "closed-keys.json";
+        std::ofstream f(p.string(), std::ios::binary);
+        f << R"({
+  "language": "<fixture-language>",
+  "source": "<fixture-source>",
+  "exitCode": 0,
+  )" << topExtra << R"(
+  "targets": [{"spec": "<fixture-arch>:<fixture-format>",
+               "artifact": "<fixture-artifact>", "runOn": ["<fixture-host>"])"
+          << targetExtra << R"(}]
+})";
+        f.close();
+        return p;
+    };
+    // Straight-line capture with no early return inside the window: a stolen
+    // `std::cerr` that was never given back would silence every later
+    // diagnostic in this process.
+    auto const parseCapturingStderr = [](fs::path const& p) {
+        ExampleManifest    mm;
+        std::ostringstream captured;
+        auto* const        saved = std::cerr.rdbuf(captured.rdbuf());
+        bool const         ok    = readManifest(p, mm);
+        std::cerr.rdbuf(saved);
+        return std::pair<bool, std::string>{ok, captured.str()};
+    };
+
+    // DIRECTION 1 — unknown TOP-LEVEL key. `optimizedPipelines` carries every
+    // optimizer arm, so dropping its plural is the typo that costs the most
+    // while looking the most correct.
+    {
+        auto const [ok, msg] = parseCapturingStderr(planted(
+            R"("optimizedPipeline": [{"label": "release",
+                "shippedPipeline": "release"}],)", ""));
+        check("a manifest declaring an UNKNOWN top-level key is REFUSED",
+              !ok,
+              "the manifest parsed clean — a key that arms the optimizer arms"
+              " was ignored in silence, which is how a typo'd"
+              " optimizedPipelines becomes a green run that witnesses nothing");
+        check("the top-level refusal NAMES the offending key",
+              msg.find("optimizedPipeline") != std::string::npos,
+              "stderr did not name 'optimizedPipeline'. Got: " + msg);
+    }
+    // DIRECTION 2 — unknown PER-TARGET key, and the message must name the
+    // TARGET as well: a manifest routinely declares five, so naming only the
+    // key would leave an author grepping for which entry carried it.
+    {
+        auto const [ok, msg] = parseCapturingStderr(
+            planted("", R"(, "expectedStdOut": "hi")"));
+        check("a target declaring an UNKNOWN key is REFUSED",
+              !ok,
+              "a per-target key was ignored in silence — a typo'd"
+              " expectedStdout override never asserts anything");
+        check("the per-target refusal NAMES the offending key",
+              msg.find("expectedStdOut") != std::string::npos,
+              "stderr did not name 'expectedStdOut'. Got: " + msg);
+        check("the per-target refusal NAMES the target it appeared on",
+              msg.find("<fixture-arch>:<fixture-format>") != std::string::npos,
+              "stderr did not name the target spec — a message that names the"
+              " key but not the entry is only half the remedy. Got: " + msg);
+    }
+    // DIRECTION 3 — `$`-prefixed keys ACCEPTED at BOTH levels, and the real
+    // expectation sitting beside them still honoured. ✔MEASURED 2026-08-20:
+    // 488 manifests carry a top-level `$comment` and 6 targets carry one,
+    // across 13 distinct `$…` spellings — a set that refused them would red
+    // most of the corpus, which would be worse than the gap it closes.
+    {
+        auto const [ok, msg] = parseCapturingStderr(planted(
+            R"("$comment": "why this example exists",
+               "$commentWhyNoArm": "nothing here to optimize",)",
+            R"(, "$comment": "this target is the pe64 leg", "exitCode": 7)"));
+        check("`$`-prefixed keys are ACCEPTED at top level AND per target",
+              ok,
+              "the parser refused a `$` documentation key — the corpus"
+              " documents itself with these at every level. stderr: " + msg);
+    }
+    std::cout << "\n";
+}
+
 void runRunnerVocabularyPin() {
-    std::cout << "[Test 6] Both corpus runners recognise the same manifest keys\n";
+    std::cout << "[Test 6] Both corpus runners MENTION the same manifest key"
+                 " literals\n";
     // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT, same discipline: `repoRoot`
     // THROWS when it cannot resolve, and this call sits outside every `try` in
     // `main`. Uncaught, it would end the process with no [FAIL] line, no Results
@@ -2436,6 +3199,17 @@ void runRunnerVocabularyPin() {
         // not have. (Same trap as the mutant whose own comment carried the
         // witness token: the text that DESCRIBES a thing must never be mistaken
         // for the thing.)
+        //
+        // ⚠ COMMENTS ARE THE ONLY NON-CODE TEXT REMOVED. Raw string literals
+        // are NOT stripped, and both files now carry a good number of them —
+        // the planted fixture manifests the closed-key-set pins parse. Those
+        // are JSON, so they name manifest keys in quantity; they are harmless
+        // here only because none of them contains an ACCESSOR spelling, which
+        // is what the needles below require. ✔MEASURED 2026-08-20: 28 raw
+        // strings across the two files, zero accessor hits. A fixture that
+        // ever embedded C++ rather than JSON would inject a phantom key into
+        // one side's set and red this pin for a reason that is not real —
+        // check that before widening what the fixtures hold.
         std::string code;
         code.reserve(body.size());
         for (std::size_t i2 = 0; i2 < body.size();) {
@@ -2502,16 +3276,17 @@ void runRunnerVocabularyPin() {
     };
     auto const onlyInSibling   = missingFrom(0, 1);
     auto const onlyInThisOne   = missingFrom(1, 0);
-    check("the two corpus runners read the SAME manifest key set ("
-              + std::to_string(found[0].size()) + " keys)",
+    check("the two corpus runners MENTION the same manifest key literals ("
+              + std::to_string(found[0].size())
+              + " found at string-literal accessor sites)",
           onlyInSibling.empty() && onlyInThisOne.empty(),
           (onlyInSibling.empty()
                ? std::string{}
-               : "read ONLY by tests/examples/examples_runner.cpp: ["
+               : "MENTIONED ONLY by tests/examples/examples_runner.cpp: ["
                      + onlyInSibling + "]. ")
               + (onlyInThisOne.empty()
                      ? std::string{}
-                     : "read ONLY by integrated_tests/runner.cpp: ["
+                     : "MENTIONED ONLY by integrated_tests/runner.cpp: ["
                            + onlyInThisOne + "]. ")
               + "A manifest key one corpus runner has never heard of is"
                 " INDISTINGUISHABLE FROM A TYPO to that runner: the example still"
@@ -3019,6 +3794,16 @@ int main(int argc, char* argv[]) {
               findings.empty(), findings);
     }
     std::cout << "\n";
+
+    // ── Harness self-test: the per-dependency opt-in parses here too ──
+    //
+    // UNNUMBERED for the same reason the staging self-test above is: the
+    // `[Test N]` labels are cited from `.plans/_deferred-anchor-registry.md`,
+    // so inserting a number would silently invalidate a registry citation. Runs
+    // BEFORE the corpus so a parser that stopped honouring the key announces
+    // itself rather than letting every dependency comparison go quietly inert.
+    runDependsOnParserPin(outputBase / "harness-dependson-parser");
+    runManifestClosedKeySetPin(outputBase / "harness-manifest-keys");
 
     // ── Test 3: Examples corpus via CLI subprocess ──
     runAllExamples(compiler, examplesRoot, outputBase);

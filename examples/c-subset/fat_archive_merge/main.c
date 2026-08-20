@@ -22,7 +22,16 @@
  *       gap), but at RUNTIME the loader reports "undefined symbol:
  *       dss_input_answer" -> exit 127 != 42 -> the runner's exit-code assert
  *       fires -> red.
- * gcc/clang agree (build the same 3-step chain -> exit 42). */
+ * gcc/clang agree (build the same 3-step chain -> exit 42).
+ *
+ * D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM -- KEEP THIS FILE THIN. It has
+ * no locals, no arithmetic and no inlinable callee, so the shipped release
+ * pipeline has nothing HERE to transform. That is deliberate: it is what lets
+ * `expected.json`'s `release` arm attribute the whole baseline-vs-release image
+ * difference to the MERGED ARCHIVE MEMBER (`dss_input_answer`, from input.c)
+ * rather than to the executable's own code. Giving `main` work of its own would
+ * let that arm go green while the static-library half of the build was never
+ * optimized at all -- the exact masked-coverage trap the arm exists to close. */
 extern int dss_input_answer(void);
 
 int main(void) {

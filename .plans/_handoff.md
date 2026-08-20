@@ -9,8 +9,8 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-19 — cycles **P14 … P20**. ★★★ **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P20). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
+**Last updated:** 2026-08-20 — cycles **P14 … P21**. ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P21). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
 
@@ -56,10 +56,31 @@ commit that lands it, and never delete a ticked row.
       §B design fork; there was none — every alternative was refuted by measurement rather than being
       merely less attractive, so the hard part landed. **What the row did NOT name and the cycle found:**
       the fall-through edge was missing from the MIR CFG entirely. Net −1.
-- [ ] **P21 — `D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM`.** Trigger FIRED. AP5/AP6's `dependsOn` path has
-      never been touched by the release optimizer on ANY leg, so a release-only fault in it is invisible today.
-- [ ] **P22 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
+- [x] **P21 — `D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM` CLOSED. ✅ DONE 2026-08-20.** Net 0.
+      The queued line above described a MANIFEST edit. ✔MEASURED: that edit alone would have asserted
+      NOTHING — both runners built the prerequisite library at the BASELINE configuration in every arm, so
+      a `release` arm re-compiled only the final exec and linked it against a DEBUG archive. Both runners
+      fixed, the examples given something for the pipeline to transform, and all **12** `dependsOn` entries
+      armed with `mustDifferFromBaseline`. ✔All 12 library images differ debug→release across four targets;
+      macho64-arm64 and elf64-aarch64 verified BY EXECUTION on real hardware, exit 42 in all eight arms.
+      **The row predicted a finding and got two** — see §0.00000000000000000000000.
+- [ ] **P22 — `D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM` (HIGH). OPERATOR-ORDERED
+      2026-08-20 for the IMMEDIATE next cycle** (*"remember to address anchor in the immediate next cycle.
+      only best long term solutions! no workarounds"*). DSS cannot link a **file-local** function out of an
+      archive on pe64 or macho64: those readers classify a non-external defined symbol as a bodyless block
+      label instead of an atom, so its bytes never enter the image. P21 landed the FAIL-LOUD half (a
+      reader-agnostic partial-coverage guard, `F_ObjectReaderSymbolBodyDropped`), so the loss can no longer
+      be silent — what remains is the CLASSIFICATION. ⚠ Reading the row first is not optional: it records a
+      boundary the guard does NOT catch (a file-local function TRAILING an external one rides along inside
+      the wrong atom), and a third, independent bug on macho64-x86_64 (conflicting relocation `nativeId`s
+      between the object and image vocabularies). ⚠ The mach-o option involves `MH_SUBSECTIONS_VIA_SYMBOLS`,
+      a SHIPPING WIRE-FORMAT change that Apple's ld64 reads as a licence for symbol-granularity
+      dead-stripping — if the design lands there, it is a §B, not a lane decision.
+- [ ] **P23 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
       family, and it gates the pe64 sqlite CLI. ✔Measured to shrink to ONE library for the CLI case.
+- [ ] **P24+ — THE REST OF WHAT P21 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
+      /loop using /dss-cycle each iteration to address ALL anchors found in _handoff §0."* Re-derive each pick
+      from the REGISTRY, never from this list.
 - [x] **OPERATOR CALL — ✅ FILED 2026-08-19: <https://sqlite.org/bugs/forumpost/97cd29ca44624113c73b30f5d2504729e6ffc5c5ebcba137078ea1a868cd97c9>.**
       The `%p` half only, which is the half that warranted it. ✔The toolchain table is what makes it
       compiler-independent: `sprintf("ptr:%p")` yields `ptr:0000007BD12FFB50` on **MSVC**, `ptr:00007ffffe2ffedc`
@@ -90,6 +111,154 @@ trigger NOT fired `D-ASM-TARGET-DECLARES-NO-BYTE-ORDER`, `D-ASM-COND-ON-TERMINAT
 ⓘ Two rows a family-grep catches that are NOT defects: `D-OPT-REBUILD-POLICY-NEUTERED-STATE-HOOK` is a 🟢
 SHIPPED design record, and `D-TEST-MACOS-LEG-EMSDK-PROFILE-REPLACES-PATH-HIDING-HOMEBREW` is a 🔵 DISCLOSED
 pre-existing environment fact.
+
+---
+
+## 0.00000000000000000000000 ★★★ CYCLE P21 — THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING, AND SIX CORPUS LINTS WERE NEVER RUNNING
+
+**Priority:** `D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM` (queued P21). **Anchors: closed 1, opened 1,
+net 0** — OPEN 1019 → 1019. Six further rows were opened and CLOSED in this same commit and carry no OPEN
+weight. **Tests 904 → 906.**
+
+### What the row asked for, and why doing only that would have been a lie
+
+📄The row asked for a `release` arm on the corpus's only two `dependsOn` manifests. ✔**MEASURED: adding it
+alone asserts nothing.** BOTH runners built the prerequisite library at the BASELINE configuration in every
+arm — an arm labelled `release` re-compiled only the FINAL exec under the release pipeline and then linked
+it against a DEBUG-pipeline archive. The `-staticlib` / `--resolve-library` path the row exists to cover
+would have stayed exactly as un-optimized as before, under a manifest now claiming otherwise.
+
+Fixed in both, the same fix in each runner's own vocabulary:
+- `tests/examples/examples_runner.cpp` — `buildDependencyArtifact` takes a pipeline and a `CompileConfig`
+  override, applies them to the prerequisite's own `Program`, and threads them down the RECURSION so a
+  NESTED prerequisite is built under the arm too.
+- `integrated_tests/runner.cpp` — `buildDependsOnArtifactCli` takes the arm's `configName` and emits
+  `--config=<name>` on every prerequisite compile.
+
+✔And the examples themselves had **nothing to optimize** — their helpers were straight-line returns, so the
+release pipeline would have produced a byte-identical archive and `mustDifferFromBaseline` would have red
+everywhere. Rewritten with a loop, a loop-invariant addend and promotable locals, so Inlining / Mem2Reg /
+CSE / LICM / DCE are witnessed on the ARCHIVED TU and not only on the exec.
+
+✔**MEASURED, debug → release, on the LIBRARY images — all 12 differ** (`dsslib.a` / `input.a` / `fatlib.a`;
+the middle one is the NESTED prerequisite, which is what proves the recursion carries the config):
+pe64-x86_64 866→664 / 886→674 / 1608→1192 · elf64-x86_64 1672→1464 / 1684→1468 / 2962→2530 ·
+macho64-arm64 770→650 / 780→656 / 1474→1230 · elf64-aarch64 1512→1376 / 1524→1380 / 2642→2362.
+
+### ★★★ THE FINDING THE ROW PREDICTED — AND IT WAS ONE KEYWORD
+
+Writing the new helper as `static`, the spelling any C author would reach for, made the **pe64 and macho64
+links FAIL**. ✔Root-caused: those readers classify a non-external DEFINED symbol as a bodyless block label
+instead of an atom, so its bytes never enter the linked image. A third, independent bug surfaced on
+macho64-x86_64 (conflicting relocation `nativeId`s between the object and image vocabularies).
+
+Per the row's own instruction — *"do NOT drop the arm to get green"* — the arm stayed. By operator ruling
+the `static` KEYWORD alone was removed (the helper stays, so every pass above is still witnessed), the
+mechanism was opened HIGH as `D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM`, and its
+**silent half was made fail-loud in this same commit** rather than deferred with it:
+`everyDefinedSymbolIsCoveredByAnAtom` in the new `src/link/format/object_atom_coverage.hpp` — ONE inline
+implementation called identically by all three readers, asking the question in the neutral
+`(sectionKey, byteOffset)` coordinates every reader already stages, so there is **no format test anywhere in
+it**. Refusal is a NEW code, `F_ObjectReaderSymbolBodyDropped`, deliberately not `F_CorruptedBinary`: every
+other reader refusal means *these bytes are not a well-formed object*; this one means the opposite — the
+object is fine and the READER cannot represent it. ✔**BLAST RADIUS ZERO** (38 `link/` entries, 7 `program/`
+entries, 5 archive-touching examples, 7 real-toolchain witnesses), because no archived TU in the corpus
+contains a file-local function.
+
+⚠ **The guard does NOT catch everything, and the row says so rather than leaving it to be discovered:** a
+file-local function that TRAILS an external one is covered by the preceding atom and rides along inside the
+WRONG atom instead of vanishing. Telling that from a genuine interior label needs the size a non-external
+symbol does not carry — i.e. exactly the wire-format work the classification fix owes.
+
+### ★★★ THE FINDING NOBODY PREDICTED — SIX CORPUS LINTS HAD NO CTEST ENTRY
+
+An implementation lane wrote three new pins into `ExamplesCorpusLint` and reported plainly that it could not
+watch them fail. Planting mutants to watch them red is what revealed **they were never running**.
+
+✔MEASURED: **8 tests defined in the suite, 2 selected by any ctest entry.** The per-example entries exclude
+`ExamplesCorpusLint.*` wholesale, so nothing else could pick the rest up. ✔ROOT-CAUSED to `2fc87192`
+(cycle P5b, 2026-08-15): splitting the carve-out census onto its own named entry narrowed the general
+entry's filter from the whole suite to ONE test name — and **the comment directly above it, which says the
+filter selects the whole suite, was left untouched**. Three lints went dark that day and stayed dark through
+P6–P20; this cycle's three would have made six. `orphan_tests_guard` cannot see it and is not at fault: it
+asks whether a test SOURCE is compiled and run, and this one is both.
+
+★ **Fixed by making the registration DEFAULT-IN.** One pair list `EXAMPLES_LINT_NAMED_ENTRIES` holding
+`<GTestName>` and `<ctest entry name>` per lint that earns its own name, and the SAME loop iteration creates
+the dedicated entry AND subtracts that test from the catch-all's filter — so "moved, not dropped" is one
+statement pair and the two halves cannot drift. ✔After the fix **8 of 8 selected**, none twice, and the
+three long-dark lints all PASS — nothing had rotted behind the darkness, which is luck and is recorded as
+luck.
+
+### ✅ RED-ON-DISABLE, WATCHED RATHER THAN READ
+
+Each pin under its own mutant, each reddening ALONE, binary mtime confirmed to advance every time:
+- drop the config override in `buildDependencyArtifact` ⇒ both examples red, naming the dependency by its
+  spec-and-artifact key and reporting the exec AND the library byte-identical;
+- ignore the per-dependency opt-in ⇒ `DependencyMustDifferFromBaselineIsWiredEndToEnd` reds;
+- open the `dependsOn` entry key set ⇒ `DependsOnEntryRefusesAnUnknownKeyAtEveryDepth` reds;
+- open the per-target key set ⇒ `ManifestRefusesAnUnknownKeyAtTopLevelAndPerTarget` reds.
+
+### ✅ EVERY LEG — AND TWO OF THEM BY EXECUTION ON REAL HARDWARE
+
+- **pe64-x86_64** — Windows gate: both examples green at debug and release.
+- **elf64-x86_64** — WSL gate: both examples green at debug and release.
+- **elf64-aarch64** — native aarch64 VPS, RUN: 42 / 42 / 42 / 42.
+- **macho64-arm64** — real Apple Silicon, RUN: 42 / 42 / 42 / 42.
+
+### The five other rows opened and closed in this commit
+
+`D-DOC-EXAMPLES-README-ASSERTS-A-REPAIRED-RUNNER-ASYMMETRY` (the author-facing schema doc asserted, with a
+✔MEASURED mark and a date, a runner asymmetry repaired three days after it was written; every positional
+citation converted, file now at ZERO — and the first repair MISSED A SECOND COPY of the false claim seven
+lines below the correction, which is the finding worth carrying) · `D-GATE-CITATION-GUARD-BLIND-TO-MARKDOWN-OUTSIDE-THE-DOC-ROOTS`
+(the guard enforcing *never cite a line number* could not see that document; `.md` joined the code family,
+five roots added, `DOC_FLOOR` 40 → 45, self-test 12 → 23 arms) ·
+`D-TEST-EXAMPLES-MANIFEST-KEYS-SILENTLY-IGNORED` (four of five manifest levels silently ignored unknown
+keys, so `mustDifferFromBaseLine` would have parsed clean and disarmed the very assertion this cycle added;
+five closed key sets now, byte-identical in both runners) · `D-PLANS-REGISTRY-UNMARKED-DUPLICATE-ROWS`
+(✔1658 rows under 1653 names AT THIS COMMIT, 5 names duplicated; the two unmarked duplicates marked
+SUPERSEDED, nothing retracted — the row's own 1651/1646 was measured before this cycle's 7 rows landed) ·
+`D-BUILD-LANE-TREES-NOT-NAMED-LANE-SURVIVE-THE-COMPLETION-CHECK` (7.2 GiB of cycle-P10 lane scratch survived
+ten cycles because the completion check keys on the NAME `build/lane-*`) ·
+`D-GATE-CITATION-GUARD-BLIND-TO-CONTINUATION-CITATIONS` (the guard could see only the FIRST line number in
+`<file>.cpp:<line>/:<line>/:<line>` — **35** references across **19** documents counted by nothing).
+
+### ⚠⚠ THE INDEPENDENT AUDIT OF THIS CYCLE'S OWN DELTA IS THE PART TO READ
+
+It returned **12 findings**, and the pattern across them is one thing: **this cycle repaired rot and then
+produced fresh rot inside the repairs.** The three that changed the work rather than the wording:
+1. **The `examples/README.md` repair fixed one of TWO copies.** The same claim, the same three zeros, the
+   same ✔ mark, in the present tense, seven lines below the correction. ⇒ **when retracting a measured
+   claim, grep the document for the CLAIM — never edit the paragraph you happened to find.**
+2. **The replacement counts were already stale in the commit that shipped them** (26/21/25/17 against a live
+   31/23/29/26), because they were taken mid-cycle while the file was still growing. ⇒ **a count of a token
+   in a file the same commit is still editing must be taken LAST**, and the convention stated with it.
+3. **The default-in lint registration left the STRING unguarded.** A typo in the pair list's GTest name
+   selects nothing, and ✔a gtest filter matching nothing exits **0** — a permanently green entry asserting
+   nothing, i.e. the very class the fix was for. Closed with a ctest `FAIL_REGULAR_EXPRESSION` on the
+   runner's own *did not match any test*, applied to EVERY entry the file registers, red-on-disable watched.
+⚠ And a fourth, recorded because it is funny and instructive: the comment introducing the new continuation
+matcher illustrated it with a REAL three-site citation and moved that guard's own ceiling 3 → 7. Caught by
+reading the re-derived inventory delta, not by review.
+
+### ⚠ CARRY FORWARD
+
+1. **P22 is `D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM`, operator-ordered for the
+   immediate next cycle.** Read the row before planning: it carries the write-vs-read measurement (all three
+   formats KEEP the bytes at object emit — the loss is exclusively on the archive-member READ-BACK path), the
+   boundary the guard does not catch, and the macho64-x86_64 relocation-vocabulary bug.
+2. **The corpus still contains no archived TU with a file-local function**, which is why the guard's blast
+   radius is zero — and also why the classification bug can only be witnessed by an example that deliberately
+   plants one. Any such example must land WITH the fix, not before it.
+3. ⓘ A COFF archive embeds the source stem, so archive byte counts move with FILENAME LENGTH. Two honest
+   measurements of the same pe64 delta differed by a constant 202 bytes for that reason. Never compare an
+   archive size across a rename.
+4. ⚠ **A BARE `ctest` RUNS THE 906 ENTRIES SERIALLY.** ✔Re-hit 2026-08-20: the `CTEST_PARALLEL_LEVEL=8`
+   default P17 added lives in `scripts/run-gate/run-gate.sh` and `scripts/local-build`, NOT in the build
+   tree, and CTest has no project-level way to set it — it reads the ENVIRONMENT only. So invoking `ctest`
+   directly turns a ~12-minute gate into ~43 minutes with no warning. Route every gate through
+   `run-gate.sh`, which is also what supplies the tool-emitted success witness.
 
 ---
 

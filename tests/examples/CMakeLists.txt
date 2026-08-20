@@ -78,10 +78,34 @@ file(GLOB_RECURSE EXAMPLE_MANIFESTS
     "${CMAKE_SOURCE_DIR}/examples/*/*/expected.json")
 
 # D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR: the corpus emulator lint is a
-# CORPUS-wide question with one corpus-wide answer, so it is ONE entry, not 558.
+# CORPUS-wide question with one corpus-wide answer, so it is ONE entry, not 611
+# (✔RE-MEASURED 2026-08-20; this line said 558, which was true when it was
+# written and has been wrong by 53 since - a raw count of a growing corpus is a
+# citation that rots in place, so read the glob, never this number).
 # The per-example entries exclude it; the lint entry selects it and receives the
 # corpus ROOT as argv[1] instead of an example dir. The filter goes AFTER the
 # directory argument so argv[1] keeps its meaning in both shapes.
+# ★★★ A `--gtest_filter` THAT MATCHES NOTHING EXITS **0**, AND THAT IS THE HOLE
+# THE DEFAULT-IN LOOP BELOW DOES NOT CLOSE BY ITSELF. ✔MEASURED 2026-08-20 on the
+# vendored googletest: `--gtest_filter=ExamplesCorpusLint.NoSuchTest` prints
+# `[  PASSED  ] 0 tests.` plus a WARNING and returns **rc=0**. So a typo in a
+# GTest name — in this file, in a rename, anywhere — buys a permanently GREEN
+# ctest entry that asserts nothing, which is precisely the vacuous-coverage class
+# `D-TEST-EXAMPLES-CORPUS-LINT-ENTRY-SELECTS-ONE-TEST-NOT-THE-SUITE` was opened
+# for. The pair list makes the STRUCTURE safe; this makes the STRING safe.
+#
+# ⚠ It is a ctest property and not a gtest flag on purpose: this googletest has
+# `--gtest_fail_if_no_test_linked` (nothing linked at all) but NO flag for
+# "the filter selected none", so the only signal the runner emits is that
+# warning line — and reading the tool's own words is this repository's rule for
+# a witness. It costs nothing on a healthy entry and applies to every shape
+# registered here: per-example, dedicated lint, and the catch-all (whose
+# negatives could in principle grow to eat it whole).
+function(dss_refuse_a_vacuous_gtest_selection test_name)
+    set_tests_properties(${test_name} PROPERTIES
+        FAIL_REGULAR_EXPRESSION "did not match any test")
+endfunction()
+
 set(EXAMPLES_LINT_SUITE "ExamplesCorpusLint")
 
 # ★ THE ENTRY IS NAMED FOR THE SUITE, NOT FOR ONE OF ITS TESTS — renamed from
@@ -94,6 +118,29 @@ set(EXAMPLES_LINT_SUITE "ExamplesCorpusLint")
 # anything to do with an emulator. A reader triaging a red
 # `examples/manifest-emulator-lint` would have gone looking at manifests and
 # qemu for a failure in a filesystem walk.
+#
+# ★★★ D-TEST-EXAMPLES-CORPUS-LINT-ENTRY-SELECTS-ONE-TEST-NOT-THE-SUITE — AND THE
+# PARAGRAPH ABOVE IS WHY THIS WAS NOT NOTICED FOR THIRTEEN CYCLES. It says the
+# filter selects the WHOLE suite. ✔MEASURED 2026-08-20: it named exactly ONE
+# test, so of the **8** lints defined that day **2** were selected and **6** were
+# selected by NO ctest entry at all — the per-example entries exclude
+# `${EXAMPLES_LINT_SUITE}.*` wholesale, so nothing else could pick them up.
+# (Three of the six had been dark since P5b, when the suite held 5; the other
+# three were written by the cycle that found this.) They compiled, they linked, `--gtest_filter`
+# could still run them by hand, and the gate never executed one of their
+# assertions. ✔ROOT-CAUSED to `2fc87192` (cycle P5b, 2026-08-15), which split
+# the census onto its own entry and, in the same edit, narrowed this filter from
+# `${EXAMPLES_LINT_SUITE}.*` to a single test name — with THIS comment left
+# saying otherwise. The intent was only to give the census its own NAME; the
+# side effect was that every lint not explicitly named stopped running.
+#
+# ★★ SO THE REGISTRATION IS NOW DEFAULT-IN, AND THAT IS THE WHOLE FIX. A lint
+# runs unless something deliberately subtracts it, and the subtraction and the
+# dedicated entry that replaces it are produced by the SAME loop over
+# `EXAMPLES_LINT_NAMED_ENTRIES` below — so they CANNOT drift apart the way a
+# hand-written filter and a hand-written `add_test` did. ⚠ Do NOT "simplify"
+# this back into two literal filters: the literal form is what failed, and it
+# failed silently, in the direction that greens the gate.
 # ⚠ THE OLD NAME IS CITED AS LANDED EVIDENCE by the CLOSED registry row
 # `D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR` above. That citation was
 # ANNOTATED with this rename rather than rewritten — a closed row records what
@@ -101,6 +148,10 @@ set(EXAMPLES_LINT_SUITE "ExamplesCorpusLint")
 # tree is how an audit trail stops being one. Anything else naming this entry
 # must move WITH it; ✔MEASURED at the rename, the repo-wide citations were this
 # file, `tests/examples/examples_runner.cpp` (x2) and that one registry row.
+# ⚠ ✔RE-MEASURED 2026-08-20: the set has GROWN — this file names the entry at 4
+# sites and `examples_runner.cpp` at 4, plus the registry. The figure above is
+# history, correct for its date; the number a future renamer must act on is the
+# one they measure themselves. Do not read a dated count as a current one.
 
 foreach(MANIFEST ${EXAMPLE_MANIFESTS})
     get_filename_component(EXAMPLE_DIR ${MANIFEST} DIRECTORY)
@@ -113,21 +164,63 @@ foreach(MANIFEST ${EXAMPLE_MANIFESTS})
                      --gtest_filter=-${EXAMPLES_LINT_SUITE}.*
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     dss_strict_arm_verdicts(${TEST_NAME})
+    dss_refuse_a_vacuous_gtest_selection(${TEST_NAME})
 endforeach()
 
+# D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the carve-out census
+# gets its OWN entry rather than riding the general lint entry's. Both are
+# corpus-wide and both live in ${EXAMPLES_LINT_SUITE}; the census gets its own
+# NAME so a census failure is reported as one, instead of arriving under the
+# generic `examples/corpus-lints` and being investigated as a manifest problem.
+# ⚠ THIS PARAGRAPH USED TO ARGUE AGAINST `${EXAMPLES_LINT_SUITE}.*` ITSELF, on
+# the ground that a census failure would surface under the name
+# "manifest-emulator-lint". ✔That hazard was retired by the AP6 rename above —
+# no entry has carried that name since — and the argument survived it, which is
+# how the catch-all ended up narrowed to a single test name. The catch-all IS
+# `${EXAMPLES_LINT_SUITE}.*` again, minus exactly what the loop below moves onto
+# its own entry. The per-example entries' exclusion filter is still the whole
+# suite, so nothing runs twice.
+#
+# ⇒ ONE PAIR PER LINT THAT EARNS ITS OWN CTEST NAME: "<test>|<ctest entry name>".
+# Add a pair here ONLY to give a lint a more findable name than the catch-all —
+# never to remove it from the gate, which this list structurally cannot do.
+set(EXAMPLES_LINT_NAMED_ENTRIES
+    "OnlyDeclaredExamplesMayDivergeFromTheirBaseline|examples/optimization-observable-census")
+
+set(_dss_lint_excluded "")
+foreach(_pair ${EXAMPLES_LINT_NAMED_ENTRIES})
+    string(REPLACE "|" ";" _parts "${_pair}")
+    list(LENGTH _parts _n)
+    if(NOT _n EQUAL 2)
+        message(FATAL_ERROR
+            "EXAMPLES_LINT_NAMED_ENTRIES entry '${_pair}' must be "
+            "\"<GTestName>|<ctest entry name>\"")
+    endif()
+    list(GET _parts 0 _lint_test)
+    list(GET _parts 1 _lint_entry)
+    add_test(NAME "${_lint_entry}"
+             COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
+                     --gtest_filter=${EXAMPLES_LINT_SUITE}.${_lint_test}
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    dss_refuse_a_vacuous_gtest_selection("${_lint_entry}")
+    # The SAME iteration that gave this lint an entry takes it out of the
+    # catch-all — the two halves of "moved, not dropped" are one statement pair.
+    if(_dss_lint_excluded STREQUAL "")
+        set(_dss_lint_excluded "${EXAMPLES_LINT_SUITE}.${_lint_test}")
+    else()
+        string(APPEND _dss_lint_excluded ":${EXAMPLES_LINT_SUITE}.${_lint_test}")
+    endif()
+endforeach()
+
+# gtest filter grammar: `positive[:positive...][-negative[:negative...]]`, so the
+# minus sign appears at most ONCE however many lints are subtracted.
+if(_dss_lint_excluded STREQUAL "")
+    set(_dss_lint_catchall "${EXAMPLES_LINT_SUITE}.*")
+else()
+    set(_dss_lint_catchall "${EXAMPLES_LINT_SUITE}.*-${_dss_lint_excluded}")
+endif()
 add_test(NAME "examples/corpus-lints"
          COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
-                 --gtest_filter=${EXAMPLES_LINT_SUITE}.EveryArmAgreesWithItsSiblingsOnTheEmulator
+                 --gtest_filter=${_dss_lint_catchall}
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-# D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the carve-out census
-# gets its OWN entry rather than riding the emulator lint's. Both are corpus-wide
-# and both live in ${EXAMPLES_LINT_SUITE}, but a `${EXAMPLES_LINT_SUITE}.*` filter
-# would report a census failure under the name "manifest-emulator-lint" — a red
-# test whose NAME points at the wrong question, which is how a finding gets
-# investigated in the wrong place and then re-filed as flaky. The per-example
-# entries' exclusion filter is still the whole suite, so nothing runs twice.
-add_test(NAME "examples/optimization-observable-census"
-         COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
-                 --gtest_filter=${EXAMPLES_LINT_SUITE}.OnlyDeclaredExamplesMayDivergeFromTheirBaseline
-         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+dss_refuse_a_vacuous_gtest_selection("examples/corpus-lints")

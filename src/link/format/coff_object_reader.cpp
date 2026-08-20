@@ -1,4 +1,5 @@
 #include "link/format/coff_object_reader.hpp"
+#include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
@@ -611,6 +612,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // sliced by sorted Value in the per-section pass below. A STATIC (local)
     // block label is NOT an atom boundary (see the loop).
     std::unordered_map<std::uint16_t, std::vector<DefSym>> defsBySection;
+    // The DEMOTED half of that split, staged for the shared coverage guard --
+    // see `link/format/object_atom_coverage.hpp`.
+    std::vector<link::format::BodilessDefinedSymbol> bodilessDefined;
 
     for (std::uint32_t i = 0; i < numSymbols; ++i) {
         if (auxSlot[i]) continue;  // an auxiliary record, not a symbol
@@ -683,6 +687,27 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // the Mach-O N_SECT-local rule, macho:545-554).
             mod.symbols.push_back(ModuleSymbol{SymbolId{i}, s.name,
                 SymbolBinding::Local, SymbolVisibility::Default});
+            // ...and STAGE it for the coverage guard
+            // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
+            // The reasoning above is right for a LABEL and wrong for a whole
+            // file-local (`static`) FUNCTION, and IMAGE_SYMBOL carries no size
+            // field to tell them apart. A label lies INSIDE the function that
+            // contains it, so the enclosing atom covers its offset and the guard
+            // stays silent; a demoted whole function is covered by nothing, and
+            // the guard names it rather than letting its bytes vanish. Only a
+            // KIND-RESOLVED section is staged (an unmodeled `.pdata`/`.debug$S`
+            // symbol reconstructs no body BY DESIGN, and is not a dropped body),
+            // and a section-DEFINITION symbol -- a STATIC symbol carrying an aux
+            // record -- is a section IDENTITY, not a body, so it is excluded.
+            bool const isSectionDefSym =
+                (static_cast<std::size_t>(i) + 1u < numSymbols)
+                && auxSlot[static_cast<std::size_t>(i) + 1u];
+            if (sections[s.sectNum - 1u].kind.has_value() && !isSectionDefSym) {
+                bodilessDefined.push_back(link::format::BodilessDefinedSymbol{
+                    /*sectionKey=*/s.sectNum, /*sectionOffset=*/s.value,
+                    /*declaredSize=*/std::nullopt, /*name=*/s.name,
+                    /*sectionName=*/sections[s.sectNum - 1u].name});
+            }
         }
     }
 
@@ -794,6 +819,32 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 Interval{off, len, mod.dataItems.size()});
             mod.dataItems.push_back(std::move(di));
             pushModuleSym(defs[k]);
+        }
+    }
+
+    // -- (6.5) Coverage guard: no defined symbol's body was dropped -------
+    //
+    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM. The
+    // demotion above is the ONLY place this reader turns a defined body-bearing
+    // symbol into a bodiless one, so this is the first point at which the
+    // question "did any named bytes end up in no atom?" is answerable. Asked
+    // BEFORE the relocation pass so the refusal names the SYMBOL rather than
+    // surfacing later as a reloc that routes to nothing (or, worse, not at all).
+    // The check itself is shared and format-neutral -- see
+    // `link/format/object_atom_coverage.hpp`.
+    {
+        std::vector<link::format::ReconstructedAtomExtent> extents;
+        for (auto const* bySec : {&funcIntervalsBySec, &dataIntervalsBySec}) {
+            for (auto const& [ordinal, ivs] : *bySec) {
+                for (auto const& iv : ivs) {
+                    extents.push_back(link::format::ReconstructedAtomExtent{
+                        ordinal, iv.start, iv.len});
+                }
+            }
+        }
+        if (!link::format::everyDefinedSymbolIsCoveredByAnAtom(
+                bodilessDefined, extents, "pe::readRelocatableObject", reporter)) {
+            return std::nullopt;
         }
     }
 

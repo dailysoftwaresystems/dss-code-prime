@@ -4330,6 +4330,43 @@ enum class DiagnosticCode : std::uint16_t {
     // RELATIONSHIP between descriptors, or between a descriptor and the format it
     // claims to serve, which is a thing no per-file read can see.
     F_ShippedCorpusInvariantBroken = 0x5026,
+    // F_ObjectReaderSymbolBodyDropped: a relocatable-object reader
+    //   (`elf/pe/macho::readRelocatableObject`) reconstructed the object, and a
+    //   DEFINED symbol in a section whose kind RESOLVED — i.e. real code or data
+    //   the `AssembledModule` models — landed at a byte offset that NO
+    //   reconstructed atom covers. Its body is therefore in the object file and
+    //   in NO `AssembledFunction` / `AssembledData`, so a merge + emit would
+    //   write an image missing those bytes.
+    //
+    //   ★ WHY THIS IS ITS OWN CODE RATHER THAN `F_CorruptedBinary` (0x5005).
+    //   Every other reader refusal answers "these bytes are not a well-formed
+    //   object". This one answers the opposite: the object is PERFECTLY well
+    //   formed and the READER is the one that cannot represent it. Triage acts on
+    //   those two differently — F_CorruptedBinary points at the producer of the
+    //   input, this points at DSS — so collapsing them would send every report to
+    //   the wrong place. The remediation is a reader change, never a rebuild of
+    //   the input.
+    //
+    //   ★★ IT EXISTS BECAUSE THE FAILURE IT REPLACES WAS SILENT, AND THAT IS THE
+    //   WHOLE POINT. `D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-
+    //   ATOM`: the COFF and Mach-O readers classify every NON-EXTERNAL defined
+    //   section symbol as an interior block label (an `&&label`), which is right
+    //   for a label and wrong for a whole file-local (`static`) function — the
+    //   two shapes are indistinguishable in those formats' symbol tables, which
+    //   carry no size field. A file-local function that IS called then failed
+    //   loud downstream (`K_SymbolUndefined` from the cross-CU resolve), but an
+    //   UNCALLED one linked GREEN with its bytes dropped: byte-identical output
+    //   across a change that should have grown `.text`. Only the ZERO-atom case
+    //   was refused, so partial coverage passed without a word. This code is the
+    //   conversion of that silence into a refusal that NAMES the symbol.
+    //
+    //   Emitted at Error severity; the read returns `nullopt`, so no partially
+    //   reconstructed module ever reaches the merge. Reader-agnostic by
+    //   construction — the check runs over the format-neutral
+    //   `(section, offset)` staging the three readers already build, so it is
+    //   ONE implementation, not three (see
+    //   `src/link/format/object_atom_coverage.hpp`).
+    F_ObjectReaderSymbolBodyDropped = 0x5027,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

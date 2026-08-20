@@ -1,5 +1,5 @@
 {
-  "$comment": "TF-C51 (D-FF1-STATICLIB-FAT-ARCHIVE): the FAT/merged static-library RUNTIME witness at the corpus tier. Building a `-staticlib` while passing INPUT `--resolve-library` static archives MERGES their members into the output library. This example needs a NESTED dependsOn (D-EXAMPLES-RUNNER-MULTI-ARTIFACT extension): each target's dependsOn is the FAT lib `fatlib.a` (from fatlib.c, defining dss_fat_extra), whose OWN nested dependsOn is the INPUT lib `input.a` (from input.c, defining dss_input_answer==42). The runner builds bottom-up: input.a, then fatlib.a RESOLVING input.a (the FAT MERGE -> fatlib.a carries BOTH members), then main RESOLVING ONLY fatlib.a. main references dss_input_answer, reaching it SOLELY via the merged copy in fatlib.a (input.a is NOT on main's --resolve-library) -> runs -> exit 42 IFF the merge worked. RED-ON-DISABLE (both gates verified, x86_64 native + arm64 qemu): (1) BUILD -- removing the merge restores the D_StaticLibFatArchiveUnsupported fail-loud so fatlib.a's dependsOn build returns rc!=0 -> red; (2) RUN -- a silent-no-op merge leaves fatlib.a without dss_input_answer and main STILL links (the open D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD gap: DSS emits the exec with the symbol unresolved) but fails at RUNTIME with the loader's 'undefined symbol: dss_input_answer' -> exit 127 != 42 -> the runner's exit-code assert fires -> red. NOTE: artifact names track the driver's `<sourceStem>.a`/`.lib`/`.exe` output naming (input.c -> input.a|input.lib, fatlib.c -> fatlib.a|fatlib.lib, main.c -> main|main.exe), NOT a 'lib' prefix. x86_64 runs natively under WSL / the ubuntu leg; arm64 under qemu-aarch64; pe64 (COFF .lib -> .exe) natively on the Windows leg (verified: fatlib.lib merges input.lib -> main.exe exit 42); macho64 arm64 NATIVELY on the darwin leg, build-clean + SkippedCrossHost elsewhere. D-TEST-EXAMPLES-DEPENDSON-UNCOVERED-ON-DARWIN: the macho64 arm is what makes the NESTED dependsOn path RUN on darwin at all. Before it, NEITHER dependsOn manifest carried a `darwin` runOn, so integrated_tests' `buildDependsOnArtifactCli` -- which SKIPS an example outright when no target's runOn matches the host -- was reached by ZERO checks on the leg this project gates on every cycle, leaving the recursion free to rot behind a green suite. MEASURED on darwin arm64, the full bottom-up chain: input.a (426 B), then fatlib.a RESOLVING it -> 774 B (the merge -- it carries BOTH members), then main RESOLVING ONLY fatlib.a, spawned -> exit 42. RUN-gate RED-ON-DISABLE re-MEASURED on this host, not merely inherited from the linux/windows legs: build fatlib.a WITHOUT the nested resolve and it stays 420 B (unmerged); main still links, but dyld aborts with `Symbol not found: _dss_input_answer` -> exit 134 != 42 -> red. Note the darwin RUN-gate signal is SIGABRT-134 from dyld, not the 127 the ELF loader gives; either way it is != 42, which is all the exit-code assert needs.",
+  "$comment": "TF-C51 (D-FF1-STATICLIB-FAT-ARCHIVE): the FAT/merged static-library RUNTIME witness at the corpus tier. Building a `-staticlib` while passing INPUT `--resolve-library` static archives MERGES their members into the output library. This example needs a NESTED dependsOn (D-EXAMPLES-RUNNER-MULTI-ARTIFACT extension): each target's dependsOn is the FAT lib `fatlib.a` (from fatlib.c, defining dss_fat_extra), whose OWN nested dependsOn is the INPUT lib `input.a` (from input.c, defining dss_input_answer==42). The runner builds bottom-up: input.a, then fatlib.a RESOLVING input.a (the FAT MERGE -> fatlib.a carries BOTH members), then main RESOLVING ONLY fatlib.a. main references dss_input_answer, reaching it SOLELY via the merged copy in fatlib.a (input.a is NOT on main's --resolve-library) -> runs -> exit 42 IFF the merge worked. RED-ON-DISABLE (both gates verified, x86_64 native + arm64 qemu): (1) BUILD -- removing the merge restores the D_StaticLibFatArchiveUnsupported fail-loud so fatlib.a's dependsOn build returns rc!=0 -> red; (2) RUN -- a silent-no-op merge leaves fatlib.a without dss_input_answer and main STILL links (the open D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD gap: DSS emits the exec with the symbol unresolved) but fails at RUNTIME with the loader's 'undefined symbol: dss_input_answer' -> exit 127 != 42 -> the runner's exit-code assert fires -> red. NOTE: artifact names track the driver's `<sourceStem>.a`/`.lib`/`.exe` output naming (input.c -> input.a|input.lib, fatlib.c -> fatlib.a|fatlib.lib, main.c -> main|main.exe), NOT a 'lib' prefix. x86_64 runs natively under WSL / the ubuntu leg; arm64 under qemu-aarch64; pe64 (COFF .lib -> .exe) natively on the Windows leg (verified: fatlib.lib merges input.lib -> main.exe exit 42); macho64 arm64 NATIVELY on the darwin leg, build-clean + SkippedCrossHost elsewhere. D-TEST-EXAMPLES-DEPENDSON-UNCOVERED-ON-DARWIN: the macho64 arm is what makes the NESTED dependsOn path RUN on darwin at all. Before it, NEITHER dependsOn manifest carried a `darwin` runOn, so integrated_tests' `buildDependsOnArtifactCli` -- which SKIPS an example outright when no target's runOn matches the host -- was reached by ZERO checks on the leg this project gates on every cycle, leaving the recursion free to rot behind a green suite. MEASURED on darwin arm64, the full bottom-up chain: input.a (426 B), then fatlib.a RESOLVING it -> 774 B (the merge -- it carries BOTH members), then main RESOLVING ONLY fatlib.a, spawned -> exit 42. RUN-gate RED-ON-DISABLE re-MEASURED on this host, not merely inherited from the linux/windows legs: build fatlib.a WITHOUT the nested resolve and it stays 420 B (unmerged); main still links, but dyld aborts with `Symbol not found: _dss_input_answer` -> exit 134 != 42 -> red. Note the darwin RUN-gate signal is SIGABRT-134 from dyld, not the 127 the ELF loader gives; either way it is != 42, which is all the exit-code assert needs. D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM (the `release` arm below): this manifest and staticlib_resolve_roundtrip's are the corpus's ONLY two that use the runner's per-target `dependsOn` key, and until now NEITHER declared an `optimizedPipelines` arm -- so the whole `dependsOn` / `-staticlib` / `--resolve-library` static-link path, INCLUDING the fat merge, had only ever been compiled through the baseline pipeline, which is a bare `Identity`, i.e. a no-op. WHAT THE ARM IS FOR: with the runner building each prerequisite library under the arm's OWN configuration, the `release` arm compiles the WHOLE bottom-up chain through the shipped release pipeline -- input.a, then the merging fatlib.a build, then main -- so the members that cross the merge and land in the exec are release-pipeline output instead of baseline output. That is the first time the shipped optimizer reaches the staticlib and fat-merge MIR shapes on any leg, which is what lets a future optimizer regression over them RED here instead of passing green. WHY THE ARM CAN ATTRIBUTE ITS DIFFERENCE TO THE ARCHIVE: `main.c` is deliberately thin -- one extern declaration and one call, no locals, no arithmetic, no inlinable callee -- so it offers the pipeline nothing of its own. `dss_input_answer` (input.c) is the member `main` references and therefore the one whose code reaches the exec, so it carries the arm's witness: an inlinable helper, a loop-invariant addend and locals for Mem2Reg to promote, still returning exactly 42. `dss_fat_extra` (fatlib.c) is shaped the same way and still returns 7, so the fat lib's OWN member is optimizer input too rather than only the merged one. `mustDifferFromBaseline: true` is therefore aimed AT THE PREREQUISITE BUILDS: if the runner stops threading the arm's configuration into them, or if someone simplifies either library function back to a single `return`, the expectation is that the optimized exec has nothing left to differ by and the arm REDS instead of quietly asserting x == x. That expectation is INFERRED, not measured here -- but it rests on a DSS measurement of exactly this shape, recorded under D-TEST-CORPUS-77-OPTIMIZED-ARMS-WITNESS-NOTHING: a consumer whose only call was external produced a BYTE-IDENTICAL pe64 image under `debug` and `release`, and only giving the consumer an inlinable helper, an accumulator and a loop made the two configs diverge. WHAT THE PER-DEPENDENCY OPT-IN ADDS OVER THE ARM-LEVEL ONE, now that every `dependsOn` entry above -- INCLUDING THE NESTED `input` ONE -- also carries `mustDifferFromBaseline: true`: the ARM-LEVEL key compares the EXECUTABLE's bytes, and an exec can differ between the two configs for reasons entirely its own -- main.c's translation unit, image layout, anything the pipeline touches on the consumer side -- so a green arm-level assertion is still consistent with BOTH archives having been built at BASELINE the whole time. Only the PER-DEPENDENCY key compares EACH PREREQUISITE'S OWN IMAGE, arm vs baseline, so it is the only form here that actually asserts `fatlib.c` and `input.c` were compiled through the arm's pipeline. And because the key is honoured at every nesting depth, arming the NESTED entry is what puts the BOTTOM of the bottom-up chain -- the archive whose member later crosses the merge -- under the assertion DIRECTLY, instead of leaving it inferred from the top of the chain. The key is opt-in (absent means report-only). NO corpus dependency declared it before this manifest and staticlib_resolve_roundtrip's, so it shipped exercised only by the two runners' planted fixtures -- these are the first corpus dependencies to arm it. SAFE TO ARM, MEASURED (shipped CLI, Windows host, cross-compiling each source to each `-staticlib` and comparing debug vs release BYTE-wise, not by size): input.c pe64-x86_64 886 -> 674, elf64-x86_64 1684 -> 1468, elf64-aarch64 1524 -> 1380, macho64-arm64 780 -> 656; fatlib.c 866 -> 662, 1672 -> 1464, 1512 -> 1376, 768 -> 648 in the same order -- all eight DIFFER, so no armed entry is a guaranteed red. That is an image measurement, NOT a leg result. Do not re-quote those byte counts as a pin: a COFF archive embeds the source stem, so the pe64 figures move if a file is renamed; what is asserted is the DIFFERENCE, never the size. D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM -- WHY `dss_input_add` AND `dss_fat_bump` ARE NOT `static`: with the keyword, MEASURED on the same host, this chain reds EARLIER than staticlib_resolve_roundtrip's does -- not at the exec link but at the FAT-MERGE staticlib build itself, with `error[K_SymbolUndefined] ... relocation in symbol #N references undefined symbol #M (not declared by any AssembledFunction, ExternImport, nor AssembledData item)` on pe64-x86_64 and macho64-arm64, while both elf64 legs build and link fine; a relocation to a FILE-LOCAL symbol inside an archive member is not resolvable by the COFF and Mach-O readers today. Dropping the keyword costs the arm nothing -- the helpers are still inlined, the images still differ, and the pe64 three-step chain still merges and runs 42 at BOTH configs (MEASURED) -- and the keyword is restored when that row closes. Leg-by-leg results are NOT recorded here -- whoever runs the legs writes them.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
@@ -13,11 +13,13 @@
           "sources": ["fatlib.c"],
           "spec": "x86_64:elf64-x86_64-linux-staticlib",
           "artifact": "fatlib.a",
+          "mustDifferFromBaseline": true,
           "dependsOn": [
             {
               "sources": ["input.c"],
               "spec": "x86_64:elf64-x86_64-linux-staticlib",
-              "artifact": "input.a"
+              "artifact": "input.a",
+              "mustDifferFromBaseline": true
             }
           ]
         }
@@ -33,11 +35,13 @@
           "sources": ["fatlib.c"],
           "spec": "arm64:elf64-aarch64-linux-staticlib",
           "artifact": "fatlib.a",
+          "mustDifferFromBaseline": true,
           "dependsOn": [
             {
               "sources": ["input.c"],
               "spec": "arm64:elf64-aarch64-linux-staticlib",
-              "artifact": "input.a"
+              "artifact": "input.a",
+              "mustDifferFromBaseline": true
             }
           ]
         }
@@ -52,11 +56,13 @@
           "sources": ["fatlib.c"],
           "spec": "x86_64:pe64-x86_64-windows-staticlib",
           "artifact": "fatlib.lib",
+          "mustDifferFromBaseline": true,
           "dependsOn": [
             {
               "sources": ["input.c"],
               "spec": "x86_64:pe64-x86_64-windows-staticlib",
-              "artifact": "input.lib"
+              "artifact": "input.lib",
+              "mustDifferFromBaseline": true
             }
           ]
         }
@@ -71,15 +77,20 @@
           "sources": ["fatlib.c"],
           "spec": "arm64:macho64-arm64-darwin-staticlib",
           "artifact": "fatlib.a",
+          "mustDifferFromBaseline": true,
           "dependsOn": [
             {
               "sources": ["input.c"],
               "spec": "arm64:macho64-arm64-darwin-staticlib",
-              "artifact": "input.a"
+              "artifact": "input.a",
+              "mustDifferFromBaseline": true
             }
           ]
         }
       ]
     }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
   ]
 }
