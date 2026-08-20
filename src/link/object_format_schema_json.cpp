@@ -20,9 +20,11 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <span>     // the per-ARM key vocabularies are selected as spans
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>   // the root key vocabulary is a UNION built at load time
 
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -60,6 +62,79 @@ namespace {
 
 using json = nlohmann::json;
 using Collector = substrate::DiagnosticCollector;
+
+// ── The typo-discriminator adapter for THIS loader ────────────────────────
+//
+// Binds the shared check (`dss::detail::rejectUnknownKeys`, beside
+// `isDocumentationKey`) to this file's sink, diagnostic code and `path/key`
+// convention. The CHECK and the sentence are shared; the allowed-key TABLE
+// stays with the block it describes, because that is the half a maintainer
+// edits when a field is added.
+//
+// ★★ WHY EVERY CLOSED-KEY BLOCK IN THIS FILE NOW CALLS IT, AND WHY DOING
+// TWO OF THEM WOULD HAVE BEEN WORSE THAN DOING NONE. This loader had exactly
+// two rejections — the document ROOT and each `relocations[]` row — and TEN
+// other closed-key objects with none, so a misspelled key loaded clean and
+// left the capability it names at its default. That is the failure this whole
+// mechanism exists to prevent, and on a config-driven compiler it means a
+// capability quietly not happening: `"segmentPrefixByt"` and TLS access
+// silently reverts to the default byte; `"minimumByte"` and a declared stack
+// reserve validates requests against 0.
+//
+// The partial state was ALSO what made the gap invisible. A reader who sees
+// the root and the relocation rows refusing typos reasonably concludes the
+// nested blocks do too — the container/leaf asymmetry the target loader's own
+// helper header names as the archetype. Coverage here is therefore all-or-
+// nothing by design, not by completionism.
+template <typename KnownKeys>
+void rejectUnknownKeys(json const& obj,
+                       KnownKeys const& known,
+                       std::string_view path,
+                       std::string_view objectLabel,
+                       Collector& coll) {
+    detail::rejectUnknownKeys(obj, known, objectLabel,
+        [&](std::string_view key, std::string message) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("{}/{}", path, key), std::move(message));
+        });
+}
+
+// ── The same check for a block whose vocabulary is PER-ARM ────────────────
+//
+// `processExit` and `processArgs` each key their field set on a `mechanism`
+// verb: the declared arm's parse code reads its own fields and NOTHING of the
+// sibling arm's. A union of both arms would therefore accept a key that can
+// never be read — inert config that loads clean and does nothing, which is
+// `D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-KEY` rebuilt in a new place. So
+// the allowed set is `common + the declared arm's own`, and a key belonging to
+// a DIFFERENT arm gets a message naming that arm: the difference between "you
+// typed this wrong" and "you pasted this from the other mechanism" is the
+// whole diagnostic, and only the loader can tell them apart.
+//
+// `armOwning(key)` answers "which other arm reads this key", or empty.
+template <typename KnownKeys, typename ArmOwningFn>
+void rejectUnknownArmKeys(json const& obj,
+                          KnownKeys const& allowedHere,
+                          std::string_view path,
+                          std::string_view objectLabel,
+                          std::string_view declaredArm,
+                          ArmOwningFn&& armOwning,
+                          Collector& coll) {
+    detail::rejectUnknownKeys(obj, allowedHere, objectLabel,
+        [&](std::string_view key, std::string message) {
+            std::string_view const other = armOwning(key);
+            if (!other.empty()) {
+                message += std::format(
+                    ". '{}' belongs to mechanism '{}', but this block declares "
+                    "'{}' — the '{}' parse arm never reads it, so it would load "
+                    "clean and do NOTHING "
+                    "(D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-KEY)",
+                    key, other, declaredArm, declaredArm);
+            }
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("{}/{}", path, key), std::move(message));
+        });
+}
 
 } // namespace
 
@@ -215,29 +290,20 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // this array AND its size. Two owners that nothing forced to agree is the
     // exact defect this cycle exists to remove — the vocabulary now comes from
     // the backends themselves.
-    auto isDeclaredIdentityBlock = [](std::string_view key) {
-        for (auto const* b : link::objectFormatBackendTable()) {
-            for (char const* blk : b->identityBlockNames()) {
-                if (key == std::string_view{blk}) return true;
-            }
-        }
-        return false;
-    };
-
-    for (auto it = doc.begin(); it != doc.end(); ++it) {
-        if (detail::isDocumentationKey(it.key())) continue;
-        bool known = isDeclaredIdentityBlock(it.key());
-        for (auto const& k : kFormatDocumentKeys) {
-            if (known) break;
-            if (it.key() == k) { known = true; break; }
-        }
-        if (!known) {
-            coll.emit(DiagnosticCode::C_MalformedJson,
-                      std::format("/{}", it.key()),
-                      std::format("unknown top-level key '{}' (typo "
-                                  "discriminator)", it.key()));
+    //
+    // The allowed ROOT vocabulary is the static table UNIONED with whatever
+    // identity blocks the registered backends declare — built as one range so
+    // the shared check needs no special case, and so the ALLOWED list in the
+    // diagnostic names the backend blocks too. A sixth backend's block becomes
+    // both accepted AND advertised without an edit here.
+    std::vector<std::string_view> rootKeys{kFormatDocumentKeys.begin(),
+                                           kFormatDocumentKeys.end()};
+    for (auto const* b : link::objectFormatBackendTable()) {
+        for (char const* blk : b->identityBlockNames()) {
+            rootKeys.emplace_back(blk);
         }
     }
+    rejectUnknownKeys(doc, rootKeys, "", "the object format document", coll);
 
     // dssObjectFormatVersion — same per-schema-file version contract
     // as TargetSchema's. v1 is the only accepted version today;
@@ -264,6 +330,15 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         return std::unexpected(std::move(coll).release());
     }
     auto const& format = doc.at("format");
+    // The identity block's key set. `version` is OPTIONAL and informational;
+    // `name` and `kind` are required below. A typo in any of the three used to
+    // load clean — and a misspelled `kind` then fell through to the REQUIRED-key
+    // diagnostic, which named the absent key rather than the present typo.
+    static constexpr std::array<std::string_view, 3> kFormatBlockKeys{
+        "name", "kind", "version"};
+    DSS_CHECK_KEY_VOCABULARY(kFormatBlockKeys);
+    rejectUnknownKeys(format, kFormatBlockKeys, "/format",
+                      "the 'format' identity block", coll);
     if (!format.contains("name") || !format.at("name").is_string()) {
         coll.emit(DiagnosticCode::C_MissingField, "/format/name",
                   "missing or non-string 'name'");
@@ -534,6 +609,17 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                   "string ('none' or 'leading-underscore')");
     } else {
         auto const& csd = doc.at("cSymbolDecoration");
+        // One key, and the strictest one in the file: this block decides how a
+        // canonical C identifier becomes a linker-visible name, and a wrong
+        // answer BINDS TO A DIFFERENT FUNCTION (`_exit` is a real, distinct
+        // export on both undecorated formats). A misspelled `"schema"` used to
+        // load clean and surface as the missing-key diagnostic, which names the
+        // absent key rather than the present typo.
+        static constexpr std::array<std::string_view, 1>
+            kCSymbolDecorationKeys{"scheme"};
+        DSS_CHECK_KEY_VOCABULARY(kCSymbolDecorationKeys);
+        rejectUnknownKeys(csd, kCSymbolDecorationKeys, "/cSymbolDecoration",
+                          "the 'cSymbolDecoration' block", coll);
         if (!csd.contains("scheme") || !csd.at("scheme").is_string()) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       "/cSymbolDecoration/scheme",
@@ -856,12 +942,26 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         auto const& ta = doc.at("tlsAccess");
         if (!ta.is_object()) {
             coll.emit(DiagnosticCode::C_MalformedJson, "/tlsAccess",
+                      // Lists all FOUR keys the parse arm reads. It listed
+                      // three: `tlsIndexSlotName` was read and never
+                      // advertised, which mattered the moment the key set
+                      // became closed below.
                       "'tlsAccess' must be an object { \"model\": "
                       "\"local-exec\"|\"pe-indexed\"|\"macho-tlv\", "
-                      "\"segmentPrefixByte\": N, \"baseDisplacement\": N }");
+                      "\"segmentPrefixByte\": N, \"baseDisplacement\": N, "
+                      "\"tlsIndexSlotName\": \"…\" }");
         } else {
             TlsAccessInfo info{};
             bool ok = true;
+            // ⓘ The wrong-shape message just above lists only three of these
+            // four keys; `tlsIndexSlotName` is read too. The TABLE is derived
+            // from the parse code, which is the half that decides.
+            static constexpr std::array<std::string_view, 4> kTlsAccessKeys{
+                "model", "segmentPrefixByte", "baseDisplacement",
+                "tlsIndexSlotName"};
+            DSS_CHECK_KEY_VOCABULARY(kTlsAccessKeys);
+            rejectUnknownKeys(ta, kTlsAccessKeys, "/tlsAccess",
+                              "the 'tlsAccess' block", coll);
             if (!ta.contains("model") || !ta.at("model").is_string()) {
                 coll.emit(DiagnosticCode::C_MissingField, "/tlsAccess/model",
                           "'tlsAccess.model' is required and must be a "
@@ -997,6 +1097,14 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                               "{ \"role\": ..., \"image\": ... }");
                     continue;
                 }
+                // The ROLE -> IMAGE table is the one owner of "which image
+                // does this format import from", so a typo'd key here is a
+                // wrong-IMAGE bind — the pe eager-import 0xC0000139 class.
+                static constexpr std::array<std::string_view, 2>
+                    kRuntimeLibraryRowKeys{"role", "image"};
+                DSS_CHECK_KEY_VOCABULARY(kRuntimeLibraryRowKeys);
+                rejectUnknownKeys(row, kRuntimeLibraryRowKeys, path,
+                                  "a 'runtimeLibraries' row", coll);
                 if (!row.contains("role") || !row.at("role").is_string()) {
                     coll.emit(DiagnosticCode::C_MissingField, path + "/role",
                               "missing or non-string 'role'");
@@ -1112,6 +1220,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                       "\"mangledName\": ... }");
         } else {
             auto const& sp = doc.at("sehPersonality");
+            static constexpr std::array<std::string_view, 2>
+                kSehPersonalityKeys{"role", "mangledName"};
+            DSS_CHECK_KEY_VOCABULARY(kSehPersonalityKeys);
+            rejectUnknownKeys(sp, kSehPersonalityKeys, "/sehPersonality",
+                              "the 'sehPersonality' block", coll);
             SehPersonality out;
             bool ok = resolveRuntimeRole(sp, "/sehPersonality",
                                          out.libraryPath);
@@ -1221,11 +1334,28 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         auto const& ls = doc.at("librarySynthesis");
         if (!ls.is_object()) {
             coll.emit(DiagnosticCode::C_MalformedJson, "/librarySynthesis",
+                      // ⚠ THIS MESSAGE USED TO ADVERTISE `libraryPath`, WHICH
+                      // IS NOT A KEY — it is the value RESOLVED from `role`
+                      // against the top-level `runtimeLibraries` table (UCRT-P4
+                      // moved the image behind the role table so no block spells
+                      // a path). Harmless while unknown keys were ignored;
+                      // actively wrong now that they are refused, because an
+                      // author following it writes a key the loader rejects.
                       "'librarySynthesis' must be an object { \"vehicle\": "
-                      "\"win32\"|\"pthread\", \"libraryPath\": \"…\" }");
+                      "\"win32\"|\"pthread\", \"role\": \"…\" } — 'role' names a "
+                      "row of this format's 'runtimeLibraries' table; the image "
+                      "path is resolved from it, never spelled here");
         } else {
             LibrarySynthesis info{};
             bool ok = true;
+            // `role` is consumed by `resolveRuntimeRole`, not by a `ls.at(...)`
+            // in this arm — which is exactly why it has to be listed HERE and
+            // could not be inferred by reading the block's own statements.
+            static constexpr std::array<std::string_view, 2>
+                kLibrarySynthesisKeys{"vehicle", "role"};
+            DSS_CHECK_KEY_VOCABULARY(kLibrarySynthesisKeys);
+            rejectUnknownKeys(ls, kLibrarySynthesisKeys, "/librarySynthesis",
+                              "the 'librarySynthesis' block", coll);
             if (!ls.contains("vehicle") || !ls.at("vehicle").is_string()) {
                 coll.emit(DiagnosticCode::C_MissingField,
                           "/librarySynthesis/vehicle",
@@ -1288,6 +1418,17 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         } else {
             StackReserveControl info{};
             bool ok = true;
+            // All four REQUIRED, so a typo already surfaced as a missing-key
+            // diagnostic — naming the absent key rather than the present typo,
+            // and leaving `"minimumByte"` reading as "the author forgot the
+            // bound" when they did not.
+            static constexpr std::array<std::string_view, 4>
+                kStackReserveControlKeys{"vehicle", "minimumBytes",
+                                         "maximumBytes", "granularityBytes"};
+            DSS_CHECK_KEY_VOCABULARY(kStackReserveControlKeys);
+            rejectUnknownKeys(sr, kStackReserveControlKeys,
+                              "/stackReserveControl",
+                              "the 'stackReserveControl' block", coll);
             if (!sr.contains("vehicle") || !sr.at("vehicle").is_string()) {
                 coll.emit(DiagnosticCode::C_MissingField,
                           "/stackReserveControl/vehicle",
@@ -1537,6 +1678,54 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     armOk = false;
                 } else {
                     out.mechanism = *m;
+                    // ── PER-ARM typo discriminator ──────────────────────
+                    //
+                    // `mechanism` is the only key BOTH arms read. The syscall
+                    // arm reads three fields the by-name-import arm never
+                    // looks at, and vice versa, so the allowed set is
+                    // arm-dependent and a union would accept inert config.
+                    // Neither arm's set is empty, so both directions of the
+                    // cross-arm message are reachable.
+                    static constexpr std::array<std::string_view, 1>
+                        kProcessExitCommonKeys{"mechanism"};
+                    static constexpr std::array<std::string_view, 3>
+                        kProcessExitSyscallKeys{"syscallNumber",
+                                                "syscallNumGpr",
+                                                "syscallOpcodeBytes"};
+                    static constexpr std::array<std::string_view, 2>
+                        kProcessExitImportKeys{"role", "importMangledName"};
+                    DSS_CHECK_KEY_VOCABULARY(kProcessExitCommonKeys);
+                    DSS_CHECK_KEY_VOCABULARY(kProcessExitSyscallKeys);
+                    DSS_CHECK_KEY_VOCABULARY(kProcessExitImportKeys);
+                    {
+                        bool const isSyscall =
+                            out.mechanism == ExitMechanism::Syscall;
+                        std::vector<std::string_view> allowedHere{
+                            kProcessExitCommonKeys.begin(),
+                            kProcessExitCommonKeys.end()};
+                        auto const own = isSyscall
+                            ? std::span<std::string_view const>{kProcessExitSyscallKeys}
+                            : std::span<std::string_view const>{kProcessExitImportKeys};
+                        auto const other = isSyscall
+                            ? std::span<std::string_view const>{kProcessExitImportKeys}
+                            : std::span<std::string_view const>{kProcessExitSyscallKeys};
+                        allowedHere.insert(allowedHere.end(),
+                                           own.begin(), own.end());
+                        std::string_view const otherName =
+                            isSyscall ? exitMechanismName(ExitMechanism::ByNameImport)
+                                      : exitMechanismName(ExitMechanism::Syscall);
+                        rejectUnknownArmKeys(
+                            pe, allowedHere, "/processExit",
+                            "the 'processExit' block",
+                            exitMechanismName(out.mechanism),
+                            [&](std::string_view key) -> std::string_view {
+                                for (auto const& k : other) {
+                                    if (key == k) return otherName;
+                                }
+                                return {};
+                            },
+                            coll);
+                    }
                     // simplifier FOLD-NOW #1 (7425905 audit fold):
                     // collapse the 3 repeated `!contains || !is_string
                     // || .empty()` patterns into one lambda. Behavior
@@ -1644,8 +1833,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
              || !pa.at("mechanism").is_string()) {
                 coll.emit(DiagnosticCode::C_MalformedJson,
                           "/processArgs/mechanism",
+                          // Both verbs, matching the unknown-value message
+                          // just below. Naming only one made the other read
+                          // as unsupported.
                           "'processArgs.mechanism' must be a string "
-                          "(\"stack-vector\")");
+                          "(\"stack-vector\" or \"crt-argv-accessors\")");
                 armOk = false;
             } else {
                 auto const mechName =
@@ -1659,193 +1851,247 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                           "\"stack-vector\", "
                                           "\"crt-argv-accessors\"", mechName));
                     armOk = false;
-                } else if (*m == ArgsMechanism::StackVector) {
-                    out.mechanism = *m;
-                    // StackVector arm: both offsets explicit u32,
-                    // bounded to int32 (they feed a MemOffset LIR
-                    // operand, an int32 displacement).
-                    auto requireOffset =
-                        [&](char const* field, std::uint32_t& dst) -> bool {
-                            std::string const path =
-                                std::string{"/processArgs/"} + field;
-                            if (!pa.contains(field)
-                             || !pa.at(field).is_number_unsigned()) {
-                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                          path,
-                                          std::format(
-                                              "stack-vector arm requires "
-                                              "'{}' (u32 byte offset from "
-                                              "the process-entry stack "
-                                              "pointer)", field));
-                                return false;
-                            }
-                            auto const v =
-                                pa.at(field).get<std::uint64_t>();
-                            if (v > 0x7FFFFFFFull) {
-                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                          path,
-                                          std::format(
-                                              "'{}' = {} exceeds the "
-                                              "int32 displacement range "
-                                              "the trampoline's memory "
-                                              "operand carries", field, v));
-                                return false;
-                            }
-                            dst = static_cast<std::uint32_t>(v);
-                            return true;
-                        };
-                    if (!requireOffset("argcStackOffset",
-                                       out.argcStackOffset)) {
-                        armOk = false;
-                    }
-                    if (!requireOffset("argvStackOffset",
-                                       out.argvStackOffset)) {
-                        armOk = false;
-                    }
                 } else {
                     out.mechanism = *m;
-                    // Shared by both CRT arms: a per-field non-empty-string
-                    // requirement whose diagnostic names the ARM, so a config
-                    // author who mixed two arms' field sets is told which one
-                    // they are in.
-                    auto requireStr =
-                        [&](char const* field, std::string& dst) -> bool {
-                            std::string const path =
-                                std::string{"/processArgs/"} + field;
-                            if (!pa.contains(field)
-                             || !pa.at(field).is_string()
-                             || pa.at(field).get<std::string>().empty()) {
-                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                          path,
-                                          std::format(
-                                              "{} arm requires a non-empty "
-                                              "string '{}'",
-                                              argsMechanismName(*m), field));
-                                return false;
-                            }
-                            dst = pa.at(field).get<std::string>();
-                            return true;
-                        };
-                    if (*m == ArgsMechanism::CrtArgvAccessors) {
-                        // CrtArgvAccessors arm (UCRT-P4): the UCRT populate
-                        // call + the three address-returning accessors, plus
-                        // the two integers. The library comes from the ROLE
-                        // table, never a path here.
-                        if (!resolveRuntimeRole(pa, "/processArgs",
-                                                out.crtLibraryPath)) {
+                    // ── PER-ARM typo discriminator ──────────────────────
+                    //
+                    // Same rule as `processExit`: `mechanism` is the only key
+                    // both arms read, and the stack-vector arm's two offsets
+                    // are meaningless to the CRT arm (and its eight fields
+                    // meaningless to stack-vector). `ArgsMechanism` has
+                    // exactly three enumerators and `none` is refused above,
+                    // so these two arms are exhaustive.
+                    static constexpr std::array<std::string_view, 1>
+                        kProcessArgsCommonKeys{"mechanism"};
+                    static constexpr std::array<std::string_view, 2>
+                        kProcessArgsStackVectorKeys{"argcStackOffset",
+                                                    "argvStackOffset"};
+                    static constexpr std::array<std::string_view, 8>
+                        kProcessArgsCrtKeys{"role", "configureNarrowArgvFn",
+                                            "configureWideArgvFn",
+                                            "argcAccessorFn",
+                                            "narrowArgvAccessorFn",
+                                            "wideArgvAccessorFn", "argvMode",
+                                            "argvUnavailableExitStatus"};
+                    DSS_CHECK_KEY_VOCABULARY(kProcessArgsCommonKeys);
+                    DSS_CHECK_KEY_VOCABULARY(kProcessArgsStackVectorKeys);
+                    DSS_CHECK_KEY_VOCABULARY(kProcessArgsCrtKeys);
+                    {
+                        bool const isStackVector =
+                            out.mechanism == ArgsMechanism::StackVector;
+                        std::vector<std::string_view> allowedHere{
+                            kProcessArgsCommonKeys.begin(),
+                            kProcessArgsCommonKeys.end()};
+                        auto const own = isStackVector
+                            ? std::span<std::string_view const>{kProcessArgsStackVectorKeys}
+                            : std::span<std::string_view const>{kProcessArgsCrtKeys};
+                        auto const other = isStackVector
+                            ? std::span<std::string_view const>{kProcessArgsCrtKeys}
+                            : std::span<std::string_view const>{kProcessArgsStackVectorKeys};
+                        allowedHere.insert(allowedHere.end(),
+                                           own.begin(), own.end());
+                        std::string_view const otherName = isStackVector
+                            ? argsMechanismName(ArgsMechanism::CrtArgvAccessors)
+                            : argsMechanismName(ArgsMechanism::StackVector);
+                        rejectUnknownArmKeys(
+                            pa, allowedHere, "/processArgs",
+                            "the 'processArgs' block",
+                            argsMechanismName(out.mechanism),
+                            [&](std::string_view key) -> std::string_view {
+                                for (auto const& k : other) {
+                                    if (key == k) return otherName;
+                                }
+                                return {};
+                            },
+                            coll);
+                    }
+                    if (*m == ArgsMechanism::StackVector) {
+                        // StackVector arm: both offsets explicit u32,
+                        // bounded to int32 (they feed a MemOffset LIR
+                        // operand, an int32 displacement).
+                        auto requireOffset =
+                            [&](char const* field, std::uint32_t& dst) -> bool {
+                                std::string const path =
+                                    std::string{"/processArgs/"} + field;
+                                if (!pa.contains(field)
+                                 || !pa.at(field).is_number_unsigned()) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson,
+                                              path,
+                                              std::format(
+                                                  "stack-vector arm requires "
+                                                  "'{}' (u32 byte offset from "
+                                                  "the process-entry stack "
+                                                  "pointer)", field));
+                                    return false;
+                                }
+                                auto const v =
+                                    pa.at(field).get<std::uint64_t>();
+                                if (v > 0x7FFFFFFFull) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson,
+                                              path,
+                                              std::format(
+                                                  "'{}' = {} exceeds the "
+                                                  "int32 displacement range "
+                                                  "the trampoline's memory "
+                                                  "operand carries", field, v));
+                                    return false;
+                                }
+                                dst = static_cast<std::uint32_t>(v);
+                                return true;
+                            };
+                        if (!requireOffset("argcStackOffset",
+                                           out.argcStackOffset)) {
                             armOk = false;
-                        } else {
-                            out.role = *runtimeLibraryRoleFromName(
-                                pa.at("role").get<std::string>());
                         }
-                        if (!requireStr("configureNarrowArgvFn",
-                                        out.configureNarrowArgvFn)) {
+                        if (!requireOffset("argvStackOffset",
+                                           out.argvStackOffset)) {
                             armOk = false;
-                        }
-                        if (!requireStr("configureWideArgvFn",
-                                        out.configureWideArgvFn)) {
-                            armOk = false;
-                        }
-                        if (!requireStr("argcAccessorFn",
-                                        out.argcAccessorFn)) {
-                            armOk = false;
-                        }
-                        if (!requireStr("narrowArgvAccessorFn",
-                                        out.narrowArgvAccessorFn)) {
-                            armOk = false;
-                        }
-                        if (!requireStr("wideArgvAccessorFn",
-                                        out.wideArgvAccessorFn)) {
-                            armOk = false;
-                        }
-                        // `argvMode` — CONSTRAINED to a declared member of the
-                        // `_crt_argv_mode` enum (0..2). ★ MEASURED 2026-08-10:
-                        // mode 7 does NOT return an error — the process dies at
-                        // 0xC0000409 printing nothing. So the only tier that can
-                        // catch a fat-fingered mode is THIS one, and it must
-                        // refuse rather than clamp.
-                        if (!pa.contains("argvMode")
-                         || !pa.at("argvMode").is_number_unsigned()) {
-                            coll.emit(DiagnosticCode::C_MissingField,
-                                      "/processArgs/argvMode",
-                                      "crt-argv-accessors arm requires "
-                                      "'argvMode' (the `_crt_argv_mode` value "
-                                      "handed to the configure call: 0 = no "
-                                      "argv, 1 = argv unexpanded, 2 = argv with "
-                                      "wildcard expansion)");
-                            armOk = false;
-                        } else {
-                            auto const v =
-                                pa.at("argvMode").get<std::uint64_t>();
-                            if (v > 2u) {
-                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                          "/processArgs/argvMode",
-                                          std::format(
-                                              "'argvMode' = {} is outside the "
-                                              "declared `_crt_argv_mode` enum "
-                                              "(0..2). MEASURED: a value "
-                                              "outside the enum does not return "
-                                              "an error — the process dies at "
-                                              "0xC0000409 printing nothing, so "
-                                              "load time is the only tier that "
-                                              "can refuse it.", v));
-                                armOk = false;
-                            } else {
-                                out.argvMode =
-                                    static_cast<std::uint32_t>(v);
-                            }
-                        }
-                        // `argvUnavailableExitStatus` — REQUIRED and must be
-                        // NON-ZERO. Zero is the C success status, so a zero here
-                        // would make the "argv came back NULL" path
-                        // indistinguishable from a program that ran and
-                        // succeeded — a guard that reports nothing.
-                        if (!pa.contains("argvUnavailableExitStatus")
-                         || !pa.at("argvUnavailableExitStatus")
-                                 .is_number_integer()) {
-                            coll.emit(DiagnosticCode::C_MissingField,
-                                      "/processArgs/argvUnavailableExitStatus",
-                                      "crt-argv-accessors arm requires "
-                                      "'argvUnavailableExitStatus' (the status "
-                                      "the synthesized init RETURNS when the "
-                                      "CRT populate call produced no argv — the "
-                                      "errno_t the configure call returns "
-                                      "CANNOT distinguish that case, MEASURED)");
-                            armOk = false;
-                        } else {
-                            auto const v = pa.at("argvUnavailableExitStatus")
-                                               .get<std::int64_t>();
-                            if (v == 0 || v < -2147483648LL
-                             || v > 2147483647LL) {
-                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                          "/processArgs/"
-                                          "argvUnavailableExitStatus",
-                                          std::format(
-                                              "'argvUnavailableExitStatus' = {} "
-                                              "must be a NON-ZERO i32 — zero is "
-                                              "C's success status, so a zero "
-                                              "here makes the no-argv failure "
-                                              "indistinguishable from a "
-                                              "successful run", v));
-                                armOk = false;
-                            } else {
-                                out.argvUnavailableExitStatus =
-                                    static_cast<std::int32_t>(v);
-                            }
                         }
                     } else {
-                        // Closed-enum discipline: a new ArgsMechanism member
-                        // must add its own field-set arm HERE. Falling through
-                        // would accept the block and leave every field empty.
-                        coll.emit(DiagnosticCode::C_MalformedJson,
-                                  "/processArgs/mechanism",
-                                  std::format(
-                                      "processArgs.mechanism '{}' is a declared "
-                                      "vocabulary member but this loader has no "
-                                      "field-set arm for it — the block would "
-                                      "load with every field EMPTY",
-                                      argsMechanismName(*m)));
-                        armOk = false;
+                        out.mechanism = *m;
+                        // Shared by both CRT arms: a per-field non-empty-string
+                        // requirement whose diagnostic names the ARM, so a config
+                        // author who mixed two arms' field sets is told which one
+                        // they are in.
+                        auto requireStr =
+                            [&](char const* field, std::string& dst) -> bool {
+                                std::string const path =
+                                    std::string{"/processArgs/"} + field;
+                                if (!pa.contains(field)
+                                 || !pa.at(field).is_string()
+                                 || pa.at(field).get<std::string>().empty()) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson,
+                                              path,
+                                              std::format(
+                                                  "{} arm requires a non-empty "
+                                                  "string '{}'",
+                                                  argsMechanismName(*m), field));
+                                    return false;
+                                }
+                                dst = pa.at(field).get<std::string>();
+                                return true;
+                            };
+                        if (*m == ArgsMechanism::CrtArgvAccessors) {
+                            // CrtArgvAccessors arm (UCRT-P4): the UCRT populate
+                            // call + the three address-returning accessors, plus
+                            // the two integers. The library comes from the ROLE
+                            // table, never a path here.
+                            if (!resolveRuntimeRole(pa, "/processArgs",
+                                                    out.crtLibraryPath)) {
+                                armOk = false;
+                            } else {
+                                out.role = *runtimeLibraryRoleFromName(
+                                    pa.at("role").get<std::string>());
+                            }
+                            if (!requireStr("configureNarrowArgvFn",
+                                            out.configureNarrowArgvFn)) {
+                                armOk = false;
+                            }
+                            if (!requireStr("configureWideArgvFn",
+                                            out.configureWideArgvFn)) {
+                                armOk = false;
+                            }
+                            if (!requireStr("argcAccessorFn",
+                                            out.argcAccessorFn)) {
+                                armOk = false;
+                            }
+                            if (!requireStr("narrowArgvAccessorFn",
+                                            out.narrowArgvAccessorFn)) {
+                                armOk = false;
+                            }
+                            if (!requireStr("wideArgvAccessorFn",
+                                            out.wideArgvAccessorFn)) {
+                                armOk = false;
+                            }
+                            // `argvMode` — CONSTRAINED to a declared member of the
+                            // `_crt_argv_mode` enum (0..2). ★ MEASURED 2026-08-10:
+                            // mode 7 does NOT return an error — the process dies at
+                            // 0xC0000409 printing nothing. So the only tier that can
+                            // catch a fat-fingered mode is THIS one, and it must
+                            // refuse rather than clamp.
+                            if (!pa.contains("argvMode")
+                             || !pa.at("argvMode").is_number_unsigned()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          "/processArgs/argvMode",
+                                          "crt-argv-accessors arm requires "
+                                          "'argvMode' (the `_crt_argv_mode` value "
+                                          "handed to the configure call: 0 = no "
+                                          "argv, 1 = argv unexpanded, 2 = argv with "
+                                          "wildcard expansion)");
+                                armOk = false;
+                            } else {
+                                auto const v =
+                                    pa.at("argvMode").get<std::uint64_t>();
+                                if (v > 2u) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson,
+                                              "/processArgs/argvMode",
+                                              std::format(
+                                                  "'argvMode' = {} is outside the "
+                                                  "declared `_crt_argv_mode` enum "
+                                                  "(0..2). MEASURED: a value "
+                                                  "outside the enum does not return "
+                                                  "an error — the process dies at "
+                                                  "0xC0000409 printing nothing, so "
+                                                  "load time is the only tier that "
+                                                  "can refuse it.", v));
+                                    armOk = false;
+                                } else {
+                                    out.argvMode =
+                                        static_cast<std::uint32_t>(v);
+                                }
+                            }
+                            // `argvUnavailableExitStatus` — REQUIRED and must be
+                            // NON-ZERO. Zero is the C success status, so a zero here
+                            // would make the "argv came back NULL" path
+                            // indistinguishable from a program that ran and
+                            // succeeded — a guard that reports nothing.
+                            if (!pa.contains("argvUnavailableExitStatus")
+                             || !pa.at("argvUnavailableExitStatus")
+                                     .is_number_integer()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          "/processArgs/argvUnavailableExitStatus",
+                                          "crt-argv-accessors arm requires "
+                                          "'argvUnavailableExitStatus' (the status "
+                                          "the synthesized init RETURNS when the "
+                                          "CRT populate call produced no argv — the "
+                                          "errno_t the configure call returns "
+                                          "CANNOT distinguish that case, MEASURED)");
+                                armOk = false;
+                            } else {
+                                auto const v = pa.at("argvUnavailableExitStatus")
+                                                   .get<std::int64_t>();
+                                if (v == 0 || v < -2147483648LL
+                                 || v > 2147483647LL) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson,
+                                              "/processArgs/"
+                                              "argvUnavailableExitStatus",
+                                              std::format(
+                                                  "'argvUnavailableExitStatus' = {} "
+                                                  "must be a NON-ZERO i32 — zero is "
+                                                  "C's success status, so a zero "
+                                                  "here makes the no-argv failure "
+                                                  "indistinguishable from a "
+                                                  "successful run", v));
+                                    armOk = false;
+                                } else {
+                                    out.argvUnavailableExitStatus =
+                                        static_cast<std::int32_t>(v);
+                                }
+                            }
+                        } else {
+                            // Closed-enum discipline: a new ArgsMechanism member
+                            // must add its own field-set arm HERE. Falling through
+                            // would accept the block and leave every field empty.
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/processArgs/mechanism",
+                                      std::format(
+                                          "processArgs.mechanism '{}' is a declared "
+                                          "vocabulary member but this loader has no "
+                                          "field-set arm for it — the block would "
+                                          "load with every field EMPTY",
+                                          argsMechanismName(*m)));
+                            armOk = false;
+                        }
                     }
                 }
             }
@@ -2062,6 +2308,23 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 }
                 info.pltNativeId = static_cast<std::uint32_t>(pv);
             }
+            // D-LK-MACHO-ISDATA-NO-CALL-SIGNAL: the DECLARED call/branch role.
+            // True iff this format's native wire relocation can only target
+            // executable code, so an extern reached through it is PROVEN to be
+            // a function. Absent -> false (the relocation proves nothing about
+            // the target's class). The readers consume this INSTEAD of guessing
+            // from the target's arithmetic formula -- see the field's own
+            // comment in object_format_schema.hpp for why the formula is the
+            // wrong vocabulary for the question.
+            if (r.contains("isCall")) {
+                if (!r.at("isCall").is_boolean()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/isCall", i),
+                           "'isCall' must be a boolean");
+                    return false;
+                }
+                info.isCall = r.at("isCall").get<bool>();
+            }
             // D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS: an EMISSION ALIAS —
             // a row sharing its wire type with another row, present only so the
             // emitter can reach that wire type through a different DSS kind.
@@ -2075,7 +2338,55 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 }
                 info.emitOnly = r.at("emitOnly").get<bool>();
             }
-            return true;
+            // ── TYPO DISCRIMINATOR FOR THE RELOCATION ROW ────────────────
+            //
+            // Every field above is read with `r.contains(...)`, so an
+            // UNRECOGNISED key was ignored in silence. That is tolerable for
+            // a key nothing reads and intolerable for these: each one is a
+            // ROLE DECLARATION whose absence changes what an object reader
+            // concludes, and absence is spelled exactly the same way as a
+            // typo. `"isCal"` / `"iscall"` / `"emitonly"` would have loaded
+            // clean and left the format silently back at the behaviour
+            // D-LK-MACHO-ISDATA-NO-CALL-SIGNAL exists to end -- a mach-o
+            // format refusing every member that calls a function, or worse,
+            // an ELF one classifying an extern function as DATA. The document
+            // ROOT has had this discriminator since TF-C125; the rows never
+            // did.
+            //
+            // `kind` and `name` are consumed by the shared loader
+            // (`substrate::loadRelocationsTable`) before this extension runs,
+            // so the closed set must be the UNION of both halves even though
+            // nothing here reads them. `$`-prefixed prose keys are skipped, as
+            // everywhere — the PREFIX predicate, never a literal `"$comment"`.
+            //
+            // ✔ THE PROMOTION THIS COMMENT USED TO ASK FOR HAS HAPPENED. The
+            // check was a fourth hand-rolled copy of the target loader's
+            // file-local helper; it now lives beside `isDocumentationKey` in
+            // `core/types/config_key_vocabulary.hpp` and every loader calls
+            // the one implementation. The measured count was worse than
+            // "fourth": EIGHT named helpers over ~57 call sites, two of them
+            // (`opt/optimizer_json.cpp`, `ffi/shipped_lib_descriptor.cpp`)
+            // missing the `$`-prose carve-out outright. The TABLE stays here,
+            // with the fields it describes — only the loop moved.
+            static constexpr std::array<std::string_view, 6> kRelocationRowKeys{
+                "name", "kind", "nativeId", "pltNativeId", "isCall", "emitOnly"};
+            DSS_CHECK_KEY_VOCABULARY(kRelocationRowKeys);
+            bool rowClean = true;
+            detail::rejectUnknownKeys(r, kRelocationRowKeys, "a relocation row",
+                [&](std::string_view key, std::string message) {
+                    // The shared sentence, plus what makes THIS row's typo
+                    // worse than a generic one: its keys are ROLE
+                    // declarations, and a misspelled role is spelled exactly
+                    // like an absent one.
+                    message += ". A misspelled ROLE key is indistinguishable "
+                               "from an absent one, and absence is what "
+                               "D-LK-MACHO-ISDATA-NO-CALL-SIGNAL was";
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/{}", i, key),
+                           std::move(message));
+                    rowClean = false;
+                });
+            return rowClean;
         });
 
     // sections[] — D-LK4-2 schema row. Each entry maps a universal
@@ -2095,6 +2406,19 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                               "section entry must be an object");
                     continue;
                 }
+                // Every optional numeric field below is read through
+                // `readU64`, which RETURNS SILENTLY when the key is absent —
+                // so a misspelled `"addrAlign"` left the section at alignment
+                // 0 with no diagnostic anywhere. The largest closed set in the
+                // file, and the one where absence and typo were least
+                // distinguishable.
+                static constexpr std::array<std::string_view, 8> kSectionRowKeys{
+                    "kind", "name", "segment", "type", "flags", "addrAlign",
+                    "entrySize", "virtualAddress"};
+                DSS_CHECK_KEY_VOCABULARY(kSectionRowKeys);
+                rejectUnknownKeys(s, kSectionRowKeys,
+                                  std::format("/sections/{}", i),
+                                  "a 'sections' row", coll);
                 ObjectFormatSectionInfo info;
                 if (!s.contains("kind") || !s.at("kind").is_string()) {
                     coll.emit(DiagnosticCode::C_MissingField,

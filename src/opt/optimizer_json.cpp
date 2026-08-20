@@ -1,6 +1,7 @@
 #include "opt/optimizer.hpp"
 
 #include "core/substrate/diagnostic_collector.hpp"
+#include "core/types/config_key_vocabulary.hpp"  // the ONE closed-key check + the `$` carve-out
 #include "core/types/config_path_walk.hpp"
 
 #include <nlohmann/json.hpp>
@@ -62,20 +63,27 @@ void emitMalformed(substrate::DiagnosticCollector& coll,
 // D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD enforcement for any JSON
 // object whose key set is fully closed. Emits X_PipelineMalformed
 // (with object-path context) for every key not in the allow-list.
+//
+// ★★ AN ADAPTER OVER THE SHARED CHECK, AND THE MOVE FIXED A LIVE BUG HERE.
+// This was one of four independently hand-written `rejectUnknownKeys`
+// helpers, and it applied NO `$`-documentation carve-out at all — so a
+// `$comment` (or any `$…Comment`) in a pipeline document was REFUSED as a
+// typo, in a codebase whose stated convention is that any config object may
+// carry one. The inverse of a silent drop, and just as wrong. The carve-out
+// is now unskippable because the caller no longer writes the loop.
 void rejectUnknownKeys(substrate::DiagnosticCollector& coll,
                        nlohmann::json const& obj,
                        std::string const& objPath,
+                       std::string_view objectLabel,
                        std::initializer_list<std::string_view> allowed) {
-    for (auto const& kv : obj.items()) {
-        bool known = false;
-        for (auto k : allowed) { if (kv.key() == k) { known = true; break; } }
-        if (!known) {
-            emitMalformed(coll, objPath,
-                          std::format("unknown key '{}' "
-                                      "(D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD)",
-                                      kv.key()));
-        }
-    }
+    detail::rejectUnknownKeys(obj, allowed, objectLabel,
+        [&](std::string_view, std::string message) {
+            // The anchor id stays in the text: it is how this rule is found
+            // from a failing document, and the shared sentence cannot carry
+            // a per-loader anchor.
+            message += " (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD)";
+            emitMalformed(coll, objPath, std::move(message));
+        });
 }
 
 [[nodiscard]] LoadResult<OptPipeline>
@@ -113,6 +121,7 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     json const& pipe = doc.at("pipeline");
 
     rejectUnknownKeys(coll, doc, std::string{sourceLabel},
+                      "the pipeline document",
                       {"dssPipelineVersion", "pipeline", "unitPipeline"});
 
     // P10 stage topology: optional top-level `unitPipeline` — the NAME of
@@ -199,7 +208,7 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
             return std::nullopt;
         }
         char const* const nodeKind = hasRepeat ? "repeat" : "fixpoint";
-        rejectUnknownKeys(coll, el, path, {nodeKind});
+        rejectUnknownKeys(coll, el, path, "a pipeline node", {nodeKind});
         json const& inner = el.at(nodeKind);
         if (!inner.is_object()) {
             emitMalformed(coll, path + "/" + nodeKind,
@@ -207,6 +216,8 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
             return std::nullopt;
         }
         rejectUnknownKeys(coll, inner, path + "/" + nodeKind,
+                          hasRepeat ? "a 'repeat' node body"
+                                    : "a 'fixpoint' node body",
                           {std::string_view{hasRepeat ? "count" : "max"},
                            std::string_view{"passes"}});
 
@@ -370,6 +381,7 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     }
 
     rejectUnknownKeys(coll, pipe, std::string{sourceLabel} + "/pipeline",
+                      "the 'pipeline' block",
                       {"name", "passes", "maxIterations", "inlineThreshold",
                        "verifyEveryPass"});
 

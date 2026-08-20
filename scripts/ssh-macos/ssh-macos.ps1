@@ -18,6 +18,15 @@
 # ★ HOST-KEY POLICY matches the operator's original (StrictHostKeyChecking=no) because the
 #   Mac is a DHCP LAN host whose address moves. STATED, not hidden: that forgoes MITM
 #   protection — fine on a home LAN, not on an untrusted one. Use -StrictHostKey there.
+#
+# ⚠⚠ SSH JOINS `-Command` WITH SPACES AND HANDS THE RESULT TO THE REMOTE SHELL, SO LOCAL
+# QUOTING IS GONE BY THE TIME IT ARRIVES. ✔MEASURED 2026-08-20 through the `.sh` twin:
+# `sh -c 'mkdir -p /tmp/x && …'` reached the Mac as `sh -c mkdir -p /tmp/x && …` and the
+# remote `mkdir` printed its usage line — a failure that looks like a broken carriage and
+# is not one. ⇒ ANYTHING CARRYING QUOTES, PIPES, `&&` OR REDIRECTION IS ONE ARGUMENT:
+#        scripts\ssh-macos\ssh-macos.ps1 "cd /tmp/x && clang -c a.c && nm -n a.o"
+# ssh's own contract, not a defect here — recorded because the failure names the wrong
+# culprit. Kept identical to the `.sh` twin (CAPABILITY-PAIRED).
 
 [CmdletBinding()]
 param(

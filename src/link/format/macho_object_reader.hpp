@@ -28,12 +28,25 @@
 // Reconstruction map (the inverse of the writer, field by field). Six
 // Mach-O-vs-ELF inversions distinguish it from the ELF reader:
 //   * (1) `__text` is sliced into per-function byte ranges by the SORTED
-//     `n_value`s of the defined N_SECT|N_EXT symbols -- Mach-O's nlist_64
-//     carries NO size field (ELF's `st_size` slices there), so each atom
-//     spans [n_value_k, n_value_{k+1}) (the last runs to the section
-//     size). Each slice becomes an `AssembledFunction` whose `symbol` is
-//     the symbol's symtab INDEX (a per-CU identity; the merge matches by
-//     NAME via `ModuleSymbol`, never by raw id).
+//     `n_value`s of the defined N_SECT symbols that START AN ATOM --
+//     Mach-O's nlist_64 carries NO size field (ELF's `st_size` slices
+//     there), so each atom spans [n_value_k, n_value_{k+1}) (the last
+//     runs to the section size). Each slice becomes an
+//     `AssembledFunction` whose `symbol` is the symbol's symtab INDEX (a
+//     per-CU identity; the merge matches by NAME via `ModuleSymbol`,
+//     never by raw id).
+//     ★ WHICH symbols start an atom is the format's OWN question, and it
+//     is asked from two fields rather than from N_EXT alone
+//     (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM):
+//     when the mach_header declares MH_SUBSECTIONS_VIA_SYMBOLS, EVERY
+//     defined N_SECT symbol starts an atom EXCEPT one carrying
+//     N_ALT_ENTRY in `n_desc`; when it does not, the old narrower rule
+//     stands (N_EXT starts an atom, a local does not). Apple's clang sets
+//     the header flag on every ordinary `.o` and DSS's own writer now
+//     emits the same pair, so the subsection arm is the live one for both
+//     foreign archive members and DSS's own round trip. A promoted
+//     file-local body is bound `SymbolBinding::Local`, so a `static`
+//     function can never satisfy a sibling TU's extern.
 //   * (2) `n_value` is a FLAT `.o`-space ADDRESS (not ELF's section
 //     -relative `st_value`), so the section-relative offset is
 //     `n_value - section.addr`.
@@ -47,8 +60,9 @@
 //     r_extern / r_symbolnum). There is NO `pltNativeId` variant on
 //     Mach-O -- an extern call is BRANCH26/BRANCH against the same
 //     nativeId whether or not ld64 synthesizes a stub -- so the "extern
-//     is a function" signal is a row whose TARGET-schema formula is a
-//     call/branch (aarch64 CALL26), never a PLT-variant id.
+//     is a function" signal is the FORMAT row's DECLARED `isCall` role
+//     (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL), never a PLT-variant id and
+//     never the target's arithmetic formula.
 //   * (5) each `relocation_info` becomes a `Relocation{offset, target,
 //     kind, addend}`. Mach-O has NO RELA addend column: a DATA-section
 //     reloc's addend lives IN the patched slot bytes (widthBytes LE at
@@ -61,14 +75,28 @@
 //     An r_extern=0 SECTION-INDEX relocation (foreign clang) FAILS LOUD
 //     (anchor D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC) -- the section
 //     -relative-redirect analog is a named follow-up; DSS never emits it.
+//     ★ A FORMAT THAT DECLARES NO `isCall` ROW REFUSES rather than
+//     guesses -- see the extern bullet below.
 //   * SHN_UNDEF-equivalent N_UNDF symbols become `externImports`. Mach-O
 //     carries NO STT_FUNC-style type hint, so `isData` is seeded DATA and
-//     forced to false (function) ONLY when a CALL/BRANCH-class reloc
-//     targets the extern (agnostic -- the aarch64 CALL26 branch formula,
-//     no hardcoded reloc number). This is the same reloc-based inference
-//     the ELF reader's STT_NOTYPE path uses.
+//     forced to false (function) ONLY when a relocation the FORMAT
+//     declares `"isCall": true` on targets the extern (agnostic -- a
+//     declared role read from the schema, no hardcoded reloc number and
+//     no arch test). This is the same reloc-based inference the ELF
+//     reader's STT_NOTYPE path uses. If the format declares no such row
+//     AT ALL, an extern reached by any relocation FAILS LOUD: DATA would
+//     be a silent guess, and a mis-typed import is a wrong answer rather
+//     than a diagnostic (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL).
 //   * defined function / data symbols become `ModuleSymbol` rows (name +
 //     binding + visibility) for the merge's cross-CU name-matching.
+//   * TWO defined symbols at ONE section offset are ONE atom under SEVERAL
+//     NAMES, never two byte-identical twins: the most externally-visible
+//     name owns the body, every other name keeps its row but carries the
+//     owner's SymbolId, and a relocation naming any of them binds to the
+//     owner. clang emits this on every ordinary `.o` (a section-start
+//     `ltmp0` at the first function's offset). The rule is shared, not
+//     per-format -- `link/format/object_atom_coverage.hpp`,
+//     D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS.
 //
 // Fail-loud discipline (mirrors the c159-c161 readers + the c164 ELF
 // reader): EVERY field is bounds-checked against the buffer with the
@@ -87,10 +115,12 @@
 // content owned by no symbol (string literals / jump tables reached via a
 // section symbol) has no gap-atom reconstruction here -- a DSS-written
 // `.o` covers every section byte with one named symbol per item, so it
-// has NO gaps. Interior `&&label` block symbols (N_SECT LOCAL in `__text`)
-// round-trip as LOCAL `ModuleSymbol`s but do NOT split a function -- their
-// interior-VA binding is a named follow-up (not needed to link whole
-// functions).
+// has NO gaps. Interior `&&label` block symbols round-trip as LOCAL
+// `ModuleSymbol`s but do NOT split a function -- their interior-VA binding
+// is a named follow-up (not needed to link whole functions). ⚠ Those are
+// now identified by N_ALT_ENTRY, not by the absence of N_EXT: the two were
+// conflated, and a whole file-local (`static`) function has the
+// SAME nlist shape as a label, so the old rule dropped its bytes.
 //   * SIZE-LESS-NLIST PADDING (D-LK-MACHO-MULTI-ITEM-SECTION-PADDING): with
 //     TWO+ named items in ONE section (e.g. two rodata globals of differing
 //     alignment packed into `__TEXT,__const`), the writer inserts alignment
@@ -113,12 +143,14 @@ namespace dss::macho {
 // diagnostic) on any structural / bounds / unknown-reloc failure.
 //
 // `objectFormatSchema` supplies the (segment, section)-name -> SectionKind
-// mapping and the reloc `nativeId` -> RelocationKind reverse map (both
-// config-driven -- no hardcoded Mach-O numbers in the reader beyond the
-// structural record layout the writer also hardcodes). `targetSchema`
-// supplies each reloc kind's `formulaKind` (the call/branch "is a
-// function" signal), `widthBytes` (the in-slot data addend width), and
-// `addendBias` (the addend un-bake).
+// mapping, the reloc `nativeId` -> RelocationKind reverse map AND each
+// row's declared `isCall` role -- the call/branch "is a function" signal
+// (all config-driven -- no hardcoded Mach-O numbers in the reader beyond
+// the structural record layout the writer also hardcodes). `targetSchema`
+// supplies each reloc kind's `widthBytes` (the in-slot data addend width)
+// and `addendBias` (the addend un-bake) -- ARITHMETIC only. It no longer
+// supplies the call signal: that was `formulaKind`, and a formula describes
+// arithmetic rather than role (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL).
 //
 // `cuId` stamps the reconstructed module's `CompilationUnitId` (the merge
 // keys its symbol index by `(cuId, SymbolId)`); the c165 static-link path

@@ -116,6 +116,29 @@ hand-typing every edit or reading every subsystem.
    `references/delegation.md`. Build the best long-term agnostic solution: extend
    config vocabulary, never branch the engine on identity. Any new `D-*` cited in `src/` is
    registered in the same commit.
+   ★★ **THE ORCHESTRATOR IS A LANE TOO — ITS OWN EDITS OBEY THE SAME OWNERSHIP.**
+   `src/dss-config/**` is a FILE SET like any other, and a config document is an INPUT to
+   every lane's build. Editing one while a lane is running does not merely risk a merge
+   conflict — it changes what that lane's binaries MEAN between two runs.
+   ⚠ ✔MEASURED 2026-08-20 (cycle P22, `D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-
+   OWNERSHIP`): the orchestrator corrected a relocation `nativeId` while a lane was mid
+   red-on-disable run. A test's verdict flipped between two runs of the same binary, and the
+   lane reported a stale tree as a defect in its final report. **The damage is not the wasted
+   report — it is that a red-on-disable observation is the ONE measurement this project
+   treats as proof, and a config edit underneath one silently corrupts it.**
+   ⇒ Announce the orchestrator's own owned paths alongside the lanes'; hold a config edit
+   until the lanes that read it have reported, or hand it to a lane that owns it. Re-measure
+   anything a lane reported across such an edit before acting on it — and when a lane's
+   report and the tree disagree, suspect the SEQUENCING before suspecting the lane.
+   ★★ **A LANE THAT BUILDS GETS ITS OWN BUILD TREE.** File ownership is not enough, because
+   two lanes with disjoint FILE sets still collide in a shared `build/`: one relinks the DLL
+   while the other is mid-`ctest`. ⚠ ✔MEASURED 2026-08-20 (cycle P22): `0xc0000043`
+   (STATUS_SHARING_VIOLATION) mid-suite, plus a set of failures that appeared and vanished
+   between two runs of the same binary. **A gate result taken from a shared build tree is not
+   attributable to anything** — which makes it worthless exactly when it matters, during a
+   red-on-disable observation.
+   ⇒ Name the lane's build tree in its brief (`build/<lane>`), and clear it once green (the
+   one-root rule). `scripts/local-build/local-build.{sh,ps1} --tree <name>` takes one.
 6. **Review and fold** — `/pr-review-toolkit:review-pr`, plus the agnosticism pass and the CI-hazard
    screen. ★★ **If this cycle created or modified a `.sh`/`.ps1` pair, TWIN PARITY IS PART OF THIS
    STEP** — same inputs, same properties, same flags, same exit codes, both siblings changed in this

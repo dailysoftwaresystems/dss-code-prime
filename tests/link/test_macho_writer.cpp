@@ -127,9 +127,10 @@ struct Loaded {
 // `resolveEntryFnIdx` (src/link/format/exec_reloc_apply.hpp) treats a
 // format that declares `processExit` as having CONTRACTED that its
 // image entry is the DSS-synthesized `_start` trampoline — and only
-// `linker::link` injects one (entry_trampoline.cpp:732 — the file's ONLY
-// assignment to that field — sets `imageEntryOverride = 0` on every
-// successful injection). Reaching the walker's
+// `linker::link` injects one (`injectEntryTrampoline` in
+// src/link/entry_trampoline.cpp — the file's ONLY assignment to that field —
+// sets `imageEntryOverride = 0` on every successful injection). Reaching the
+// walker's
 // `entryPoint`-empty default with no override therefore means the
 // module never came through the linker, and the walker now fails loud
 // instead of silently making the user's first function the process
@@ -216,10 +217,29 @@ TEST(MachOWriter, MachHeader64IdentityBytesMatchAppleAbi) {
     // sizeofcmds = 72 + 80*1 (segment+section) + 24 (build_version)
     //            + 24 (symtab) = 200
     EXPECT_EQ(readU32LE(bytes, 20), 200u);
-    // flags = 0 (MH_SUBSECTIONS_VIA_SYMBOLS deliberately NOT set
-    // because cycle 1 emits a flat __text without subsection markers;
-    // anchored as D-LK3-2 for the future subsection-emit cycle)
-    EXPECT_EQ(readU32LE(bytes, 24), 0u);
+    // flags = 0x2000 = MH_SUBSECTIONS_VIA_SYMBOLS.
+    //
+    // ★ THIS PIN IS REARGUED, NOT MERELY UPDATED, and the history it replaces
+    // is kept because it was RIGHT. It used to assert 0 and said so: "cycle 1
+    // emits a flat __text without subsection markers, anchored as D-LK3-2 for
+    // the future subsection-emit cycle" — i.e. the flag was withheld because
+    // setting it would have LIED to ld64 about function-granular dead-strip
+    // safety. That precondition is now SATISFIED rather than overturned: the
+    // MH_OBJECT writer stamps N_ALT_ENTRY (n_desc 0x0200) on every synthetic
+    // per-block label, so each remaining defined symbol genuinely does start
+    // its own subsection and the declaration is true
+    // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM). The old
+    // deferral named plan 14 §3.1 D-LK3-2, which had closed as the
+    // MH_EXECUTE/LC_MAIN row and therefore owned this for nobody.
+    //
+    // The value is NOT hardcoded in the writer — it is `MachOIdentity::flags`
+    // copied verbatim from the shipped format schema, which is exactly why the
+    // ld64 dead-strip evidence can be revisited by editing one JSON number and
+    // this one expectation, with no C++ change.
+    EXPECT_EQ(readU32LE(bytes, 24), 0x2000u)
+        << "MH_OBJECT must declare MH_SUBSECTIONS_VIA_SYMBOLS — without it a "
+           "reader cannot tell a file-local `static` body from an interior "
+           "block label and drops the body's bytes";
     // reserved = 0
     EXPECT_EQ(readU32LE(bytes, 28), 0u);
 }
@@ -403,6 +423,12 @@ TEST(MachOWriter, ObjectNlistCouplesNameAndBindingStaticLocalDropsNExt) {
         return s;
     };
 
+    auto descAt = [&](std::uint32_t i) {
+        return static_cast<std::uint16_t>(
+            bytes[symoff + i * 16 + 6]
+            | (static_cast<std::uint16_t>(bytes[symoff + i * 16 + 7]) << 8));
+    };
+
     // sym[0] = fn A (global) → real name, N_SECT|N_EXT (0x0F).
     EXPECT_EQ(nameAt(0), "_realfn");
     EXPECT_EQ(bytes[symoff + 0 * 16 + 4], 0x0Fu)
@@ -411,6 +437,31 @@ TEST(MachOWriter, ObjectNlistCouplesNameAndBindingStaticLocalDropsNExt) {
     EXPECT_EQ(nameAt(1), "_sym_11");
     EXPECT_EQ(bytes[symoff + 1 * 16 + 4], 0x0Eu)
         << "static (Local) fn drops N_EXT — the TF-C54 fix";
+
+    // ── n_desc: NEITHER function is an alternate entry ──────────────
+    //
+    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM. This is
+    // the OTHER half of the byte that used to make a `static` function and an
+    // interior block label indistinguishable: with n_type coupled to binding
+    // (above) but n_desc left 0 on BOTH, fn B's nlist was byte-identical to a
+    // synthetic `_sym_<id>` block label, so the archive-member reader demoted
+    // it to a bodiless symbol and its bytes never entered the image. A whole
+    // function is never an alternate entry — it must carry n_desc = 0 while
+    // `Arm64ObjectJumpTableBlockSymbolIsLocalDefinedNotUndef` pins the block
+    // label at N_ALT_ENTRY (0x0200). The two pins are the discriminating PAIR;
+    // either one alone proves nothing.
+    // RED-ON-DISABLE: stamp N_ALT_ENTRY on the defined-function loop (or on the
+    // Local arm of it) and these two go red.
+    EXPECT_EQ(descAt(0), 0x0000u)
+        << "an externally-visible whole function is an atom, never an "
+           "N_ALT_ENTRY interior label";
+    EXPECT_EQ(descAt(1) & 0x0200u, 0x0000u)
+        << "a file-local (`static`) whole function must NOT carry N_ALT_ENTRY "
+           "(0x0200) — that is the bit that says 'I am interior to the atom "
+           "before me', and setting it here is exactly the misread that drops "
+           "a static function's body on archive-member read-back";
+    EXPECT_EQ(descAt(1), 0x0000u)
+        << "no other n_desc bit is claimed for a defined function either";
 }
 
 // ── D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined symbol fails loud ──
@@ -419,7 +470,8 @@ TEST(MachOWriter, ObjectNlistCouplesNameAndBindingStaticLocalDropsNExt) {
 // DEFINED symbol (N_WEAK_DEF + MH_WEAK_DEFINES is not wired). Degrading it to
 // N_SECT|N_EXT would SILENTLY lose the weak-override semantics, so the writer
 // fails loud instead — the same posture the MH_DYLIB export arm already takes
-// (macho.cpp:2980, D-LK3-DYLIB-WEAK-EXPORT). RED-ON-DISABLE: reverting the
+// (`macho::encodeExecDynamic`'s export-trie loop, D-LK3-DYLIB-WEAK-EXPORT).
+// RED-ON-DISABLE: reverting the
 // fail-loud arm makes the writer emit the weak fn as N_SECT|N_EXT (0x0F) with 0
 // errors — this pin (empty bytes + exactly one K_NoMatchingObjectFormat citing
 // the anchor) goes red. The ELF sibling (Weak → STB_WEAK, native) + the EXEC
@@ -542,7 +594,13 @@ TEST(MachOWriter, MachHeader64Arm64IdentityBytesMatchAppleAbi) {
     EXPECT_EQ(readU32LE(bytes, 4), 0x0100000Cu);    // cputype = CPU_TYPE_ARM64
     EXPECT_EQ(readU32LE(bytes, 8), 0u);             // cpusubtype = CPU_SUBTYPE_ARM64_ALL
     EXPECT_EQ(readU32LE(bytes, 12), 1u);            // filetype = MH_OBJECT
-    EXPECT_EQ(readU32LE(bytes, 24), 0u);            // flags = 0
+    // flags = MH_SUBSECTIONS_VIA_SYMBOLS — the arm64 mirror of the x86_64 pin,
+    // where the rearguing of this expectation is written out in full
+    // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM). Pinned
+    // on BOTH arches deliberately: the value comes from each format schema
+    // separately, so one arch declaring it and the other not is a real and
+    // otherwise-invisible way for the two `.o` families to diverge.
+    EXPECT_EQ(readU32LE(bytes, 24), 0x2000u);       // MH_SUBSECTIONS_VIA_SYMBOLS
 }
 
 // ── LC_BUILD_VERSION in a RELOCATABLE object (D-LK10-ENTRY-MACHO-EXIT) ──
@@ -1262,6 +1320,27 @@ TEST(MachOWriter, Arm64ObjectJumpTableBlockSymbolIsLocalDefinedNotUndef) {
            "fabricated-extern break this pin guards";
     EXPECT_EQ(bytes[n1 + 5], 1u)             // n_sect = __text
         << "block symbol lives in __text";
+    // n_desc = N_ALT_ENTRY (0x0200) — D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS
+    // -BLOCK-LABEL-NOT-ATOM. n_type/n_sect/n_value above are byte-for-byte what
+    // a file-local (`static`) whole FUNCTION also carries, so before this bit
+    // existed nothing on the wire distinguished the two and the archive-member
+    // reader had to guess from N_EXT — guessing wrong for every `static`
+    // function and dropping its body. N_ALT_ENTRY is the format's own word for
+    // "an alternate entry INTO the atom before me, not an atom", and it is what
+    // makes the header's MH_SUBSECTIONS_VIA_SYMBOLS declaration honest.
+    // ⚠ 0x0200, NOT 0x0020: ✔MEASURED against clang 19 targeting
+    // arm64-apple-macos, an explicit `.alt_entry` emits n_desc=0x0200 while
+    // `__attribute__((used))` emits 0x0020 (N_NO_DEAD_STRIP) — a different bit
+    // with a different meaning. The paired pin is
+    // `ObjectNlistCouplesNameAndBindingStaticLocalDropsNExt`, which asserts a
+    // whole function carries n_desc = 0.
+    // RED-ON-DISABLE: revert the block-symbol loop to n_desc = 0 and this fails.
+    EXPECT_EQ(static_cast<std::uint16_t>(
+                  bytes[n1 + 6] | (static_cast<std::uint16_t>(bytes[n1 + 7]) << 8)),
+              0x0200u)
+        << "synthetic block label must carry N_ALT_ENTRY (0x0200) — it is the "
+           "ONLY thing distinguishing it from a file-local whole function, "
+           "which has identical n_type/n_sect and no size field";
     EXPECT_EQ(readU64LE(bytes, n1 + 8), 4u)  // n_value = flat text addr
         << "n_value = funcTextStart + blockByteOffset (flat address)";
 

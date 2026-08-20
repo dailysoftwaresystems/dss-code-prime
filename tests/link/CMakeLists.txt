@@ -1,6 +1,12 @@
 # Linker unit tests (plan 14 LK4 substrate).
 
 dss_add_test(NAME link/test_object_format_schema SOURCES test_object_format_schema.cpp)
+# The closed-key-block table splices ONE extra key into a shipped
+# `.format.json` at each block whose vocabulary is closed, so the fixtures are
+# the real documents rather than copies that can drift — hence the json link
+# (the `test_c_symbol_decoration` precedent just below).
+target_link_libraries(dss_link_test_object_format_schema
+                      PRIVATE nlohmann_json::nlohmann_json)
 
 # D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN — the per-format C-symbol decoration
 # axis (`cSymbolDecoration`), given its own file the way the sibling
@@ -182,6 +188,12 @@ dss_add_test(NAME link/test_relocatable_object_reader SOURCES test_relocatable_o
 # unknown reloc nativeId, r_extern=0 section-relative reloc), non-Mach-O schema
 # fail-loud, and the x86_64 leaf-only agnosticism round-trip.
 dss_add_test(NAME link/test_macho_object_reader SOURCES test_macho_object_reader.cpp)
+# D-LK-MACHO-ISDATA-NO-CALL-SIGNAL case 5c parses a shipped `.format.json`
+# directly so its "shipped file MINUS exactly one key" fixture is copied
+# VERBATIM and cannot drift from the real document — hence the json link (the
+# `test_c_symbol_decoration.cpp` precedent).
+target_link_libraries(dss_link_test_macho_object_reader
+                      PRIVATE nlohmann_json::nlohmann_json)
 
 # c170 (D-LK-RELOCATABLE-OBJECT-READER-COFF) -- the Windows COFF `.obj`
 # relocatable-object MEMBER READER: the inverse of pe.cpp's Obj-arm writer
@@ -193,6 +205,12 @@ dss_add_test(NAME link/test_macho_object_reader SOURCES test_macho_object_reader
 # nativeId, out-of-range SymbolTableIndex, out-of-range SectionNumber), non-PE
 # schema fail-loud, and the DTYPE_FUNCTION extern isData inference.
 dss_add_test(NAME link/test_coff_object_reader SOURCES test_coff_object_reader.cpp)
+# The emission-alias pin splices ONE extra `relocations[]` row into a shipped
+# `.format.json`, deriving the aliased wire id and a free `kind` FROM the
+# document rather than hardcoding either — hence the json link, matching the
+# Mach-O twin above.
+target_link_libraries(dss_link_test_coff_object_reader
+                      PRIVATE nlohmann_json::nlohmann_json)
 
 # D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM -- the
 # ATOM-COVERAGE guard shared by all three relocatable-object readers

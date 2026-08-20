@@ -216,6 +216,29 @@ namespace dss::runtime {
 // writes the STATIC ARCHIVE for the same machine — the format a runtime unit is
 // compiled against.
 //
+// ★★ IT HAS TWO CALLERS AND THEY ASK FOR DIFFERENT REASONS, WHICH IS WHY THE
+// REFUSAL TEXT IS NOT WRITTEN HERE. This started as the runtime object cache's
+// private lookup and its messages said so; the archive-MEMBER reader
+// ([[D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT]])
+// needs the same answer for the opposite direction — the format that WROTE the
+// members it is about to READ. One derivation, two purposes: a refusal saying
+// "runtime object cache" to somebody static-linking a `.a` would name a
+// component that had nothing to do with the build, so the caller supplies its
+// own label and its own anchor rather than inheriting the first caller's.
+struct ArchiveSiblingRequester {
+    // How the refusal introduces itself, e.g. "runtime object cache" or
+    // "static-link". Rendered as the message's leading `<requester>: ` prefix.
+    std::string_view label;
+    // The anchor a reader who lands on the refusal should go and read. NOT a
+    // shared constant: the two callers are documented by different rows.
+    std::string_view anchor;
+};
+
+// This module's own identity, so neither its tests nor a future production
+// caller hand-spells the pair and drifts from it.
+inline constexpr ArchiveSiblingRequester kRuntimeCacheSiblingRequester{
+    "runtime object cache", "D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF"};
+//
 // ★★★ SCAN EVERY CANDIDATE; FAIL LOUD ON 0 OR >1. NEVER FIRST-MATCH.
 // `directory_iterator` order is SORTED on NTFS and HASH-ORDERED on ext4, so a
 // first-match rule decides the answer by filesystem — the exact NTFS-green /
@@ -251,9 +274,10 @@ namespace dss::runtime {
 // EMPTY and the 0-candidate refusal fires with a real diagnostic — never a
 // silent skip that would report success having compiled nothing.
 [[nodiscard]] DSS_EXPORT std::expected<std::string, std::string>
-resolveArchiveSiblingFormat(ObjectFormatSchema const&    buildFormat,
-                            TargetSchema const&          target,
-                            std::filesystem::path const& objectFormatsDir);
+resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
+                            TargetSchema const&            target,
+                            std::filesystem::path const&   objectFormatsDir,
+                            ArchiveSiblingRequester const& requester);
 
 // ── The two roots ───────────────────────────────────────────────────────────
 

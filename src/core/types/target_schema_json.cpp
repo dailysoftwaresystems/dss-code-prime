@@ -66,39 +66,27 @@ using Collector = substrate::DiagnosticCollector;
 //
 // `objectLabel` names the object in the message ("variant", "register row")
 // so the diagnostic reads as prose rather than as a path echo.
+//
+// ★★ THE LOOP ITSELF NOW LIVES IN `core/types/config_key_vocabulary.hpp`,
+// beside `isDocumentationKey`, and the argument above is WHY — it just could
+// not reach past this translation unit while it was written here. Three
+// sibling loaders had independently written the same helper and two of them
+// omitted the `$` carve-out this header spends a paragraph on. What remains
+// here is an ADAPTER, not a fifth copy: it binds the shared check to THIS
+// loader's sink, diagnostic code and `path/key` convention. The allowed-key
+// TABLES stay with the objects they describe, which is the half a maintainer
+// actually edits.
 template <std::size_t N>
 void rejectUnknownKeys(json const& obj,
                        std::array<std::string_view, N> const& known,
                        std::string_view path,
                        std::string_view objectLabel,
                        Collector& coll) {
-    if (!obj.is_object()) return;   // shape is the caller's own diagnostic
-    for (auto it = obj.begin(); it != obj.end(); ++it) {
-        // `$`-prefixed keys are PROSE (config-wide convention). Prefix
-        // predicate, never a literal — see the header note above.
-        if (detail::isDocumentationKey(it.key())) continue;
-        bool found = false;
-        for (auto const& k : known) {
-            if (it.key() == k) { found = true; break; }
-        }
-        if (found) continue;
-        std::string allowed;
-        for (auto const& k : known) {
-            if (!allowed.empty()) allowed += ", ";
-            allowed += '\'';
-            allowed += k;
-            allowed += '\'';
-        }
-        coll.emit(DiagnosticCode::C_MalformedJson,
-                  std::format("{}/{}", path, it.key()),
-                  std::format("unknown key '{}' in {} — allowed keys are {} "
-                              "(plus any '$'-prefixed documentation key). An "
-                              "unrecognized key is REFUSED rather than "
-                              "ignored: a silently-dropped key leaves the "
-                              "feature it names switched off with no "
-                              "diagnostic",
-                              it.key(), objectLabel, allowed));
-    }
+    detail::rejectUnknownKeys(obj, known, objectLabel,
+        [&](std::string_view key, std::string message) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("{}/{}", path, key), std::move(message));
+        });
 }
 
 // Single helper for "read a bounded non-negative integer field". Replaces
@@ -233,8 +221,10 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     // the variant would quietly take the default routing. That is precisely
     // how a renamed axis turns into a wrong-variant election with no
     // diagnostic. Allowlist the known sub-keys and emit per unknown key.
-    // `$comment` is the ONE universally allowed unknown key (config-wide
-    // convention).
+    // Any `$`-PREFIXED key is allowed on top (config-wide prose convention) —
+    // the prefix, not the single spelling `$comment`, which is what
+    // `$framePointerComment` and friends depend on. The helper applies it, so
+    // the table below states only this object's real vocabulary.
     // ⚠ 'negMemoffset' was RENAMED to 'negValue' when the sign axis
     // generalized from a memory displacement to any value-bearing operand;
     // the old spelling now lands here as an unknown key rather than being
@@ -863,19 +853,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         "wideFloatSoftcalls", "wideFloatSoftcallLibraryByFormat",
         "callingConventions"};
     DSS_CHECK_KEY_VOCABULARY(kTargetDocumentKeys);
-    for (auto it = doc.begin(); it != doc.end(); ++it) {
-        if (detail::isDocumentationKey(it.key())) continue;
-        bool known = false;
-        for (auto const& k : kTargetDocumentKeys) {
-            if (it.key() == k) { known = true; break; }
-        }
-        if (!known) {
-            coll.emit(DiagnosticCode::C_MalformedJson,
-                      std::format("/{}", it.key()),
-                      std::format("unknown top-level key '{}' (typo "
-                                  "discriminator)", it.key()));
-        }
-    }
+    // The ROOT runs the same check as every nested object — it had its own
+    // hand-written loop, which is how the container/leaf asymmetry this
+    // helper's header describes gets in. Empty `path` yields `/key`.
+    rejectUnknownKeys(doc, kTargetDocumentKeys, "", "the target document", coll);
 
     // ── dssTargetVersion ──
     if (!doc.contains("dssTargetVersion")
@@ -1250,6 +1231,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // same carve-out every other closed vocabulary gets —
                 // without it a `$comment` documenting the table would be
                 // rejected as an unknown cond code.
+                //
+                // ⓘ NOT ROUTED THROUGH `rejectUnknownKeys`, and that is a
+                // judgement rather than an oversight: this is a name→INDEX
+                // lookup whose "not found" arm IS the unknown-key report, and
+                // the index it produces is consumed two statements down. A
+                // shared pre-pass would walk the object twice to learn what
+                // this loop already knows. The carve-out is the shared
+                // predicate, which is the half that was ever gotten wrong.
                 if (detail::isDocumentationKey(key)) continue;
                 std::size_t idx = kCondNames.size();
                 for (std::size_t i = 0; i < kCondNames.size(); ++i) {
@@ -1463,20 +1452,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             static constexpr std::array<std::string_view, 2>
                 kCharIsUnsignedKeys{"default", "byObjectFormat"};
             DSS_CHECK_KEY_VOCABULARY(kCharIsUnsignedKeys);
-            for (auto it = cu.begin(); it != cu.end(); ++it) {
-                if (detail::isDocumentationKey(it.key())) continue;
-                bool known = false;
-                for (auto const& k : kCharIsUnsignedKeys) {
-                    if (it.key() == k) { known = true; break; }
-                }
-                if (!known) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/charIsUnsigned/{}", it.key()),
-                              std::format("unknown key '{}' in 'charIsUnsigned' "
-                                          "(expected 'default' / "
-                                          "'byObjectFormat')", it.key()));
-                }
-            }
+            rejectUnknownKeys(cu, kCharIsUnsignedKeys, "/charIsUnsigned",
+                              "the 'charIsUnsigned' block", coll);
 
             if (!cu.contains("default")) {
                 coll.emit(DiagnosticCode::C_MissingField,
@@ -3139,6 +3116,18 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                 // the SAME predicate `rejectUnknownKeys` uses
                                 // — a second spelling of it here is how one
                                 // site ends up rejecting `$fooComment`.
+                                //
+                                // ⓘ NOT ROUTED THROUGH `rejectUnknownKeys`,
+                                // deliberately: the vocabulary here is TWO
+                                // tables (common + the declared strategy's
+                                // own), and the whole value of this site is a
+                                // message the shared sentence cannot carry —
+                                // it names the OTHER strategy that would have
+                                // read the key, which is what distinguishes a
+                                // typo from a copy-paste off the wrong ABI
+                                // (D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-
+                                // KEY). Routing it would trade a diagnostic
+                                // for a shape.
                                 if (detail::isDocumentationKey(key)) continue;
                                 if (inSet(kVaListCommonKeys, key)) continue;
                                 if (inSet(own, key)) continue;

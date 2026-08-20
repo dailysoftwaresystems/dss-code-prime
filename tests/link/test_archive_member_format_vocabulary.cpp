@@ -2,43 +2,59 @@
 // D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT (OPEN,
 // HIGH).
 //
-// ★★★ THIS TEST PINS A KNOWN DEFECT'S BLAST RADIUS. IT DOES NOT ASSERT DESIRED
-// BEHAVIOUR. Everything below describes something that is WRONG and is expected
-// to stay wrong until that row closes; the assertion exists so the wrongness
-// cannot quietly spread or quietly change shape.
-//
-// THE DEFECT. `compile_pipeline.cpp::readArchiveMemberModule` hands an archive
-// MEMBER to a reader together with the FINAL IMAGE's `ObjectFormatSchema` -- the
-// `-exec` / `-dylib` / `-dll` variant the link is producing -- rather than the
-// member's own relocatable format. Every reader builds a reverse map from the
-// schema's `nativeId` back to a universal `RelocationKind`, so the member's wire
-// values are decoded against a vocabulary that was never promised to describe
+// ⚠⚠ THIS HEADER WAS WRITTEN WHILE THE ROW WAS OPEN AND HAS BEEN REWRITTEN NOW
+// THAT IT IS FIXED. It used to say the census "PINS A KNOWN DEFECT'S BLAST
+// RADIUS. IT DOES NOT ASSERT DESIRED BEHAVIOUR", and that the divergence below
+// was "expected to stay wrong until that row closes". BOTH HALVES TURNED OUT TO
+// BE THE WRONG PREDICTION, and the correction is the point worth keeping: the
+// divergence was never the defect. It is a CORRECT and PERMANENT fact about the
+// two vocabularies, and the defect was reading a member through the wrong one of
 // them.
 //
-// WHY IT HAS NOT BURNED EVERY LEG. On most families the object-side and
-// image-side vocabularies happen to declare the same `nativeId` for the same
-// `kind`, so reading a member through the wrong one is harmless BY COINCIDENCE.
-// That coincidence is load-bearing and entirely undocumented, which is exactly
-// the thing worth pinning: if a family's variants drift apart, the leg that
-// stops working gives no hint that a schema pairing was the cause.
+// THE DEFECT, AND WHAT FIXED IT. `compile_pipeline.cpp::readArchiveMemberModule`
+// used to hand an archive MEMBER to a reader together with the FINAL IMAGE's
+// `ObjectFormatSchema` -- the `-exec` / `-dylib` / `-dll` variant the link is
+// producing -- rather than the member's own relocatable format. Every reader
+// builds a reverse map from the schema's `nativeId` back to a universal
+// `RelocationKind`, so the member's wire values were decoded against a
+// vocabulary that was never promised to describe them. It now resolves the
+// member's OWN format (the `container: "archive"` document for the same kind and
+// machine) and reads through that, refusing loud if it cannot.
 //
-// ★ THE ONE FAMILY WHERE THE COINCIDENCE ALREADY FAILS is `macho64-x86_64-
-// darwin`, on two kinds, and the split is structurally meaningful rather than a
-// typo: `{relocatable, staticlib}` on one side against `{exec, dylib}` on the
-// other -- the OBJECT vocabulary disagreeing with the IMAGE vocabulary, which is
-// precisely the axis the defect crosses. A member read there does not merely
-// miss a key; it resolves the same wire value to a different meaning, or fails
-// to resolve it at all.
+// ★ SO WHAT DOES THIS CENSUS STILL ASSERT, now that the read is correct? The
+// SHAPE of the shipped configuration, and it is still worth asserting. On most
+// families the object-side and image-side vocabularies declare the same
+// `nativeId` for the same `kind` -- an AGREEMENT BY COINCIDENCE that no rule
+// enforces. While the reader was reading with the wrong document, that
+// coincidence was load-bearing for correctness. It no longer is; what it is now
+// is a claim about the corpus that a maintainer would otherwise have to
+// re-derive by hand, and the ONE family that breaks it is the one that proves
+// the two vocabularies are genuinely different documents rather than duplicates
+// -- i.e. the reason "declare the relocation vocabulary once per lineage" is not
+// an available design.
 //
-// ⚠⚠ A RED HERE MAY BE GOOD NEWS, AND THE NEXT READER SHOULD CHECK WHICH.
-//   * If a SECOND family appears in the divergent set, the coincidence the other
-//     legs rely on has started to erode -- that is the alarm this test exists to
-//     raise, and it must not be silenced by widening the expectation without
-//     understanding why the new family drifted.
-//   * If `macho64-x86_64-darwin` DISAPPEARS from the set, the defect has been
-//     REPAIRED. The expectation below must then be updated IN THE SAME COMMIT
-//     that repairs it, and this file's premise re-read: once no family diverges,
-//     the census pins nothing and the row is closable.
+// ⚠⚠ THE ONE FAMILY WHERE THE COINCIDENCE FAILED WAS `macho64-x86_64-darwin`,
+// on two kinds, and THIS HEADER USED TO CALL THAT SPLIT "structurally
+// meaningful rather than a typo". THAT WAS WRONG, and the correction is worth
+// more than the original claim: it WAS a typo, in two documents, and each of
+// the two values contradicted its own row's name, comment and stated packing
+// (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-ROW,
+// 2026-08-20). The set below is now EMPTY. The lesson the old text drew from
+// the divergence -- that object and image vocabularies are genuinely different
+// documents -- is still TRUE, but this census is no longer its evidence; see
+// the note at the expectation.
+//
+// ⚠⚠ A RED HERE IS A CONFIGURATION CHANGE.
+//   * If a family appears in the divergent set, its variants have drifted
+//     apart. That is no longer a correctness alarm -- the member read resolves
+//     its own document now -- but it IS news, and widening the list without
+//     understanding why the family drifted throws the news away. The FIRST
+//     question to ask is the one that settled the last occurrence: does the new
+//     value contradict its own row?
+//   * ✔MEASURED 2026-08-20, both directions, so the expectation is not vacuous:
+//     restoring `macho64-x86_64-darwin-exec`'s kind-1 `nativeId` to the old
+//     369098752 reds this case (the set gains a row), and with the corrected
+//     value it is green.
 //
 // ⓘ MEASURED, NOT PINNED: several families also declare a `kind` in one variant
 // and not another (e.g. an ELF exec-only PLT kind absent from the relocatable
@@ -227,21 +243,40 @@ TEST(ArchiveMemberFormatVocabulary, ObjectAndImageRelocationTablesDivergeExactly
            "the relocation tables did not load, so agreement here means nothing";
 
     // ★ THE EXACT SET, re-derived from the shipped configuration on this run.
-    // Not "at least one", not "no more than N": exactly these, so the test reds
-    // when a family JOINS the set and reds again when this family LEAVES it.
-    // MEASURED from `src/dss-config/object-formats` at the commit that added
-    // this test.
-    std::vector<std::string> const expected = {
-        "macho64-x86_64-darwin kind 1: "
-        "369098752 = dylib/exec | 620756992 = relocatable/staticlib",
-        "macho64-x86_64-darwin kind 3: "
-        "33554432 = dylib/exec | 67108864 = relocatable/staticlib",
-    };
+    // Not "at most N": EXACTLY this, so the test reds when any family JOINS.
+    //
+    // ⚠⚠ THE SET IS EMPTY, AND IT WAS NOT ALWAYS. It held two rows for
+    // `macho64-x86_64-darwin` (kind 1: 369098752 dylib/exec vs 620756992
+    // relocatable/staticlib; kind 3: 33554432 vs 67108864) until 2026-08-20,
+    // and this guard fired exactly as it was built to when they left. THE
+    // SCHEMA EDIT WAS RE-ARGUED, which is what the failure message demands,
+    // and the argument is `D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-
+    // CONTRADICTS-ITS-OWN-ROW`: the two image documents were not a second
+    // honest encoding, they were SELF-REFUTING. Under the packing their own
+    // comments state -- (r_type<<28)|(r_length<<25)|(r_pcrel<<24) -- 369098752
+    // decodes to r_type=1 (SIGNED), 8 bytes, NOT pc-relative, for a row named
+    // X86_64_RELOC_BRANCH, and 33554432 decodes to a TWO-byte slot for a row
+    // named `_4`. No external authority was needed to settle it; the documents
+    // refute themselves, and their `-darwin`/`-staticlib` siblings and the
+    // entire arm64 family always carried the corrected values.
+    //
+    // ⓘ WHAT THE EMPTINESS DOES **NOT** MEAN. This file used to argue that the
+    // one divergent family was "the reason `declare the relocation vocabulary
+    // once per lineage` is not an available design". That argument is now
+    // GONE and must not be quietly inherited: on the same-kind-different-value
+    // axis the shipped corpus is unanimous. What still differs between an
+    // object and an image vocabulary is KIND MEMBERSHIP -- an image-only PLT
+    // or TLS kind absent from the relocatable arm, an `emitOnly` alias present
+    // only in it -- which this census deliberately excludes (see the header).
+    // A future cycle that wants to collapse the two documents has to argue
+    // against THAT, not against this now-empty set.
+    std::vector<std::string> const expected = {};
     EXPECT_EQ(observed, expected)
         << "the object-vs-image relocation-vocabulary divergence set changed.\n"
-           "  A NEW family in the set: the coincidence every other leg relies on "
-           "is eroding -- investigate that family, do not widen this list.\n"
-           "  macho64-x86_64-darwin GONE from the set: "
-           "D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT "
-           "was repaired -- update this expectation in the repairing commit.";
+           "  A NEW family in the set: a family's object and image variants "
+           "have drifted apart, i.e. one variant declares a wire value for a "
+           "kind that its sibling spells differently. Investigate that family "
+           "-- widening this list throws the news away. Check first whether "
+           "the new value CONTRADICTS its own row (name, comment, declared "
+           "packing), which is how the last two entries got here.";
 }

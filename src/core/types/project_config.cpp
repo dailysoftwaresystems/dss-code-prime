@@ -64,24 +64,6 @@ std::string joinStrings(std::span<std::string const> items) {
     return out;
 }
 
-// The FIRST key of `obj` that is neither a `$`-documentation key nor a member
-// of `known`; nullopt when every key is recognized. The `$` carve-out is
-// `dss::detail::isDocumentationKey` — the codebase-wide predicate, not another
-// open-coded copy of `key.front() == '$'`.
-template <std::size_t N>
-std::optional<std::string> firstUnknownKey(
-    json const& obj, std::array<std::string_view, N> const& known) {
-    for (auto it = obj.begin(); it != obj.end(); ++it) {
-        std::string const& key = it.key();
-        if (detail::isDocumentationKey(key)) continue;   // PROSE, never config
-        bool recognized = false;
-        for (auto const& k : known) {
-            if (k == key) { recognized = true; break; }
-        }
-        if (!recognized) return key;
-    }
-    return std::nullopt;
-}
 
 // Emit an Error-severity diagnostic into `rep` with a `<sourceLabel>: `
 // prefix so the user sees which project file failed.
@@ -304,7 +286,7 @@ bool readOptionalResolveLibraries(json const& doc,
         static constexpr std::array<std::string_view, 2> kEntryKeys = {
             "path", "importName"};
         DSS_CHECK_KEY_VOCABULARY(kEntryKeys);
-        if (auto bad = firstUnknownKey(e, kEntryKeys)) {
+        if (auto bad = detail::firstUnknownKey(e, kEntryKeys)) {
             emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
                              at + "has unknown member '" + *bad
                              + "' (recognized members: " + joinKeys(kEntryKeys)
@@ -380,7 +362,7 @@ bool readOptionalScripts(json const& doc,
         static constexpr std::array<std::string_view, 2> kScriptKeys = {
             "run", "runOn"};
         DSS_CHECK_KEY_VOCABULARY(kScriptKeys);
-        if (auto bad = firstUnknownKey(e, kScriptKeys)) {
+        if (auto bad = detail::firstUnknownKey(e, kScriptKeys)) {
             emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
                              at + "has unknown member '" + *bad
                              + "' (recognized members: " + joinKeys(kScriptKeys)
@@ -551,7 +533,7 @@ bool readOptionalDependsOn(json const& doc,
         static constexpr std::array<std::string_view, 3> kDependencyKeys = {
             "path", "git", "ref"};
         DSS_CHECK_KEY_VOCABULARY(kDependencyKeys);
-        if (auto bad = firstUnknownKey(e, kDependencyKeys)) {
+        if (auto bad = detail::firstUnknownKey(e, kDependencyKeys)) {
             emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
                              at + "has unknown member '" + *bad
                              + "' (recognized members: "
@@ -676,7 +658,7 @@ parseProjectConfig(std::string_view jsonText,
     //     would still reject `$sourcesComment` and re-open the inconsistency
     //     for the next annotation someone writes. The closed set is NOT
     //     relaxed: a non-`$` typo still fails loud, exactly as before.
-    if (auto bad = firstUnknownKey(doc, kKnownKeys)) {
+    if (auto bad = detail::firstUnknownKey(doc, kKnownKeys)) {
         emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
                          "unknown field '" + *bad + "' (recognized fields: "
                          + projectConfigKnownKeyList() + ")");

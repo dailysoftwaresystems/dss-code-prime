@@ -796,6 +796,92 @@ TEST(ShippedLibDescriptor, SymbolLinkNameMalformedShapesFailLoud) {
             ] } }] })JSON"));
 }
 
+// ── `$`-DOCUMENTATION KEYS, ON EVERY OBJECT AND NOT ONLY THE ROOT ─────────
+//
+// The repo-wide convention is that ANY config object may carry a `$`-prefixed
+// PROSE key. This loader used to honour it at exactly one place: the literal
+// `"$comment"`, hand-listed in the ROOT allow-list. Its own `rejectUnknownKeys`
+// applied no prefix predicate, so on every one of its other 18 objects a
+// documentation key was REFUSED as a typo — and even at the root, only the one
+// spelling worked (`$abiComment`, the shape shipped targets use, did not).
+//
+// That is a real refusal of a valid document, not a silent drop: the inverse
+// failure, and the exact "carve-out remembered per site" archetype the shared
+// `core/types/config_key_vocabulary.hpp` check exists to abolish. Both halves
+// are pinned here, because a fix to either alone would leave the other broken.
+//
+// ⚠ THE NEGATIVE ARM IS NOT OPTIONAL. "A `$` key is accepted" is also true of
+// a loader that accepts EVERY key, which is the failure this whole discriminator
+// exists to prevent — so each accept is paired with the same document carrying
+// a NON-`$` unknown key in the SAME position, which must still be refused.
+//
+// RED-ON-DISABLE: remove the `isDocumentationKey` skip in `dss::detail::
+// rejectUnknownKeys` and the accepting arms go red; remove the membership loop
+// and the refusing arms go red.
+TEST(ShippedLibDescriptor, DocumentationKeysAreAcceptedOnEveryObjectNotJustTheRoot) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    int caseNo = 0;
+    auto readsClean = [&](std::string const& body) -> bool {
+        auto const path =
+            writeTemp(dir, "doc" + std::to_string(caseNo++) + ".json", body);
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, "x86_64",
+                                             ObjectFormatKind::MachO);
+        return desc.has_value() && !rep.hasErrors();
+    };
+
+    // BASELINE: the same document with no extra keys at all, so every arm
+    // below is attributable to the key it adds and not to the fixture.
+    EXPECT_TRUE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32" }] })JSON"));
+
+    // ROOT — worked before only for the literal `"$comment"`.
+    EXPECT_TRUE(readsClean(R"JSON({ "$comment":"prose", "header":"x.h",
+        "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32" }] })JSON"));
+    // ROOT, a DIFFERENT `$` spelling — the prefix is the convention, not the
+    // one word. This arm failed before the shared check.
+    EXPECT_TRUE(readsClean(R"JSON({ "$abiComment":"prose", "header":"x.h",
+        "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32" }] })JSON"));
+    // ROOT negative control: a bare unknown key is still REFUSED.
+    EXPECT_FALSE(readsClean(R"JSON({ "comment":"prose", "header":"x.h",
+        "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32" }] })JSON"))
+        << "the `$` PREFIX is what makes a key prose — an ordinary `comment` "
+           "is a typo discriminator hit, and if this passes the discriminator "
+           "has been turned off rather than taught the convention";
+
+    // A NESTED object: a `symbols[]` row. Refused before.
+    EXPECT_TRUE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "$comment":"why this symbol exists",
+                     "name":"f","signature":"fn() -> i32" }] })JSON"));
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "note":"why this symbol exists",
+                     "name":"f","signature":"fn() -> i32" }] })JSON"))
+        << "a symbol row's key set is CLOSED — a misspelled role key there is "
+           "what D-FFI-DESCRIPTOR-EAGER-IMPORT reads";
+
+    // A DEEPLY nested object: a per-target `when` guard, two levels down.
+    EXPECT_TRUE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32",
+            "linkName": { "variants": [
+                { "$whenComment":"Darwin only",
+                  "when": { "arch":"x86_64", "format":"macho" },
+                  "value":"f$INODE64" } ] } }] })JSON"));
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32",
+            "linkName": { "variants": [
+                { "whenComment":"Darwin only",
+                  "when": { "arch":"x86_64", "format":"macho" },
+                  "value":"f$INODE64" } ] } }] })JSON"))
+        << "the variant row stays closed — a typo'd `when`/`value` sibling is "
+           "how a rename silently stops applying";
+}
+
 // ★ THE REAL DESCRIPTORS, every renamed symbol at once — the pin that would have
 // caught the shipped bug. MEASURED ground truth (macOS 26.5.2, Apple clang
 // 21.0.0), and the control is EXHAUSTIVE rather than a sample: ONE generated TU

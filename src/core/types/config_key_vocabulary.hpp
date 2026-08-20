@@ -2,6 +2,8 @@
 
 #include <array>
 #include <cstddef>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -80,6 +82,128 @@ template <typename T, std::size_t N>
             if (rows[a].first == rows[b].first) return false;
     }
     return true;
+}
+
+// ── THE TYPO DISCRIMINATOR ITSELF ─────────────────────────────────────────
+//
+// Reject every key of `obj` that is neither a `$`-documentation key nor a
+// member of `known`. THE ONE loop; every closed-key object in every DSS config
+// loader runs through this one.
+//
+// ★ WHY IT LIVES HERE AND NOT IN A LOADER. It DID live in a loader — in four
+// of them, independently written, plus ~50 open-coded copies at individual
+// call sites. `target_schema_json.cpp`'s copy carries a header arguing at
+// length that a loop per site IS the defect, and that argument was right and
+// could not reach past its own translation unit: two of the four sibling
+// helpers (`opt/optimizer_json.cpp` and `ffi/shipped_lib_descriptor.cpp`) omit
+// the `$` carve-out entirely, which is the SAME class of miss the target
+// loader's header describes, in the other direction — they REFUSE a
+// `$…Comment` prose key that the convention says every document may carry.
+// A rule that must be remembered per site is a rule that holds only where
+// someone remembered it, and the site that forgets is never the one being
+// read at the time.
+//
+// ★ WHAT IS SHARED AND WHAT IS NOT. The CHECK and the DIAGNOSTIC SHAPE are
+// shared; the VOCABULARY and the SINK are not. Each loader keeps its own
+// allowed-key table next to the object it describes (that is the part a
+// maintainer edits, and it must stay where the fields are read), and its own
+// diagnostic code, JSON-path convention and reporter — which is why `emit` is
+// a callback rather than a `Collector&`. That also keeps this header free of
+// any JSON or diagnostic dependency: `obj` and `known` are duck-typed, so
+// nothing above `core/types` is dragged into everything that includes this.
+//
+// ★ WHY IT MATTERS, WHICH IS NOT TIDINESS. On a config-driven compiler a
+// dropped key is a CAPABILITY THAT QUIETLY DOES NOT HAPPEN: the document
+// still loads, the feature it names stays at its default, and nothing says so.
+// That is why the message states the refusal policy rather than only the fact.
+//
+// `obj`         — anything with `is_object()` and a key/value iteration range
+//                 whose iterator exposes `.key()` (nlohmann's object shape).
+//                 A non-object is left alone: its SHAPE is the caller's own
+//                 diagnostic, and reporting it twice reads as two defects.
+// `known`       — any range of string-comparable keys. It need not be a
+//                 compile-time table: the object-format loader unions its
+//                 static roots with the block names the registered backends
+//                 declare, so the ALLOWED list in the message stays true for
+//                 a format backend added later.
+// `objectLabel` — names the object in prose ("a register row", "the tls
+//                 block"), so the message reads as a sentence and not as a
+//                 path echo.
+// `emit`        — `void(std::string_view key, std::string message)`, called
+//                 once per unknown key with the shared sentence. A caller that
+//                 needs to say more appends to it; a caller that needs to
+//                 stop tracks that itself.
+template <typename JsonObject, typename KnownKeys, typename EmitFn>
+void rejectUnknownKeys(JsonObject const& obj,
+                       KnownKeys const&  known,
+                       std::string_view  objectLabel,
+                       EmitFn&&          emit) {
+    if (!obj.is_object()) return;
+    // Rendered at most once, and only if some key actually needs it — this
+    // runs over every key of every config object, so the clean path must not
+    // build a string. The explicit flag rather than `allowed.empty()`: an
+    // EMPTY `known` renders to the empty string, and testing the string would
+    // silently re-render per key while reading as "render once".
+    std::string allowed;
+    bool        allowedRendered = false;
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        // `$`-prefixed keys are PROSE (config-wide convention). The PREFIX
+        // predicate, never a literal `"$comment"` — `$templateComment` and
+        // `$framePointerComment` are spellings shipped documents really use,
+        // and a literal would reject them as typos.
+        if (isDocumentationKey(it.key())) continue;
+        bool found = false;
+        for (auto const& k : known) {
+            if (it.key() == k) { found = true; break; }
+        }
+        if (found) continue;
+        if (!allowedRendered) {
+            for (auto const& k : known) {
+                if (!allowed.empty()) allowed += ", ";
+                allowed += '\'';
+                allowed += std::string_view{k};
+                allowed += '\'';
+            }
+            allowedRendered = true;
+        }
+        std::string message = "unknown key '";
+        message += std::string_view{it.key()};
+        message += "' in ";
+        message += objectLabel;
+        message += " — allowed keys are ";
+        message += allowed;
+        message += " (plus any '$'-prefixed documentation key). An "
+                   "unrecognized key is REFUSED rather than ignored: a "
+                   "silently-dropped key leaves the feature it names switched "
+                   "off with no diagnostic";
+        emit(std::string_view{it.key()}, std::move(message));
+    }
+}
+
+// The QUERY form of the same check: the FIRST key of `obj` that is neither a
+// `$`-documentation key nor a member of `known`; nullopt when every key is
+// recognized.
+//
+// A second primitive rather than a mode of the first, because two loaders
+// genuinely need this shape: the project-manifest and lockfile loaders report
+// ONE diagnostic per failed load, each ending in its own remediation ("delete
+// the lockfile and let the next build re-resolve"), so they must own the
+// message and only need the finding. They had written this identically, in two
+// files, down to the comment on the `$` skip — which is the same duplication
+// `rejectUnknownKeys` above exists to end, at a smaller scale.
+template <typename JsonObject, typename KnownKeys>
+[[nodiscard]] std::optional<std::string>
+firstUnknownKey(JsonObject const& obj, KnownKeys const& known) {
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        std::string const& key = it.key();
+        if (isDocumentationKey(key)) continue;   // PROSE, never config
+        bool recognized = false;
+        for (auto const& k : known) {
+            if (key == k) { recognized = true; break; }
+        }
+        if (!recognized) return key;
+    }
+    return std::nullopt;
 }
 
 } // namespace dss::detail

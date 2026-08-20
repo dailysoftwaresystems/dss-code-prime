@@ -64,7 +64,7 @@ commit that lands it, and never delete a ticked row.
       armed with `mustDifferFromBaseline`. ✔All 12 library images differ debug→release across four targets;
       macho64-arm64 and elf64-aarch64 verified BY EXECUTION on real hardware, exit 42 in all eight arms.
       **The row predicted a finding and got two** — see §0.00000000000000000000000.
-- [ ] **P22 — `D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM` (HIGH). OPERATOR-ORDERED
+- [x] **P22 — `D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM` CLOSED. ✅ DONE 2026-08-20.** OPERATOR-ORDERED
       2026-08-20 for the IMMEDIATE next cycle** (*"remember to address anchor in the immediate next cycle.
       only best long term solutions! no workarounds"*). DSS cannot link a **file-local** function out of an
       archive on pe64 or macho64: those readers classify a non-external defined symbol as a bodyless block
@@ -76,9 +76,50 @@ commit that lands it, and never delete a ticked row.
       between the object and image vocabularies). ⚠ The mach-o option involves `MH_SUBSECTIONS_VIA_SYMBOLS`,
       a SHIPPING WIRE-FORMAT change that Apple's ld64 reads as a licence for symbol-granularity
       dead-stripping — if the design lands there, it is a §B, not a lane decision.
-- [ ] **P23 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
+      ✅ **IT LANDED THERE, AND IT WAS NOT A §B** — no fork existed once the evidence was in: the flag
+      WITHOUT `N_ALT_ENTRY` markers is catastrophic (five dense-switch examples crash, ~85% of `__text`
+      stripped) and WITH them `__text` is byte-identical, so one option was refuted by measurement rather
+      than merely being less attractive. Widened witness: **525 objects** through real ld64 under
+      `-dead_strip`, flag ON vs OFF, **0 run disagreements**. A `static` helper now links out of an archive
+      on ALL FIVE legs, run-witnessed at both configs, macho64-x86_64 included (Rosetta, on the Mac).
+      ⚠ **The row named THREE further problems and understated the fourth.** The `nativeId` conflict it
+      mentioned was not two honest encodings — the image documents were SELF-REFUTING under the packing
+      their own comments state. And the leg it did not mention at all, `D-LK-MACHO-ISDATA-NO-CALL-SIGNAL`,
+      turned out to mean macho64-x86_64 had **no working static-library path whatsoever**. Net −2.
+- [ ] **P23 — THE TWO ROWS CYCLE P22 OPENED. OPERATOR RULING 2026-08-20**, verbatim: *"we don't want no
+      open anchors, so this cycle can end with it opened, but next one must address it if addressable (use
+      /dss-cycle)"*, narrowed the same day to *"only if strictly needed due to cycle size, amount of
+      changes or bigger stuff"*. ⚠ **APPLYING THE NARROWING HONESTLY REMOVED ONE OF THE THREE DEFERRALS AND
+      CORRECTED THE SIZING OF THE OTHER TWO — do the same before assuming these two are big.**
+      * `D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB` — the non-canonical name of an aliased atom
+        does not reach a RE-EMITTED relocatable object's symtab. ✔Sized: `definedName` has ~5–6 ET_REL call
+        sites behind ONE `ObjectSymbolNames` helper, and the alias rows already carry the owner's
+        `SymbolId`. ⚠ Size the CONSUMER first — no shipped corpus example round-trips an aliased object, so
+        this is a correctness gap with no current victim.
+      * `D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP` — instance closed, CLASS open.
+        ✔Sizing corrected in the row: about **fourteen** exported pipeline entry points, not the "76 test
+        files" first reported (that number sizes a different question and was attached by mistake).
+      * `D-CONFIG-UNKNOWN-KEY-CHECK-HAND-ROLLED-SITES-REMAIN` — ✔the report that opened this class said
+        "a fourth hand-rolled copy"; MEASURED, it was **58**. Two of them held LIVE defects (loaders
+        REFUSING valid `$…Comment` documentation keys), both fixed this cycle. **49 sites remain** —
+        44 in `grammar_schema_json.cpp`, 5 in `predefined_macro_json.cpp` — all measured correct on the
+        `$` axis, so no live defect is known in them today. ⚠ **ELEVEN of the grammar sites have NO
+        allow-list table at all** (chained `key != "a" && key != "b"`), so converting them means MINTING
+        the table from the parse arm first, not routing a call — and this cycle found three shipped
+        messages that disagreed with their own parse code, so the conditions are not a trustworthy
+        source for it.
+      ⇒ All three are ordinary lanes. They were deferred on **P22's** size — a shipping wire-format change
+      gated on hardware evidence, a new object-format schema field declared across 13 documents, three
+      object readers rewritten, a shared unknown-key check promoted across five loaders, five lanes,
+      ~70 files — not on their own.
+      ⚠ **NET −1 IS THIN AND IS SAID PLAINLY RATHER THAN DRESSED UP:** OPEN 1019 → 1018, closed 4, opened 3.
+      Every one of the three is a defect this cycle FOUND rather than inherited, and each was sized before
+      being written down — but a cycle that closes four and opens three has not moved the number much, and
+      the next one should expect to spend itself on these rather than on new ground.
+- [ ] **P24 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
       family, and it gates the pe64 sqlite CLI. ✔Measured to shrink to ONE library for the CLI case.
-- [ ] **P24+ — THE REST OF WHAT P21 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
+      ⓘ Was P23 until 2026-08-20; pushed down one slot by the ruling above, not deprioritised.
+- [ ] **P25+ — THE REST OF WHAT P21 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
       /loop using /dss-cycle each iteration to address ALL anchors found in _handoff §0."* Re-derive each pick
       from the REGISTRY, never from this list.
 - [x] **OPERATOR CALL — ✅ FILED 2026-08-19: <https://sqlite.org/bugs/forumpost/97cd29ca44624113c73b30f5d2504729e6ffc5c5ebcba137078ea1a868cd97c9>.**
@@ -111,6 +152,207 @@ trigger NOT fired `D-ASM-TARGET-DECLARES-NO-BYTE-ORDER`, `D-ASM-COND-ON-TERMINAT
 ⓘ Two rows a family-grep catches that are NOT defects: `D-OPT-REBUILD-POLICY-NEUTERED-STATE-HOOK` is a 🟢
 SHIPPED design record, and `D-TEST-MACOS-LEG-EMSDK-PROFILE-REPLACES-PATH-HIDING-HOMEBREW` is a 🔵 DISCLOSED
 pre-existing environment fact.
+
+---
+
+## 0.000000000000000000000000 ★★★ CYCLE P22 — A `static` HELPER NOW LINKS OUT OF AN ARCHIVE ON EVERY LEG, AND THREE OF THE FOUR THINGS THAT MADE IT HARD WERE NOT IN THE ROW
+
+**Closes `D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM` (HIGH, queued P22).**
+
+The row said: pe64 and mach-o readers classify a non-external defined symbol as a bodyless block
+label instead of an atom, so a file-local function pulled from an archive loses its bytes — loudly
+when it is called, silently when it is not. That is true, and it was the smallest of the four
+problems that had to be solved to make the shape work.
+
+### ★★★ THE FOUR, AND ONLY THE FIRST WAS THE ONE THAT WAS QUEUED
+
+1. **The classification itself.** COFF closes it from DECLARED evidence: a file-local function
+   declares `IMAGE_SYM_DTYPE_FUNCTION`, and a file-local data object is a class-STATIC symbol in a
+   non-code section. Both become atom boundaries BEFORE slicing, so a file-local symbol's POSITION
+   stops mattering — including the trailing case the row warned the coverage guard could not see.
+2. **Mach-O has no declared evidence at all** — `nlist_64` carries no size and no function bit — so
+   the discrimination had to come from the FORMAT's own vocabulary rather than a DSS convention:
+   `MH_SUBSECTIONS_VIA_SYMBOLS` in the header plus `N_ALT_ENTRY` on the writer's synthetic block
+   labels. Together they say "every other defined symbol starts an atom of its own".
+   ⚠ **This is a SHIPPING WIRE-FORMAT change and it was gated on hardware evidence, not on a DSS
+   round trip** — the bit is a LICENCE for Apple's ld64 to dead-strip at symbol granularity in every
+   artifact built from these objects. See the widened witness below.
+3. **The archive member was being read with the wrong vocabulary.** Closed as
+   `D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT`: the pull handed the
+   member to a reader together with the FINAL IMAGE's schema, so its wire values were decoded
+   against a document that never promised to describe them. It now resolves the member's own
+   `container: "archive"` document and refuses loud if it cannot.
+4. **The member's externs came back owning no library.** Two rows, one root — an object file records
+   a symbol NAME and nothing else. See both below.
+
+### ★★ THE FLAG WAS SAFE ONLY BECAUSE OF THE MARKERS, AND THAT WAS MEASURED IN BOTH DIRECTIONS
+
+`MH_SUBSECTIONS_VIA_SYMBOLS` **without** `N_ALT_ENTRY` markers is catastrophic: five dense-switch
+examples crash and ~85% of `__text` is stripped, because ld64 takes the licence and every synthetic
+block label looks like an atom start. **With** the markers, all arms exit 42 and `__text` comes back
+byte-identical. The final witness compared **525 objects** through Apple's real ld64 under
+`-dead_strip`, flag ON vs OFF, and found **0 run disagreements**.
+
+★ **NO C++ READS THE HEADER VALUE.** The writer copies `MachOIdentity::flags` verbatim; the reader
+asks only whether the bit is present in the object it is READING. So setting that one number back to
+0 is the entire rollback — the markers stay honest and the reader falls back to its narrower
+external-only rule with the coverage guard still refusing any dropped body.
+
+### ★★★ THE PART THAT COST THE MOST WAS A NUMBER IN MY OWN BRIEF
+
+The brief handed to the mach-o lane said `N_ALT_ENTRY = 0x0020`. **It is 0x0200. 0x0020 is
+`N_NO_DEAD_STRIP`.** Had it shipped, every `static` carrying `__attribute__((used))` would have had
+its bytes dropped, and my earlier ld64 probes — which tested the wrong bit — had to be thrown away
+and re-run. The lane caught it by measuring the constant on real clang output instead of taking it
+from the brief.
+
+⚠⚠ **THIS IS THE THIRD TIME IN SIX CYCLES A LANE BRIEF CARRIED AN ERROR WITH AUTHORITY ATTACHED.**
+The rule already exists — *name the symptom, not the fix* — and it did not save this one, because
+the error was not a prescription, it was a FACT stated without a citation. The rule needs the second
+half: **a brief may state a measurement only with the instrument that produced it**, so the lane can
+re-run it. A bare constant is not a measurement.
+
+### ✅ THE TWO LIBRARY-BINDING ROWS — same root, and the second one predates the first's fix
+
+`D-LK-ARCHIVE-MEMBER-EXTERN-LOSES-ITS-LIBRARY` (platform half) and
+`D-LK-ARCHIVE-MEMBER-EXTERN-UNBOUND-BY-RESOLVE-LIBRARY` (operator-named half), both BORN CLOSED.
+An object file records an undefined symbol's NAME and nothing else, so the binding has to be
+re-derived at pull time. Two tiers were ruled out BY MEASUREMENT rather than by argument: the READER
+cannot recover it (the emitted `.lib` and `.a` were dumped and carry the symbol name and no library
+string at all), and the LINKER cannot either — binding must precede the cross-CU merge, whose dedup
+key is `(mangledName, libraryPath, version)`, or one C runtime ends up with two import descriptors.
+
+★ **THE PLATFORM HALF UNDERSTATED ITSELF BY ONE HALF:** a compiled TU emits the PLATFORM LINK NAME,
+not the C identifier, so un-decorating recovers a spelling the descriptor corpus is not keyed on.
+Exactly **nine** shipped rows realize to a link name the corpus does not separately declare
+(`write`→`_write`, `lseek`, `getpid`, `_setjmp`→`__intrinsic_setjmp`, and five Darwin `$INODE64` /
+`$DARWIN_EXTSN` forms). A reverse index keyed by each row's REALIZED link name closes it.
+
+★★ **THE OPERATOR-NAMED HALF PRODUCED THE CYCLE'S SHARPEST TEST FINDING.** Dropping the new
+threading at ONE driver call site reproduced the original CLI failure exactly while the entire
+in-process suite stayed **green at 32/32** — every unit case calls `pullStaticArchiveMembers`
+directly and constructs the argument the driver is supposed to supply, so no unit case can ever
+witness a gap in the supplying. A driver-level pin now exists; the CLASS is anchored OPEN as
+`D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP`.
+
+### ⚠⚠ A CONFIG CORRECTION KILLED TWO PINS, AND THE PINS WERE THE ONES IN THE WRONG
+
+Surveying relocation rows turned up `macho64-x86_64-darwin-exec` and `-dylib` declaring
+`X86_64_RELOC_BRANCH` with a value that, under the packing **those same files state in their own
+comments**, decodes to `r_type=SIGNED`, 8 bytes, not PC-relative — every field contradicting the
+row's own name — and an `UNSIGNED_4` row declaring a TWO-byte slot. No external authority was needed;
+the documents refute themselves. Corrected
+(`D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-ROW`).
+
+Two pins then went red, and both had been **asserting that reading a member through the IMAGE
+document REFUSES** — a refusal that only ever happened because of that typo. They were asserting a
+CONSEQUENCE that rested on a defect, so they stopped discriminating the moment it was fixed.
+★ Neither was reverted. Both were re-derived onto the CONTRACT — which document the member read
+RESOLVES — which keeps discriminating even where two vocabularies legitimately agree. The
+re-derivation was proved by a mutant that makes the resolver fall back to the image format: the
+mach-o case now reds under it, and **under the old assertion it could not have.**
+
+⚠ The ELF sibling arm was checked rather than assumed and KEPT: `elf64-x86_64-linux{,-staticlib}`
+declare a PLT variant and an `emitOnly` alias that the `-exec` document does not, so a member calling
+a library function emits a wire value no image document has a row for. That difference is
+structural. Its failure guidance was inverted, though: it used to say "must be re-derived, not
+deleted", which is exactly the advice that produced the mach-o situation. It now says that if those
+vocabularies ever legitimately converge, the block should be DELETED, because the contract is pinned
+elsewhere and hunting the corpus for a fresh coincidence is asserting the corpus.
+
+### ★★★ THE UNKNOWN-KEY CLASS — "a fourth hand-rolled copy" was MEASURED to be 58
+
+The cycle promoted `rejectUnknownKeys` into `config_key_vocabulary.hpp` because a fourth copy had just
+been minted. ✔The survey that followed found **eight named helpers over 57 call sites plus ~50
+open-coded inline loops** — 58 independent implementations of one check.
+
+★★ **AND THE ARGUMENT FOR THE CLASS TURNED OUT NOT TO BE TIDINESS. Two copies held LIVE defects, both
+of the INVERSE kind — loaders REFUSING a valid document.** `optimizer_json.cpp` had no `$`-documentation
+carve-out at all, so a `$comment` in a pipeline document was rejected as a typo at all four of its
+objects; `shipped_lib_descriptor.cpp` honoured it at ONE of NINETEEN objects and only for the literal
+spelling `$comment`, so `$abiComment` — the shape shipped descriptors actually use — never worked even at
+the root. ⇒ **a duplicated CHECK is not only a place a check can be MISSING; it is a place the check's own
+EXEMPTIONS can be forgotten, and that failure direction is the one nobody thinks to test for.** Both are
+fixed BY CONSTRUCTION: the caller no longer writes the loop.
+
+Then the object-format loader, which had exactly TWO checks (document root, `relocations[]` row) against
+its siblings' 28 / 23 / 7 / 6. **Ten blocks now checked, twelve call sites** — three of them (`format`,
+`cSymbolDecoration`, `sehPersonality`) missed by the survey that scoped the work.
+★ **The two PER-MECHANISM blocks are deliberately NOT unioned.** Flattening `processExit` /`processArgs`
+would accept a cross-arm key the declared mechanism's parse code never reads —
+`D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-KEY` rebuilt in a new place — so a sibling-arm key is refused
+with a diagnostic that NAMES the arm it belongs to. Every derived set was dry-run against all 24 shipped
+documents BEFORE any code was written: zero violations.
+
+★ **THREE SHIPPED DIAGNOSTICS TURNED OUT TO DESCRIBE A DIFFERENT SCHEMA THAN THE LOADER PARSES** —
+`tlsAccess` listed 3 keys where the arm reads 4, `librarySynthesis` advertised `libraryPath` as a KEY when
+it is a value resolved from `role`, and `processArgs` named one of its two accepted mechanisms. Harmless
+while unknown keys were ignored; **actively wrong once they are refused**, because an author following the
+message writes a key the guard now rejects. Found only because adding a discriminator forces the message
+and the parse arm to be read side by side.
+
+⚠⚠ **AND ONE LIVE SILENT DEFECT THAT WAS CLOSED RATHER THAN DEFERRED:** the grammar loader's `language`
+block had NO discriminator at all, and the gap had already **bent the schema** — `isa` and
+`identifierClass` sit at TOP LEVEL, where neither belongs, for the loader's own stated reason that
+`language` could not check them. The direct failure was silent in the worst way: `fileExtensons` loaded
+perfectly clean and produced an EMPTY extension list, i.e. a language that recognises no source file. Three
+keys, derived from the parse arm, dry-run against all six shipped `.lang.json` documents first. It shares
+ONE loop with `checkDocumentKeys`, so it did not become a 59th copy.
+
+### ⚠ THE WORKING TREE MOVED UNDER A LANE, AND IT FLIPPED A VERDICT
+
+A config document was rewritten DURING a lane's mutant build, changing a test's verdict between two
+runs of the same binary; the lane then reported a stale state as a defect. Live instance of
+`D-CYCLE-CANNOT-ASSUME-IT-OWNS-THE-WORKING-TREE`, and the new part is the consequence: **it can
+silently corrupt a red-on-disable observation**, which is the one measurement this project treats as
+proof. The scheduling rule that follows is not "be careful" — it is that config edits must be
+sequenced against lanes exactly like source edits, because a lane's ownership boundary protects
+`src/**` and said nothing about `src/dss-config/**`.
+
+### ⚠ CARRY FORWARD
+
+★★★ **OPERATOR RULING 2026-08-20, AND IT CHANGES THE QUEUE, NOT THE BAR:** *"we don't want no open
+anchors, so this cycle can end with it opened, but next one must address it if addressable (use
+/dss-cycle)"*. A cycle that finds a real defect too large to fix inside it MAY open the row and ship
+rather than compressing the finding to fit — and the rows it opened become the NEXT cycle's FIRST
+picks, ahead of whatever was queued. "If addressable" is a MEASURED judgement (trigger not fired, or
+an operator §B decision is required), never a shrug, and it is stated IN THE ROW at the moment of
+deferral. The balance gate is untouched and still refuses `after > before`.
+
+**⇒ P23 IS RE-SCOPED TO THIS CYCLE'S OWN OPENED ROWS**, and
+`D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH) moves down one slot to P24.
+
+★★ **OPERATOR NARROWED THE RULING THE SAME DAY, AND IT IS THE HALF THAT MATTERS:** rows may be left
+open *"only if strictly needed due to cycle size, amount of changes or bigger stuff"*. That is not a
+convenience clause, and applying it honestly cost one of this cycle's three deferrals and corrected
+the sizing of the other two.
+
+  * `D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-OWNERSHIP` — **NOT deferred; CLOSED in this
+    commit.** Its whole fix is a rule written down, the same shape as the P18/P19 pairing rulings,
+    and it is now step 5 of `dss-cycle/SKILL.md`. Deferring it would have been exactly the
+    convenience the narrowing forbids.
+  * `D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB` — deferred to P23. ⚠ **SIZING CORRECTED:**
+    `definedName` has ~5–6 ET_REL call sites across `elf.cpp`/`macho.cpp`/`coff`, all fed by ONE
+    `ObjectSymbolNames` helper, and the alias rows already carry the owner's `SymbolId`. This is an
+    ordinary lane, not a monster.
+  * `D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP` — deferred to P23.
+    ⚠⚠ **SIZING WAS WRONG AND IS RETRACTED:** it was first reported as "76 test files, not
+    mechanically separable". That number sizes a DIFFERENT question — tests asserting on
+    shipped-config values — and was attached to this row by mistake. The real question is how many
+    PIPELINE ENTRY POINTS take a parameter the driver must supply, and `compile_pipeline.hpp` exports
+    about **fourteen**. Bounded audit, one lane.
+
+★ **SO THE DEFERRAL RESTS ON THIS CYCLE'S SIZE, NOT ON THEIRS**, and that is the claim to check
+rather than inherit: a shipping wire-format change gated on hardware evidence, a new object-format
+schema field declared across thirteen documents, three object readers rewritten, four lanes, ~35
+files. Two more substantive lanes on top is the pile-up that makes a cycle unreviewable. If a future
+reader disagrees with that judgement, the rows are ordinary and can simply be taken.
+
+
+⚠ **THE LESSON THIS CYCLE OWES THE NEXT ONE, and it is about briefs, not about linking:** a brief may
+state a MEASUREMENT only together with the instrument that produced it. A bare constant handed to a
+lane is not a measurement, and this cycle nearly shipped a wire-format bit dropped from the wrong
+half of `n_desc` because of one.
 
 ---
 

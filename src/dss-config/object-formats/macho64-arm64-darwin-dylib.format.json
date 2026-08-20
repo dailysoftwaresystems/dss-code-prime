@@ -161,10 +161,11 @@
 
   "relocations": [
     {
-      "$comment": "ARM64 Mach-O relocation kinds -- the exec sibling's table verbatim (`kind` MUST match arm64.target.json's rows; nativeId is descriptive on image flavors, which apply relocs in place). ARM64_RELOC_BRANCH26 = 2, length 2, pcrel 1 -> 0x25000000.",
+      "$comment": "ARM64 Mach-O relocation kinds -- the exec sibling's table verbatim (`kind` MUST match arm64.target.json's rows; nativeId is descriptive on image flavors, which apply relocs in place). ARM64_RELOC_BRANCH26 = 2, length 2, pcrel 1 -> 0x25000000. ★ `isCall` (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL, 2026-08-20): this wire relocation can ONLY target executable code, so an object reader that meets an undefined extern through it has PROVEN the extern is a function rather than a data object -- the only classification signal a symbol-name-only reference offers. It is declared HERE, on the format row, and not derived from the target's formula, because a formula describes ARITHMETIC and not ROLE: `S + A - P` is the identical arithmetic for a call and for a PC-relative data reference, so the x86_64 target's `linear` is honest and simply carries no role, while aarch64's `aarch64_call26` looked like a role only because that CPU's branch has its own instruction encoding. ✔MEASURED 2026-08-20: every macho64-x86_64 archive member calling any library function was unreadable for exactly this reason while the arm64 sibling read the same source cleanly. The target document cannot carry it -- it is PER-CPU and shared with ELF, where the same `rel32` genuinely serves data references too.",
       "name": "ARM64_RELOC_BRANCH26",
       "kind": 1,
-      "nativeId": 620756992
+      "nativeId": 620756992,
+      "isCall": true
     },
     {
       "$comment": "ARM64_RELOC_PAGE21 = 3, length 2, pcrel 1 -> 0x35000000.",

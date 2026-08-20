@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -23,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // `ObjectFormatSchema` (plan 14 §2.0 + LK4 substrate). JSON-configured
@@ -134,6 +136,44 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     // names an extern call — e.g. abs64/abs32 data relocs), and the emitter
     // uses `nativeId` unchanged.
     std::uint32_t  pltNativeId = 0;
+    // ── DECLARED CALL/BRANCH ROLE (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL) ──
+    //
+    // True iff this format's NATIVE relocation can only ever target executable
+    // code -- i.e. reaching an undefined extern through it PROVES the extern is
+    // a FUNCTION, not a data object. An object reader has no other way to
+    // classify an extern it meets only as a name.
+    //
+    // ★ WHY THIS IS DECLARED HERE AND NOT DERIVED FROM THE TARGET'S FORMULA.
+    //   The readers used to infer the role from `TargetRelocationInfo::formulaKind`,
+    //   testing for the aarch64 CALL26 formula. That is a proxy for the wrong
+    //   thing: a formula describes ARITHMETIC, not ROLE. It happens to be
+    //   branch-specific on AArch64 only because the branch instruction has its
+    //   own encoding. On x86_64 it fails BY CONSTRUCTION -- `S + A - P` is the
+    //   identical arithmetic for a call and for a PC-relative data reference,
+    //   so `linear` is the HONEST formula there and carries no role at all.
+    //   ✔MEASURED 2026-08-20: every macho64-x86_64 archive member that calls
+    //   any library function was unreadable for exactly this reason, while the
+    //   arm64 sibling read the same source cleanly.
+    //
+    // ★ WHY THE FORMAT ROW AND NOT THE TARGET ROW. A target document is
+    //   PER-CPU and shared across formats. `x86_64.target.json`'s `rel32` is
+    //   also ELF's R_X86_64_PC32, which genuinely serves data references too --
+    //   declaring a call role there would be a lie about ELF. The FORMAT is
+    //   where the ambiguity resolves, because the format is what picks the
+    //   native wire relocation: mach-o maps `rel32` to X86_64_RELOC_BRANCH,
+    //   which is branch-only, while ELF maps it to a wire type that is not.
+    //   ELF x86_64's own call signal is likewise format-side (`pltNativeId`).
+    //
+    // ⚠ FALSE on a row whose wire type is SHARED with a data use -- ELF
+    //   R_X86_64_PC32 is the shipped case (kind 5 `R_X86_64_PC32_UNBIASED`
+    //   shares its nativeId). Setting it there would re-commit the same
+    //   conflation in a new field.
+    //
+    // Declared on EVERY document that carries the relocation, including ones
+    // no reader consults, because it states what the relocation IS rather than
+    // what an artifact kind needs. A fact true in one document and absent from
+    // its sibling is how the sibling drifts.
+    bool           isCall = false;
     // ── EMISSION ALIAS (D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS) ──
     //
     // True iff this row shares its `nativeId` with another row and exists
@@ -156,6 +196,45 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     //   the reader's runtime discovery into a LOAD-TIME invariant (at most
     //   one non-alias row per nativeId).
     bool           emitOnly = false;
+};
+
+// ── THE DECODE SIDE OF `relocations[]`, BUILT ONCE ────────────────
+//
+// The two lookups every object READER needs, derived from the rows above by
+// `ObjectFormatSchema::relocationDecodeTable()` — the one place that knows
+// which rows a DECODER may see.
+//
+// ★ WHY THIS IS A SCHEMA METHOD AND NOT A LOOP INSIDE EACH READER. It WAS a
+// loop inside each reader, and two of the three got it wrong in the same way:
+// the ELF reader skips `emitOnly` rows, and the Mach-O and COFF readers did
+// not. That is the archetype this codebase already named for closed-key
+// vocabularies — a rule that must be REMEMBERED per site is a rule that holds
+// only where someone remembered it — and the site that forgets is never the
+// one being read at the time. The row's meaning is the SCHEMA's to know: it
+// declares `emitOnly`, `validate()` enforces what the flag promises, so the
+// schema is what answers "which rows decode".
+//
+// ⓘ THE MACH-O / COFF GAP WAS LATENT AND LOUD, NOT A MISCOMPILE — stated at
+//   that precision because overstating it would be its own defect. No shipped
+//   Mach-O or PE document declares `emitOnly` (✔MEASURED: 2 of the 24 shipped
+//   format documents do, both `elf64-x86_64-linux*`), so nothing decoded
+//   wrongly. Had one declared it, `validate()`'s unique-`kind` rule guarantees
+//   the alias carries a DIFFERENT kind from the row owning its wire id, so
+//   those readers would have hit the ambiguity refusal below and rejected
+//   EVERY object of that format. A correctness gap that fails loud, and a
+//   capability — one wire type, two emission semantics — silently unavailable
+//   to two of the three formats.
+struct DSS_EXPORT RelocationDecodeTable {
+    // Wire type → the DSS kind it decodes to. A FUNCTION by construction:
+    // emission aliases are excluded, and a residual collision is refused.
+    std::unordered_map<std::uint32_t, RelocationKind> nativeToKind;
+    // The wire types whose presence PROVES the extern they reach is a
+    // FUNCTION: every row the format declares `"isCall": true` on, plus every
+    // declared `pltNativeId` (a call-through-stub variant can only be a call).
+    // DECLARED by the schema, never inferred from the target's arithmetic
+    // formula — D-LK-MACHO-ISDATA-NO-CALL-SIGNAL. Legitimately EMPTY for a
+    // format that declares neither (every shipped PE document).
+    std::unordered_set<std::uint32_t> callSignalNativeIds;
 };
 
 // ── Per-section row (plan 14 D-LK4-2) ───────────────────────────
@@ -446,8 +525,20 @@ struct DSS_EXPORT MachOIdentity {
                                      // MH_DYLIB (closes D-LK3-3).
     std::uint32_t flags = 0;         // MH_SUBSECTIONS_VIA_SYMBOLS=0x2000
                                      // / MH_PIE=0x200000 (mandatory for
-                                     //   modern macOS exec). Optional;
-                                     //   0 is legal for a minimal .o.
+                                     //   modern macOS exec). Optional in
+                                     //   the schema; carried VERBATIM into
+                                     //   mach_header_64.flags and read by
+                                     //   no writer code.
+                                     // ★ Every MH_OBJECT format DECLARES
+                                     //   0x2000 since 2026-08-20: it is the
+                                     //   header half of the pair (with
+                                     //   N_ALT_ENTRY in n_desc) that lets a
+                                     //   reader tell a file-local body from
+                                     //   an interior label — see
+                                     //   D-LINK-NONEXTERNAL-DEFINED-SYMBOL-
+                                     //   READ-AS-BLOCK-LABEL-NOT-ATOM and
+                                     //   the rationale in each object
+                                     //   format's `macho.$comment`.
 };
 
 // ── Mach-O image block (loaded when filetype is MH_EXECUTE or
@@ -1603,6 +1694,20 @@ public:
         if (it == d_.relocationNameIndex.end()) return nullptr;
         return &d_.relocations[it->second];
     }
+
+    // The DECODE-side view of `relocations()` — see `RelocationDecodeTable`.
+    // Every object reader builds its reverse map through this and nothing
+    // else, so the `emitOnly` exclusion and the call-signal union have ONE
+    // definition to read and to change.
+    //
+    // Returns the ambiguity as a MESSAGE rather than reporting it: the schema
+    // has no reporter, and each reader prefixes its own `<format>::read…`
+    // context so the diagnostic still names who was decoding. Unreachable for
+    // any document that passed `validate()` (which turns this into a LOAD-time
+    // invariant); it stays as the belt-and-suspenders catch for schema data
+    // constructed directly, which is how unit tests reach this code.
+    [[nodiscard]] std::expected<RelocationDecodeTable, std::string>
+    relocationDecodeTable() const;
 
     // Section accessors — the walker calls `sectionByKind(...)` to
     // resolve format-native name + sh_type / sh_flags / addralign

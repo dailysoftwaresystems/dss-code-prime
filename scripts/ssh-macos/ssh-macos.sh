@@ -26,6 +26,16 @@
 #
 # Usage: scripts/ssh-macos/ssh-macos.sh                # interactive
 #        scripts/ssh-macos/ssh-macos.sh uname -m       # run a command, exit with ITS status
+#
+# ⚠⚠ SSH JOINS THE REMAINING ARGUMENTS WITH SPACES AND HANDS THE RESULT TO THE REMOTE
+# SHELL, SO YOUR LOCAL QUOTING IS GONE BY THE TIME IT ARRIVES. `uname -m` above works
+# only because it contains none. ✔MEASURED 2026-08-20: `ssh-macos.sh sh -c 'mkdir -p /tmp/x
+# && …'` reached the Mac as `sh -c mkdir -p /tmp/x && …`, and the remote `mkdir` printed
+# its usage line — a failure that looks like a broken carriage and is not one. ⇒ ANYTHING
+# CARRYING QUOTES, PIPES, `&&` OR REDIRECTION MUST BE PASSED AS ONE ARGUMENT:
+#        scripts/ssh-macos/ssh-macos.sh "cd /tmp/x && clang -c a.c && nm -n a.o"
+# This is ssh's own contract, not a defect here — recorded because the usage line above
+# invites the multi-argument form and the failure it produces names the wrong culprit.
 set -uo pipefail
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)

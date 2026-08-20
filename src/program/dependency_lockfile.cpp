@@ -29,20 +29,6 @@ constexpr std::array<std::string_view, 1> kRootKeys  = {kDependenciesKey};
 constexpr std::array<std::string_view, 3> kEntryKeys = {"url", "ref",
                                                         "resolvedCommit"};
 
-template <std::size_t N>
-[[nodiscard]] std::optional<std::string>
-firstUnknownKey(json const& obj, std::array<std::string_view, N> const& known) {
-    for (auto it = obj.begin(); it != obj.end(); ++it) {
-        std::string const& key = it.key();
-        if (detail::isDocumentationKey(key)) continue;  // PROSE, never state
-        bool recognized = false;
-        for (auto const& k : known) {
-            if (k == key) { recognized = true; break; }
-        }
-        if (!recognized) return key;
-    }
-    return std::nullopt;
-}
 
 // EXACTLY ONE diagnostic per failed load, and it always ends with the same
 // remediation. The lockfile is a REGENERABLE cache: the correct fix is never to
@@ -125,7 +111,7 @@ DependencyLockfile::load(fs::path const& lockPath, DiagnosticReporter& rep) {
         emitLockfileMalformed(rep, lockPath, "the root value is not an object");
         return std::nullopt;
     }
-    if (auto const bad = firstUnknownKey(doc, kRootKeys)) {
+    if (auto const bad = detail::firstUnknownKey(doc, kRootKeys)) {
         emitLockfileMalformed(rep, lockPath,
                               "unrecognized top-level key `" + *bad + "`");
         return std::nullopt;
@@ -162,7 +148,7 @@ DependencyLockfile::load(fs::path const& lockPath, DiagnosticReporter& rep) {
             emitLockfileMalformed(rep, lockPath, where + " is not an object");
             return std::nullopt;
         }
-        if (auto const bad = firstUnknownKey(entry, kEntryKeys)) {
+        if (auto const bad = detail::firstUnknownKey(entry, kEntryKeys)) {
             emitLockfileMalformed(rep, lockPath,
                                   where + " has unrecognized key `" + *bad + "`");
             return std::nullopt;

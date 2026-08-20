@@ -845,6 +845,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             return reported(linkAndWriteWithStaticArchives(
                 std::move(*mod),
                 std::span<std::filesystem::path const>{staticArchives},
+                // D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY: the
+                // DYNAMIC half, so a pulled member's extern can rebind to a
+                // library the operator named. `perCuOpts` (not `compileOpts`)
+                // for the same reason it is `perCuOpts` above — the `ar`
+                // archives are already partitioned out into `staticArchives`.
+                std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
                 **targetR, **formatR, outPath, reporter, imageRequest));
         }
         case PipelineTier::Mir:
@@ -1059,8 +1065,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // c165 (D-LK-STATIC-LINK): link against any `ar` static archives named on
         // `--resolve-library` (pull the referenced members + merge them in). With
         // no static archives this is `linkAndWrite({mod})`, unchanged.
+        // D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY: the DYNAMIC
+        // half rides along so a pulled member's extern can rebind to a library
+        // the operator named (`perCuOpts` — archives already partitioned out).
         return reported(linkAndWriteWithStaticArchives(
             std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
+            std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
             **targetR, **formatR, outPath, reporter, imageRequest));
     }
 
@@ -1439,8 +1449,13 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // against any `ar` static archives named on `--resolve-library` the same way
     // the single-CU path does (pull referenced members + merge). No archives =>
     // `linkAndWrite({mod})`, unchanged.
+    // D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY: the DYNAMIC half
+    // rides along here TOO. This is the THIRD of three routes to this call, and
+    // all three must answer — a route that kept the old argument list would
+    // silently keep the gap for whichever builds happen to take it.
     return reported(linkAndWriteWithStaticArchives(
         std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
+        std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
         **targetR, **formatR, outPath, reporter, imageRequest));
 }
 

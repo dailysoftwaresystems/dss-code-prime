@@ -754,6 +754,22 @@ TEST(PeWriter, ObjectStaticDataItemIsClassStaticNotExternal) {
         << "a static (Local) data item stays internal `sym_<id>`, not its real name";
     EXPECT_EQ(bytes[s1 + 16], 3u)   // IMAGE_SYM_CLASS_STATIC — THE FIX
         << "static data emits IMAGE_SYM_CLASS_STATIC (3), not the pre-fix EXTERNAL (2)";
+
+    // ★★ THE DERIVED-TYPE HALF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
+    // BLOCK-LABEL-NOT-ATOM, the DATA twin of the block-symbol pin in
+    // ObjJumpTableBlockSymbolIsStaticLocalDefinedNotUndefExtern. A COFF data
+    // symbol is `notype` whatever its linkage, and the reader relies on that:
+    // class STATIC + type 0 is the shape it must NOT promote to an atom. This
+    // also fixes the boundary of the reader fix in place -- stamping
+    // DTYPE_FUNCTION here would silently make every static data object an atom
+    // boundary in the wrong section kind. Both directions again.
+    EXPECT_EQ(readU16LE(bytes, s1 + 14), 0u)
+        << "a defined DATA symbol must carry derived type 0 (`notype`) -- "
+           "DTYPE_FUNCTION is functions-only, and the COFF reader classifies "
+           "atom boundaries on this field";
+    EXPECT_EQ(readU16LE(bytes, symPtr + 14), 0x20u)
+        << "...while the FUNCTION symbol at index 0 carries "
+           "IMAGE_SYM_DTYPE_FUNCTION (0x20) -- the field discriminates";
 }
 
 // D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined DATA symbol fails loud — the
@@ -934,6 +950,25 @@ TEST(PeWriter, ObjJumpTableBlockSymbolIsStaticLocalDefinedNotUndefExtern) {
         << "block symbol lives in .text";
     EXPECT_EQ(readU32LE(bytes, s1 + 8), 4u)   // Value = text offset
         << "Value = funcTextStart + blockByteOffset (section-relative)";
+
+    // ★★ THE DERIVED-TYPE HALF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
+    // BLOCK-LABEL-NOT-ATOM. The storage class above says LOCAL and says nothing
+    // more: a file-local FUNCTION is class STATIC too. What separates them is
+    // IMAGE_SYMBOL.Type (+14) -- a function declares DTYPE_FUNCTION (0x20), a
+    // block label declares 0 -- and the COFF reader now classifies atom
+    // boundaries on exactly that field. Until this pin existed the property the
+    // reader depends on was UNASSERTED on the writer side: a writer that stamped
+    // 0x20 on block symbols would make every interior label an atom boundary and
+    // SPLIT the function containing it, and nothing here would have noticed.
+    // Both directions are pinned, because "all zero" is not a discriminator.
+    EXPECT_EQ(readU16LE(bytes, s1 + 14), 0u)
+        << "a synthetic block label must carry derived type 0 -- 0x20 would make "
+           "the reader treat an interior label as its own atom and split the "
+           "enclosing function";
+    EXPECT_EQ(readU16LE(bytes, symPtr + 14), 0x20u)
+        << "...while the FUNCTION symbol at index 0 carries "
+           "IMAGE_SYM_DTYPE_FUNCTION (0x20) -- the field is a real discriminator, "
+           "not uniformly zero";
 
     // The .data section's reloc resolves SymbolTableIndex to the block
     // local (index 1), and its Type is the JSON abs64 nativeId.

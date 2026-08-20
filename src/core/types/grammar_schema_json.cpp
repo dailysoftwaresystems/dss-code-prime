@@ -2343,21 +2343,50 @@ constexpr std::array<std::string_view, 24> kDocumentKeys{
     "requires", "languageReferences"};
 DSS_CHECK_KEY_VOCABULARY(kDocumentKeys);
 
-void checkDocumentKeys(json const& doc, std::string_view docLabel,
-                       Collector& coll) {
-    for (auto it = doc.begin(); it != doc.end(); ++it) {
+// ★ THE KEYS THE `language` BLOCK'S PARSE ARM ACTUALLY READS, derived FROM THAT
+// ARM and not from a comment: `name` and `version` are required (`present()`
+// gates both), `fileExtensions` is the optional array the driver matches a
+// source file against.
+//
+// ⚠⚠ THIS TABLE DID NOT EXIST, AND ITS ABSENCE HAD ALREADY BENT THE SCHEMA. The
+// `kDocumentKeys` comment above records `isa` and `identifierClass` being placed
+// at TOP LEVEL rather than inside `language` — where they otherwise belong —
+// **because this block had no typo discriminator at all**. So the gap was never
+// just "a diagnostic that never fires": it was pushing language-scoped keys out
+// of the language block to borrow a check that lived somewhere else. The direct
+// failure was silent in the worst way — `fileExtensons` loaded perfectly clean
+// and yielded an EMPTY extension list, i.e. a language that recognises no source
+// file, reported as nothing at all.
+// ✔MEASURED before this table was written: all 6 shipped `.lang.json` documents
+// declare only these three keys, so nothing legitimate reds.
+constexpr std::array<std::string_view, 3> kLanguageKeys{
+    "name", "version", "fileExtensions"};
+DSS_CHECK_KEY_VOCABULARY(kLanguageKeys);
+
+// One implementation, two tables — `checkDocumentKeys` and the `language` block
+// differ ONLY in which vocabulary they hold and how the diagnostic names the
+// object, so they must not become two loops. (The 49 hand-rolled sites still in
+// this file and `predefined_macro_json.cpp` are the same class, tracked as
+// D-CONFIG-UNKNOWN-KEY-CHECK-HAND-ROLLED-SITES-REMAIN.)
+void checkKeysAgainst(json const& obj, std::span<std::string_view const> known,
+                      std::string_view label, std::string_view what,
+                      Collector& coll) {
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
         // `$`-prefixed keys are the codebase-wide documentation convention
         // (`$comment` / `$…Comment`) — never a block, so exempt them from the
         // typo discriminator (the same carve-out every nested block applies).
         if (isDocumentationKey(it.key())) continue;
-        if (std::ranges::find(kDocumentKeys, it.key()) != kDocumentKeys.end()) {
-            continue;
-        }
+        if (std::ranges::find(known, it.key()) != known.end()) continue;
         coll.emit(DiagnosticCode::C_MalformedJson,
-                  std::format("{}/{}", docLabel, it.key()),
-                  std::format("unknown top-level key '{}' (typo "
-                              "discriminator)", it.key()));
+                  std::format("{}/{}", label, it.key()),
+                  std::format("unknown {} '{}' (typo discriminator)",
+                              what, it.key()));
     }
+}
+
+void checkDocumentKeys(json const& doc, std::string_view docLabel,
+                       Collector& coll) {
+    checkKeysAgainst(doc, kDocumentKeys, docLabel, "top-level key", coll);
 }
 
 // ★★ THE BLOCKS A REFERENCED DOCUMENT MAY DECLARE — a NARROWER table than
@@ -4022,6 +4051,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         coll.emit(DiagnosticCode::C_MissingField, "/language", "must be an object");
         return std::unexpected(std::move(coll).release());
     }
+    // ⚠ NOT an early return: the block keeps parsing so a document with a typo
+    // ALSO reports whatever else is wrong with it, and `Collector` already makes
+    // the load fail. Bailing here would turn a two-defect config into a
+    // two-load-cycle fix — the rule `numberStyle` already states.
+    checkKeysAgainst(langObj, kLanguageKeys, "/language", "key in 'language'",
+                     coll);
     if (!present(langObj, "name",    coll, "/language") ||
         !present(langObj, "version", coll, "/language")) {
         return std::unexpected(std::move(coll).release());

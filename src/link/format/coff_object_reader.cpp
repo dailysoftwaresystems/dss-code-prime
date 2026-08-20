@@ -67,7 +67,12 @@ constexpr std::size_t kRelTypeOff     = 8;  // u16 (== schema nativeId)
 
 // IMAGE_SYM_CLASS_*
 constexpr std::uint8_t kSymClassExternal = 2;
-constexpr std::uint8_t kSymClassStatic   = 3;  // documented; a LOCAL block label
+// STATIC (3) is COFF's INTERNAL-LINKAGE class -- "defined here, invisible to
+// other objects". It is NOT a shape: a file-local (`static`) FUNCTION, a
+// file-local DATA object, a section-definition symbol and DSS's synthetic block
+// labels are all class STATIC. What separates them is the DERIVED-TYPE field
+// below (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
+constexpr std::uint8_t kSymClassStatic   = 3;
 
 // IMAGE_SECTION_NUMBER specials (SectionNumber is a signed i16).
 constexpr std::uint16_t kSymUndefined = 0x0000u;  // extern
@@ -79,6 +84,18 @@ constexpr std::uint16_t kSymDebug     = 0xFFFEu;  // -2
 // as a FUNCTION (the isData signal). The full 2-bit mask distinguishes it from
 // DT_ARY (0x30) / DT_PTR (0x10), which are DATA -- a bare `& DTYPE_FUNCTION`
 // would misread DT_ARY as a function.
+//
+// ★ THIS FIELD CARRIES TWO DECISIONS, NOT ONE. It is the extern's isData class
+// AND -- for a DEFINED symbol -- the ATOM-BOUNDARY discriminator that COFF's
+// missing size field would otherwise leave undecidable: a class-STATIC symbol
+// that DECLARES ITSELF A FUNCTION is a whole file-local function (a body, an
+// atom), while one that does not is an interior block label / a data object /
+// a section identity. ✔MEASURED on three independent producers of the same
+// `static int helper(int); int entry(int);` source -- DSS's own `pe.cpp`, MSVC
+// cl.exe 14.51.36231, and mingw gcc (Strawberry) -- ALL THREE stamp
+// `(type 0x20)(class 3)` on the static function and type 0 on everything else
+// class STATIC (`$unwind$`/`$pdata$` thunks, section-definition symbols, block
+// labels). So this is a universal convention, not a DSS round-trip trick.
 constexpr std::uint16_t kSymDtypeMask     = 0x30u;
 constexpr std::uint16_t kSymDtypeFunction = 0x20u;
 
@@ -111,16 +128,30 @@ constexpr std::uint8_t kComdatSelExactMatch   = 4;  // -> Weak
 // NumberOfRelocations[2], NumberOfLinenumbers[2], CheckSum[4], Number[2]).
 constexpr std::size_t kAuxSectionDefSelectionOff = 14;
 
-// Is this target-schema reloc formula a FUNCTION CALL / BRANCH (as opposed
-// to a data-address computation)? The AGNOSTIC "extern is a function"
-// signal a call/branch reloc would give. PE x86_64 declares NO such
-// formula (REL32 is `linear`), so `callSignalNativeIds` is EMPTY there and
-// the extern's isData comes from the IMAGE_SYMBOL type hint instead (see
-// the header). Kept for a hypothetical call-branch PE target (agnostic --
-// the same aarch64 CALL26 formula the ELF/Mach-O readers key on).
-[[nodiscard]] constexpr bool isCallBranchFormula(RelocFormulaKind k) noexcept {
-    return k == RelocFormulaKind::Aarch64Call26;
-}
+// ── THE "EXTERN IS A FUNCTION" SIGNAL IS DECLARED, NOT DERIVED ──────────
+//
+// This file used to carry an `isCallBranchFormula` helper that answered the
+// question from the TARGET row's arithmetic formula (`Aarch64Call26`). It is
+// GONE (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL) and must not come back: a formula
+// describes ARITHMETIC, and the question is about ROLE. It answered "no" for
+// every PE row, which was the right answer for the wrong reason -- and the
+// wrong reason is the one that would have generalised.
+//
+// ✔MEASURED 2026-08-20 against the four shipped pe64 documents: COFF x86_64
+// declares IMAGE_REL_AMD64_REL32 / ADDR64 / ADDR32 / SECREL and NOT ONE of
+// them is branch-only (REL32 is the call displacement AND the `lea rip+d`
+// data displacement), so none may declare `isCall` and PE also declares no
+// `pltNativeId`. `callSignalNativeIds` is therefore EMPTY on every shipped
+// PE format -- which costs nothing HERE, because COFF is the one family of
+// the three that carries an INDEPENDENT class hint in its symbol table
+// (IMAGE_SYMBOL.Type's DTYPE_FUNCTION nibble), read in step (6). That is
+// also why this reader has no Mach-O-style empty-set refusal: an empty set
+// leaves a real hint standing rather than a guess.
+//
+// The consumption below is kept and now reads the DECLARED role, because the
+// PE family does contain a branch-only relocation the moment a non-x86_64 PE
+// target lands -- IMAGE_REL_ARM64_BRANCH26 -- and that document will declare
+// `isCall` and be honoured here untouched.
 
 // Overflow-safe [off, off+size) within [0, total) -- the c159-c168
 // `rangeExceedsBuffer` shape (subtraction, never `off + size` which wraps
@@ -155,7 +186,9 @@ rdName(std::span<std::uint8_t const> b, std::uint64_t tabStart, std::uint64_t ta
                        static_cast<std::size_t>(end - start)};
 }
 
-// Decode a COFF 8-byte name field at `o`. Two encodings (pe.cpp:467):
+// Decode a COFF 8-byte name field at `o`. Two encodings -- the inverse of
+// `pe.cpp`'s "PE/COFF name encoding" block (its `NameField` / `emitSymWithName`;
+// the old positional citation here had drifted onto SEH unwind-code emission):
 //   * INLINE: the name (<= 8 bytes) NUL-padded in the field -- the bytes up
 //     to the first NUL (or all 8 if unterminated).
 //   * OFFSET: the first 4 bytes are ZERO, the next 4 are a string-table
@@ -179,7 +212,9 @@ rdCoffName(std::span<std::uint8_t const> b, std::size_t o,
 
 // Sign-extend the low `width` bytes of `raw` to a signed 64-bit value --
 // the inverse of the writer truncating an int64 addend to `widthBytes` LE
-// in the patched data slot (pe.cpp:1109). width is 4 or 8 (the non-pcrel
+// in the patched data slot (`pe.cpp`'s `buildDataRelocTable` and the ADDEND
+// paragraph above it; the old positional citation here had drifted onto extern
+// symbol-index assignment). width is 4 or 8 (the non-pcrel
 // Linear kinds a data slot uses -- schema invariant (a)).
 [[nodiscard]] std::int64_t signExtendLE(std::uint64_t raw, std::uint8_t width) noexcept {
     if (width >= 8u) return static_cast<std::int64_t>(raw);
@@ -213,14 +248,26 @@ struct Sym {
     std::uint8_t  storage = 0;
 };
 
-// A defined symbol staged for atom slicing: its section-relative Value is an
-// atom boundary (EXTERNAL) or an interior label (STATIC -- see the loop).
+// A defined symbol staged for atom slicing: its section-relative Value IS an
+// atom boundary. Every linkage reaches here -- an EXTERNAL symbol, a
+// class-STATIC one that declares DTYPE_FUNCTION (a file-local function), a
+// class-STATIC one in a NON-CODE section (a file-local data object), and
+// whatever the geometry fallback recovers -- and `binding` is what tells them
+// apart downstream. See the classification loop and `coff_object_reader.hpp`
+// clause (7).
 struct DefSym {
     std::uint32_t    symIdx    = 0;
     std::uint64_t    secRelOff = 0;
     std::string      name;
     SymbolBinding    binding    = SymbolBinding::Global;
     SymbolVisibility visibility = SymbolVisibility::Default;
+    // Set only for a symbol the GEOMETRY FALLBACK promoted: it was first
+    // recorded as a bodiless `ModuleSymbol` and only later found to start a
+    // body, so the slicing loop must not push a SECOND `ModuleSymbol` for it.
+    // Suppressing the duplicate here rather than de-duplicating afterwards
+    // keeps `mod.symbols` in symbol-table order, which is the order every
+    // existing round-trip pin reads it in.
+    bool moduleSymbolAlreadyPushed = false;
 };
 
 // A reconstructed [start, start+len) byte range within one section, plus the
@@ -406,7 +453,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // COFF has NO segment (unlike Mach-O's (segment,section) pair). The
     // object schema declares TWO rows named `.rdata` -- `rodata` (no
     // relocations) and `relro` (reloc-bearing const data, RelRoConst) -- that
-    // are header-identical. `nameToKind` is FIRST-WINS (mirror elf:308) so it
+    // are header-identical. `nameToKind` is FIRST-WINS (the same `emplace` over
+    // `objectFormatSchema.sections()` that `elf::readRelocatableObject` builds
+    // its own `nameToKind` with) so it
     // maps `.rdata` -> the rodata (first) row. `nameToRelroKind` holds the
     // RelRoConst-kind row per name. The disambiguator is RELOC-PRESENCE: a
     // `.rdata` section carrying its own IMAGE_RELOCATION table takes the relro
@@ -449,33 +498,30 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // -- (4) Reverse reloc map (nativeId -> RelocationKind), from the
     //         FORMAT SCHEMA -- no hardcoded IMAGE_REL_AMD64_* numbers --------
     //
-    // `callSignalNativeIds` collects the native ids that mark an extern as a
-    // FUNCTION: a row whose TARGET-schema formula is a call/branch class. PE
-    // x86_64 declares NONE (REL32 is `linear`), so this set is EMPTY there and
-    // the extern's isData comes from the IMAGE_SYMBOL type hint (step 5/7). PE
-    // declares no `pltNativeId` variant either. Kept general for a
-    // hypothetical call-branch PE target (agnostic).
-    std::unordered_map<std::uint32_t, RelocationKind> nativeToKind;
-    std::unordered_set<std::uint32_t> callSignalNativeIds;
-    for (auto const& r : objectFormatSchema.relocations()) {
-        auto const ins = nativeToKind.emplace(r.nativeId, r.kind);
-        if (!ins.second && ins.first->second.v != r.kind.v) {
-            // A native id mapping to two DIFFERENT kinds is an ambiguous
-            // schema -- fail loud rather than let "last row wins" silently
-            // mis-decode (mirrors the ELF / Mach-O duplicate-nativeId guard).
-            return fail(DiagnosticCode::F_CorruptedBinary,
-                "pe::readRelocatableObject: object format schema '"
-                + std::string{objectFormatSchema.name()}
-                + "' maps native reloc id " + std::to_string(r.nativeId)
-                + " to two different RelocationKinds ("
-                + std::to_string(ins.first->second.v) + " and "
-                + std::to_string(r.kind.v) + ") -- ambiguous reverse map.");
-        }
-        if (auto const* tri = targetSchema.relocationInfo(r.kind);
-            tri != nullptr && isCallBranchFormula(tri->formulaKind)) {
-            callSignalNativeIds.insert(r.nativeId);
-        }
+    // `callSignalNativeIds` collects the native ids that PROVE an extern
+    // reached through them is a FUNCTION: the rows the FORMAT declares
+    // `"isCall": true` on. No shipped PE document declares one (COFF x86_64
+    // has no branch-only relocation -- REL32 serves data too) and PE declares
+    // no `pltNativeId` variant either, so this set is EMPTY on every shipped
+    // PE format and the extern's isData comes from the IMAGE_SYMBOL type hint
+    // (step 5/7) instead. Read from the schema rather than inferred -- see the
+    // note above the byte helpers.
+    //
+    // Built by `ObjectFormatSchema::relocationDecodeTable()`. This reader used
+    // to own the loop, and it omitted the `emitOnly` exclusion the ELF reader's
+    // copy had: an EMISSION ALIAS would have entered the map, and since
+    // `validate()` guarantees the alias carries a different `kind` from the row
+    // owning its wire id, a PE document declaring one would have been refused
+    // as an ambiguous reverse map -- rejecting every object of that format.
+    // LOUD, and no shipped PE document declares one, so nothing ever
+    // mis-decoded; the alias capability was simply unavailable here.
+    auto decode = objectFormatSchema.relocationDecodeTable();
+    if (!decode) {
+        return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: " + decode.error());
     }
+    auto const& nativeToKind        = decode->nativeToKind;
+    auto const& callSignalNativeIds = decode->callSignalNativeIds;
 
     // -- (5) Decode every IMAGE_SYMBOL; assign SymbolId = symtab index ----
     //
@@ -503,6 +549,44 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
         i += static_cast<std::size_t>(1) + numAux;
     }
+
+    // -- (5.1) The two symbol predicates the passes below SHARE -----------
+    //
+    // Both were previously spelled inline at each use site; a decision written
+    // twice is a decision that can disagree with itself, so each lives once.
+
+    // Does this IMAGE_SYMBOL's derived type declare a FUNCTION? Drives BOTH the
+    // extern's isData class (step 6) and the defined symbol's atom-boundary
+    // classification (step 6, and see `kSymDtypeFunction`).
+    auto declaresFunction = [](Sym const& s) {
+        return (s.type & kSymDtypeMask) == kSymDtypeFunction;
+    };
+
+    // Is symtab record `k` a SECTION-DEFINITION symbol -- a section IDENTITY
+    // rather than a body? PE/COFF 5.5.5 gives it two properties TOGETHER: its
+    // NAME is the section's own name, and its FIRST auxiliary record is the
+    // format-5 section definition. BOTH are required here.
+    //
+    // ⚠ THE AUX RECORD ALONE IS NOT THE RECOGNISER, and believing it was is a
+    // measured bug. ✔MEASURED on mingw gcc (Strawberry), with AND without `-g`:
+    // a file-local function is emitted as `(sec 1)(ty 20)(scl 3)(nx 1)` -- class
+    // STATIC, DTYPE_FUNCTION, and ONE auxiliary record (COFF aux format 1, the
+    // function definition). An aux-only test therefore calls gcc's static
+    // FUNCTION a section identity. That is wrong twice over: it would exempt the
+    // very symbol whose loss this reader must never allow, and -- because gcc
+    // emits that record BEFORE the `.text` section symbol of the same ordinal --
+    // it would hand Gate 3 a function-definition aux record to read a COMDAT
+    // Selection byte out of. cl.exe 14.51.36231 attaches no aux to either a
+    // static or an external function, so this shape is producer-specific and
+    // exactly the kind a name test settles and an aux test cannot.
+    auto isSectionDefinitionSymbol = [&](std::size_t k) {
+        Sym const& s = syms[k];
+        if (s.storage != kSymClassStatic) return false;
+        if (s.sectNum < 1u || s.sectNum > numSections) return false;
+        if (s.name != sections[s.sectNum - 1u].name) return false;
+        std::size_t const auxIdx = k + 1u;
+        return auxIdx < numSymbols && auxSlot[auxIdx];
+    };
 
     // -- (5.5) GATE 3: COMDAT selection -> the section's external-symbol binding.
     //
@@ -536,16 +620,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // metadata -- the same kind split both gates key on.
         if (!sec.kind.has_value()) continue;
         std::uint16_t const ordinal = static_cast<std::uint16_t>(si + 1u);
-        // The section-definition symbol: a STATIC symbol naming THIS ordinal
-        // with an auxiliary record (its FIRST aux is the format-5 section
-        // definition, PE/COFF spec 5.5.5). Its Selection byte is the policy.
+        // The section-definition symbol for THIS ordinal (the shared 5.5.5
+        // recogniser above -- NAME matches the section AND an aux record
+        // follows). Its Selection byte is the policy. Taking the first
+        // aux-bearing STATIC symbol of the ordinal instead would read a gcc
+        // static function's format-1 aux record as a Selection byte, because
+        // gcc emits that record ahead of the section symbol.
         std::optional<std::uint8_t> selection;
         for (std::uint32_t k = 0; k < numSymbols; ++k) {
             if (auxSlot[k]) continue;                          // an aux slot, not a symbol
-            Sym const& s = syms[k];
-            if (s.storage != kSymClassStatic || s.sectNum != ordinal) continue;
+            if (syms[k].sectNum != ordinal) continue;
+            if (!isSectionDefinitionSymbol(k)) continue;
             std::size_t const auxIdx = static_cast<std::size_t>(k) + 1u;
-            if (auxIdx >= numSymbols || !auxSlot[auxIdx]) continue;  // no aux -> not the section symbol
             // The aux record sits at symtab index auxIdx; [ao, ao+18) is in
             // bounds (auxIdx < numSymbols, and the symbol table [symTabPtr,
             // +18*numSymbols) was proven file-backed in (1)).
@@ -609,12 +695,21 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // isData inference in step 7).
     std::unordered_map<std::uint32_t, std::size_t> externBySym;
     // Defined symbols grouped by 1-based section ordinal -- atom boundaries,
-    // sliced by sorted Value in the per-section pass below. A STATIC (local)
-    // block label is NOT an atom boundary (see the loop).
+    // sliced by sorted Value in the per-section pass below. The boundary set is
+    // EXTERNAL symbols, class-STATIC symbols that declare DTYPE_FUNCTION
+    // (file-local functions), and class-STATIC symbols in a NON-CODE section
+    // (file-local data objects). What is left -- a block label, a section
+    // identity -- is NOT a boundary here (see the loop); the geometry fallback
+    // in (6.4) gets the last word on it.
     std::unordered_map<std::uint16_t, std::vector<DefSym>> defsBySection;
-    // The DEMOTED half of that split, staged for the shared coverage guard --
-    // see `link/format/object_atom_coverage.hpp`.
+    // The DEMOTED half of that split, staged for the shared header -- see
+    // `link/format/object_atom_coverage.hpp`. `bodilessSymIdx` is the parallel
+    // symbol-table index, kept HERE rather than in the shared struct because it
+    // is COFF's own coordinate: the shared staging is deliberately nothing but
+    // `(sectionKey, byteOffset)`, and widening it with one reader's identity
+    // would be the first format-specific field in a format-neutral type.
     std::vector<link::format::BodilessDefinedSymbol> bodilessDefined;
+    std::vector<std::uint32_t>                       bodilessSymIdx;
 
     for (std::uint32_t i = 0; i < numSymbols; ++i) {
         if (auxSlot[i]) continue;  // an auxiliary record, not a symbol
@@ -640,7 +735,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // function/data class round-trips FAITHFULLY -- no silent default.
             // An extern that reaches the walker unresolved is rejected loud by
             // the linker's unbound-extern gate regardless.
-            ext.isData      = (s.type & kSymDtypeMask) != kSymDtypeFunction;
+            ext.isData      = !declaresFunction(s);
             externBySym.emplace(i, mod.externImports.size());
             mod.externImports.push_back(std::move(ext));
             continue;
@@ -678,35 +773,160 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             defsBySection[s.sectNum].push_back(
                 DefSym{i, s.value, s.name, extBinding,
                        SymbolVisibility::Default});
+        } else if (s.storage == kSymClassStatic && declaresFunction(s)) {
+            // A FILE-LOCAL (`static`) FUNCTION -- an atom BOUNDARY, exactly like
+            // an external one. D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-
+            // LABEL-NOT-ATOM: the only thing internal linkage changes is WHO MAY
+            // SEE the definition, never whether it has a body, so classifying it
+            // by EXTERNAL-ness dropped whole functions on the archive-member
+            // read-back path (loud as `K_SymbolUndefined` when called, and
+            // SILENT -- bytes simply absent from the image -- when not).
+            //
+            // ★ The discriminator is on the wire and is producer-universal, not
+            // a DSS convention: see `kSymDtypeFunction`. A section-DEFINITION
+            // symbol and a block label are both class STATIC too, and both carry
+            // derived type 0, so neither reaches this arm -- which is why the
+            // aux-record recogniser is deliberately NOT consulted here (it
+            // misfires on gcc's static functions; see
+            // `isSectionDefinitionSymbol`).
+            //
+            // ★ BINDING IS `Local`, AND THE OTHER TWO CHOICES ARE BOTH WRONG --
+            // verified against `linker.cpp` / `cross_cu_resolve.cpp`, not
+            // assumed. `resolveCrossCuDefs` SKIPS `Local` outright, which is
+            // precisely C's internal-linkage rule: this definition can never
+            // satisfy another TU's extern. `Global` would enter the name table
+            // as a STRONG def, so two members each holding a `sym_<n>` (DSS
+            // renames every internal-linkage function that way) would collide
+            // with `K_SymbolRedefinedAcrossUnits`. `Weak` is worse than either:
+            // both would enter as weak, lowest-key would win, and
+            // `isShadowedDuplicate` would DROP the loser's body -- one member's
+            // private function silently replaced by another's. `Local` bodies
+            // are never shadowed and `mergedIdFor` mints each a fresh id.
+            //
+            // ★ NO COMDAT LIFT, deliberately -- the `comdatBindingBySection`
+            // consultation in the EXTERNAL arm is absent here rather than
+            // forgotten. COMDAT Selection is a cross-object dedup policy keyed
+            // BY NAME, and an internal-linkage symbol has no cross-object name
+            // to dedup by. cl.exe `/Gy` does put a file-local function in its
+            // own COMDAT `.text$mn` (✔MEASURED, selection 1 = NODUPLICATES),
+            // so the lift is REACHABLE: honoring it would make this symbol
+            // Global and re-create the collision above, and an ANY-selection
+            // section would make it Weak and re-create the silent body drop.
+            //
+            // ★ NO SECTION-KIND GATE, deliberately, and for the same reason the
+            // EXTERNAL arm has none: a symbol that declares itself a FUNCTION is
+            // a body by its producer's own statement, so if its section resolves
+            // to no modeled kind that is a SCHEMA GAP and the slicing loop below
+            // must recover it loud. Gating on a resolved kind here would silently
+            // drop exactly the bytes an external symbol's absence would refuse --
+            // reinstating, for internal linkage only, the asymmetry this arm
+            // exists to remove.
+            defsBySection[s.sectNum].push_back(
+                DefSym{i, s.value, s.name, SymbolBinding::Local,
+                       SymbolVisibility::Default});
+        } else if (s.storage == kSymClassStatic
+                   && sections[s.sectNum - 1u].kind.has_value()
+                   && *sections[s.sectNum - 1u].kind != SectionKind::Text
+                   && !isSectionDefinitionSymbol(i)) {
+            // A FILE-LOCAL DATA OBJECT -- an atom BOUNDARY, exactly like an
+            // external one, and the OTHER half of
+            // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM
+            // (D-LK-COFF-ARCHIVE-MEMBER-READER-LOSES-STATIC-RODATA-SYMBOLS is
+            // the same loss scoped to `.rdata`). The derived-type field cannot
+            // decide this one: COFF stamps type 0 on EVERY data symbol
+            // regardless of linkage -- `pe.cpp` says so at its defined-DATA loop
+            // ("COFF data symbols are `notype`; DTYPE_FUNCTION is
+            // functions-only"), and cl.exe and gcc agree -- so a `static const`
+            // array is byte-for-byte the shape of a block label on the wire.
+            //
+            // ★ THE SECOND DISCRIMINATOR IS THE SECTION'S OWN KIND, and it is
+            // sound because a block label is a CODE address. It labels an
+            // instruction boundary inside a function; there is no such thing as
+            // an interior label in `.rdata`. ✔MEASURED, and the risk this had to
+            // rule out was specific -- a foreign jump-table label landing in a
+            // non-code section and being read as a datum. Over 6 cl.exe
+            // 14.51.36231 arms (/Od, /O2, /Gy, /Zi combinations) and 7 mingw
+            // gcc 13.2.0 arms (-O0, -O2, -g, -ffunction-sections,
+            // -fdata-sections, -fno-pic) compiling a dense 12-case switch,
+            // NEITHER producer does that: cl.exe emits the jump table as a
+            // class-STATIC type-0 symbol (`$LN18`) INSIDE `.text$mn` at the end
+            // of its own function, and the case targets as class LABEL, also in
+            // `.text`; gcc puts the table in `.rdata` but attaches NO SYMBOL to
+            // it at all, reaching it through the `.rdata` section symbol plus an
+            // addend. Every class-STATIC type-0 symbol either producer put in a
+            // non-code section was a whole data object (`table`, `msg`,
+            // `counter`, `zeroed`) or unwind metadata in a section whose kind
+            // does not resolve (`$unwind$`/`$pdata$`), which is excluded above.
+            // DSS's own writer is narrower still: its block-symbol loop
+            // hardcodes `kTextSectionNumber`.
+            //
+            // ★ THE RULE IS NOT NEW -- IT REMOVES AN EXCEPTION. This reader
+            // ALREADY treats an external data symbol as a boundary that runs to
+            // the next one, with exactly the same theoretical exposure (an
+            // interior data alias at a non-zero offset would split the object).
+            // What made internal linkage different was never evidence, only
+            // EXTERNAL-ness; C's object model gives named objects disjoint
+            // storage whichever linkage they have. Making the two paths agree is
+            // the whole content of this anchor.
+            //
+            // ★ CLASS STATIC SPECIFICALLY, not "non-external". IMAGE_SYM_CLASS_
+            // LABEL (6) means a label WITHIN A MODULE -- a code address by
+            // definition, and the class cl.exe stamps on its `$LN` case targets.
+            // Promoting one of those on the strength of its section would be
+            // reading the section instead of the symbol.
+            //
+            // ★ BINDING IS `Local` and takes NO COMDAT lift, for the same two
+            // reasons spelled out in the function arm above: `resolveCrossCuDefs`
+            // skips Local (C internal linkage), and a Selection policy dedups BY
+            // NAME across objects, which internal linkage has no part in.
+            defsBySection[s.sectNum].push_back(
+                DefSym{i, s.value, s.name, SymbolBinding::Local,
+                       SymbolVisibility::Default});
         } else if (!s.name.empty()) {
-            // A STATIC (local) defined symbol -- an interior `&&label` /
-            // jump-table block label (DSS's only STATIC-defined shape,
-            // pe.cpp:1224) or a foreign static. Recorded as a LOCAL
-            // ModuleSymbol but NOT an atom boundary, so it never splits the
-            // function/data item that contains its interior offset (mirrors
-            // the Mach-O N_SECT-local rule, macho:545-554).
+            // A NON-EXTERNAL defined symbol that neither declares a function
+            // type nor sits in a non-code section -- an interior `&&label` /
+            // jump-table block label (DSS's own writer emits those class STATIC
+            // with derived type 0, `pe.cpp`'s "Synthetic per-block symbols"
+            // loop; cl.exe emits its `$LN` case targets as class LABEL and its
+            // jump TABLE as class STATIC, all three inside `.text`), a section
+            // identity, or a foreign `$unwind$`/`$pdata$` thunk symbol.
+            // Recorded as a LOCAL ModuleSymbol and NOT an atom boundary for
+            // now, so it never splits the function/data item that contains its
+            // interior offset.
             mod.symbols.push_back(ModuleSymbol{SymbolId{i}, s.name,
                 SymbolBinding::Local, SymbolVisibility::Default});
-            // ...and STAGE it for the coverage guard
+            // ...and STAGE it for the shared header
             // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
-            // The reasoning above is right for a LABEL and wrong for a whole
-            // file-local (`static`) FUNCTION, and IMAGE_SYMBOL carries no size
-            // field to tell them apart. A label lies INSIDE the function that
-            // contains it, so the enclosing atom covers its offset and the guard
-            // stays silent; a demoted whole function is covered by nothing, and
-            // the guard names it rather than letting its bytes vanish. Only a
-            // KIND-RESOLVED section is staged (an unmodeled `.pdata`/`.debug$S`
-            // symbol reconstructs no body BY DESIGN, and is not a dropped body),
-            // and a section-DEFINITION symbol -- a STATIC symbol carrying an aux
-            // record -- is a section IDENTITY, not a body, so it is excluded.
-            bool const isSectionDefSym =
-                (static_cast<std::size_t>(i) + 1u < numSymbols)
-                && auxSlot[static_cast<std::size_t>(i) + 1u];
-            if (sections[s.sectNum - 1u].kind.has_value() && !isSectionDefSym) {
+            // The reasoning above is right for a label and STILL UNPROVEN for
+            // anything else that lands here: COFF declares no size, so a
+            // `.text` symbol with no function type is the same three numbers
+            // whether it is a block label or a body written by an assembler
+            // that stamped no type. GEOMETRY decides in (6.4) -- a label lies
+            // INSIDE its enclosing function, so that atom covers its offset and
+            // nothing happens; anything the atoms do NOT cover is promoted to a
+            // body rather than left to vanish. Only a KIND-RESOLVED section is
+            // staged (an unmodeled `.pdata`/`.debug$S` symbol reconstructs no
+            // body BY DESIGN, and is not a dropped body), and a section-
+            // DEFINITION symbol is a section IDENTITY, not a body, so it is
+            // excluded.
+            if (sections[s.sectNum - 1u].kind.has_value()
+                && !isSectionDefinitionSymbol(i)) {
+                // ★ ONE EXTENT IS DERIVABLE EVEN THOUGH COFF DECLARES NONE: a
+                // symbol sitting exactly at SizeOfRawData has no room for a
+                // byte, so it is a MARKER (an end-of-section label), not a body.
+                // Staging it as size 0 says that in the shared vocabulary, which
+                // stops the fallback minting a zero-length atom for it and stops
+                // the post-condition then reporting that atom as not covering
+                // its own start.
+                std::optional<std::uint64_t> const derivedSize =
+                    (s.value == sections[s.sectNum - 1u].rawSize)
+                        ? std::optional<std::uint64_t>{0u}
+                        : std::nullopt;
                 bodilessDefined.push_back(link::format::BodilessDefinedSymbol{
                     /*sectionKey=*/s.sectNum, /*sectionOffset=*/s.value,
-                    /*declaredSize=*/std::nullopt, /*name=*/s.name,
+                    /*declaredSize=*/derivedSize, /*name=*/s.name,
                     /*sectionName=*/sections[s.sectNum - 1u].name});
+                bodilessSymIdx.push_back(i);
             }
         }
     }
@@ -716,19 +936,170 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     std::unordered_map<std::uint16_t, std::vector<Interval>> dataIntervalsBySec;
 
     auto pushModuleSym = [&](DefSym const& d) {
-        if (!d.name.empty()) {
+        // A geometry-promoted symbol already has its ModuleSymbol from the
+        // classification loop; pushing a second one would duplicate the name in
+        // `mod.symbols` (see `DefSym::moduleSymbolAlreadyPushed`).
+        if (!d.name.empty() && !d.moduleSymbolAlreadyPushed) {
             mod.symbols.push_back(ModuleSymbol{SymbolId{d.symIdx}, d.name,
                                                d.binding, d.visibility});
         }
     };
 
-    // Slice each section's atoms by SORTED Value (THE key inversion --
-    // IMAGE_SYMBOL has no size field, like Mach-O's nlist_64). Only EXTERNAL
-    // defined symbols reached `defsBySection` (a STATIC symbol became an
-    // interior-label ModuleSymbol above, never an atom -- the Mach-O
-    // N_EXT-vs-local rule). Each atom spans [off_k, next STRICTLY-GREATER off)
-    // (the last -> the section's SizeOfRawData). Equal-offset ALIASES share
-    // the same span (both get identical bytes -- the ELF equal-start rule).
+    // Order each section's boundary set. Hoisted out of the slicing loop
+    // because (6.4) below reads the SAME order to compute the extents it
+    // reasons about, and two orderings written in two places is one rule that
+    // can disagree with itself.
+    //
+    // ★ THE TIE-BREAK IS PART OF THE RULE, not tidiness. Equal-offset ALIASES
+    // share a span, so their relative order does not change any atom's bytes --
+    // but it does decide which of them `mod.functions` lists first, and this
+    // runs TWICE (again after (6.4) appends). An offset-only comparator lets an
+    // unstable sort permute an alias pair between the two passes, making the
+    // reconstruction depend on the sort implementation. Breaking the tie on the
+    // symbol-table index makes the order total, so both passes agree and
+    // aliases come back in the order the object listed them.
+    auto sortBoundaries = [&] {
+        for (auto& [ordinal, defs] : defsBySection) {
+            std::sort(defs.begin(), defs.end(),
+                      [](DefSym const& a, DefSym const& b) {
+                          if (a.secRelOff != b.secRelOff)
+                              return a.secRelOff < b.secRelOff;
+                          return a.symIdx < b.symIdx;
+                      });
+        }
+    };
+    sortBoundaries();
+
+    // THE ATOM EXTENT RULE, stated once (THE key inversion -- IMAGE_SYMBOL has
+    // no size field, like Mach-O's nlist_64, so an atom's END comes from the
+    // NEXT boundary rather than from the symbol itself). The k-th boundary of a
+    // SORTED `defs` ends at the next STRICTLY-GREATER offset -- skipping
+    // equal-offset ALIASES so they share the span and both get identical bytes,
+    // the ELF equal-start rule -- else at the section's SizeOfRawData.
+    //
+    // (6.4) and the slicing loop must agree on this exactly: (6.4) decides which
+    // symbols to promote by asking which offsets these extents cover, and if it
+    // computed a DIFFERENT extent than the slicer then a symbol could be
+    // promoted on the strength of an atom that never materialises (or left alone
+    // on the strength of one that does not reach it).
+    auto atomEndFor = [](std::vector<DefSym> const& defs, std::size_t k,
+                         std::uint64_t sectionSize) -> std::uint64_t {
+        std::uint64_t const off = defs[k].secRelOff;
+        for (std::size_t j = k + 1; j < defs.size(); ++j) {
+            if (defs[j].secRelOff > off) return defs[j].secRelOff;
+        }
+        return sectionSize;
+    };
+
+    // -- (6.4) GEOMETRY FALLBACK: recover a body the wire could not name ---
+    //
+    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM. What is
+    // still staged as bodiless at this point is a `.text` symbol that declares
+    // no function type -- a block label if the section's functions were
+    // reconstructed around it, and otherwise a body written by a producer that
+    // stamped no type on it. COFF offers nothing further to read, so the last
+    // evidence is geometric, and the shared header owns both the inference and
+    // the argument for it (`uncoveredDefinedSymbolsThatStartAnAtom`): a symbol
+    // no reconstructed atom covers cannot be interior to one, and promoting it
+    // preserves its bytes where demoting it drops them.
+    //
+    // ⚠ THE EXTENTS FED IN ARE PROSPECTIVE, computed from the boundary set
+    // decided above with `atomEndFor`. They must be the ones the slicer will
+    // actually produce, which is why the extent rule was hoisted rather than
+    // re-derived here. Promoting BEFORE slicing (rather than slicing, promoting
+    // and re-slicing) means every body is cut exactly once and the bounds checks
+    // below run over the final boundary set.
+    {
+        std::vector<link::format::ReconstructedAtomExtent> prospective;
+        for (auto const& [ordinal, defs] : defsBySection) {
+            std::uint64_t const secSize = sections[ordinal - 1u].rawSize;
+            for (std::size_t k = 0; k < defs.size(); ++k) {
+                std::uint64_t const off = defs[k].secRelOff;
+                std::uint64_t const end = atomEndFor(defs, k, secSize);
+                // A corrupt offset past the section end is the SLICER's refusal
+                // to make (it names the symbol and the size); skip it here
+                // rather than fabricate a reversed extent.
+                if (off > secSize || end < off) continue;
+                prospective.push_back(link::format::ReconstructedAtomExtent{
+                    ordinal, off, end - off});
+            }
+        }
+        for (std::size_t idx :
+             link::format::uncoveredDefinedSymbolsThatStartAnAtom(bodilessDefined,
+                                                                  prospective)) {
+            auto const& c = bodilessDefined[idx];
+            // `Local` and no COMDAT lift, for the reasons the two classified
+            // arms above spell out. A promoted symbol is a body this reader
+            // could not NAME a reason for, never a reason to change linkage.
+            defsBySection[static_cast<std::uint16_t>(c.sectionKey)].push_back(
+                DefSym{bodilessSymIdx[idx], c.sectionOffset, c.name,
+                       SymbolBinding::Local, SymbolVisibility::Default,
+                       /*moduleSymbolAlreadyPushed=*/true});
+        }
+        sortBoundaries();
+    }
+
+    // -- (6.44) EQUAL-OFFSET ALIAS IDENTITY: one atom, several names ------
+    //
+    // D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS. The boundary set is
+    // FINAL here -- every COFF discriminator plus whatever (6.4) recovered --
+    // and this is the last moment before bytes are cut. Two boundaries at one
+    // offset are two NAMES for one body; minting an atom for each produced
+    // byte-identical twins, and `findInterval` hands a relocation in the span
+    // they share to exactly ONE of them, leaving the other's copy un-patched.
+    // The shared header owns the rule, the ranking, and the argument for both
+    // (`resolveEqualOffsetAtomAliases`).
+    //
+    // COFF passes `declaredExtent = nullopt` because `IMAGE_SYMBOL` has no size
+    // field -- this reader derives an atom's end from the next boundary
+    // (`atomEndFor`), so equal-offset candidates get equal extents by
+    // construction and the conflicting-extent refusal cannot fire here.
+    std::unordered_map<std::uint32_t, std::uint32_t> atomOwnerBySym;
+    {
+        std::vector<link::format::AtomStartCandidate> candidates;
+        for (auto const& [ordinal, defs] : defsBySection) {
+            Section const& sec = sections[ordinal - 1u];
+            for (auto const& d : defs) {
+                candidates.push_back(link::format::AtomStartCandidate{
+                    /*sectionKey=*/ordinal, /*offset=*/d.secRelOff,
+                    /*declaredExtent=*/std::nullopt, /*symbolId=*/d.symIdx,
+                    /*binding=*/d.binding, /*visibility=*/d.visibility,
+                    /*name=*/d.name, /*sectionName=*/sec.name});
+            }
+        }
+        std::vector<std::uint32_t> owner;
+        if (!link::format::resolveEqualOffsetAtomAliases(
+                candidates, owner, "pe::readRelocatableObject", reporter)) {
+            return std::nullopt;   // the resolver reported, naming both symbols
+        }
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (owner[i] != candidates[i].symbolId) {
+                atomOwnerBySym.emplace(candidates[i].symbolId, owner[i]);
+            }
+        }
+    }
+    // The atom identity a symbol resolves to: itself unless it aliases another.
+    // Consulted at BOTH sites that need it -- the slicing loop (does this
+    // boundary mint a body?) and the relocation pass (which atom does this
+    // target name?) -- because a collapse without the target remap turns a
+    // silent miscompile into a spurious `K_SymbolUndefined`.
+    auto ownerOf = [&](std::uint32_t symIdx) -> std::uint32_t {
+        auto const it = atomOwnerBySym.find(symIdx);
+        return it == atomOwnerBySym.end() ? symIdx : it->second;
+    };
+    // Alias rows are appended AFTER the slicing loop, never during it: every
+    // id -> row lookup over `AssembledModule::symbols` keeps the FIRST row for
+    // an id, so the canonical name must be recorded before any alias of it.
+    std::vector<ModuleSymbol> aliasRows;
+
+    // Slice each section's atoms by SORTED Value. What reached `defsBySection`
+    // is every defined symbol that STARTS A BODY, of either linkage: EXTERNAL
+    // symbols, class-STATIC symbols declaring DTYPE_FUNCTION, class-STATIC
+    // symbols in a non-code section, and whatever (6.4) recovered. A STATIC
+    // symbol that survived all four became an interior-label ModuleSymbol and is
+    // never an atom. Slicing is BINDING-BLIND from here down: a local body's
+    // bytes, bounds checks and relocation routing are the external path's,
+    // unchanged.
     for (auto& [ordinal, defs] : defsBySection) {
         Section const& sec = sections[ordinal - 1u];
         std::optional<SectionKind> const rk = sec.kind;
@@ -736,20 +1107,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             rk.has_value() ? dataSectionKindOf(*rk) : std::nullopt;
         bool const isText = rk.has_value() && *rk == SectionKind::Text;
 
-        std::sort(defs.begin(), defs.end(),
-                  [](DefSym const& a, DefSym const& b) {
-                      return a.secRelOff < b.secRelOff;
-                  });
-
         for (std::size_t k = 0; k < defs.size(); ++k) {
             std::uint64_t const off = defs[k].secRelOff;
-            // The atom ends at the next STRICTLY-GREATER offset (skipping
-            // equal-offset aliases so they share the span), else the section
-            // size (SizeOfRawData).
-            std::uint64_t end = sec.rawSize;
-            for (std::size_t j = k + 1; j < defs.size(); ++j) {
-                if (defs[j].secRelOff > off) { end = defs[j].secRelOff; break; }
-            }
+            std::uint64_t const end = atomEndFor(defs, k, sec.rawSize);
             if (off > sec.rawSize || end < off) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "pe::readRelocatableObject: defined symbol '" + defs[k].name
@@ -757,6 +1117,34 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + sec.name + "' size " + std::to_string(sec.rawSize) + ".");
             }
             std::uint64_t const len = end - off;
+
+            // (6.44) THE ALIAS ARM: this boundary names a body another boundary
+            // at the same offset already owns, so it mints NO atom -- it keeps
+            // its NAME and takes the owner's identity. Placed after the offset
+            // refusal so a corrupt offset is still named by the symbol that
+            // carries it.
+            if (std::uint32_t const owner = ownerOf(defs[k].symIdx);
+                owner != defs[k].symIdx) {
+                if (defs[k].moduleSymbolAlreadyPushed) {
+                    // A (6.4) geometry promotion that turned out to alias. It
+                    // cannot happen today -- the fallback promotes only symbols
+                    // NO reconstructed atom covers, and an atom starting at this
+                    // very offset covers it -- but if it ever does, the row it
+                    // already pushed carries the WRONG id and retargeting it is
+                    // the correct repair, not skipping it.
+                    for (auto& ms : mod.symbols) {
+                        if (ms.symbol == SymbolId{defs[k].symIdx}) {
+                            ms.symbol = SymbolId{owner};
+                            break;
+                        }
+                    }
+                } else if (!defs[k].name.empty()) {
+                    aliasRows.push_back(ModuleSymbol{SymbolId{owner}, defs[k].name,
+                                                     defs[k].binding,
+                                                     defs[k].visibility});
+                }
+                continue;
+            }
 
             if (isText) {
                 // A function body -- slice [off, end) out of the file-backed
@@ -822,16 +1210,109 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
-    // -- (6.5) Coverage guard: no defined symbol's body was dropped -------
+    // Every canonical row is now recorded, so the aliases can follow: several
+    // names, one SymbolId, the owning name first (see (6.44)).
+    for (auto& ms : aliasRows) mod.symbols.push_back(std::move(ms));
+
+    // -- (6.45) SYNTHETIC GAP ATOMS: reconstruct ANONYMOUS data-section bytes
     //
-    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM. The
-    // demotion above is the ONLY place this reader turns a defined body-bearing
-    // symbol into a bodiless one, so this is the first point at which the
-    // question "did any named bytes end up in no atom?" is answerable. Asked
-    // BEFORE the relocation pass so the refusal names the SYMBOL rather than
-    // surfacing later as a reloc that routes to nothing (or, worse, not at all).
-    // The check itself is shared and format-neutral -- see
-    // `link/format/object_atom_coverage.hpp`.
+    // D-LK-COFF-READER-ANONYMOUS-GAP-ATOMS. Bytes in a DATA section that no
+    // symbol names become one synthetic anonymous `AssembledData` per maximal
+    // uncovered range, so they reach the image instead of vanishing. This is the
+    // COFF arm of the pass ELF has had since the c167 fold, and it runs off the
+    // SAME shared rule (`unownedByteRangesOfSection`) -- the only thing that
+    // differs is the section vocabulary each reader already speaks.
+    //
+    // ★★★ WHY THIS HAD TO LAND IN THE SAME CYCLE AS THE CLASSIFICATION ABOVE.
+    // ✔MEASURED, mingw gcc 13.2.0 `-O2`: a dense switch puts its jump table in
+    // `.rdata` with NO SYMBOL ON IT, reached from `.text` through a REL32
+    // against the `.rdata` SECTION symbol plus an addend. Before this cycle such
+    // an object was refused -- but for the WRONG REASON: the atom-coverage guard
+    // fired on the file-local `msg`/`table` symbols, which are not the bytes at
+    // risk. Promoting those symbols (clause (7)(c)) made them covered, the guard
+    // fell correctly silent, and a reloc-free `.rdata` would then have read
+    // GREEN with the anonymous third of the section dropped. TRADING A LOUD
+    // REFUSAL FOR A SILENT BYTE LOSS IS EXACTLY WHAT THIS PROJECT'S BAR
+    // FORBIDS, even when the underlying row is filed elsewhere -- so the row
+    // gets closed here rather than the regression getting shipped behind it.
+    //
+    // ★ THE THREE RESTRICTIONS ARE THE SHARED HEADER'S, and COFF satisfies one
+    // of them for free. Only DATA (a `.text` gap is inter-function alignment
+    // padding), only FILE-BACKED (a zero-fill `.bss` gap has no bytes), and only
+    // a DECLARED kind -- and COFF resolves kinds from the section NAME alone
+    // (the base name before `$`), with no SHF_ALLOC-style flags fallback, so
+    // `.xdata` / `.pdata` / `.debug$S` / `.drectve` / `.chks64` stay `nullopt`
+    // and are skipped without a special case. The `.eh_frame` hazard the ELF
+    // arm has to exclude by hand cannot arise here.
+    //
+    // ⓘ INERT ON DSS'S OWN OUTPUT: `pe.cpp` emits a symbol for every data item,
+    // so its sections are fully covered and no gap exists to mint.
+    {
+        std::uint32_t nextSyntheticId = numSymbols;
+        for (std::size_t si = 0; si < sections.size(); ++si) {
+            Section const& sec = sections[si];
+            if (sec.zeroFill || sec.rawSize == 0u) continue;
+            std::optional<DataSectionKind> const dk =
+                sec.kind.has_value() ? dataSectionKindOf(*sec.kind) : std::nullopt;
+            if (!dk.has_value() || isZeroFill(*dk)) continue;
+            if (rangeExceedsBuffer(sec.rawPtr, sec.rawSize, bytes.size())) continue;
+
+            std::uint16_t const ordinal = static_cast<std::uint16_t>(si + 1u);
+            // A fresh COPY of what is already reconstructed here: `emitGap`
+            // appends to the live map vector, and the shared rule must never see
+            // the gaps it is in the middle of producing.
+            std::vector<link::format::ReconstructedAtomExtent> covered;
+            if (auto it = dataIntervalsBySec.find(ordinal);
+                it != dataIntervalsBySec.end()) {
+                for (auto const& iv : it->second) {
+                    covered.push_back(link::format::ReconstructedAtomExtent{
+                        ordinal, iv.start, iv.len});
+                }
+            }
+            for (auto const& g : link::format::unownedByteRangesOfSection(
+                     ordinal, sec.rawSize, covered)) {
+                AssembledData di;
+                // A SymbolId past the symbol table cannot collide with any real
+                // symbol's, and NO ModuleSymbol is recorded -- the atom stays
+                // module-private and is never folded cross-CU by name, which is
+                // right for bytes that have no name.
+                di.symbol  = SymbolId{nextSyntheticId++};
+                di.section = *dk;
+                std::size_t const b0 = static_cast<std::size_t>(sec.rawPtr + g.start);
+                di.bytes.assign(bytes.begin() + b0,
+                                bytes.begin() + b0 + static_cast<std::size_t>(g.len));
+                dataIntervalsBySec[ordinal].push_back(
+                    Interval{g.start, g.len, mod.dataItems.size()});
+                mod.dataItems.push_back(std::move(di));
+            }
+        }
+    }
+
+    // -- (6.5) POST-CONDITION: no defined symbol's body was dropped -------
+    //
+    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM. Asked
+    // over the ACTUAL sliced intervals -- not the prospective ones (6.4)
+    // reasoned about -- AFTER the gap pass (a symbol covered only by a synthetic
+    // gap atom is still covered; asking before it would judge the reconstruction
+    // half-finished) and BEFORE the relocation pass, so a failure names the
+    // SYMBOL rather than surfacing later as a reloc that routes to nothing.
+    //
+    // ★ THIS IS NO LONGER A DETECTOR ON THIS READER, and saying so is the point.
+    // (6.4) promotes every staged symbol the atoms do not cover, so no OBJECT
+    // can reach this refusal any more. What the check still asserts is a
+    // property of the READER -- that (6.4)'s promotions actually MATERIALISED as
+    // atoms at the coordinates they were filed under. A promotion filed under
+    // the wrong section ordinal, or staged at a pre-conversion offset, produces
+    // atoms that exist and do not cover the symbol they were minted for, and
+    // nothing else downstream would notice: the bytes would land in the wrong
+    // atom, not in none.
+    //
+    // ⚠ WHICH IS WHY EVERY CANDIDATE IS PASSED, PROMOTED ONES INCLUDED. Passing
+    // only the ones (6.4) declined would be a tautology -- it declines exactly
+    // the covered ones -- and would leave the refusal unreachable by ANY defect
+    // rather than merely by any object. The shared header's "WHAT THE
+    // POST-CONDITION STILL ASSERTS" paragraph carries the argument, and the
+    // mutant that reds it is in `tests/link/test_object_atom_coverage.cpp`.
     {
         std::vector<link::format::ReconstructedAtomExtent> extents;
         for (auto const* bySec : {&funcIntervalsBySec, &dataIntervalsBySec}) {
@@ -843,7 +1324,16 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
         }
         if (!link::format::everyDefinedSymbolIsCoveredByAnAtom(
-                bodilessDefined, extents, "pe::readRelocatableObject", reporter)) {
+                bodilessDefined, extents, "pe::readRelocatableObject", reporter,
+                // COFF's own sentence. Every wire discriminator and the
+                // geometric one have already been applied, so reaching here
+                // means the reader contradicted itself -- point the triager at
+                // the reader, not at the object's producer.
+                "every COFF discriminator has already been applied to it "
+                "(IMAGE_SYM_DTYPE_FUNCTION, the section's kind, and finally "
+                "atom-coverage geometry), so this is the READER disagreeing "
+                "with itself about where it put the atom, not an object it "
+                "cannot classify")) {
             return std::nullopt;
         }
     }
@@ -891,20 +1381,24 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // limitation -- D-LK-COFF-FOREIGN-UNWIND-DROP).
                 continue;
             }
-            // A KIND-RESOLVED section (a real `.rdata`/`.data`/`.text`) that
-            // reconstructed NO atom -- e.g. an ANONYMOUS `.rdata` string-literal
-            // section owned by no symbol. COFF has NO gap-atom analog to the ELF
-            // c167 reconstruction, so its relocations cannot be attached. FAIL
-            // LOUD rather than skip: skipping a resolved-kind section's relocs
-            // would be a SILENT DROP (the never-silently-drop contract). The
-            // closing work is COFF gap atoms -- D-LK-COFF-READER-ANONYMOUS-GAP-ATOMS.
+            // A KIND-RESOLVED section that reconstructed NO atom. Since (6.45)
+            // this is a TEXT section specifically: an anonymous DATA section is
+            // gap-filled there and always has an atom, so it cannot arrive here.
+            // Text is excluded from gap-filling DELIBERATELY -- a `.text` gap is
+            // inter-function ALIGNMENT PADDING, and fabricating a code atom out
+            // of padding would give a corrupt code reference somewhere to land
+            // instead of failing loud. FAIL LOUD rather than skip: skipping a
+            // resolved-kind section's relocs would be a SILENT DROP (the
+            // never-silently-drop contract).
             return fail(DiagnosticCode::F_CorruptedBinary,
                 "pe::readRelocatableObject: section '" + sec.name + "' carries "
                 + std::to_string(sec.relocCount) + " relocation(s) but "
                 "reconstructed no atom to attach them to (its kind resolved, so "
                 "it is real code/data, not skippable metadata) -- refusing to "
-                "silently drop a section's relocations. "
-                "D-LK-COFF-READER-ANONYMOUS-GAP-ATOMS.");
+                "silently drop a section's relocations. An anonymous DATA "
+                "section is recovered by the gap-atom pass; a code section is "
+                "not, because a gap in executable bytes is alignment padding "
+                "rather than a body.");
         }
         std::vector<Interval> const& ivs = patchesText ? fIt->second : dIt->second;
 
@@ -990,18 +1484,26 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
 
             Relocation rel;
             rel.offset = static_cast<std::uint32_t>(va - iv->start);
-            rel.target = SymbolId{symIdx};
+            // (6.44): a target naming an ALIAS binds to the atom that owns the
+            // body, because only the owner is a declared definition -- an id
+            // that owns no body is `K_SymbolUndefined` at the linker's compound
+            // index. The addend needs no adjustment: an alias shares its owner's
+            // offset exactly, so the same S makes the same address.
+            rel.target = SymbolId{ownerOf(symIdx)};
             rel.kind   = kind;
             rel.addend = addend;
             if (patchesText) mod.functions[iv->outIdx].relocations.push_back(rel);
             else             mod.dataItems[iv->outIdx].relocations.push_back(rel);
 
-            // isData inference: an extern reached through a CALL/BRANCH-class
-            // reloc is a FUNCTION -- force isData=false. On PE x86_64
-            // callSignalNativeIds is EMPTY (REL32 is `linear`), so this is a
-            // no-op and the type-hint seed (step 6) stands -- NO fail-loud (the
-            // COFF-vs-Mach-O difference: COFF carries the type hint). Kept
-            // agnostic for a hypothetical call-branch PE target.
+            // isData inference: an extern reached through a relocation the
+            // FORMAT declares `"isCall": true` on is a FUNCTION -- force
+            // isData=false. On every shipped PE document callSignalNativeIds
+            // is EMPTY (COFF x86_64 has no branch-only relocation), so this is
+            // a no-op and the type-hint seed (step 6) stands -- NO fail-loud,
+            // which is the COFF-vs-Mach-O difference: COFF carries the hint,
+            // Mach-O does not. Reads the declared role so a PE document that
+            // does have a branch-only wire type (IMAGE_REL_ARM64_BRANCH26)
+            // is honoured here untouched.
             if (auto ex = externBySym.find(symIdx); ex != externBySym.end()) {
                 if (callSignalNativeIds.contains(nativeId)) {
                     mod.externImports[ex->second].isData = false;

@@ -304,8 +304,9 @@ struct Machine {
             if (!crossValidateTargetFormat(**target, **format, pairing)) continue;
 
             auto const sibling =
-                dss::runtime::resolveArchiveSiblingFormat(**format, **target,
-                                                          objectFormatsDir());
+                dss::runtime::resolveArchiveSiblingFormat(
+                    **format, **target, objectFormatsDir(),
+                    dss::runtime::kRuntimeCacheSiblingRequester);
             if (!sibling.has_value()) {
                 ADD_FAILURE()
                     << "SHIPPED RUNTIME COMPILE GATE: object format '" << formatName

@@ -38,12 +38,16 @@
 #include "ffi/binary_readers/ar_reader.hpp"
 #include "link/format/ar.hpp"
 #include "link/format/elf_object_reader.hpp"
+#include "link/format/macho_object_reader.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "program/compile_pipeline.hpp"
 #include "core/substrate/phase_timers.hpp"
 #include "program/program.hpp"
+#include "program/runtime_object_cache.hpp"   // resolveArchiveSiblingFormat
+#include "repo_root.hpp"
 #include "run_binary.hpp"
+#include "scoped_env.hpp"
 #include "scratch_dir.hpp"
 
 #include "../link/gcc_section_relative_c167.inc"
@@ -68,6 +72,15 @@
 using namespace dss;
 using namespace dss::test_support;
 namespace fs = std::filesystem;
+
+// D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY: the pull's
+// `dynamicLibraries` argument. Almost every case in this file names no
+// `--resolve-library` binary at all, so it passes an EMPTY span and the pull
+// behaves exactly as it did before that parameter existed -- the argument is
+// spelled rather than defaulted so a route that needs one cannot forget it (see
+// the header's contract). `ArchiveMemberResolveLibraryImport` is the suite that
+// passes a real one.
+constexpr std::span<ResolveLibrarySpec const> kNoDynamicLibraries{};
 
 namespace {
 
@@ -94,8 +107,54 @@ struct Schemas {
     std::shared_ptr<TargetSchema>       target;
     std::shared_ptr<ObjectFormatSchema> reloc;   // ET_REL member format
     std::shared_ptr<ObjectFormatSchema> exec;    // ET_EXEC link target
+    // The `container: "archive"` format -- what the DRIVER writes a static
+    // library with, and therefore the vocabulary a member's bytes are IN.
+    // Loaded lazily by `loadStaticlibSchema` below: only the
+    // D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT pins
+    // need it, and every other case here predates the axis.
+    std::shared_ptr<ObjectFormatSchema> staticlib;
     std::shared_ptr<GrammarSchema const> grammar;
 };
+
+// The Mach-O **x86_64** sibling.
+//
+// ⚠ ITS ORIGINAL REASON FOR EXISTING IS GONE, AND THAT IS RECORDED RATHER THAN
+// QUIETLY EDITED AWAY. It was introduced as the family whose object and image
+// relocation vocabularies "genuinely CONFLICT" -- kind 1 declared as 620756992
+// in `macho64-x86_64-darwin{,-staticlib}` and 369098752 in `-exec`/`-dylib` --
+// making it the one family that could tell a member read through the OBJECT
+// vocabulary apart from one read through the IMAGE's. That conflict was not a
+// design difference: the image value was a TYPO that contradicted its own row's
+// name and its own stated packing, and correcting it made all four documents
+// agree (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-
+// ROW). The family is kept because it is still a real leg with a real writer
+// round trip; what it can no longer do is discriminate two vocabularies, and no
+// case here asks it to.
+[[nodiscard]] Schemas loadMachoX86Schemas() {
+    Schemas s;
+    auto t = TargetSchema::loadShipped("x86_64");
+    auto r = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin");
+    auto e = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
+    auto l = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-staticlib");
+    auto g = GrammarSchema::loadShipped("c-subset");
+    if (!t || !r || !e || !l || !g) {
+        ADD_FAILURE() << "macho x86_64 schema load failed";
+        return s;
+    }
+    s.target    = std::move(t).value();
+    s.reloc     = std::move(r).value();
+    s.exec      = std::move(e).value();
+    s.staticlib = std::move(l).value();
+    s.grammar   = std::move(g).value();
+    return s;
+}
+
+// Attach the `-staticlib` variant to an already-loaded family.
+void loadStaticlibSchema(Schemas& s, std::string_view name) {
+    auto l = ObjectFormatSchema::loadShipped(name);
+    if (!l) { ADD_FAILURE() << "staticlib schema load failed: " << name; return; }
+    s.staticlib = std::move(l).value();
+}
 
 [[nodiscard]] Schemas loadSchemas() {
     Schemas s;
@@ -194,6 +253,42 @@ buildArchive(fs::path const& dir, std::string_view archiveName,
     return archivePath;
 }
 
+// DSS writes a `.a`/`.lib` THE WAY THE DRIVER DOES: every member assembled for,
+// and the archive written through, the `container: "archive"` format. The older
+// `buildArchive` above writes through the bare relocatable schema instead;
+// both are DSS's own writer, but only this one reproduces the byte stream a
+// `--target <t>:<base>-staticlib` build actually emits, which is the stream the
+// D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT pins are
+// about.
+[[nodiscard]] fs::path
+buildArchiveThroughStaticlibFormat(
+    fs::path const& dir, std::string_view archiveName,
+    std::vector<std::pair<std::string, std::string>> const& members,
+    Schemas const& s) {
+    if (!s.staticlib) { ADD_FAILURE() << "no staticlib schema loaded"; return {}; }
+    std::vector<AssembledModule> mods;
+    std::vector<std::string>     names;
+    for (auto const& [src, memberName] : members) {
+        DiagnosticReporter rep;
+        auto mod = assembleFromSource(src, memberName + ".c", s, *s.staticlib, rep);
+        if (!mod) { ADD_FAILURE() << "assemble member '" << memberName
+                                  << "' failed; errs=" << rep.errorCount(); return {}; }
+        mods.push_back(std::move(*mod));
+        names.push_back(memberName);
+    }
+    auto const archivePath = dir / std::string{archiveName};
+    DiagnosticReporter rep;
+    if (!linkAndWriteStaticArchive(
+            std::span<AssembledModule const>{mods.data(), mods.size()},
+            std::span<std::string const>{names.data(), names.size()},
+            *s.target, *s.staticlib, archivePath, rep)) {
+        ADD_FAILURE() << "linkAndWriteStaticArchive failed; errs="
+                      << rep.errorCount();
+        return {};
+    }
+    return archivePath;
+}
+
 [[nodiscard]] bool importsContain(std::vector<std::string> const& names,
                                   std::string_view symbol) {
     return std::any_of(names.begin(), names.end(),
@@ -222,6 +317,26 @@ buildArchive(fs::path const& dir, std::string_view archiveName,
                static_cast<std::streamsize>(bytes.size()));
     }
     return bytes;
+}
+
+// The raw bytes of the FIRST real object member of an `ar` archive on disk.
+[[nodiscard]] std::vector<std::uint8_t>
+firstMemberBytes(fs::path const& archivePath, std::vector<std::uint8_t>& owner) {
+    owner = readFileBytes(archivePath);
+    DiagnosticReporter rep;
+    auto arch = dss::ffi::readArArchive(
+        std::span<std::uint8_t const>{owner.data(), owner.size()},
+        archivePath.filename().string(), rep);
+    if (!arch || arch->members.empty()) {
+        ADD_FAILURE() << "archive did not parse or has no members: "
+                      << archivePath.string();
+        return {};
+    }
+    auto const& m = arch->members.front();
+    return std::vector<std::uint8_t>(
+        owner.begin() + static_cast<std::ptrdiff_t>(m.dataOffset),
+        owner.begin() + static_cast<std::ptrdiff_t>(m.dataOffset)
+                      + static_cast<std::ptrdiff_t>(m.size));
 }
 
 // Structurally walk `ar` member headers and count the "/" LINKER-INDEX members
@@ -317,7 +432,7 @@ TEST(StaticLink, PullResolvesReferenceAndMergeStripsImport) {
     // Pull the archive members that satisfy main's externs.
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
-    auto pulled = pullStaticArchiveMembers(*mainMod, archives, *s.target,
+    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target,
                                            *s.exec, pullRep);
     ASSERT_TRUE(pulled) << "pull failed; errs=" << pullRep.errorCount();
     ASSERT_EQ(pulled->size(), 1u) << "exactly the one member defining dss_lib_answer";
@@ -391,7 +506,7 @@ TEST(StaticLink, LazyPullSkipsUnreferencedMember) {
 
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
-    auto pulled = pullStaticArchiveMembers(*clientMod, archives, *s.target,
+    auto pulled = pullStaticArchiveMembers(*clientMod, archives, kNoDynamicLibraries, *s.target,
                                            *s.exec, pullRep);
     ASSERT_TRUE(pulled) << "pull failed; errs=" << pullRep.errorCount();
 
@@ -611,7 +726,7 @@ TEST(StaticLink, MachOPullResolvesReferenceAndMergeStripsImport) {
 
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
-    auto pulled = pullStaticArchiveMembers(*mainMod, archives, *s.target, *s.exec, pullRep);
+    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target, *s.exec, pullRep);
     ASSERT_TRUE(pulled) << "macho pull failed; errs=" << pullRep.errorCount();
     ASSERT_EQ(pulled->size(), 1u) << "exactly the one member defining dss_lib_answer";
     EXPECT_TRUE(std::any_of((*pulled)[0].symbols.begin(), (*pulled)[0].symbols.end(),
@@ -723,7 +838,7 @@ TEST(StaticLink, CoffPullResolvesReferenceAndMergeStripsImport) {
 
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
-    auto pulled = pullStaticArchiveMembers(*mainMod, archives, *s.target, *s.exec, pullRep);
+    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target, *s.exec, pullRep);
     ASSERT_TRUE(pulled) << "coff pull failed; errs=" << pullRep.errorCount();
     ASSERT_EQ(pulled->size(), 1u) << "exactly the one member defining dss_lib_answer";
     EXPECT_TRUE(std::any_of((*pulled)[0].symbols.begin(), (*pulled)[0].symbols.end(),
@@ -1300,4 +1415,1267 @@ TEST(StaticArchive, ReleaseMemberIsProgramStageOptimized) {
         << "a 1-CU static-archive build must run Optimize TWICE — the unit "
            "stage in buildCuMir and the program stage at the member's "
            "lowering site (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE)";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT
+//
+// A `.o` inside a `.a` is a RELOCATABLE OBJECT no matter what image it is being
+// linked into, so it must be decoded through the relocatable vocabulary — never
+// through the `-exec`/`-dylib` vocabulary of the artifact being produced. The
+// member reader used to be handed the IMAGE's schema, which made DSS unable to
+// read back its OWN writer's output for the most ordinary library member there
+// is: one that CALLS something.
+//
+// ★★★ EVERY CASE BELOW PINS THE **RESOLUTION** — WHICH DOCUMENT DESCRIBES THE
+// MEMBER — AND THAT IS THE CONTRACT. `archiveMemberFormat`, the pull's single
+// member-read chokepoint, resolves the member's own object format through
+// `runtime::resolveArchiveSiblingFormat` and never falls back to the link
+// format; that fallback IS the defect this anchor names. So each case asserts
+// that the resolution lands on the very document the fixture WROTE the archive
+// with, which is a statement about the contract and holds no matter what the
+// two vocabularies happen to contain.
+//
+// ⚠⚠ IT DID NOT ALWAYS SAY THAT, AND HOW THE OLD PIN DIED IS THE LESSON WORTH
+// KEEPING. Each case used to assert a CONSEQUENCE instead: that reading the
+// member through the IMAGE document REFUSES. That is only true while the two
+// vocabularies happen to DIVERGE, so it was never the contract — it was a
+// property of the corpus. On Mach-O x86_64 it was worse than that: the refusal
+// existed only because the image documents held a TYPO. For a row named
+// `X86_64_RELOC_BRANCH` they declared a nativeId that, under the packing their
+// OWN comment states, decodes to r_type=SIGNED / 8 bytes / NOT pc-relative, and
+// the row named `_4` declared a TWO-byte slot. The documents refuted
+// themselves; no external authority was needed to call it a bug. When it was
+// corrected (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-
+// OWN-ROW) all four macho64-x86_64 documents became IDENTICAL on this axis, the
+// image stopped refusing, and the pin went red — having spent its life
+// asserting a consequence that rested on a defect.
+// ⇒ A DIVERGENCE DISCRIMINATOR IS KEPT ONLY WHERE THE DIVERGENCE IS GENUINE AND
+// DEFENSIBLE, as an EXTRA, never as the case's reason to exist.
+//
+// ⓘ WHERE THE TWO FAMILIES NOW STAND — ✔MEASURED over the shipped documents:
+//   * ELF x86_64 STILL DIVERGES, structurally: `elf64-x86_64-linux{,-staticlib}`
+//     declare `pltNativeId: 4` (R_X86_64_PLT32) and an `emitOnly` PC32 alias
+//     (`R_X86_64_PC32_UNBIASED`); `-exec` declares NEITHER, and its only extra
+//     row is a TLS one. A member that CALLS a library function emits wire 4,
+//     which no image document has a row for. That is a real difference in what
+//     the two artifacts can contain, so the ELF case keeps its discriminator.
+//   * MACH-O x86_64 NO LONGER DIVERGES AT ALL: all four documents declare the
+//     same three rows with the same wire values. Its discriminator is gone, and
+//     its absence is correct rather than a gap — the resolution pin is what that
+//     case was always really about.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── THE SHARED CONTRACT ASSERTION ───────────────────────────────────────────
+//
+// `s.exec` is what the link PRODUCES; `s.staticlib` is the document the fixture
+// WROTE the archive with. The pull must resolve the second from the first. The
+// oracle is the fixture's own writer, so no format name is spelled here and the
+// case cannot rot when the shipped set is renamed or extended.
+//
+// ⓘ The requester only shapes the REFUSAL PROSE (`resolveArchiveSiblingFormat`
+// takes it so a refusal can name the static link rather than the runtime object
+// cache it was first written for). The RESOLUTION is requester-independent, so
+// borrowing the public constant here is a fact about the API, not a second owner
+// of the static-link one — which is `internal` to the pipeline and deliberately
+// not exported.
+void expectMemberFormatResolvesToTheWriterDocument(Schemas const&   s,
+                                                   std::string_view familyLabel) {
+    ASSERT_TRUE(s.target && s.exec && s.staticlib)
+        << familyLabel << ": schemas must load";
+    auto const root = dss::test::findRepoRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
+    fs::path const formatsDir = *root / "src" / "dss-config" / "object-formats";
+    ASSERT_TRUE(fs::is_directory(formatsDir))
+        << familyLabel
+        << ": the shipped object-format tree is the SUBJECT of this assertion; "
+           "without it the scan would be empty and the case would assert "
+           "nothing: " << formatsDir.generic_string();
+
+    auto const sibling = dss::runtime::resolveArchiveSiblingFormat(
+        *s.exec, *s.target, formatsDir,
+        dss::runtime::kRuntimeCacheSiblingRequester);
+    ASSERT_TRUE(sibling.has_value())
+        << familyLabel << ": the member's object format must RESOLVE from the "
+           "image format the link is producing — a refusal here means the pull "
+           "has no document to read the member with at all: " << sibling.error();
+    EXPECT_EQ(*sibling, s.staticlib->name())
+        << familyLabel
+        << ": the pull must read the member through the SAME document that "
+           "WROTE it. Resolving anything else decodes relocatable bytes with a "
+           "vocabulary that was never promised to describe them";
+    EXPECT_NE(*sibling, s.exec->name())
+        << familyLabel
+        << ": resolving the LINK's own image format is the defect itself — the "
+           "member read must never fall back to the artifact being produced "
+           "(D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-"
+           "FORMAT)";
+}
+
+// The ELF instance, exactly as the anchor recorded it: a member that CALLS A
+// LIBRARY FUNCTION, hence an R_X86_64_PLT32 the exec format does not declare.
+TEST(ArchiveMemberObjectFormat,
+     ElfMemberCallingALibraryFunctionReadsBackThroughTheObjectVocabulary) {
+    ScratchDir scratch{Location::InsideRepo, "member-format-elf"};
+    Schemas s = loadSchemas();
+    ASSERT_TRUE(s.grammar);
+    loadStaticlibSchema(s, "elf64-x86_64-linux-staticlib");
+    ASSERT_TRUE(s.staticlib);
+
+    // `puts` is an extern CALL, so the member carries a PLT-flavored branch
+    // relocation — the whole point of the fixture. A member with no call at all
+    // reads back fine through either vocabulary and would assert nothing.
+    auto const archivePath = buildArchiveThroughStaticlibFormat(
+        scratch.path(), "libanswer.a",
+        {{"extern int puts(char const* s);\n"
+          "int dss_lib_answer(void){ puts(\"lib\"); return 42; }\n",
+          "libanswer"}}, s);
+    ASSERT_FALSE(archivePath.empty());
+
+    std::vector<std::uint8_t> owner;
+    auto const memberBytes = firstMemberBytes(archivePath, owner);
+    ASSERT_FALSE(memberBytes.empty());
+
+    // ── THE CONTRACT: the member resolves to the document that WROTE it ─────
+    expectMemberFormatResolvesToTheWriterDocument(s, "elf64-x86_64");
+
+    // ── THE DIVERGENCE DISCRIMINATOR — KEPT HERE BECAUSE IT IS GENUINE ──────
+    // These exact bytes must be REFUSED by the image vocabulary, and on THIS
+    // family that refusal is structural rather than incidental: a member that
+    // calls a library function emits R_X86_64_PLT32 (wire 4), which
+    // `elf64-x86_64-linux{,-staticlib}` declare as `pltNativeId` and no image
+    // document declares at all. It is an EXTRA assertion on top of the
+    // resolution pin above, never this case's reason to exist.
+    // ⚠ IF THIS EVER GOES GREEN-SIDE — i.e. the image format legitimately gains
+    // a PLT32 row — DELETE THIS BLOCK, do not re-derive it onto some other
+    // coincidence. The contract is already pinned above, and a discriminator
+    // that has to be hunted for a fresh divergence every time the corpus
+    // converges is asserting the corpus, not the compiler. That mistake is on
+    // the record: the Mach-O sibling below carried exactly such a block until
+    // the typo it depended on was fixed (see this section's docblock).
+    {
+        DiagnosticReporter imageRep;
+        auto const throughImage = elf::readRelocatableObject(
+            std::span<std::uint8_t const>{memberBytes}, *s.target, *s.exec,
+            imageRep);
+        EXPECT_FALSE(throughImage.has_value())
+            << "the image format '" << s.exec->name() << "' ACCEPTED a "
+               "relocatable member carrying R_X86_64_PLT32 — the ELF x86_64 "
+               "vocabularies no longer divide here, so this EXTRA block should "
+               "be DELETED (the resolution pin above carries the contract)";
+        EXPECT_GT(imageRep.errorCount(), 0u);
+    }
+    {
+        DiagnosticReporter objRep;
+        auto const throughObject = elf::readRelocatableObject(
+            std::span<std::uint8_t const>{memberBytes}, *s.target,
+            *s.staticlib, objRep);
+        ASSERT_TRUE(throughObject.has_value())
+            << "the OBJECT format '" << s.staticlib->name()
+            << "' could not read DSS's own writer output; errs="
+            << objRep.errorCount();
+        EXPECT_EQ(objRep.errorCount(), 0u);
+    }
+
+    // ── AND THE PULL, HANDED THE IMAGE FORMAT, MUST NOW SUCCEED ─────────────
+    // This is the defect itself: the caller legitimately holds the image format
+    // (it is producing an image), and the member read must not inherit it.
+    DiagnosticReporter cliRep;
+    auto clientMod = assembleFromSource(
+        "extern int dss_lib_answer(void);\n"
+        "int main(void){ return dss_lib_answer(); }\n",
+        "client.c", s, *s.exec, cliRep);
+    ASSERT_TRUE(clientMod);
+
+    std::vector<fs::path> const archives{archivePath};
+    DiagnosticReporter pullRep;
+    auto pulled = pullStaticArchiveMembers(*clientMod, archives, kNoDynamicLibraries, *s.target,
+                                           *s.exec, pullRep);
+    ASSERT_TRUE(pulled.has_value())
+        << "the pull was handed the IMAGE format and read the member with it; "
+           "errs=" << pullRep.errorCount();
+    EXPECT_EQ(pullRep.errorCount(), 0u);
+    ASSERT_EQ(pulled->size(), 1u);
+    EXPECT_TRUE(moduleDefinesExternallyVisible((*pulled)[0], "dss_lib_answer"));
+
+    // The member's library call survived the decode. Asserting only "no error"
+    // would also pass if the relocation had been dropped on the floor.
+    std::vector<std::string> memberImports;
+    for (auto const& ext : (*pulled)[0].externImports) {
+        memberImports.push_back(ext.mangledName);
+    }
+    EXPECT_TRUE(importsContain(memberImports, "puts"))
+        << "the pulled member lost the library call it was built to carry";
+}
+
+// The Mach-O x86_64 instance — the leg the anchor's 2026-08-20 amendment
+// recorded as worse than the ELF case it was opened for. The member here calls
+// a SIBLING FUNCTION rather than a library one: that is enough to emit
+// X86_64_RELOC_BRANCH, and it keeps the case clear of
+// D-LK-MACHO-ISDATA-NO-CALL-SIGNAL, which an EXTERN call on this leg now
+// reaches.
+//
+// ⚠ This was once described here as "the CONFLICTING one". It is not, any more:
+// the conflict was a typo in the image documents and has been corrected. What
+// this case asserts is the RESOLUTION contract plus a genuine writer→reader
+// round trip; see this section's docblock for why that is the stronger pin.
+TEST(ArchiveMemberObjectFormat,
+     MachoX86MemberWithABranchRelocReadsBackThroughTheObjectVocabulary) {
+    ScratchDir scratch{Location::InsideRepo, "member-format-macho-x86"};
+    Schemas const s = loadMachoX86Schemas();
+    ASSERT_TRUE(s.grammar);
+    ASSERT_TRUE(s.staticlib);
+
+    auto const archivePath = buildArchiveThroughStaticlibFormat(
+        scratch.path(), "libbranch.a",
+        {{"int dss_lib_step(int x){ return x + 1; }\n"
+          "int dss_lib_answer(void){ return dss_lib_step(41); }\n",
+          "libbranch"}}, s);
+    ASSERT_FALSE(archivePath.empty());
+
+    std::vector<std::uint8_t> owner;
+    auto const memberBytes = firstMemberBytes(archivePath, owner);
+    ASSERT_FALSE(memberBytes.empty());
+
+    // ── THE CONTRACT: the member resolves to the document that WROTE it ─────
+    //
+    // ⓘ AND THERE IS DELIBERATELY NO DIVERGENCE DISCRIMINATOR HERE. This case
+    // used to assert that the IMAGE document REFUSES these bytes; that refusal
+    // rested entirely on a self-refuting nativeId in the image documents, and
+    // when it was corrected all four macho64-x86_64 documents became identical
+    // on this axis. Re-deriving the block onto some other difference would be
+    // hunting the corpus for a coincidence to lean on — see this section's
+    // docblock. What the case is ACTUALLY about is which document the read
+    // resolves, and that is asserted directly.
+    expectMemberFormatResolvesToTheWriterDocument(s, "macho64-x86_64");
+    {
+        DiagnosticReporter objRep;
+        auto const throughObject = macho::readRelocatableObject(
+            std::span<std::uint8_t const>{memberBytes}, *s.target,
+            *s.staticlib, objRep);
+        ASSERT_TRUE(throughObject.has_value())
+            << "the OBJECT format '" << s.staticlib->name()
+            << "' could not read DSS's own writer output; errs="
+            << objRep.errorCount();
+        EXPECT_EQ(objRep.errorCount(), 0u);
+    }
+
+    DiagnosticReporter cliRep;
+    auto clientMod = assembleFromSource(
+        "extern int dss_lib_answer(void);\n"
+        "int main(void){ return dss_lib_answer(); }\n",
+        "client.c", s, *s.exec, cliRep);
+    ASSERT_TRUE(clientMod);
+
+    std::vector<fs::path> const archives{archivePath};
+    DiagnosticReporter pullRep;
+    auto pulled = pullStaticArchiveMembers(*clientMod, archives, kNoDynamicLibraries, *s.target,
+                                           *s.exec, pullRep);
+    ASSERT_TRUE(pulled.has_value())
+        << "macho64-x86_64 pull refused; errs=" << pullRep.errorCount();
+    EXPECT_EQ(pullRep.errorCount(), 0u);
+    ASSERT_EQ(pulled->size(), 1u);
+    EXPECT_TRUE(moduleDefinesExternallyVisible((*pulled)[0], "_dss_lib_answer"))
+        << "the pulled member does not define the decorated entry the client "
+           "referenced";
+}
+
+// ── The UNRESOLVABLE case: fail loud, and never fall back to the image ──────
+//
+// The fallback to the image format IS the defect, so "cannot resolve" must be a
+// refusal rather than a quieter version of the old behaviour. The condition is
+// forced the only way it can be without editing a shipped document: point the
+// config discovery at a tree that holds the IMAGE format and no
+// `container: "archive"` document at all, so the scan finds ZERO candidates.
+TEST(ArchiveMemberObjectFormat,
+     UnresolvableMemberFormatRefusesAndNamesMemberArchiveAndBothFormats) {
+    ScratchDir scratch{Location::InsideRepo, "member-format-unresolvable"};
+    Schemas s = loadSchemas();
+    ASSERT_TRUE(s.grammar);
+    loadStaticlibSchema(s, "elf64-x86_64-linux-staticlib");
+    ASSERT_TRUE(s.staticlib);
+
+    auto const archivePath = buildArchiveThroughStaticlibFormat(
+        scratch.path(), "libanswer.a",
+        {{"extern int puts(char const* s);\n"
+          "int dss_lib_answer(void){ puts(\"lib\"); return 42; }\n",
+          "libanswer"}}, s);
+    ASSERT_FALSE(archivePath.empty());
+
+    DiagnosticReporter cliRep;
+    auto clientMod = assembleFromSource(
+        "extern int dss_lib_answer(void);\n"
+        "int main(void){ return dss_lib_answer(); }\n",
+        "client.c", s, *s.exec, cliRep);
+    ASSERT_TRUE(clientMod);
+
+    // A config root carrying exactly ONE object-format document — the image
+    // one. Every schema this case needs is already loaded and held above, so
+    // narrowing discovery affects only the member-format resolution.
+    auto const repoRoot = dss::test::findRepoRoot();
+    ASSERT_TRUE(repoRoot.has_value()) << dss::test::repoRootDiagnostic();
+    fs::path const shippedExec = *repoRoot / "src" / "dss-config"
+                               / "object-formats"
+                               / "elf64-x86_64-linux-exec.format.json";
+    ASSERT_TRUE(fs::is_regular_file(shippedExec)) << shippedExec.string();
+    fs::path const fakeFormats =
+        scratch.path() / "cfgroot" / "src" / "dss-config" / "object-formats";
+    fs::create_directories(fakeFormats);
+    fs::copy_file(shippedExec, fakeFormats / shippedExec.filename(),
+                  fs::copy_options::overwrite_existing);
+
+    std::vector<fs::path> const archives{archivePath};
+    DiagnosticReporter pullRep;
+    std::optional<std::vector<AssembledModule>> pulled;
+    {
+        ScopedEnv env("DSS_CONFIG_ROOT",
+                      (scratch.path() / "cfgroot").string());
+        pulled = pullStaticArchiveMembers(*clientMod, archives, kNoDynamicLibraries, *s.target,
+                                          *s.exec, pullRep);
+    }
+    ASSERT_FALSE(pulled.has_value())
+        << "an unresolvable member format was absorbed instead of refused — "
+           "the only way to continue here is to read the member with the image "
+           "format, which is the defect this row exists for";
+
+    // ⚠⚠ AND THE `ASSERT_FALSE` ABOVE IS NOT THE ASSERTION THAT MATTERS —
+    // ✔MEASURED, it passes under a mutant that reports the refusal and THEN
+    // falls back to the image format anyway, because the reader refuses those
+    // bytes one tier lower and the pull returns `nullopt` either way. A nullopt
+    // therefore cannot tell "refused" from "fell back and failed downstream",
+    // which is exactly the silent-fallback the row is about.
+    //
+    // THE COUNT IS WHAT DISCRIMINATES. Resolution is latched per link, so a
+    // refusal is reported EXACTLY ONCE and nothing after it touches the member.
+    // A fallback shows up as a SECOND diagnostic — the reader's
+    // `F_CorruptedBinary` on bytes it was never meant to be handed.
+    ASSERT_EQ(pullRep.errorCount(), 1u)
+        << "expected exactly ONE diagnostic (the member-format refusal). More "
+           "than one means the member was handed to a reader ANYWAY after the "
+           "refusal was reported — a fallback wearing a diagnostic, which is "
+           "the same wrong bytes reaching the same wrong vocabulary";
+    ASSERT_FALSE(pullRep.all().empty());
+    EXPECT_EQ(pullRep.all().front().code, DiagnosticCode::D_SchemaLoadFailed)
+        << "the refusal must be the CONFIGURATION failure it is (the member's "
+           "object format could not be resolved), not a claim that the member's "
+           "bytes are corrupt — they are not";
+
+    std::string text;
+    for (auto const& d : pullRep.all()) {
+        text += d.actual;
+        text.push_back('\n');
+    }
+    // The four facts a triager needs, none of which the format resolver itself
+    // can know: which member, in which archive, for which link, and the row.
+    EXPECT_NE(text.find("libanswer"), std::string::npos) << text;
+    EXPECT_NE(text.find(archivePath.filename().string()), std::string::npos)
+        << text;
+    EXPECT_NE(text.find("elf64-x86_64-linux-exec"), std::string::npos) << text;
+    EXPECT_NE(text.find("D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-"
+                        "THE-OBJECT-FORMAT"),
+              std::string::npos) << text;
+    // And it must name the caller, not the runtime object cache the shared
+    // resolver was first written for.
+    EXPECT_NE(text.find("static-link archive member read"), std::string::npos)
+        << text;
+}
+
+// ── D-LK-ARCHIVE-MEMBER-EXTERN-LOSES-ITS-LIBRARY ─────────────────────────────
+//
+// ★★★ AN ARCHIVE MEMBER THAT CALLS A LIBRARY FUNCTION READ BACK CLEANLY AND
+// THEN FAILED TO LINK — on EVERY leg, which is what made it the last thing
+// standing between DSS and an ordinary static library.
+//
+// ✔MEASURED at the defect (shipped CLI, this host, baseline config) with a
+// discriminating pair over ONE pair of sources — a TU calling `puts` plus a
+// `main` calling it: compiled DIRECTLY as a multi-TU exec the build returned
+// rc=0 on pe64-x86_64, elf64-x86_64, elf64-aarch64, macho64-arm64 and
+// macho64-x86_64; routed through `-staticlib` + `--resolve-library` it returned
+// rc=1 on all five, with `error[K_SymbolUndefined] undefined symbol 'puts'`.
+//
+// The direct path binds `puts` at the SEMANTIC tier, folding the shipped
+// descriptor's per-format `library` map into the extern's `libraryPath`. An
+// object file has nowhere to put that: an undefined symbol in ELF/COFF/Mach-O is
+// a NAME and nothing else (✔MEASURED — the emitted `.lib`/`.a` contain the
+// string `puts` and no `ucrtbase.dll` / `libc.so.6` anywhere). So the archive
+// path must RE-DERIVE the binding from the same authority, which is what
+// `pullStaticArchiveMembers` now does.
+//
+// ★★ THE ORACLE HERE IS THE DIRECT PATH ITSELF, NOT A HARDCODED LIBRARY NAME.
+// Each case asks what the SAME SOURCE binds when compiled straight to the exec
+// format, then requires the pulled member to reach BYTE-IDENTICALLY that. A test
+// that spelled the image name would pin today's corpus rather than the property,
+// and would have to be edited every time the platform's realization legitimately
+// moved — while still not asserting that the two paths AGREE, which is the only
+// thing that matters (two rows that disagree on the owning image do not fold in
+// the linker's dedup and become two import descriptors for one C runtime — the
+// split-CRT defect UCRT-P4 exists to prevent).
+
+// A TU that calls a plain library function, plus its client. `puts` is chosen
+// because it is a PLAIN descriptor row on every shipped format — no `synthesize`
+// recipe, no per-target `linkName` — so this case isolates the binding itself.
+constexpr std::string_view kPutsLibSrc =
+    "extern int puts(const char *s);\n"
+    "static int dss_helper(int v){ return v + 1; }\n"
+    "int dss_lib_answer(void){ puts(\"from-lib\"); return dss_helper(41); }\n";
+
+// The `libraryPath` the named extern carries in `mod`, or nullopt when the
+// module has no such import at all.
+[[nodiscard]] std::optional<std::string>
+importLibraryOf(AssembledModule const& mod, std::string_view symbol) {
+    for (auto const& e : mod.externImports) {
+        if (e.mangledName == symbol) return e.libraryPath;
+    }
+    return std::nullopt;
+}
+
+// The on-binary spelling `cName` takes in `mod` — the C name on an undecorated
+// format, the decorated one on Mach-O. Derived from the module the DIRECT path
+// produced rather than from an underscore literal, so no format name appears in
+// a test.
+[[nodiscard]] std::optional<std::string>
+onBinaryNameEndingIn(AssembledModule const& mod, std::string_view cName) {
+    for (auto const& e : mod.externImports) {
+        if (e.mangledName == cName) return e.mangledName;
+        if (e.mangledName.size() > cName.size()
+            && e.mangledName.compare(e.mangledName.size() - cName.size(),
+                                     cName.size(), cName) == 0) {
+            return e.mangledName;
+        }
+    }
+    return std::nullopt;
+}
+
+// One family's worth of the discriminating pair. `s` must carry `exec` and
+// `staticlib`; the member is written through the `container: "archive"` format,
+// exactly as a `-staticlib` target build does.
+void expectArchiveMemberRebindsLibraryImport(Schemas const& s,
+                                             std::string_view familyLabel) {
+    ASSERT_TRUE(s.target && s.exec && s.staticlib && s.grammar)
+        << familyLabel << ": schemas must load";
+
+    // (1) THE REFERENCE BEHAVIOUR: the same source compiled straight to the exec
+    // format. Whatever image it names for `puts` is what the archive path owes.
+    // The lib source and its client in ONE translation unit — an exec format
+    // needs an entry point, and this is exactly the "compiled DIRECTLY as one
+    // multi-TU exec" arm of the CLI measurement in the docblock above.
+    DiagnosticReporter directRep;
+    auto directMod = assembleFromSource(
+        std::string{kPutsLibSrc} + std::string{kMainSrc}, "direct.c", s,
+        *s.exec, directRep);
+    ASSERT_TRUE(directMod) << familyLabel << ": direct assemble failed; errs="
+                           << directRep.errorCount();
+    auto const putsName = onBinaryNameEndingIn(*directMod, "puts");
+    ASSERT_TRUE(putsName) << familyLabel
+                          << ": the direct build must import puts at all";
+    auto const referenceLibrary = importLibraryOf(*directMod, *putsName);
+    ASSERT_TRUE(referenceLibrary) << familyLabel << ": direct import lookup";
+    ASSERT_FALSE(referenceLibrary->empty())
+        << familyLabel
+        << ": the DIRECT path must bind puts to an owning image — without that "
+           "there is no reference behaviour for the archive path to match";
+
+    // (2) THE ARCHIVE ROUND TRIP over the identical source.
+    ScratchDir dir{Location::InsideRepo, "static-link"};
+    auto const archive = buildArchiveThroughStaticlibFormat(
+        dir.path(), "libanswer.a", {{std::string{kPutsLibSrc}, "lib"}}, s);
+    ASSERT_FALSE(archive.empty()) << familyLabel << ": archive build";
+
+    DiagnosticReporter mainRep;
+    auto mainMod = assembleFromSource(std::string{kMainSrc}, "main.c", s,
+                                      *s.exec, mainRep);
+    ASSERT_TRUE(mainMod) << familyLabel << ": main assemble failed; errs="
+                         << mainRep.errorCount();
+
+    DiagnosticReporter pullRep;
+    std::vector<fs::path> const archives{archive};
+    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target,
+                                           *s.exec, pullRep);
+    ASSERT_TRUE(pulled) << familyLabel << ": pull failed; errs="
+                        << pullRep.errorCount();
+    ASSERT_EQ(pulled->size(), 1u) << familyLabel << ": one defining member";
+    EXPECT_EQ(pullRep.errorCount(), 0u) << familyLabel;
+
+    // ★ THE ASSERTION THE DEFECT FAILED: the member read back out of the archive
+    // must carry the SAME owning image the direct build derived. Before the fix
+    // this was the empty string on every leg.
+    auto const pulledLibrary = importLibraryOf((*pulled)[0], *putsName);
+    ASSERT_TRUE(pulledLibrary)
+        << familyLabel << ": the pulled member must still import " << *putsName;
+    EXPECT_FALSE(pulledLibrary->empty())
+        << familyLabel
+        << ": the pulled member's " << *putsName << " import lost its owning "
+           "library — the object file records only the NAME, so the binding must "
+           "be re-derived from the shipped-descriptor corpus at pull time "
+           "(D-LK-ARCHIVE-MEMBER-EXTERN-LOSES-ITS-LIBRARY)";
+    EXPECT_EQ(*pulledLibrary, *referenceLibrary)
+        << familyLabel
+        << ": the archive path must reach the SAME image as the direct path, or "
+           "the two rows do not fold in the linker's (name, library, version) "
+           "dedup and one C runtime becomes two imports";
+
+    // (3) AND THE WHOLE POINT: the combined span must LINK. This is the surface
+    // the CLI reported rc=1 on.
+    std::vector<AssembledModule> combined;
+    combined.push_back(*mainMod);
+    combined.push_back((*pulled)[0]);
+    DiagnosticReporter linkRep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{combined.data(), combined.size()},
+        *s.target, *s.exec, linkRep);
+    EXPECT_EQ(countCode(linkRep, DiagnosticCode::K_SymbolUndefined), 0u)
+        << familyLabel
+        << ": a library call inside an archive member is not an undefined symbol";
+    EXPECT_EQ(linkRep.errorCount(), 0u) << familyLabel << ": link must be clean";
+    EXPECT_TRUE(image.ok()) << familyLabel;
+}
+
+TEST(ArchiveMemberLibraryImport, ElfMemberRebindsToTheImageTheDirectPathBinds) {
+    Schemas s = loadSchemas();
+    loadStaticlibSchema(s, "elf64-x86_64-linux-staticlib");
+    expectArchiveMemberRebindsLibraryImport(s, "elf64-x86_64");
+}
+
+TEST(ArchiveMemberLibraryImport, CoffMemberRebindsToTheImageTheDirectPathBinds) {
+    Schemas s = loadCoffSchemas();
+    loadStaticlibSchema(s, "pe64-x86_64-windows-staticlib");
+    expectArchiveMemberRebindsLibraryImport(s, "pe64-x86_64");
+}
+
+TEST(ArchiveMemberLibraryImport, MachOMemberRebindsToTheImageTheDirectPathBinds) {
+    Schemas s = loadMachoSchemas();
+    loadStaticlibSchema(s, "macho64-arm64-darwin-staticlib");
+    expectArchiveMemberRebindsLibraryImport(s, "macho64-arm64");
+}
+
+// ★★★ THE HALF A CANONICAL-NAME LOOKUP MISSES — AND CHOOSING THE SYMBOL FOR
+// THIS TEST TOOK A MUTANT RUN, BECAUSE THE OBVIOUS CHOICE ASSERTED NOTHING.
+//
+// The corpus is keyed on the C identifier, but a compiled TU emits the PLATFORM
+// LINK NAME, so a member's symbol table can hold a spelling that is not a corpus
+// key at all. Un-decorating it recovers that same spelling, the forward lookup
+// misses, and the whole family becomes un-archivable.
+//
+// ⚠⚠ BUT MOST `linkName` ROWS ARE **ALSO** DECLARED UNDER THEIR LINK SPELLING,
+// AND THOSE PROVE NOTHING HERE. ✔MEASURED over the shipped corpus: `time` carries
+// `linkName: "_time64"` AND `time.json` separately declares a first-class
+// `_time64` row — so `_time64` IS a corpus key and the FORWARD arm finds it
+// unaided. The same is true of `open` / `close` / `read` / `access` / `isatty` /
+// `dup` / `dup2` / `getcwd` / `chdir` / `rmdir` / `unlink` and the rest of the pe
+// `<io.h>` and `<time.h>` families. A test written on `time` therefore passes
+// with the reverse arm DELETED — ✔MEASURED, exactly that mutant left an earlier
+// draft of this test GREEN.
+//
+// EXACTLY NINE rows in the shipped corpus realize to a link name that is NOT
+// itself declared: `write`→`_write`, `lseek`→`_lseek`, `getpid`→`_getpid`,
+// `_setjmp`→`__intrinsic_setjmp`, and the five Darwin suffixed ones
+// (`opendir` / `readdir` / `statfs` / `fstatfs` → `…$INODE64`, `realpath` →
+// `realpath$DARWIN_EXTSN`). Those nine are the ONLY witnesses of the reverse
+// arm, so this test uses one of them — `write`. ✔MEASURED with the reverse arm
+// mutated out (shipped CLI, pe64-x86_64): the archived TU`s exec link failed
+// with `undefined symbol '_write'`.
+//
+// pe64 is used because the arm64 Darwin family (the Mach-O leg this suite can
+// build everywhere) carries none of the suffixed rows — they are x86_64-gated.
+// Nothing about the mechanism is pe-specific: the index is built through
+// `linkNameFor` under the format`s OWN declared decoration rule.
+//
+// ★ THE PROTOTYPE IS HAND-WRITTEN RATHER THAN INCLUDED, AND THAT CHANGES NOTHING
+// ABOUT WHAT IS ASSERTED. Since UCRT-P4 the DECLARATION SYNTAX HAS NO AUTHORITY
+// OVER REALIZATION: a hand-written prototype and an included one resolve through
+// the SAME descriptor row and produce a BYTE-IDENTICAL import (C23 6.2.2p5 +
+// 7.1.4p2). The hand-written form is used because this in-process harness feeds
+// `UnitBuilder::addInMemory` with no system include search path, so the include
+// form fails to preprocess here for reasons unrelated to the property under test.
+constexpr std::string_view kLinkNameLibSrc =
+    "extern int write(int fd, const void *buf, unsigned n);\n"
+    "int dss_lib_answer(void){ write(1, \"\", 0); return 42; }\n";
+
+TEST(ArchiveMemberLibraryImport, CoffMemberBindsARowCarryingAPlatformLinkName) {
+    Schemas s = loadCoffSchemas();
+    loadStaticlibSchema(s, "pe64-x86_64-windows-staticlib");
+    ASSERT_TRUE(s.target && s.exec && s.staticlib && s.grammar);
+
+    // The reference behaviour again: what does the direct build bind, and under
+    // which on-binary spelling? Both are READ from it, never spelled here.
+    DiagnosticReporter directRep;
+    auto directMod = assembleFromSource(
+        std::string{kLinkNameLibSrc} + std::string{kMainSrc}, "direct.c", s,
+        *s.exec, directRep);
+    ASSERT_TRUE(directMod) << "direct assemble failed; errs="
+                           << directRep.errorCount();
+    auto const linkedName = onBinaryNameEndingIn(*directMod, "write");
+    ASSERT_TRUE(linkedName)
+        << "the direct build must import the platform's link name for write() — "
+           "if this stops holding, the corpus row changed and this test is "
+           "asserting the wrong thing";
+    auto const referenceLibrary = importLibraryOf(*directMod, *linkedName);
+    ASSERT_TRUE(referenceLibrary && !referenceLibrary->empty())
+        << "direct build must bind " << *linkedName;
+
+    ScratchDir dir{Location::InsideRepo, "static-link"};
+    auto const archive = buildArchiveThroughStaticlibFormat(
+        dir.path(), "libanswer.a", {{std::string{kLinkNameLibSrc}, "lib"}}, s);
+    ASSERT_FALSE(archive.empty());
+
+    DiagnosticReporter mainRep;
+    auto mainMod = assembleFromSource(std::string{kMainSrc}, "main.c", s,
+                                      *s.exec, mainRep);
+    ASSERT_TRUE(mainMod) << "main assemble failed; errs=" << mainRep.errorCount();
+
+    DiagnosticReporter pullRep;
+    std::vector<fs::path> const archives{archive};
+    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target,
+                                           *s.exec, pullRep);
+    ASSERT_TRUE(pulled) << "pull failed; errs=" << pullRep.errorCount();
+    ASSERT_EQ(pulled->size(), 1u);
+
+    auto const pulledLibrary = importLibraryOf((*pulled)[0], *linkedName);
+    ASSERT_TRUE(pulledLibrary)
+        << "the pulled member must still import " << *linkedName;
+    EXPECT_EQ(*pulledLibrary, *referenceLibrary)
+        << "a descriptor row carrying a per-target linkName must bind through "
+           "the REALIZED link name: the member's symbol table holds '"
+        << *linkedName
+        << "', which is not a corpus key, so a canonical-name-only lookup misses "
+           "it — and this is one of the NINE rows whose link name the corpus "
+           "does not separately declare, so the forward arm cannot cover it";
+
+    std::vector<AssembledModule> combined;
+    combined.push_back(*mainMod);
+    combined.push_back((*pulled)[0]);
+    DiagnosticReporter linkRep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{combined.data(), combined.size()},
+        *s.target, *s.exec, linkRep);
+    EXPECT_EQ(countCode(linkRep, DiagnosticCode::K_SymbolUndefined), 0u);
+    EXPECT_EQ(linkRep.errorCount(), 0u);
+    EXPECT_TRUE(image.ok());
+}
+
+// ★★★ AND THE OTHER DIRECTION, WHICH MATTERS AT LEAST AS MUCH: a binder that
+// bound optimistically would turn a typo into a LOAD-time failure, which is
+// strictly worse than the defect it fixes. A name the corpus does not answer for
+// must stay UNBOUND and must still be rejected LOUD, with the message unchanged.
+constexpr std::string_view kBogusLibSrc =
+    "extern int dss_no_such_symbol_anywhere(int v);\n"
+    "int dss_lib_answer(void){ return dss_no_such_symbol_anywhere(41); }\n";
+
+void expectGenuinelyUndefinedStillFailsLoud(Schemas const& s,
+                                            std::string_view familyLabel) {
+    ASSERT_TRUE(s.target && s.exec && s.staticlib && s.grammar) << familyLabel;
+    ScratchDir dir{Location::InsideRepo, "static-link"};
+    auto const archive = buildArchiveThroughStaticlibFormat(
+        dir.path(), "libanswer.a", {{std::string{kBogusLibSrc}, "lib"}}, s);
+    ASSERT_FALSE(archive.empty()) << familyLabel;
+
+    DiagnosticReporter mainRep;
+    auto mainMod = assembleFromSource(std::string{kMainSrc}, "main.c", s,
+                                      *s.exec, mainRep);
+    ASSERT_TRUE(mainMod) << familyLabel;
+
+    DiagnosticReporter pullRep;
+    std::vector<fs::path> const archives{archive};
+    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target,
+                                           *s.exec, pullRep);
+    ASSERT_TRUE(pulled) << familyLabel;
+    ASSERT_EQ(pulled->size(), 1u) << familyLabel;
+
+    auto const bogusName =
+        onBinaryNameEndingIn((*pulled)[0], "dss_no_such_symbol_anywhere");
+    ASSERT_TRUE(bogusName) << familyLabel << ": the member must import it";
+    auto const bogusLibrary = importLibraryOf((*pulled)[0], *bogusName);
+    ASSERT_TRUE(bogusLibrary) << familyLabel;
+    EXPECT_TRUE(bogusLibrary->empty())
+        << familyLabel
+        << ": a name no descriptor declares must stay UNBOUND — binding it to "
+           "any image would replace a build error with a loader failure. Got '"
+        << *bogusLibrary << "'";
+
+    std::vector<AssembledModule> combined;
+    combined.push_back(*mainMod);
+    combined.push_back((*pulled)[0]);
+    DiagnosticReporter linkRep;
+    (void)linker::link(
+        std::span<AssembledModule const>{combined.data(), combined.size()},
+        *s.target, *s.exec, linkRep);
+    EXPECT_GE(countCode(linkRep, DiagnosticCode::K_SymbolUndefined), 1u)
+        << familyLabel
+        << ": a genuinely undefined symbol reached through an archive member "
+           "must still be rejected LOUD by the reference gate";
+    bool namedTheSymbol = false;
+    for (auto const& d : linkRep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined
+            && d.actual.find(*bogusName) != std::string::npos) {
+            namedTheSymbol = true;
+        }
+    }
+    EXPECT_TRUE(namedTheSymbol)
+        << familyLabel
+        << ": the rejection must NAME the symbol — the message quality is part "
+           "of the contract, not incidental";
+}
+
+TEST(ArchiveMemberLibraryImport, ElfGenuinelyUndefinedSymbolStillFailsLoud) {
+    Schemas s = loadSchemas();
+    loadStaticlibSchema(s, "elf64-x86_64-linux-staticlib");
+    expectGenuinelyUndefinedStillFailsLoud(s, "elf64-x86_64");
+}
+
+TEST(ArchiveMemberLibraryImport, CoffGenuinelyUndefinedSymbolStillFailsLoud) {
+    Schemas s = loadCoffSchemas();
+    loadStaticlibSchema(s, "pe64-x86_64-windows-staticlib");
+    expectGenuinelyUndefinedStillFailsLoud(s, "pe64-x86_64");
+}
+
+// ★★★ A `synthesize` RECIPE ROW MUST NEVER BE BOUND, AND THE MEMBER HAS TO BE
+// HAND-BUILT TO REACH THE ARM AT ALL.
+//
+// ✔MEASURED: a DSS-compiled pe64 member never carries a bare `printf` reference
+// — with a `<stdio.h>` include OR with a hand-written prototype, the semantic
+// tier claims the shim, so the archive DEFINES `printf` and imports the UCRT
+// cores instead. (Those cores were the pe64 half of this very defect, and they
+// bind through the ordinary arm.) The recipe arm is therefore reachable only
+// from a FOREIGN archive whose member references `printf` directly, which is
+// what this module imitates: an `ExternImport` with no library plus a relocation
+// naming it, exactly what a gcc- or MSVC-produced object contains.
+//
+// Binding it would request a symbol the UCRT image does not export — the binary
+// would link clean and die at LOAD with 0xC0000139 and no diagnostic anywhere.
+// Leaving it unbound produces a build error instead.
+TEST(ArchiveMemberLibraryImport, CoffSynthesizeRecipeRowIsNeverBound) {
+    Schemas s = loadCoffSchemas();
+    loadStaticlibSchema(s, "pe64-x86_64-windows-staticlib");
+    ASSERT_TRUE(s.target && s.exec && s.staticlib && s.grammar);
+
+    // A member shaped like a foreign object: `dss_lib_answer` calls `printf`,
+    // which it imports with NO owning library (all an object file can record).
+    AssembledModule member;
+    AssembledFunction answer;
+    answer.symbol = SymbolId{1};
+    answer.bytes.assign(16, 0x90);
+    answer.relocations.push_back(
+        Relocation{4u, SymbolId{9}, RelocationKind{1}, 0});
+    member.functions.push_back(std::move(answer));
+    member.symbols.push_back(ModuleSymbol{SymbolId{1}, "dss_lib_answer",
+                                          SymbolBinding::Global,
+                                          SymbolVisibility::Default});
+    member.externImports.push_back(
+        ExternImport{SymbolId{9}, "printf", "", /*isData=*/false});
+    member.expectedFuncCount = member.functions.size();
+
+    ScratchDir dir{Location::InsideRepo, "static-link"};
+    auto const archivePath = dir.path() / "libanswer.a";
+    {
+        std::vector<AssembledModule> mods;
+        mods.push_back(std::move(member));
+        std::vector<std::string> const names{"lib"};
+        DiagnosticReporter writeRep;
+        ASSERT_TRUE(linkAndWriteStaticArchive(
+            std::span<AssembledModule const>{mods.data(), mods.size()},
+            std::span<std::string const>{names.data(), names.size()},
+            *s.target, *s.staticlib, archivePath, writeRep))
+            << "archive write failed; errs=" << writeRep.errorCount();
+    }
+
+    DiagnosticReporter mainRep;
+    auto mainMod = assembleFromSource(std::string{kMainSrc}, "main.c", s,
+                                      *s.exec, mainRep);
+    ASSERT_TRUE(mainMod);
+
+    DiagnosticReporter pullRep;
+    std::vector<fs::path> const archives{archivePath};
+    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target,
+                                           *s.exec, pullRep);
+    ASSERT_TRUE(pulled) << "pull failed; errs=" << pullRep.errorCount();
+    ASSERT_EQ(pulled->size(), 1u);
+
+    auto const printfLibrary = importLibraryOf((*pulled)[0], "printf");
+    ASSERT_TRUE(printfLibrary)
+        << "the pulled member must still import printf";
+    EXPECT_TRUE(printfLibrary->empty())
+        << "this platform realizes printf as a COMPILER-SYNTHESIZED body, not as "
+           "a library export; binding the name would produce an image that links "
+           "clean and fails to LOAD. Got '"
+        << *printfLibrary << "'";
+}
+
+// ── D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY ─────────────────
+//
+// ★★★ THE SUITE ABOVE CLOSED THE **PLATFORM** HALF. THIS IS THE OTHER HALF:
+// A LIBRARY THE OPERATOR NAMED ON THE COMMAND LINE.
+//
+// Same root cause, different authority. An object file records an undefined
+// symbol's NAME and nothing else, so a member's library binding is lost at
+// archive-write time and has to be re-derived at pull time. `pullStaticArchive-
+// Members` learned to ask the shipped-descriptor corpus — which answers for
+// `puts` and `ucrtbase.dll`, and has never heard of a library the operator built
+// five seconds ago and pointed the build at with `--resolve-library`. That
+// binary was invisible to the pull, because the pull was never handed the list.
+//
+// ✔MEASURED before the fix (shipped CLI, this host, baseline config, pe64): a
+// three-step build — a `.dll` defining `dss_dyn_answer`; a `-staticlib` calling
+// it, built WITH `--resolve-library <dll>`; then an exec linking the client
+// against BOTH — returned rc=0, rc=0, **rc=1**, with
+// `error[K_SymbolUndefined] undefined symbol 'dss_dyn_answer'`. The gap PREDATES
+// the platform-half fix: it was narrowed by it, never introduced by it.
+//
+// ★★ THE ORACLE IS THE OPERATOR'S OWN STATED IDENTITY, NOT A LIBRARY NAME THIS
+// FILE SPELLS. `--resolve-library <path>=<import-name>` STATES the runtime
+// identity to record, so a case that passes one knows exactly what the member's
+// row must come back carrying, on every format, with no platform string in the
+// test. The same lever makes the PRECEDENCE case below possible: it is the only
+// way to name an image the shipped corpus provably would NOT have chosen.
+
+// The dynamic library's source, its archived caller, and that caller's client —
+// the three steps of the measured CLI repro, in-process.
+constexpr std::string_view kDynLibSrc =
+    "int dss_dyn_answer(void){ return 42; }\n";
+constexpr std::string_view kUsesDynLibSrc =
+    "extern int dss_dyn_answer(void);\n"
+    "int dss_lib_answer(void){ return dss_dyn_answer(); }\n";
+
+// DSS writes a real DYNAMIC library (ELF `.so` / PE `.dll` / Mach-O `.dylib`)
+// whose EXPORT TABLE the `--resolve-library` reader then reads. Nothing is
+// stubbed: this is the artifact the CLI's step 1 emits, through the same
+// `linkAndWrite` the driver calls.
+[[nodiscard]] fs::path
+buildDynamicLibrary(fs::path const& dir, std::string_view fileName,
+                    std::string_view src, Schemas const& s,
+                    ObjectFormatSchema const& dynFormat) {
+    DiagnosticReporter rep;
+    auto mod = assembleFromSource(std::string{src}, "dynsrc.c", s, dynFormat, rep);
+    if (!mod) {
+        ADD_FAILURE() << "dynamic-library assemble failed; errs=" << rep.errorCount();
+        return {};
+    }
+    auto const outPath = dir / std::string{fileName};
+    std::vector<AssembledModule> mods;
+    mods.push_back(std::move(*mod));
+    DiagnosticReporter writeRep;
+    if (!linkAndWrite(std::span<AssembledModule const>{mods.data(), mods.size()},
+                      *s.target, dynFormat, outPath, writeRep)) {
+        ADD_FAILURE() << "dynamic-library link/write failed; errs="
+                      << writeRep.errorCount();
+        return {};
+    }
+    return outPath;
+}
+
+// The STATED identity — what `--resolve-library <path>=<import-name>` records.
+// Naming it here is what lets the assertions below be exact without spelling a
+// platform image anywhere.
+constexpr std::string_view kStatedIdentity = "dss-operator-named-lib";
+
+// One family's worth of the repro. `s` must carry `exec` + `staticlib`;
+// `dynFormat` is the family's shared-library format.
+void expectArchiveMemberBindsAnOperatorNamedLibrary(
+    Schemas const& s, ObjectFormatSchema const& dynFormat,
+    std::string_view familyLabel) {
+    ASSERT_TRUE(s.target && s.exec && s.staticlib && s.grammar)
+        << familyLabel << ": schemas must load";
+
+    ScratchDir dir{Location::InsideRepo, "static-link"};
+    auto const dynPath =
+        buildDynamicLibrary(dir.path(), "dss_dyn", kDynLibSrc, s, dynFormat);
+    ASSERT_FALSE(dynPath.empty()) << familyLabel << ": dynamic library build";
+
+    auto const archive = buildArchiveThroughStaticlibFormat(
+        dir.path(), "libusesdyn.a", {{std::string{kUsesDynLibSrc}, "usesdyn"}}, s);
+    ASSERT_FALSE(archive.empty()) << familyLabel << ": archive build";
+
+    DiagnosticReporter mainRep;
+    auto mainMod = assembleFromSource(std::string{kMainSrc}, "main.c", s,
+                                      *s.exec, mainRep);
+    ASSERT_TRUE(mainMod) << familyLabel << ": client assemble failed; errs="
+                         << mainRep.errorCount();
+
+    std::vector<ResolveLibrarySpec> const dynamicLibs{
+        ResolveLibrarySpec{dynPath, std::string{kStatedIdentity}}};
+
+    DiagnosticReporter pullRep;
+    std::vector<fs::path> const archives{archive};
+    auto pulled = pullStaticArchiveMembers(
+        *mainMod, archives,
+        std::span<ResolveLibrarySpec const>{dynamicLibs}, *s.target, *s.exec,
+        pullRep);
+    ASSERT_TRUE(pulled) << familyLabel << ": pull failed; errs="
+                        << pullRep.errorCount();
+    ASSERT_EQ(pulled->size(), 1u) << familyLabel << ": one defining member";
+    EXPECT_EQ(pullRep.errorCount(), 0u) << familyLabel;
+
+    auto const dynName = onBinaryNameEndingIn((*pulled)[0], "dss_dyn_answer");
+    ASSERT_TRUE(dynName)
+        << familyLabel << ": the pulled member must still import dss_dyn_answer";
+
+    // ★ THE ASSERTION THE DEFECT FAILED. Before the fix this was the empty
+    // string on every leg — the corpus has no row for this name, and the
+    // operator's binary was never shown to the pull at all.
+    auto const pulledLibrary = importLibraryOf((*pulled)[0], *dynName);
+    ASSERT_TRUE(pulledLibrary) << familyLabel << ": pulled import lookup";
+    EXPECT_EQ(*pulledLibrary, kStatedIdentity)
+        << familyLabel
+        << ": the pulled member's " << *dynName << " import must bind to the "
+           "library the OPERATOR named, under the identity the operator STATED. "
+           "An object file records only the NAME, so the binding has to be "
+           "re-derived at pull time from the `--resolve-library` list — the "
+           "shipped-descriptor corpus structurally cannot answer for a library "
+           "it has never heard of "
+           "(D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY)";
+
+    // AND THE WHOLE POINT: the combined span must LINK. This is the surface the
+    // CLI reported rc=1 on.
+    std::vector<AssembledModule> combined;
+    combined.push_back(*mainMod);
+    combined.push_back((*pulled)[0]);
+    DiagnosticReporter linkRep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{combined.data(), combined.size()},
+        *s.target, *s.exec, linkRep);
+    EXPECT_EQ(linkRep.errorCount(), 0u) << familyLabel << ": link must be clean";
+    EXPECT_TRUE(image.ok()) << familyLabel;
+}
+
+TEST(ArchiveMemberResolveLibraryImport, ElfMemberBindsAnOperatorNamedLibrary) {
+    Schemas s = loadSchemas();
+    loadStaticlibSchema(s, "elf64-x86_64-linux-staticlib");
+    auto dynF = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-dyn");
+    ASSERT_TRUE(dynF) << "elf dyn schema load";
+    expectArchiveMemberBindsAnOperatorNamedLibrary(s, **dynF, "elf64-x86_64");
+}
+
+TEST(ArchiveMemberResolveLibraryImport, CoffMemberBindsAnOperatorNamedLibrary) {
+    Schemas s = loadCoffSchemas();
+    loadStaticlibSchema(s, "pe64-x86_64-windows-staticlib");
+    auto dynF = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-dll");
+    ASSERT_TRUE(dynF) << "pe dll schema load";
+    expectArchiveMemberBindsAnOperatorNamedLibrary(s, **dynF, "pe64-x86_64");
+}
+
+TEST(ArchiveMemberResolveLibraryImport, MachOMemberBindsAnOperatorNamedLibrary) {
+    Schemas s = loadMachoSchemas();
+    loadStaticlibSchema(s, "macho64-arm64-darwin-staticlib");
+    auto dynF = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-dylib");
+    ASSERT_TRUE(dynF) << "macho dylib schema load";
+    expectArchiveMemberBindsAnOperatorNamedLibrary(s, **dynF, "macho64-arm64");
+}
+
+// ★★★ ORDER IS PRECEDENCE, AND THIS IS THE ONLY CASE THAT CAN SEE IT.
+//
+// The two arms both skip a row whose `libraryPath` is already set, so which one
+// runs FIRST decides who wins a name they BOTH answer for. Every case above uses
+// `dss_dyn_answer`, which the corpus has no row for — reversing the arms leaves
+// them all green. This case uses `puts`: a plain descriptor row on every shipped
+// format, AND an export of a stand-in library the operator names. If the corpus
+// arm ran first, the member would come back bound to the platform's C runtime.
+//
+// ★ THE OPPOSING ANSWER IS MEASURED, NOT SPELLED. What the corpus would say is
+// read off the DIRECT path — the same oracle the sibling suite uses — so the
+// case asserts the two answers DIFFER and that the operator's won, with no
+// platform image name written down anywhere.
+constexpr std::string_view kStandinPutsSrc =
+    "int puts(const char *s){ return s == 0 ? 0 : 1; }\n";
+
+void expectOperatorNamedLibraryOutranksThePlatformCorpus(
+    Schemas const& s, ObjectFormatSchema const& dynFormat,
+    std::string_view familyLabel) {
+    ASSERT_TRUE(s.target && s.exec && s.staticlib && s.grammar)
+        << familyLabel << ": schemas must load";
+
+    // What the PLATFORM says about `puts` here — the answer the operator must
+    // outrank.
+    DiagnosticReporter directRep;
+    auto directMod = assembleFromSource(
+        std::string{kPutsLibSrc} + std::string{kMainSrc}, "direct.c", s,
+        *s.exec, directRep);
+    ASSERT_TRUE(directMod) << familyLabel << ": direct assemble failed; errs="
+                           << directRep.errorCount();
+    auto const putsName = onBinaryNameEndingIn(*directMod, "puts");
+    ASSERT_TRUE(putsName) << familyLabel << ": the direct build must import puts";
+    auto const platformLibrary = importLibraryOf(*directMod, *putsName);
+    ASSERT_TRUE(platformLibrary) << familyLabel << ": direct import lookup";
+    ASSERT_FALSE(platformLibrary->empty())
+        << familyLabel
+        << ": the platform must bind puts to SOME image, or there is no "
+           "competing answer for the operator's binary to outrank and this case "
+           "asserts nothing";
+    ASSERT_NE(*platformLibrary, kStatedIdentity)
+        << familyLabel
+        << ": the stated identity must differ from the platform's, or the "
+           "comparison below cannot tell the two arms apart";
+
+    ScratchDir dir{Location::InsideRepo, "static-link"};
+    auto const dynPath = buildDynamicLibrary(dir.path(), "dss_standin",
+                                             kStandinPutsSrc, s, dynFormat);
+    ASSERT_FALSE(dynPath.empty()) << familyLabel << ": stand-in library build";
+
+    auto const archive = buildArchiveThroughStaticlibFormat(
+        dir.path(), "libputs.a", {{std::string{kPutsLibSrc}, "lib"}}, s);
+    ASSERT_FALSE(archive.empty()) << familyLabel << ": archive build";
+
+    DiagnosticReporter mainRep;
+    auto mainMod = assembleFromSource(std::string{kMainSrc}, "main.c", s,
+                                      *s.exec, mainRep);
+    ASSERT_TRUE(mainMod) << familyLabel << ": client assemble failed";
+
+    std::vector<ResolveLibrarySpec> const dynamicLibs{
+        ResolveLibrarySpec{dynPath, std::string{kStatedIdentity}}};
+
+    DiagnosticReporter pullRep;
+    std::vector<fs::path> const archives{archive};
+    auto pulled = pullStaticArchiveMembers(
+        *mainMod, archives,
+        std::span<ResolveLibrarySpec const>{dynamicLibs}, *s.target, *s.exec,
+        pullRep);
+    ASSERT_TRUE(pulled) << familyLabel << ": pull failed; errs="
+                        << pullRep.errorCount();
+    ASSERT_EQ(pulled->size(), 1u) << familyLabel;
+
+    auto const pulledLibrary = importLibraryOf((*pulled)[0], *putsName);
+    ASSERT_TRUE(pulledLibrary)
+        << familyLabel << ": the pulled member must still import " << *putsName;
+    EXPECT_EQ(*pulledLibrary, kStatedIdentity)
+        << familyLabel
+        << ": the operator NAMED a binary exporting " << *putsName
+        << ", so its export table outranks the platform default — the "
+           "`--resolve-library` arm must run BEFORE the shipped-descriptor arm. "
+           "Got '" << *pulledLibrary << "'; the platform's answer is '"
+        << *platformLibrary << "'";
+}
+
+TEST(ArchiveMemberResolveLibraryImport, ElfOperatorNamedLibraryOutranksTheCorpus) {
+    Schemas s = loadSchemas();
+    loadStaticlibSchema(s, "elf64-x86_64-linux-staticlib");
+    auto dynF = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-dyn");
+    ASSERT_TRUE(dynF) << "elf dyn schema load";
+    expectOperatorNamedLibraryOutranksThePlatformCorpus(s, **dynF, "elf64-x86_64");
+}
+
+TEST(ArchiveMemberResolveLibraryImport, CoffOperatorNamedLibraryOutranksTheCorpus) {
+    Schemas s = loadCoffSchemas();
+    loadStaticlibSchema(s, "pe64-x86_64-windows-staticlib");
+    auto dynF = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-dll");
+    ASSERT_TRUE(dynF) << "pe dll schema load";
+    expectOperatorNamedLibraryOutranksThePlatformCorpus(s, **dynF, "pe64-x86_64");
+}
+
+// ★★ THE FAIL-LOUD DIRECTION, PINNED IN THE PRESENCE OF THE FLAG. A binder that
+// widens what it accepts every time it misses would eventually bind a typo; the
+// guard has to hold with a `--resolve-library` binary in hand. The member's
+// reference names a symbol NOTHING defines and the named library does NOT
+// export, so it must come back UNBOUND and the link must still refuse it with
+// the full `K_SymbolUndefined` message.
+TEST(ArchiveMemberResolveLibraryImport, GenuinelyUndefinedSymbolStillFailsLoud) {
+    Schemas s = loadSchemas();
+    loadStaticlibSchema(s, "elf64-x86_64-linux-staticlib");
+    auto dynF = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-dyn");
+    ASSERT_TRUE(dynF) << "elf dyn schema load";
+    ASSERT_TRUE(s.target && s.exec && s.staticlib && s.grammar);
+
+    ScratchDir dir{Location::InsideRepo, "static-link"};
+    auto const dynPath =
+        buildDynamicLibrary(dir.path(), "dss_dyn", kDynLibSrc, s, **dynF);
+    ASSERT_FALSE(dynPath.empty());
+
+    // The member calls a name the stand-in library does NOT export and no
+    // descriptor row realizes.
+    constexpr std::string_view kTypoLibSrc =
+        "extern int dss_no_such_symbol_anywhere(void);\n"
+        "int dss_lib_answer(void){ return dss_no_such_symbol_anywhere(); }\n";
+    auto const archive = buildArchiveThroughStaticlibFormat(
+        dir.path(), "libtypo.a", {{std::string{kTypoLibSrc}, "typo"}}, s);
+    ASSERT_FALSE(archive.empty());
+
+    DiagnosticReporter mainRep;
+    auto mainMod = assembleFromSource(std::string{kMainSrc}, "main.c", s,
+                                      *s.exec, mainRep);
+    ASSERT_TRUE(mainMod);
+
+    std::vector<ResolveLibrarySpec> const dynamicLibs{
+        ResolveLibrarySpec{dynPath, std::string{kStatedIdentity}}};
+    DiagnosticReporter pullRep;
+    std::vector<fs::path> const archives{archive};
+    auto pulled = pullStaticArchiveMembers(
+        *mainMod, archives,
+        std::span<ResolveLibrarySpec const>{dynamicLibs}, *s.target, *s.exec,
+        pullRep);
+    ASSERT_TRUE(pulled) << "pull failed; errs=" << pullRep.errorCount();
+    ASSERT_EQ(pulled->size(), 1u);
+    EXPECT_EQ(pullRep.errorCount(), 0u)
+        << "an unbindable member reference is not the PULL's error — the LINK "
+           "tier judges the reference (C23 5.1.1.2 phase 8)";
+
+    auto const typoLibrary =
+        importLibraryOf((*pulled)[0], "dss_no_such_symbol_anywhere");
+    ASSERT_TRUE(typoLibrary) << "the pulled member must still import the name";
+    EXPECT_TRUE(typoLibrary->empty())
+        << "nothing defines this symbol and the named library does not export "
+           "it, so the row must stay UNBOUND. Got '" << *typoLibrary << "'";
+
+    std::vector<AssembledModule> combined;
+    combined.push_back(*mainMod);
+    combined.push_back((*pulled)[0]);
+    DiagnosticReporter linkRep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{combined.data(), combined.size()},
+        *s.target, *s.exec, linkRep);
+    EXPECT_FALSE(image.ok())
+        << "a genuinely undefined symbol must still fail the link";
+    EXPECT_GE(countCode(linkRep, DiagnosticCode::K_SymbolUndefined), 1u)
+        << "the undefined reference must still be rejected LOUD by the "
+           "reference gate — the presence of a --resolve-library binary must "
+           "not weaken the guard";
+    bool namedTheSymbol = false;
+    for (auto const& d : linkRep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined
+            && d.actual.find("dss_no_such_symbol_anywhere") != std::string::npos) {
+            namedTheSymbol = true;
+        }
+    }
+    EXPECT_TRUE(namedTheSymbol)
+        << "the rejection must NAME the symbol — the message quality is part of "
+           "the contract, not incidental";
+}
+
+// ★★ A NAMED BINARY THAT CANNOT BE READ REFUSES THE PULL — it must never leave
+// the flag QUIETLY INEFFECTIVE, which is the shape of the whole anchor. Feeding
+// an ELF link a PE `.dll` is caught by the target-aware read chokepoint
+// (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL) — the two formats are
+// both undecorated, so nothing else would catch it and the image would record an
+// import naming a library of the wrong format: a LOAD-time death with no
+// build-time signal.
+TEST(ArchiveMemberResolveLibraryImport, WrongFormatNamedBinaryRefusesThePull) {
+    Schemas elf = loadSchemas();
+    loadStaticlibSchema(elf, "elf64-x86_64-linux-staticlib");
+    ASSERT_TRUE(elf.target && elf.exec && elf.staticlib && elf.grammar);
+
+    Schemas pe = loadCoffSchemas();
+    auto peDynF = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-dll");
+    ASSERT_TRUE(peDynF) << "pe dll schema load";
+
+    ScratchDir dir{Location::InsideRepo, "static-link"};
+    // A genuine PE `.dll`, handed to an ELF link.
+    auto const peDll =
+        buildDynamicLibrary(dir.path(), "dss_dyn.dll", kDynLibSrc, pe, **peDynF);
+    ASSERT_FALSE(peDll.empty());
+
+    auto const archive = buildArchiveThroughStaticlibFormat(
+        dir.path(), "libusesdyn.a", {{std::string{kUsesDynLibSrc}, "usesdyn"}},
+        elf);
+    ASSERT_FALSE(archive.empty());
+
+    DiagnosticReporter mainRep;
+    auto mainMod = assembleFromSource(std::string{kMainSrc}, "main.c", elf,
+                                      *elf.exec, mainRep);
+    ASSERT_TRUE(mainMod);
+
+    std::vector<ResolveLibrarySpec> const dynamicLibs{
+        ResolveLibrarySpec{peDll, ""}};
+    DiagnosticReporter pullRep;
+    std::vector<fs::path> const archives{archive};
+    auto pulled = pullStaticArchiveMembers(
+        *mainMod, archives,
+        std::span<ResolveLibrarySpec const>{dynamicLibs}, *elf.target,
+        *elf.exec, pullRep);
+    EXPECT_FALSE(pulled.has_value())
+        << "a --resolve-library binary of the WRONG object format must REFUSE "
+           "the pull, not be silently skipped";
+    EXPECT_GT(pullRep.errorCount(), 0u)
+        << "and the refusal must be reported — the chokepoint names the path "
+           "and the structural cause";
+}
+
+// ★★★ THE DRIVER-LEVEL PIN, AND IT EXISTS BECAUSE A MUTANT PROVED THE UNIT
+// CASES ABOVE DO NOT COVER WHAT THE DEFECT ACTUALLY WAS.
+//
+// Every case above calls `pullStaticArchiveMembers` DIRECTLY and hands it the
+// library list itself. That asserts the pull binds correctly — it asserts
+// NOTHING about whether the DRIVER ever gives it the list, which is precisely
+// the half that was broken: `pullStaticArchiveMembers` was never handed
+// `--resolve-library` at all.
+//
+// ✔MEASURED (this cycle, mutant D): dropping the threading at ONE of the three
+// `linkAndWriteWithStaticArchives` call sites in `Program`'s per-target compile
+// reproduced the original CLI failure EXACTLY — rc=1,
+// `undefined symbol 'dss_dyn_answer'` — while the whole in-process suite above
+// stayed GREEN, 32/32. A gap no test can see is the shape this repo has already
+// paid for once (two corpus runners, one enforcing and its sibling shrugging),
+// so the threading gets its own witness through the real driver.
+//
+// THREE SEQUENTIAL IN-PROCESS `Program` BUILDS INTO ONE SHARED OUTPUT DIR — the
+// same shape `PeFatArchiveSequentialInProcessMergeExecRunsFortyTwo` uses, and
+// the same three steps as the measured CLI repro:
+//   1. dynsrc.dll  (pe64 dll)       defining dss_dyn_answer() = 42
+//   2. usesdyn.lib (pe64 staticlib) calling it, RESOLVING dynsrc.dll
+//   3. client.exe  (pe64 exec)      calling dss_lib_answer, RESOLVING BOTH
+// Step 3 is the one that returned rc=1 before the fix: the member pulled out of
+// usesdyn.lib carries `dss_dyn_answer` as a bare NAME, and only the operator's
+// `--resolve-library dynsrc.dll` can say which image owns it.
+TEST(StaticLink, PeArchiveMemberBindsAnOperatorNamedLibraryThroughTheDriver) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+
+    // ── Build 1: dynsrc.dll — the operator's own dynamic library ──
+    auto const dynSrc = writeSrc(dir, "dynsrc.c", kDynLibSrc);
+    Program pDyn;
+    pDyn.setOutputDir(dir);
+    DiagnosticReporter repDyn;
+    ASSERT_EQ(pDyn.compileFiles(
+                  std::vector<std::string>{dynSrc.string()}, "c-subset",
+                  std::vector<std::string>{"x86_64:pe64-x86_64-windows-dll"},
+                  repDyn),
+              0) << "dynsrc.dll build must succeed; errs=" << repDyn.errorCount();
+    auto const dynDll = dir / "dynsrc.dll";
+    ASSERT_TRUE(fs::exists(dynDll)) << "the driver must emit dynsrc.dll";
+
+    // ── Build 2: usesdyn.lib — a STATIC library whose member calls into it ──
+    // Built WITH `--resolve-library dynsrc.dll`, exactly as the CLI repro does.
+    // The binding is correct HERE and is then LOST: the archive member records
+    // `dss_dyn_answer` as a name and no format has anywhere to put the library.
+    auto const usesSrc = writeSrc(dir, "usesdyn.c", kUsesDynLibSrc);
+    Program pLib;
+    pLib.setOutputDir(dir);
+    pLib.setResolveLibraries(std::vector<fs::path>{dynDll});
+    DiagnosticReporter repLib;
+    ASSERT_EQ(pLib.compileFiles(
+                  std::vector<std::string>{usesSrc.string()}, "c-subset",
+                  std::vector<std::string>{"x86_64:pe64-x86_64-windows-staticlib"},
+                  repLib),
+              0) << "usesdyn.lib build must succeed; errs=" << repLib.errorCount();
+    auto const usesLib = dir / "usesdyn.lib";
+    ASSERT_TRUE(fs::exists(usesLib)) << "the driver must emit usesdyn.lib";
+
+    // ── Build 3: client.exe — THE STEP THAT RETURNED rc=1 ──
+    auto const clientSrc = writeSrc(dir, "client.c", kMainSrc);
+    Program pClient;
+    pClient.setOutputDir(dir);
+    pClient.setResolveLibraries(std::vector<fs::path>{dynDll, usesLib});
+    DiagnosticReporter repClient;
+    int const rcClient = pClient.compileFiles(
+        std::vector<std::string>{clientSrc.string()}, "c-subset",
+        std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, repClient);
+    EXPECT_EQ(countCode(repClient, DiagnosticCode::K_SymbolUndefined), 0u)
+        << "the pulled member's dss_dyn_answer must bind to the library the "
+           "OPERATOR named. Before the fix this reported K_SymbolUndefined — the "
+           "driver never handed the `--resolve-library` list to the archive pull "
+           "(D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY)";
+    ASSERT_EQ(rcClient, 0) << "client.exe link must succeed; errs="
+                           << repClient.errorCount();
+    auto const clientExe = dir / "client.exe";
+    ASSERT_TRUE(fs::exists(clientExe)) << "the driver must emit client.exe";
+
+#if defined(_WIN32)
+    // RUN (Windows host): `dss_lib_answer`'s body came out of usesdyn.lib and
+    // its call to `dss_dyn_answer` is a real PE import of dynsrc.dll, which sits
+    // beside the exe. A binding that named the wrong image — or none — would
+    // fault at LOAD (0xC0000139) rather than return 42, which is exactly why
+    // this witness is a RUN and not a header inspection.
+    auto const r = runBinary(clientExe, std::chrono::milliseconds{5000});
+    ASSERT_TRUE(r.spawned) << "client.exe must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE acceptance criterion: exit 42 = dss_dyn_answer(), reached "
+           "through an archive member whose import was re-bound at pull time to "
+           "the operator-named dynsrc.dll";
+#endif  // _WIN32
 }

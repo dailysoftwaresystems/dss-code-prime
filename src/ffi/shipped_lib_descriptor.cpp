@@ -1,5 +1,6 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 
+#include "core/types/config_key_vocabulary.hpp"   // the ONE closed-key check + the `$`-prose carve-out
 #include "core/types/config_path_walk.hpp"       // findShippedConfigDir — shared src/dss-config/<dir> resolver
 #include "core/types/data_model.hpp"             // dataModelFromName (signatureByDataModel keys)
 #include "core/types/diagnostic_reporter.hpp"
@@ -104,25 +105,36 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
     return &it->second;
 }
 
-// D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD enforcement (mirrors
-// optimizer_json.cpp::rejectUnknownKeys). Reports one
+// D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD enforcement. Reports one
 // F_ShippedLibDescriptorMalformed per key not in the allow-list. Returns true
 // iff every key was known.
+//
+// ★★ AN ADAPTER OVER THE SHARED CHECK, AND THE MOVE FIXED A LIVE BUG HERE.
+// This was one of four independently hand-written `rejectUnknownKeys` helpers
+// and it applied the `$`-documentation carve-out at exactly ONE of its 19 call
+// sites — as a literal `"$comment"` smuggled into the ROOT allow-list. So the
+// convention held for the root object and for nothing else: a `$comment` on a
+// symbol row, a struct, a macro or a `when` guard was REFUSED as a typo, and
+// only `$comment` ever worked even there (`$abiComment`, the spelling shipped
+// targets really use, never did). That is precisely the "carve-out remembered
+// per site" failure the shared header exists to abolish, which is why the
+// literal is now GONE from the root list: the PREFIX predicate applies to all
+// 19 sites because the caller no longer writes the loop.
+//
+// `objPath` doubles as the object LABEL — it is already the most specific
+// name this loader has for the object ("(root)", "symbols[3]", "macros[7]"),
+// so the message names it once instead of twice.
 [[nodiscard]] bool rejectUnknownKeys(DiagnosticReporter& reporter,
                                      json const& obj, std::string const& objPath,
                                      std::initializer_list<std::string_view> allowed) {
     bool ok = true;
-    for (auto const& kv : obj.items()) {
-        bool known = false;
-        for (auto k : allowed) { if (kv.key() == k) { known = true; break; } }
-        if (!known) {
+    detail::rejectUnknownKeys(obj, allowed, "'" + objPath + "'",
+        [&](std::string_view, std::string message) {
             ok = false;
             emitMalformed(reporter,
-                std::string{"shipped-lib descriptor "} + objPath
-                    + ": unknown key '" + kv.key()
-                    + "' (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD)");
-        }
-    }
+                std::string{"shipped-lib descriptor: "} + std::move(message)
+                    + " (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD)");
+        });
     return ok;
 }
 
@@ -1526,15 +1538,18 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     json const& symbols =
         doc.contains("symbols") ? doc.at("symbols") : emptyArray;
 
-    // Reject unknown top-level keys (closed key set). `$comment` is the
-    // repo-wide config-documentation convention (a `$`-prefixed key carrying a
-    // human note, e.g. the LP64-vs-LLP64 deferral rationale in stdio/stdlib) —
-    // accepted + ignored, never consumed by lowering.
+    // Reject unknown top-level keys (closed key set). `$comment` is NOT in
+    // this list any more and its absence is the fix, not an omission: the
+    // repo-wide config-documentation convention is a `$` PREFIX (a human note
+    // such as the LP64-vs-LLP64 deferral rationale in stdio/stdlib, under any
+    // `$…` spelling), and it is now applied by the shared check to this object
+    // AND to every nested one. Listing the literal here made the convention
+    // true of the root only, and true of one spelling only.
     (void)rejectUnknownKeys(reporter, doc, "(root)",
                             {"header", "standard", "library", "realization",
                              "availableObjectFormats",
                              "includes", "symbols", "constants", "floatConstants",
-                             "typedefs", "structs", "unions", "macros", "$comment"});
+                             "typedefs", "structs", "unions", "macros"});
 
     // (3.pre) TYPEDEFS resolved FIRST — Option C (D-FFI-DESCRIPTOR-TYPEDEF-NAME-
     // RESOLUTION). A descriptor's own typedefs are decoded BEFORE its symbols /

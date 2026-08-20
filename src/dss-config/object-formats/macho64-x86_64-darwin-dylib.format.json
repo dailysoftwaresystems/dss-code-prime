@@ -116,10 +116,11 @@
 
   "relocations": [
     {
-      "$comment": "X86_64_RELOC_BRANCH -- the extern-call reloc on a __stubs entry (a plain rel32 branch). kind = 1 matches x86_64.target.json's `rel32` row (nativeId is the packed (type<<28)|(length<<25)|(pcrel<<24)).",
+      "$comment": "X86_64_RELOC_BRANCH -- the extern-call reloc on a __stubs entry (a plain rel32 branch). kind = 1 matches x86_64.target.json's `rel32` row (nativeId is the packed (type<<28)|(length<<25)|(pcrel<<24)). ⚠⚠ VALUE CORRECTED 2026-08-20 (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-ROW): this row declared nativeId 369098752 = 0x16000000, which under the packing THIS COMMENT ITSELF states -- (type<<28)|(length<<25)|(pcrel<<24) -- decodes to r_type=1 (X86_64_RELOC_SIGNED), r_length=3 (8 bytes), r_pcrel=0. Every one of those three fields contradicts the row's own name and stated intent: BRANCH is r_type=2, 4 bytes, PC-relative. The `-darwin` and `-staticlib` siblings have always carried the correct 620756992 = 0x25000000 = (2<<28)|(2<<25)|(1<<24), and the arm64 family agrees on that same packed value for its own BRANCH26. ⓘ THE DEFECT WAS LATENT, NOT LIVE, AND IT IS WORTH SAYING WHICH: relocation_info records are emitted only by the MH_OBJECT writer, which reads the `-darwin`/`-staticlib` documents, so nothing consumed this number. It is corrected rather than left alone because the exec format serves a real `cli` profile with a real run leg, and a wrong declared value that no consumer reads today is precisely the shape that becomes a silent miscompile the day one does. ★ `isCall` (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL, 2026-08-20): this wire relocation can ONLY target executable code, so an object reader that meets an undefined extern through it has PROVEN the extern is a function rather than a data object -- the only classification signal a symbol-name-only reference offers. It is declared HERE, on the format row, and not derived from the target's formula, because a formula describes ARITHMETIC and not ROLE: `S + A - P` is the identical arithmetic for a call and for a PC-relative data reference, so the x86_64 target's `linear` is honest and simply carries no role, while aarch64's `aarch64_call26` looked like a role only because that CPU's branch has its own instruction encoding. ✔MEASURED 2026-08-20: every macho64-x86_64 archive member calling any library function was unreadable for exactly this reason while the arm64 sibling read the same source cleanly. The target document cannot carry it -- it is PER-CPU and shared with ELF, where the same `rel32` genuinely serves data references too.",
       "name": "X86_64_RELOC_BRANCH",
       "kind": 1,
-      "nativeId": 369098752
+      "nativeId": 620756992,
+      "isCall": true
     },
     {
       "$comment": "X86_64_RELOC_UNSIGNED (length 3 = 8 bytes) -- an abs64 data pointer; the walker emits a dyld rebase for it under the base slide. kind = 2.",
@@ -128,10 +129,10 @@
       "nativeId": 100663296
     },
     {
-      "$comment": "X86_64_RELOC_UNSIGNED (length 2 = 4 bytes) -- an abs32 data slot. kind = 3.",
+      "$comment": "X86_64_RELOC_UNSIGNED (length 2 = 4 bytes) -- an abs32 data slot. kind = 3. ⚠ VALUE CORRECTED 2026-08-20 (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-ROW): declared 33554432 = 0x02000000, which is r_length=1 = TWO bytes, for a row named _4 and (in the dylib sibling) commented \"length 2 = 4 bytes\". The correct packing is (0<<28)|(2<<25)|(0<<24) = 0x04000000 = 67108864, which is what the `-darwin`/`-staticlib` siblings carry. Same latency as the BRANCH row above: the MH_OBJECT writer is the only consumer of these numbers and it reads a different document.",
       "name": "X86_64_RELOC_UNSIGNED_4",
       "kind": 3,
-      "nativeId": 33554432
+      "nativeId": 67108864
     }
   ]
 }

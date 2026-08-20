@@ -3941,6 +3941,75 @@ TEST(GrammarSchema, ScopesBlockEmptyValidityStaysSilent) {
     ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
 }
 
+// ── `language` BLOCK closed key vocabulary (typo discriminator) ──────────
+//
+// ⚠⚠ THIS BLOCK HAD NO DISCRIMINATOR AT ALL until 2026-08-20, and the absence
+// had already bent the schema rather than merely leaving a diagnostic unfired:
+// `isa` and `identifierClass` sit at TOP LEVEL — where neither belongs — for the
+// stated reason that `language` could not check them, so language-scoped keys
+// were pushed out of the language block to borrow a check living elsewhere.
+// The direct failure was silent in the worst way: `fileExtensons` loaded
+// perfectly clean and produced an EMPTY extension list, i.e. a language that
+// recognises no source file, reported as nothing whatsoever.
+// D-CONFIG-GRAMMAR-LANGUAGE-BLOCK-HAS-NO-TYPO-DISCRIMINATOR.
+
+namespace {
+// A minimal loadable document whose `language` block carries one extra key.
+[[nodiscard]] std::string languageBlockWith(std::string_view extra) {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "LangKeys", "version": "0.1.0"%X% },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } }
+    })JSON";
+    auto const pos = cfg.find("%X%");
+    cfg.replace(pos, 3, extra);
+    return cfg;
+}
+} // namespace
+
+// Baseline, and it is not decoration: without it a mutant that rejects EVERY
+// key would still turn the negative cases below green, and the pin would be
+// asserting nothing.
+TEST(GrammarSchema, LanguageBlockClosedKeyBaselineLoadsCleanly) {
+    auto r = GrammarSchema::loadFromText(languageBlockWith(
+        R"(, "fileExtensions": [".lk"])"));
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+}
+
+// The exact real-world shape: one transposed letter in the OPTIONAL key, whose
+// absence means "no extensions". This is the case that used to load clean.
+TEST(GrammarSchema, LanguageBlockMisspelledFileExtensionsReportsMalformed) {
+    auto r = GrammarSchema::loadFromText(languageBlockWith(
+        R"(, "fileExtensons": [".lk"])"));
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled 'fileExtensions' must fail the load — it yields an "
+           "EMPTY extension list, i.e. a language matching no source file";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// A second, differently-spelled key, so the pin asserts the VOCABULARY rather
+// than one special-cased name.
+TEST(GrammarSchema, LanguageBlockUnknownKeyReportsMalformed) {
+    auto r = GrammarSchema::loadFromText(languageBlockWith(
+        R"(, "identifierClass": "unicode")"));
+    ASSERT_FALSE(r.has_value())
+        << "'identifierClass' is a TOP-LEVEL key; inside 'language' it is read "
+           "by nothing and must not be accepted in silence";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// `$`-prefixed documentation keys stay EXEMPT here too — the carve-out is
+// codebase-wide, and a check that refused them would red every shipped
+// document that annotates its own language block.
+TEST(GrammarSchema, LanguageBlockDocumentationKeyStaysExempt) {
+    auto r = GrammarSchema::loadFromText(languageBlockWith(
+        R"(, "$comment": "why this language exists", "$originComment": "x")"));
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+}
+
 // ── TOP-LEVEL document closed key vocabulary (typo discriminator) ────────
 //
 // The widest-blast-radius instance: every block is optional and absence is

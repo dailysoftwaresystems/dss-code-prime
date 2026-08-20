@@ -380,7 +380,8 @@ TEST(RuntimeObjectCacheSibling, EveryShippedExecFormatResolvesItsExactSibling) {
             << "shipped target failed to load: " << testCase.target;
 
         auto const sibling =
-            resolveArchiveSiblingFormat(**format, **target, formatsDir);
+            resolveArchiveSiblingFormat(**format, **target, formatsDir,
+            dss::runtime::kRuntimeCacheSiblingRequester);
         ASSERT_TRUE(sibling.has_value())
             << testCase.buildFormat << " refused: " << sibling.error();
         EXPECT_EQ(*sibling, testCase.expectedSibling)
@@ -407,7 +408,8 @@ TEST(RuntimeObjectCacheSibling, SpirvHasNoArchiveSiblingAndRefusesByName) {
     ASSERT_TRUE(target.has_value());
 
     auto const sibling =
-        resolveArchiveSiblingFormat(**format, **target, formatsDir);
+        resolveArchiveSiblingFormat(**format, **target, formatsDir,
+            dss::runtime::kRuntimeCacheSiblingRequester);
     ASSERT_FALSE(sibling.has_value())
         << "spirv resolved a sibling it cannot have: " << *sibling;
     EXPECT_TRUE(contains(sibling.error(), "'spirv-1.6'")) << sibling.error();
@@ -429,7 +431,8 @@ TEST(RuntimeObjectCacheSibling, WasmHasNoArchiveSiblingAndRefusesByName) {
     ASSERT_TRUE(target.has_value());
 
     auto const sibling =
-        resolveArchiveSiblingFormat(**format, **target, formatsDir);
+        resolveArchiveSiblingFormat(**format, **target, formatsDir,
+            dss::runtime::kRuntimeCacheSiblingRequester);
     ASSERT_FALSE(sibling.has_value())
         << "wasm resolved a sibling it cannot have: " << *sibling;
     EXPECT_TRUE(contains(sibling.error(), "'wasm32-v1'")) << sibling.error();
@@ -484,7 +487,8 @@ TEST(RuntimeObjectCacheSibling, TwoAgreeingArchiveFormatsRefuseAndNameBoth) {
     // phase-2 refusal can only be caused by the second document.
     {
         auto const unique =
-            resolveArchiveSiblingFormat(**format, **target, formatsDir);
+            resolveArchiveSiblingFormat(**format, **target, formatsDir,
+            dss::runtime::kRuntimeCacheSiblingRequester);
         ASSERT_TRUE(unique.has_value())
             << "the one-candidate control refused: " << unique.error();
         EXPECT_EQ(*unique, "elf64-x86_64-linux-staticlib");
@@ -495,7 +499,8 @@ TEST(RuntimeObjectCacheSibling, TwoAgreeingArchiveFormatsRefuseAndNameBoth) {
         formatsDir / "elf64-x86_64-linux-staticlib-clone.format.json", clone));
 
     auto const ambiguous =
-        resolveArchiveSiblingFormat(**format, **target, formatsDir);
+        resolveArchiveSiblingFormat(**format, **target, formatsDir,
+            dss::runtime::kRuntimeCacheSiblingRequester);
     ASSERT_FALSE(ambiguous.has_value())
         << "two agreeing archive formats resolved to one answer ('"
         << (ambiguous.has_value() ? *ambiguous : std::string{})
@@ -524,7 +529,8 @@ TEST(RuntimeObjectCacheSibling, MissingObjectFormatDirectoryRefuses) {
     fs::path const absent = scratch.path() / "no-such-object-formats";
     ASSERT_FALSE(fs::exists(absent));
 
-    auto const sibling = resolveArchiveSiblingFormat(**format, **target, absent);
+    auto const sibling = resolveArchiveSiblingFormat(**format, **target, absent,
+            dss::runtime::kRuntimeCacheSiblingRequester);
     ASSERT_FALSE(sibling.has_value());
     EXPECT_TRUE(contains(sibling.error(), absent.generic_string()))
         << sibling.error();

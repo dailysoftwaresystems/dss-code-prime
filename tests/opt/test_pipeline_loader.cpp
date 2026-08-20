@@ -334,6 +334,67 @@ TEST(PipelineLoader, UnknownNodeKeyRejects) {
     EXPECT_TRUE(msgHas(r2.error(), "unknown key"));
 }
 
+// ── `$`-DOCUMENTATION KEYS, ON EVERY OBJECT ──────────────────────────────
+//
+// The repo-wide convention is that ANY config object may carry a `$`-prefixed
+// PROSE key. This loader's hand-written `rejectUnknownKeys` applied NO such
+// carve-out — not a literal, not a predicate — so a `$comment` explaining why
+// a pipeline is shaped the way it is was REFUSED as a typo, at every one of
+// its four objects. A real refusal of a valid document: the inverse of a
+// silent drop, and just as wrong. The check now comes from
+// `core/types/config_key_vocabulary.hpp`, where the carve-out is unskippable
+// because the caller no longer writes the loop.
+//
+// ⚠ Each accept is paired with the SAME document carrying a NON-`$` unknown
+// key in the SAME position. Without that pairing this test would also pass
+// against a loader that accepted everything, which is the defect the
+// discriminator exists to prevent (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD).
+//
+// RED-ON-DISABLE: remove the `isDocumentationKey` skip in `dss::detail::
+// rejectUnknownKeys` and the accepting arms go red; remove the membership loop
+// and the rejecting arms go red.
+TEST(PipelineLoader, DocumentationKeysAcceptedAtEveryObjectOrdinaryKeysStillRejected) {
+    // Root, `pipeline`, and a node body — all three objects at once.
+    auto ok = opt::loadPipelineFromText(
+        R"({"$comment": "why this schedule",
+             "dssPipelineVersion": 1,
+             "pipeline": {"$nameComment": "the flat spelling",
+               "name": "x", "passes": [
+                 {"fixpoint": {"$boundComment": "converges fast",
+                               "max": 2, "passes": ["Identity"]}}]}})",
+        "doc-keys-ok.json");
+    ASSERT_TRUE(ok.has_value())
+        << "a `$`-prefixed key is PROSE at every config object, and the prefix "
+           "is the rule — not the single spelling `$comment`";
+
+    // The same three positions, each with an ORDINARY unknown key: all refused.
+    struct Arm { char const* label; char const* text; };
+    Arm const arms[] = {
+        {"root", R"({"comment": "x", "dssPipelineVersion": 1,
+                     "pipeline": {"name": "x", "passes": ["Identity"]}})"},
+        {"pipeline block", R"({"dssPipelineVersion": 1,
+                     "pipeline": {"comment": "x", "name": "x",
+                                  "passes": ["Identity"]}})"},
+        {"node body", R"({"dssPipelineVersion": 1,
+                     "pipeline": {"name": "x", "passes": [
+                       {"fixpoint": {"comment": "x", "max": 2,
+                                     "passes": ["Identity"]}}]}})"},
+    };
+    for (auto const& a : arms) {
+        auto bad = opt::loadPipelineFromText(a.text, "doc-keys-bad.json");
+        EXPECT_FALSE(bad.has_value())
+            << "an ordinary unknown key at the " << a.label << " must still be "
+               "refused — otherwise the `$` accept above proves only that the "
+               "discriminator was switched off";
+        if (bad.has_value()) continue;
+        EXPECT_TRUE(hasCode(bad.error(), DiagnosticCode::X_PipelineMalformed));
+        EXPECT_TRUE(msgHas(bad.error(),
+                           "D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD"))
+            << "the anchor id must survive the move to the shared check — it "
+               "is how this rule is found from a failing document";
+    }
+}
+
 // Non-string, non-object element → X_PipelineMalformed.
 TEST(PipelineLoader, NonStringNonObjectElementRejects) {
     auto r = opt::loadPipelineFromText(

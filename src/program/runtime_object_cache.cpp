@@ -726,16 +726,18 @@ writeThroughTemp(RuntimeObjectKey const&       key,
 // ═══ THE ARCHIVE-SIBLING LOOKUP ══════════════════════════════════════════════
 
 std::expected<std::string, std::string>
-resolveArchiveSiblingFormat(ObjectFormatSchema const& buildFormat,
-                            TargetSchema const&       target,
-                            fs::path const&           objectFormatsDir) {
+resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
+                            TargetSchema const&            target,
+                            fs::path const&                objectFormatsDir,
+                            ArchiveSiblingRequester const& requester) {
     std::error_code ec;
     if (!fs::is_directory(objectFormatsDir, ec) || ec) {
         return std::unexpected(std::format(
-            "runtime object cache: the object-format directory '{}' does not "
+            "{}: the object-format directory '{}' does not "
             "exist or is not a directory, so the archive-writing sibling of "
             "build format '{}' cannot be resolved. Anchored: {}.",
-            objectFormatsDir.generic_string(), buildFormat.name(), kAnchor));
+            requester.label, objectFormatsDir.generic_string(),
+            buildFormat.name(), requester.anchor));
     }
 
     // ── STEP 1: enumerate, then SORT BY FILENAME ────────────────────────────
@@ -751,18 +753,20 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const& buildFormat,
         fs::directory_iterator it(objectFormatsDir, ec);
         if (ec) {
             return std::unexpected(std::format(
-                "runtime object cache: could not open the object-format "
+                "{}: could not open the object-format "
                 "directory '{}': {}. Anchored: {}.",
-                objectFormatsDir.generic_string(), ec.message(), kAnchor));
+                requester.label, objectFormatsDir.generic_string(),
+                ec.message(), requester.anchor));
         }
         for (fs::directory_iterator const end{}; it != end; it.increment(ec)) {
             if (ec) {
                 return std::unexpected(std::format(
-                    "runtime object cache: the scan of object-format directory "
+                    "{}: the scan of object-format directory "
                     "'{}' was interrupted after PARTIAL enumeration: {}. A "
                     "partial scan cannot prove the archive-writing sibling is "
                     "unique, so this is a refusal. Anchored: {}.",
-                    objectFormatsDir.generic_string(), ec.message(), kAnchor));
+                    requester.label, objectFormatsDir.generic_string(),
+                    ec.message(), requester.anchor));
             }
             // A dedicated error_code: `ec` carries the ITERATION's status and
             // clobbering it here would let a probe failure masquerade as a
@@ -801,14 +805,14 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const& buildFormat,
                 detail += diag.message;
             }
             return std::unexpected(std::format(
-                "runtime object cache: object-format document '{}' failed to "
+                "{}: object-format document '{}' failed to "
                 "load while scanning for the archive-writing sibling of build "
                 "format '{}': {}. The scan must be TOTAL — a document that "
                 "cannot be read could have been a second candidate, so "
                 "skipping it would turn an AMBIGUOUS set into a silently "
                 "UNIQUE one. Anchored: {}.",
-                document.generic_string(), buildFormat.name(), detail,
-                kAnchor));
+                requester.label, document.generic_string(), buildFormat.name(),
+                detail, requester.anchor));
         }
         ObjectFormatSchema const& candidate = **loaded;
 
@@ -840,29 +844,32 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const& buildFormat,
 
     if (matches.empty()) {
         return std::unexpected(std::format(
-            "runtime object cache: build format '{}' (kind '{}') has NO "
+            "{}: build format '{}' (kind '{}') has NO "
             "archive-writing sibling object format that agrees with target "
-            "'{}'. A runtime unit is compiled into a single-member STATIC "
-            "ARCHIVE, so a format whose kind ships no `container: \"archive\"` "
-            "document for this target's machine cannot realize the shipped "
-            "implementation half at all. Scanned {} document(s) in '{}'. "
+            "'{}'. A relocatable object — a static archive's MEMBER — is "
+            "described by the `container: \"archive\"` document for its "
+            "machine, so a format whose kind ships none for this target's "
+            "machine has no object vocabulary to write members with, and none "
+            "to read them back through. Scanned {} document(s) in '{}'. "
             "Anchored: {}.",
-            buildFormat.name(), objectFormatKindName(buildFormat.kind()),
-            target.name(), documents.size(),
-            objectFormatsDir.generic_string(), kAnchor));
+            requester.label, buildFormat.name(),
+            objectFormatKindName(buildFormat.kind()), target.name(),
+            documents.size(), objectFormatsDir.generic_string(),
+            requester.anchor));
     }
 
     return std::unexpected(std::format(
-        "runtime object cache: build format '{}' (kind '{}') has {} AMBIGUOUS "
+        "{}: build format '{}' (kind '{}') has {} AMBIGUOUS "
         "archive-writing siblings for target '{}': {}. Refusing to pick one — "
         "a first-match rule would let filesystem enumeration order decide the "
         "answer (sorted on NTFS, hash-ordered on ext4), so the same tree would "
-        "compile the runtime against a different format on different hosts. "
+        "resolve a different object format on different hosts. "
         "Make exactly one archive-writing format agree with this target's "
         "machine. Scanned {} document(s) in '{}'. Anchored: {}.",
-        buildFormat.name(), objectFormatKindName(buildFormat.kind()),
-        matches.size(), target.name(), quotedList(matches), documents.size(),
-        objectFormatsDir.generic_string(), kAnchor));
+        requester.label, buildFormat.name(),
+        objectFormatKindName(buildFormat.kind()), matches.size(),
+        target.name(), quotedList(matches), documents.size(),
+        objectFormatsDir.generic_string(), requester.anchor));
 }
 
 // ═══ THE TWO ROOTS ═══════════════════════════════════════════════════════════

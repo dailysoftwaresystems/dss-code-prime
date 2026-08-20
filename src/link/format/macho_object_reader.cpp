@@ -54,6 +54,17 @@ constexpr std::size_t kHdrMagicOff    = 0;
 constexpr std::size_t kHdrFiletypeOff = 12;
 constexpr std::size_t kHdrNcmdsOff    = 16;
 constexpr std::size_t kHdrSizeCmdsOff = 20;
+constexpr std::size_t kHdrFlagsOff    = 24;
+
+// mach_header_64.flags: MH_SUBSECTIONS_VIA_SYMBOLS (<mach-o/loader.h>). The
+// producer's statement that "the sections in this file may be divided into
+// individual blocks, and those blocks may be moved or dead-stripped
+// independently" -- i.e. EVERY defined symbol starts its own atom unless it
+// says otherwise with N_ALT_ENTRY. This is the flag that makes an object's
+// symbol table SUFFICIENT to slice it, which is exactly what a size-less
+// nlist_64 otherwise is not (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-
+// LABEL-NOT-ATOM).
+constexpr std::uint32_t kMhSubsectionsViaSymbols = 0x00002000u;
 
 // nlist_64.n_type masks (<mach-o/nlist.h>).
 constexpr std::uint8_t kNStabMask = 0xE0u;  // any stab bit -> debug entry
@@ -62,6 +73,28 @@ constexpr std::uint8_t kNTypeMask = 0x0Eu;  // N_TYPE
 constexpr std::uint8_t kNExtBit   = 0x01u;  // external
 constexpr std::uint8_t kNTypeUndf = 0x00u;  // N_UNDF (undefined -> extern)
 constexpr std::uint8_t kNTypeSect = 0x0Eu;  // N_SECT (defined in a section)
+
+// nlist_64.n_desc bits (<mach-o/nlist.h>). N_ALT_ENTRY marks a defined symbol
+// as an ALTERNATE ENTRY POINT of the atom that precedes it rather than the
+// start of an atom of its own -- the `.alt_entry` assembler directive, and the
+// ONLY discriminator Mach-O has between an interior label and a whole body,
+// since nlist_64 carries no size field.
+//
+// ⚠ 0x0200, NOT 0x0020. ✔MEASURED 2026-08-20, not read off a table: clang 19
+// targeting arm64-apple-macos assembling an explicit `.alt_entry _inner`
+// directive emits n_desc=0x0200 for `_inner`, while a `static` C function
+// carrying `__attribute__((used))` -- which lowers to `.no_dead_strip` --
+// emits n_desc=0x0020 in the SAME object. 0x0020 is N_NO_DEAD_STRIP, named
+// here because it is the near-miss that would invert this reader on precisely
+// the input this work exists to read: a `used` file-local helper (the shape a
+// `static` function needs to survive -O2) would be classified as an interior
+// label and its bytes dropped.
+constexpr std::uint16_t kNDescAltEntry    = 0x0200u;  // N_ALT_ENTRY
+constexpr std::uint16_t kNDescNoDeadStrip = 0x0020u;  // N_NO_DEAD_STRIP (NOT alt-entry)
+static_assert(kNDescAltEntry != kNDescNoDeadStrip,
+              "N_ALT_ENTRY (0x0200) and N_NO_DEAD_STRIP (0x0020) are different "
+              "bits -- confusing them silently drops a `used` static function's "
+              "body (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM)");
 
 // section_64.flags: the low byte is the section TYPE; S_ZEROFILL (1) marks
 // a bss-style section that reserves an addr span but stores NO file bytes.
@@ -77,16 +110,21 @@ constexpr std::uint32_t kRInfoSymbolnumMask = 0x00FFFFFFu;
 constexpr std::uint32_t kRInfoExternBit     = 1u << 27;
 constexpr std::uint32_t kRInfoNativeIdMask  = 0xF7000000u;
 
-// Is this target-schema reloc formula a FUNCTION CALL / BRANCH (as opposed
-// to a data-address computation)? The AGNOSTIC "extern is a function"
-// signal on Mach-O: aarch64 ARM64_RELOC_BRANCH26 carries the
-// `Aarch64Call26` formula. Mach-O declares NO PLT-variant native id (an
-// extern call is BRANCH26 against the same id whether or not ld64 builds a
-// stub), so this formula test is the whole signal -- no `pltNativeId` leg
-// (unlike the ELF reader, whose x86_64 rel32 leans on a PLT variant).
-[[nodiscard]] constexpr bool isCallBranchFormula(RelocFormulaKind k) noexcept {
-    return k == RelocFormulaKind::Aarch64Call26;
-}
+// ── THE "EXTERN IS A FUNCTION" SIGNAL IS DECLARED, NOT DERIVED ──────────
+//
+// This file used to carry an `isCallBranchFormula` helper that answered the
+// question from the TARGET row's arithmetic formula (`Aarch64Call26`). It is
+// GONE (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL), and it must not come back as a
+// fallback: a formula describes ARITHMETIC, and the question is about ROLE.
+// The proxy held on AArch64 only by accident -- that CPU's branch has its own
+// instruction encoding, so its formula happens to be branch-specific. On
+// x86_64 it fails BY CONSTRUCTION: `S + A - P` is the identical arithmetic for
+// a call and for a PC-relative data reference, so `linear` is the honest
+// formula and carries no role at all. Every future target whose branch
+// arithmetic is `linear` -- which is most of them -- would inherit the same
+// defect from a fallback. The role now comes from the FORMAT row's `isCall`
+// declaration (see `ObjectFormatRelocationInfo::isCall`), collected into
+// `callSignalNativeIds` below.
 
 // Overflow-safe [off, off+size) within [0, total) -- the c159-c164
 // `rangeExceedsBuffer` shape (subtraction, never `off + size` which wraps
@@ -188,6 +226,12 @@ struct DefSym {
     std::string      name;
     SymbolBinding    binding    = SymbolBinding::Global;
     SymbolVisibility visibility = SymbolVisibility::Default;
+    // Set only for a symbol the GEOMETRY FALLBACK promoted: it was first
+    // recorded as a bodiless `ModuleSymbol` and only later found to start a
+    // body, so the slicing loop must not push a SECOND one. Suppressing the
+    // duplicate here rather than de-duplicating afterwards keeps `mod.symbols`
+    // in symbol-table order.
+    bool moduleSymbolAlreadyPushed = false;
 };
 
 // A reconstructed [start, start+len) byte range within one section, plus
@@ -201,7 +245,10 @@ struct Interval {
 
 // Sign-extend the low `width` bytes of `raw` to a signed 64-bit value --
 // the inverse of the writer truncating an `int64` addend to `widthBytes`
-// LE in the patched data slot (macho.cpp:1288). width is 4 or 8 (the
+// LE in the patched data slot (macho.cpp's IN-PLACE data-slot addend
+// convention -- see `buildDataRelocTable`'s block comment: Mach-O has no
+// RELA addend column, so a DATA slot carries its own addend and the final
+// value is S + slot). width is 4 or 8 (the
 // non-pcrel Linear kinds a data slot uses -- schema invariant (a)).
 [[nodiscard]] std::int64_t signExtendLE(std::uint64_t raw, std::uint8_t width) noexcept {
     if (width >= 8u) return static_cast<std::int64_t>(raw);
@@ -302,6 +349,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     }
     std::uint32_t const ncmds      = rdU32(bytes, kHdrNcmdsOff);
     std::uint32_t const sizeofcmds = rdU32(bytes, kHdrSizeCmdsOff);
+    // The producer's own statement about how its symbol table may be read --
+    // see `kMhSubsectionsViaSymbols` and step (6)'s classification.
+    bool const subsectionsViaSymbols =
+        (rdU32(bytes, kHdrFlagsOff) & kMhSubsectionsViaSymbols) != 0u;
     if (rangeExceedsBuffer(kMachHeader64Sz, sizeofcmds, bytes.size())) {
         return fail(DiagnosticCode::F_CorruptedBinary,
             "macho::readRelocatableObject: sizeofcmds="
@@ -468,31 +519,36 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // -- (4) Reverse reloc map (nativeId -> RelocationKind), from the
     //         FORMAT SCHEMA -- no hardcoded ARM64_RELOC_* numbers ---------
     //
-    // `callSignalNativeIds` collects the native ids that mark an extern as a
-    // FUNCTION: a row whose TARGET-schema formula is a call/branch class
-    // (aarch64 CALL26). Mach-O has NO PLT-variant id, so this formula test
-    // is the whole signal (unlike the ELF reader's PLT leg).
-    std::unordered_map<std::uint32_t, RelocationKind> nativeToKind;
-    std::unordered_set<std::uint32_t> callSignalNativeIds;
-    for (auto const& r : objectFormatSchema.relocations()) {
-        auto const ins = nativeToKind.emplace(r.nativeId, r.kind);
-        if (!ins.second && ins.first->second.v != r.kind.v) {
-            // A native id mapping to two DIFFERENT kinds is an ambiguous
-            // schema -- fail loud rather than let "last row wins" silently
-            // mis-decode (mirrors the ELF reader's duplicate-nativeId guard).
-            return fail(DiagnosticCode::F_CorruptedBinary,
-                "macho::readRelocatableObject: object format schema '"
-                + std::string{objectFormatSchema.name()}
-                + "' maps native reloc id " + std::to_string(r.nativeId)
-                + " to two different RelocationKinds ("
-                + std::to_string(ins.first->second.v) + " and "
-                + std::to_string(r.kind.v) + ") -- ambiguous reverse map.");
-        }
-        if (auto const* tri = targetSchema.relocationInfo(r.kind);
-            tri != nullptr && isCallBranchFormula(tri->formulaKind)) {
-            callSignalNativeIds.insert(r.nativeId);
-        }
+    // `callSignalNativeIds` collects the native ids that PROVE an extern
+    // reached through them is a FUNCTION: the rows the FORMAT declares
+    // `"isCall": true` on -- i.e. wire relocations that can only ever target
+    // executable code (ARM64_RELOC_BRANCH26, X86_64_RELOC_BRANCH). The
+    // declaration is read, never inferred; see the note above the byte
+    // helpers for why the target's arithmetic formula was the wrong
+    // vocabulary for this question (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL).
+    //
+    // Built by `ObjectFormatSchema::relocationDecodeTable()` — the SCHEMA's
+    // own answer to "which rows decode, and which wire ids are call signals",
+    // not a loop this reader owns. It used to be one, and it was WRONG in a
+    // way the ELF reader's copy was not: it fed EVERY row into the map,
+    // including an `emitOnly` EMISSION ALIAS, which `validate()` guarantees
+    // carries a different `kind` from the row owning its wire id -- so a
+    // Mach-O document declaring one would have been refused as an ambiguous
+    // reverse map, rejecting every object of that format. LOUD, and no shipped
+    // Mach-O document declares one, so nothing ever mis-decoded; the alias
+    // capability was simply unavailable here. Also gone with the copy: the
+    // omitted `pltNativeId` leg. Mach-O declares no PLT-variant id (an extern
+    // call is BRANCH26/BRANCH against the same id whether or not ld64
+    // synthesizes a stub), so the shared builder's leg costs nothing on every
+    // shipped document -- but it is now read from the SCHEMA rather than
+    // assumed absent by this reader.
+    auto decode = objectFormatSchema.relocationDecodeTable();
+    if (!decode) {
+        return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: " + decode.error());
     }
+    auto const& nativeToKind        = decode->nativeToKind;
+    auto const& callSignalNativeIds = decode->callSignalNativeIds;
 
     // -- (5) Decode every nlist_64; assign SymbolId = symtab index ---
     std::vector<Nlist> syms(nsyms);
@@ -515,14 +571,21 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // symtab index -> the extern's position in mod.externImports (for the
     // isData inference in step 7).
     std::unordered_map<std::uint32_t, std::size_t> externBySym;
-    // Defined N_SECT|N_EXT symbols grouped by 1-based n_sect ordinal --
-    // atom boundaries, sliced by sorted n_value in the per-section pass
-    // below. A NAMELESS or LOCAL (block) N_SECT symbol is NOT an atom
-    // boundary (see the loop) -- so it never splits a function.
+    // Defined N_SECT symbols that START AN ATOM, grouped by 1-based n_sect
+    // ordinal -- sliced by sorted n_value in the per-section pass below. Which
+    // symbols qualify is decided in the loop and depends on whether the object
+    // declares MH_SUBSECTIONS_VIA_SYMBOLS (see there).
     std::unordered_map<std::uint8_t, std::vector<DefSym>> defsBySection;
     // The DEMOTED half of that split, staged for the shared coverage guard --
     // see `link/format/object_atom_coverage.hpp`.
     std::vector<link::format::BodilessDefinedSymbol> bodilessDefined;
+    // Mach-O's own coordinates alongside the neutral staging (kept HERE, not in
+    // the shared struct, which is deliberately nothing but
+    // `(sectionKey, byteOffset)`): the symtab index the fallback needs to turn a
+    // promotion back into an atom, and whether this symbol is even ELIGIBLE for
+    // the fallback -- see the staging site.
+    std::vector<std::uint32_t>                       bodilessSymIdx;
+    std::vector<bool>                                bodilessFallbackEligible;
 
     for (std::uint32_t i = 0; i < nsyms; ++i) {
         Nlist const& s = syms[i];
@@ -581,36 +644,117 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
         std::uint64_t const secRelOff = s.value - sec.addr;
 
-        if (isExt) {
-            // Externally-visible defined symbol -> an atom boundary.
+        // ── Does this defined symbol START AN ATOM? ────────────────
+        //
+        // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM. The
+        // question Mach-O cannot answer from one nlist alone: a whole
+        // file-local (`static`) FUNCTION and an interior `&&label` block symbol
+        // are the SAME three numbers (bare N_SECT, a section ordinal, an
+        // offset) because nlist_64 has no size field. Reading EXTERNAL-ness as
+        // the answer -- which this reader used to do -- demotes every `static`
+        // function to a bodiless label and drops its bytes.
+        //
+        // The format answers it with a PAIR of its own fields, and this reader
+        // now honours both:
+        //   * MH_SUBSECTIONS_VIA_SYMBOLS in the mach_header (the PRODUCER's
+        //     declaration that its symbols carve the section into independently
+        //     movable blocks), and
+        //   * N_ALT_ENTRY in n_desc (the PER-SYMBOL exception: "I am an
+        //     alternate entry into the atom before me, not an atom").
+        // Apple's own clang sets the header flag on every ordinary `.o`, so
+        // this is the rule a real archive member is written under -- not a DSS
+        // convention. DSS's writer now emits the same pair (`macho.cpp`: the
+        // flag comes from the format schema's `MachOIdentity::flags`, and the
+        // synthetic per-block label loop stamps N_ALT_ENTRY).
+        //
+        // WITHOUT the flag the reader keeps the OLD, narrower rule: external =>
+        // atom, otherwise => bodiless. That is not a guess about what the
+        // producer meant -- with no subsection declaration the section is one
+        // atom by definition, so a local symbol inside it is genuinely
+        // ambiguous, and the shared coverage guard below is what refuses to let
+        // the ambiguity cost bytes silently. Inventing a geometry rule here
+        // would be inventing evidence the object does not carry.
+        //
+        // ⚠ N_ALT_ENTRY is honoured for EXTERNAL symbols too, not just locals:
+        // `.alt_entry` + `.globl` on one label is legal and means the same
+        // thing (✔MEASURED: clang emits n_desc=0x0200 on an external
+        // `.alt_entry` symbol). Gating it on locals would slice an atom in half
+        // at an alternate entry point.
+        bool const altEntry = (s.desc & kNDescAltEntry) != 0u;
+        bool const startsAtom = subsectionsViaSymbols ? !altEntry : isExt;
+
+        if (startsAtom && (isExt || !s.name.empty())) {
+            // An atom boundary. BINDING IS NOT VISIBILITY AND NOT ATOM-NESS: a
+            // promoted file-local body is Local, so `resolveCrossCuDefs` skips
+            // it ("module-private -- excluded") and a `static` helper can never
+            // satisfy a SIBLING translation unit's extern. Global would make
+            // two TUs' `static` helpers a redefinition conflict; Weak would let
+            // one member's body be silently dropped as a shadowed duplicate.
+            // Its own CU still resolves it: `buildCompoundIndex` declares every
+            // `AssembledFunction` / `AssembledData` by SymbolId regardless of
+            // binding.
             defsBySection[s.sect].push_back(
-                DefSym{i, secRelOff, s.name, SymbolBinding::Global,
+                DefSym{i, secRelOff, s.name,
+                       isExt ? SymbolBinding::Global : SymbolBinding::Local,
                        machoVisibility(s.type)});
         } else if (!s.name.empty()) {
-            // A LOCAL N_SECT symbol -- an interior `&&label` block symbol
-            // (DSS's only N_SECT-local shape) or a foreign static. Recorded as
-            // a LOCAL ModuleSymbol but NOT an atom boundary, so it never
-            // splits the function that contains its interior offset. Its
-            // interior-VA binding is the named follow-up (mirrors the ELF
-            // reader treating interior text labels as ModuleSymbol only).
+            // NOT an atom boundary -- an interior label. Either the object
+            // declares subsections and this symbol says N_ALT_ENTRY, or it
+            // declares none and this is the un-discriminated local case.
+            // Recorded as a LOCAL ModuleSymbol so a relocation can still resolve
+            // it by identity, but it never splits the function that contains its
+            // interior offset (mirrors the ELF reader treating interior text
+            // labels as ModuleSymbol only). Its interior-VA binding is the named
+            // follow-up D-LINK-OBJECT-READERS-DROP-INTERIOR-SYMBOL-OFFSET.
+            //
+            // The binding is forced Local even for an EXTERNAL N_ALT_ENTRY
+            // symbol, and that is deliberate: this reader cannot yet represent
+            // "an interior offset within an atom", so publishing the name
+            // cross-CU would bind a sibling's reference to the ATOM START --
+            // a silent wrong address. Kept module-private, a sibling reference
+            // instead fails loud (`K_SymbolUndefined`, nothing declares it),
+            // which is the correct posture until the interior-VA follow-up lands.
             mod.symbols.push_back(ModuleSymbol{SymbolId{i}, s.name,
                 SymbolBinding::Local, machoVisibility(s.type)});
             // ...and STAGE it for the coverage guard
             // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
-            // The reasoning above is right for a LABEL and wrong for a whole
-            // file-local (`static`) FUNCTION, and nlist_64 carries no size field
-            // to tell them apart. A label lies INSIDE the function that contains
-            // it, so the enclosing atom covers its offset and the guard stays
-            // silent; a demoted whole function is covered by nothing, and the
-            // guard names it rather than letting its bytes vanish. Only a
-            // KIND-RESOLVED section is staged -- a symbol in an unmodeled
-            // metadata section reconstructs no body BY DESIGN and is not a
-            // dropped body.
+            // A label lies INSIDE the function that contains it, so the
+            // enclosing atom covers its offset and the guard stays silent; a
+            // demoted whole function is covered by nothing, and the guard names
+            // it rather than letting its bytes vanish. The staging is kept for
+            // BOTH arms deliberately: an N_ALT_ENTRY symbol that turns out to be
+            // covered by nothing means the producer's own subsection claim did
+            // not hold, and that must be loud too. Only a KIND-RESOLVED section
+            // is staged -- a symbol in an unmodeled metadata section
+            // reconstructs no body BY DESIGN and is not a dropped body.
             if (sec.kind.has_value()) {
                 bodilessDefined.push_back(link::format::BodilessDefinedSymbol{
                     /*sectionKey=*/s.sect, /*sectionOffset=*/secRelOff,
                     /*declaredSize=*/std::nullopt, /*name=*/s.name,
                     /*sectionName=*/sec.segName + "," + sec.sectName});
+                bodilessSymIdx.push_back(i);
+                // ★★★ WHERE THE GEOMETRY FALLBACK SITS RELATIVE TO THE WIRE, and
+                // it is BELOW it, never over it. Mach-O now carries a real
+                // declaration -- MH_SUBSECTIONS_VIA_SYMBOLS in the header plus
+                // N_ALT_ENTRY per symbol -- and geometry is an INFERENCE. An
+                // inference must never overrule a producer that spoke:
+                //   * `subsectionsViaSymbols && altEntry` -- the object said, in
+                //     its own vocabulary, "this symbol is an alternate entry
+                //     into the atom before me". Promoting it would SPLIT that
+                //     atom at an interior entry point, which is the exact
+                //     miscompile the run rule exists to avoid, except committed
+                //     against an explicit statement rather than a guess.
+                //   * `altEntry` WITHOUT the header flag -- still a positive
+                //     per-symbol declaration, and honouring it only ever
+                //     promotes LESS. Conservative in the safe direction.
+                //   * neither -- the object said NOTHING about this symbol, so
+                //     the demotion above rests on no evidence at all, and
+                //     geometry is the only evidence there is.
+                // ⚠ The STAGING is unconditional even so: an N_ALT_ENTRY symbol
+                // that no atom covers means the producer's own subsection claim
+                // did not hold, and that must still reach the post-condition and
+                // fail LOUD rather than be quietly promoted into agreement.
+                bodilessFallbackEligible.push_back(!altEntry);
             }
         }
     }
@@ -620,16 +764,169 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     std::unordered_map<std::uint8_t, std::vector<Interval>> dataIntervalsBySec;
 
     auto pushModuleSym = [&](DefSym const& d) {
-        if (!d.name.empty()) {
+        // A geometry-promoted symbol already has its ModuleSymbol from the
+        // classification loop (see `DefSym::moduleSymbolAlreadyPushed`).
+        if (!d.name.empty() && !d.moduleSymbolAlreadyPushed) {
             mod.symbols.push_back(ModuleSymbol{SymbolId{d.symIdx}, d.name,
                                                d.binding, d.visibility});
         }
     };
 
-    // Slice each section's atoms by SORTED n_value (THE key inversion --
-    // nlist_64 has no size field). Each atom spans [off_k, next distinct
-    // off) (the last -> section.size). Equal-offset ALIASES share the same
-    // span (like the ELF equal-start rule) -- both get identical bytes.
+    // Order each section's boundary set by offset, then by SYMTAB INDEX. The
+    // index tie-break is not cosmetic: `std::sort` is not stable, so with offset
+    // alone the ORDER OF EQUAL-OFFSET ALIASES was unspecified -- and that order
+    // decides which atom `findInterval` hands a relocation whose site lies in
+    // the span they share. Ties are common in foreign objects (clang's
+    // section-start `ltmp0` sits at the same offset as the first function) and
+    // impossible in DSS's own output, where every atom has a distinct offset.
+    // Hoisted out of the slicing loop because (6.4) below reads the SAME order,
+    // and it runs TWICE (again after (6.4) appends).
+    auto sortBoundaries = [&] {
+        for (auto& [ordinal, defs] : defsBySection) {
+            std::sort(defs.begin(), defs.end(),
+                      [](DefSym const& a, DefSym const& b) {
+                          if (a.secRelOff != b.secRelOff) return a.secRelOff < b.secRelOff;
+                          return a.symIdx < b.symIdx;
+                      });
+        }
+    };
+    sortBoundaries();
+
+    // THE ATOM EXTENT RULE, stated once (THE key inversion -- nlist_64 has no
+    // size field, so an atom's END comes from the NEXT boundary rather than from
+    // the symbol). The k-th boundary of a SORTED `defs` ends at the next
+    // STRICTLY-GREATER offset -- skipping equal-offset ALIASES so they share the
+    // span, the ELF equal-start rule -- else at section.size.
+    //
+    // (6.4) and the slicing loop must agree on this EXACTLY: (6.4) decides which
+    // symbols to promote by asking which offsets these extents cover, and a
+    // different rule there would promote a symbol on the strength of an atom
+    // that never materialises (or leave one alone on the strength of an atom
+    // that does not reach it).
+    auto atomEndFor = [](std::vector<DefSym> const& defs, std::size_t k,
+                         std::uint64_t sectionSize) -> std::uint64_t {
+        std::uint64_t const off = defs[k].secRelOff;
+        for (std::size_t j = k + 1; j < defs.size(); ++j) {
+            if (defs[j].secRelOff > off) return defs[j].secRelOff;
+        }
+        return sectionSize;
+    };
+
+    // -- (6.4) GEOMETRY FALLBACK: recover a body the wire could not name ---
+    //
+    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM, operator
+    // ruling 2026-08-20: the fallback lands on ALL THREE readers. It applies to
+    // exactly the symbols this object said NOTHING about -- see the eligibility
+    // note at the staging site, which is where the relationship between this
+    // inference and the MH_SUBSECTIONS_VIA_SYMBOLS / N_ALT_ENTRY facts is
+    // decided. The shared header owns the inference and the argument for it
+    // (`uncoveredDefinedSymbolsThatStartAnAtom`).
+    //
+    // ⚠ THE EXTENTS FED IN ARE PROSPECTIVE, computed from the boundary set
+    // decided above with `atomEndFor` -- they must be the ones the slicer will
+    // actually produce, which is why the extent rule was hoisted rather than
+    // re-derived here. Promoting BEFORE slicing (rather than slicing, promoting
+    // and re-slicing) means every body is cut exactly once and the bounds checks
+    // below run over the final boundary set.
+    {
+        std::vector<link::format::BodilessDefinedSymbol> eligible;
+        std::vector<std::size_t>                        eligibleOrigin;
+        for (std::size_t i = 0; i < bodilessDefined.size(); ++i) {
+            if (!bodilessFallbackEligible[i]) continue;
+            eligible.push_back(bodilessDefined[i]);
+            eligibleOrigin.push_back(i);
+        }
+        std::vector<link::format::ReconstructedAtomExtent> prospective;
+        for (auto const& [ordinal, defs] : defsBySection) {
+            std::uint64_t const secSize = sections[ordinal - 1u].size;
+            for (std::size_t k = 0; k < defs.size(); ++k) {
+                std::uint64_t const off = defs[k].secRelOff;
+                std::uint64_t const end = atomEndFor(defs, k, secSize);
+                // A corrupt offset past the section end is the SLICER's refusal
+                // to make (it names the symbol and the size); skip it here
+                // rather than fabricate a reversed extent.
+                if (off > secSize || end < off) continue;
+                prospective.push_back(link::format::ReconstructedAtomExtent{
+                    ordinal, off, end - off});
+            }
+        }
+        for (std::size_t e :
+             link::format::uncoveredDefinedSymbolsThatStartAnAtom(eligible,
+                                                                  prospective)) {
+            auto const& c = bodilessDefined[eligibleOrigin[e]];
+            // `Local`, for the same reason the boundary arm above spells out:
+            // `resolveCrossCuDefs` skips Local, which is what stops a `static`
+            // helper satisfying a sibling TU's extern. A symbol this reader
+            // could name no reason for is never a reason to change linkage.
+            defsBySection[static_cast<std::uint8_t>(c.sectionKey)].push_back(
+                DefSym{bodilessSymIdx[eligibleOrigin[e]], c.sectionOffset, c.name,
+                       SymbolBinding::Local, SymbolVisibility::Default,
+                       /*moduleSymbolAlreadyPushed=*/true});
+        }
+        sortBoundaries();
+    }
+
+    // -- (6.44) EQUAL-OFFSET ALIAS IDENTITY: one atom, several names ------
+    //
+    // D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS. The boundary set is
+    // FINAL here -- the wire's own plus whatever (6.4) recovered -- and this is
+    // the last moment before bytes are cut, which is where the question belongs:
+    // a name that aliases another must never mint a second body.
+    //
+    // ✔MEASURED, clang 19 (`-target arm64-apple-macos11 -c -O1`) on a three-line
+    // C file: `ltmp0` (local, n_value 0) and the first EXTERNAL function
+    // (n_value 0) are both boundaries, with that function's own `bl` relocation
+    // at offset 8 inside the span they share. Two atoms over one span means
+    // `findInterval` hands that reloc to exactly ONE of them and the other ships
+    // an un-patched branch. The shared header owns the rule, the ranking, and
+    // the argument for both (`resolveEqualOffsetAtomAliases`).
+    //
+    // Mach-O passes `declaredExtent = nullopt` because `nlist_64` has no size
+    // field -- this reader derives an atom's end from the next boundary
+    // (`atomEndFor`), so equal-offset candidates get equal extents by
+    // construction and the conflicting-extent refusal cannot fire here.
+    std::unordered_map<std::uint32_t, std::uint32_t> atomOwnerBySym;
+    {
+        std::vector<link::format::AtomStartCandidate> candidates;
+        for (auto const& [ordinal, defs] : defsBySection) {
+            Section const& sec = sections[ordinal - 1u];
+            for (auto const& d : defs) {
+                candidates.push_back(link::format::AtomStartCandidate{
+                    /*sectionKey=*/ordinal, /*offset=*/d.secRelOff,
+                    /*declaredExtent=*/std::nullopt, /*symbolId=*/d.symIdx,
+                    /*binding=*/d.binding, /*visibility=*/d.visibility,
+                    /*name=*/d.name,
+                    /*sectionName=*/sec.segName + "," + sec.sectName});
+            }
+        }
+        std::vector<std::uint32_t> owner;
+        if (!link::format::resolveEqualOffsetAtomAliases(
+                candidates, owner, "macho::readRelocatableObject", reporter)) {
+            return std::nullopt;   // the resolver reported, naming both symbols
+        }
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (owner[i] != candidates[i].symbolId) {
+                atomOwnerBySym.emplace(candidates[i].symbolId, owner[i]);
+            }
+        }
+    }
+    // The atom identity a symbol resolves to: itself unless it aliases another.
+    // Consulted at BOTH sites that need it -- the slicing loop (does this
+    // boundary mint a body?) and the relocation pass (which atom does this
+    // target name?) -- because a collapse without the target remap turns a
+    // silent miscompile into a spurious `K_SymbolUndefined`.
+    auto ownerOf = [&](std::uint32_t symIdx) -> std::uint32_t {
+        auto const it = atomOwnerBySym.find(symIdx);
+        return it == atomOwnerBySym.end() ? symIdx : it->second;
+    };
+    // Alias rows are appended AFTER the slicing loop, never during it: every
+    // id -> row lookup over `AssembledModule::symbols` keeps the FIRST row for
+    // an id, so the canonical name must be recorded before any alias of it.
+    std::vector<ModuleSymbol> aliasRows;
+
+    // Slice each section's atoms by SORTED n_value. What reached
+    // `defsBySection` is every defined symbol that STARTS A BODY: the wire's
+    // own boundary set, plus whatever (6.4) recovered.
     for (auto& [ordinal, defs] : defsBySection) {
         Section const& sec = sections[ordinal - 1u];
         std::optional<SectionKind> const rk = sec.kind;
@@ -637,19 +934,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             rk.has_value() ? dataSectionKindOf(*rk) : std::nullopt;
         bool const isText = rk.has_value() && *rk == SectionKind::Text;
 
-        std::sort(defs.begin(), defs.end(),
-                  [](DefSym const& a, DefSym const& b) {
-                      return a.secRelOff < b.secRelOff;
-                  });
-
         for (std::size_t k = 0; k < defs.size(); ++k) {
             std::uint64_t const off = defs[k].secRelOff;
-            // The atom ends at the next STRICTLY-GREATER offset (skipping
-            // equal-offset aliases so they share the span), else section.size.
-            std::uint64_t end = sec.size;
-            for (std::size_t j = k + 1; j < defs.size(); ++j) {
-                if (defs[j].secRelOff > off) { end = defs[j].secRelOff; break; }
-            }
+            std::uint64_t const end = atomEndFor(defs, k, sec.size);
             if (off > sec.size || end < off) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "macho::readRelocatableObject: defined symbol '"
@@ -658,6 +945,34 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + "' size " + std::to_string(sec.size) + ".");
             }
             std::uint64_t const len = end - off;
+
+            // (6.44) THE ALIAS ARM: this boundary names a body another boundary
+            // at the same offset already owns, so it mints NO atom -- it keeps
+            // its NAME and takes the owner's identity. Placed after the offset
+            // refusal so a corrupt offset is still named by the symbol that
+            // carries it.
+            if (std::uint32_t const owner = ownerOf(defs[k].symIdx);
+                owner != defs[k].symIdx) {
+                if (defs[k].moduleSymbolAlreadyPushed) {
+                    // A (6.4) geometry promotion that turned out to alias. It
+                    // cannot happen today -- the fallback promotes only symbols
+                    // NO reconstructed atom covers, and an atom starting at this
+                    // very offset covers it -- but if it ever does, the row it
+                    // already pushed carries the WRONG id and retargeting it is
+                    // the correct repair, not skipping it.
+                    for (auto& ms : mod.symbols) {
+                        if (ms.symbol == SymbolId{defs[k].symIdx}) {
+                            ms.symbol = SymbolId{owner};
+                            break;
+                        }
+                    }
+                } else if (!defs[k].name.empty()) {
+                    aliasRows.push_back(ModuleSymbol{SymbolId{owner}, defs[k].name,
+                                                     defs[k].binding,
+                                                     defs[k].visibility});
+                }
+                continue;
+            }
 
             if (isText) {
                 // A function body -- slice [off, end) out of the file-backed
@@ -730,6 +1045,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             pushModuleSym(defs[k]);
         }
     }
+
+    // Every canonical row is now recorded, so the aliases can follow: several
+    // names, one SymbolId, the owning name first (see (6.44)).
+    for (auto& ms : aliasRows) mod.symbols.push_back(std::move(ms));
 
     // -- (6.5) Coverage guard: no defined symbol's body was dropped -------
     //
@@ -893,27 +1212,42 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
 
             Relocation rel;
             rel.offset = static_cast<std::uint32_t>(rAddress - iv->start);
-            rel.target = SymbolId{rSymNum};
+            // (6.44): a target naming an ALIAS binds to the atom that owns the
+            // body, because only the owner is a declared definition -- an id
+            // that owns no body is `K_SymbolUndefined` at the linker's compound
+            // index. The addend needs no adjustment: an alias shares its owner's
+            // offset exactly, so the same S makes the same address.
+            rel.target = SymbolId{ownerOf(rSymNum)};
             rel.kind   = kind;
             rel.addend = addend;
             if (patchesText) mod.functions[iv->outIdx].relocations.push_back(rel);
             else             mod.dataItems[iv->outIdx].relocations.push_back(rel);
 
-            // isData inference: an extern reached through a CALL/BRANCH-class
-            // reloc (aarch64 BRANCH26) is a FUNCTION -- force isData=false. A
+            // isData inference: an extern reached through a relocation the
+            // FORMAT declares `"isCall": true` on -- ARM64_RELOC_BRANCH26,
+            // X86_64_RELOC_BRANCH -- is a FUNCTION, so force isData=false. A
             // plain address reloc (PAGE21/PAGEOFF12/UNSIGNED) leaves the DATA
             // seed intact. Mirrors the ELF reader's reloc-typed extern rule.
+            // Mach-O's nlist_64 carries no STT_FUNC-style type hint, so this
+            // relocation is the ONLY class signal a name-only reference offers.
             //
-            // On a target whose Mach-O schema declares NO call-branch-formula
-            // reloc AT ALL (x86_64 Mach-O: X86_64_RELOC_BRANCH is a plain
-            // `linear` rel32, indistinguishable from a PC-relative data ref),
-            // an extern reached by a reloc CANNOT be classified function-vs
-            // -data -- the DATA seed would be a SILENT guess. Fail loud instead
-            // (silent-failure-review fold): unreachable today (the shipped
-            // x86_64 Mach-O schema is leaf-only, no extern-call dispatch, so no
-            // extern is ever reached), but a future x86_64 Mach-O call leg must
-            // confront the ambiguity, not inherit a silent misclassification.
-            // The named follow-up is D-LK-MACHO-ISDATA-NO-CALL-SIGNAL.
+            // ── THE EMPTY-SET REFUSAL (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL) ──
+            // A Mach-O format that declares NO `isCall` row at all cannot
+            // classify an extern it meets through a relocation, and the DATA
+            // seed would then be a SILENT GUESS -- not a diagnostic, a wrong
+            // answer. Refuse instead, naming the extern and the format.
+            //
+            // ⚠ THIS ARM IS NOT DEAD CODE AND IS NOT A HYPOTHETICAL. It is
+            // what every macho64-x86_64 archive member that called a library
+            // function hit until 2026-08-20, when the classification stopped
+            // being derived from the target's arithmetic formula and started
+            // being READ from the format's declared role. What changed is WHO
+            // it can fire for: no shipped Mach-O format reaches it any more
+            // (all eight declare their BRANCH row `isCall`), and it now guards
+            // the case it should always have guarded -- a NEW Mach-O format
+            // that forgets the declaration is refused rather than allowed to
+            // guess. Its message therefore names the missing SCHEMA KEY, since
+            // adding that key is the whole fix.
             if (auto ex = externBySym.find(rSymNum); ex != externBySym.end()) {
                 if (callSignalNativeIds.empty()) {
                     return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
@@ -921,8 +1255,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                         + mod.externImports[ex->second].mangledName
                         + "' is reached by a relocation, but Mach-O format '"
                         + std::string{objectFormatSchema.name()}
-                        + "' declares no call-branch-formula relocation -- a "
-                        "function-vs-data classification cannot be inferred "
+                        + "' declares no relocation row with \"isCall\": true "
+                        "-- a function-vs-data classification cannot be made, "
+                        "and guessing DATA would silently mis-type the import "
                         "(D-LK-MACHO-ISDATA-NO-CALL-SIGNAL).");
                 }
                 if (callSignalNativeIds.contains(nativeId)) {

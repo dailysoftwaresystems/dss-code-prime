@@ -732,11 +732,28 @@ isArArchiveFile(std::filesystem::path const& path);
 // archive-parse / member-read failure (fail loud via `reporter`). The reader's
 // `ok()` is a tautology for reader output (see elf_object_reader.hpp), so this
 // consumes the reader's `optional` return as the read-success signal -- never
-// `module.ok()`. SCOPE: ELF (the reader is ELF-only; a non-ELF `format` makes
-// `readRelocatableObject` fail loud -- Mach-O/COFF are named follow-ups).
+// `module.ok()`. Member parsing dispatches on the member's own
+// `ObjectFormatKind` (ELF / Mach-O / PE) through one shared chokepoint; a format
+// whose kind has no reader arm fails loud rather than mis-parsing a member.
+//
+// ── `dynamicLibraries` (D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-
+// LIBRARY) ──────────────────────────────────────────────────────────────────
+// An object file records an undefined symbol's NAME and nothing else -- no
+// format has anywhere to say WHICH library owns it. So a member whose extern was
+// bound to a library when it was COMPILED reads back unbound, and the binding
+// must be re-derived here, before the merge, from the same authorities that
+// derived it the first time: the binaries the operator NAMED (this parameter,
+// which WINS) and then the shipped-descriptor corpus (the platform default).
+//
+// ⚠ Pass the DYNAMIC half of `--resolve-library` -- the same partition the
+// driver hands to the per-CU build. The `ar` archives in that list are
+// `archivePaths` here: they are merged INTO the image and record no import at
+// all, and feeding one to the export reader is refused loud (correctly), which
+// would fail an otherwise good build. Empty is a valid no-op.
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<AssembledModule>>
 pullStaticArchiveMembers(AssembledModule const&                 clientModule,
                          std::span<std::filesystem::path const> archivePaths,
+                         std::span<ResolveLibrarySpec const>    dynamicLibraries,
                          TargetSchema const&                    target,
                          ObjectFormatSchema const&              format,
                          DiagnosticReporter&                    reporter);
@@ -774,9 +791,17 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
 // `mergeModules` binds each archive reference to the pulled member's definition
 // (stripping the extern import) exactly as it does a sibling-CU reference.
 // Returns true iff the pull, merge, link, and write all succeeded.
+//
+// `dynamicLibraries` rides through to `pullStaticArchiveMembers` -- see its
+// contract above for why a pulled member's library binding has to be re-derived
+// and why this must be the DYNAMIC half of `--resolve-library`. It is NOT
+// defaulted: every route that produces an image has to answer the question, and
+// a default would let a new route silently inherit the gap this parameter
+// closes.
 [[nodiscard]] DSS_EXPORT bool
 linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
                                std::span<std::filesystem::path const> staticArchives,
+                               std::span<ResolveLibrarySpec const>    dynamicLibraries,
                                TargetSchema const&                    target,
                                ObjectFormatSchema const&              format,
                                std::filesystem::path const&           outPath,

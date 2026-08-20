@@ -21,12 +21,15 @@
 #include "link/object_format_backend.hpp"
 #include "link/object_format_schema.hpp"
 #include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
+#include "repo_root.hpp"               // the ONE test-side repo/config-root resolver
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>   // the "shipped file PLUS exactly one key" fixtures
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <iterator>
 #include <optional>
 #include <span>
@@ -315,6 +318,50 @@ TEST(ObjectFormatSchemaLoader, DuplicateRelocationNameRejected) {
     })");
     ASSERT_FALSE(r.has_value()) << "duplicate relocation name must reject";
     EXPECT_EQ(countAtPath(r, "/relocations/1/name"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+}
+
+// D-LK-MACHO-ISDATA-NO-CALL-SIGNAL — the TYPO DISCRIMINATOR on the relocation
+// ROW. Every row field is read with `contains(...)`, so before this rule an
+// unrecognised key loaded in silence. That is intolerable for these keys
+// specifically: each is a ROLE DECLARATION whose absence changes what an
+// object reader concludes, and a typo is spelled exactly like an absence.
+// `"iscall"` would have left a Mach-O format refusing every member that calls
+// a function, or an ELF one classifying an extern function as DATA — with a
+// green load either way. The document ROOT has had this discriminator since
+// TF-C125; the rows never did.
+TEST(ObjectFormatSchemaLoader, UnknownRelocationRowKeyRejected) {
+    // CONTROL: the same document with the key spelled correctly loads clean,
+    // so the rejection below is attributable to the SPELLING and to nothing
+    // else (the vacuous-fixture discipline).
+    auto ok = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"x","kind":"elf"},
+      "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocations":[{"$comment":"prose is always allowed",
+                      "name":"R_OK","kind":1,"nativeId":1,"isCall":true}]
+    })");
+    ASSERT_TRUE(ok.has_value()) << rejectSummary(ok);
+    ASSERT_NE((*ok)->relocationByName("R_OK"), nullptr);
+    EXPECT_TRUE((*ok)->relocationByName("R_OK")->isCall)
+        << "the control must actually CARRY the role, or it is not a control";
+
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"x","kind":"elf"},
+      "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocations":[{"name":"R_TYPO","kind":1,"nativeId":1,"iscall":true}]
+    })");
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled role key must fail at LOAD -- silently ignoring it "
+           "re-creates the very defect the key was added to end";
+    EXPECT_EQ(countAtPath(r, "/relocations/0/iscall"), 1u) << rejectSummary(r);
     EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
@@ -2806,4 +2853,191 @@ TEST(ObjectFormatSchemaContentDigest, ConstructionBypassingLoadFromTextLeavesItE
     EXPECT_TRUE(schema.contentDigest().empty())
         << "a schema with no document bytes reported a digest: "
         << schema.contentDigest();
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// THE TYPO DISCRIMINATOR, ON EVERY CLOSED-KEY BLOCK
+// ══════════════════════════════════════════════════════════════════════════
+//
+// This loader used to reject an unknown key at exactly TWO places — the
+// document ROOT and each `relocations[]` row — while TEN other closed-key
+// objects accepted anything. A misspelled key in one of those ten loaded
+// clean and left the capability it names at its DEFAULT, with no diagnostic
+// anywhere: `"segmentPrefixByt"` and TLS access silently reverts to the
+// default byte; `"addrAlig"` and a section is emitted at alignment 0.
+//
+// ★★ WHY THIS IS ONE TABLE AND NOT TEN SCATTERED TESTS. The partial state was
+// not merely incomplete, it was ACTIVELY MISLEADING: a reader who saw the root
+// and the relocation rows refusing typos reasonably concluded the nested blocks
+// did too. That is the container/leaf asymmetry the shared helper's header
+// names as the archetype. A table makes the coverage claim CHECKABLE — adding
+// a closed-key block without a row here is visible, where a missing eleventh
+// test file is not.
+//
+// Each row runs THREE arms against the SAME shipped document, and all three
+// are needed:
+//   (1) UNMODIFIED, it loads — so a refusal below is attributable to the
+//       inserted key and not to the fixture.
+//   (2) plus ONE near-miss typo key at that block, it is REFUSED, and the
+//       diagnostic NAMES the key (not merely "malformed").
+//   (3) plus a `$`-prefixed PROSE key in the same position, it loads clean —
+//       without this arm the whole table would also pass against a loader that
+//       rejected everything, which is a different way of being wrong.
+//
+// The fixtures are shipped `.format.json` files read VERBATIM, so a block that
+// is renamed or restructured reds here instead of drifting.
+namespace {
+
+[[nodiscard]] std::string shippedFormatText(std::string_view stem) {
+    auto const root = dss::test::findRepoRoot();
+    if (!root.has_value()) {
+        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        return {};
+    }
+    auto const path = *root / "src" / "dss-config" / "object-formats"
+                    / (std::string{stem} + ".format.json");
+    std::ifstream in{path, std::ios::binary};
+    if (!in.good()) {
+        ADD_FAILURE() << "cannot open " << path.string();
+        return {};
+    }
+    return std::string{std::istreambuf_iterator<char>{in},
+                       std::istreambuf_iterator<char>{}};
+}
+
+// The document with one extra key spliced into the object at `pointer`.
+[[nodiscard]] std::string withExtraKey(std::string const& text,
+                                       char const* pointer,
+                                       char const* key) {
+    nlohmann::json doc = nlohmann::json::parse(text);
+    doc.at(nlohmann::json::json_pointer{pointer})[key] = "x";
+    return doc.dump();
+}
+
+struct ClosedKeyBlock {
+    char const* label;      // named in every failure message below
+    char const* document;   // a shipped format that DECLARES this block
+    char const* pointer;    // the object whose key set is closed
+    char const* typo;       // a near-miss of one of that block's real keys
+};
+
+} // namespace
+
+TEST(ObjectFormatSchemaLoader, EveryClosedKeyBlockRefusesATypoAndAcceptsProse) {
+    constexpr ClosedKeyBlock kBlocks[] = {
+        {"format",              "elf64-aarch64-linux-dyn",    "/format",              "nmae"},
+        {"cSymbolDecoration",   "elf64-aarch64-linux-dyn",    "/cSymbolDecoration",   "schem"},
+        {"tlsAccess",           "elf64-aarch64-linux-exec",   "/tlsAccess",           "segmentPrefixByt"},
+        {"librarySynthesis",    "macho64-arm64-darwin-exec",  "/librarySynthesis",    "vehicl"},
+        {"stackReserveControl", "pe64-x86_64-windows-exec",   "/stackReserveControl", "minimumByte"},
+        {"sehPersonality",      "pe64-x86_64-windows-dll",    "/sehPersonality",      "mangledNam"},
+        {"runtimeLibraries[]",  "elf64-aarch64-linux-exec",   "/runtimeLibraries/0",  "imag"},
+        {"sections[]",          "elf64-aarch64-linux-dyn",    "/sections/0",          "addrAlig"},
+        // The two PER-MECHANISM blocks. The typo is a near-miss of a key the
+        // DECLARED arm reads, so it is owned by no arm and gets the plain
+        // message; the cross-arm case is the separate test below.
+        {"processExit",         "elf64-aarch64-linux-exec",   "/processExit",         "importMangledNam"},
+        {"processArgs",         "elf64-aarch64-linux-exec",   "/processArgs",         "argcStackOffse"},
+    };
+
+    for (auto const& b : kBlocks) {
+        auto const text = shippedFormatText(b.document);
+        ASSERT_FALSE(text.empty()) << b.label;
+
+        // (1) CONTROL — unmodified, it loads.
+        {
+            auto const ctl = ObjectFormatSchema::loadFromText(text, b.document);
+            ASSERT_TRUE(ctl.has_value())
+                << b.label << ": the unmodified shipped document must load, or "
+                   "the refusal below proves nothing about the added key: "
+                << rejectSummary(ctl);
+        }
+
+        // (2) plus ONE typo at that block — REFUSED, and the key is NAMED.
+        {
+            auto const bad = ObjectFormatSchema::loadFromText(
+                withExtraKey(text, b.pointer, b.typo), b.document);
+            EXPECT_FALSE(bad.has_value())
+                << b.label << ": a misspelled key here loads clean and leaves "
+                   "the capability this block declares at its DEFAULT, with no "
+                   "diagnostic — the exact failure the discriminator exists to "
+                   "prevent";
+            EXPECT_GE(countWithMessage(bad, b.typo), 1u)
+                << b.label << ": the refusal must NAME the offending key — "
+                   "a bare 'malformed' sends the author to the wrong field: "
+                << rejectSummary(bad);
+            EXPECT_GE(countAtPath(bad, b.pointer), 1u)
+                << b.label << ": the diagnostic must point AT the block: "
+                << rejectSummary(bad);
+        }
+
+        // (3) plus a `$`-PROSE key in the same position — still loads.
+        {
+            auto const prose = ObjectFormatSchema::loadFromText(
+                withExtraKey(text, b.pointer, "$comment"), b.document);
+            EXPECT_TRUE(prose.has_value())
+                << b.label << ": a `$`-prefixed key is PROSE at every config "
+                   "object. If this reds, the discriminator was added without "
+                   "the carve-out — and if arm (2) passes while THIS fails, "
+                   "the block refuses every document its author documented: "
+                << rejectSummary(prose);
+        }
+    }
+}
+
+// The PER-MECHANISM half, and the reason those two blocks do not simply union
+// their arms' key sets.
+//
+// `processExit` and `processArgs` each key their field set on a `mechanism`
+// verb, and the declared arm's parse code reads its own fields and NOTHING of
+// the sibling's. A union would accept a key that can never be read — inert
+// config that loads clean and does nothing, which is
+// D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-KEY rebuilt in a new place.
+//
+// So the key must be refused, AND the message must name the arm it belongs to:
+// "unknown key" alone reads as a typo, when the actual mistake is almost always
+// a paste from the other mechanism's example. Both directions are pinned
+// because each arm's table is the other's "other".
+TEST(ObjectFormatSchemaLoader, PerMechanismBlockNamesTheArmAKeyBelongsTo) {
+    struct CrossArm {
+        char const* label;
+        char const* document;
+        char const* pointer;
+        char const* declaredMechanism;  // what the shipped document declares
+        char const* siblingKey;         // a REAL key of the OTHER arm
+        char const* siblingMechanism;   // the arm the message must name
+    };
+    constexpr CrossArm kCases[] = {
+        {"processExit", "elf64-aarch64-linux-exec", "/processExit",
+         "by-name-import", "syscallNumber", "syscall"},
+        {"processArgs", "elf64-aarch64-linux-exec", "/processArgs",
+         "stack-vector", "argcAccessorFn", "crt-argv-accessors"},
+    };
+
+    for (auto const& c : kCases) {
+        auto const text = shippedFormatText(c.document);
+        ASSERT_FALSE(text.empty()) << c.label;
+        // The fixture only means what it says while the shipped document still
+        // declares the arm this case assumes.
+        {
+            nlohmann::json const doc = nlohmann::json::parse(text);
+            ASSERT_EQ(doc.at(nlohmann::json::json_pointer{c.pointer})
+                          .at("mechanism").get<std::string>(),
+                      std::string{c.declaredMechanism})
+                << c.label << ": the shipped document changed mechanism — "
+                   "re-derive this fixture rather than adjusting the assert";
+        }
+
+        auto const bad = ObjectFormatSchema::loadFromText(
+            withExtraKey(text, c.pointer, c.siblingKey), c.document);
+        EXPECT_FALSE(bad.has_value())
+            << c.label << ": a REAL key of the sibling arm must be refused — "
+               "the declared arm never reads it, so accepting it would be "
+               "inert config that loads clean and does nothing";
+        EXPECT_GE(countWithMessage(bad, c.siblingMechanism), 1u)
+            << c.label << ": the refusal must NAME the mechanism the key "
+               "belongs to. Telling the author only that a REAL field name is "
+               "unknown sends them hunting a typo that is not there — the "
+               "mistake is a paste from the other arm: " << rejectSummary(bad);
+    }
 }

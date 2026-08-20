@@ -93,6 +93,23 @@ constexpr std::uint8_t N_EXT  = 0x01;
 constexpr std::uint8_t N_UNDF = 0x00;
 constexpr std::uint8_t N_SECT = 0x0E;
 
+// nlist_64.n_desc bits (<mach-o/nlist.h>). N_ALT_ENTRY declares a defined
+// symbol to be an ALTERNATE ENTRY POINT into the atom that precedes it rather
+// than the start of an atom of its own -- the wire spelling of the
+// `.alt_entry` assembler directive. It is the ONLY thing that tells an
+// interior label apart from a whole body in Mach-O, because nlist_64 carries
+// no size field, and it is meaningful exactly when the mach_header declares
+// MH_SUBSECTIONS_VIA_SYMBOLS (which the object/staticlib format schemas do,
+// via `MachOIdentity::flags`) -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
+// BLOCK-LABEL-NOT-ATOM.
+//
+// ⚠ 0x0200, NOT 0x0020 -- ✔MEASURED 2026-08-20 against clang 19 targeting
+// arm64-apple-macos, which emits n_desc=0x0200 for an explicit `.alt_entry`
+// and n_desc=0x0020 (N_NO_DEAD_STRIP) for a `__attribute__((used))` static in
+// the same object. Writing 0x0020 here would stamp every block label
+// "never dead-strip me" and mark none of them as interior.
+constexpr std::uint16_t N_ALT_ENTRY = 0x0200;
+
 constexpr std::size_t kMachHeader64Size   = 32;
 constexpr std::size_t kSegmentCommand64Size = 72;
 constexpr std::size_t kSection64Size      = 80;
@@ -1507,6 +1524,28 @@ encode(AssembledModule const&    module,
     // above (functions → blocks → data → externs) so relocation r_symbolnum
     // indices line up. The ELF ET_REL writer's STB_LOCAL block-symbol leg is
     // the mirror (c147 silent-failure-review fold).
+    //
+    // ★ n_desc = N_ALT_ENTRY — THE DISCRIMINATOR MACH-O PREVIOUSLY LACKED
+    // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM). Before
+    // this, a whole file-local (`static`) FUNCTION and one of these interior
+    // labels were emitted BYTE-IDENTICALLY — bare N_SECT, n_sect=1, n_desc=0,
+    // both spelled `_sym_<id>` — so no reader could tell them apart and every
+    // reader that tried classified the function as a label and dropped its
+    // body. N_ALT_ENTRY says, in the format's own vocabulary, exactly what
+    // these symbols are: alternate entry points INTO the function they sit in,
+    // never atoms of their own. It is the per-symbol half of a pair; the other
+    // half is MH_SUBSECTIONS_VIA_SYMBOLS in the mach_header, which arrives
+    // purely from the format schema (`MachOIdentity::flags`, emitted verbatim
+    // below) and is NOT read by any code here.
+    //
+    // Emitted UNCONDITIONALLY rather than gated on that flag, for two reasons
+    // that both point the same way: the writer would otherwise have to
+    // interpret a config value it currently only copies, and a stray
+    // N_ALT_ENTRY in a non-subsections object is inert to Apple's ld64
+    // (✔MEASURED on real Apple Silicon: flag on/off × N_ALT_ENTRY on/off, each
+    // linked with and without `-dead_strip` — all 8 cells rc=0 with identical
+    // correct output). So if the header flag is ever reverted in config, these
+    // labels stay honest and the reader simply falls back to its narrower rule.
     for (auto const& b : blockSyms) {
         std::string const symName =
             std::string{"_sym_"} + std::to_string(b.symId.v);
@@ -1514,7 +1553,7 @@ encode(AssembledModule const&    module,
         appendNlist(nameOff,
                     /*n_type=*/N_SECT,          // LOCAL: no N_EXT
                     kTextSectionNumber,
-                    /*n_desc=*/0,
+                    /*n_desc=*/N_ALT_ENTRY,     // interior label, not an atom
                     b.flatTextAddr);
     }
     // Defined DATA symbols (D-LK-OBJECT-DATA-SECTION-RELOCATABLE, Mach-O
@@ -1679,6 +1718,14 @@ encode(AssembledModule const&    module,
     // does not count leaves ld64 walking off the end of the command list.
     appendU32LE(bytes, emitBuildVersion ? 3u : 2u);
     appendU32LE(bytes, static_cast<std::uint32_t>(sizeOfCommands));
+    // flags: VERBATIM from the format schema, interpreted by nothing here.
+    // The object/staticlib schemas declare MH_SUBSECTIONS_VIA_SYMBOLS (0x2000)
+    // — the header half of the pair that lets a reader tell an interior label
+    // from a whole file-local body (see the N_ALT_ENTRY block-symbol loop
+    // above, D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
+    // Deliberately NO code here reads or asserts that bit: the declaration is
+    // the config's to make, so it is one JSON field to change if the ld64
+    // dead-strip evidence ever says otherwise, with no writer edit attached.
     appendU32LE(bytes, id.flags);
     appendU32LE(bytes, 0);  // reserved (64-bit padding)
 

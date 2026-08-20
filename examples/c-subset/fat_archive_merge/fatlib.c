@@ -18,19 +18,33 @@
  * lib's own member is identified by value in the notes above); only the way it
  * is computed gives the optimizer something to do.
  *
- * !! D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM -- THE
- * !! HELPER BELOW IS DELIBERATELY *NOT* `static`. DO NOT PUT THE KEYWORD BACK
- * !! AS A TIDY-UP. Mechanism: a relocation to a FILE-LOCAL symbol inside an
- * !! archive member is not resolvable by the COFF and Mach-O readers today, so
- * !! with `static` this member links only on elf64 -- pe64 and macho64-arm64
- * !! red with `error[K_SymbolUndefined] ... relocation in CU #N targets symbol
- * !! #M ...` (MEASURED, baseline config) -- and it links under `release` only
- * !! because inlining deletes the call so the relocation never exists, which
- * !! is a config-dependent escape rather than a fix. External linkage costs
- * !! this example nothing: the helper is still inlined under `release`, and
- * !! the library image still differs between the two configs. The keyword is
- * !! restored when that row closes, and not before. */
-int dss_fat_bump(int acc, int addend) {
+ * ★ D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM -- WHY
+ * `dss_fat_bump` IS `static`, AND WHY IT MATTERS THAT IT IS THE HALF NOBODY
+ * REFERENCES. The keyword is the test: a file-local function called from an
+ * exported one, inside an archive member, is the shape the COFF and Mach-O
+ * archive-member readers used to demote to a bodyless interior block label,
+ * dropping its bytes. Without `static` the helper is an ordinary external,
+ * which every reader has always promoted to an atom, and this file stops
+ * asserting anything.
+ * ★★ WHAT THIS COPY ADDS OVER `input.c`'s. `dss_fat_extra` is the fat
+ * library's OWN member and `main` never calls it, so this file's file-local
+ * symbol has to survive being WRITTEN INTO the merged archive without ever
+ * being pulled out of it -- the fat `-staticlib` build must emit a member
+ * carrying a local function beside the merged one, and the exec link must
+ * then read `fatlib.a`'s index and correctly leave this member alone.
+ * ✔MEASURED 2026-08-20 (shipped CLI, baseline config, `nm` on `fatlib.a`): the
+ * merged archive carries BOTH members, this one's local as `sym_84` and the
+ * merged `input.o`'s as `sym_2`, and the linked executable contains the
+ * merged copy only. The whole three-step chain returns rc=0 on pe64-x86_64,
+ * elf64-x86_64, elf64-aarch64, macho64-arm64 AND macho64-x86_64.
+ *
+ * ⚠⚠ THE WITNESS IS THE **BASELINE** ARM. ✔MEASURED with `nm`: at
+ * `--config=release` the local symbol is ABSENT ENTIRELY -- Inlining removes
+ * the call and DCE removes the function -- so no file-local relocation
+ * survives for a reader to get wrong, and a release-only test of this defect
+ * is vacuous. (`examples/c-subset/staticlib_file_local_atoms` is the example
+ * built to hold at BOTH configurations.) */
+static int dss_fat_bump(int acc, int addend) {
     return acc + addend;
 }
 
