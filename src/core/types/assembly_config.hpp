@@ -701,14 +701,42 @@ struct DSS_EXPORT AssemblyConfig {
     // `labelTailRule` — so the engine holds no opinion about how a placeholder
     // is spelled and never names a rule of another document in C++.
     //
-    // ⚠ OPTIONAL AS A PAIR, REQUIRED OF EACH OTHER — the loader refuses one
-    // without the other. A mode with no rule mints tokens no shape accepts; a
+    // ⚠ OPTIONAL AS A SET, REQUIRED OF EACH OTHER — the loader refuses any
+    // proper subset. A mode with no rule mints tokens no shape accepts; a
     // rule with no mode declares a shape whose FIRST token nothing ever
-    // produces. Both halves are silent no-ops, which is the one outcome this
-    // config surface is shaped to make impossible. A dialect that hosts no
-    // embedded templates declares neither, and both stay invalid.
+    // produces; and see `templateLabelRule` below for the third. Every one of
+    // them is a silent no-op, which is the one outcome this config surface is
+    // shaped to make impossible. A dialect that hosts no embedded templates
+    // declares none of them, and all stay invalid.
     LexerModeId templateLexerMode{};
     RuleId      templateOperandRule{};
+
+    // ★★★ WHICH PLACEHOLDER RULE IS THE `asm goto` **LABEL** REFERENCE —
+    // `asm.lang.json`'s `asmTemplateLabelRef`, naming `%l[done]` and `%l2`.
+    //
+    // ★★ IT EXISTS SO THE ENGINE CAN TELL THE TWO PLACEHOLDER FAMILIES APART
+    // WITHOUT EVER LOOKING AT A BYTE. An operand placeholder denotes a
+    // REGISTER and is asked for through `AsmLoweringHost::resolveRegister`; a
+    // label placeholder denotes a BLOCK and is asked for through
+    // `resolveBranchTarget`. Two questions, two virtuals — and the only
+    // dialect-neutral way to know which one a matched node is asking is the
+    // rule it was produced by. Testing the `%l` bytes in C++ would put a
+    // second owner beside `semantics.inlineAsmTemplateLexemes`, which is the
+    // defect `D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER`
+    // closed; this key is what keeps it closed.
+    //
+    // ⚠⚠ MANDATORY FOR EVERY DIALECT DOCUMENT, PRESENT AND FUTURE, AND THAT IS
+    // A LOAD-BREAKING CHANGE FOR ANY OUT-OF-TREE DIALECT — stated plainly
+    // rather than discovered. `asm.lang.json`'s `asmLine` closure SPELLS the
+    // template holes, so a dialect that imports the shared standalone surface
+    // imports the placeholder shapes whether or not it wants them, and the
+    // capability was therefore never really optional for such a document. That
+    // is not a new policy: it is the consequence recorded in the closed row
+    // `D-CONFIG-ASM-TEMPLATE-CAPABILITY-NO-LONGER-OPTIONAL-FOR-A-SHARED-SURFACE-IMPORTER`,
+    // now extended to a third key by the same argument. A dialect importing a
+    // NARROWER entry — one whose closure does not reach the template shapes —
+    // may still declare none of the three.
+    RuleId      templateLabelRule{};
 
     // Indexed by `static_cast<std::size_t>(AsmOperandRole)`. Every role is
     // REQUIRED when the block is present — a partial `operandForms` is a load

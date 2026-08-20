@@ -215,12 +215,19 @@ TEST(UnsuppressableCodes, ThreadLocalRejectsAreUnsuppressable) {
            "table — membership is what made it read as load-bearing.";
 }
 
-// Inline-asm P5 operand binding (D-CSUBSET-INLINE-ASM-OPERANDS +
-// D-CSUBSET-INLINE-ASM-TEXT, 0xE065..0xE06B). All seven are members on PRONG
-// (1): each refuses a construct that has a SECOND CANDIDATE LOWERING a silenced
-// compiler would take unannounced — an unbound operand, an alternative the
-// binder chose itself, a full-width register where a narrow view was written, a
-// dropped clobber, a vanished template, a placeholder dropped or emitted raw.
+// Inline-asm operand binding (D-CSUBSET-INLINE-ASM-OPERANDS +
+// D-CSUBSET-INLINE-ASM-TEXT + D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-
+// OPERAND, 0xE065..0xE06C). All EIGHT are members on PRONG (1): each refuses a
+// construct that has a SECOND CANDIDATE LOWERING a silenced compiler would take
+// unannounced — an unbound operand, an alternative the binder chose itself, a
+// full-width register where a narrow view was written, a dropped clobber, a
+// vanished template, a placeholder dropped or emitted raw, and — the eighth,
+// added by cycle P20 — one of the two bindings a repeated symbolic name
+// introduces, discarded by a first-match lookup.
+// ★ THE EIGHTH IS THE ONLY ONE WHOSE SUPPRESSED BEHAVIOUR WAS **MEASURED**
+// RATHER THAN REASONED: ✔2026-08-19, before the refusal existed, `[out] "=r"(r),
+// [v] "=r"(d) : [v] "r"(a)` compiled rc=0 at debug AND release through the
+// shipped CLI and returned the OUTPUT's value where the input's was written.
 // Named per-code pins, because `ListSelfConsistent` would still pass if any one
 // row were dropped from the table.
 //
@@ -240,7 +247,8 @@ TEST(UnsuppressableCodes, InlineAsmOperandBindingCodesAreUnsuppressable) {
           DiagnosticCode::S_InlineAsmClobberUnknown,
           DiagnosticCode::S_InlineAsmTemplateUnparsable,
           DiagnosticCode::S_InlineAsmPlaceholderOutOfRange,
-          DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate}) {
+          DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate,
+          DiagnosticCode::S_InlineAsmDuplicateSymbolicName}) {
         EXPECT_TRUE(isUnsuppressable(code))
             << diagnosticCodeName(code)
             << ": suppressed, the operand binding silently takes its second "
@@ -271,9 +279,9 @@ TEST(UnsuppressableCodes, InlineAsmOperandBindingCodesAreUnsuppressable) {
         ++checked;
     }
     // Non-vacuity: a counter incremented in the loop, not the list's length.
-    EXPECT_EQ(checked, 7);
+    EXPECT_EQ(checked, 8);
 
-    // ★ THE NEGATIVE THAT KEEPS THE SEVEN HONEST. The arc's EIGHTH code is
+    // ★ THE NEGATIVE THAT KEEPS THE EIGHT HONEST. One code of this arc is
     // deliberately NOT a member, and it is the same one P1 left out:
     // `volatile volatile` suppressed compiles to exactly what `volatile`
     // means, so there is no second candidate reading to pick silently. Pinned
@@ -286,6 +294,11 @@ TEST(UnsuppressableCodes, InlineAsmOperandBindingCodesAreUnsuppressable) {
            "is redundant, not ambiguous, so suppressing it ships no wrong "
            "bytes and hides no build failure. Read its block in "
            "`parse_diagnostic.hpp` before changing this.";
+    // ⚠ AND THE PAIR IS THE POINT: a repeated QUALIFIER stays suppressible while
+    // a repeated NAME (0xE06C) does not. The two look like one family and are
+    // not — `volatile volatile` has ONE candidate reading, a name used twice has
+    // exactly two and the compiler picks one in silence. Both pins in one test
+    // is what stops the next sweep collapsing them.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

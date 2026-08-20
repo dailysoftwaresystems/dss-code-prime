@@ -608,6 +608,63 @@ private:
                 // `seh_try_end <region>` — the payload is the region id.
                 out_ += std::format(" {}", mir_.instPayload(id));
                 break;
+            // ★★★ INLINE ASM: RENDER THE EDGES, AND SAY WHAT CANNOT BE RENDERED
+            // (D-MIR-TEXT-INLINE-ASM-RENDERS-A-POOL-INDEX-AND-NO-EDGES).
+            //
+            // Both asm opcodes used to fall into `default:`, which rendered the
+            // operands and then the raw `instPayload` — an index into the module's
+            // `MirAsmDescriptorPool` that means NOTHING once the text is detached
+            // from the module that produced it — and, because `default:` renders no
+            // successors, an `asm goto` printed with **no CFG edges at all**.
+            // ⚠ THE HALF THAT IS A DECLARED LIMITATION IS NOT THIS ONE. The parser
+            // REFUSES both mnemonics by name and states the reason (the descriptor
+            // carries text and constraints this format does not spell), so the text
+            // is deliberately one-way. A one-way dump is a choice; a dump that
+            // silently omits a terminator's edges while looking complete is not, and
+            // an `asm goto` is the first terminator this reached.
+            // ★ WHAT IS RENDERED: the operands, then every successor — the labels in
+            // source order followed by the FALL-THROUGH, which is the successor
+            // convention `MirBuilder::addInlineAsmGoto` establishes and the MIR
+            // verifier enforces — then an explicit marker in place of the descriptor.
+            // The marker names the absence rather than substituting a number for it,
+            // which is the whole difference between this and what it replaced.
+            case MirOpcode::InlineAsm:
+            case MirOpcode::InlineAsmGoto: {
+                auto operands = mir_.instOperands(id);
+                if (!operands.empty()) {
+                    out_ += " (";
+                    bool first = true;
+                    for (MirInstId const op2 : operands) {
+                        if (!first) out_ += ", ";
+                        out_ += std::format("%v{}", op2.v);
+                        first = false;
+                    }
+                    out_ += ')';
+                }
+                if (op == MirOpcode::InlineAsmGoto) {
+                    auto succs = mir_.blockSuccessors(block);
+                    for (std::size_t k = 0; k < succs.size(); ++k) {
+                        // The last successor is the fall-through; labelling it in the
+                        // text is what lets a reader check the convention instead of
+                        // counting on having remembered it.
+                        out_ += std::format(" {}%b{}",
+                                            (k + 1 == succs.size()) ? "fallthrough " : "",
+                                            succs[k].v);
+                    }
+                }
+                // ⚠ ONE TOKEN, HYPHENATED, AND THAT IS A REQUIREMENT RATHER
+                // THAN A STYLE. ✔MEASURED: the first spelling of this marker was
+                // the English phrase `<descriptor not spelled by this format>`,
+                // and the round-trip ABORTED the process --
+                // `addInst: opcode 'not' takes [1, 1] operands but got 0`. The
+                // parser refuses the `inlineasm*` mnemonic and its recovery then
+                // re-tokenizes the rest of the line, where the bare word `not` is
+                // a real MIR mnemonic. A writer must not hand the parser a valid
+                // opcode inside prose, so the marker is a single token with no
+                // interior spaces.
+                out_ += " <asm-descriptor-unspelled>";
+                break;
+            }
             default: {
                 // Generic: render all operands.
                 auto operands = mir_.instOperands(id);
@@ -1397,6 +1454,30 @@ private:
         // finish()`'s abort. Bailing first keeps the builder in a
         // clean state regardless of the finalize() path.
         if (!expect(TokKind::LBrace)) return;
+        // ★★★ AND BAIL ON AN EARLIER ERROR TOO, BECAUSE finalize()'s GUARD IS IN
+        // THE WRONG PLACE TO CATCH THIS ONE.
+        //
+        // ✔MEASURED 2026-08-19 (cycle P20) on the first `.dssir` text ever emitted
+        // containing an `inlineasmgoto`: the process ABORTED with
+        // `block MirBlockId=1 has no terminator`. Not in `finish()` — in
+        // `beginBlock`, HERE, which refuses to open a block while the previous one
+        // is unterminated.
+        //
+        // ⚠ THE REFUSAL SITE'S OWN COMMENT NAMES THE RULE IT WAS BREAKING —
+        // *"a refusal that crashes is not a refusal"* — and it was right about the
+        // principle and wrong about the coverage: `finalize()` short-circuits on
+        // `errors_` and so never calls `finish()`, but an instruction refused
+        // mid-block leaves that block unterminated and the NEXT `%bN {` never
+        // reaches `finalize()` at all. The guard protected the last step of a walk
+        // that dies two steps earlier.
+        //
+        // ★ Stopping here rather than sealing the block with a synthesized
+        // `unreachable`: the module is already being discarded by `finalize()`, so
+        // a synthetic terminator would exist only to satisfy a builder invariant
+        // for a module nobody will read — and it would make a REFUSED parse and a
+        // SUCCESSFUL one produce structurally similar builders, which is how the
+        // discard path stops being obviously correct.
+        if (errors_) return;
         builder_.beginBlock(b);
         while (true) {
             Tok pk = lex_.peek();

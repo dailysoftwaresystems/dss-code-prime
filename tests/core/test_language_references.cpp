@@ -1717,32 +1717,71 @@ TEST(LanguageReferences, HostSpelledPlaceholdersWalkTheMergedRulesToCompletion) 
             << "`? 0` walked the rule but did not COMPLETE it";
     }
 
-    // `?^ ( done )` — an `asm goto` label by NAME. ★ THE LABEL SIGIL IS A
-    // DIFFERENT KIND FROM THE OPERAND SIGIL, so this arm also proves the two
-    // placeholder families did not collapse into one during the merge.
+    // `?^ ( done )` and `?^ 2` — an `asm goto` label, by NAME and by INDEX.
+    // ★ THE LABEL SIGIL IS A DIFFERENT KIND FROM THE OPERAND SIGIL, so this arm
+    // also proves the two placeholder families did not collapse into one during
+    // the merge.
+    //
+    // ★★★ AND THE SLOT AFTER THE SIGIL IS THE **SELECTOR**, NOT THE BRACKETED
+    // NAME — THE SYMMETRY P20 ADDED, ASSERTED AS THE SCHEMA'S OWN SHAPE. Before
+    // it, this arm expected `asmTemplateSymbolicName` directly and the
+    // positional label form did not parse at all; ✔MEASURED in cycle P20 that
+    // gcc and clang both accept `%l<N>`, so refusing it was a conformance
+    // defect. Naming the selector is what makes BOTH forms reachable with zero
+    // rules added, and asserting the slot is what stops the two families from
+    // drifting back into two shapes.
     {
         auto cur = schema->advance(schema->enterRule(labelRef),
                                    kind("SlotLabelMark"));
         ASSERT_TRUE(cur.valid())
             << "asmTemplateLabelRef rejected the host's LABEL sigil";
+        EXPECT_FALSE(schema->isAtEndOfRule(cur))
+            << "a bare label sigil COMPLETED the rule";
         ASSERT_EQ(schema->slotKind(cur), SlotKind::RuleLeaf);
-        EXPECT_EQ(schema->slotRuleRef(cur).v, bracketed.v)
-            << "a label reference does not descend into the bracketed name — "
-               "the two forms are not sharing one symbolic-name rule";
+        EXPECT_EQ(schema->slotRuleRef(cur).v, selector.v)
+            << "a label reference does not descend into the SELECTOR — the two "
+               "placeholder families are no longer sharing one selector rule, "
+               "which is what makes `?^ 2` unparseable";
 
-        auto inner = schema->advance(schema->enterRule(bracketed),
-                                     kind("HugOpen"));
-        ASSERT_TRUE(inner.valid()) << "the bracketed name did not open";
-        inner = schema->advance(inner, kind("Identifier"));
-        ASSERT_TRUE(inner.valid()) << "the label name was rejected";
-        inner = schema->advance(inner, kind("HugClose"));
-        ASSERT_TRUE(inner.valid()) << "the bracketed name did not close";
-        EXPECT_TRUE(schema->isAtEndOfRule(inner));
+        // The POSITIONAL form, walked to completion through the selector's
+        // TOKEN branch. ⚠ THE SELECTOR'S TWO BRANCHES ARE NOT WALKED THE SAME
+        // WAY, AND THAT IS THE SCHEMA'S SHAPE RATHER THAN AN INCONSISTENCY
+        // HERE: `advance` routes an AltChoice by FIRST token and can then
+        // CONSUME a TokenLeaf branch, but a RuleLeaf branch has to be descended
+        // into with `enterRule` — the same structure the alt above `labelRef`
+        // has, and the reason the operand arm is written this way too.
+        {
+            auto inner = schema->advance(schema->enterRule(selector),
+                                         kind("IntLiteral"));
+            ASSERT_TRUE(inner.valid())
+                << "the selector rejected the host's integer kind on the LABEL "
+                   "path — the positional `%l<N>` form both references accept "
+                   "does not parse";
+            EXPECT_TRUE(schema->isAtEndOfRule(inner));
+        }
+        // ...and the BRACKETED form, through the SAME selector's RULE branch.
+        // ⚠ BOTH ARMS, OR THIS PROVES NOTHING: a selector that predicted only
+        // on the index would satisfy the slot assertion above and would have
+        // silently deleted `%l[name]`.
+        {
+            EXPECT_TRUE(schema->expectedSetContains(schema->enterRule(selector),
+                                                    kind("HugOpen")))
+                << "the selector does not predict on the host's bracket — a "
+                   "label by NAME no longer reaches the symbolic-name rule";
+            auto inner = schema->advance(schema->enterRule(bracketed),
+                                         kind("HugOpen"));
+            ASSERT_TRUE(inner.valid()) << "the bracketed name did not open";
+            inner = schema->advance(inner, kind("Identifier"));
+            ASSERT_TRUE(inner.valid()) << "the label name was rejected";
+            inner = schema->advance(inner, kind("HugClose"));
+            ASSERT_TRUE(inner.valid()) << "the bracketed name did not close";
+            EXPECT_TRUE(schema->isAtEndOfRule(inner));
+        }
 
         cur = schema->leaveRule(cur);
         ASSERT_TRUE(cur.valid());
         EXPECT_TRUE(schema->isAtEndOfRule(cur))
-            << "`?^ ( done )` walked the rule but did not COMPLETE it";
+            << "`?^ <selector>` walked the rule but did not COMPLETE it";
     }
 
     // ⚠ AND THE SIGILS ARE NOT INTERCHANGEABLE. If the merge had bound both

@@ -34,6 +34,7 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstdint>
 #include <format>
 #include <fstream>
@@ -143,6 +144,9 @@ struct TemplateRun {
     std::vector<std::uint8_t>        bytes;
     std::vector<std::uint16_t>       opcodes;   // the emitted block, in order
     std::vector<LirReg>              bindingRegs;   // index-parallel to the bindings
+    // Index-parallel to the LABEL bindings the caller asked for: one block per
+    // label, whatever number of spellings that label answers to.
+    std::vector<LirBlockId>          labelBlocks;
 };
 
 [[nodiscard]] std::string messages(TemplateRun const& r) {
@@ -165,13 +169,31 @@ struct TemplateRun {
 // ⚠ WITHOUT THIS THE arm64 `mrs %0, cntvct_el0` PIN WAS SILENTLY VACUOUS: it
 // asserted equality against an EMPTY byte vector, i.e. it was measuring the
 // harness giving up rather than the instruction encoding.
+// ★★★ `labelSpellings` IS A LIST **PER LABEL**, NOT A FLAT LIST OF SPELLINGS,
+// AND IT MIRRORS THE DESCRIPTOR SHAPE THE REAL CALLER CARRIES. One `asm goto`
+// label answers to EVERY spelling the source could name it by — the bracketed
+// `%l[done]` and the positional `%l2` are two names for ONE block — so the
+// harness creates one block per OUTER entry and binds every spelling in the
+// inner list to it. A flat list would have made "two spellings, one block"
+// unexpressible, which is exactly the property a positional-plus-symbolic
+// template exercises.
+//
+// ⚠ `templateTerminates` IS THE TEST STATING A PROPERTY OF THE TEMPLATE **IT
+// WROTE**, AND IT IS SELF-CHECKING RATHER THAN TRUSTED. A template ending in a
+// branch SEALS the entry block, so the harness must not add its own `ret`
+// there; one that does not, must get one. Both mistakes abort LOUDLY inside
+// `LirBuilder` — "block already terminated" if the flag is too low, "current
+// block has no terminator" if it is too high — so a wrong value can never
+// produce a quietly wrong CFG for an assertion to read.
 [[nodiscard]] std::unique_ptr<TemplateRun>
 runTemplateWith(std::shared_ptr<GrammarSchema> dialect, ShippedPair const& p,
                 std::string_view                templateText,
                 std::vector<std::string> const& bindingSpellings,
                 std::vector<std::string> const& physicalFor = {},
                 AsmTemplateSurface              surface
-                    = AsmTemplateSurface::Extended) {
+                    = AsmTemplateSurface::Extended,
+                std::vector<std::vector<std::string>> const& labelSpellings = {},
+                bool                            templateTerminates = false) {
     auto run     = std::make_unique<TemplateRun>();
     run->dialect = std::move(dialect);
     auto targetR = TargetSchema::loadShipped(p.target);
@@ -227,18 +249,39 @@ runTemplateWith(std::shared_ptr<GrammarSchema> dialect, ShippedPair const& p,
         bindings.push_back(std::move(b));
     }
 
+    // The `asm goto` targets. ⚠ THE BLOCKS ARE CREATED BEFORE THE LOWERING RUNS
+    // AND FILLED AFTER IT **UNCONDITIONALLY**, including on the refusal path:
+    // `LirBuilder::closeFunction` aborts on a block that was created and never
+    // opened, so a harness that only closed them on success would turn every
+    // refusal test into a process abort.
+    std::vector<AsmLabelBinding> labelBindings;
+    for (auto const& spellings : labelSpellings) {
+        LirBlockId const block = builder.createBlock();
+        run->labelBlocks.push_back(block);
+        for (auto const& s : spellings) {
+            AsmLabelBinding b;
+            b.spelling = s;
+            b.block    = block;
+            labelBindings.push_back(std::move(b));
+        }
+    }
+
     run->ok = lowerAsmTemplateToLirRun(*run->tree, *run->dialect,
                                        *run->target, bindings, builder,
-                                       run->reporter);
+                                       run->reporter, labelBindings);
 
-    // Close the block the way the embedding language will. ⚠ NO TEMPLATE IN
-    // THIS FILE CONTAINS A TERMINATOR — `LirBuilder` seals a block on one and
-    // would abort the process on a second, so adding a terminator here is only
-    // sound while that holds. A future test that writes `ret` inside a template
-    // must close its own block instead of reaching this line.
+    // Close the block the way the embedding language will. ⚠ A TEMPLATE THAT
+    // BRANCHES HAS ALREADY SEALED IT — `LirBuilder` seals a block on one
+    // terminator and aborts on a second — so the harness adds its own only when
+    // the caller said the template does not terminate, or when the lowering
+    // REFUSED before it could (a refused `jmp %l[x]` emits nothing at all).
     auto const retOp = run->target->opcodeByMnemonic("ret");
     if (!retOp.has_value()) throw std::runtime_error{"target has no `ret`"};
-    builder.addReturn(*retOp, {});
+    if (!templateTerminates || !run->ok) builder.addReturn(*retOp, {});
+    for (LirBlockId const block : run->labelBlocks) {
+        builder.beginBlock(block);
+        builder.addReturn(*retOp, {});
+    }
     run->lir = std::move(builder).finish();
 
     auto const blk = run->lir.funcBlockAt(run->lir.funcAt(0), 0);
@@ -259,9 +302,12 @@ runTemplate(ShippedPair const& p, std::string_view templateText,
             std::vector<std::string> const& bindingSpellings,
             std::vector<std::string> const& physicalFor = {},
             AsmTemplateSurface              surface
-                = AsmTemplateSurface::Extended) {
+                = AsmTemplateSurface::Extended,
+            std::vector<std::vector<std::string>> const& labelSpellings = {},
+            bool                            templateTerminates = false) {
     return runTemplateWith(loadDialect(p.dialect), p, templateText,
-                           bindingSpellings, physicalFor, surface);
+                           bindingSpellings, physicalFor, surface,
+                           labelSpellings, templateTerminates);
 }
 
 // The bytes an EMPTY template produces — i.e. the terminator alone. Every byte
@@ -1054,26 +1100,84 @@ TEST(AsmTemplateToLir, ASymbolicPlaceholderResolvesThroughTheSameBindingTable) {
     EXPECT_TRUE(run->lir.instResult(inst) == run->bindingRegs[0]);
 }
 
-// `%l[label]` — the `asm goto` target form (GNU 6.47.2.7). ⚠ WHAT THIS PINS IS
-// THE GRAMMAR HALF ONLY, AND IT SAYS SO RATHER THAN OVERCLAIMING: binding a
-// label to a LIR block is the embedding language's half, so an unbound label
-// spelling must reach the host and be refused BY NAME — which is a strictly
-// better state than the parse error it produced before the shape existed,
-// because a parse error cannot tell an author whether the form is unsupported
-// or merely misspelled.
+// ── (1b) the `asm goto` LABEL placeholder ─────────────────────────────────
 //
-// ★★★ AND THE REFUSAL MUST **SAY** THAT (added 2026-08-15). The message used to
-// stop at "names neither a register this target declares nor one of the N
-// operand(s) bound", which is true of `%l[done]` and describes the wrong
-// construct: it presents a dichotomy — register or operand — that a label can
-// never satisfy, and sends the author to the target's register list for a token
-// no target could declare. `AsmOperandBinding` carries a `LirReg` and no BLOCK,
-// so no caller can bind a label and no spelling change can fix it; the message
-// now says so. ⚠ THIS ASSERTION IS THE ONLY THING STOPPING THAT SENTENCE FROM
-// SILENTLY REVERTING TO THE DICHOTOMY — the lowering behaviour is identical
-// either way, so nothing else here can see the difference.
-TEST(AsmTemplateToLir, ALabelPlaceholderParsesAndIsRefusedAsALabelNotARegister) {
-    auto const run = runTemplate(kX86, "movq %l[done], %0\n", {"%0"});
+// ★★★ WHAT THESE PIN AND WHAT THEY REPLACE. Until P20 the label form was the
+// GRAMMAR HALF ONLY: `AsmOperandBinding` carried a `LirReg` and no block, so a
+// label spelling matched no binding and the host refused it, and the test here
+// pinned the WORDING of that refusal — because the lowering behaviour was
+// identical either way and nothing else could see the difference. The lowering
+// exists now, so the sentence that test protected has to be protected by the
+// refusal that REMAINS: an UNBOUND label. A label the caller did not bind still
+// cannot become a branch, for exactly the reason the old comment gave — the
+// block belongs to the embedding language's CFG — so the pin moved rather than
+// went away.
+
+// The resolution, in BOTH spellings and on BOTH dialects. ★ THE ASSERTION IS
+// THE BLOCK THE BRANCH NAMES, not merely that the template lowered: a `jmp`
+// that reached the wrong block would lower, encode, and run the wrong code.
+TEST(AsmTemplateToLir, ALabelPlaceholderBranchesToTheBoundBlock) {
+    struct Case { ShippedPair p; std::string_view text; std::string_view spelling; };
+    for (auto const& c : {Case{kX86, "jmp %l[done]\n", "%l[done]"},
+                          Case{kX86, "jmp %l2\n",      "%l2"},
+                          Case{kArm, "b %l[done]\n",   "%l[done]"},
+                          Case{kArm, "b %l2\n",        "%l2"}}) {
+        // ⚠ BOTH SPELLINGS NAME **ONE** LABEL AND THEREFORE ONE BLOCK — the
+        // shape a real `asm goto` carries, where the bracketed and positional
+        // forms are two names for the same target. Binding them to two blocks
+        // would have made "the branch reached the right block" trivially true
+        // for whichever spelling was tried.
+        auto const run = runTemplate(c.p, c.text, {}, {},
+                                     AsmTemplateSurface::Extended,
+                                     {{"%l[done]", "%l2"}},
+                                     /*templateTerminates=*/true);
+        ASSERT_TRUE(run->parsed)
+            << c.p.dialect << " / " << c.spelling << ": did not PARSE — the "
+               "two-byte `%l` lexeme, the selector, or the bracketed-name shape "
+               "is missing:\n" << messages(*run);
+        ASSERT_TRUE(run->ok)
+            << c.p.dialect << " / " << c.spelling << ":\n" << messages(*run);
+        ASSERT_EQ(run->labelBlocks.size(), 1u);
+
+        auto const entry = run->lir.funcBlockAt(run->lir.funcAt(0), 0);
+        ASSERT_EQ(run->lir.blockInstCount(entry), 1u)
+            << c.p.dialect << " / " << c.spelling
+            << ": the template must have emitted exactly the branch";
+        auto const term = run->lir.blockTerminator(entry);
+        auto const ops  = run->lir.instOperands(term);
+        ASSERT_EQ(ops.size(), 1u)
+            << c.p.dialect << " / " << c.spelling
+            << ": an unconditional branch names exactly one target";
+        EXPECT_EQ(ops[0].kind, LirOperandKind::BlockRef)
+            << c.p.dialect << " / " << c.spelling
+            << ": the label placeholder did not become a BLOCK reference — it "
+               "is still being decoded as an operand";
+        EXPECT_EQ(ops[0].blockSlot, run->labelBlocks[0].v)
+            << c.p.dialect << " / " << c.spelling
+            << ": the branch names the wrong block";
+        // ★ AND THE CFG EDGE, WHICH IS A SEPARATE FACT FROM THE OPERAND. A
+        // BlockRef operand with no recorded successor is a branch the later
+        // passes cannot see.
+        auto const succs = run->lir.blockSuccessors(entry);
+        ASSERT_EQ(succs.size(), 1u) << c.p.dialect << " / " << c.spelling;
+        EXPECT_TRUE(succs[0] == run->labelBlocks[0])
+            << c.p.dialect << " / " << c.spelling
+            << ": the successor edge does not reach the bound block";
+    }
+}
+
+// ★★★ THE REFUSAL THAT REMAINS, AND IT IS THE ONE THE OLD TEST'S SENTENCE
+// SURVIVES IN. A template still declares NO labels of its own: the blocks
+// around it belong to the embedding language, and `LirOperand::makeBlockRef`
+// names a FUNCTION-LOCAL slot — so a spelling nobody bound must be refused by
+// name and must never be bound to "some block anyway". ⚠ THE MESSAGE MUST NAME
+// THE BOUND SET, exactly as the unbound-OPERAND refusal does: `%l3` on a
+// two-label `asm goto` is the shape this catches, and a generic "no such block"
+// would be true and useless.
+TEST(AsmTemplateToLir, AnUnboundLabelPlaceholderIsRefusedNamingTheBoundLabels) {
+    auto const run = runTemplate(kX86, "jmp %l[done]\n", {}, {},
+                                 AsmTemplateSurface::Extended,
+                                 {{"%l[other]"}}, /*templateTerminates=*/true);
     ASSERT_TRUE(run->parsed)
         << "`%l[done]` did not PARSE — the two-byte `%l` lexeme or the "
            "bracketed-name shape is missing:\n" << messages(*run);
@@ -1081,11 +1185,55 @@ TEST(AsmTemplateToLir, ALabelPlaceholderParsesAndIsRefusedAsALabelNotARegister) 
     expectRefusalNamesThePair(*run, "%l[done]");
     auto const msg = messages(*run);
     EXPECT_NE(msg.find("asm goto"), std::string::npos)
-        << "the refusal must name the CONSTRUCT, not just report an unknown "
-           "register-position name: " << msg;
-    EXPECT_NE(msg.find("BLOCK"), std::string::npos)
-        << "the refusal must say WHY no spelling can fix it — a label resolves "
-           "to a block and an operand binding carries none: " << msg;
+        << "the refusal must name the CONSTRUCT, not merely report an unknown "
+           "branch target: " << msg;
+    EXPECT_NE(msg.find("%l[other]"), std::string::npos)
+        << "the refusal must ENUMERATE the labels that WERE bound — the count "
+           "and the list are the whole diagnosis, and only the host can supply "
+           "them: " << msg;
+    EXPECT_NE(msg.find("block"), std::string::npos)
+        << "the refusal must say WHY a template cannot invent one — a label "
+           "resolves to a block of the CALLER's function: " << msg;
+}
+
+// ★★ AND THE POSITIONAL SPELLING IS MATCHED THE SAME WAY, WHICH IS WHAT STOPS
+// "`%l2` parses" FROM BEING MISTAKEN FOR "`%l2` resolves". A template naming
+// `%l2` against a label bound only as `%l[done]` must be refused, not silently
+// answered by the label that happens to be there.
+TEST(AsmTemplateToLir, APositionalLabelSpellingIsNotAnsweredByABracketedBinding) {
+    auto const run = runTemplate(kX86, "jmp %l2\n", {}, {},
+                                 AsmTemplateSurface::Extended,
+                                 {{"%l[done]"}}, /*templateTerminates=*/true);
+    ASSERT_TRUE(run->parsed) << messages(*run);
+    EXPECT_FALSE(run->ok)
+        << "`%l2` resolved against a binding spelled `%l[done]` — the engine is "
+           "interpreting the spelling instead of comparing it, and a label's "
+           "index would then be decided somewhere below the front end:\n"
+        << messages(*run);
+    EXPECT_NE(messages(*run).find("%l2"), std::string::npos) << messages(*run);
+}
+
+// ★★★ A LABEL IN A NON-BRANCH POSITION IS REFUSED, AND THE MESSAGE NAMES THE
+// CONSTRUCT. `movq %l[done], %0` decodes the label as a symbol-valued source,
+// so the ordinary instruction path asks the host for its ADDRESS — a different
+// question from "which block does this branch to", and one this build answers
+// for nothing inside a template. ⚠ THE BINDING IS SUPPLIED, so this cannot pass
+// for the unbound refusal above: the label IS bound and the POSITION is what is
+// wrong.
+TEST(AsmTemplateToLir, ALabelPlaceholderOutsideABranchIsRefusedNamingAsmGoto) {
+    auto const run = runTemplate(kX86, "movq %l[done], %0\n", {"%0"}, {},
+                                 AsmTemplateSurface::Extended,
+                                 {{"%l[done]"}});
+    ASSERT_TRUE(run->parsed) << messages(*run);
+    EXPECT_FALSE(run->ok)
+        << "a bound label was accepted as an instruction SOURCE — that is the "
+           "computed-goto construct, which no reference gives `%l` and which "
+           "this build does not lower:\n" << messages(*run);
+    expectRefusalNamesThePair(*run, "%l[done]");
+    auto const msg = messages(*run);
+    EXPECT_NE(msg.find("asm goto"), std::string::npos)
+        << "the refusal must name the construct the author actually wrote, not "
+           "only say that an address cannot be taken: " << msg;
 }
 
 // ★★★ THE `spellingCase` SEAM, BOTH SIDES, AGAINST **ONE** DIALECT — the pin
@@ -1237,11 +1385,17 @@ TEST(AsmTemplateToLir, EscapedPercentAndPlainPercentReachIdenticalBytes) {
 // wrote. [[feedback_reference_compilers_are_the_spec]] is bidirectional:
 // accepting what no reference accepts is the same defect as refusing what they
 // do, and this is the arm that catches it.
+// ⚠ THE POSITIONAL LABEL FORM IS IN THE LIST, AND IT HAD TO BE ADDED THE DAY
+// IT BECAME GRAMMATICAL (P20). `%l2` was previously unreachable from a `.s` for
+// TWO independent reasons — the mode never mints `%l`, AND no shape accepted
+// `%l` followed by an index — and widening the shape removed one of them. If
+// the remaining reason ever stopped holding, a `.s` would accept a form gas
+// rejects, which is the same defect as refusing one it takes.
 TEST(AsmTemplateToLir, ThePlaceholderSurfaceIsUnreachableFromAStandaloneFile) {
     for (auto const& p : {kX86, kArm}) {
         auto dialect = loadDialect(p.dialect);
         for (auto const& line : {"\tmovq %0, %0\n", "\tmovq %%rcx, %%rax\n",
-                                 "\tmov %l[done], %0\n"}) {
+                                 "\tmov %l[done], %0\n", "\tmov %l2, %0\n"}) {
             auto const msg = standaloneParseMessages(*dialect, dialect, line);
             EXPECT_FALSE(msg.empty())
                 << p.dialect << ": a `.s` ACCEPTED `" << line
@@ -1522,29 +1676,89 @@ TEST(AsmTemplateToLir, ADialectMintingThePlaceholderKindUnderItsOwnBytesIsRefuse
     }
 }
 
-// ★★★ THE PAIR RULE, EXERCISED IN BOTH DIRECTIONS. `templateLexerMode` and
-// `templateOperandRule` are two halves of one capability and neither does
-// anything alone — a mode with no rule mints tokens no shape accepts, a rule
-// with no mode declares a shape whose FIRST token nothing produces. Both are
-// SILENT failures, so the loader refuses the half-declaration; this is the arm
-// that proves it does.
-TEST(AsmTemplateToLir, HalfATemplateSurfaceIsRefusedAtLoadNamingBothKeys) {
+// ★★★ THE ALL-OR-NOTHING RULE, EXERCISED IN EVERY DIRECTION.
+// `templateLexerMode`, `templateOperandRule` and `templateLabelRule` are three
+// parts of ONE capability and none does anything alone — a mode with no operand
+// rule mints tokens no shape accepts, an operand rule with no mode declares a
+// shape whose FIRST token nothing produces, and a surface with no label rule
+// cannot tell an `asm goto` target from an operand. All three are SILENT
+// failures, so the loader refuses any proper subset; this is the arm that
+// proves it does.
+// ⚠ THE LOOP RUNS OVER **EVERY** KEY, NOT THE TWO THAT PREDATE P20. A
+// third key joined the set, and a test that dropped only the original two would
+// have left the new one's half of the rule unexercised — which is exactly how a
+// REQUIRE-ALL block quietly becomes a REQUIRE-MOST one.
+TEST(AsmTemplateToLir, HalfATemplateSurfaceIsRefusedAtLoadNamingEveryKey) {
+    constexpr std::array<char const*, 3> kCapability{
+        "templateLexerMode", "templateOperandRule", "templateLabelRule"};
     for (auto const& p : {kX86, kArm}) {
-        for (auto const* dropped : {"templateLexerMode",
-                                    "templateOperandRule"}) {
+        for (auto const* dropped : kCapability) {
             auto const half = loadDialectMutated(
                 p.dialect, [dropped](nlohmann::json& doc) {
+                    ASSERT_TRUE(doc["assembly"].contains(dropped))
+                        << "the shipped document does not declare '" << dropped
+                        << "' — this arm would be green for the wrong reason";
                     doc["assembly"].erase(dropped);
                 });
             EXPECT_EQ(half.grammar, nullptr)
-                << p.dialect << ": the document loaded with only half of the "
+                << p.dialect << ": the document loaded with only part of the "
                    "template surface (dropped '" << dropped << "')";
             auto const why = joined(half.loadErrors);
-            EXPECT_NE(why.find("templateLexerMode"), std::string::npos)
-                << p.dialect << ": the refusal must name BOTH keys: " << why;
-            EXPECT_NE(why.find("templateOperandRule"), std::string::npos)
-                << p.dialect << ": the refusal must name BOTH keys: " << why;
+            for (auto const* key : kCapability) {
+                EXPECT_NE(why.find(key), std::string::npos)
+                    << p.dialect << " (dropped '" << dropped
+                    << "'): the refusal must name EVERY key of the set, so the "
+                       "author learns what the capability actually is: " << why;
+            }
         }
+    }
+}
+
+// ★★★ A `templateLabelRule` THAT NAMES A RULE THE PLACEHOLDER RULE CANNOT
+// BEGIN WITH IS REFUSED AT LOAD — the silent no-op the key exists to prevent.
+//
+// ⚠ THE MUTATION IS THE PLAUSIBLE TYPO, NOT AN ABSURD ONE: the two placeholder
+// families SHARE the bracketed symbolic-name rule, so naming it here is the
+// mistake a dialect author would actually make. Its effect is total and silent
+// — `decodePlaceholder` matches the label rule against the placeholder's own
+// child, that child is never the shared name rule, and every `asm goto` target
+// would decode as an operand and be refused as an unbound register. A true
+// diagnostic, pointing at the wrong thing.
+TEST(AsmTemplateToLir, ATemplateLabelRuleOutsideThePlaceholderFamilyIsRefused) {
+    for (auto const& p : {kX86, kArm}) {
+        auto const strayed = loadDialectMutated(
+            p.dialect, [](nlohmann::json& doc) {
+                doc["assembly"]["templateLabelRule"] = "asmTemplateSymbolicName";
+            });
+        EXPECT_EQ(strayed.grammar, nullptr)
+            << p.dialect << ": a 'templateLabelRule' naming a rule outside the "
+               "placeholder family loaded clean — the label form is then dead "
+               "and nothing says so";
+        auto const why = joined(strayed.loadErrors);
+        EXPECT_NE(why.find("templateLabelRule"), std::string::npos)
+            << p.dialect << ": " << why;
+
+        // ★ AND THE SAME-RULE MISTAKE, which FIRST-set containment cannot see
+        // (a set is trivially a subset of itself) and which is therefore its
+        // own arm rather than a variant of the one above.
+        auto const same = loadDialectMutated(
+            p.dialect, [](nlohmann::json& doc) {
+                doc["assembly"]["templateLabelRule"] =
+                    doc["assembly"]["templateOperandRule"];
+            });
+        EXPECT_EQ(same.grammar, nullptr)
+            << p.dialect << ": 'templateLabelRule' naming the same rule as "
+               "'templateOperandRule' loaded clean — the label form matches "
+               "nothing and is silently dead";
+        EXPECT_NE(joined(same.loadErrors).find("templateOperandRule"),
+                  std::string::npos)
+            << p.dialect << ": the refusal must name the rule it collided with: "
+            << joined(same.loadErrors);
+
+        // The shipped document is unaffected — the mutations are the only
+        // variables.
+        auto const shipped = runTemplate(p, "nop\n", {});
+        EXPECT_TRUE(shipped->ok) << p.dialect << ": " << messages(*shipped);
     }
 }
 
@@ -1656,6 +1870,7 @@ TEST(AsmTemplateToLir, ADialectImportingTheSharedSurfaceCannotDropTheTemplateCap
         kX86.dialect, [](nlohmann::json& doc) {
             doc["assembly"].erase("templateLexerMode");
             doc["assembly"].erase("templateOperandRule");
+            doc["assembly"].erase("templateLabelRule");
         });
     EXPECT_EQ(capOnly.grammar, nullptr)
         << "a dialect dropped the template capability and kept its role "
@@ -1677,6 +1892,7 @@ TEST(AsmTemplateToLir, ADialectImportingTheSharedSurfaceCannotDropTheTemplateCap
         kX86.dialect, [](nlohmann::json& doc) {
             doc["assembly"].erase("templateLexerMode");
             doc["assembly"].erase("templateOperandRule");
+            doc["assembly"].erase("templateLabelRule");
             std::size_t erased = 0;
             for (auto& [_, ref] : doc["languageReferences"].items()) {
                 if (!ref.is_object() || !ref.contains("bindTokens")) continue;

@@ -9407,10 +9407,11 @@ struct Lowerer {
         // The practical delta today is ZERO and that is measured, not assumed:
         // `MirOpcode::InlineAsm`/`InlineAsmGoto` are BOTH `hasSideEffects` and
         // both members of the opcode memory-clobber set unconditionally
-        // (`mir_opcode.hpp:562-563`, `:754`), so the four optimizer gates already
-        // refuse to move or elide the block regardless of this bit — the field's
-        // own docblock says it "records the SOURCE's word; it is not the
-        // optimizer's only defence". The bit becomes load-bearing the moment a
+        // (the two asm rows in `opcodeInfo` and the `opcodeClobbersMemory` arm),
+        // so the four optimizer gates already refuse to move or elide the block
+        // regardless of this bit — the field's own docblock says it "records the
+        // SOURCE's word; it is not the optimizer's only defence". The bit
+        // becomes load-bearing the moment a
         // pass keys elision of an unused-output asm off it, which is why this is
         // reported as a front-end gap rather than left as a silent `false`.
         desc.isVolatile             = true;
@@ -9462,6 +9463,19 @@ struct Lowerer {
             mo.fixedRegister  = o.fixedRegister;
             mo.isReadWrite    = o.constraint.isReadWrite;
             mo.isEarlyClobber = o.constraint.earlyClobber;
+            // ★★★ THE SPELLINGS TRAVEL; NO TIER BELOW MINTS ONE. The front end
+            // built them from the language's own declared template lexemes, and
+            // the numbering they encode CANNOT be recomputed here: an index
+            // derived from `outputs.size() + inputs.size()` overcounts by the
+            // number of `"+"` operands, because the tied read halves appended
+            // below are entries the SOURCE never wrote (`MirAsmOperand::spellings`
+            // carries the discriminating program).
+            // ⚠ THIS BLOCK IS FIELD-BY-FIELD — the one place in this lowering
+            // where the whole-by-value discipline does not protect a new
+            // descriptor field. An unassigned field here is silently empty on
+            // every real compile while hand-built unit tests, which construct
+            // `MirAsmOperand` directly, keep passing.
+            mo.spellings      = o.spellings;
             if (i < src.outputCount) desc.outputs.push_back(std::move(mo));
             else                     desc.inputs.push_back(std::move(mo));
         }
@@ -9496,6 +9510,13 @@ struct Lowerer {
             MirAsmOperand tied = desc.outputs[k];
             tied.isEarlyClobber = false;   // `&` is the OUTPUT's promise, not the read's
             tied.tiedOutput     = static_cast<std::uint32_t>(k);
+            // ★ AND THE SPELLINGS STAY WITH THE OUTPUT. The source wrote this
+            // operand ONCE and named it once; the read half is GNU's synthesized
+            // matching-constraint entry, which no `%N` the front end admits can
+            // reach. Copying the spellings across would publish the same spelling
+            // at two different registers, and a consumer that binds one row per
+            // spelling would silently keep whichever row it saw last.
+            tied.spellings.clear();
             desc.inputs.push_back(std::move(tied));
         }
 
@@ -9509,8 +9530,8 @@ struct Lowerer {
         // ★ EVERY ADDRESS AND EVERY INPUT IS COMPUTED BEFORE THE ASM IS EMITTED, and
         // the whole batch is validated before ANY of it is used. A mid-loop bail-out
         // after the asm instruction existed would leave a producer with a partial
-        // piece set — the shape `mir_to_lir.cpp:4944-4950` names as drowning the root
-        // cause.
+        // piece set — the shape `mir_to_lir`'s piece-consumption refusal names
+        // as drowning the root cause.
         std::vector<MirInstId> outAddrs;
         outAddrs.reserve(src.outputCount);
         // The VALUES behind the tied read halves appended to `desc.inputs`
@@ -9573,8 +9594,8 @@ struct Lowerer {
         // index aborts instead of naming a different entry (or none) in an empty pool.
         // ⚠ `isGoto` IS NOT THE SAME QUESTION AS "ARE THERE LABELS", and conflating
         // them ABORTS THE COMPILER on a legal program. ✔MEASURED 2026-08-15:
-        // `MirBuilder::addInlineAsmGoto` (`mir.cpp:887-891`) calls `std::abort()` on an
-        // empty label span, because `opcodeInfo` requires `InlineAsmGoto` to have >= 1
+        // `MirBuilder::addInlineAsmGoto` calls `std::abort()` on an empty label span,
+        // because `opcodeInfo` requires `InlineAsmGoto` to have at least one label
         // successor. But clang 18.1.3/19.1.1 ACCEPT `asm goto` with an EMPTY label
         // section (gcc 13.3 rejects it) and the operator ruled to follow clang — the
         // `HirInlineAsmDescriptor::isGoto` docblock records exactly that — so a
@@ -9590,17 +9611,26 @@ struct Lowerer {
             labels.reserve(src.labelOrdinals.size());
             for (std::uint32_t ord : src.labelOrdinals)
                 labels.push_back(getOrCreateLabelBlock(ord));
+            // ★ THE LABEL SPELLINGS TRAVEL BESIDE THE LABEL BLOCKS, index-aligned
+            // 1:1 — the two lists are the SAME label list resolved two ways (an
+            // ordinal for the CFG, the bytes a template may write for the asm
+            // engine), and an ordinal cannot rebuild a spelling. `HirVerifier`'s
+            // `checkInlineAsm` pins the HIR-side sizes; `addInlineAsmGoto` refuses
+            // a disagreement here, so a dropped spelling cannot reach the pool as
+            // a silently short list.
+            desc.labelSpellings = src.labelSpellings;
 
             auto const res = mir.addInlineAsmGoto(std::move(desc), inputs, labels);
             if (!res.terminator.valid()) return false;
 
-            // THE EDGE-PLACEMENT RULE (plan 29 §4.5, `mir.hpp:600-631`). A terminator
-            // has nothing after it in its block, so an `asm goto` with outputs places
-            // its pieces at the head of every SUCCESSOR. The builder interposed a
-            // single-predecessor landing block on each edge; fill each one, then
-            // branch on to the label the source named. A split block left unopened is
-            // caught by `finish()`'s fill+terminate sweep, so a forgotten edge cannot
-            // ship.
+            // THE EDGE-PLACEMENT RULE (plan 29 §4.5, `MirBuilder::addInlineAsmGoto`,
+            // which owns it). A terminator has nothing after it in its block, so an
+            // `asm goto` with outputs places its pieces at the head of every
+            // SUCCESSOR. The builder interposed a single-predecessor landing block
+            // on each edge — INCLUDING the fall-through edge, whose pieces are just
+            // as readable as a label path's; fill each one, then branch on to where
+            // that edge continues. A split block left unopened is caught by
+            // `finish()`'s fill+terminate sweep, so a forgotten edge cannot ship.
             for (auto const& e : res.edges) {
                 if (!e.split) continue;
                 mir.beginBlock(e.successor);
@@ -9621,15 +9651,21 @@ struct Lowerer {
                     std::array<MirInstId, 2> st{rp, outAddrs[k]};
                     emitScalarStore(st, pieceTypeFor(k), kids[k]);
                 }
-                mir.addBr(e.label);
+                mir.addBr(e.onward);
             }
-            // An `asm goto` SEALS its block. Open a fresh dead block for anything the
-            // statement list still holds, exactly as the other terminator arms do; the
-            // mandatory unreachable-prune (D-MIR-UNREACHABLE-PRUNE-NORMALIZE) drops it.
-            if (mir.openBlockHasTerminator()) {
-                MirBlockId const dead = mir.createBlock(StructCfMarker::Linear);
-                mir.beginBlock(dead);
-            }
+            // ★★★ THE STATEMENTS AFTER THE ASM GO IN THE CONTINUATION, NOT IN A
+            // DEAD BLOCK — AND THE DIFFERENCE WAS A SILENT MISCOMPILE. This arm
+            // used to open a fresh block it called dead, on the reasoning that an
+            // `asm goto` seals its own block like every other terminator arm; the
+            // mandatory unreachable-prune then DELETED everything that followed the
+            // statement. ✔MEASURED on gcc 13.3.0, clang 19.1.1 and
+            // aarch64-linux-gnu-gcc: an `asm goto` whose template does not branch
+            // FALLS THROUGH, so that code is live on a real path. The builder minted
+            // the continuation as the fall-through edge's target; opening it is what
+            // makes the CFG say so. (Left unopened it is a created-but-unfilled
+            // block, which `finish()` aborts on — the sweep that keeps this from
+            // being forgettable.)
+            mir.beginBlock(res.continuation());
             return true;
         }
 
@@ -9642,9 +9678,10 @@ struct Lowerer {
         if (!asmInst.valid()) return false;
 
         // Pass 1 — capture pieces 1..N-1 IMMEDIATELY after the producer. Nothing may
-        // intervene: `lir_callconv.cpp:2615-2632` fails loud on a piece that is not
-        // adjacent to its producer, because a non-adjacent read would take a register
-        // the asm block has already overwritten. Piece 0 is `asmInst` itself.
+        // intervene: `lir_callconv`'s piece-capture pass fails loud on a piece
+        // that is not adjacent to its producer, because a non-adjacent read would
+        // take a register the asm block has already overwritten. Piece 0 is
+        // `asmInst` itself.
         std::vector<MirInstId> pieceVals;
         pieceVals.reserve(src.outputCount);
         for (std::size_t k = 0; k < src.outputCount; ++k) {

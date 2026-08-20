@@ -1137,6 +1137,10 @@ private:
                 // blocks, which are ordinary blocks here) map through mapSucc;
                 // the descriptor is re-added. `cloneInlineAsmGoto`, never
                 // `addInlineAsmGoto` -- the placement rule already ran.
+                // ⚠ EVERY successor, the trailing FALL-THROUGH edge included:
+                // dropping it leaves the code after the asm with no predecessor
+                // and the unreachable prune deletes it. `cloneInlineAsmGoto`
+                // re-checks the count against the descriptor's label list.
                 std::vector<MirInstId> newOps;
                 newOps.reserve(oldOps.size());
                 for (MirInstId const o : oldOps) newOps.push_back(mapCallerValue(o, id));
@@ -1462,6 +1466,8 @@ private:
                 // `MirFunctionRebuilder` fix does not reach here, since this
                 // splice path is Inlining's own
                 // (D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER).
+                // ⚠ EVERY successor, the trailing FALL-THROUGH edge included --
+                // see the caller-host arm above for what dropping it deletes.
                 std::vector<MirInstId> newOps;
                 newOps.reserve(cops.size());
                 for (MirInstId const o : cops) {

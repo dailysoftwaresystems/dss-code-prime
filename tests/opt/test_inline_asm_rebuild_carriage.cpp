@@ -104,19 +104,21 @@ public:
 // outputs with distinct classes, a named clobber, and BOTH clobber flags. A
 // dropped-and-re-defaulted descriptor cannot look like this one.
 //
-// ★★ EVERY FIELD THE DESCRIPTOR GAINS MUST BE ADDED HERE, AND THE TWO NEWEST
-// ONES SHOW WHY. `isExtended` and `MirAsmOperand::tiedOutput` arrived after this
-// fixture was written and were NOT pinned. Today nothing can drop them — every
-// rebuild site passes `src.asmDescriptor(id)` WHOLE by value, so new members ride
-// along for free — and that is exactly the trap: the pin's strength is a property
-// of how the copy happens to be spelled today, not of anything asserted. The
-// exposure is a future refactor to a field-by-field copy, which is the silent-drop
-// class `mir_asm_descriptor.hpp`'s own docblock exists to guard
-// ("A POOL INDEX IS NOT SELF-CARRYING, AND THAT IS THE WHOLE HAZARD").
-// ⚠ Both are set to NON-DEFAULT values on purpose: `isExtended` defaults to the
-// BASIC surface and `tiedOutput` to `nullopt`, so a dropped field would be
-// indistinguishable from a field that was never set if the sentinel used the
-// defaults.
+// ★★ EVERY FIELD THE DESCRIPTOR GAINS MUST BE ADDED HERE, AND THE FIRST TWO
+// SHOWED WHY. `isExtended` and `MirAsmOperand::tiedOutput` arrived after this
+// fixture was written and were NOT pinned (the row
+// `D-TEST-MIR-ASM-DESCRIPTOR-NEW-FIELDS-UNPINNED-THROUGH-REBUILD`, which closed by
+// adding them). Today nothing can drop any of them — every rebuild site passes
+// `src.asmDescriptor(id)` WHOLE by value, so new members ride along for free — and
+// that is exactly the trap: the pin's strength is a property of how the copy
+// happens to be spelled today, not of anything asserted. The exposure is a future
+// refactor to a field-by-field copy, which is the silent-drop class
+// `mir_asm_descriptor.hpp`'s own docblock exists to guard ("A POOL INDEX IS NOT
+// SELF-CARRYING, AND THAT IS THE WHOLE HAZARD").
+// ⚠ EVERY ONE IS SET TO A NON-DEFAULT VALUE on purpose: `isExtended` defaults to
+// the BASIC surface, `tiedOutput` to `nullopt`, and both spelling lists to EMPTY,
+// so a sentinel that used the defaults could not tell a dropped field from a field
+// that was never set.
 MirAsmDescriptor sentinelDescriptor() {
     MirAsmDescriptor d;
     d.templateText = "cpuid; rdtsc";
@@ -126,11 +128,19 @@ MirAsmDescriptor sentinelDescriptor() {
     o0.constraint    = "=a";
     o0.regClass      = TargetRegClass::GPR;
     o0.fixedRegister = "rax";
+    // ★ THE SPELLINGS THE TEMPLATE MAY WRITE FOR THIS OPERAND, minted by the front
+    // end from the language's declared lexemes and only ever COMPARED below. Two
+    // entries (positional + symbolic) rather than one, so a copy that kept the
+    // vector but truncated it is still visible; and a DIFFERENT symbolic name per
+    // operand, so a copy that filled every operand from the same source would show
+    // up as the wrong name rather than as a plausible one.
+    o0.spellings = {"%0", "%[lo]"};
     d.outputs.push_back(o0);
     MirAsmOperand o1;
     o1.constraint     = "=&x";
     o1.regClass       = TargetRegClass::FPR;
     o1.isEarlyClobber = true;
+    o1.spellings      = {"%1", "%[hi]"};
     d.outputs.push_back(o1);
     // ★ THE TIED INPUT. `tiedOutput` is set on the synthesized INPUT entry that
     // carries a `"+r"` operand's READ half, naming the output it shares a
@@ -141,7 +151,15 @@ MirAsmDescriptor sentinelDescriptor() {
     i0.constraint = "r";
     i0.regClass   = TargetRegClass::FPR;
     i0.tiedOutput = 1u;
+    i0.spellings  = {"%2"};
     d.inputs.push_back(i0);
+    // ★ THE PER-LABEL SPELLINGS. ⚠ This sentinel is planted on the NON-goto
+    // `InlineAsm` form, which names no labels — and it carries them anyway,
+    // deliberately: the subject under test is the descriptor CARRIAGE, and the
+    // four copy sites are shared by both asm forms, so the strongest input is one
+    // with every field engaged. Two groups of two, all distinct, for the same
+    // reason the operand spellings are.
+    d.labelSpellings = {{"%l0", "%l[again]"}, {"%l1", "%l[done]"}};
     d.clobbers.push_back("rbx");
     d.clobbers.push_back("rcx");
     d.clobbersMemory         = true;
@@ -179,14 +197,36 @@ void expectSentinel(MirAsmDescriptor const& d, char const* where) {
     EXPECT_EQ(d.outputs[1].constraint, "=&x") << where;
     EXPECT_EQ(d.outputs[1].regClass, TargetRegClass::FPR) << where;
     EXPECT_TRUE(d.outputs[1].isEarlyClobber) << where;
+    // ★ ENGAGEMENT BEFORE VALUE, exactly as the `tiedOutput` rule below: a dropped
+    // `spellings` is an EMPTY vector, and indexing one is undefined behaviour
+    // rather than a failed expectation naming the site. Asserting the size first
+    // also separates "the field was dropped" from "the field survived with the
+    // wrong contents", which are different defects at different copy sites.
+    ASSERT_EQ(d.outputs[0].spellings.size(), 2u) << where;
+    EXPECT_EQ(d.outputs[0].spellings[0], "%0") << where;
+    EXPECT_EQ(d.outputs[0].spellings[1], "%[lo]") << where;
+    ASSERT_EQ(d.outputs[1].spellings.size(), 2u) << where;
+    EXPECT_EQ(d.outputs[1].spellings[0], "%1") << where;
+    EXPECT_EQ(d.outputs[1].spellings[1], "%[hi]") << where;
     ASSERT_EQ(d.inputs.size(), 1u) << where;
     EXPECT_EQ(d.inputs[0].constraint, "r") << where;
     EXPECT_EQ(d.inputs[0].regClass, TargetRegClass::FPR) << where;
+    ASSERT_EQ(d.inputs[0].spellings.size(), 1u) << where;
+    EXPECT_EQ(d.inputs[0].spellings[0], "%2") << where;
     // ASSERT on the engagement first: a dropped `tiedOutput` is `nullopt`, and
     // reading `.value()` off it would abort the process instead of failing the
     // test with a message naming the site.
     ASSERT_TRUE(d.inputs[0].tiedOutput.has_value()) << where;
     EXPECT_EQ(*d.inputs[0].tiedOutput, 1u) << where;
+    // The per-label spellings, nested one level deeper — so a copy that kept the
+    // OUTER vector's size while emptying the inner groups still reds here.
+    ASSERT_EQ(d.labelSpellings.size(), 2u) << where;
+    ASSERT_EQ(d.labelSpellings[0].size(), 2u) << where;
+    EXPECT_EQ(d.labelSpellings[0][0], "%l0") << where;
+    EXPECT_EQ(d.labelSpellings[0][1], "%l[again]") << where;
+    ASSERT_EQ(d.labelSpellings[1].size(), 2u) << where;
+    EXPECT_EQ(d.labelSpellings[1][0], "%l1") << where;
+    EXPECT_EQ(d.labelSpellings[1][1], "%l[done]") << where;
     ASSERT_EQ(d.clobbers.size(), 2u) << where;
     EXPECT_EQ(d.clobbers[0], "rbx") << where;
     EXPECT_EQ(d.clobbers[1], "rcx") << where;
@@ -665,13 +705,21 @@ TEST(InlineAsmRebuildCarriage, LoadMotionTreatsAnInlineAsmAsAnOpaqueClobber) {
 
 namespace {
 
-// An `asm goto` with ONE output, its piece placed by the builder's own
-// edge-placement rule at the head of the interposed landing block. Returns the
-// terminator so a caller can assert against it.
+// An `asm goto` with ONE output and ONE label, its pieces placed by the builder's
+// own edge-placement rule at the heads of the interposed landing blocks. Returns
+// the terminator so a caller can assert against it.
 //
 // ★ Through `addInlineAsmGoto` (the rule's owner), never by hand-placing the
 // piece: a fixture that built the shape itself would be testing the fixture's
 // idea of the shape, not the one the front end ships.
+//
+// ★★ THE SHAPE HAS **TWO** PIECE-BEARING EDGES, NOT ONE: the label edge and the
+// FALL-THROUGH edge, which is a CFG successor because an `asm goto` whose template
+// does not branch continues at the next statement. The fixture closes the
+// continuation itself — with a `Br` to the same label block — for the reason
+// `plantSentinelAsm` gives above: a coupling the builder owns belongs in ONE place,
+// not in the four call sites that would otherwise each have to remember it, and a
+// forgotten continuation is a `finish()` abort with no test name attached.
 MirInstId plantAsmGotoWithOneOutput(MirBuilder& mb, TypeId ty,
                                     MirBlockId label) {
     MirAsmDescriptor d;
@@ -681,20 +729,29 @@ MirInstId plantAsmGotoWithOneOutput(MirBuilder& mb, TypeId ty,
     MirAsmOperand o0;
     o0.constraint = "=r";
     o0.regClass   = TargetRegClass::GPR;
+    o0.spellings  = {"%0", "%[out]"};
     d.outputs.push_back(o0);
+    // One group per label — `addInlineAsmGoto` refuses a descriptor whose label
+    // list disagrees with the blocks, which is what makes a dropped edge loud one
+    // clone site later.
+    d.labelSpellings = {{"%l0", "%l[done]"}};
     MirBlockId const labels[] = {label};
     auto res = mb.addInlineAsmGoto(std::move(d), {}, labels);
     for (auto const& e : res.edges) {
         if (!e.split) continue;
         mb.beginBlock(e.successor);
         (void)mb.addReturnPiece(res.terminator, 0, TargetRegClass::GPR, ty);
-        mb.addBr(e.label);
+        mb.addBr(e.onward);
     }
+    mb.beginBlock(res.continuation());
+    mb.addBr(label);
     return res.terminator;
 }
 
 // Assert the module holds exactly one `InlineAsmGoto` and exactly one
-// `ReturnPiece`, and that the piece's operand IS that terminator.
+// `ReturnPiece` PER PIECE-BEARING EDGE, that each piece's operand IS that
+// terminator, and that the descriptor still carries the spellings no tier below
+// the front end can re-mint.
 void expectPieceAnchoredToTheGoto(Mir const& mir, char const* where) {
     std::vector<MirInstId> gotos;
     std::vector<MirInstId> pieces;
@@ -710,14 +767,35 @@ void expectPieceAnchoredToTheGoto(Mir const& mir, char const* where) {
         }
     }
     ASSERT_EQ(gotos.size(), 1u) << where;
-    ASSERT_EQ(pieces.size(), 1u)
-        << where << ": the output piece must SURVIVE — dropping it is the "
+    // ⚠ TWO, and the second one is the fall-through edge's. `plantAsmGotoWithOneOutput`
+    // declares one output and one label, and the builder splits EVERY edge of an
+    // output-bearing asm goto — so the piece count is (labels + 1) × outputs. This
+    // read `1u` while the fall-through edge did not exist.
+    ASSERT_EQ(pieces.size(), 2u)
+        << where << ": one output piece per piece-bearing edge (the label edge and "
+                    "the fall-through edge) must SURVIVE — dropping one is the "
                     "silently-wrong alternative to the abort this pins";
-    auto const ops = mir.instOperands(pieces[0]);
-    ASSERT_EQ(ops.size(), 1u) << where;
-    EXPECT_EQ(ops[0], gotos[0])
-        << where << ": the piece must anchor to THIS module's own asm goto — a "
-                    "stale or wrong anchor is the silent half of the defect";
+    for (MirInstId const p : pieces) {
+        auto const ops = mir.instOperands(p);
+        ASSERT_EQ(ops.size(), 1u) << where;
+        EXPECT_EQ(ops[0], gotos[0])
+            << where << ": the piece must anchor to THIS module's own asm goto — a "
+                        "stale or wrong anchor is the silent half of the defect";
+    }
+    // ★ THE DESCRIPTOR'S SPELLINGS MADE THE CROSSING TOO. They are the fact that
+    // `cloneInlineAsmGoto`'s arity check reads, so a clone that lost them would
+    // disarm the very guard that catches a dropped edge — and the loss would be
+    // invisible to every assertion above.
+    MirAsmDescriptor const& d = mir.asmDescriptor(gotos[0]);
+    ASSERT_EQ(d.labelSpellings.size(), 1u)
+        << where << ": one label group, and it is what pairs with the successors";
+    ASSERT_EQ(d.labelSpellings[0].size(), 2u) << where;
+    EXPECT_EQ(d.labelSpellings[0][0], "%l0") << where;
+    EXPECT_EQ(d.labelSpellings[0][1], "%l[done]") << where;
+    ASSERT_EQ(d.outputs.size(), 1u) << where;
+    ASSERT_EQ(d.outputs[0].spellings.size(), 2u) << where;
+    EXPECT_EQ(d.outputs[0].spellings[0], "%0") << where;
+    EXPECT_EQ(d.outputs[0].spellings[1], "%[out]") << where;
 }
 
 } // namespace
@@ -845,14 +923,19 @@ TEST(InlineAsmRebuildCarriage, AnchorSite2InlinedCalleeKeepsTheAsmGotoPieceAncho
     std::size_t checked = 0;
     auto checkFunction = [&](std::uint32_t fi, MirInstId gotoId,
                              std::vector<MirInstId> const& pieces) {
-        ASSERT_EQ(pieces.size(), 1u) << "function ordinal " << fi;
-        auto const pops = mir.instOperands(pieces[0]);
-        ASSERT_EQ(pops.size(), 1u) << "function ordinal " << fi;
-        EXPECT_EQ(pops[0], gotoId)
-            << "function ordinal " << fi
-            << ": the spliced piece must anchor to the asm goto in the SAME "
-               "function — an anchor left pointing into the callee is the "
-               "cross-function version of this defect";
+        // Two: one per piece-bearing edge (the label edge and the fall-through
+        // edge) — see `expectPieceAnchoredToTheGoto` for why the count is
+        // (labels + 1) × outputs and not the outputs alone.
+        ASSERT_EQ(pieces.size(), 2u) << "function ordinal " << fi;
+        for (MirInstId const p : pieces) {
+            auto const pops = mir.instOperands(p);
+            ASSERT_EQ(pops.size(), 1u) << "function ordinal " << fi;
+            EXPECT_EQ(pops[0], gotoId)
+                << "function ordinal " << fi
+                << ": the spliced piece must anchor to the asm goto in the SAME "
+                   "function — an anchor left pointing into the callee is the "
+                   "cross-function version of this defect";
+        }
     };
     for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
         MirFuncId const f = mir.funcAt(fi);
@@ -1002,10 +1085,10 @@ TEST(InlineAsmRebuildCarriage, AnchorSite4CrossCuMergeKeepsTheAsmGotoPieceAnchor
     // The descriptor made the crossing too — the terminator arm re-adds it to
     // the merged pool exactly as the value arm does.
     EXPECT_EQ(merged->mir.asmDescriptorPool().size(), 1u);
-    // ★ EXACTLY ONE landing block's worth of edges: `cloneInlineAsmGoto` takes
-    // the successors VERBATIM. If this arm ever called `addInlineAsmGoto`
-    // instead, the placement rule would run a second time and interpose ANOTHER
-    // landing block, which this count is what notices.
+    // ★ EXACTLY the landing blocks the fixture built, and no more:
+    // `cloneInlineAsmGoto` takes the successors VERBATIM. If this arm ever called
+    // `addInlineAsmGoto` instead, the placement rule would run a second time and
+    // interpose ANOTHER landing block per edge, which this count is what notices.
     std::uint32_t brCount = 0;
     for (std::uint32_t fi = 0; fi < merged->mir.moduleFuncCount(); ++fi) {
         MirFuncId const f = merged->mir.funcAt(fi);
@@ -1016,7 +1099,8 @@ TEST(InlineAsmRebuildCarriage, AnchorSite4CrossCuMergeKeepsTheAsmGotoPieceAnchor
             }
         }
     }
-    EXPECT_EQ(brCount, 1u)
-        << "one interposed landing block, cloned verbatim — a second one means "
-           "the merge re-ran the edge-placement rule instead of cloning";
+    EXPECT_EQ(brCount, 3u)
+        << "two interposed landing blocks (the label edge and the fall-through "
+           "edge) plus the continuation's own branch, all cloned verbatim — more "
+           "means the merge re-ran the edge-placement rule instead of cloning";
 }

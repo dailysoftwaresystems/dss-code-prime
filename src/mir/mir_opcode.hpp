@@ -182,14 +182,31 @@ enum class MirOpcode : std::uint16_t {
     // text, so no pass may prove it writes nothing, moves nothing, or is dead.
     InlineAsm,
     // `asm goto` — the TERMINATOR form. Same operands + payload as `InlineAsm`;
-    // successors = the label list (out-of-band in the succ pool, the
-    // `Switch`/`IndirectBr` shape, ≥1). Result `None`, NOT Optional, and that is
-    // structural rather than a restriction: piece capture requires a piece to
-    // IMMEDIATELY FOLLOW its producer (`lir_callconv.cpp:2255`, `:2522-2529`,
-    // where broken adjacency is already fail-loud) and a terminator has nothing
-    // after it in its block. ⇒ EVERY output of an `asm goto`, output 0 included,
-    // is a `ReturnPiece` at a SUCCESSOR block's head — see
-    // `MirBuilder::addInlineAsmGoto`, which owns the edge-placement rule.
+    // successors are out-of-band in the succ pool, the `Switch`/`IndirectBr`
+    // shape, and they are
+    //
+    //     [ label 0 … label N-1, FALL-THROUGH ]        N >= 1, so >= 2 successors
+    //
+    // ★★★ THE FALL-THROUGH EDGE IS A SUCCESSOR, NOT AN IMPLICIT CONTINUATION,
+    // AND OMITTING IT WAS A SILENT MISCOMPILE. ✔MEASURED on gcc 13.3.0, clang
+    // 19.1.1 and aarch64-linux-gnu-gcc: an `asm goto` whose template does not
+    // branch FALLS THROUGH to the statement after it (a discriminating program
+    // exits 7 on the fall-through path and 3 on the label path under all three).
+    // While the successor set was the label list alone, the code after the
+    // statement had no predecessor, so the mandatory unreachable prune DELETED
+    // it. ⇒ the fall-through is LAST: every `succs[i] == label i` reader keeps
+    // working, where a fall-through FIRST would have shifted every label index
+    // by one with nothing to observe it. `MirAsmDescriptor::labelSpellings` is
+    // index-aligned with the LABEL successors and its size + 1 is the successor
+    // count — the checked invariant that makes a dropped edge loud.
+    //
+    // Result `None`, NOT Optional, and that is structural rather than a
+    // restriction: piece capture requires a piece to IMMEDIATELY FOLLOW its
+    // producer (`lir_callconv`'s adjacency refusal is already fail-loud) and a
+    // terminator has nothing after it in its block. ⇒ EVERY output of an
+    // `asm goto`, output 0 included, is a `ReturnPiece` at a SUCCESSOR block's
+    // head — see `MirBuilder::addInlineAsmGoto`, which owns the edge-placement
+    // rule and applies it to the fall-through edge like any other.
     InlineAsmGoto,
     // FC7 C3 (AAPCS64/Apple x8 sret). The CALLEE-side entry read of the indirect-
     // result-register (x8): the incoming address of the caller-allocated result
@@ -557,10 +574,14 @@ struct MirOpcodeInfo {
         // minimum operand is the CALLEE, and an asm block has no callee, so an
         // input-less `__asm__("nop")` needs `{0, N}`. Everything else is Call's:
         // Optional result, side-effecting, non-terminator, and (below)
-        // `opcodeClobbersMemory`. The goto form differs only in being a
-        // terminator with `Switch`'s unbounded successor range and NO result.
+        // `opcodeClobbersMemory`. The goto form differs in being a terminator
+        // with an unbounded successor range and NO result — and its MINIMUM is
+        // 2, not `Switch`'s 1: an `asm goto` carries at least one label AND the
+        // fall-through edge (see the enumerator's own banner). `mir.cpp`'s head
+        // `static_assert` block pins that this row and `addInlineAsmGoto`'s
+        // hardcoded `labels + 1` cannot drift apart.
         case MirOpcode::InlineAsm:     return {0, N, 0, 0, R::Optional, false, true, false, "inlineasm"};
-        case MirOpcode::InlineAsmGoto: return {0, N, 1, S, R::None,     true,  true, false, "inlineasmgoto"};
+        case MirOpcode::InlineAsmGoto: return {0, N, 2, S, R::None,     true,  true, false, "inlineasmgoto"};
         // ReadIndirectResult: a leaf value-origin (reads x8 at entry) — mirror of
         // Arg; side-effecting so it pins to entry and DCE can't drop it.
         case MirOpcode::ReadIndirectResult:  return {0, 0, 0, 0, R::Value, false, true, false, "readindirectresult"};

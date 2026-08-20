@@ -9,8 +9,8 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-19 — cycles **P14 + P15 + P16 + P17 + P18 + P19**. **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P19). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
+**Last updated:** 2026-08-19 — cycles **P14 … P20**. ★★★ **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
+**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P20). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
 
@@ -50,9 +50,12 @@ commit that lands it, and never delete a ticked row.
       audit classified all **50** surviving citations of the two withdrawn rows and found **three that asserted
       something false** — one claiming the sibling row *stays OPEN*, two instructing a future cycle to build the
       forbidden guard. All three repaired. Net −1.
-- [ ] **P20 — `D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` (label half).** Trigger FIRED. The operand half and
-      the `%%` half are DONE; this is the asm-goto BLOCK-binding design and the last piece of the feature.
-      Expect a real design fork — bring it as a §B rather than guessing.
+- [x] **P20 — `D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER` CLOSED. ✅ DONE 2026-08-19.**
+      `asm goto` lowers, compiles and RUNS: 42 on pe64 native, WSL elf64-x86_64 and qemu-aarch64, at
+      debug AND release; macho64-arm64 compiles (no runner off-Mac). The queued line above predicted a
+      §B design fork; there was none — every alternative was refuted by measurement rather than being
+      merely less attractive, so the hard part landed. **What the row did NOT name and the cycle found:**
+      the fall-through edge was missing from the MIR CFG entirely. Net −1.
 - [ ] **P21 — `D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM`.** Trigger FIRED. AP5/AP6's `dependsOn` path has
       never been touched by the release optimizer on ANY leg, so a release-only fault in it is invisible today.
 - [ ] **P22 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
@@ -89,6 +92,154 @@ SHIPPED design record, and `D-TEST-MACOS-LEG-EMSDK-PROFILE-REPLACES-PATH-HIDING-
 pre-existing environment fact.
 
 ---
+
+## 0.0000000000000000000000 ★★★ CYCLE P20 — `asm goto` WORKS, AND THE ROW THAT ASKED FOR IT UNDERSTATED THE JOB BY ONE CFG EDGE
+
+**Closed `D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER`; opened-and-closed five more; net −1.**
+
+### What the operator can now write, and what it does
+
+```c
+__asm__ goto ("cmpl $0, %0\n\tjne %l[jumped]" : : "r"(x) : "cc" : jumped);
+__asm__ goto ("movl $3, %0\n\tcmpl $0, %1\n\tjne %l2" : "=&r"(r) : "r"(x) : "cc" : one, two, three);
+__asm__      ("movl %[in], %[out]" : [out] "=r"(out) : [in] "r"(a));
+```
+
+✔`examples/c-subset/asm_goto_labels` exits **42** in **both** configs on **all five legs**:
+pe64-x86_64 (native Windows), elf64-x86_64 (WSL), elf64-aarch64 under **qemu**, elf64-aarch64 on
+**NATIVE aarch64 hardware**, and macho64-arm64 on **REAL APPLE SILICON**. Six shapes, each
+independently discriminating.
+
+★★ **THE LAST TWO LEGS EXIST BECAUSE THE OPERATOR SAID SO MID-CYCLE.** The Mac is normally off
+and the row was about to ship claiming macho64-arm64 *“compiles (no runner off-Mac)”* — a census
+verdict, which is precisely what this project's standard rejects. When the operator said both
+hosts were up, the cross-compiled binaries were shipped over the two carriages and RUN. ⇒ the
+aarch64 answer no longer rests on emulation, and Mach-O is no longer compile-only.
+⚠ Getting there re-ran two known traps in one sitting: an inline `scp` invocation built by hand
+failed on quoting (the carriages have `--rsync` for exactly this), and an `&&` chain printed
+`RSYNC-OK` over two rsync FAILURES because each stage was piped through `tail` and the pipeline's
+status is `tail`'s. **Both are already written down. Writing them down is not what stops them —
+using the script that exists is.**
+
+### ★★★ THE FINDING, AND IT WAS NOT IN THE ROW
+
+✔MEASURED through the shipped CLI *before any code changed*, on a program whose only statement after
+the asm was a `return`: the refusal renders `succs.size()`, and it read **1** for one label and **2**
+for two. **The fall-through contributed no successor.** `MirBuilder::addInlineAsmGoto` pushed one
+entry per label and nothing else; `hir_to_mir` then opened a block its own comment called dead,
+*“which the mandatory unreachable-prune drops”*.
+
+✔MEASURED on gcc 13.3.0, clang 19.1.1 and aarch64-linux-gnu-gcc 13.3.0: `asm goto` **falls through**
+when the template does not branch (exit 7 vs 3). ⇒ **DSS was deleting the fall-through path's code.**
+
+★★ **IT COULD NOT SHIP, AND THAT IS THE LESSON RATHER THAN THE EXCUSE.** The LIR tier refused
+`asm goto` outright, so the wrong CFG never reached codegen. The defect was invisible *because* a
+capability was missing, and binding the label without fixing the edge would have converted a
+fail-loud refusal into a silent miscompile in one commit. **A cycle that had done only what its row
+asked would have shipped it.**
+
+### ★★★ THE ARCHITECTURAL CALL: CARRY SPELLINGS, NOT NAMES
+
+Three symptoms shared one root — no tier below the front end knew what the embedding language CALLS
+an operand or a label. `mir_to_lir` synthesized `%N` from an index and had nothing else, so
+`%[name]` was **refused on a program both references compile**, `%l[name]` had no carrier, and `%lN`
+had no index rule.
+
+The first design computed the numbering in `src/lir/` — **inside the agnosticism veto list**. An
+independent design audit named the asymmetry that settles it: the template sigil BYTES already had a
+config owner; the NUMBERING never did. ⇒ the front end mints every spelling from the declared
+lexemes, the descriptor CARRIES them, every tier below only COMPARES, and `asmOperandSpelling` is
+**deleted rather than kept as a fallback** — a fallback is a second owner of the fact being fixed.
+
+★★ **AND IT DISSOLVED A DIVERGENCE INSTEAD OF PATCHING ONE.** `MirAsmDescriptor::inputs` carries
+SYNTHESIZED entries (one tied input per `"+"` output), so an index computed at MIR overcounts by the
+number of `+` operands while the source counts each once. ✔The discriminating program exists and gcc
+compiles it. Minting at the front end deletes the second count.
+
+### ⚠⚠ THE AUDITS EARNED THEIR KEEP — AND ONE OF THEM FOUND A MISCOMPILE THE CYCLE ITSELF CREATED
+
+Two design audits ran before the diff and two adversarial audits after it. **The most valuable
+finding was a defect that did not exist when the cycle started.**
+
+1. ★★★ **A SILENT MISCOMPILE THIS CYCLE OPENED.** Two operands sharing a `[name]` bound the WRONG
+   one: every spelling lookup below the front end is a FIRST-MATCH scan over a list whose outputs
+   come first. ✔MEASURED out of the shipped CLI — `movl %[v], %[out]` with two `[v]` operands
+   compiled rc=0 and returned **0 instead of 20**, at debug and release. Before `%[name]` bound at
+   all the shape was refused BY NAME, so **making the feature work is exactly what converted a
+   fail-loud refusal into a wrong answer.** ⇒ refused now at the tier that holds the operand list,
+   with a fail-loud collision check at the LIR tier too (direct-API callers never run the C
+   semantic pass). ★ The fix lane then MEASURED past its brief: GNU keeps operand names and
+   `asm goto` label names in **ONE name space** — gcc and clang reject all three collision shapes
+   (operand/operand, label/label, operand/label) with the same message — and the label side is a
+   real defect too, because the LIR tier mints a distinct capture block per edge index.
+2. **The design's central claim was refuted.** *“The numbering lives in exactly one place”* was
+   **false**: `scanInlineAsmTemplate` re-derived `base = operandCount` in five places, and this
+   cycle's own pin proved they were SEPARABLE — forcing the minting base to 0 left the semantic tier
+   green, the divergence surfacing two tiers later. Fixed by making that tier look the written form
+   up in the minted spellings, so the two now agree **by construction**. ★ The rewrite also stopped
+   parsing an index into a number at all — it carries the DIGIT BYTES — so a monstrous index can no
+   longer wrap a `size_t` into an in-range one, and `%00` is refused where the operand list lives
+   instead of dying at a binding that matches on the exact spelling.
+3. ★★ **MY OWN AGNOSTICISM ARGUMENT WAS WRONG.** I justified moving the numbering out of `src/lir/`
+   as leaving the veto list. ✔`src/analysis/` is in the **same** shared-substrate list. The move is
+   still right — three owners became one, and the count now comes from the SOURCE list, which is the
+   correctness fix — but the headline reason was not. The residual is anchored trigger-gated
+   (`D-CONFIG-INLINE-ASM-TEMPLATE-NUMBERING-HAS-NO-DECLARED-OWNER`) rather than glossed.
+4. ★★ **THE HEADLINE PIN CARRIED A ✔ WITH NO RUN BEHIND IT**, and running it showed the *design* was
+   wrong too. Passing `labels[0]` as the fall-through keeps the arity legal but makes the builder
+   open one block twice and **abort** — the failure mode the plan had rejected a different mutant
+   for, arrived at from the other side. ⇒ the discriminating mutant REPRODUCES THE PRE-CYCLE SHAPE:
+   seal the continuation and strand the following statements. ✔It **compiles rc=0** and the program
+   dies with an illegal instruction (**rc=132**) at both configs, GOOD and RESTORED 42/42.
+5. **A closure row overstated its own measurement.** The label-index pin's *“33 instead of 11”* was
+   measured on the shape **ISOLATED**; in the shipped composite the mutant is caught earlier, at
+   build time, for a different shape's reason. The example's header said so and the row did not —
+   the row was written from a lane's summary rather than from the artifact. ⇒ **a pin measured in
+   isolation and the same pin in the composite can red for different reasons, and only the composite
+   is what `ctest` runs.**
+6. **A shape nothing covered**, found by reading and settled by running: a **pinned** output on an
+   **unconditionally branching** template — the one case where the capture register is defined on the
+   label edge and not on the fall-through. ✔compile 0, run 42 at both configs; now SHAPE 6.
+7. **A brief premise of mine measured FALSE.** I predicted the piece-0 defect would be silent; it is
+   fail-loud. The lane implemented as specified and corrected the claim rather than stopping.
+8. **The new verifier guard had no test at all** — the guard created *because a docblock claimed a
+   check that did not exist* was itself shipping unexercised. Five arms now drive it through the
+   **direct `Mir` ctor**, which is the path `MirBuilder` does not own and the whole reason it exists.
+
+### The four other rows this cycle opened and closed
+
+- **`D-MIR-VERIFIER-DOES-NOT-CHECK-SUCCESSOR-ARITY`** — `recordSuccessors_`'s comment claimed *“ML3's
+  verifier re-runs the same descriptor check on any frozen module”*. ✔MEASURED false: no
+  `minSuccessors`/`maxSuccessors` reference existed anywhere in the MIR verifier. Found because a new
+  silent seam needed a backstop and the backstop was imaginary — `cloneInlineAsmGoto` only
+  count-checks against `[min, ∞)`, so a clone dropping the fall-through from a ≥2-label goto stays in
+  range and the edge vanishes with no diagnostic.
+- **`D-MIR-TEXT-INLINE-ASM-RENDERS-A-POOL-INDEX-AND-NO-EDGES`** — both asm opcodes fell into the
+  writer's `default:`, rendering a raw descriptor-pool index and, for a terminator, **no CFG edges at
+  all**; zero tests touched either mnemonic. ⚠ Two things surfaced while pinning it: the marker had
+  to be a SINGLE TOKEN, because the parser's recovery re-tokenizes a refused instruction's tail and
+  the bare word `not` **is** a MIR opcode (the first spelling aborted the process); and the parser's
+  refusal was **not survivable** — its own comment says *“a refusal that crashes is not a refusal”*,
+  and it crashed at the NEXT block's `beginBlock`, two steps before the `finalize()` guard that was
+  supposed to catch it.
+- **`D-GATE-CITATION-GUARD-BLIND-TO-SOURCE-AND-CONFIG`** — the guard for *“never document a line
+  number”* read `.md` under two roots and could not see the code. ✔The evidence is a citation that
+  went stale **inside this cycle**: one lane cited a `mir_opcode.hpp` line, a sibling lane's edit
+  moved the row, nothing could report it. Now covers `src`/`tests`/`scripts`/`examples`; baseline 75
+  documents / 2,374 citations → 278 files / 3,059.
+- **`D-DIAG-INLINE-ASM-INDEX-DOCBLOCKS-DESCRIBE-A-REPLACED-REFUSAL`** — docblock-only, reported by a
+  lane forbidden to touch the file.
+
+### ⚠ CARRY FORWARD
+
+- **`D-LIR-VERIFY-VREG-CLASS-RULE-ASSUMES-A-ONE-TO-ONE-LIR-TO-MIR-MAP` gained a second measurement**
+  and its closing work now owes both shapes: for an inline-asm template the `lirToMir` map has **no
+  entry at all** — not many-to-one, ZERO-to-one — because `lowerAsmTemplateToLirRun` appends straight
+  into the `LirBuilder`, bypassing `recordSource`. Every instruction an `__asm__` lowers to has no MIR
+  provenance.
+- The `%w0`-style operand **modifier** vocabulary is still owed (it is why every aarch64 arm in the
+  asm examples widens its operands to `long`). That belongs to
+  `D-CSUBSET-INLINE-ASM-OPERANDS`' deferral tail and still has no row of its own.
 
 ## 0.000000000000000000000 ★★★ CYCLE P19 — THE SECOND PAIRING ANCHOR WITHDRAWN, AND THREE CITATIONS THAT HAD QUIETLY GONE FALSE
 

@@ -198,6 +198,34 @@ public:
     // for switch-lowering's first compare).
     [[nodiscard]] LirBlockId openBlock() const noexcept { return openBlock_; }
 
+    // ★★★ HAS THE OPEN BLOCK ALREADY BEEN SEALED? The read half of the flag
+    // every terminator builder sets, and the sibling of `instResult`/
+    // `orInstFlags`: it exists for the same reason those two do — **a producer
+    // that did not call the terminator itself still has to know one was
+    // emitted**. `mir_to_lir`'s `asm goto` expansion is that producer. The
+    // instructions of an `__asm__` template are appended by the SHARED assembly
+    // engine (`lowerAsmTemplateToLirRun`), which returns only a bool, so the
+    // embedding lowering cannot see whether the template's last statement was
+    // an unconditional branch.
+    //
+    // ⚠ WHY ASKING IS NOT OPTIONAL: BOTH ANSWERS ABORT IF GUESSED WRONG.
+    // Appending to a sealed block hits `appendInst_`'s *"block already
+    // terminated"* fatal; `beginBlock` on an UNSEALED one hits its *"current
+    // block has no terminator"* fatal. Those guards are producer-contract
+    // aborts, and the producer here is fed by USER TEXT (`__asm__ goto ("jmp
+    // %l[done]" …)` seals the block; `__asm__ goto ("" …)` does not) — so
+    // without this reader the choice between the two would be a coin flip that
+    // kills the process on a legal program. ✔MEASURED: `AsmLoweringHost`
+    // exposes the same question to the ENGINE as `blockIsTerminated()`; this is
+    // the CALLER's half of it, and both shipped hosts answer it from a bool
+    // they maintain by hand because the builder did not publish its own.
+    //
+    // ⓘ Read-only, and deliberately not paired with a setter: only the
+    // terminator builders may set the flag.
+    [[nodiscard]] bool openBlockIsTerminated() const noexcept {
+        return openBlockHasTerminator_;
+    }
+
     // Open a function. Closes the current function first (which
     // requires its current block be terminated + the function have
     // ≥1 block). `symbol` is the declared SymbolId of the function.

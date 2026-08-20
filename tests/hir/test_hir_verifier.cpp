@@ -1363,6 +1363,81 @@ TEST(HirVerifier, InlineAsmDescriptorHandleMustResolveAndAgreeWithTheChildren) {
         << "with no pool the handle is unresolvable and must be left unjudged";
 }
 
+// (c) THE `asm goto` LABEL HALF: the ordinal list and the spelling list are
+// index-aligned by contract, and NOTHING downstream can notice them disagreeing.
+// A dropped spelling leaves the control-flow edge intact and the template's
+// reference to it unresolvable, so the failure surfaces (if at all) as an
+// unbound-label refusal blaming the assembly text for a fact the front end lost.
+// This check is the only place the loss is reported where it happened.
+//
+// !! BOTH DIRECTIONS ARE EXERCISED, because they are different bugs: MORE
+// ordinals than spellings is a spelling dropped on the way down, and MORE
+// spellings than ordinals is an edge that was never created for a reference the
+// template can write.
+TEST(HirVerifier, InlineAsmLabelOrdinalsAndSpellingsMustAgreeInCount) {
+    // AGREEING: two labels, two spelling groups -> clean.
+    {
+        TypeInterner in{CompilationUnitId{1}};
+        HirInlineAsmPool pool;
+        HirInlineAsmDescriptor d;
+        d.templateText   = "jmp %l0";
+        d.isGoto         = true;
+        d.labelOrdinals  = {3, 4};
+        d.labelSpellings = {{"%l[a]", "%l0"}, {"%l[b]", "%l1"}};
+        std::uint32_t const handle = pool.add(std::move(d));
+        Hir const ok = asmModule(handle, /*childCount=*/0, in);
+        DiagnosticReporter r;
+        HirVerifier v{ok, nullptr, nullptr, &pool};
+        EXPECT_TRUE(v.verify(r));
+    }
+    // A SPELLING DROPPED: two edges, one group.
+    {
+        TypeInterner in{CompilationUnitId{2}};
+        HirInlineAsmPool pool;
+        HirInlineAsmDescriptor d;
+        d.templateText   = "jmp %l0";
+        d.isGoto         = true;
+        d.labelOrdinals  = {3, 4};
+        d.labelSpellings = {{"%l[a]", "%l0"}};
+        std::uint32_t const handle = pool.add(std::move(d));
+        Hir const bad = asmModule(handle, /*childCount=*/0, in);
+        DiagnosticReporter r;
+        HirVerifier v{bad, nullptr, nullptr, &pool};
+        EXPECT_FALSE(v.verify(r));
+        EXPECT_GT(countCode(r, DiagnosticCode::H_VerifierFailure), 0u);
+    }
+    // AN EDGE MISSING: one ordinal, two groups.
+    {
+        TypeInterner in{CompilationUnitId{3}};
+        HirInlineAsmPool pool;
+        HirInlineAsmDescriptor d;
+        d.templateText   = "jmp %l0";
+        d.isGoto         = true;
+        d.labelOrdinals  = {3};
+        d.labelSpellings = {{"%l[a]", "%l0"}, {"%l[b]", "%l1"}};
+        std::uint32_t const handle = pool.add(std::move(d));
+        Hir const bad = asmModule(handle, /*childCount=*/0, in);
+        DiagnosticReporter r;
+        HirVerifier v{bad, nullptr, nullptr, &pool};
+        EXPECT_FALSE(v.verify(r));
+        EXPECT_GT(countCode(r, DiagnosticCode::H_VerifierFailure), 0u);
+    }
+    // POSITIVE CONTROL: a statement with NO labels at all. Both lists empty is
+    // the commonest descriptor in the tree, and a check written as "spellings
+    // must be non-empty" would red every one of them.
+    {
+        TypeInterner in{CompilationUnitId{4}};
+        HirInlineAsmPool pool;
+        HirInlineAsmDescriptor d;
+        d.templateText = "nop";
+        std::uint32_t const handle = pool.add(std::move(d));
+        Hir const ok = asmModule(handle, /*childCount=*/0, in);
+        DiagnosticReporter r;
+        HirVerifier v{ok, nullptr, nullptr, &pool};
+        EXPECT_TRUE(v.verify(r));
+    }
+}
+
 // The `InlineAsm` arity itself: widening it must not have widened its former
 // case-group neighbours. `test_hir_node.cpp` pins this at COMPILE time; this is
 // the behavioural half, and it exists because the first attempt at the widening

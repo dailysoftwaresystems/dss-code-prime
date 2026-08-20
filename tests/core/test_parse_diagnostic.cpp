@@ -393,9 +393,12 @@ TEST(ScopeKind, NameMapping) {
     EXPECT_EQ(scopeName(static_cast<ScopeKind>(2048)), "Custom");
 }
 
-// The seven inline-asm P5 operand-binding codes occupy a CONTIGUOUS run at the
-// top of the semantic band, 0xE065..0xE06B, immediately after the P1 arc's last
-// code (`S_InlineAsmDuplicateQualifier`, 0xE064). Same three properties the
+// The inline-asm operand-binding codes occupy a CONTIGUOUS run at the top of the
+// semantic band, 0xE065..0xE06C, immediately after the P1 arc's last code
+// (`S_InlineAsmDuplicateQualifier`, 0xE064). Seven arrived with P5; the eighth,
+// `S_InlineAsmDuplicateSymbolicName` (0xE06C), with cycle P20 — a code the arc
+// NEEDED only because P20 made `%[name]` bind, which turned a repeated name from
+// a fail-loud refusal into a silent wrong register. Same three properties the
 // D_* band pin above asserts, at the one place the S_* band has just grown:
 //
 //   (1) the NAMES. `diagnosticCodeName` has a no-`default:` exhaustive switch
@@ -410,8 +413,8 @@ TEST(ScopeKind, NameMapping) {
 //       is pinned literally rather than derived from the enumerator.
 //
 //   (3) CONTIGUITY with 0xE064. The S_* band is dense — ✔MEASURED over the
-//       enum's own declaration lines at this commit: 107 codes spanning
-//       0xE001..0xE06B with NO gaps, FOUR of them RETIRED-but-reserved
+//       enum's own declaration lines at this commit: 108 codes spanning
+//       0xE001..0xE06C with NO gaps, FOUR of them RETIRED-but-reserved
 //       (0xE015, 0xE04E, 0xE04F, 0xE052 — reserved, never renumbered, never
 //       reused) — so "the next free value" is a fact about the band and not a
 //       guess. A future code that lands on a used slot, or that skips one,
@@ -439,6 +442,8 @@ TEST(DiagnosticCode, InlineAsmOperandBindingBandIsContiguousAndRenders) {
          "S_InlineAsmPlaceholderOutOfRange"},
         {DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate, 0xE06B, "S006B",
          "S_InlineAsmPlaceholderInBasicTemplate"},
+        {DiagnosticCode::S_InlineAsmDuplicateSymbolicName, 0xE06C, "S006C",
+         "S_InlineAsmDuplicateSymbolicName"},
     };
 
     int checked = 0;
@@ -461,5 +466,5 @@ TEST(DiagnosticCode, InlineAsmOperandBindingBandIsContiguousAndRenders) {
         ++checked;
     }
     // Non-vacuity: a counter incremented in the loop, not sizeof the array.
-    EXPECT_EQ(checked, 7);
+    EXPECT_EQ(checked, 8);
 }

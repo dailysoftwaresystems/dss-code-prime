@@ -1863,6 +1863,51 @@ void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll
     }
 }
 
+// ★★★ CAN `outer` EVER BEGIN A DERIVATION THAT STARTS `inner`? Returns the
+// kinds of `FIRST(inner)` that are NOT in `FIRST(outer)` — empty means every
+// token `inner` may begin with is one `outer` may begin with too, which is the
+// necessary condition for `inner` to be one of the forms `outer` covers.
+//
+// ★★ IT IS A NECESSARY CONDITION AND NOT A SUFFICIENT ONE, and the caller says
+// so at its own site rather than leaving a reader to assume otherwise. A
+// genuine reachability walk over the merged rule graph would be sufficient and
+// is not what this buys: what it buys is that a landmark naming a rule from a
+// DIFFERENT part of the grammar — the realistic mistake, because the two
+// template placeholder families share a bracketed-name rule that is easy to
+// name by accident — cannot load silently.
+//
+// ⚠ SAME INSTRUMENT AND SAME JUSTIFICATION AS `templateModeUnmintedFirstKinds`
+// below: both are stated purely in FIRST-sets, a fact this pass already holds,
+// and neither can be phrased over token ROLE names because the merge consumes
+// those before this pass runs.
+[[nodiscard]] std::vector<SchemaTokenId>
+ruleFirstKindsOutside(GrammarSchemaData const& data, RuleId inner,
+                      RuleId outer) {
+    // A rule that did not resolve has already been refused by `readRule`;
+    // a second, derived failure would send the reader to the wrong key.
+    if (!inner.valid() || !outer.valid()) return {};
+    auto const innerIt = data.compiledRules.find(inner.v);
+    auto const outerIt = data.compiledRules.find(outer.v);
+    if (innerIt == data.compiledRules.end()
+        || outerIt == data.compiledRules.end()) {
+        return {};
+    }
+    auto const& innerFirst = innerIt->second.firstSet;
+    auto const& outerFirst = outerIt->second.firstSet;
+    // ⚠ AN EMPTY INNER FIRST-SET SAYS NOTHING AND MUST NOT BE READ AS
+    // "contained": a rule that compiled to nothing is a different defect with
+    // its own diagnostic, and reporting it here too would name the wrong key.
+    if (innerFirst.empty()) return {};
+
+    std::unordered_set<std::uint32_t> covered;
+    for (SchemaTokenId const k : outerFirst) covered.insert(k.v);
+    std::vector<SchemaTokenId> outside;
+    for (SchemaTokenId const k : innerFirst) {
+        if (!covered.contains(k.v)) outside.push_back(k);
+    }
+    return outside;
+}
+
 // ★★★ CAN A TEMPLATE STARTED IN `mode` EVER LEX A PLACEHOLDER? Returns the
 // kinds of `FIRST(placeholderRule)` that `mode`'s lexeme table does NOT mint —
 // empty means the mode can produce every token a placeholder may begin with,
@@ -14966,12 +15011,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             coll.emit(DiagnosticCode::C_InvalidHirLowering, "/assembly",
                       "'assembly' must be an object");
         } else {
-            static constexpr std::array<std::string_view, 13> kAssemblyKeys{
+            static constexpr std::array<std::string_view, 14> kAssemblyKeys{
                 "unitRule",      "lineRule",      "elementRule",
                 "directiveRule", "statementRule", "labelTailRule",
                 "operandSeqRule", "operandOrder", "operandForms",
                 "instructions",  "spellingCase",
-                "templateLexerMode", "templateOperandRule"};
+                "templateLexerMode", "templateOperandRule",
+                "templateLabelRule"};
             DSS_CHECK_KEY_VOCABULARY(kAssemblyKeys);
             // `directives` is intentionally NOT in the required set above — it
             // is validated separately below because it is the one key whose
@@ -15029,53 +15075,167 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readRule("labelTailRule",  cfg.labelTailRule);
             readRule("operandSeqRule", cfg.operandSeqRule);
 
-            // ── the TEMPLATE SURFACE: `templateLexerMode` + `templateOperandRule`
+            // ── the TEMPLATE SURFACE: `templateLexerMode` +
+            //    `templateOperandRule` + `templateLabelRule`
             //
-            // ★★★ OPTIONAL AS A PAIR, REQUIRED OF EACH OTHER, AND THAT IS THE
-            // WHOLE OF WHY THIS IS NOT TWO INDEPENDENT `if (contains)` BLOCKS.
-            // A dialect that hosts no embedded `__asm__` declares neither and
-            // loses nothing. Declaring ONE is always a defect, and a SILENT one
-            // in both directions: a mode with no rule mints placeholder tokens
-            // no shape accepts (every template fails at the parser with a
-            // message about the sigil, never about the missing rule), and a rule
-            // with no mode declares a shape whose FIRST token nothing ever
-            // produces (every template fails as if the placeholder had not been
-            // declared at all). Neither half announces itself, which is exactly
-            // the accept-and-do-nothing this config surface refuses everywhere
-            // else — `operandForms` is REQUIRE-ALL for the same reason.
+            // ★★★ OPTIONAL AS A SET, REQUIRED OF EACH OTHER, AND THAT IS THE
+            // WHOLE OF WHY THIS IS NOT THREE INDEPENDENT `if (contains)`
+            // BLOCKS. A dialect that hosts no embedded `__asm__` declares none
+            // of them and loses nothing. Declaring a PROPER SUBSET is always a
+            // defect, and a SILENT one in every direction: a mode with no
+            // operand rule mints placeholder tokens no shape accepts (every
+            // template fails at the parser with a message about the sigil,
+            // never about the missing rule); an operand rule with no mode
+            // declares a shape whose FIRST token nothing ever produces (every
+            // template fails as if the placeholder had not been declared at
+            // all); and a surface with no LABEL rule cannot tell the two
+            // placeholder families apart, so every `asm goto` target decodes as
+            // an operand and is refused as unbound — a true diagnostic naming
+            // the wrong construct. None of the three announces itself, which is
+            // exactly the accept-and-do-nothing this config surface refuses
+            // everywhere else — `operandForms` is REQUIRE-ALL for the same
+            // reason.
+            //
+            // ⚠ THE SET GREW FROM TWO TO THREE AND THAT BROKE EVERY OUT-OF-TREE
+            // DIALECT'S LOAD, deliberately and once. `assembly_config.hpp`'s
+            // `templateLabelRule` docblock carries the argument and the closed
+            // registry row it follows from; it is not restated here, because a
+            // fact with an owner does not get a second owner.
             {
-                bool const hasMode = as.contains("templateLexerMode");
-                bool const hasRule = as.contains("templateOperandRule");
-                if (hasMode != hasRule) {
+                // ★ ONE LIST, SO A FOURTH KEY JOINS BY ADDING A ROW. The
+                // previous shape was a hand-written `hasMode != hasRule` with
+                // the two names spelled four times between the path and the
+                // message; extending THAT to three would have meant enumerating
+                // six orderings by hand, which is how one of them ends up
+                // saying the wrong thing.
+                struct CapabilityKey { char const* name; bool present; };
+                std::array<CapabilityKey, 3> const capability{{
+                    {"templateLexerMode",
+                     as.contains("templateLexerMode")},
+                    {"templateOperandRule",
+                     as.contains("templateOperandRule")},
+                    {"templateLabelRule",
+                     as.contains("templateLabelRule")},
+                }};
+                std::size_t declaredCount = 0;
+                for (auto const& k : capability) {
+                    if (k.present) ++declaredCount;
+                }
+
+                if (declaredCount != 0 && declaredCount != capability.size()) {
+                    std::string present;
+                    std::string missing;
+                    char const* firstMissing = nullptr;
+                    for (auto const& k : capability) {
+                        std::string& into = k.present ? present : missing;
+                        if (!into.empty()) into += ", ";
+                        into += '\'';
+                        into += k.name;
+                        into += '\'';
+                        if (!k.present && firstMissing == nullptr) {
+                            firstMissing = k.name;
+                        }
+                    }
                     coll.emit(DiagnosticCode::C_MissingField,
-                              std::format("/assembly/{}",
-                                          hasMode ? "templateOperandRule"
-                                                  : "templateLexerMode"),
+                              std::format("/assembly/{}", firstMissing),
                               std::format(
-                                  "'assembly' declares '{}' but not '{}' — the "
-                                  "two are the TWO HALVES of one capability (an "
-                                  "embedded assembly template's operand "
-                                  "placeholders) and neither does anything "
-                                  "alone. The mode is what gives this dialect's "
-                                  "placeholder sigil a token kind of its own; "
-                                  "the rule is what lets the lowering RECOGNISE "
-                                  "a placeholder without naming another "
-                                  "document's rule in C++. Declare both, or "
-                                  "neither and host no templates",
-                                  hasMode ? "templateLexerMode"
-                                          : "templateOperandRule",
-                                  hasMode ? "templateOperandRule"
-                                          : "templateLexerMode"));
+                                  "'assembly' declares {} but not {} — these "
+                                  "are the THREE PARTS of one capability (an "
+                                  "embedded assembly template's placeholders) "
+                                  "and none does anything alone. "
+                                  "'templateLexerMode' is what gives this "
+                                  "dialect's placeholder sigils token kinds of "
+                                  "their own; 'templateOperandRule' is what "
+                                  "lets the lowering RECOGNISE a placeholder "
+                                  "without naming another document's rule in "
+                                  "C++; 'templateLabelRule' is what tells an "
+                                  "`asm goto` LABEL reference apart from an "
+                                  "OPERAND reference — a label denotes a BLOCK "
+                                  "and an operand a REGISTER, and the rule is "
+                                  "the only dialect-neutral thing that "
+                                  "distinguishes them. Declare all three, or "
+                                  "none and host no templates",
+                                  present, missing));
                     assemblyClean = false;
-                } else if (hasMode) {
-                    // ★ THE RULE IS READ FIRST BECAUSE THE MODE CHECK NEEDS IT.
-                    // "Is this a mode a template can be read in?" is not a
-                    // question about the mode alone — see the FIRST-set arm
-                    // below, which asks whether this mode can produce the token
-                    // the placeholder RULE begins with. Reading the rule after
-                    // the mode (as this block did when it shipped) left that
-                    // question unanswerable and the check enforced a proxy.
+                } else if (declaredCount == capability.size()) {
+                    // ★ THE RULES ARE READ FIRST BECAUSE THE MODE CHECK NEEDS
+                    // ONE OF THEM. "Is this a mode a template can be read in?"
+                    // is not a question about the mode alone — see the FIRST-set
+                    // arm below, which asks whether this mode can produce the
+                    // token the placeholder RULE begins with. Reading the rule
+                    // after the mode (as this block did when it shipped) left
+                    // that question unanswerable and the check enforced a proxy.
                     readRule("templateOperandRule", cfg.templateOperandRule);
+                    readRule("templateLabelRule",   cfg.templateLabelRule);
+
+                    // ★★★ THE LABEL RULE MUST BE A PLACEHOLDER FORM THE OPERAND
+                    // RULE CAN ACTUALLY REACH, AND BOTH ARMS BELOW ARE SILENT
+                    // NO-OPS RATHER THAN CRASHES — which is why they are load
+                    // errors and not left to the lowering.
+                    //
+                    //   * NAMING THE SAME RULE TWICE: `decodePlaceholder`
+                    //     matches the CHILD of the operand rule's node against
+                    //     the label rule, so a label rule equal to the operand
+                    //     rule matches nothing and the label form silently stops
+                    //     being a label.
+                    //   * NAMING A RULE OUTSIDE THE FAMILY (the plausible typo
+                    //     is the bracketed-NAME rule, which both families share)
+                    //     has the same effect for the same reason.
+                    //
+                    // ⚠ THE TEST IS FIRST-SET CONTAINMENT, NOT A REACHABILITY
+                    // WALK, AND IT IS STATED IN FACTS THIS PASS ALREADY HOLDS —
+                    // the same instrument, and the same justification, as the
+                    // `templateModeUnmintedFirstKinds` arm below. ⓘ IT IS A
+                    // NECESSARY CONDITION AND NOT A SUFFICIENT ONE, stated
+                    // plainly: a dialect that named the OPERAND-reference rule
+                    // here would pass, and every `%0` would then be routed as a
+                    // branch target. Nothing at config level can decide which
+                    // arm of the alt is the label one — that is precisely the
+                    // fact this key exists to DECLARE — so the check bounds the
+                    // mistake rather than eliminating it.
+                    if (cfg.templateOperandRule.valid()
+                        && cfg.templateLabelRule.valid()) {
+                        if (cfg.templateLabelRule.v
+                            == cfg.templateOperandRule.v) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      "/assembly/templateLabelRule",
+                                      "'templateLabelRule' names the same rule "
+                                      "as 'templateOperandRule' — the label "
+                                      "form is matched among the operand rule's "
+                                      "own alternatives, so a rule that IS the "
+                                      "operand rule matches none of them and "
+                                      "every `asm goto` target would silently "
+                                      "decode as an operand and be refused as "
+                                      "unbound");
+                            assemblyClean = false;
+                        } else if (auto const unreachable =
+                                       ruleFirstKindsOutside(
+                                           data, cfg.templateLabelRule,
+                                           cfg.templateOperandRule);
+                                   !unreachable.empty()) {
+                            std::string kinds;
+                            for (SchemaTokenId const k : unreachable) {
+                                if (!kinds.empty()) kinds += ", ";
+                                kinds += '\'';
+                                kinds += data.schemaTokens->name(k);
+                                kinds += '\'';
+                            }
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      "/assembly/templateLabelRule",
+                                      std::format(
+                                          "'templateLabelRule' begins with {}, "
+                                          "which 'templateOperandRule' cannot "
+                                          "begin with — so no placeholder this "
+                                          "dialect can parse would ever match "
+                                          "the label rule, and the whole `asm "
+                                          "goto` label form would be silently "
+                                          "dead. Name the LABEL alternative of "
+                                          "the placeholder rule itself",
+                                          kinds));
+                            assemblyClean = false;
+                        }
+                    }
+
                     json const& lm = as.at("templateLexerMode");
                     if (!lm.is_string() || lm.get<std::string>().empty()) {
                         coll.emit(DiagnosticCode::C_InvalidHirLowering,

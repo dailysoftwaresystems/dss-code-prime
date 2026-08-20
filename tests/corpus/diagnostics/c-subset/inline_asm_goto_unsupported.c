@@ -27,6 +27,13 @@
  * three operand sections and fills none, so the joined operand count is 0 and EVERY
  * index is out of range — including the first. `lbl` is a REAL, DEFINED label, so the
  * diagnostic is about the template and not about an undeclared name.
+ * ★★ AND SINCE P20 IT IS ALSO THE WRONG-SIGIL CASE, which is why the message changed
+ * while the code and the span did not. Index 0 is out of range FOR AN OPERAND and in
+ * range for a LABEL (GNU 6.47.2.7 numbers the labels after every operand, and this
+ * statement has none), so the refusal now says the index names an `asm goto` label and
+ * quotes the `%l` form that would have named it. Reporting only "this statement
+ * declares 0 operands" would send the author to add an operand they do not want. The
+ * message CONTENT is asserted in the unit suite; this file pins code + position.
  *
  * RED-on-disable: drop `hasLabelList`/`hasGotoQualifier` from the grammar -> a P_*
  * parse cascade replaces the single S006A. Remove the placeholder bound check -> this

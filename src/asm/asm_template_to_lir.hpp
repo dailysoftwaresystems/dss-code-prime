@@ -289,6 +289,32 @@ struct DSS_EXPORT AsmOperandBinding {
     std::uint32_t widthBits = 0;
 };
 
+// ★★★ ONE `asm goto` LABEL TARGET, AS THE EMBEDDING LANGUAGE BOUND IT (GNU
+// 6.47.2.7). `spelling` is EXACTLY what the template writes — `"%l[done]"` or
+// `"%l2"` — and, like an operand spelling, the engine never interprets it; it
+// only compares.
+//
+// ★★★ A SECOND SPAN, NEVER A WIDENED `AsmOperandBinding`, AND THE REASON IS
+// THE ONE `AsmLoweringHost`'s own docblock rejects a mode flag on. An operand
+// binds a REGISTER and is asked for through `resolveRegister`; a label binds a
+// BLOCK and is asked for through `resolveBranchTarget`. Two questions, two
+// virtuals — and one struct carrying both with a "which field is live?"
+// discriminator would be exactly the `isEmbedded` bool that class refuses:
+// every later question gets answered with a second branch, and the first thing
+// such a branch does is let the two meanings diverge invisibly. There is no
+// register a label could be handed to, and no block an operand could be, so
+// the union would never have a legitimate reader.
+//
+// ⚠ THE SPELLINGS ARE MATCHED VERBATIM, exactly as operand placeholder
+// spellings are and for the same measured reason — see
+// `AsmLoweringHost::namesRegister`'s two-caller paragraph. A label spelling is
+// the EMBEDDING language's, not gas vocabulary, so the dialect's
+// `spellingCase` must not reach it.
+struct DSS_EXPORT AsmLabelBinding {
+    std::string spelling;
+    LirBlockId  block = InvalidLirBlock;
+};
+
 // ★★★ EVERYTHING THE PER-INSTRUCTION ENGINE CANNOT DERIVE FROM (tree, dialect,
 // target). Every one of these is a fact about the PROGRAM the instruction sits
 // in — which labels exist, which register an operand denotes, whether a
@@ -384,6 +410,17 @@ public:
                         std::vector<LirOperand>& out) = 0;
 
     // The block `symbol` names, or nullopt with a diagnostic.
+    //
+    // ⚠ `symbol` IS WHATEVER THE SOURCE WROTE IN BRANCH-TARGET POSITION, AND
+    // FOR THE EMBEDDED CALLER THAT IS A **PLACEHOLDER SPELLING**, NOT A LABEL
+    // NAME. A `.s` writes `jmp Lloop` and a template writes `jmp %l[done]` or
+    // `jmp %l2`; both arrive here, and each host answers from the label model
+    // it actually has. ★ A PLACEHOLDER SPELLING ARRIVES **VERBATIM** — never
+    // folded by the dialect's `spellingCase` — for the same measured reason
+    // `namesRegister`'s two-caller paragraph gives: it names a label of the
+    // EMBEDDING language, which is case-SENSITIVE about it, and is not gas
+    // vocabulary at all. A host matching label bindings must therefore compare
+    // exactly.
     [[nodiscard]] virtual std::optional<LirBlockId>
     resolveBranchTarget(std::string const& symbol, NodeId at,
                         std::string_view mnemonic) = 0;
@@ -511,6 +548,23 @@ parseAsmTemplateText(std::string                          templateText,
 // `bindings` are the template's operands in GNU order (outputs then inputs),
 // each carrying the DIALECT SPELLING that names it and the register it denotes.
 //
+// `labelBindings` are the `asm goto` targets, each carrying the SPELLING the
+// template writes and the block the branch must reach. ⚠ EVERY SPELLING A
+// LABEL ANSWERS TO IS ITS OWN ROW — the bracketed form and the positional one
+// are two rows pointing at ONE block, because this engine only compares
+// spellings and holds no opinion about how a label may be named.
+//
+// ⚠ THE LABEL SPAN DEFAULTS TO EMPTY, AND THAT DEFAULT IS NOT A SILENT ONE.
+// Empty is the CORRECT value for every template that is not an `asm goto` —
+// which is nearly all of them, and every one of the callers that predate the
+// label surface — and a template that names a label nobody bound is refused BY
+// NAME, saying how many labels were bound. So the default can only ever produce
+// a loud diagnostic, never a wrong branch. ⓘ It is a trailing parameter for a
+// mechanical reason worth stating rather than leaving to be re-derived: the two
+// reference parameters after `bindings` cannot carry defaults, so a second span
+// placed beside the first would have forced every existing call site to be
+// rewritten in the same commit that introduced it.
+//
 // ⚠ THE BUILDER MUST ALREADY HAVE AN OPEN BLOCK. A template is emitted MID
 // FUNCTION, into the block the embedding language is filling; every instruction
 // lands there in source order.
@@ -522,6 +576,7 @@ lowerAsmTemplateToLirRun(Tree const&                        templateTree,
                          TargetSchema const&                target,
                          std::span<AsmOperandBinding const> bindings,
                          LirBuilder&                        builder,
-                         DiagnosticReporter&                reporter);
+                         DiagnosticReporter&                reporter,
+                         std::span<AsmLabelBinding const>   labelBindings = {});
 
 } // namespace dss

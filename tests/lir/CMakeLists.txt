@@ -33,6 +33,18 @@ target_link_libraries(dss_lir_test_lir_two_address_tie PRIVATE nlohmann_json::nl
 # lowering for the positive claim and its untied control, and hand-builds the
 # two descriptor shapes that must still REFUSE.
 dss_add_test(NAME lir/test_lir_asm_tied_operand SOURCES test_lir_asm_tied_operand.cpp)
+# D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-LONGER-EXISTS (P20): the
+# `asm goto` label edge, the fall-through edge, result piece 0 and the two
+# refusals that must NOT become acceptance. Drives the REAL c-subset → HIR →
+# MIR → LIR lowering, because the property is a relation between what the front
+# end minted (the spellings) and what this tier bound (the blocks).
+dss_add_test(NAME lir/test_lir_asm_goto_labels SOURCES test_lir_asm_goto_labels.cpp)
+# D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-OPERAND (P20): the binding
+# builder's collision refusal, for BOTH row sets (operands and `asm goto`
+# labels). Hand-builds the descriptors, because the C front end now refuses the
+# shape and this guard exists for the producers that never run that pass.
+dss_add_test(NAME lir/test_lir_asm_binding_collision
+             SOURCES test_lir_asm_binding_collision.cpp)
 dss_add_test(NAME lir/test_lir_text      SOURCES test_lir_text.cpp)
 dss_add_test(NAME lir/test_mir_to_lir    SOURCES test_mir_to_lir.cpp)
 # FC1 (V2-4.X): the role-contract red-on-disable levers strip

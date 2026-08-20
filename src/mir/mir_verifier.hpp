@@ -60,6 +60,18 @@ private:
     // Emits I_VerifierFailure.
     void checkStructuralInvariants(DiagnosticReporter& reporter) const;
 
+    // The successor half of the line above, per block — and it is a SEPARATE
+    // method because the successor arity is a property of the block's TERMINATOR
+    // while the rest of the sweep walks instructions. ⚠ The claim "successor-
+    // count in [min,max]" stood in this docblock while NO such check existed
+    // anywhere in the verifier (✔MEASURED, cycle P20); it is true now because it
+    // was implemented, and the implementation carries the measurement. Also
+    // enforces `InlineAsmGoto`'s stronger rule — successors == labels + the
+    // fall-through — which the `[min,max]` range cannot express.
+    // Emits I_VerifierFailure.
+    void checkTerminatorSuccessorArity(DiagnosticReporter& reporter,
+                                       MirBlockId block) const;
+
     // Each function has exactly one block marked `StructCfMarker::EntryBlock`
     // AND that block is `funcBlockAt(f, 0)`. Emits I_NoEntryBlock /
     // I_MultipleEntryBlocks / I_EntryBlockNotFirst.

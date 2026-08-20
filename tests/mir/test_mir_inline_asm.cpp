@@ -4,10 +4,11 @@
 // design could regress into a SILENT wrong answer rather than a loud one:
 //
 //   1. The two opcode ROWS. `InlineAsm` is `Call`-shaped except for `{0, N}`
-//      operands, `InlineAsmGoto` is `Switch`-shaped in its successors, and BOTH
-//      are in the `opcodeClobbersMemory` positive list. A row edit that dropped
-//      the clobber membership would let CSE/LICM move loads across an asm block
-//      with nothing to observe it.
+//      operands; `InlineAsmGoto` is variadic in its successors like `Switch` but
+//      with a FLOOR OF 2 — its successors are [label…, fall-through], and the
+//      fall-through is not optional; and BOTH are in the `opcodeClobbersMemory`
+//      positive list. A row edit that dropped the clobber membership would let
+//      CSE/LICM move loads across an asm block with nothing to observe it.
 //   2. The `ReturnPiece` payload SPLIT. The piece carries an ordinal AND the
 //      register class that ordinal indexes; the class is no longer inferred from
 //      the MIR type. The discriminating case is a piece whose declared class
@@ -18,7 +19,8 @@
 //      `addInst` refuses it, so a rebuild site that forwards the raw payload
 //      aborts instead of naming a descriptor in a pool that does not have one.
 //   4. The `asm goto` EDGE-PLACEMENT rule: pieces at successor heads, every
-//      piece-bearing edge single-predecessor.
+//      piece-bearing edge single-predecessor — and the FALL-THROUGH edge, which
+//      is what keeps the statements after the asm reachable instead of pruned.
 
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"          // TargetRegClass
@@ -30,6 +32,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -82,6 +85,23 @@ std::vector<MirInstId> allInsts(Mir const& mir) {
     return out;
 }
 
+// One spelling group per `asm goto` label, in label order. `addInlineAsmGoto`
+// requires the descriptor's label list and the block list to agree, so every
+// fixture that builds an asm goto mints these — the same pairing the front end
+// carries down from the source.
+//
+// ★ The groups are DISTINCT and non-empty on purpose: a fixture whose spellings
+// were all `{}` would satisfy the size check while telling a reader nothing about
+// which label a group describes.
+std::vector<std::vector<std::string>> labelSpellingsFor(std::size_t labelCount) {
+    std::vector<std::vector<std::string>> out;
+    out.reserve(labelCount);
+    for (std::size_t j = 0; j < labelCount; ++j) {
+        out.push_back({"%l" + std::to_string(j), "%l[L" + std::to_string(j) + "]"});
+    }
+    return out;
+}
+
 // How many blocks of `f` list `target` among their CFG successors.
 std::uint32_t predecessorCount(Mir const& mir, MirFuncId f, MirBlockId target) {
     std::uint32_t n = 0;
@@ -123,19 +143,35 @@ TEST(MirInlineAsm, InlineAsmRowIsCallShapedButAcceptsZeroOperands) {
     EXPECT_EQ(mnemonic(MirOpcode::InlineAsm), "inlineasm");
 }
 
-// The goto form is a TERMINATOR with Switch's unbounded successor range and NO
-// result. `R::None` is structural, not a restriction: piece capture requires the
-// piece to immediately follow its producer and a terminator has nothing after
-// it, so EVERY output — output 0 included — must land at a successor head.
-TEST(MirInlineAsm, InlineAsmGotoRowIsSwitchShapedInItsSuccessors) {
+// The goto form is a TERMINATOR with an unbounded successor range and NO result.
+// `R::None` is structural, not a restriction: piece capture requires the piece to
+// immediately follow its producer and a terminator has nothing after it, so EVERY
+// output — output 0 included — must land at a successor head.
+//
+// ★★★ AND ITS SUCCESSOR FLOOR IS 2, WHICH IS WHERE IT PARTS COMPANY WITH SWITCH.
+// The successors are [label…, FALL-THROUGH], so the minimum is one label plus the
+// fall-through. This test used to assert `minSuccessors == 1` AND
+// `== switchRow.minSuccessors` — it pinned the label-list-only successor set that
+// ✔MEASURED WRONG on gcc 13.3.0, clang 19.1.1 and aarch64-linux-gnu-gcc, all three
+// of which fall through an `asm goto` whose template does not branch. The old
+// framing is kept visible here on purpose: the row it pinned was the miscompile.
+TEST(MirInlineAsm, InlineAsmGotoRowCarriesAFallThroughSuccessorBeyondSwitchs) {
     MirOpcodeInfo const gotoRow   = opcodeInfo(MirOpcode::InlineAsmGoto);
     MirOpcodeInfo const switchRow = opcodeInfo(MirOpcode::Switch);
 
     EXPECT_EQ(gotoRow.minOperands, 0u)
         << "like InlineAsm and unlike Switch, an asm goto may have no operands";
     EXPECT_EQ(gotoRow.maxOperands, kMirUnboundedOperands);
-    EXPECT_EQ(gotoRow.minSuccessors, 1u);
-    EXPECT_EQ(gotoRow.minSuccessors, switchRow.minSuccessors);
+    EXPECT_EQ(gotoRow.minSuccessors, 2u)
+        << "at least one label AND the fall-through — a floor of 1 is exactly the "
+           "shape that let the label list alone be a legal successor set";
+    EXPECT_GT(gotoRow.minSuccessors, switchRow.minSuccessors)
+        << "anti-vacuity: the two rows must genuinely DIFFER, else this assertion "
+           "would pass on a row that had merely been kept Switch-shaped";
+    EXPECT_EQ(switchRow.minSuccessors, 1u)
+        << "and Switch's own floor is unchanged — its trailing successor is the "
+           "default, a different fact from the fall-through";
+    // The upper half stays shared: both are variadic in their successors.
     EXPECT_EQ(gotoRow.maxSuccessors, kMirUnboundedSuccessors);
     EXPECT_EQ(gotoRow.maxSuccessors, switchRow.maxSuccessors);
     EXPECT_EQ(gotoRow.result, MirResultRule::None)
@@ -406,10 +442,18 @@ TEST(MirInlineAsm, IdenticalDescriptorsGetDistinctPoolSlots) {
 // ── 5. the `asm goto` edge-placement rule ───────────────────────────────────
 
 // With NO outputs there is nothing to place, so nothing is interposed: the
-// terminator's successor set IS the label set, literally. This is the arm that
-// makes the split arm below non-vacuous — without it, "a split happened" could
-// just mean "the builder always splits everything".
-TEST(MirInlineAsm, AsmGotoWithoutOutputsBranchesStraightToItsLabels) {
+// terminator's successor set IS the label set followed by the fall-through, with
+// no landing block anywhere. This is the arm that makes the split arm below
+// non-vacuous — without it, "a split happened" could just mean "the builder always
+// splits everything".
+//
+// ⚠ THIS TEST USED TO ASSERT `funcBlockCount(f) == 3` under the heading "no landing
+// block was interposed", and that number was only correct while the builder emitted
+// no fall-through edge at all. The continuation block is NOT a landing block: it is
+// where the statements after the asm live, and it exists whether or not the asm has
+// outputs. Both facts are asserted separately below so the count cannot silently
+// absorb a landing block that reappeared.
+TEST(MirInlineAsm, AsmGotoWithoutOutputsBranchesStraightToItsLabelsAndContinuation) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const voidT = interner.primitive(TypeKind::Void);
     TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
@@ -421,31 +465,169 @@ TEST(MirInlineAsm, AsmGotoWithoutOutputsBranchesStraightToItsLabels) {
     MirBlockId const l1    = mb.createBlock(StructCfMarker::Linear);
     mb.beginBlock(entry);
     MirAsmDescriptor d;
-    d.templateText = "jmp %l0";
+    d.templateText   = "jmp %l0";
+    d.labelSpellings = labelSpellingsFor(2);
     MirBlockId const labels[] = {l0, l1};
     auto const r = mb.addInlineAsmGoto(std::move(d), {}, labels);
-    ASSERT_EQ(r.edges.size(), 2u);
+    ASSERT_EQ(r.edges.size(), 3u) << "two labels + the fall-through";
     EXPECT_FALSE(r.edges[0].split);
     EXPECT_FALSE(r.edges[1].split);
+    EXPECT_FALSE(r.edges[2].split);
     EXPECT_EQ(r.edges[0].successor.v, l0.v);
     EXPECT_EQ(r.edges[1].successor.v, l1.v);
+    EXPECT_FALSE(r.edges[0].isFallthrough);
+    EXPECT_FALSE(r.edges[1].isFallthrough);
+    EXPECT_TRUE(r.edges[2].isFallthrough)
+        << "the fall-through edge is LAST — first would shift every label index";
+    EXPECT_EQ(r.continuation().v, r.edges[2].onward.v);
+    // The label edges name the blocks the SOURCE named; the fall-through names
+    // neither of them.
+    EXPECT_EQ(r.edges[0].onward.v, l0.v);
+    EXPECT_EQ(r.edges[1].onward.v, l1.v);
+    MirBlockId const cont = r.continuation();
     mb.beginBlock(l0); mb.addReturn();
     mb.beginBlock(l1); mb.addReturn();
+    mb.beginBlock(cont); mb.addReturn();
     Mir const mir = std::move(mb).finish();
 
     auto const succ = mir.blockSuccessors(entry);
-    ASSERT_EQ(succ.size(), 2u);
+    ASSERT_EQ(succ.size(), 3u);
     EXPECT_EQ(succ[0].v, l0.v);
     EXPECT_EQ(succ[1].v, l1.v);
-    EXPECT_EQ(mir.funcBlockCount(f), 3u) << "no landing block was interposed";
+    EXPECT_EQ(succ[2].v, cont.v);
+    EXPECT_EQ(mir.funcBlockCount(f), 4u)
+        << "entry + l0 + l1 + the continuation — no landing block was interposed";
+}
+
+// ★★★ THE FALL-THROUGH PIN, AND IT IS BUILT TO SURVIVE ITS OWN MUTANT. The code
+// after an `asm goto` is reached when the template does not branch — ✔MEASURED on
+// gcc 13.3.0, clang 19.1.1 and aarch64-linux-gnu-gcc — so the continuation is a
+// real CFG successor and must be a block of its own.
+//
+// RED-ON-DISABLE, and the mutation is chosen so the ARITY STAYS LEGAL: make
+// `addInlineAsmGoto` pass `labels[0]` to the fall-through `addEdge` instead of a
+// freshly created block. The successor count is unchanged, so `recordSuccessors_`
+// and the opcode row both still accept it and the builder does NOT crash — the
+// module simply says the fall-through path lands on label 0, and control after the
+// asm runs the wrong statements. ⚠ DELETING the successor instead would abort in
+// `recordSuccessors_`, and an abort cannot tell "the guard works" from "the builder
+// crashed"; this mutant compiles, builds, and is caught only by the assertions
+// below.
+TEST(MirInlineAsm, AsmGotoFallThroughIsAFreshBlockDistinctFromEveryLabel) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidT = interner.primitive(TypeKind::Void);
+    TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    MirFuncId  const f     = mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const l0    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const l1    = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirAsmDescriptor d;
+    d.templateText   = "test %0,%0; jne %l1";
+    d.labelSpellings = labelSpellingsFor(2);
+    MirBlockId const labels[] = {l0, l1};
+    auto const r = mb.addInlineAsmGoto(std::move(d), {}, labels);
+    MirBlockId const cont = r.continuation();
+    mb.beginBlock(l0);   mb.addReturn();
+    mb.beginBlock(l1);   mb.addReturn();
+    mb.beginBlock(cont); mb.addReturn();
+    Mir const mir = std::move(mb).finish();
+
+    auto const succ = mir.blockSuccessors(entry);
+    ASSERT_EQ(succ.size(), 3u) << "two labels + the fall-through";
+    // (a) the fall-through is a block NEITHER label names …
+    EXPECT_NE(succ[2].v, l0.v)
+        << "the fall-through must not alias label 0 — that is the mutant this pin "
+           "exists for, and it keeps the successor count legal";
+    EXPECT_NE(succ[2].v, l1.v);
+    // (b) … it is the block the result hands the caller for the statements after
+    //     the asm …
+    EXPECT_EQ(succ[2].v, cont.v);
+    // (c) … and nothing else in the function reaches it, so the code after the asm
+    //     runs on the fall-through path and on no other.
+    EXPECT_EQ(predecessorCount(mir, f, cont), 1u);
+    // Anti-vacuity: the label blocks really are reachable too, so (a) is comparing
+    // three live successors rather than one live and two arbitrary ids.
+    EXPECT_EQ(predecessorCount(mir, f, l0), 1u);
+    EXPECT_EQ(predecessorCount(mir, f, l1), 1u);
+    EXPECT_EQ(mir.funcBlockCount(f), 4u);
+}
+
+// The descriptor's label list and the block list are one fact seen from two
+// sides. A descriptor short by one label would make a legal-looking successor set
+// whose trailing entry a consumer reads as the fall-through when it is a label.
+TEST(MirInlineAsmDeath, AddInlineAsmGotoRefusesALabelCountThatContradictsTheDescriptor) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidT = interner.primitive(TypeKind::Void);
+    TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
+    EXPECT_DEATH({
+        MirBuilder mb;
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const l0    = mb.createBlock(StructCfMarker::Linear);
+        MirBlockId const l1    = mb.createBlock(StructCfMarker::Linear);
+        mb.beginBlock(entry);
+        MirAsmDescriptor d;
+        d.templateText   = "jmp %l0";
+        d.labelSpellings = labelSpellingsFor(1);   // one group, two labels
+        // ⚠ A `std::vector` rather than a braced array: EXPECT_DEATH is a macro,
+        // and the preprocessor counts commas that braces do not protect — a
+        // two-element aggregate initializer inside the statement block would be
+        // read as an extra macro argument.
+        std::vector<MirBlockId> labels;
+        labels.push_back(l0);
+        labels.push_back(l1);
+        (void)mb.addInlineAsmGoto(std::move(d), {}, labels);
+    }, "must differ by exactly one");
+}
+
+// ★★★ THE SEAM THE CLONE PATH LEAVES OPEN, AND WHY THE OPCODE ROW CANNOT CLOSE IT.
+// A clone that drops the fall-through edge of a TWO-label goto hands over two
+// successors — inside the row's `[2, ∞)` range, so `recordSuccessors_` is happy and
+// the edge is gone with no diagnostic. Checking the descriptor's carried label list
+// is what makes it loud.
+TEST(MirInlineAsmDeath, CloneInlineAsmGotoRefusesADroppedFallThroughInsideTheRowsRange) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const voidT = interner.primitive(TypeKind::Void);
+    TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
+    EXPECT_DEATH({
+        MirBuilder mb;
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const l0    = mb.createBlock(StructCfMarker::Linear);
+        MirBlockId const l1    = mb.createBlock(StructCfMarker::Linear);
+        mb.beginBlock(entry);
+        MirAsmDescriptor d;
+        d.templateText   = "jmp %l0";
+        d.labelSpellings = labelSpellingsFor(2);
+        // Two labels, so a well-formed clone carries THREE successors. Two is
+        // still inside the opcode row's range — the count the range cannot reject.
+        // (A vector, not a braced array: see the sibling death test on why a
+        // brace-comma cannot appear inside an EXPECT_DEATH statement block.)
+        std::vector<MirBlockId> succs;
+        succs.push_back(l0);
+        succs.push_back(l1);
+        (void)mb.cloneInlineAsmGoto(std::move(d), {}, succs);
+    }, "must differ by exactly one");
 }
 
 // ★★★ THE PLACEMENT RULE. With outputs, every edge gets a landing block whose
 // HEAD holds that edge's pieces and whose only predecessor is the asm block —
 // i.e. no piece ever sits on a critical edge. Following each landing block's
-// single `Br` recovers exactly the label set the source named.
+// single `Br` recovers exactly the label set the source named, THEN the
+// continuation.
 //
-// RED-ON-DISABLE: make `addInlineAsmGoto` push `label` instead of `landing` and
+// ★ THE FALL-THROUGH EDGE IS SPLIT LIKE ANY OTHER, and that is the point of
+// asserting `e.split` for every edge rather than for the first N: an `asm goto`'s
+// outputs are readable on the fall-through path too, so that path needs its pieces
+// at a single-predecessor head under exactly the same rule. The one thing the
+// fall-through edge cannot supply is a source label — it branches onward to the
+// continuation the builder minted, which is why the loop below reads `e.onward`
+// (the renamed field) and never a `label`.
+//
+// RED-ON-DISABLE: make `addInlineAsmGoto` push `onward` instead of `landing` and
 // the pieces have nowhere legal to go — the successor blocks are then shared,
 // `predecessorCount` reports 2 for a shared label, and the head assertion fails
 // because the label block's first instruction is not a ReturnPiece.
@@ -474,33 +656,37 @@ TEST(MirInlineAsm, AsmGotoWithOutputsPlacesPiecesAtSinglePredecessorSuccessorHea
 
     mb.beginBlock(pre);
     MirAsmDescriptor d;
-    d.templateText = "cmp %1, %2; je %l1";
+    d.templateText   = "cmp %1, %2; je %l1";
+    d.labelSpellings = labelSpellingsFor(2);
     d.outputs.push_back(gprOut("=r"));
     d.outputs.push_back(fprOut("=x"));
     MirBlockId const labels[] = {l0, l1};
     auto const r = mb.addInlineAsmGoto(std::move(d), {}, labels);
-    ASSERT_EQ(r.edges.size(), 2u);
-    MirInstId const asmId = r.terminator;
+    ASSERT_EQ(r.edges.size(), 3u) << "two labels + the fall-through";
+    MirInstId  const asmId = r.terminator;
+    MirBlockId const cont  = r.continuation();
 
     std::vector<MirInstId> headPieces;
     for (auto const& e : r.edges) {
         ASSERT_TRUE(e.split) << "an asm goto WITH outputs must land them on an "
-                                "edge block, never in the label block";
-        EXPECT_NE(e.successor.v, e.label.v);
+                                "edge block, never in the label block — and the "
+                                "fall-through edge is not exempt";
+        EXPECT_NE(e.successor.v, e.onward.v);
         mb.beginBlock(e.successor);
         headPieces.push_back(
             mb.addReturnPiece(asmId, 0, TargetRegClass::GPR, i64));
         headPieces.push_back(
             mb.addReturnPiece(asmId, 1, TargetRegClass::FPR, i64));
-        mb.addBr(e.label);
+        mb.addBr(e.onward);
     }
-    mb.beginBlock(l0); mb.addReturn();
-    mb.beginBlock(l1); mb.addReturn();
+    mb.beginBlock(l0);   mb.addReturn();
+    mb.beginBlock(l1);   mb.addReturn();
+    mb.beginBlock(cont); mb.addReturn();
     Mir const mir = std::move(mb).finish();
 
-    // (a) the terminator has one successor per label …
+    // (a) the terminator has one successor per label, then the fall-through …
     auto const succ = mir.blockSuccessors(pre);
-    ASSERT_EQ(succ.size(), 2u);
+    ASSERT_EQ(succ.size(), 3u);
     // (b) … and following each successor's `Br` recovers exactly the label set.
     std::vector<std::uint32_t> reached;
     for (MirBlockId const s : succ) {
@@ -524,9 +710,11 @@ TEST(MirInlineAsm, AsmGotoWithOutputsPlacesPiecesAtSinglePredecessorSuccessorHea
         ASSERT_EQ(onward.size(), 1u);
         reached.push_back(onward[0].v);
     }
-    std::vector<std::uint32_t> const expected{l0.v, l1.v};
+    std::vector<std::uint32_t> const expected{l0.v, l1.v, cont.v};
     EXPECT_EQ(reached, expected)
-        << "the EFFECTIVE successor set equals the label set, in source order";
+        << "the EFFECTIVE successor set equals the label set in source order, "
+           "followed by the continuation — the fall-through path reaches the code "
+           "after the asm, not a label";
 
     EXPECT_EQ(mir.instOpcode(mir.blockTerminator(pre)), MirOpcode::InlineAsmGoto);
     // ★ ANTI-VACUITY FOR THE WHOLE TEST: `l0` really does have two predecessors
@@ -536,6 +724,7 @@ TEST(MirInlineAsm, AsmGotoWithOutputsPlacesPiecesAtSinglePredecessorSuccessorHea
     EXPECT_EQ(predecessorCount(mir, f, l0), 2u)
         << "the fixture must keep l0 multi-predecessor, else the split is "
            "untested";
-    EXPECT_EQ(mir.funcBlockCount(f), 6u)
-        << "entry + pre + 2 landing blocks + l0 + l1";
+    EXPECT_EQ(mir.funcBlockCount(f), 8u)
+        << "entry + pre + 3 landing blocks (2 labels + the fall-through) + l0 + "
+           "l1 + the continuation";
 }

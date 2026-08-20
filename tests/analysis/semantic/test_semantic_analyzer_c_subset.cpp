@@ -16273,7 +16273,8 @@ TEST(SemanticAnalyzerCSubset, InlineAsmLabelSectionWithoutGotoIsRefused) {
             if (!gia.rule.valid() || tr.rule(n).v != gia.rule.v) return;
             sawGoto = true;
             auto const f = gatherInlineAsmFacts(
-                tr, n, gia, plain->schema().semantics().identifierToken,
+                tr, n, gia, plain->schema().semantics().inlineAsmTemplateLexemes,
+                plain->schema().semantics().identifierToken,
                 plain->schema().hirLowering().stringBodyToken);
             EXPECT_TRUE(f.hasGotoQualifier);
             EXPECT_EQ(f.gotoQualifierText, "goto");
@@ -16431,7 +16432,8 @@ TEST(SemanticAnalyzerCSubset, InlineAsmQualifierScanStopsAtTemplateAndIgnoresOpe
             if (!ia.rule.valid() || tree.rule(n).v != ia.rule.v) return;
             checked = true;
             auto const f = gatherInlineAsmFacts(
-                tree, n, ia, cu->schema().semantics().identifierToken,
+                tree, n, ia, cu->schema().semantics().inlineAsmTemplateLexemes,
+                cu->schema().semantics().identifierToken,
                 cu->schema().hirLowering().stringBodyToken);
             ASSERT_EQ(f.operands.size(), 1u);
             EXPECT_EQ(f.operands[0].constraint, "r");

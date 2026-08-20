@@ -527,6 +527,13 @@ private:
                 // `mapBlock` with their pieces intact. `addInlineAsmGoto` owns the
                 // edge-PLACEMENT rule and re-running it here would interpose a SECOND
                 // landing block on every edge, on top of the one already cloned.
+                //
+                // ⚠ EVERY successor crosses, the trailing FALL-THROUGH edge
+                // included — it is what keeps the code after the asm statement
+                // reachable, so a filtered walk here would delete live code in the
+                // merged module. `cloneInlineAsmGoto` re-checks the count against
+                // the descriptor's own label list rather than trusting the opcode
+                // row's range, which a truncated set can still satisfy.
                 std::vector<MirInstId> newOps;
                 newOps.reserve(ops.size());
                 for (MirInstId const o : ops) newOps.push_back(mapValue(o, id));

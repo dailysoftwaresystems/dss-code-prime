@@ -495,6 +495,23 @@ void HirVerifier::checkInlineAsm(DiagnosticReporter& reporter) const {
                                  d.outputCount, d.operands.size()),
                      sourceMap_);
         }
+        // The `asm goto` label ORDINAL and what the template CALLS that label
+        // are two halves of one fact, pushed together by the lowering and
+        // index-aligned by contract. Nothing downstream can notice them
+        // disagreeing: a dropped spelling leaves the edge intact and the
+        // template's reference to it unresolvable, which surfaces (if at all) as
+        // an unbound-label refusal blaming the assembly text for a fact this
+        // tier lost. Assert the sizes so the loss is reported where it happened.
+        if (d.labelSpellings.size() != d.labelOrdinals.size()) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("InlineAsm descriptor carries {} `asm goto` label "
+                                 "ordinal(s) but {} spelling group(s); the two are "
+                                 "index-aligned by contract, so a mismatch means a "
+                                 "label reference the template can write has no "
+                                 "edge behind it (or an edge nothing can name)",
+                                 d.labelOrdinals.size(), d.labelSpellings.size()),
+                     sourceMap_);
+        }
     }
 }
 

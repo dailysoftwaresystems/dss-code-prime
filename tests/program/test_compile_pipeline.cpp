@@ -1516,16 +1516,24 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
            "alone is a substring of the C-primary statement's ~43-caret "
            "underline and pins nothing by itself; got:\n" << err2;
 
-    // ARM 3 — `asm goto` with a label edge: refused at the TERMINATOR site
-    // (`lowerInlineAsmGoto`), a refusal that names the MIR inst and the
-    // dialect but never the statement — and its guard instance is a SEPARATE
-    // instantiation from expandInlineAsm's, so it needs its own witness
-    // (audit finding 2026-08-19: this arm shipped only as a CLI probe).
+    // ARM 3 — the same two-locus render on the `asm goto` path, which is a
+    // SEPARATE code path from ARM 2's and needs its own witness.
+    //
+    // ★★ THIS ARM USED TO PIN A REFUSAL THAT NO LONGER EXISTS, AND WHAT IT
+    // PROTECTED IS WHAT IT STILL PINS. It compiled `__asm__ goto ("jmp
+    // %l[done]" …)` and asserted `rc != 0`, because `lowerInlineAsmGoto` was a
+    // bare refusal; P20 replaced that refusal with a lowering, so asserting the
+    // failure would now pin the ABSENCE of the feature. The property the arm was
+    // written for is untouched: a refusal raised while expanding an `asm goto`
+    // must make the C STATEMENT the primary locus. So the program keeps its
+    // shape and gains ONE unlowerable mnemonic — the same lever ARM 2 uses —
+    // and the positive half (the very program this arm used to reject) is
+    // asserted directly below as ARM 4.
     auto const src3 = writeCSubsetSource(
         scratch.path(), "goto_template.c",
         "int main(void) {\n"
         "    int x = 1;\n"
-        "    __asm__ goto (\"jmp %l[done]\" : : \"r\"(x) : : done);\n"
+        "    __asm__ goto (\"frobnicate %l[done]\" : : \"r\"(x) : : done);\n"
         "    x = 2;\n"
         "done:\n"
         "    return x;\n"
@@ -1536,15 +1544,44 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
         {src3.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
     auto const err3 = testing::internal::GetCapturedStderr();
 
-    EXPECT_NE(rc3, 0) << "an `asm goto` with label edges must fail the build "
-                         "(the refusal is the correct current answer)";
+    EXPECT_NE(rc3, 0) << "an `asm goto` whose template names no instruction the "
+                         "target declares must fail the build";
     EXPECT_NE(err3.find("goto_template.c:3:5"), std::string::npos)
         << "expected the C statement as primary on the asm-goto refusal too; "
            "got:\n" << err3;
     EXPECT_NE(err3.find(
-                  " 3 |     __asm__ goto (\"jmp %l[done]\" : : \"r\"(x) : : done);"),
+                  " 3 |     __asm__ goto (\"frobnicate %l[done]\" : : \"r\"(x) : : done);"),
               std::string::npos)
         << "expected the C statement line echoed; got:\n" << err3;
+    EXPECT_NE(err3.find("--> <inline asm>:1:1"), std::string::npos)
+        << "expected the template locus as a related note at the mnemonic, "
+           "DEMOTED but not dropped, on the goto path too; got:\n" << err3;
+
+    // ARM 4 — ★ THE POSITIVE HALF: the `asm goto` this test used to require to
+    // FAIL must now BUILD. An unconditional-branch template is the shape that
+    // seals the block inside the template itself, which is the one of the three
+    // builder states `sealAsmGotoEdges` answers by emitting NOTHING — get it
+    // wrong in either direction and `LirBuilder` aborts the process rather than
+    // reporting, so a green `rc == 0` here is load-bearing beyond "it compiled".
+    // (The RUNTIME witness is `examples/c-subset/asm_goto_labels`; this arm is
+    // the one that pins the CLI path and the abort-free build.)
+    auto const src4 = writeCSubsetSource(
+        scratch.path(), "goto_lowers.c",
+        "int main(void) {\n"
+        "    int x = 1;\n"
+        "    __asm__ goto (\"jmp %l[done]\" : : \"r\"(x) : : done);\n"
+        "    x = 2;\n"
+        "done:\n"
+        "    return x;\n"
+        "}\n");
+    Program prog4;
+    testing::internal::CaptureStderr();
+    int const rc4 = prog4.compileFiles(
+        {src4.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err4 = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(rc4, 0)
+        << "an `asm goto` whose template branches to its own label must LOWER; "
+           "got:\n" << err4;
 }
 
 // D-CAP-MARKER-MULTI-TARGET-E2E-PIN close (e4508b9 → next 2026-06-01):
@@ -3613,9 +3650,9 @@ diagnosticCodeSet(DiagnosticReporter const& r) {
 // rides along either, so a future re-ordering that swaps the `#error` cascade
 // for some other front-end noise class still goes red.
 //
-// RED-ON-DISABLE (verified, not assumed): move the pre-flight target
-// resolution at src/program/program.cpp:992-1012 back below the CU build (or
-// merely drop its `if (rep.hasErrors()) { … return 1; }` gate at :1013-1016 so
+// RED-ON-DISABLE (verified, not assumed): move `runCusToTargets`' pre-flight
+// target/format resolution pass back below the CU build (or merely drop the
+// `if (rep.hasErrors()) { … return 1; }` drain that immediately follows it, so
 // the front-end runs anyway) and the front-end preprocesses with no
 // architecture predefines → `P_PreprocessorErrorDirective` joins the set and
 // the set equality fails. Half (a) keeps passing in that state, which is the

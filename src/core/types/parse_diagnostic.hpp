@@ -1546,10 +1546,22 @@ enum class DiagnosticCode : std::uint16_t {
     //       rather than for the operand itself;
     //   (2) any other unrecognised `%`-form, including GNU's `%=` (the unique
     //       per-instantiation number) and a template ending in a bare `%`;
-    //   (3) the POSITIONAL `asm goto` label reference `%lN` — gcc accepts it,
-    //       this build declares only the bracketed `%l[name]`, and the two tiers
-    //       must agree, so it is refused here where the label list lives
-    //       (D-CSUBSET-INLINE-ASM-POSITIONAL-LABEL-REF-ACCEPTED-WITH-NO-GRAMMAR).
+    //   (3) ⛔ RETIRED 2026-08-19 (cycle P20) — the positional `asm goto`
+    //       label reference `%lN` was refused here from 2026-08-17 to 2026-08-19
+    //       because the grammar declared only the bracketed `%l[name]`. It is
+    //       now a LOWERED FEATURE: `asmTemplateLabelRef` takes the shared
+    //       `asmTemplateSelector`, so both spellings parse, and the front end
+    //       mints both as binding spellings on the reference numbering. ✔The
+    //       index rule was MEASURED by execution on gcc 13.3.0 and clang 19.1.1
+    //       at two operand counts: a label's index is
+    //       `#outputs + #source-inputs + labelPosition`, and a `"+"` operand
+    //       counts ONCE. An index that lands on an OPERAND, or past the last
+    //       label, is now refused by `S_InlineAsmPlaceholderOutOfRange` — the
+    //       code that owns index questions — not here.
+    //       ★ Kept as a numbered entry rather than deleted because the census
+    //       reason below turns on how many forms this code reports, and silently
+    //       renumbering would leave the next reader unable to check that claim
+    //       against the history ([[D-CSUBSET-INLINE-ASM-POSITIONAL-LABEL-REF-ACCEPTED-WITH-NO-GRAMMAR]]).
     //
     // ⚠ The broader contract is the RIGHT one — the docblock simply never
     // followed the code. Widened rather than split into three codes: they share
@@ -1632,6 +1644,21 @@ enum class DiagnosticCode : std::uint16_t {
     // section's own, and a check written against one section would accept `%2`
     // on a one-output-one-input statement while rejecting a legal `%1`.
     //
+    // ★★ WIDENED 2026-08-19 (cycle P20) — THIS CODE NOW OWNS EVERY INDEX
+    // QUESTION IN A TEMPLATE, NOT ONLY `%N`, AND THE DOCBLOCK SAYS SO BEFORE IT
+    // DRIFTS AGAIN. `asm goto` labels are numbered in the SAME index space,
+    // CONTINUING past the operands — ✔MEASURED by execution on gcc 13.3.0 and
+    // clang 19.1.1 at two operand counts, a label's index is
+    // `#outputs + #source-inputs + labelPosition` and a `"+"` operand counts
+    // ONCE. So one index space has two sigils reading from it, and this code
+    // reports all four ways that can go wrong: a `%N` past the operands, a `%N`
+    // landing in the LABEL range (the message names the label and quotes the
+    // `%l` form), a `%lN` landing in the OPERAND range (✔gcc: *"'%l' operand
+    // isn't a label"*), and a `%lN` past the last label. ★ Not split into
+    // separate codes, for the reason the sibling 0xE067 docblock already gives:
+    // they share one refusal reason, one severity and one remedy, and splitting
+    // would make the census enumerate SPELLINGS instead of the property.
+    //
     // The message states the index the template asked for AND the count that
     // exists, because an off-by-one here is nearly always a section the author
     // edited without renumbering. UNSUPPRESSABLE: silenced, expansion has
@@ -1657,21 +1684,62 @@ enum class DiagnosticCode : std::uint16_t {
     // NOT have (the same source table records `"A%%0B"` emitting `A%0B`, the
     // emitted `%0` deliberately NOT re-read).
     //
-    // ⚠ THE ACCEPTANCE CLAIM THIS CODE MUST NOT BREAK, stated as the INFERENCE
-    // it currently is: under [[feedback_reference_compilers_are_the_spec]] the
-    // rule is bidirectional, so refusing a program the reference TOOLCHAIN
-    // builds would itself be the defect. INFERRED, and owed a measurement
-    // before the consumer lands: gcc emits the `%0` verbatim and the ASSEMBLER
-    // then refuses it as a register spelling, so the program fails either way
-    // and this code only moves the refusal to the one place that knows how
-    // many operands were declared. If a measurement shows the emitted text
-    // ASSEMBLES, this is a divergence and must be narrowed or withdrawn — not
-    // kept because it is already written.
+    // ⚠ THE ACCEPTANCE CLAIM THIS CODE MUST NOT BREAK: under
+    // [[feedback_reference_compilers_are_the_spec]] the rule is bidirectional,
+    // so refusing a program the reference TOOLCHAIN builds would itself be the
+    // defect. This block asked for a measurement before a consumer landed —
+    // ✔THE MEASUREMENT WAS TAKEN 2026-08-14 and RE-MEASURED 2026-08-15 on gcc
+    // 13.3.0 and clang 18.1.3 (sources fed as base64 so no shell quoting could
+    // alter a byte), and it is recorded at the scan that emits this code
+    // (`inline_asm_facts.hpp`'s `scanInlineAsmTemplate` docblock, with its
+    // matched POSITIVE CONTROL) and pinned in
+    // `tests/analysis/semantic/test_inline_asm_capture.cpp`: gcc emits the `%0`
+    // VERBATIM and the ASSEMBLER then refuses it ("bad register name '%0'";
+    // clang "invalid register name"), so the program does not build there
+    // either and this code only moves the refusal to the one place that knows
+    // how many operands were declared. ⇒ NOT a divergence. ★ The demand stays
+    // written down rather than deleted: the clause was labelled INFERRED here
+    // and stayed labelled INFERRED for five days AFTER the measurement existed
+    // in two other files, which is how a docblock ends up telling readers the
+    // opposite of the record. If a future measurement shows the emitted text
+    // ASSEMBLES, this must be narrowed or withdrawn — not kept because it is
+    // already written.
     //
     // UNSUPPRESSABLE: silenced, the `%` form is either bound (wrong — there is
     // no operand list to bind against) or passed through raw, and the two
     // differ in the machine code that ships. Renders error[S006B].
     S_InlineAsmPlaceholderInBasicTemplate = 0xE06B,
+
+    // D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-OPERAND (cycle P20): ONE
+    // symbolic name used TWICE in a single inline-asm statement. The operands'
+    // `[name]` labels and the `asm goto` label list share ONE name space per
+    // statement, so all three collisions are this code: two operands, two
+    // labels, or an operand and a label.
+    //
+    // ★★★ THIS CODE EXISTS BECAUSE THE FEATURE THAT NEEDED IT LANDED IN THE SAME
+    // CYCLE. Before `%[name]` could bind at all the shape was refused by name
+    // ("names neither a register this target declares nor one of the N operands
+    // bound"), so a repeated name was a failed build. ✔MEASURED 2026-08-19
+    // through the shipped CLI, `__asm__("movl %[v], %[out]" : [out] "=r"(r),
+    // [v] "=r"(d) : [v] "r"(a))` with a==20: DSS compiled rc=0 at BOTH debug and
+    // release and the program returned 0 — `%[v]` bound the OUTPUT, because
+    // every tier's spelling lookup is a FIRST-MATCH scan and the output list is
+    // scanned first. Making the name bind is exactly what turned a fail-loud
+    // refusal into a wrong answer, which is why the refusal is minted beside it.
+    //
+    // ✔MEASURED 2026-08-19 on gcc 13.3.0 and clang 19.1.1, all three collisions,
+    // `-std=gnu17`: gcc "duplicate 'asm' operand name", clang "duplicate use of
+    // asm operand name" plus a note at the first use. NOT ONE reference accepts
+    // any of them, which is what makes acceptance a defect under the
+    // bidirectional half of the reference rule as §A.3b bounds it.
+    //
+    // ★ THE DIAGNOSTIC CARRIES A `related` LOCATION AT THE FIRST USE, the way
+    // clang's note does: the two occurrences are what the author has to compare,
+    // and a message that names only the second sends them looking for the other
+    // one. UNSUPPRESSABLE: silenced, the statement compiles and one of the two
+    // bindings is silently discarded — the measurement above IS the silenced
+    // behaviour. Renders error[S006C].
+    S_InlineAsmDuplicateSymbolicName = 0xE06C,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

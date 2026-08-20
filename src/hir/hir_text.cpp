@@ -17,6 +17,7 @@
 #include "hir/hir_op_registry.hpp"
 #include "hir/hir_verifier.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <optional>
@@ -791,8 +792,19 @@ private:
     //   inline_asm "TEMPLATE" [{ [extended] [goto] [mem] [cc]
     //                          [outputs <N> operands ( <opnd> , ... )]
     //                          [clobbers ( "r" , ... )]
-    //                          [labels ( L<n> , ... )] }]
-    //   <opnd> := "constraint" [ [name] ] [class <N>] [pin "reg"] -> <expr>
+    //                          [labels ( <label> , ... )] }]
+    //   <opnd>  := "constraint" [ [name] ] [<spells>] [class <N>] [pin "reg"]
+    //              -> <expr>
+    //   <label> := L<n> [<spells>]
+    //   <spells>:= spells ( "%0" , ... )
+    //
+    // * `spells` RENDERS A CARRIED FACT, NOT A DERIVED ONE, which is why it is
+    // in the text at all. An operand's `%N`/`%[name]` forms and a label's
+    // `%lN`/`%l[name]` forms are minted ONCE at the front end from the
+    // language's declared lexemes; a reader that recomputed them here would be
+    // a second owner of the numbering, and the numbering is exactly what this
+    // arc moved to one owner. A field that is not rendered is a field the round
+    // trip silently drops, so omitting them would put the drop back.
     //
     // * THE POOL HANDLE IS NOT PRINTED, and that is what keeps the round trip
     // stable: the descriptor is rendered INLINE, the parser re-adds it and gets
@@ -831,10 +843,29 @@ private:
         // The braces are omitted when there is nothing to put in them, so the
         // commonest form -- a plain basic template -- stays a one-token tail.
         auto const kids = hir_.children(id);
+        // !! THIS PREDICATE ENUMERATES EVERY FIELD, and a new field left out of
+        // it is not a cosmetic miss: with nothing else set, the whole brace
+        // group is skipped and that field is dropped from the text with no
+        // report. `labelSpellings` is listed beside `labelOrdinals` rather than
+        // assumed to travel with it precisely so the enumeration stays literal.
+        // (An operand's `spellings` live INSIDE an operand, so `operands` is
+        // already the condition that renders them.)
         bool const anyTail = d.isExtended || d.isGoto || d.clobbersMemory
                              || d.clobbersConditionCodes || !d.operands.empty()
-                             || !d.clobbers.empty() || !d.labelOrdinals.empty();
+                             || !d.clobbers.empty() || !d.labelOrdinals.empty()
+                             || !d.labelSpellings.empty();
         if (!anyTail) { out_ += '\n'; return; }
+        // One operand's / one label's spelling list, or nothing at all when it
+        // has none (a language whose sigil role is declared `null`).
+        auto const emitSpells = [&](std::vector<std::string> const& spellings) {
+            if (spellings.empty()) return;
+            out_ += " spells (";
+            for (std::size_t i = 0; i < spellings.size(); ++i) {
+                out_ += (i == 0 ? " " : ", ");
+                out_ += quote(spellings[i]);
+            }
+            out_ += " )";
+        };
         out_ += " {";
         if (d.isExtended)             out_ += " extended";
         if (d.isGoto)                 out_ += " goto";
@@ -849,6 +880,7 @@ private:
                 if (!op.symbolicName.empty()) {
                     out_ += " ["; out_ += op.symbolicName; out_ += ']';
                 }
+                emitSpells(op.spellings);
                 if (op.regClassResolved)
                     out_ += std::format(" class {}", op.regClass);
                 if (!op.fixedRegister.empty()) {
@@ -875,11 +907,31 @@ private:
             }
             out_ += " )";
         }
-        if (!d.labelOrdinals.empty()) {
+        if (!d.labelOrdinals.empty() || !d.labelSpellings.empty()) {
+            // !! THE SPELLINGS RIDE ON THEIR OWN ORDINAL RATHER THAN IN A
+            // PARALLEL SECTION, and that is the same argument the descriptor
+            // itself makes: two sibling lists in the text can be edited out of
+            // step and the reader cannot tell, whereas an inner group attached
+            // to `L<n>` makes the alignment structural. A count DISAGREEMENT is
+            // still possible (a hand-written dump), which is why
+            // `HirVerifier::checkInlineAsm` asserts the sizes rather than this
+            // writer assuming them: the writer walks the LONGER list so a
+            // mismatch is rendered and reported, never silently truncated.
+            std::size_t const n =
+                std::max(d.labelOrdinals.size(), d.labelSpellings.size());
+            if (d.labelOrdinals.size() != d.labelSpellings.size()) {
+                report("inline-asm descriptor carries a different number of "
+                       "`asm goto` label ordinals and spelling groups - the two "
+                       "are index-aligned by contract");
+            }
             out_ += " labels (";
-            for (std::size_t i = 0; i < d.labelOrdinals.size(); ++i) {
+            for (std::size_t i = 0; i < n; ++i) {
                 out_ += (i == 0 ? " " : ", ");
-                out_ += std::format("L{}", d.labelOrdinals[i]);
+                if (i < d.labelOrdinals.size())
+                    out_ += std::format("L{}", d.labelOrdinals[i]);
+                else
+                    out_ += "error";
+                if (i < d.labelSpellings.size()) emitSpells(d.labelSpellings[i]);
             }
             out_ += " )";
         }
@@ -2055,6 +2107,20 @@ private:
         if (acceptKeyword("mem"))      d.clobbersMemory         = true;
         if (acceptKeyword("cc"))       d.clobbersConditionCodes = true;
 
+        // The inverse of the writer's `emitSpells`. Absent group => an empty
+        // spelling list, which is the same state the writer renders as nothing:
+        // the round trip is closed in both directions, and a language whose
+        // sigil role is `null` stays distinguishable from one whose spellings
+        // were dropped only because `HirVerifier` asserts the label sizes.
+        auto const parseSpells = [&]() -> std::vector<std::string> {
+            std::vector<std::string> out;
+            if (!acceptKeyword("spells")) return out;
+            expect(Tk::LParen, "'('");
+            do { out.push_back(takeStr()); } while (accept(Tk::Comma));
+            expect(Tk::RParen, "')'");
+            return out;
+        };
+
         if (acceptKeyword("outputs")) {
             d.outputCount = static_cast<std::uint32_t>(takeInt());
             if (!acceptKeyword("operands")) {
@@ -2079,6 +2145,7 @@ private:
                     op.symbolicName = takeIdent();
                     expect(Tk::RBrack, "']'");
                 }
+                op.spellings = parseSpells();
                 if (acceptKeyword("class")) {
                     op.regClassResolved = true;
                     op.regClass = static_cast<std::uint8_t>(takeInt());
@@ -2097,8 +2164,13 @@ private:
         }
         if (acceptKeyword("labels")) {
             expect(Tk::LParen, "'('");
-            do { d.labelOrdinals.push_back(parseLabelOrdinal()); }
-            while (accept(Tk::Comma));
+            // Ordinal and spellings are pushed TOGETHER, so the two lists this
+            // parse produces are index-aligned by construction and no input can
+            // make them drift — the same lockstep the lowering uses.
+            do {
+                d.labelOrdinals.push_back(parseLabelOrdinal());
+                d.labelSpellings.push_back(parseSpells());
+            } while (accept(Tk::Comma));
             expect(Tk::RParen, "')'");
         }
         expect(Tk::RBrace, "'}' closing the inline-asm descriptor");

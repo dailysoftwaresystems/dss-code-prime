@@ -431,6 +431,9 @@ constexpr std::string_view kWhyAsmPlaceholderInBasic =
     "silenced, a % form in a template with no operand sections is either "
     "bound against an operand list that does not exist or passed through "
     "raw, and the two ship different machine code";
+constexpr std::string_view kWhyAsmDuplicateSymbolicName =
+    "silenced, one of the two bindings the repeated name introduces is "
+    "discarded by a first-match lookup and the template reads the other";
 constexpr std::string_view kWhyBitfieldMutation =
     "silenced, the mutation falls to a full-unit store that clobbers "
     "packed neighbours and skips truncation";
@@ -460,7 +463,10 @@ constexpr std::string_view kWhyOperatorNameNotDefinable =
 // branches raised this independently — AP6 by 1 and P5 by 5 — so the rebase
 // had to RECONCILE rather than pick a side. Taking either number would have
 // dropped the other branch's rows silently past this guard.
-constexpr std::array<UnsuppressableEntry, 163> kUnsuppressableCodes{{
+// ⓘ EXTENT 163 → 164 (2026-08-19, cycle P20): `S_InlineAsmDuplicateSymbolicName`
+// (0xE06C) joined on prong (1) — see its row below. ✔The explicit extent did its
+// job again: the row was written first and the build failed until this line moved.
+constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1339,6 +1345,18 @@ constexpr std::array<UnsuppressableEntry, 163> kUnsuppressableCodes{{
     {DiagnosticCode::S_InlineAsmTemplateUnparsable, kWhyAsmTemplateUnparsable},
     {DiagnosticCode::S_InlineAsmPlaceholderOutOfRange, kWhyAsmPlaceholderRange},
     {DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate, kWhyAsmPlaceholderInBasic},
+    // S_InlineAsmDuplicateSymbolicName (0xE06C, cycle P20,
+    // D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-OPERAND) — the EIGHTH
+    // member of this arc, admitted on the same prong (1) and with the strongest
+    // evidence of any of them, because the suppressed behaviour was MEASURED
+    // rather than reasoned: before the refusal existed, `[out] "=r"(r),
+    // [v] "=r"(d) : [v] "r"(a)` compiled rc=0 at debug AND release through the
+    // shipped CLI and returned the OUTPUT's value where the input's was written.
+    // ⓘ It is a NAME collision, not a qualifier repeat, so the reasoning that
+    // keeps `S_InlineAsmDuplicateQualifier` (0xE064) suppressible does not reach
+    // it: `volatile volatile` has one candidate reading, a name used twice has
+    // exactly two and the compiler picks one in silence.
+    {DiagnosticCode::S_InlineAsmDuplicateSymbolicName, kWhyAsmDuplicateSymbolicName},
     // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-
     // RESIDUAL): a bit-field compound/inc-dec/value mutation through an anonymous-
     // member or array-arrow base. Suppressed, the mutation falls to the generic

@@ -137,7 +137,8 @@ namespace {
 // owner had to be edited by hand every time an opcode was added.
 //
 // ✔MEASURED 2026-08-15 that the drift was live rather than theoretical:
-// `InlineAsmGoto` is declared `isTerminator = true` (`mir_opcode.hpp:563`) and was
+// `InlineAsmGoto` is declared `isTerminator = true` (its row in `mir_opcode.hpp`'s
+// `opcodeInfo` table) and was
 // ABSENT here, so an `asm goto` with labels never reached `lowerTerminator` at all.
 // It fell through to the non-terminator path and produced TWO diagnostics — a
 // spurious *"MIR block ended with non-terminator opcode"* structural-violation
@@ -749,13 +750,14 @@ struct Lowerer {
     //
     // ⚠ WHY THE EXPANSION CAPTURES ITS OWN PIECES INSTEAD OF EMITTING LIR
     // `ret_piece`. ✔MEASURED 2026-08-15: `lir_callconv`'s piece look-ahead lives
-    // INSIDE the `isCall` arm (`lir_callconv.cpp:3003` gates it,
-    // `:3802` is the loop), and a `ret_piece` that reaches the general path
-    // unconsumed is FAIL-LOUD by design (`:2622-2631`). An asm block is not a
-    // call, so a `ret_piece` emitted for one would be refused by the very rule
-    // that protects struct returns. Capturing here is therefore not a shortcut
-    // around the piece machinery — it is the only placement that does not
-    // require the piece machinery to learn what an asm block is.
+    // INSIDE `materializeOneFunc`'s `isCall` arm — that arm gates it and the
+    // per-piece scan loop sits inside it — and a `ret_piece` that reaches the
+    // same function's general instruction path unconsumed is FAIL-LOUD by design
+    // (its *"reads must immediately follow the call"* refusal). An asm block is
+    // not a call, so a `ret_piece` emitted for one would be refused by the very
+    // rule that protects struct returns. Capturing here is therefore not a
+    // shortcut around the piece machinery — it is the only placement that does
+    // not require the piece machinery to learn what an asm block is.
     std::unordered_map<std::uint64_t, LirReg> asmPieceReg_;
 
     [[nodiscard]] static std::uint64_t asmPieceKey(MirInstId producer,
@@ -1201,10 +1203,11 @@ struct Lowerer {
     // for a case the substrate can serve perfectly well by expansion.
     //
     // `guardWidthBits == 0` = a WIDTH-ABSENT (match-any) variant, which by the
-    // schema's own overlap rule (target_schema.cpp:851-869) can only appear when
-    // NO sibling of the same operand shape is width-keyed — so it genuinely
-    // encodes every width and counts as a hit. Same scan the riprel-load fold
-    // uses (~:4256), factored so the two cannot drift.
+    // schema's own overlap rule (the overlapping-variant-guard check in
+    // `TargetSchema`'s loader) can only appear when NO sibling of the same
+    // operand shape is width-keyed — so it genuinely encodes every width and
+    // counts as a hit. Same scan the riprel-load fold
+    // (`globalAddrRiprelFoldsIntoLoad`) uses, factored so the two cannot drift.
     [[nodiscard]] std::optional<std::uint16_t>
     opcodeWithWidth(MnemonicSlot s, std::uint8_t widthFlags) const {
         auto const id = opcode(s);
@@ -2675,7 +2678,17 @@ struct Lowerer {
         std::uint16_t ordinal = 0;     // meaningful iff `pinned`
         std::string   name;            // canonical parent name iff `pinned`
         std::uint32_t widthBits = 64;
-        std::string   spelling;        // what the template writes for it
+        // ★★★ EVERY spelling the template may write for this operand, CARRIED
+        // from the descriptor — the positional form and, when the source named
+        // the operand, the symbolic one. One binding row is emitted per entry,
+        // all of them pointing at the SAME `reg`, because the assembly engine
+        // only ever COMPARES spellings.
+        // ⚠ LEGITIMATELY EMPTY on the synthesized read half of a `"+r"` operand
+        // (`MirAsmOperand::spellings` states the rule): the source wrote that
+        // operand once, so only the OUTPUT entry answers to its `%N`. Publishing
+        // it twice, at two registers, would let a one-row-per-spelling consumer
+        // keep whichever row it saw last.
+        std::vector<std::string> spellings;
         // `"=&r"` — the source said this output is written before every
         // input has been read. Carried per-operand because the flag it
         // becomes is stamped on ONE instruction (the one that defines
@@ -2684,15 +2697,38 @@ struct Lowerer {
         std::string   constraint;      // verbatim, for diagnostics
     };
 
-    // GNU numbering: outputs first, then inputs, `%0`.. across BOTH lists
-    // (GCC 6.47.2.3). ★ THE CONVENTION IS THE EMBEDDING LANGUAGE'S, NOT THE
-    // ENGINE'S — `asm_template_to_lir.hpp` says so outright: the engine only
-    // COMPARES spellings, so a dialect that numbered its placeholders
-    // differently needs no engine change and this is the one place the GNU
-    // rule is stated.
-    [[nodiscard]] static std::string asmOperandSpelling(std::size_t index) {
-        return std::format("%{}", index);
+    // A spelling list as a diagnostic reads it: `'%0', '%[out]'`. An operand
+    // answers to more than one name now, so a message that quoted just one
+    // would send a reader looking for a form they may not have written.
+    [[nodiscard]] static std::string
+    renderSpellings(std::vector<std::string> const& spellings) {
+        if (spellings.empty()) return "no template spelling at all";
+        std::string out;
+        for (auto const& s : spellings) {
+            if (!out.empty()) out += ", ";
+            out += '\'';
+            out += s;
+            out += '\'';
+        }
+        return out;
     }
+
+    // ⛔ `asmOperandSpelling` IS GONE, AND ITS DELETION IS THE POINT OF THIS
+    // CYCLE RATHER THAN A TIDY-UP. It rendered `std::format("%{}", index)` —
+    // the GNU numbering convention (GCC 6.47.2.3), spelled in `src/lir/`, which
+    // is inside the source/target/format agnosticism veto list. The template
+    // SIGIL BYTES already had a config owner
+    // (`semantics.inlineAsmTemplateLexemes`, won by
+    // `D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER`); the
+    // NUMBERING never did, and this function was that unowned convention.
+    // ⇒ the FRONT END now mints every spelling from the language's own declared
+    // lexemes and carries them on `MirAsmOperand::spellings`; this tier only
+    // COMPARES. A fallback kept here "for descriptors that carry none" would be
+    // a SECOND OWNER of the same fact — and the two owners provably disagree:
+    // an index computed here as `outputs.size() + inputs.size()` overcounts by
+    // the number of `"+"` operands, because `inputs` carries the SYNTHESIZED
+    // tied read halves while the source counts a `"+"` once (✔MEASURED on a
+    // program gcc compiles: source base 2, MIR-computed base 3).
 
     [[nodiscard]] std::uint32_t asmWidthBitsForType(TypeId ty) const {
         return lirInstWidthBits(widthFlagsForType(ty));
@@ -2701,7 +2737,7 @@ struct Lowerer {
     [[nodiscard]] bool
     bindAsmOperand(MirAsmOperand const& o, MirInstId at, std::size_t gnuIndex,
                    std::string_view role, TypeId valueType, AsmBound& out) {
-        out.spelling   = asmOperandSpelling(gnuIndex);
+        out.spellings  = o.spellings;
         out.widthBits  = asmWidthBitsForType(valueType);
         out.constraint = o.constraint;
         // ⚠ `"+r"` IS BOUND LIKE ANY OTHER OPERAND **HERE**, AND TIED IN
@@ -2826,6 +2862,40 @@ struct Lowerer {
                             at.v, text));
             return false;
         };
+        // ★★★ HOW A MESSAGE NAMES ONE INPUT — BY **LOOKUP**, NEVER BY AN INDEX
+        // THIS TIER COMPUTED. This function used to write
+        // `gnuIndex = desc.outputs.size() + j` and print it as "input N", which
+        // is the very re-derivation `asmOperandSpelling` was deleted for, one
+        // tier further down. It was diagnostic-only, so never a miscompile — but
+        // it was WRONG in the message it appears in most: for a SYNTHESIZED tied
+        // read half the sum names an operand index the source never wrote, and
+        // an author told to look at "input 2" of a one-input statement has been
+        // sent nowhere.
+        // ⇒ an entry that carries spellings is named BY them (the minted forms,
+        // read back, exactly as the front end's own refusals quote them), and an
+        // entry with none is named by its POSITION IN THE DESCRIPTOR, which is a
+        // fact about the object being described rather than a claim about the
+        // source. No number here is an operand index.
+        // ⚠ "IT ANSWERS TO NO FORM" AND "IT IS THE SYNTHESIZED READ HALF" ARE
+        // TWO DIFFERENT FACTS, and only the first is observable from the entry
+        // alone. `hir_to_mir` empties the spellings of the tied half, so the two
+        // coincide on every descriptor the shipped front end builds — but a
+        // hand-built or deserialized one can leave an UNTIED entry spelling-less
+        // too, and calling that the synthesized read half would state the cause
+        // of a symptom this tier cannot see. The tie is READ, never inferred.
+        auto nameInput = [&](std::size_t j) -> std::string {
+            if (j >= desc.inputs.size())
+                return "input entry " + std::to_string(j) + " (out of range)";
+            if (!desc.inputs[j].spellings.empty())
+                return "input " + renderSpellings(desc.inputs[j].spellings);
+            return "input entry " + std::to_string(j)
+                 + " (it answers to no template form"
+                 + (desc.inputs[j].tiedOutput.has_value()
+                        ? ", being the synthesized read half of a read-write "
+                          "operand"
+                        : "")
+                 + ")";
+        };
         // ⛔ AN OUTPUT NEVER CARRIES THE TIE — `mir_asm_descriptor.hpp` states it
         // outright: the index is written on the INPUT because that is where GNU
         // writes it and because outputs are bound FIRST, so the partner is
@@ -2845,40 +2915,39 @@ struct Lowerer {
         std::vector<std::optional<std::size_t>> claimedBy(desc.outputs.size());
         for (std::size_t j = 0; j < desc.inputs.size(); ++j) {
             MirAsmOperand const& in = desc.inputs[j];
-            std::size_t const gnuIndex = desc.outputs.size() + j;
             if (!in.tiedOutput.has_value()) {
                 if (in.isReadWrite) {
                     return refuse(std::format(
-                        "input {} uses the read-write constraint \"{}\", but a "
+                        "{} uses the read-write constraint \"{}\", but a "
                         "`+` written in the INPUT section has no output entry, "
                         "no result piece and no lvalue address, so the WRITE "
                         "half of it cannot exist. gcc 13.3.0 rejects the "
                         "same spelling: \"input operand constraint contains "
                         "'+'\"",
-                        gnuIndex, in.constraint));
+                        nameInput(j), in.constraint));
                 }
                 continue;
             }
             std::size_t const k = *in.tiedOutput;
             if (k >= desc.outputs.size()) {
                 return refuse(std::format(
-                    "input {} is tied to output {}, and the block declares only "
-                    "{} output(s)", gnuIndex, k, desc.outputs.size()));
+                    "{} is tied to output {}, and the block declares only "
+                    "{} output(s)", nameInput(j), k, desc.outputs.size()));
             }
             if (!desc.outputs[k].isReadWrite) {
                 return refuse(std::format(
-                    "input {} is tied to output {} (constraint \"{}\"), which is "
+                    "{} is tied to output {} (constraint \"{}\"), which is "
                     "not read-write. A tie exists to carry a `+` operand's read "
                     "half, so tying to a write-only output would feed the "
                     "template a value the source never asked it to read",
-                    gnuIndex, k, desc.outputs[k].constraint));
+                    nameInput(j), k, desc.outputs[k].constraint));
             }
             if (claimedBy[k].has_value()) {
                 return refuse(std::format(
-                    "inputs {} and {} are both tied to output {} — a read-write "
+                    "{} and {} are both tied to output {} — a read-write "
                     "operand has exactly one read half, and two would leave the "
                     "register holding whichever was materialised last",
-                    desc.outputs.size() + *claimedBy[k], gnuIndex, k));
+                    nameInput(*claimedBy[k]), nameInput(j), k));
             }
             // ⚠ WIDTHS MUST AGREE, AND THE CHECK IS NOT CEREMONIAL. Both halves
             // come from the same C lvalue, so today they cannot differ — but the
@@ -2888,18 +2957,25 @@ struct Lowerer {
             // sub-register spelling for a value stored at another width.
             if (ins[j].widthBits != outs[k].widthBits) {
                 return refuse(std::format(
-                    "input {} is tied to output {}, but the two halves of that "
+                    "{} is tied to output {}, but the two halves of that "
                     "one operand carry different widths ({} vs {} bits) — they "
                     "name the same object and must select the same register "
-                    "spelling", gnuIndex, k, ins[j].widthBits,
+                    "spelling", nameInput(j), k, ins[j].widthBits,
                     outs[k].widthBits));
             }
             claimedBy[k] = j;
             // ★★ THE TIE ITSELF: the read half binds to the location the write
             // half already got. Copying the LOCATION fields (never the whole
-            // bound operand) keeps this input's own `spelling`, `constraint` and
-            // width — the template names the halves by DIFFERENT `%N`, and the
-            // diagnostics quote each half's own index.
+            // bound operand) leaves this input's own `spellings`, `constraint`
+            // and width alone — and for `spellings` that is load-bearing in the
+            // opposite direction from what it sounds like: `hir_to_mir` clears
+            // them on the synthesized read half (`tied.spellings.clear()`, with
+            // its own paragraph saying why), so the half this line ties answers
+            // to NO template form at all. The source wrote the operand ONCE and
+            // named it once; the OUTPUT half owns every spelling it answers to,
+            // and publishing the same spelling here at a second row is exactly
+            // the state `mir_to_lir`'s binding builder now refuses outright
+            // (D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-OPERAND).
             // ⓘ `earlyClobber` is deliberately NOT copied: `&` is the OUTPUT's
             // promise about when it is written, and `stampEarlyClobberOutputs`
             // only ever walks `outs`. The front end already clears it on the
@@ -3001,12 +3077,36 @@ struct Lowerer {
         }
     };
 
-    // ★★★ THE EXPANSION. `succs` is empty for the non-terminator form.
+    // ★★★ THE EXPANSION. `succs` is empty for the non-terminator form and is
+    // the `asm goto` successor list — `[label0 … labelN-1, FALLTHROUGH]`, the
+    // layout `MirBuilder::addInlineAsmGoto` owns — for the terminator form.
     // Returns false on any refusal (already reported).
-    [[nodiscard]] bool expandInlineAsm(MirInstId id) {
+    //
+    // ★★ ONE EXPANSION, NOT TWO, AND THE SHARED BODY IS THE ARGUMENT. Everything
+    // from operand binding through the clobber invariant, the template parse,
+    // the input materialisation, the earlyclobber stamp and the constraint
+    // attachment asks the SAME question of an `asm goto` as of an `asm`; only
+    // three things differ, and each is a `succs`-keyed clause below rather than
+    // a second copy of the surrounding two hundred lines:
+    //   * the LABEL bindings exist (and only a terminator has successors to
+    //     bind);
+    //   * the pinned-output captures cannot follow the template, because a
+    //     terminator has nothing after it — they move onto the EDGES;
+    //   * result piece 0 is a successor-head `ReturnPiece` rather than the
+    //     instruction's own value (`MirOpcode::InlineAsmGoto`'s row is `R::None`).
+    // A duplicated expansion would drift, and the drift's failure mode is the
+    // one this file's whole asm arc exists to prevent: a template silently
+    // bound to a register nothing wrote.
+    [[nodiscard]] bool expandInlineAsm(MirInstId id,
+                                       std::span<MirBlockId const> succs = {}) {
         MirAsmDescriptor const& desc = mir.asmDescriptor(id);
         GrammarSchema const* dialect = asmDialect();
         if (dialect == nullptr) return false;
+        // The TERMINATOR form iff the caller handed successors. Asked of the
+        // caller's span rather than of the opcode, so this function holds no
+        // opcode identity test and a future terminator-shaped asm producer needs
+        // no edit here.
+        bool const isGoto = !succs.empty();
 
         AsmStatementLocusGuard const asmLocus{reporter, desc,
                                               reporter.all().size()};
@@ -3021,6 +3121,41 @@ struct Lowerer {
                             id.v, desc.inputs.size(), operands.size()));
             return false;
         }
+        // ── 0. the `asm goto` CFG, checked BEFORE anything is emitted ──
+        //
+        // ★ THE ARITY IS RE-ASKED HERE EVEN THOUGH THREE TIERS ALREADY ENFORCE
+        // IT (`MirBuilder::addInlineAsmGoto`, `cloneInlineAsmGoto` and
+        // `MirVerifier::checkTerminatorSuccessorArity`). This tier INDEXES
+        // `succs[j]` with `j` taken from `labelSpellings`, so a disagreement is
+        // an out-of-range read rather than a wrong answer — and the three
+        // enforcement sites are all on the MIR side of an interface a direct-Mir
+        // caller can bypass. A cheap re-check at the indexing site is what makes
+        // the index safe by construction instead of by inheritance.
+        if (isGoto && desc.labelSpellings.size() + 1 != succs.size()) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format("`asm goto` (MIR inst {}): the descriptor carries {} "
+                            "label spelling group(s) but the block has {} CFG "
+                            "successor(s) — the layout is "
+                            "[label0 … labelN-1, FALLTHROUGH], so these must "
+                            "differ by exactly one",
+                            id.v, desc.labelSpellings.size(), succs.size()));
+            return false;
+        }
+        // Every successor must have a LIR block. `lowerTerminator`'s split pass
+        // already skips a successor with none; reaching the template with an
+        // unresolvable target would bind a label to an invalid block id, which
+        // `LirBuilder::addBr` turns into a process abort rather than a
+        // diagnostic — the same guard `lowerSehTryBegin` states for its own edge.
+        for (MirBlockId const s : succs) {
+            if (mirBlockToLirBlock.has(s)) continue;
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format("`asm goto` (MIR inst {}): CFG successor block {} has "
+                            "no LIR block — the label edge cannot be expressed",
+                            id.v, s.v));
+            return false;
+        }
 
         // ── 1. resolve every operand BEFORE emitting anything ──
         // ★ NOTHING IS EMITTED UNTIL EVERY OPERAND, THE CLOBBER LIST AND THE
@@ -3030,8 +3165,23 @@ struct Lowerer {
         std::vector<AsmBound> outs(desc.outputs.size());
         std::vector<AsmBound> ins(desc.inputs.size());
         for (std::size_t k = 0; k < desc.outputs.size(); ++k) {
-            // Output k's value type: piece 0 IS the instruction's own result.
-            TypeId const ty = (k == 0) ? mir.instType(id) : pieceTypeForAsm(id, k);
+            TypeId const ty = asmOutputType(id, succs, k);
+            if (!ty.valid()) {
+                // ⚠ A WIDTH IS NOT GUESSABLE, SO THIS REFUSES. `bindAsmOperand`
+                // derives the operand's width from this type; with no type there
+                // is no honest width, and defaulting to the full one would run a
+                // 32-bit template operand at 64 bits with no diagnostic.
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format(
+                        "inline asm (MIR inst {}): output {} (constraint \"{}\") "
+                        "has no result-piece type — no `ReturnPiece` with that "
+                        "ordinal reads this block, so the width the template "
+                        "operand runs at cannot be derived",
+                        id.v, k, desc.outputs[k].constraint));
+                return false;
+            }
             if (!bindAsmOperand(desc.outputs[k], id, k, "output", ty, outs[k]))
                 return false;
         }
@@ -3208,16 +3358,120 @@ struct Lowerer {
             emitInst(*movOp, ins[j].reg, pin);
         }
 
+        // ★★★ ONE BINDING ROW PER **SPELLING**, ALL ROWS OF ONE OPERAND POINTING
+        // AT THE SAME `LirReg`. The engine holds no `%N` convention and only
+        // COMPARES, so `%0` and `%[out]` are two keys for one register — which
+        // is exactly what makes `%[name]` work with no engine change.
+        // ⚠ AN EMPTY LIST IS SKIPPED, NOT ASSERTED ON: the synthesized read half
+        // of a `"+r"` operand deliberately carries none (see `AsmBound::
+        // spellings`). It still needs its materialisation `mov` — which is why
+        // the loop above emits one for EVERY input regardless — but it must not
+        // publish a second row for the `%N` its output half already answers to.
         std::vector<AsmOperandBinding> bindings;
         bindings.reserve(outs.size() + ins.size());
-        for (auto const& b : outs) {
-            bindings.push_back({b.spelling, b.reg, b.cls, b.widthBits});
+        auto bindOperand = [&bindings](AsmBound const& b) {
+            for (auto const& s : b.spellings) {
+                bindings.push_back({s, b.reg, b.cls, b.widthBits});
+            }
+        };
+        for (auto const& b : outs) bindOperand(b);
+        for (auto const& b : ins)  bindOperand(b);
+
+        // ★★★ AND THE ROW SET HAS TO BE A **FUNCTION** FROM SPELLING TO BINDING,
+        // WHICH IS THE ONE PROPERTY "one row per spelling" DOES NOT GIVE YOU.
+        // Both engine lookups — `TemplateHost::bindingFor` for an operand and
+        // `resolveBranchTarget` for a label — are FIRST-MATCH scans, so a
+        // spelling that appears twice does not fail, it silently keeps one row
+        // and drops the other. ✔MEASURED 2026-08-19 through the shipped CLI,
+        // before the front end refused it: two operands both named `v` compiled
+        // rc=0 at debug AND release and the template read the OUTPUT's register,
+        // returning 0 where 20 was written
+        // (D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-OPERAND).
+        //
+        // ⚠ THE SEMANTIC REFUSAL IS NOT ENOUGH ON ITS OWN, AND THAT IS WHY THIS
+        // EXISTS RATHER THAN A COMMENT POINTING AT IT. The tier that MINTS the
+        // spellings and the tier that BINDS them are two tiers apart, and this
+        // one has direct-API callers that never run the C semantic pass at all —
+        // the LSP, the FFI header parser, the optimizer's rebuild carriage, a
+        // deserializer, and every hand-built descriptor in the test suite. A
+        // producer that mints two identical spellings reaches here directly.
+        //
+        // ★ STRICT ON PURPOSE: ANY repeat is refused, not only one whose two rows
+        // disagree. Within one operand the minted forms are distinct by
+        // construction (positional vs symbolic) and across operands the
+        // positional forms are distinct by index — so a repeated spelling can
+        // only come from a repeated NAME, and two differently-named things never
+        // share a register. "Refuse a repeat" and "refuse a disagreement" are
+        // therefore the same set today, and the first is the one a reader can
+        // check by looking at the list.
+        auto firstDuplicateSpelling =
+            [](auto const& rows) -> std::optional<std::string> {
+                for (std::size_t b = 1; b < rows.size(); ++b) {
+                    for (std::size_t a = 0; a < b; ++a) {
+                        if (rows[a].spelling == rows[b].spelling)
+                            return rows[b].spelling;
+                    }
+                }
+                return std::nullopt;
+            };
+        auto refuseDuplicateSpelling = [&](std::string_view kind,
+                                           std::string const& spelling) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "inline asm (MIR inst {}): the {} spelling '{}' is bound "
+                    "TWICE by this statement's descriptor. The assembly engine "
+                    "resolves a spelling by FIRST match, so a repeat does not "
+                    "fail — it silently discards one of the two bindings and "
+                    "lowers the template against the other. A C source reaching "
+                    "here is already refused by the front end "
+                    "(S_InlineAsmDuplicateSymbolicName); this descriptor came "
+                    "from a producer that does not run that pass "
+                    "(D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-OPERAND)",
+                    id.v, kind, spelling));
+            return false;
+        };
+        if (auto const dup = firstDuplicateSpelling(bindings)) {
+            return refuseDuplicateSpelling("operand", *dup);
         }
-        for (auto const& b : ins) {
-            bindings.push_back({b.spelling, b.reg, b.cls, b.widthBits});
+
+        // ★★★ ONE LABEL ROW PER SPELLING TOO, AND THE BLOCK IS `lirSucc`'s,
+        // NEVER `mirBlockToLirBlock`'s. The phi-copy split blocks
+        // `lowerTerminator` builds are reachable ONLY through `lirSucc`: binding
+        // the raw successor would leave a split built, filled with the copies,
+        // given its jump — and BRANCHED TO BY NOTHING. The copies would never
+        // run, which is the lost-copy miscompile this opcode joins
+        // `terminatorOwnsEverySuccessorBranch` in order to prevent, walked back
+        // in through the label edge.
+        // ⓘ `captureBlocks` interposes one more block per edge when an output is
+        // register-PINNED — see the capture emission below, which explains why a
+        // terminator has no "after the template" to put the capture in.
+        std::vector<LirBlockId> const captureBlocks =
+            createAsmCaptureBlocks(succs, outs);
+        auto edgeEntry = [&](std::size_t j) {
+            return captureBlocks.empty() ? lirSucc(succs[j]) : captureBlocks[j];
+        };
+        std::vector<AsmLabelBinding> labelBindings;
+        for (std::size_t j = 0; j < desc.labelSpellings.size(); ++j) {
+            for (auto const& s : desc.labelSpellings[j]) {
+                labelBindings.push_back({s, edgeEntry(j)});
+            }
+        }
+        // The label half of the same rule — see the operand check above for the
+        // whole argument. ⚠ HERE THE TWO ROWS CAN NAME DIFFERENT **BLOCKS** even
+        // when the source's two labels are one C label: `getOrCreateLabelBlock`
+        // does give both edges the same MIR block, but `createAsmCaptureBlocks`
+        // mints a DISTINCT capture block per edge index, so a first-match lookup
+        // picks edge 0's and leaves edge 1's built, filled, and branched to by
+        // nothing. The refusal must come after `createAsmCaptureBlocks`, so it
+        // owes the same seal every other post-creation refusal does.
+        if (auto const dup = firstDuplicateSpelling(labelBindings)) {
+            sealOrphanedAsmCaptureBlocks(captureBlocks);
+            return refuseDuplicateSpelling("`asm goto` label", *dup);
         }
         if (!lowerAsmTemplateToLirRun(*tree, *dialect, target, bindings, lir,
-                                      reporter)) {
+                                      reporter, labelBindings)) {
+            sealOrphanedAsmCaptureBlocks(captureBlocks);
             return false;
         }
         // ★ THE ENGINE EMITS DIRECTLY INTO THE BUILDER, so `recordSource` never
@@ -3232,37 +3486,264 @@ struct Lowerer {
         if (templateLineCount(*tree, dialect->assembly()) > 0) {
             lirInstEverEmitted_ = true;
         }
-        if (!stampEarlyClobberOutputs(id, outs, firstEmitted)) return false;
+        if (!stampEarlyClobberOutputs(id, outs, firstEmitted)) {
+            sealOrphanedAsmCaptureBlocks(captureBlocks);
+            return false;
+        }
 
         // Every register-pinned OUTPUT is read out of its register immediately.
         // ⚠ Unpinned outputs are NOT captured: the template wrote the operand's
         // vreg directly (that IS the `%N` binding), so a copy would be dead.
-        for (std::size_t k = 0; k < outs.size(); ++k) {
-            if (!outs[k].pinned) continue;
-            LirReg const dest = lir.newVReg(outs[k].cls);
-            std::array<LirOperand, 1> const cap{LirOperand::makeReg(outs[k].reg)};
-            emitInst(*movOp, dest, cap);
-            outs[k].reg = dest;   // the VALUE now lives in the vreg, not the pin
+        // ★★ ON A TERMINATOR THERE IS NO "IMMEDIATELY AFTER". An `asm goto`
+        // seals its block, so the captures move onto the EDGES — see
+        // `sealAsmGotoEdges`, which emits the same `mov`s at the head of each
+        // one. That is why this loop is `!isGoto` rather than unconditional: the
+        // placement differs, the capture does not.
+        if (!isGoto) {
+            for (std::size_t k = 0; k < outs.size(); ++k) {
+                if (!outs[k].pinned) continue;
+                LirReg const dest = lir.newVReg(outs[k].cls);
+                std::array<LirOperand, 1> const cap{
+                    LirOperand::makeReg(outs[k].reg)};
+                emitInst(*movOp, dest, cap);
+                outs[k].reg = dest;  // the VALUE now lives in the vreg, not the pin
+            }
         }
         std::uint32_t const afterEmitted = nextLirInstIdValue();
 
         // ── 5. attach the ONE constraint to EVERY instruction the block emitted ──
+        // ⓘ The handle is kept: the `asm goto` edge captures are emitted into
+        // OTHER blocks and must carry the same constraint the in-block captures
+        // do, or the value they read out of a clobbered register would be
+        // protected by nothing.
+        std::optional<std::uint32_t> constraintHandle;
         if (anyConstraint && afterEmitted > firstEmitted) {
-            std::uint32_t const handle = lir.regConstraintPoolAdd(std::move(c));
+            constraintHandle = lir.regConstraintPoolAdd(std::move(c));
             for (std::uint32_t v = firstEmitted; v < afterEmitted; ++v) {
-                lir.setInstRegConstraints(LirInstId{v, lir.id().v}, handle);
+                lir.setInstRegConstraints(LirInstId{v, lir.id().v},
+                                          *constraintHandle);
             }
         }
 
+        // ── 5b. `asm goto` only: seal the block and place the edge captures ──
+        if (isGoto
+            && !sealAsmGotoEdges(succs, outs, captureBlocks, movOp,
+                                 constraintHandle)) {
+            sealOrphanedAsmCaptureBlocks(captureBlocks);
+            return false;
+        }
+
         // ── 6. publish the outputs ──
-        // Output 0 is the instruction's OWN result (Call's rule); outputs
-        // 1..N-1 are read by `ReturnPiece`s that follow, and are handed their
-        // vreg through the derivability lookup in `lowerReturnPiece`.
-        for (std::size_t k = 1; k < outs.size(); ++k) {
+        // ★★★ THE FIRST PUBLISHED ORDINAL IS THE ONE SILENT DIFFERENCE BETWEEN
+        // THE TWO FORMS, AND IT IS THE ONLY ONE WITH NO DIAGNOSTIC BEHIND IT.
+        // For a non-terminator asm, output 0 IS the instruction's own value
+        // (`Call`'s rule) and outputs 1..N-1 are read by the `ReturnPiece`s that
+        // follow. `InlineAsmGoto` does NOT carry that rule — its `opcodeInfo`
+        // row is `R::None`, because a terminator has nothing after it to hold a
+        // result — so EVERY output, ordinal 0 included, is a successor-head
+        // piece. Publishing from 1 here (and calling `defineValue` on the
+        // terminator) makes ordinal 0's `ReturnPiece` MISS the `asmPieceReg_`
+        // lookup in `lowerReturnPiece` and fall through to the
+        // `MnemonicSlot::RetPiece` capture, which is the CALLING CONVENTION'S
+        // return-register read rather than the register the `"=r"` constraint
+        // named.
+        // ✔MEASURED 2026-08-19 by publishing from 1 and rebuilding
+        // `examples/c-subset/asm_goto_labels`: it does NOT reach a wrong answer
+        // — `lir_callconv`'s *"ret_piece … is not adjacent to its
+        // struct-returning call"* refusal fires first, at both configs, because
+        // an `asm goto`'s pieces LEAD a landing block and nothing calls
+        // anything before them. ⇒ the failure mode is FAIL-LOUD, not silent,
+        // and the sequencing is what makes it so: the derivability lookup runs
+        // ahead of the capture, so the piece machinery never has to learn what
+        // an asm block is AND the one shape that would mis-capture is already
+        // refused by the rule protecting struct returns. Stated because the
+        // opposite ("silent, no diagnostic") is the intuitive reading and it is
+        // wrong; the pin is still mandatory, since the guard being someone
+        // else's makes it exactly the kind that can be removed without anyone
+        // noticing here.
+        for (std::size_t k = isGoto ? 0 : 1; k < outs.size(); ++k) {
             asmPieceReg_[asmPieceKey(id, static_cast<std::uint32_t>(k))] =
                 outs[k].reg;
         }
-        if (!outs.empty()) defineValue(id, outs[0].reg);
+        // ⚠ AND THE TERMINATOR DEFINES NO VALUE. `mir.instType(id)` is
+        // `InvalidType` for an `asm goto`; `defineValue` on it would enter a
+        // register for a value the MIR says does not exist.
+        if (!isGoto && !outs.empty()) defineValue(id, outs[0].reg);
+        return true;
+    }
+
+    // ★★★ ONE CAPTURE BLOCK PER **LABEL** EDGE, MINTED ONLY WHEN AN OUTPUT IS
+    // REGISTER-PINNED. `expandInlineAsm`'s capture `mov`s follow the template;
+    // an `asm goto` template ENDS the block, so there is no "after" to put them
+    // in and they have to sit on the edges instead.
+    //
+    // ★★ WHY AN INTERPOSED BLOCK RATHER THAN THE LANDING BLOCK'S OWN HEAD. Both
+    // are "the head of the successor"; the interposed one is strictly EARLIER,
+    // and earlier is what the capture needs. The value sits in a PHYSICAL
+    // register between the template and the `mov` that reads it out, so every
+    // instruction in that window is one more chance for the register to be
+    // reused — and `lowerTerminator` may legitimately interpose a phi-copy split
+    // on the same edge, whose copies are emitted by a mechanism that knows
+    // nothing about this template's clobber list. Placing the capture first on
+    // the edge makes the window exactly one branch wide, and makes it so by
+    // CONSTRUCTION rather than by the current absence of splits on these edges.
+    // ⓘ Correspondingly the FALL-THROUGH edge gets no block here: its captures
+    // are emitted inline into whatever block the template left open, which is
+    // already the earliest point on that edge.
+    //
+    // ⚠ A BLOCK CREATED AND NEVER OPENED IS A **PROCESS ABORT**, NOT A LEAK
+    // (`LirBuilder::closeFunction`: *"block created but never `beginBlock`'d"*),
+    // and these blocks are minted BEFORE the template runs because the label
+    // bindings have to name them. So every refusal downstream of the creation
+    // routes through `sealOrphanedAsmCaptureBlocks` — the same obligation
+    // `lowerTerminator` already discharges for the phi-copy splits it creates
+    // ahead of its own terminator lowerer.
+    //
+    // Returns an empty vector when nothing is pinned — the common case, and the
+    // one where the LIR is then byte-identical to an `asm goto` with no outputs.
+    [[nodiscard]] std::vector<LirBlockId>
+    createAsmCaptureBlocks(std::span<MirBlockId const> succs,
+                           std::vector<AsmBound> const& outs) {
+        if (succs.empty()) return {};
+        bool const anyPinned = std::any_of(
+            outs.begin(), outs.end(), [](AsmBound const& b) { return b.pinned; });
+        if (!anyPinned) return {};
+        std::vector<LirBlockId> blocks;
+        blocks.reserve(succs.size() - 1);       // labels only; see above
+        for (std::size_t j = 0; j + 1 < succs.size(); ++j) {
+            blocks.push_back(lir.createBlock());
+        }
+        return blocks;
+    }
+
+    // The cleanup half of `createAsmCaptureBlocks`, run on every refusal raised
+    // after the blocks were minted. A refused statement's edges carry nothing —
+    // the diagnostic has already failed the module — so each block is opened and
+    // sealed with the target's return, exactly the fallback seal `lowerBlock`
+    // applies to a block whose terminator did not lower. The point is not the
+    // code (it is unreachable) but that the builder's *"created but never
+    // opened"* contract is satisfied, so the compiler REPORTS the user's error
+    // instead of aborting on top of it.
+    // ⚠ The open block must be terminated before any of them can be opened; the
+    // template may have left it either way, so ask.
+    void sealOrphanedAsmCaptureBlocks(std::vector<LirBlockId> const& blocks) {
+        if (blocks.empty()) return;
+        auto const ret = opcode(MnemonicSlot::Ret);
+        if (!ret.has_value()) {
+            // ⚠ WHAT HAPPENS NEXT IS AN ABORT, NOT A REPORT, AND THE COMMENT
+            // HERE USED TO SAY OTHERWISE. ✔MEASURED by reading
+            // `LirBuilder::closeFunction_`: each of its three block invariants
+            // calls `lirFatal` — *"block created but never `beginBlock`'d"* is
+            // the one these blocks would trip — and `lirFatal` kills the
+            // process. Saying it "reports it" made this look like a handled
+            // path, which is the *"a refusal that crashes is not a refusal"*
+            // species this file cites elsewhere.
+            // ⓘ AND SEALING IS NOT AVAILABLE HERE, which is why the early return
+            // stays. A block is sealable only with a TERMINATOR, this target
+            // declares no return mnemonic, and the very next statement below
+            // needs the same opcode for the block the template left OPEN — so
+            // that block is equally unsealable and aborts first. The capture
+            // blocks are not the first casualty and sealing them would avert
+            // nothing; the refusal that brought us here has already named the
+            // real cause. The sibling path in `lowerTerminator`'s `edgeSplits_`
+            // handling takes the same exit for the same reason.
+            return;
+        }
+        if (!lir.openBlockIsTerminated()) {
+            emitReturn(*ret, std::span<LirOperand const>{});
+        }
+        for (LirBlockId const b : blocks) {
+            lir.beginBlock(b);
+            emitReturn(*ret, std::span<LirOperand const>{});
+        }
+    }
+
+    // ★★★ THE FALL-THROUGH EDGE IN LIR, AND THE PINNED CAPTURES ON EVERY EDGE.
+    //
+    // ✔MEASURED on gcc 13.3.0, clang 19.1.1 and aarch64-linux-gnu-gcc 13.3.0: an
+    // `asm goto` FALLS THROUGH when its template does not branch. The template
+    // has already been emitted when this runs, and it left the builder in one of
+    // three states — all three legitimate, all three reachable from source:
+    //
+    //   * a CONDITIONAL branch last (`cmpl …; jne %l[x]`): `buildCondBr` minted
+    //     an anonymous fall-through block AND OPENED IT, so the open block is
+    //     empty and unterminated. The trailing jump goes there.
+    //   * NO branch at all (`nop`, or an empty template): the asm's own block is
+    //     still open and unterminated. The trailing jump goes there.
+    //   * an UNCONDITIONAL branch last (`jmp %l[done]`): `buildBr` opened
+    //     nothing and left the block SEALED. ⇒ the fall-through edge is
+    //     unreachable BY THE PROGRAM'S OWN TEXT, and emitting a second
+    //     terminator would hit `LirBuilder::appendInst_`'s *"block already
+    //     terminated"* fatal — a process kill on a legal program. The stated
+    //     answer is to emit NOTHING: the MIR successor stays as CFG bookkeeping
+    //     and its LIR block is simply reached by no branch, which is exactly
+    //     what `__asm__ goto ("jmp %l[done]" …)` means.
+    //
+    // ⚠ THE THREE STATES ARE INDISTINGUISHABLE FROM THE ENGINE'S RETURN VALUE
+    // (it is a bool), and guessing between them aborts in BOTH directions —
+    // hence `LirBuilder::openBlockIsTerminated`, whose docblock records the same
+    // reasoning from the builder's side.
+    [[nodiscard]] bool
+    sealAsmGotoEdges(std::span<MirBlockId const> succs,
+                     std::vector<AsmBound>& outs,
+                     std::vector<LirBlockId> const& captureBlocks,
+                     std::optional<std::uint16_t> movOp,
+                     std::optional<std::uint32_t> constraintHandle) {
+        // The `lowerSehTryBegin` pattern: the opcode this edge needs, asked for
+        // by slot and refused by name. Checked BEFORE anything is emitted, so a
+        // target without it refuses rather than half-sealing the block.
+        auto const jmpOp = opcode(MnemonicSlot::Jmp);
+        if (!jmpOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::Jmp, "MIR InlineAsmGoto edge");
+            return false;
+        }
+        // One destination vreg per pinned output, minted ONCE and written at the
+        // head of every edge. The MIR reads the piece in ONE place (the landing
+        // block's `ReturnPiece`), so the paths must agree on the register; the
+        // several defs sit on mutually exclusive paths, which is the shape a
+        // linear scan over live ranges already handles (`firstDef` takes the
+        // minimum — the same widening a `"+r"` operand's two defs produce).
+        std::vector<LirReg> captureDest(outs.size(), InvalidLirReg);
+        bool anyPinned = false;
+        for (std::size_t k = 0; k < outs.size(); ++k) {
+            if (!outs[k].pinned) continue;
+            captureDest[k] = lir.newVReg(outs[k].cls);
+            anyPinned      = true;
+        }
+        if (anyPinned && !movOp.has_value()) {
+            // Unreachable from `expandInlineAsm` (`needMoves` is true whenever an
+            // output is pinned), so reaching it is a defect in THIS file rather
+            // than in the target — which is exactly when a silent pass costs most.
+            reportMissingOpcode(MnemonicSlot::Mov, "MIR InlineAsmGoto edge capture");
+            return false;
+        }
+        auto emitCaptures = [&] {
+            for (std::size_t k = 0; k < outs.size(); ++k) {
+                if (!outs[k].pinned) continue;
+                std::array<LirOperand, 1> const cap{
+                    LirOperand::makeReg(outs[k].reg)};
+                LirInstId const li = emitInst(*movOp, captureDest[k], cap);
+                if (constraintHandle.has_value()) {
+                    lir.setInstRegConstraints(li, *constraintHandle);
+                }
+            }
+        };
+
+        // ── the fall-through edge ──
+        if (!lir.openBlockIsTerminated()) {
+            emitCaptures();
+            emitBr(*jmpOp, lirSucc(succs.back()));
+        }
+        // ── each label edge's capture block ──
+        for (std::size_t j = 0; j < captureBlocks.size(); ++j) {
+            lir.beginBlock(captureBlocks[j]);
+            emitCaptures();
+            emitBr(*jmpOp, lirSucc(succs[j]));
+        }
+        // The VALUE now lives in the vreg rather than in the pin, on every path.
+        for (std::size_t k = 0; k < outs.size(); ++k) {
+            if (outs[k].pinned) outs[k].reg = captureDest[k];
+        }
         return true;
     }
 
@@ -3317,14 +3798,14 @@ struct Lowerer {
                     DiagnosticSeverity::Error,
                     std::format(
                         "inline asm (MIR inst {}): the earlyclobber output "
-                        "\"{}\" is bound to template operand '{}', and no "
+                        "\"{}\" is bound to template operand {}, and no "
                         "instruction the template lowered to WRITES it — so "
                         "there is nothing to mark as written-before-the-inputs-"
                         "are-read. Refused rather than silently dropping the "
                         "`&`, which would let the output share a register with "
                         "an input the template has not finished reading "
                         "(D-LIR-EARLYCLOBBER-FLAG-UNSETTABLE-AFTER-EMISSION)",
-                        id.v, b.constraint, b.spelling));
+                        id.v, b.constraint, renderSpellings(b.spellings)));
                 return false;
             }
         }
@@ -3345,6 +3826,54 @@ struct Lowerer {
             if (!asm_walk::visibleChildren(tree, line).empty()) ++n;
         }
         return n;
+    }
+
+    // ★★★ OUTPUT k's MIR VALUE TYPE — THE ONE QUESTION WHOSE ANSWER LIVES IN A
+    // DIFFERENT PLACE FOR THE TWO ASM FORMS, WHICH IS WHY IT IS ASKED HERE
+    // RATHER THAN INLINE.
+    //
+    //   * non-terminator asm: output 0 IS the instruction's own value (`Call`'s
+    //     rule), and 1..N-1 are the adjacent `ReturnPiece`s `pieceTypeForAsm`
+    //     scans for IN THE PRODUCER'S OWN BLOCK.
+    //   * `asm goto`: the terminator's own type is `InvalidType` (its
+    //     `opcodeInfo` row is `R::None`) and NO piece follows it in its block —
+    //     `MirBuilder::addInlineAsmGoto` interposes a landing block per edge and
+    //     `hir_to_mir` fills each one's HEAD with a piece per output, ordinal 0
+    //     included. So `pieceTypeForAsm` returns its producer-type fallback,
+    //     which here is the invalid type, for EVERY k. Reading the type off the
+    //     landing-block piece is the only place it exists.
+    //
+    // ⚠ AN INVALID RETURN IS A REFUSAL AT THE CALLER, NOT A DEFAULT. The type
+    // selects the operand's WIDTH, and there is no safe fallback: guessing the
+    // full width would run a 32-bit template operand at 64 bits silently.
+    [[nodiscard]] TypeId asmOutputType(MirInstId producer,
+                                       std::span<MirBlockId const> succs,
+                                       std::size_t k) const {
+        if (succs.empty()) {
+            return (k == 0) ? mir.instType(producer) : pieceTypeForAsm(producer, k);
+        }
+        // The pieces LEAD each landing block, so the scan stops at the first
+        // non-`ReturnPiece` exactly as the in-block one does. Every edge carries
+        // the same piece set, so the FIRST successor that answers is the answer —
+        // and the loop continues past an edge that does NOT answer rather than
+        // giving up on it, which is the property worth stating: a rebuild pass
+        // that dropped one edge's pieces makes this fall through to the next
+        // edge instead of returning `InvalidType`, i.e. the width survives a
+        // partial loss. ⚠ IT IS NOT A CROSS-EDGE AGREEMENT CHECK, and reading it
+        // as one is the mistake this paragraph replaced: the width IS taken from
+        // another edge when one is missing, and no comparison between the edges
+        // happens here at all.
+        for (MirBlockId const s : succs) {
+            std::uint32_t const n = mir.blockInstCount(s);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                MirInstId const cur = mir.blockInstAt(s, i);
+                if (mir.instOpcode(cur) != MirOpcode::ReturnPiece) break;
+                auto const ops = mir.instOperands(cur);
+                if (ops.empty() || ops[0].v != producer.v) continue;
+                if (mir.returnPieceOrdinal(cur) == k) return mir.instType(cur);
+            }
+        }
+        return InvalidType;
     }
 
     // Output k's MIR value type for k >= 1: the type of the `ReturnPiece` that
@@ -3379,51 +3908,46 @@ struct Lowerer {
 
     // `asm goto` — the TERMINATOR form. Returns true iff the block was sealed.
     //
-    // ⚠⚠ REFUSED, AND THE REFUSAL IS THE CORRECT ANSWER RATHER THAN A DEFERRAL.
+    // ★★★ THE REFUSAL THAT USED TO LIVE HERE IS GONE, AND WHAT RETIRED IT IS
+    // EXACTLY WHAT IT NAMED (D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-
+    // LONGER-EXISTS). ✔MEASURED, and worth keeping because it is the shape of a
+    // correctly-scoped refusal: the message said a label target must resolve to
+    // a BLOCK of the embedding function while `AsmOperandBinding` carried a
+    // `LirReg` and no block, *"so no caller can bind one"* — and that it would
+    // retire *"when a binding can name a BLOCK, not when config changes"*. It
+    // now can: `AsmLabelBinding` is a second span on `lowerAsmTemplateToLirRun`,
+    // answered through `AsmLoweringHost::resolveBranchTarget`. Nothing about the
+    // dialects changed, exactly as the refusal predicted.
     //
-    // ★★ THE REASON CHANGED ON 2026-08-15 AND THIS DOCBLOCK DID NOT FOLLOW IT
-    // FOR TWO DAYS (D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-LONGER-
-    // EXISTS). It used to say — correctly at the time — that neither shipped
-    // dialect declared a `%l[label]` form. ✘ THAT IS NOW FALSE: both
-    // `asm-x86_64-att.lang.json` and `asm-arm64-gas.lang.json` bind
-    // `templateLabelPlaceholder` → `PlaceholderLabelSigil` with a two-byte `%l`
-    // lexeme, `asm.lang.json` declares the `asmTemplateLabelRef` shape, and a
-    // detector test proves `%l` survives `loadShipped` as a lexeme of the
-    // template mode. The stale claim was written the SAME DAY the placeholder
-    // surface landed, which is how a reason outlives its measurement.
+    // ⇒ this function is now a thin router: the expansion is `expandInlineAsm`,
+    // which serves BOTH asm forms and takes the successor list as its only extra
+    // input. Keeping a second body here is what would let the two forms drift.
     //
-    // ✔THE REAL BLOCKER, MEASURED: a label target must resolve to a BLOCK of the
-    // function that embedded the template, and an `AsmOperandBinding` carries a
-    // `LirReg` and no block — so no caller can bind one. A template that cannot
-    // name its labels cannot branch to them, so sealing this block with an
-    // unconditional jump to any one successor would silently pick a branch the
-    // programmer did not write, and sealing it with a fall-through would discard
-    // the edges entirely. Both are miscompiles with no diagnostic.
-    // ⇒ this refusal retires when a binding can name a BLOCK, not when config
-    // changes. Sending a reader to edit a dialect file that is already correct
-    // is the cost a wrong reason carries.
     // (`asm goto` with NO labels never reaches here: HIR→MIR routes it to the
-    // ordinary non-terminator form, which this build lowers.)
+    // ordinary non-terminator form, which clang accepts and gcc rejects — the
+    // operator ruled to follow clang.)
     [[nodiscard]] bool lowerInlineAsmGoto(MirInstId id,
                                           std::span<MirBlockId const> succs) {
-        // Same locus rule as `expandInlineAsm` — the refusal names the MIR inst
-        // and the dialect but not the source statement, and the descriptor
-        // carries the statement's locus for exactly this.
-        AsmStatementLocusGuard const asmLocus{
-            reporter, mir.asmDescriptor(id), reporter.all().size()};
-        dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
-            DiagnosticSeverity::Error,
-            std::format(
-                "`asm goto` (MIR inst {}) has {} label edge(s), and an assembly "
-                "operand binding carries a register and no BLOCK — so a label "
-                "target cannot be expressed, and the template cannot branch to "
-                "its own labels. Refused rather than sealed with a synthesized "
-                "branch, which would choose an edge the programmer did not "
-                "write. (The dialect is not at fault: '{}' does declare the "
-                "`%l` label placeholder, and the template parses.) "
-                "(D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-LONGER-EXISTS)",
-                id.v, succs.size(), target.defaultAssemblyLanguage()));
-        return false;
+        // ⚠ NON-EMPTY IS WHAT MAKES IT THE TERMINATOR FORM, so an empty span
+        // would silently expand as an ordinary asm block and leave the block
+        // unsealed. `MirBuilder::addInlineAsmGoto` cannot produce one (the
+        // opcode row's `minSuccessors` is 2 and `recordSuccessors_` enforces it),
+        // which is why this is a fail-loud rather than a branch.
+        if (succs.empty()) {
+            // Same locus rule as the expansion's — the refusal names the MIR
+            // inst but not the source statement, and the descriptor carries the
+            // statement's locus for exactly this.
+            AsmStatementLocusGuard const asmLocus{
+                reporter, mir.asmDescriptor(id), reporter.all().size()};
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format("`asm goto` (MIR inst {}) has NO CFG successors — the "
+                            "opcode row requires at least two (one label plus the "
+                            "fall-through), so this block cannot be sealed",
+                            id.v));
+            return false;
+        }
+        return expandInlineAsm(id, succs);
     }
 
     // FC7 C3 (AAPCS64/Apple x8 sret): the callee-side entry read of the indirect-
@@ -5306,13 +5830,14 @@ struct Lowerer {
     //     PLAIN `bl` (CALL26 only) that the foreign linker resolves via a veneer/
     //     PLT — the correctness fix that unblocks a default-PIE arm64 `.o`/`.a`.
     // SINGLE-USE is load-bearing (mirrors the riprel `count != 1` guard): the
-    // `:4655` fold routes the callee symbol into the direct branch EVEN WHEN the
+    // `lowerCall` direct-branch fold routes the callee symbol into the branch
+    // EVEN WHEN the
     // GlobalAddr has OTHER uses (a `&fn` value/argument), so without `count == 1`
     // a still-needed lea would be dropped → a loud undefined-vreg fail in
     // `regForValue`. Operand-position-0 excludes a `&fn` passed as an ARGUMENT
     // (operand ≥ 1) of the call from being mistaken for the callee. TLS/GOT-data
     // guards are unneeded: a function callee is never a TLS or extern-DATA symbol
-    // (see the `lowerCall` note at :4545).
+    // (see the `lowerCall` marshalling note).
     [[nodiscard]] bool globalAddrFoldsIntoDirectCall(MirInstId gaId) {
         auto const it = mirValueUses_.find(gaId.v);
         if (it == mirValueUses_.end() || it->second.count != 1) {
@@ -7015,8 +7540,9 @@ struct Lowerer {
         // hypothetical future target whose dividend lives in an
         // FPR-class register would silently misallocate if this
         // hardcoded `LirRegClass::GPR`. The cast is sound — the two
-        // enums are statically asserted identical-shape at
-        // `lir_reg.hpp:96-100`.
+        // enums are statically asserted identical-shape by the
+        // `LirRegClass`/`TargetRegClass` `static_assert` block in
+        // `lir_reg.hpp`.
         auto const* dividendRegInfo = target.registerInfo(*dividendOrdinal);
         auto const* captureRegInfo  = target.registerInfo(*captureOrdinal);
         if (dividendRegInfo == nullptr || captureRegInfo == nullptr) {
@@ -7536,7 +8062,7 @@ struct Lowerer {
     //
     // ★★ IT MASKS ITS INTERMEDIATES AND NEVER ITS RESULT — that is not a style
     // choice, it is the correctness argument. DSS's lazy-narrowing model
-    // (see the Trunc note ~:1428) permits a U16-typed value to sit in a register
+    // (see the `gatedKind` Trunc note) permits a U16-typed value to sit in a register
     // with STALE bits 31:16: narrowing realizes at the width-exact CONSUMER, not
     // at the producer. So for x = [g3 g2 b1 b0] (g = garbage, b = the real
     // halfword) the tempting two-instruction form `(x<<8)|(x>>8)` followed by a
@@ -8445,6 +8971,23 @@ struct Lowerer {
     //                       outright, so redirecting the id redirects control.
     //   Br                  one successor: the copies are already unconditional
     //                       in the predecessor, so there is nothing to fix.
+    //   InlineAsmGoto       yes — and it is the one entry whose branches this
+    //                       lowerer does not EMIT itself. Every label edge is
+    //                       bound to `lirSucc(succ)` through `AsmLabelBinding`
+    //                       and the shared assembly engine branches to the block
+    //                       id it was handed; the fall-through edge is the
+    //                       trailing `jmp lirSucc(succs.back())`
+    //                       `sealAsmGotoEdges` emits. So redirecting the id
+    //                       redirects control on every edge, which is this
+    //                       predicate's whole question — "does the terminator
+    //                       CHOOSE the target block id?", not "did this file
+    //                       write the branch?".
+    //                       ⚠ WITHOUT THIS ROW the copies go inline BEFORE the
+    //                       terminator, i.e. before the template runs, and every
+    //                       edge's copies run on every edge — the lost-copy
+    //                       miscompile the block comment in `lowerTerminator`
+    //                       measures, reached through an `asm goto` instead of
+    //                       through a loop's back edge.
     //   IndirectBr          NO — and this one is a STATED RESIDUAL, not a proof
     //                       of safety. `goto *p` jumps to a `&&label` ADDRESS
     //                       that `lowerBlockAddress` materialized from the
@@ -8471,7 +9014,8 @@ struct Lowerer {
     //                       predecessor at all (D-WIN64-SEH-FUNCLETS).
     //   Return/Unreachable  zero successors.
     [[nodiscard]] static bool terminatorOwnsEverySuccessorBranch(MirOpcode op) {
-        return op == MirOpcode::CondBr || op == MirOpcode::Switch;
+        return op == MirOpcode::CondBr || op == MirOpcode::Switch
+            || op == MirOpcode::InlineAsmGoto;
     }
 
     // The LIR block a terminator must branch to in order to reach MIR successor
@@ -8594,6 +9138,15 @@ struct Lowerer {
         // terminator lowerers emit into (and seal) the predecessor. Nothing has
         // to be "restored" afterwards — `lowerBlock` opens the next block itself,
         // and every path out of here leaves the open block terminated.
+        // ★★ A REFUSAL CAN NOW ARRIVE WITH THE BLOCK ALREADY SEALED, WHICH NO
+        // OTHER TERMINATOR COULD PRODUCE. An `asm goto` template emits its own
+        // branches through the shared assembly engine, so a refusal raised
+        // AFTER the template (a missing edge opcode, a broken piece type) leaves
+        // a terminated block behind a `false` return. Applying the fallback seal
+        // to it would hit `LirBuilder::appendInst_`'s *"block already
+        // terminated"* fatal — a process kill on top of a diagnostic that had
+        // already said the right thing. The block IS sealed; say so.
+        if (!sealed && lir.openBlockIsTerminated()) sealed = true;
         if (!edgeSplits_.empty()) {
             if (!sealed) {
                 // The terminator failed to lower and left the predecessor open.
@@ -9591,7 +10144,11 @@ struct Lowerer {
         }
         // Fallback seal for blocks whose MIR terminator was deferred to a
         // later cycle. The diagnostic was already issued.
-        if (!sealed && opcode(MnemonicSlot::Ret).has_value()) {
+        // ⚠ `openBlockIsTerminated` is asked because an `asm goto` whose
+        // TEMPLATE sealed the block can still refuse afterwards — see the same
+        // guard in `lowerTerminator`, which states the case.
+        if (!sealed && !lir.openBlockIsTerminated()
+            && opcode(MnemonicSlot::Ret).has_value()) {
             emitReturn(*opcode(MnemonicSlot::Ret), std::span<LirOperand const>{});
         }
     }

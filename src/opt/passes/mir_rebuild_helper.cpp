@@ -712,6 +712,15 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
             // re-placed. `cloneInlineAsmGoto` (not `addInlineAsmGoto`) is what says
             // that: re-running the placement rule here would interpose a second
             // landing block on every optimizer pass.
+            //
+            // ⚠ MAP EVERY SUCCESSOR, INCLUDING THE LAST ONE. An `asm goto`'s
+            // successors are [label..., FALL-THROUGH] and the fall-through is
+            // what keeps the code after the statement reachable -- dropping it
+            // hands the unreachable prune a block with no predecessor. The
+            // 1:1 `oldSucc` walk below preserves the count by construction;
+            // `cloneInlineAsmGoto` re-checks it against the descriptor's own
+            // label list, so a future edit that filters successors here fails
+            // loud instead of deleting live code.
             std::vector<MirInstId> newOps;
             newOps.reserve(oldOps.size());
             for (MirInstId const a : oldOps) newOps.push_back(mapOperand(a));

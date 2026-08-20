@@ -92,6 +92,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_InlineAsmPlaceholderOutOfRange";
         case DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate:
             return "S_InlineAsmPlaceholderInBasicTemplate";
+        case DiagnosticCode::S_InlineAsmDuplicateSymbolicName:
+            return "S_InlineAsmDuplicateSymbolicName";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

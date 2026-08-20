@@ -1147,9 +1147,19 @@ TEST(HirText, InlineAsmDescriptorRoundTripsWithEveryField) {
     d.clobbersConditionCodes = true;
     d.clobbers               = {"rax", "rbx"};
     d.labelOrdinals          = {2, 7};
+    // !! THE LABEL ORDINAL AND THE LABEL'S POSITIONAL SPELLING ARE DIFFERENT
+    // NUMBERS, and they are deliberately different here. The ordinal is the
+    // per-FUNCTION label id (2 and 7 -- whatever the enclosing function handed
+    // out); the positional spelling is `operandCount + position` within THIS
+    // statement, so with two operands the two labels are `%l2` and `%l3`. A
+    // writer that "helpfully" rendered the ordinal as the spelling, or a
+    // consumer that re-derived one from the other, is caught by this pair and
+    // by nothing else in the suite.
+    d.labelSpellings         = {{"%l[done]", "%l2"}, {"%l[again]", "%l3"}};
     {
         HirInlineAsmOperand out;
         out.symbolicName        = "dst";
+        out.spellings           = {"%0", "%[dst]"};
         out.constraint          = parseAsmConstraint("=&r").value;
         out.isOutput            = true;
         out.regClassResolved    = true;
@@ -1157,6 +1167,10 @@ TEST(HirText, InlineAsmDescriptorRoundTripsWithEveryField) {
         d.operands.push_back(std::move(out));
 
         HirInlineAsmOperand inp;
+        // NO symbolic name was written, so this operand answers to ONE
+        // spelling. A one-element group and a two-element group in the same
+        // dump is what proves the section is length-driven rather than fixed.
+        inp.spellings     = {"%1"};
         inp.constraint    = parseAsmConstraint("a").value;
         inp.fixedRegister = "rax";
         d.operands.push_back(std::move(inp));
@@ -1190,10 +1204,15 @@ TEST(HirText, InlineAsmDescriptorRoundTripsWithEveryField) {
     EXPECT_NE(text.find(R"(inline_asm "mov %0, %1; nop" { extended goto mem cc)"),
               std::string::npos) << text;
     EXPECT_NE(text.find("outputs 1 operands ("), std::string::npos) << text;
-    EXPECT_NE(text.find(R"("=&r" [dst] class 3 -> )"), std::string::npos) << text;
-    EXPECT_NE(text.find(R"("a" pin "rax" -> )"), std::string::npos) << text;
+    EXPECT_NE(text.find(R"("=&r" [dst] spells ( "%0", "%[dst]" ) class 3 -> )"),
+              std::string::npos) << text;
+    EXPECT_NE(text.find(R"("a" spells ( "%1" ) pin "rax" -> )"),
+              std::string::npos) << text;
     EXPECT_NE(text.find(R"(clobbers ( "rax", "rbx" ))"), std::string::npos) << text;
-    EXPECT_NE(text.find("labels ( L2, L7 )"), std::string::npos) << text;
+    EXPECT_NE(
+        text.find(
+            R"(labels ( L2 spells ( "%l[done]", "%l2" ), L7 spells ( "%l[again]", "%l3" ) ))"),
+        std::string::npos) << text;
 
     // The PARSE must reconstruct the descriptor, not just the bytes.
     DiagnosticReporter r;
@@ -1220,6 +1239,60 @@ TEST(HirText, InlineAsmDescriptorRoundTripsWithEveryField) {
     EXPECT_EQ(back.operands[1].fixedRegister, "rax");
     EXPECT_EQ(back.clobbers, (std::vector<std::string>{"rax", "rbx"}));
     EXPECT_EQ(back.labelOrdinals, (std::vector<std::uint32_t>{2u, 7u}));
+    // The spellings are the field every tier below HIR COMPARES against, so a
+    // round trip that lost them would hand the next tier an asm statement whose
+    // operands answer to no `%N` at all. Asserted by CONTENT, per group.
+    EXPECT_EQ(back.operands[0].spellings,
+              (std::vector<std::string>{"%0", "%[dst]"}));
+    EXPECT_EQ(back.operands[1].spellings, (std::vector<std::string>{"%1"}));
+    EXPECT_EQ(back.labelSpellings,
+              (std::vector<std::vector<std::string>>{{"%l[done]", "%l2"},
+                                                     {"%l[again]", "%l3"}}));
+}
+
+// The OTHER half of the label section: a descriptor whose labels carry NO
+// spellings at all. That is the honoured-absence case -- a language whose
+// `templateLabelPlaceholder` is declared `null` cannot spell a label reference
+// -- and it must stay distinguishable from a descriptor whose spellings were
+// DROPPED, which is what the writer's `spells` group being length-driven (and
+// omitted when empty) buys.
+//
+// !! IT IS ALSO THE PIN FOR A REAL ROUND-TRIP HAZARD. The writer renders an
+// empty group as nothing; the parser must therefore rebuild an empty group
+// rather than skipping the entry, or the two lists come back different LENGTHS
+// and `HirVerifier::checkInlineAsm` reds on text `emitHir` itself produced.
+TEST(HirText, InlineAsmLabelsWithNoSpellingsStillRoundTripOneGroupPerOrdinal) {
+    HirInlineAsmPool asmPool;
+    HirInlineAsmDescriptor d;
+    d.templateText   = "nop";
+    d.isGoto         = true;
+    d.isExtended     = true;
+    d.labelOrdinals  = {4, 5};
+    d.labelSpellings = {{}, {}};
+    std::uint32_t const handle = asmPool.add(std::move(d));
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm, InvalidType, handle);
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN});
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{body});
+    Hir hir = std::move(b).finish(root);
+
+    HirTextContext ctx;
+    ctx.inlineAsmPool = &asmPool;
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find("labels ( L4, L5 )"), std::string::npos)
+        << "an empty spelling group renders as NOTHING, not as an empty pair of "
+           "parens:\n" << text;
+
+    DiagnosticReporter r;
+    auto res = parseHir(text, CompilationUnitId{17}, r);
+    ASSERT_TRUE(res->ok) << text;
+    ASSERT_EQ(res->inlineAsmPool.size(), 1u);
+    auto const& back = res->inlineAsmPool.at(1);
+    EXPECT_EQ(back.labelOrdinals, (std::vector<std::uint32_t>{4u, 5u}));
+    EXPECT_EQ(back.labelSpellings, (std::vector<std::vector<std::string>>{{}, {}}))
+        << "one group per ordinal, or the verifier reds on the writer's own "
+           "output";
 }
 
 // !! THE NO-POOL ARM IS NOT A SILENT DEGRADATION, and this pin is the
@@ -1315,7 +1388,7 @@ TEST(HirText, InlineAsmTemplateWithANewlineStillRoundTripsByteIdentically) {
     ctx.inlineAsmPool = &asmPool;
     std::string const text = expectRoundTrip(hir, ctx);
     EXPECT_NE(text.find("nop\n\tnop"), std::string::npos)
-        << "the newline is emitted RAW today (quote() escapes only \" and \):\n"
+        << "the newline is emitted RAW today (quote() escapes only \" and \\):\n"
         << text;
 
     DiagnosticReporter r;

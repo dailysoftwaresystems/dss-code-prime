@@ -174,6 +174,24 @@ struct DSS_EXPORT HirInlineAsmOperand {
     // written positionally. Carried because a template may reference an operand
     // by name (`%[name]`) as well as by index.
     std::string      symbolicName;
+
+    // ★★★ EVERY SPELLING THIS OPERAND ANSWERS TO IN A TEMPLATE, CARRIED
+    // VERBATIM FROM THE FRONT END — the positional form (`%0`) always, and the
+    // symbolic form (`%[name]`) when the source named it. Order is
+    // [positional, symbolic].
+    //
+    // ★★ CARRIED, NEVER RE-DERIVED, AND THAT IS AN ARCHITECTURAL DECISION AND
+    // NOT A CACHE. The sigil BYTES are LANGUAGE vocabulary with exactly one
+    // declared owner (`semantics.inlineAsmTemplateLexemes`) and the NUMBERING is
+    // the SOURCE's operand list — in which a `"+"` read-write operand appears
+    // ONCE, while every tier below realizes it as an output PLUS a synthesized
+    // tied input. A consumer that rebuilt `%N` from its own list would therefore
+    // overcount by the number of `"+"` operands and shift every `asm goto` label
+    // reference, with nothing to notice it. Minting once at the front end makes
+    // the disagreement unwritable: only one tier counts.
+    // ⇒ every tier below this one COMPARES these strings and never composes one.
+    std::vector<std::string> spellings;
+
     HirAsmConstraint constraint;
     // Redundant with `constraint.isOutput` BY CONSTRUCTION and deliberately so:
     // this records which SECTION the operand was written in, which is what the
@@ -243,6 +261,26 @@ struct DSS_EXPORT HirInlineAsmDescriptor {
     // `GotoStmt`/`LabelStmt` namespace already uses — resolved at lowering, so
     // no consumer re-resolves an identifier.
     std::vector<std::uint32_t> labelOrdinals;
+
+    // ★★★ WHAT THE TEMPLATE CALLS EACH OF THOSE LABELS. Index-aligned 1:1 with
+    // `labelOrdinals` (`HirVerifier::checkInlineAsm` asserts the sizes), one
+    // inner vector per label holding EVERY spelling it answers to: the
+    // bracketed form (`%l[done]`) and the positional form (`%l2`) on the
+    // reference numbering, in that order.
+    //
+    // ★★ CARRIED, NEVER RE-DERIVED — and here the argument is stronger than it
+    // is for an operand, because an ordinal genuinely cannot rebuild a spelling:
+    // the label's SOURCE NAME is gone by this tier (it is a number now), and the
+    // positional index is `operandCount + position`, a fact of the STATEMENT
+    // rather than of the label. The spelling is a lexical fact and is treated as
+    // one — the same argument this file's `HirInlineAsmOperand::spellings`
+    // makes, arrived at from the side where re-derivation is not merely risky
+    // but impossible.
+    //
+    // ⚠ An inner vector is EMPTY exactly when the language declares
+    // `templateLabelPlaceholder` as `null` — the honoured-absence case; such a
+    // language cannot write a label reference at all.
+    std::vector<std::vector<std::string>> labelSpellings;
 
     // The `goto` qualifier was written. ⚠ NOT the same question as "are there
     // labels": ✔MEASURED 2026-08-14, clang 18.1.3/19.1.1 ACCEPT `asm goto` with

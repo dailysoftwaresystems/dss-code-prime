@@ -94,6 +94,37 @@ struct MirAsmOperand {
     // when input j is bound, `outs[*tiedOutput]` already holds the register the
     // template will use for both halves.
     std::optional<std::uint32_t> tiedOutput;
+
+    // ★★★ EVERY SPELLING THIS OPERAND ANSWERS TO, AS THE TEMPLATE WRITES IT —
+    // MINTED BY THE FRONT END, ONLY EVER *COMPARED* HERE AND BELOW. The
+    // positional form always, plus the symbolic form when the source named the
+    // operand (`[in]`). Order is [positional, symbolic].
+    //
+    // ⚠ EMPTY ON EXACTLY ONE KIND OF ENTRY, AND THAT IS THE CORRECT ANSWER: the
+    // synthesized read half of a `"+r"` operand (the entry carrying `tiedOutput`
+    // above). The source wrote that operand ONCE, so exactly one entry — the
+    // OUTPUT — answers to its spellings; giving the read half a copy would
+    // publish the same `%N` twice, at two different registers, and a consumer
+    // binding one row per spelling would silently keep whichever it saw last.
+    // This is the same "the tied entries sit past the last index a `%N` can
+    // reach" rule `inputs` states below.
+    //
+    // ★★ IT IS CARRIED BECAUSE THE INDEX CANNOT BE RECOMPUTED AT THIS TIER, AND
+    // THAT IS MEASURED, NOT STYLISTIC. An index derived here as
+    // `outputs.size() + inputs.size()` OVERCOUNTS by the number of `"+"`
+    // operands, because `inputs` carries the SYNTHESIZED tied read halves (see
+    // `tiedOutput` above) while the source counts a `"+"` operand ONCE.
+    // ✔MEASURED: `asm goto ("…%l2…" : [o]"+r"(x) : "r"(y) : : L)` — a program
+    // gcc compiles — has source base 2 and MIR-computed base 3. Minting at the
+    // front end deletes the second count: there is ONE list, the source's, and
+    // two tiers cannot disagree when only one of them counts.
+    //
+    // ⛔ THE BYTES ARE THE LANGUAGE'S, NOT THIS FILE'S. They come from the
+    // dialect's declared template lexemes (`semantics.inlineAsmTemplateLexemes`,
+    // the owner won by `D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER`).
+    // No consumer may rebuild a spelling from a sigil literal — doing so would
+    // give the convention a second owner, which is the defect this field closes.
+    std::vector<std::string> spellings;
 };
 
 struct DSS_EXPORT MirAsmDescriptor {
@@ -173,6 +204,32 @@ struct DSS_EXPORT MirAsmDescriptor {
     // tied entries occupy the indices past the last one the front end lets a
     // `%N` reach, exactly as they do in gcc.
     std::vector<MirAsmOperand> inputs;
+
+    // ★★★ ONE ENTRY PER `asm goto` LABEL, IN LABEL-SUCCESSOR ORDER — i.e. entry
+    // `j` describes CFG successor `j`, and the successors after the last of them
+    // are the fall-through (see `MirOpcode::InlineAsmGoto` and
+    // `MirBuilder::addInlineAsmGoto`, which owns the successor layout). Each
+    // entry holds every spelling that label answers to: the bracketed form when
+    // it has a name and the positional form on the reference numbering, minted
+    // by the front end from the dialect's declared lexemes exactly like
+    // `MirAsmOperand::spellings`.
+    //
+    // ★★ THE SIZE IS A CHECKED INVARIANT, NOT A CONVENTION:
+    // `labelSpellings.size() + 1 == blockSuccessors(theAsmBlock).size()`. Both
+    // `MirBuilder::addInlineAsmGoto` and `MirBuilder::cloneInlineAsmGoto` refuse
+    // a descriptor that disagrees, and
+    // `MirVerifier::checkTerminatorSuccessorArity` re-checks it on a frozen
+    // module — including the direct-`Mir`-ctor path no builder owns. Without it
+    // a clone that dropped the
+    // fall-through edge from a ≥2-label goto still satisfies the opcode row's
+    // `[min, ∞)` range and the edge disappears with NO diagnostic.
+    //
+    // ⚠ AN INNER VECTOR MAY LEGITIMATELY BE EMPTY, and that is an honoured
+    // absence rather than a drop: a dialect whose `templateLabelPlaceholder` is
+    // declared `null` mints no label spelling at all. The OUTER size still
+    // counts the labels, so the invariant above holds for such a dialect too.
+    std::vector<std::vector<std::string>> labelSpellings;
+
     // Register names the block DESTROYS. Names only — `"memory"` and `"cc"` are
     // the two clobber spellings that name no register and are hoisted into the
     // two flags below at parse time, so this list is uniformly resolvable

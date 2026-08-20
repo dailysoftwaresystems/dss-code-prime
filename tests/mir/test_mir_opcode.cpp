@@ -17,7 +17,8 @@ bool isOneOfTheTerminators(MirOpcode op) {
     // D-CSUBSET-COMPUTED-GOTO added IndirectBr (the 6th terminator); c115 SEH
     // (D-WIN64-SEH-FUNCLETS) added SehTryBegin + SehFilterReturn (7th, 8th);
     // inline-asm P5 added InlineAsmGoto (the 9th) -- `asm goto`, whose
-    // successors are the label list. This list is a CLOSED CENSUS on purpose:
+    // successors are the label list PLUS the fall-through edge. This list is a
+    // CLOSED CENSUS on purpose:
     // adding a terminator obliges a clone arm in every MIR rebuild path, so it
     // must be a deliberate edit here rather than something a row change does
     // quietly.
@@ -269,13 +270,22 @@ TEST(MirOpcode, SuccessorArities) {
     // operands — the builder's recordSuccessors_ asserts against it, so the
     // single-source-of-truth runs both ways: a future terminator method that
     // miscounts fails loud, and ML3's frozen-module verifier reads this same
-    // table for arbitrary construction paths.
+    // table for arbitrary construction paths
+    // (`MirVerifier::checkTerminatorSuccessorArity` — added in cycle P20, when
+    // that second half was ✔MEASURED to be a claim two docblocks made and no
+    // code implemented).
     EXPECT_EQ(opcodeInfo(MirOpcode::Br).minSuccessors, 1);
     EXPECT_EQ(opcodeInfo(MirOpcode::Br).maxSuccessors, 1);
     EXPECT_EQ(opcodeInfo(MirOpcode::CondBr).minSuccessors, 2);
     EXPECT_EQ(opcodeInfo(MirOpcode::CondBr).maxSuccessors, 2);
     EXPECT_EQ(opcodeInfo(MirOpcode::Switch).minSuccessors, 1);   // ≥ default
     EXPECT_EQ(opcodeInfo(MirOpcode::Switch).maxSuccessors, kMirUnboundedSuccessors);
+    // `asm goto` — ≥1 LABEL successor plus the FALL-THROUGH, so the minimum is 2
+    // and NOT Switch's 1. The row's floor is what stops a builder or a clone from
+    // emitting the label list alone, which deleted the code after the statement.
+    EXPECT_EQ(opcodeInfo(MirOpcode::InlineAsmGoto).minSuccessors, 2);
+    EXPECT_EQ(opcodeInfo(MirOpcode::InlineAsmGoto).maxSuccessors,
+              kMirUnboundedSuccessors);
     EXPECT_EQ(opcodeInfo(MirOpcode::Return).minSuccessors, 0);
     EXPECT_EQ(opcodeInfo(MirOpcode::Return).maxSuccessors, 0);
     EXPECT_EQ(opcodeInfo(MirOpcode::Unreachable).minSuccessors, 0);

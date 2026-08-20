@@ -72,6 +72,30 @@ INVENTORY_REL = os.path.join("scripts", "check-plan-citations", "inventory.json"
 # because they give the same instructions to the next cycle.
 SCAN_ROOTS = (".plans", ".claude")
 
+# ★★★ THE CODE IS GOVERNED TOO, AND UNTIL 2026-08-19 IT WAS NOT.
+# The operator's rule -- *"we must never document line numbers, we must document
+# method names, comment ids or defined anchors. everything that changes is
+# unreliable"* -- is about DOCUMENTATION, and a comment in a `.cpp` is
+# documentation. This guard read `.md` under two roots, so every `path:line` in
+# shipped source and in `.lang.json` config was invisible to it.
+# ✔THE EVIDENCE IS A CITATION THAT WENT STALE INSIDE ONE CYCLE: `mir_to_lir.cpp`
+# cited a `mir_opcode.hpp` line, a sibling lane's edit moved the row, and nothing
+# could have reported it. That is the whole failure mode, observed rather than
+# argued.
+CODE_ROOTS = ("src", "tests", "scripts", "examples")
+CODE_EXTS = (".cpp", ".hpp", ".h", ".c", ".cc", ".json", ".py", ".sh", ".ps1",
+             ".cmake", ".txt", ".s", ".S")
+
+# ⚠ A CITATION OF A FILE OUTSIDE THIS REPOSITORY IS COUNTED TOO, AND THAT IS
+# DELIBERATE. The tempting carve-out is "an SDK header is not ours to convert",
+# but ranking those SAFER inverts the truth: `SDK/usr/include/sys/mount.h:366` is
+# a claim about a file that differs between machines and between SDK versions,
+# where a claim about our own file at least drifts under version control. The
+# remedy is identical in both cases -- cite the DECLARATION, not the line.
+# ★ It also keeps this guard's stated philosophy intact: citations are not
+# anchored to files on disk, because a citation into a deleted file is exactly as
+# unreliable as one into a moved line.
+
 # A citation is a repo-ish path with a file extension, followed by `:<digits>`.
 # Deliberately NOT anchored to real files on disk: a citation into a file that
 # was since deleted is exactly as unreliable, and excluding it would let a stale
@@ -96,6 +120,13 @@ EXIT_OK, EXIT_RATCHET, EXIT_COLLAPSE, EXIT_USAGE = 0, 1, 2, 3
 # trips it, and high enough that a collapsed enumeration cannot pass as clean.
 DOC_FLOOR = 40
 
+# ★ THE CODE FAMILY GETS ITS OWN FLOOR, NOT A SHARED ONE. A single total
+# would let one family collapse entirely while the other's size covered for it --
+# ✔the live counts are ~75 markdown documents against ~2,200 code files, so a
+# combined floor of 40 would be satisfied by the markdown alone with every source
+# file gone. Two floors make each family's collapse its own refusal.
+CODE_FLOOR = 400
+
 
 class Collapse(Exception):
     """The scan failed structurally. Never reported as a clean pass."""
@@ -112,26 +143,47 @@ def repo_root():
     return p.stdout.decode("utf-8", "replace").strip()
 
 
-def documents(root):
-    """Every governed markdown document, in a stable order."""
+def _walk(root, rel_roots, keep):
+    """Every file under `rel_roots` whose name satisfies `keep`, repo-relative."""
     out = []
-    for rel_root in SCAN_ROOTS:
+    for rel_root in rel_roots:
         base = os.path.join(root, rel_root)
         if not os.path.isdir(base):
             continue
         for dirpath, dirnames, files in os.walk(base):
-            dirnames[:] = [d for d in dirnames if d not in ("__pycache__", "worktrees")]
+            # `build` is generated and enormous; `worktrees` is another checkout
+            # and would double-count every file it holds.
+            dirnames[:] = [d for d in dirnames
+                           if d not in ("__pycache__", "worktrees", "build", ".git")]
             for f in files:
-                if f.endswith(".md"):
+                if keep(f):
                     rel = os.path.relpath(os.path.join(dirpath, f), root)
                     out.append(rel.replace(os.sep, "/"))
     return sorted(out)
 
 
+def documents(root):
+    """Every governed markdown document, in a stable order."""
+    return _walk(root, SCAN_ROOTS, lambda f: f.endswith(".md"))
+
+
+def code_files(root):
+    """Every governed source/config file, in a stable order."""
+    return _walk(root, CODE_ROOTS, lambda f: f.endswith(CODE_EXTS))
+
+
 def count_in(path):
     """Positional citations in one document."""
     n = 0
-    with io.open(path, "r", encoding="utf-8", newline="") as fh:
+    # ⚠ `errors="replace"`, added when the roots widened to code: the markdown
+    # corpus is all UTF-8, the code corpus is NOT — ✔MEASURED, a fixture under
+    # the new roots carries a 0x97 byte and the strict decode raised
+    # `UnicodeDecodeError` mid-census, which this guard would have reported as a
+    # crash rather than as a count. Replacement cannot invent a citation (the
+    # pattern needs ASCII path bytes followed by `:<digits>`) and cannot hide one
+    # (only the offending bytes become U+FFFD), so the count is unchanged wherever
+    # the decode would have succeeded.
+    with io.open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
         for line in fh:
             urls = [(u.start(), u.end()) for u in URL_SPAN.finditer(line)]
             for m in CITATION.finditer(line):
@@ -148,7 +200,21 @@ def census(root):
             "found only %d governed document(s) under %s, floor is %d. The scan "
             "COLLAPSED -- fix the scan, do not lower the floor."
             % (len(docs), " + ".join(SCAN_ROOTS), DOC_FLOOR))
-    return {d: count_in(os.path.join(root, d)) for d in docs if count_in(os.path.join(root, d))}
+    code = code_files(root)
+    if len(code) < CODE_FLOOR:
+        raise Collapse(
+            "found only %d governed code file(s) under %s, floor is %d. The scan "
+            "COLLAPSED -- fix the scan, do not lower the floor."
+            % (len(code), " + ".join(CODE_ROOTS), CODE_FLOOR))
+    # ★ COUNTED ONCE PER FILE. The first version called `count_in` twice per
+    # document -- once for the filter and once for the value -- which was merely
+    # wasteful here but is the shape that lets a filter and a value disagree.
+    out = {}
+    for rel in docs + code:
+        n = count_in(os.path.join(root, rel))
+        if n:
+            out[rel] = n
+    return out
 
 
 def load_inventory(root):
@@ -234,7 +300,7 @@ def run(root, write):
 # an arm that checks only the code cannot tell which one it proved. That mistake
 # was measured in a sibling guard in this same cycle.
 
-EXPECTED_ARMS = 9
+EXPECTED_ARMS = 12
 _RAN = None
 
 
@@ -269,11 +335,26 @@ def selftest(root):
     ran = []
     try:
         globals()["_RAN"] = ran
-        for rel_root in SCAN_ROOTS:
+        # ⚠ THE CODE ROOTS ARE COPIED WITH AN EXTENSION FILTER, NOT WHOLESALE.
+        # A faithful replica is what makes arm 0 mean anything, but `src` + `tests`
+        # + `examples` also carry generated trees; copying only the extensions the
+        # census actually reads keeps the replica exact for this guard's purpose
+        # while leaving `build/` behind.
+        def _drop(dirpath, names):
+            drop = []
+            for n in names:
+                full = os.path.join(dirpath, n)
+                if os.path.isdir(full):
+                    if n in ("__pycache__", "worktrees", "build", ".git"):
+                        drop.append(n)
+                elif not n.endswith(CODE_EXTS + (".md",)):
+                    drop.append(n)
+            return drop
+
+        for rel_root in SCAN_ROOTS + CODE_ROOTS:
             src = os.path.join(root, rel_root)
             if os.path.isdir(src):
-                shutil.copytree(src, os.path.join(tmp, rel_root),
-                                ignore=shutil.ignore_patterns("__pycache__", "worktrees", "*.pyc"))
+                shutil.copytree(src, os.path.join(tmp, rel_root), ignore=_drop)
         os.makedirs(os.path.dirname(os.path.join(tmp, INVENTORY_REL)), exist_ok=True)
         shutil.copyfile(os.path.join(root, INVENTORY_REL), os.path.join(tmp, INVENTORY_REL))
 
@@ -315,11 +396,38 @@ def selftest(root):
         ok &= _arm("4 PORT-IS-NOT-A-CITATION", tmp, EXIT_OK)
         io.open(subject, "w", encoding="utf-8", newline="").write(pristine)
 
-        # the scan collapses
+        # a NEW citation in shipped SOURCE, not in a plan. ★ This arm is the
+        # whole reason the roots were widened: before 2026-08-19 it passed GREEN,
+        # because the guard never opened a `.cpp` at all.
+        code_subject = os.path.join(tmp, "src", "mir", "mir_opcode.hpp")
+        code_pristine = io.open(code_subject, encoding="utf-8", newline="").read()
+        io.open(code_subject, "w", encoding="utf-8", newline="").write(
+            code_pristine + "\n// see src/core/zz_selftest.cpp:4321\n")
+        ok &= _arm("7 NEW-CITATION-IN-CODE", tmp, EXIT_RATCHET,
+                   says="new positional citation", not_says="above the live count")
+        io.open(code_subject, "w", encoding="utf-8", newline="").write(code_pristine)
+        ok &= _arm("7b RESTORED", tmp, EXIT_OK)
+
+        # the scan collapses -- once per FAMILY, because one floor covering both
+        # would let the code family vanish behind the markdown family's size.
         held = tempfile.mkdtemp(prefix="plan-citations-held-")
         shutil.move(os.path.join(tmp, ".plans"), os.path.join(held, ".plans"))
-        ok &= _arm("5 SCAN-COLLAPSED", tmp, EXIT_COLLAPSE, says="floor is")
+        ok &= _arm("5 SCAN-COLLAPSED", tmp, EXIT_COLLAPSE, says="governed document(s)")
         shutil.move(os.path.join(held, ".plans"), os.path.join(tmp, ".plans"))
+
+        # ⚠ EVERY code root moves, not just `src`. ✔MEASURED: `src` alone is
+        # ~550 of ~2,270 governed files, so holding back one root leaves the
+        # others comfortably above the floor and the arm would prove nothing --
+        # a collapse arm that cannot collapse is the vacuity this suite exists
+        # to refuse.
+        for rel_root in CODE_ROOTS:
+            if os.path.isdir(os.path.join(tmp, rel_root)):
+                shutil.move(os.path.join(tmp, rel_root), os.path.join(held, rel_root))
+        ok &= _arm("8 CODE-SCAN-COLLAPSED", tmp, EXIT_COLLAPSE,
+                   says="governed code file(s)", not_says="governed document(s)")
+        for rel_root in CODE_ROOTS:
+            if os.path.isdir(os.path.join(held, rel_root)):
+                shutil.move(os.path.join(held, rel_root), os.path.join(tmp, rel_root))
         shutil.rmtree(held, ignore_errors=True)
 
         ok &= _arm("6 GREEN-AFTER-RESTORE", tmp, EXIT_OK)

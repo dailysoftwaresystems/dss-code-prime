@@ -842,6 +842,20 @@ struct AsmInstructionLowering::Impl {
         return AsmOperandRole::Register;
     }
 
+    // Is this placeholder the dialect's `asm goto` LABEL alternative? Asked of
+    // the CST by RuleId and of the config by name — never of the text. An
+    // absent `templateLabelRule` matches nothing, which is the honoured-absence
+    // arm every rule landmark in this engine already has (`RuleId{}` is the
+    // invalid sentinel, so a bare `.v` comparison would match slot 0).
+    [[nodiscard]] bool placeholderIsALabelRef(NodeId placeholder) const {
+        if (!cfg_.templateLabelRule.valid()) return false;
+        for (NodeId const k : visibleChildren(tree_, placeholder)) {
+            if (tree_.kind(k) != NodeKind::Internal) continue;
+            if (tree_.rule(k).v == cfg_.templateLabelRule.v) return true;
+        }
+        return false;
+    }
+
     // ★★★ A TEMPLATE PLACEHOLDER — EVERY FORM THE DIALECT'S
     // `templateOperandRule` COVERS — RESOLVED THROUGH THE HOST BY ITS WRITTEN
     // SPELLING, EXACTLY AS A REGISTER SPELLING IS.
@@ -853,21 +867,40 @@ struct AsmInstructionLowering::Impl {
     // legalizer and every encoder see an ordinary register operand and need no
     // placeholder concept at all.
     //
-    // ⛔ AND THAT IS **NOT** TRUE OF AN `asm goto` LABEL PLACEHOLDER (`%l[done]`,
-    // GNU 6.47.2.7), WHICH THE SHIPPED GRAMMAR ALSO ACCEPTS. This banner used to
-    // list it alongside the other two and claim the same "nothing downstream
-    // knows the difference"; it cannot be true, and saying so was the recurring
-    // defect of a comment recording more than the code does. A label names a
-    // BRANCH DESTINATION, and `AsmOperandBinding` carries a `LirReg` and no
-    // block — so a label spelling matches no binding, falls through to the
-    // physical-register lookup, and is REFUSED BY THE HOST BY NAME.
-    // ★ THE STATE IS DELIBERATE AND IT IS THE GRAMMAR HALF ONLY. Binding a label
-    // to a LIR block is the EMBEDDING language's half: the blocks around a
-    // template belong to the caller, the successor edge has to exist in the
-    // caller's CFG before a branch to it can be emitted, and only the caller can
-    // supply either. Keeping the SHAPE is what makes the refusal a sentence
-    // about `asm goto` instead of a tokenizer complaint about the sigil byte,
-    // which cannot tell an author whether the form is unsupported or misspelled.
+    // ⛔ AND THAT IS **NOT** TRUE OF AN `asm goto` LABEL PLACEHOLDER (`%l[done]`
+    // or `%l2`, GNU 6.47.2.7), WHICH TAKES A SECOND ROUTE OUT OF THIS FUNCTION.
+    // A label names a BRANCH DESTINATION, not a register, so it is decoded into
+    // the shape the branch arms already consume and asked of a DIFFERENT host
+    // virtual — `resolveBranchTarget`, never `resolveRegister`. Two questions,
+    // two virtuals; see `AsmLabelBinding`'s docblock for why the two binding
+    // kinds are two spans rather than one struct with a discriminator.
+    //
+    // ★★★ WHICH OF THE TWO A PLACEHOLDER IS, IS A **RULE IDENTITY** QUESTION AND
+    // NOTHING ELSE. The dialect names the label alternative in
+    // `assembly.templateLabelRule`, exactly as it names `templateOperandRule`
+    // and `labelTailRule`, and this engine compares RuleIds. ⛔ TESTING THE `%l`
+    // BYTES HERE WOULD PUT A SECOND OWNER BESIDE
+    // `semantics.inlineAsmTemplateLexemes` — the defect
+    // `D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER` closed,
+    // and one this file must not reopen. The engine holds no opinion about how
+    // a label is spelled; it only compares the reconstructed text against the
+    // spellings its caller bound.
+    // ★ THE TEST IS ON THE MATCHED **CHILD**, NOT ON A SUBTREE SEARCH, AND THE
+    // FAILURE MODES DECIDE IT. The two placeholder families are SIBLING
+    // alternatives of the placeholder rule, so the label form is always a direct
+    // child when it is present at all; a subtree search would additionally match
+    // a rule that both families CONTAIN — the shared bracketed-name rule is the
+    // obvious mis-declaration — and every operand placeholder would then be
+    // routed as a branch target, a silent miscompile. A child test
+    // mis-declared the same way matches nothing, which is loud. (The loader
+    // refuses both mis-declarations outright; this is the shape that fails
+    // safely if one ever slipped past.)
+    // ★ WHAT SURVIVES FROM THE OLD REFUSAL, WHICH THIS PARAGRAPH REPLACES: the
+    // blocks around a template belong to the CALLER, and the successor edge has
+    // to exist in the caller's CFG before a branch to it can be emitted. That is
+    // still true — which is why the block is BOUND by the caller and never
+    // invented here, and why a label the caller did not bind is still refused by
+    // name.
     //
     // ★★★ WHY THE SPELLING IS REBUILT FROM THE TOKENS RATHER THAN TAKEN AS THE
     // NODE'S SOURCE TEXT OR AS ITS LAST TOKEN. Both obvious readings are wrong,
@@ -936,8 +969,38 @@ struct AsmInstructionLowering::Impl {
         }
 
         AsmDecodedOperand out;
-        out.role = AsmOperandRole::Register;
         out.node = node;
+
+        if (placeholderIsALabelRef(node)) {
+            // ★★★ THE ONLY SHAPE `branchTarget()`'s GATE ADMITS, SPELLED OUT
+            // FIELD BY FIELD RATHER THAN LEFT TO THE MEMBER DEFAULTS — because
+            // the gate is what makes the rest of the path work unchanged, and a
+            // reader has to be able to check the two against each other without
+            // opening a second function. ✔VERIFIED against `branchTarget`: it
+            // refuses an operand that is `indirect`, is `isMemory`, or carries
+            // an EMPTY `symbol`, and passes everything else straight to
+            // `host_.resolveBranchTarget`. So a label placeholder reaches the
+            // EXISTING `branchTarget` → `resolveBranchTarget` → `makeBlockRef`
+            // → `addBr`/`addCondBr` path — the very path the standalone `.s`
+            // tests already prove for `jmp .L1` — with no new branch arm.
+            // ★ `Displaced` IS THE ROLE A SYMBOL-VALUED SCALAR ALREADY HAS in
+            // this decoder (`jmp foo` in a `.s` decodes to exactly this), which
+            // is why it is reused rather than a role being minted: a new role
+            // would be a language-private verb for a shape the pipeline already
+            // has a verb for.
+            // ⚠ AND IT IS ALSO WHAT MAKES A LABEL IN A NON-BRANCH POSITION FAIL
+            // LOUD RATHER THAN QUIETLY: `movq %l[done], %0` takes the ordinary
+            // instruction path, whose symbol-valued source arm asks the host for
+            // the label's ADDRESS, and the template host refuses that by name.
+            out.role     = AsmOperandRole::Displaced;
+            out.symbol   = std::move(written);
+            out.isMemory = false;
+            out.indirect = false;
+            out.hasValue = false;
+            return out;
+        }
+
+        out.role = AsmOperandRole::Register;
 
         AsmResolvedRegister resolved;
         switch (host_.resolveRegister(written, node, resolved)) {
@@ -2445,12 +2508,22 @@ namespace {
 // SLOT — so a permissive `resolveBranchTarget` would not fail, it would bind to
 // whichever block sits at that index in the CALLER, which is a miscompile with
 // no diagnostic. Refusing names the template and the target.
+//
+// ★★★ AND THAT SENTENCE IS EXACTLY WHY `asm goto` LOWERS THROUGH A **BINDING**
+// RATHER THAN THROUGH A LOOKUP. The host still mints no block and still reads
+// no label table of its own; the caller — which owns the CFG and has already
+// created the successor edge — hands it a block per spelling, and this class
+// only ever ANSWERS with one it was given. A spelling nobody bound is refused,
+// which keeps the miscompile above unreachable by construction rather than by
+// care.
 class TemplateHost final : public AsmLoweringHost {
 public:
     TemplateHost(TargetSchema const&                target,
                  std::span<AsmOperandBinding const> bindings,
+                 std::span<AsmLabelBinding const>   labelBindings,
                  AsmDiagnosticSink&                 sink)
-        : target_(target), bindings_(bindings), sink_(sink) {}
+        : target_(target), bindings_(bindings),
+          labelBindings_(labelBindings), sink_(sink) {}
 
     [[nodiscard]] bool namesRegister(std::string_view spelling) const override {
         return bindingFor(spelling) != nullptr
@@ -2487,17 +2560,17 @@ public:
         // it living here: the OPERAND LIST is the embedding language's, so only
         // its host can enumerate it. The engine holds no `%N` convention.
         //
-        // ★★ THE `asm goto` LABEL CLAUSE IS NOT PADDING — IT IS THE ONLY PLACE A
-        // LABEL PLACEHOLDER CAN BE DESCRIBED AT ALL. The shipped grammar accepts
-        // one, and it arrives here as an ordinary unmatched spelling: an
-        // `AsmOperandBinding` carries a `LirReg` and no block, so no caller can
-        // bind a label and the lookup can never succeed. The host cannot TELL a
-        // label spelling from a mistyped operand one — that is a fact of the
-        // rule the engine already settled — so the message states the third
-        // possibility instead of pretending to detect it. Without the clause the
-        // sentence read as "you meant a register or an operand", which is a true
-        // dichotomy for two of the three forms the dialect declares and sends
-        // the author of the third to the target's register list.
+        // ⚠ THE `asm goto` CLAUSE THIS MESSAGE USED TO CARRY IS GONE, AND ITS
+        // REMOVAL IS THE POINT RATHER THAN A TRIM. It said a label *"lands here
+        // for a reason no spelling can fix … this build parses the label form
+        // and lowers none"*, which was true while `AsmOperandBinding` was the
+        // only binding kind. A label placeholder no longer reaches this
+        // function at all: `decodePlaceholder` routes it by RULE IDENTITY into
+        // `resolveBranchTarget`, which has its own refusal naming the labels
+        // that WERE bound. Keeping the clause would have sent every author of a
+        // mistyped operand name to a paragraph about `asm goto`, and every
+        // author of an unbound label to a message that no longer described the
+        // build.
         std::string bound;
         for (auto const& b : bindings_) {
             if (!bound.empty()) bound += ", ";
@@ -2509,12 +2582,7 @@ public:
             "'{}' names neither a register this target declares nor one of the "
             "{} operand(s) bound to this assembly template ({}) — and binding it "
             "to some register anyway would read a value the enclosing function "
-            "never wrote. ⓘ If this is an `asm goto` LABEL placeholder, it lands "
-            "here for a reason no spelling can fix: a label must resolve to a "
-            "BLOCK of the function that embedded this template, an operand "
-            "binding carries a register and no block, and only the embedding "
-            "language can supply one — so this build parses the label form and "
-            "lowers none{}",
+            "never wrote{}",
             spelling, bindings_.size(),
             bound.empty() ? std::string{"this template binds none"} : bound,
             sink_.pairSuffix()));
@@ -2533,6 +2601,18 @@ public:
         return "<assembly template>";
     }
 
+    // ★★ THIS IS WHERE AN `asm goto` LABEL IN A **NON-BRANCH** POSITION LANDS,
+    // AND THE MESSAGE HAS TO SAY SO. `movq %l[done], %0` decodes the label as a
+    // symbol-valued source, and the ordinary instruction path asks the host for
+    // that symbol's ADDRESS — a different question from "which block does this
+    // branch to", and one this build answers for nothing inside a template.
+    // ⚠ ✔DOCUMENTED (GNU 6.47.2.7), and it is the reason the refusal STAYS
+    // rather than becoming a lowering: `%l[name]` is defined as an `asm goto`
+    // BRANCH TARGET. Taking a label's ADDRESS is `&&label`, the computed-goto
+    // extension — a different construct with a different lowering — so
+    // accepting it here would be inventing a semantic no reference gave us,
+    // which is the same defect in the opposite direction from refusing one they
+    // all accept.
     [[nodiscard]] bool appendSymbolAddress(std::string const& symbol, NodeId at,
                                            std::string_view mnemonic,
                                            std::vector<LirOperand>&) override {
@@ -2541,21 +2621,75 @@ public:
             "labels of its own: the blocks around it belong to the language "
             "that embedded it, and a LIR block reference is function-local, so "
             "binding one here would name whichever block sits at that index in "
-            "the caller. Name the operand through this template's operand list "
-            "instead{}",
-            mnemonic, symbol, sink_.pairSuffix()));
+            "the caller. ⓘ If '{}' is an `asm goto` LABEL placeholder, it is "
+            "bound as a BRANCH TARGET and can only be used as one — this "
+            "instruction reads it as an ADDRESS, which is the computed-goto "
+            "construct and not this one. Name the operand through this "
+            "template's operand list instead{}",
+            mnemonic, symbol, symbol, sink_.pairSuffix()));
         return false;
     }
 
+    // ★★★ THE `asm goto` TARGET, ANSWERED FROM THE CALLER'S OWN BINDINGS.
+    //
+    // ⚠ `symbol` IS THE SPELLING THE TEMPLATE WROTE — `%l[done]`, `%l2` — not a
+    // label name, because a template has no labels of its own to name. That is
+    // the same key `bindingFor` matches an operand on, and it is matched the
+    // same way: EXACTLY, never folded. The measurement is in
+    // `AsmLoweringHost::namesRegister`'s two-caller paragraph — GNU symbolic
+    // names are case-SENSITIVE C identifiers, so folding would merge two
+    // distinct labels under both shipped dialects, which are `asciiFolded`.
+    //
+    // ⚠ A `.s` LABEL STILL LANDS HERE AND IS STILL REFUSED. `jmp Lloop` inside a
+    // template arrives with `symbol == "Lloop"`, matches no binding, and gets
+    // the same refusal — which is correct and is the original capability
+    // statement intact: the block would have to be one the caller's CFG carries,
+    // and nothing bound it.
+    //
+    // ★★★ THE SCAN BELOW TAKES THE **FIRST** MATCH, AND THAT IS SAFE ONLY
+    // BECAUSE THE CALLER GUARANTEES THE LIST HAS NO REPEAT — a guarantee that
+    // did not exist until cycle P20 and is now made in two places, neither of
+    // which is here (D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-OPERAND):
+    //   * the C front end refuses a symbolic name used twice in one statement
+    //     (`S_InlineAsmDuplicateSymbolicName`) — operands and `asm goto` labels
+    //     share ONE name space, ✔MEASURED 2026-08-19 on gcc 13.3.0 and clang
+    //     19.1.1, which reject all three collisions;
+    //   * `mir_to_lir`'s binding builder refuses a repeated spelling in either
+    //     row set, for the direct-API producers that never run that pass.
+    // ⚠ DO NOT "HARDEN" THIS LOOKUP INSTEAD. A host that silently picked, or
+    // merged, or reported here would be answering a question about the CALLER's
+    // list from inside the engine — which holds no `%N` convention and cannot
+    // say which of two rows the author meant. The invariant belongs to whoever
+    // builds the list, and the sibling `bindingFor` is first-match for exactly
+    // the same reason.
     [[nodiscard]] std::optional<LirBlockId>
     resolveBranchTarget(std::string const& symbol, NodeId at,
                         std::string_view mnemonic) override {
+        for (auto const& b : labelBindings_) {
+            if (b.spelling == symbol) return b.block;
+        }
+        // ★ THE REFUSAL NAMES THE BOUND SET, THE SAME SHAPE THE UNBOUND-OPERAND
+        // ONE HAS — and for the same reason: the LABEL LIST is the embedding
+        // language's, so only its host can enumerate it, and the count is the
+        // whole diagnosis. `%l3` on a two-label `asm goto` is the shape this
+        // catches, and a generic "no such block" would be true and useless.
+        std::string bound;
+        for (auto const& b : labelBindings_) {
+            if (!bound.empty()) bound += ", ";
+            bound += '\'';
+            bound += b.spelling;
+            bound += '\'';
+        }
         sink_.fail(at, std::format(
-            "'{}' branches to '{}', and an assembly TEMPLATE declares no "
-            "labels: the blocks around it belong to the language that embedded "
-            "it, and a LIR block reference is function-local — binding one here "
-            "would name whichever block sits at that index in the caller{}",
-            mnemonic, symbol, sink_.pairSuffix()));
+            "'{}' branches to '{}', which is none of the {} `asm goto` label(s) "
+            "bound to this assembly template ({}) — a template declares no "
+            "labels of its own: the blocks around it belong to the language "
+            "that embedded it, and a LIR block reference is function-local, so "
+            "binding one here would name whichever block sits at that index in "
+            "the caller{}",
+            mnemonic, symbol, labelBindings_.size(),
+            bound.empty() ? std::string{"this template binds none"} : bound,
+            sink_.pairSuffix()));
         return std::nullopt;
     }
 
@@ -2572,9 +2706,19 @@ public:
         return std::nullopt;
     }
 
+    // ⚠ EMPTY, AND THE REASON MOVED WITH P20 RATHER THAN SURVIVING IT. This
+    // used to read *"no label model ⇒ nothing here is address-taken"*, which
+    // stopped being the reason the moment `asm goto` labels became bindable.
+    // The reason now is narrower and still decisive: a bound label is a BRANCH
+    // TARGET the template named explicitly, not a block whose ADDRESS was
+    // taken, and an indirect branch's successor set is the address-taken set.
+    // Handing it the bound labels would claim `jmp *%rax` can only reach the
+    // `asm goto` targets — a claim nothing in the template supports and one the
+    // optimizer would believe. Empty is a REFUSAL here (`addressTakenSuccessors`
+    // states so in its own contract), which is the honest answer.
     [[nodiscard]] std::vector<LirBlockId>
     addressTakenSuccessors() const override {
-        return {};   // no label model ⇒ nothing here is address-taken
+        return {};
     }
 
     void onInstructionEmitted() override { ++emitted_; }
@@ -2592,6 +2736,7 @@ private:
 
     TargetSchema const&                target_;
     std::span<AsmOperandBinding const> bindings_;
+    std::span<AsmLabelBinding const>   labelBindings_;
     AsmDiagnosticSink&                 sink_;
     std::size_t                        emitted_    = 0;
     bool                               terminated_ = false;
@@ -2801,7 +2946,8 @@ bool lowerAsmTemplateToLirRun(Tree const&                        templateTree,
                               TargetSchema const&                target,
                               std::span<AsmOperandBinding const> bindings,
                               LirBuilder&                        builder,
-                              DiagnosticReporter&                reporter) {
+                              DiagnosticReporter&                reporter,
+                              std::span<AsmLabelBinding const>   labelBindings) {
     AsmDiagnosticSink sink{templateTree, dialect, target, reporter};
     auto const&       cfg = dialect.assembly();
     // ⚠ NOT AN ASSERT, for the reason the standalone entry states: a caller
@@ -2819,7 +2965,7 @@ bool lowerAsmTemplateToLirRun(Tree const&                        templateTree,
         return false;
     }
 
-    TemplateHost           host{target, bindings, sink};
+    TemplateHost           host{target, bindings, labelBindings, sink};
     AsmInstructionLowering engine{templateTree, dialect, target,
                                   builder,      sink,   host};
     if (!engine.resolveRows()) return false;

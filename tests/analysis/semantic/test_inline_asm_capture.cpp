@@ -24,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace dss;
@@ -172,8 +173,10 @@ TEST(InlineAsmCapture, EveryOperandYieldsAConstraintAndAValueExpressionNodeId) {
             NodeId const n = cursor.current();
             if (t.kind(n) != NodeKind::Internal || t.rule(n).v != ia.rule.v) return;
             found = true;
-            auto const f = gatherInlineAsmFacts(t, n, ia, schema.semantics().identifierToken,
-                                                schema.hirLowering().stringBodyToken);
+            auto const f = gatherInlineAsmFacts(
+                t, n, ia, schema.semantics().inlineAsmTemplateLexemes,
+                schema.semantics().identifierToken,
+                schema.hirLowering().stringBodyToken);
             ASSERT_EQ(f.operands.size(), 2u);
             EXPECT_EQ(f.outputCount, 1u) << "outputs come FIRST and outputCount splits";
             EXPECT_TRUE(f.isExtended)    << "any colon makes the statement extended";
@@ -197,6 +200,248 @@ TEST(InlineAsmCapture, EveryOperandYieldsAConstraintAndAValueExpressionNodeId) {
         });
     }
     EXPECT_TRUE(found) << "the fixture must contain one asmStmt";
+}
+
+// ★★★ THE MINTING SITE, PINNED ON CONTENT. Every tier below the front end
+// COMPARES template spellings and never composes one, so the strings this
+// gatherer produces ARE the contract — a count assertion would be satisfied by
+// two wrong strings, which is the failure this pin exists to exclude.
+//
+// ★★ THE FIXTURE IS CHOSEN TO DISCRIMINATE THE ONE MISTAKE THAT IS INVISIBLE
+// EVERYWHERE ELSE: a `"+"` read-write operand is ONE entry in the source list
+// and becomes an output PLUS a synthesized tied input further down the
+// pipeline. A label base computed from that later list would be 3 here instead
+// of 2, so `%l2` would silently name the WRONG edge (or be refused as naming an
+// operand). With ONE output and ONE input the two bases agree and the pin
+// proves nothing — hence the `"+"`.
+//
+// ⓘ The lexeme guards below are not decoration: the expectations are literal
+// bytes, so if the c-subset ever re-spelled a sigil this would fail with a
+// confusing string diff instead of naming the config change that caused it.
+TEST(InlineAsmCapture, EverySpellingIsMintedFromTheDeclaredLexemesAndAPlusOperandCountsOnce) {
+    auto cu = buildShippedUnit(
+        "c-subset",
+        {wrap("__asm__ goto (\"jmp %l2\" : [o] \"+r\"(lo) : \"r\"(hi) : : lbl);")});
+    assertNoBuilderErrors(*cu);
+    auto const& schema = cu->schema();
+    auto const& ia     = schema.semantics().inlineAsm;
+    auto const& lex    = schema.semantics().inlineAsmTemplateLexemes;
+    ASSERT_TRUE(ia.rule.valid());
+    ASSERT_EQ(lex.placeholder, "%");
+    ASSERT_EQ(lex.labelPlaceholder, "%l");
+    ASSERT_EQ(lex.symbolicNameOpen, "[");
+    ASSERT_EQ(lex.symbolicNameClose, "]");
+
+    bool found = false;
+    for (auto const& t : cu->trees()) {
+        walkPreOrder(t, [&](TreeCursor const& cursor) {
+            NodeId const n = cursor.current();
+            if (t.kind(n) != NodeKind::Internal || t.rule(n).v != ia.rule.v) return;
+            found = true;
+            auto const f = gatherInlineAsmFacts(
+                t, n, ia, lex, schema.semantics().identifierToken,
+                schema.hirLowering().stringBodyToken);
+            ASSERT_EQ(f.operands.size(), 2u)
+                << "a `+` operand is ONE entry in the source list";
+            ASSERT_EQ(f.labels.size(), 1u);
+
+            // Positional first, then symbolic — the order the header states.
+            EXPECT_EQ(f.operands[0].spellings,
+                      (std::vector<std::string>{"%0", "%[o]"}));
+            // No `[name]` was written, so there is no symbolic spelling to mint
+            // — and minting one anyway would let `%[hi]` bind a variable name
+            // the statement never exposed to the template.
+            EXPECT_EQ(f.operands[1].spellings,
+                      (std::vector<std::string>{"%1"}));
+            // Bracketed first, then positional; the index is
+            // `operandCount + position` = 2, NOT 3.
+            EXPECT_EQ(f.labels[0].spellings,
+                      (std::vector<std::string>{"%l[lbl]", "%l2"}));
+        });
+    }
+    EXPECT_TRUE(found) << "the fixture must contain one asmStmt";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1b. THE MINTING IS THE ONLY NUMBERING — THE DERIVATION, SHOWN LIVE
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// What the template scan SAID, so an arm can assert on content rather than on a
+// count. The scan is a free template over its report sink, which is why it can
+// be driven here with no analyzer, no target and no diagnostic engine.
+struct ScanSaid {
+    std::vector<DiagnosticCode> codes;
+    std::vector<std::string>    messages;
+    [[nodiscard]] bool clean() const { return codes.empty(); }
+    [[nodiscard]] std::string joined() const {
+        std::string out;
+        for (auto const& m : messages) { out += m; out += "\n"; }
+        return out.empty() ? std::string{"(the scan said nothing)"} : out;
+    }
+};
+
+[[nodiscard]] ScanSaid scanTemplate(InlineAsmFacts const&           f,
+                                    InlineAsmTemplateLexemes const& lex,
+                                    std::string_view                text) {
+    ScanSaid said;
+    inline_asm_detail::scanInlineAsmTemplate(
+        f, lex, text,
+        [&](DiagnosticCode code, NodeId, std::string message) {
+            said.codes.push_back(code);
+            said.messages.push_back(std::move(message));
+        });
+    return said;
+}
+
+// A form as a diagnostic quotes it. A backtick is this project's quoting
+// convention and no language's syntax, so writing one here is not writing a
+// sigil.
+[[nodiscard]] std::string quoted(std::string const& form) {
+    return "`" + form + "`";
+}
+
+// The facts of the ONE `asmStmt` in `cu`, or nullopt when it holds none.
+[[nodiscard]] std::optional<InlineAsmFacts>
+onlyAsmFacts(CompilationUnit const& cu) {
+    auto const& schema = cu.schema();
+    auto const& ia     = schema.semantics().inlineAsm;
+    if (!ia.rule.valid()) return std::nullopt;
+    std::optional<InlineAsmFacts> out;
+    for (auto const& t : cu.trees()) {
+        walkPreOrder(t, [&](TreeCursor const& cursor) {
+            NodeId const n = cursor.current();
+            if (t.kind(n) != NodeKind::Internal || t.rule(n).v != ia.rule.v) return;
+            if (out.has_value()) {
+                ADD_FAILURE() << "the fixture holds more than one asmStmt — the "
+                                 "arm below would be measuring whichever came "
+                                 "last";
+                return;
+            }
+            out = gatherInlineAsmFacts(t, n, ia,
+                                       schema.semantics().inlineAsmTemplateLexemes,
+                                       schema.semantics().identifierToken,
+                                       schema.hirLowering().stringBodyToken);
+        });
+    }
+    return out;
+}
+
+} // namespace
+
+// ★★★ THE PIN THAT PROVES THE SEMANTIC TIER'S ANSWER **IS** THE MINTING'S
+// ANSWER, RATHER THAN A SECOND ANSWER THAT AGREES WITH IT.
+//
+// ⚠⚠ WHAT THE REST OF THIS FILE COULD NOT DO, AND IT WAS MEASURED BY AN
+// INDEPENDENT P20 AUDIT RATHER THAN REASONED ABOUT: force
+// `mintTemplateSpellings`' base to 0 and every other arm here stays GREEN.
+// `scanInlineAsmTemplate` re-derived `base = operandCount` in FIVE places — the
+// rendered label range, both `%l<N>` bounds, the `%<N>` label-range test, and an
+// INDEX MAPPING (`f.labels[idx - operandCount]`) that named a label in a message
+// — so the two copies agreed in the shipped tree and diverged only under a
+// mutant this suite had no way to build. The divergence surfaced two tiers down,
+// at the LIR label binding. A pin satisfied by two copies that happen to agree
+// is not a pin on the derivation.
+//
+// ★★ SO THE MUTANT IS BUILT HERE, ON THE FACT ITSELF: the label's spellings are
+// rewritten exactly as a base of 0 would have minted them, and the SAME scan is
+// re-run over the SAME templates. Every verdict must INVERT. That can only
+// happen if the scan READS the spellings; a scan holding a numbering of its own
+// answers identically in both columns, which is the RED this arm produces on the
+// pre-P20 code.
+//
+// ⓘ THE SHAPE IS `test_inline_asm_template_sigil_agreement.cpp`'s, one tier
+// over: move the single declaration and require everything downstream to move
+// with it. There the declaration is on disk (the language's lexemes) and the
+// mutant is a config rewrite; here it is a C++ list and the mutant is a rewrite
+// of that list.
+//
+// ★ THE FIXTURE'S `"+"` OPERAND IS LOAD-BEARING, for the reason the minting pin
+// above states: it is ONE entry in the source list and becomes an output PLUS a
+// synthesized tied input further down, so a base taken from that later list
+// would be 3 here. And the fixture's own template carries NO placeholder at all
+// — every form this arm asks about is built through the language's renderers, so
+// no GNU byte is written in the assertions.
+TEST(InlineAsmCapture, TheTemplateScanFollowsTheMintedSpellingsRatherThanRecomputingTheBase) {
+    auto cu = buildShippedUnit(
+        "c-subset",
+        {wrap("__asm__ goto (\"jmp\" : [o] \"+r\"(lo) : \"r\"(hi) : : lbl);")});
+    assertNoBuilderErrors(*cu);
+    auto const& lex = cu->schema().semantics().inlineAsmTemplateLexemes;
+    ASSERT_FALSE(lex.placeholder.empty())
+        << "c-subset declares no operand placeholder — the scan returns without "
+           "scanning and this arm would assert nothing";
+    ASSERT_FALSE(lex.labelPlaceholder.empty())
+        << "c-subset declares no label placeholder — there would be no label "
+           "numbering to move";
+
+    auto const shipped = onlyAsmFacts(*cu);
+    ASSERT_TRUE(shipped.has_value()) << "the fixture must contain one asmStmt";
+    ASSERT_EQ(shipped->operands.size(), 2u) << "a `+` operand is ONE entry";
+    ASSERT_EQ(shipped->labels.size(), 1u);
+    ASSERT_TRUE(shipped->isExtended) << "any colon makes the statement extended";
+    std::string const labelName = shipped->labels[0].name;
+    ASSERT_FALSE(labelName.empty());
+
+    // The form the SHIPPED minting gives this label, and the form a base of 0
+    // would give it. Both through the language's own renderer.
+    std::string const shippedForm = lex.labelRef("2");
+    std::string const mutantForm  = lex.labelRef("0");
+    ASSERT_NE(shippedForm, mutantForm);
+    ASSERT_EQ(shipped->labels[0].spellings,
+              (std::vector<std::string>{lex.namedLabelRef(labelName), shippedForm}))
+        << "THE PREMISE: the shipped minting numbers this label AFTER the two "
+           "operands. Without it the two columns below are not a differential";
+
+    // ── COLUMN 1: the SHIPPED minting ──
+    auto const okShipped = scanTemplate(*shipped, lex, "jmp " + shippedForm);
+    EXPECT_TRUE(okShipped.clean())
+        << "the form the minting gives this label must clear the tier that "
+           "guards the lowering: " << okShipped.joined();
+    auto const badShipped = scanTemplate(*shipped, lex, "jmp " + mutantForm);
+    EXPECT_FALSE(badShipped.clean())
+        << "under the shipped minting that index names OPERAND 0, not a label";
+
+    // ── COLUMN 2: the MUTANT — the same list, minted at a base of 0 ──
+    InlineAsmFacts mutant = *shipped;
+    mutant.labels[0].spellings = {lex.namedLabelRef(labelName), mutantForm};
+    ASSERT_NE(mutant.labels[0].spellings, shipped->labels[0].spellings)
+        << "the mutation left the spellings IDENTICAL — both columns below would "
+           "be measuring one state twice, which is the shape of a red-on-disable "
+           "whose 'good' column silently ran the mutant";
+
+    EXPECT_FALSE(scanTemplate(mutant, lex, "jmp " + shippedForm).clean())
+        << "the scan still ACCEPTS the shipped label form after the minting "
+           "moved it — it is deciding from a numbering of its own, which is the "
+           "two-owner state this arm exists to forbid";
+    auto const okMutant = scanTemplate(mutant, lex, "jmp " + mutantForm);
+    EXPECT_TRUE(okMutant.clean())
+        << "the scan did not FOLLOW the minting to the form it now mints — it "
+           "kept validating against a base it computed itself: "
+        << okMutant.joined();
+
+    // ── AND THE `%<N>` SIDE MOVES TOO ──
+    // The operand form's "you meant the label" advice is the same fact read from
+    // the other side, and it used to be reached by INDEXING
+    // `f.labels[idx - operandCount]` — the fifth re-derivation the audit named,
+    // a real index mapping rather than prose. Under the shipped minting index 2
+    // IS this statement's label; after the minting moves it names nothing, and
+    // advice that still recommended the label would be reading a numbering this
+    // tier no longer has.
+    auto const advice = scanTemplate(*shipped, lex, "jmp " + lex.operandRef("2"));
+    ASSERT_FALSE(advice.clean()) << "no operand answers to that form";
+    EXPECT_NE(advice.joined().find(quoted(lex.namedLabelRef(labelName))),
+              std::string::npos)
+        << "the actionable half is the forms the label at that index answers to: "
+        << advice.joined();
+    auto const noAdvice = scanTemplate(mutant, lex, "jmp " + lex.operandRef("2"));
+    ASSERT_FALSE(noAdvice.clean());
+    EXPECT_EQ(noAdvice.joined().find(lex.namedLabelRef(labelName)),
+              std::string::npos)
+        << "after the minting moved, index 2 names neither an operand nor a "
+           "label — recommending the label anyway would be the index mapping "
+           "answering from a base of its own: " << noAdvice.joined();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -650,96 +895,380 @@ TEST(InlineAsmAcceptance, WithNoTargetTheMachineQuestionsAreUnaskedAndTheGrammar
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. THE `asm goto` LABEL REFERENCE — THE TWO SPELLINGS, AND WHICH TIER OWNS
-//    THE ANSWER (D-CSUBSET-INLINE-ASM-POSITIONAL-LABEL-REF-ACCEPTED-WITH-NO-
-//    GRAMMAR)
+// 6. THE `asm goto` LABEL REFERENCE — BOTH SPELLINGS ACCEPTED, THE INDEX
+//    CHECKED AGAINST THE REAL RULE
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ★★★ THE DEFECT THIS PINS WAS A PASSING TEST, NOT A FAILING ONE. Before
-// 2026-08-17 the semantic tier RANGE-CHECKED a positional `%l<N>` and let a
-// valid one through in silence, while `asm.lang.json` declared exactly one
-// label-reference shape — the bracketed `%l[name]` — and no production the
-// positional spelling could ever match. One construct, two tiers, two answers.
+// ★★★ THIS TEST WAS INVERTED IN P20, AND THE INVERSION IS THE POINT. It used to
+// pin a blanket REFUSAL of the positional `%l<N>` — correct while nothing below
+// this tier could represent a label reference, and a DIVERGENCE the moment the
+// grammar and the lowering could. Both reference compilers accept `%l<N>`, and
+// §A.3b of the bar makes one working reference enough to require the behaviour;
+// so the question this tier may ask is only whether the INDEX names a label.
+// The refusal was not deleted, it was replaced by the check it was standing in
+// for, and every arm below states which side of the boundary it is on.
 //
-// ⚠ THE ASSERTION IS ON CONTENT, NEVER ON A COUNT OF DIAGNOSTICS. "One error
+// ⚠ THE ASSERTIONS ARE ON CONTENT, NEVER ON A COUNT OF DIAGNOSTICS. "One error
 // fired" is satisfied by the wrong error; what has to hold is that the message
-// names the CONSTRUCT (`asm goto`), states the spelling this build declares,
-// and — when the index resolves — names the very label the author meant, which
-// is the half that lets them rewrite it.
-TEST(InlineAsmRefusals, APositionalAsmGotoLabelReferenceIsRefusedNamingTheDeclaredSpelling) {
-    // `%l0` with ZERO operands is the FIRST label — an IN-RANGE reference, and
-    // therefore the one the old range check passed silently. This is the arm
-    // that would have gone green before the fix.
-    auto inRange = analyzeFor(
-        "x86_64", wrap("__asm__ goto (\"jmp %l0\" : : : : lbl);"));
-    ASSERT_TRUE(inRange.model.has_value());
-    EXPECT_TRUE(has(*inRange.model,
-                    DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
-        << "an IN-RANGE positional label reference must still be refused — the "
-           "index is not the property in question, the SHAPE is: "
-        << errorInventory(*inRange.model);
-
-    bool namedTheConstructAndTheLabel = false;
-    for (auto const& d : inRange.model->diagnostics().all()) {
-        if (d.code != DiagnosticCode::S_InlineAsmOperandModifierUnsupported)
-            continue;
-        namedTheConstructAndTheLabel =
-            d.actual.find("asm goto") != std::string::npos
-            && d.actual.find("%l0") != std::string::npos
-            // The DECLARED spelling, rendered with the author's own label name
-            // — not a generic "use brackets".
-            && d.actual.find("`%l[lbl]`") != std::string::npos;
+// names the CONSTRUCT, states what the written form actually names, and quotes
+// the spelling that WOULD have named the author's target.
+//
+// ⓘ THE EXPECTATIONS BELOW ARE LITERAL BYTES, GUARDED. Every quoted form is one
+// the c-subset currently declares, so the guard at the top names the config
+// change if a sigil is ever re-spelled — the same reason the minting pin carries
+// one. The forms themselves are not owned here: they are what
+// `mintTemplateSpellings` produced, read back out of a diagnostic.
+TEST(InlineAsmRefusals, APositionalAsmGotoLabelReferenceIsAcceptedAndItsIndexIsCheckedAgainstTheLabelRange) {
+    {
+        auto probe = buildShippedUnit("c-subset", {wrap("__asm__ (\"\");")});
+        auto const& lex = probe->schema().semantics().inlineAsmTemplateLexemes;
+        ASSERT_EQ(lex.placeholder,       "%");
+        ASSERT_EQ(lex.labelPlaceholder,  "%l");
+        ASSERT_EQ(lex.symbolicNameOpen,  "[");
+        ASSERT_EQ(lex.symbolicNameClose, "]");
     }
-    EXPECT_TRUE(namedTheConstructAndTheLabel)
-        << "the refusal must name `asm goto`, quote the form as written, and "
-           "render the bracketed spelling WITH the label this index resolves "
-           "to: " << errorInventory(*inRange.model);
 
-    // An OUT-OF-RANGE positional reference is refused by the SAME code — the
-    // form is unsupported whether or not the index would have resolved, and
-    // reporting it as "out of range" would tell the author to renumber a
-    // spelling that has no shape at any number.
-    auto outOfRange = analyzeFor(
+    // The message text of the FIRST diagnostic carrying `code`, or "" when none
+    // did — so an arm can assert what a refusal SAYS rather than that one fired.
+    auto const messageFor = [](SemanticModel const& m, DiagnosticCode code) {
+        for (auto const& d : m.diagnostics().all()) {
+            if (d.code == code) return d.actual;
+        }
+        return std::string{};
+    };
+
+    // ── (a) THE ARM THAT WAS RED BEFORE P20. Zero operands, one label ⇒ the
+    // label's index is 0, `%l0` names it, and nothing is wrong with this
+    // statement at all.
+    auto ok0 = analyzeFor("x86_64",
+                          wrap("__asm__ goto (\"jmp %l0\" : : : : lbl);"));
+    ASSERT_TRUE(ok0.model.has_value());
+    EXPECT_FALSE(ok0.model->hasErrors())
+        << "a correctly-numbered positional label reference is legal on both "
+           "references and must be legal here: " << errorInventory(*ok0.model);
+
+    // ── (b) THE INDEX BASE, WITH OPERANDS PRESENT — the arm that
+    // discriminates. With ZERO operands the "labels are numbered after the
+    // operands" rule and a labels-only numbering AGREE, so (a) alone cannot
+    // catch a wrong base. One input operand moves the label to index 1.
+    auto ok1 = analyzeFor(
+        "x86_64", wrap("__asm__ goto (\"jmp %l1\" : : \"r\"(hi) : : lbl);"));
+    ASSERT_TRUE(ok1.model.has_value());
+    EXPECT_FALSE(ok1.model->hasErrors())
+        << "GNU 6.47.2.7 numbers the labels AFTER every operand, so with one "
+           "operand the first label is index 1: " << errorInventory(*ok1.model);
+
+    // ── (c) A `"+"` OPERAND COUNTS ONCE. It is realized further down the
+    // pipeline as an output PLUS a synthesized tied input, so a base taken from
+    // that later list would be 3 here and `%l2` would name the wrong thing.
+    // The source list has TWO operands, so the label is index 2.
+    auto plus = analyzeFor(
+        "x86_64",
+        wrap("__asm__ goto (\"jmp %l2\" : [o] \"+r\"(lo) : \"r\"(hi) : : lbl);"));
+    ASSERT_TRUE(plus.model.has_value());
+    EXPECT_FALSE(plus.model->hasErrors())
+        << "a `+` operand is ONE entry of the index space the source declares — "
+           "counting it twice shifts every label reference: "
+        << errorInventory(*plus.model);
+
+    // ── (d) AN INDEX THAT LANDS AMONG THE OPERANDS. The reference calls this
+    // "'%l' operand isn't a label"; the message here must say which range the
+    // index fell in and quote the operand form that WOULD have named it.
+    auto namesOperand = analyzeFor(
+        "x86_64", wrap("__asm__ goto (\"jmp %l0\" : : \"r\"(hi) : : lbl);"));
+    ASSERT_TRUE(namesOperand.model.has_value());
+    ASSERT_TRUE(has(*namesOperand.model,
+                    DiagnosticCode::S_InlineAsmPlaceholderOutOfRange))
+        << errorInventory(*namesOperand.model);
+    {
+        std::string const msg = messageFor(
+            *namesOperand.model, DiagnosticCode::S_InlineAsmPlaceholderOutOfRange);
+        EXPECT_NE(msg.find("`%l0`"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("names an OPERAND"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("Write `%0`"), std::string::npos)
+            << "the actionable half is the spelling that names what index 0 IS: "
+            << msg;
+        EXPECT_NE(msg.find("`%l1`"), std::string::npos)
+            << "and the index the author's label actually has: " << msg;
+    }
+
+    // ── (e) AN INDEX PAST EVERY LABEL. The reference calls this "operand
+    // number out of range", and the message must state what DOES name a label.
+    //
+    // ★★ THE INVENTORY REPLACED A RENDERED `%l0..%l0` RANGE IN P20, AND IT IS
+    // NOT A COSMETIC SWAP. A range has to know where the label numbering starts,
+    // so rendering one made this tier state the numbering a SECOND time — one of
+    // the five re-derivations the audit found. These are the MINTED spellings
+    // read back, which is strictly more (the symbolic form is in them) and
+    // cannot disagree with what the lowering binds.
+    auto beyond = analyzeFor(
         "x86_64", wrap("__asm__ goto (\"jmp %l7\" : : : : lbl);"));
-    ASSERT_TRUE(outOfRange.model.has_value());
-    EXPECT_TRUE(has(*outOfRange.model,
-                    DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
-        << errorInventory(*outOfRange.model);
-    EXPECT_EQ(countOf(*outOfRange.model,
-                      DiagnosticCode::S_InlineAsmPlaceholderOutOfRange), 0u)
-        << "an unsupported SHAPE must not be reported as an out-of-range INDEX "
-           "— that message sends the author to renumber something that cannot "
-           "parse at any number: " << errorInventory(*outOfRange.model);
+    ASSERT_TRUE(beyond.model.has_value());
+    ASSERT_TRUE(has(*beyond.model,
+                    DiagnosticCode::S_InlineAsmPlaceholderOutOfRange))
+        << errorInventory(*beyond.model);
+    {
+        std::string const msg =
+            messageFor(*beyond.model, DiagnosticCode::S_InlineAsmPlaceholderOutOfRange);
+        EXPECT_NE(msg.find("`%l7`"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("`%l0`"), std::string::npos)
+            << "the form the label actually answers to is the fact that lets the "
+               "author renumber: " << msg;
+        EXPECT_NE(msg.find("`%l[lbl]`"), std::string::npos)
+            << "and the symbolic form, which is minted alongside it and is the "
+               "one an edited label list cannot silently renumber: " << msg;
+    }
 
-    // ★★ POSITIVE CONTROL #1 — THE BRACKETED SPELLING, WHICH THE GRAMMAR DOES
-    // DECLARE, MUST STILL CLEAR THIS TIER. Without it the pin above is
-    // satisfied by a blanket "refuse every `%l`", which is a different (and
-    // wrong) compiler. The bracketed form's own capability gap is refused
-    // downstream, by the tier that owns the missing label carrier.
+    // ── (f) A PLAIN `%N` THAT LANDS IN THE LABEL RANGE is the SIGIL being
+    // wrong, not the number, and saying only "this statement declares 0
+    // operands" would send the author to add an operand they do not want.
+    auto wrongSigil = analyzeFor(
+        "x86_64", wrap("__asm__ goto (\"jmp %0\" : : : : lbl);"));
+    ASSERT_TRUE(wrongSigil.model.has_value());
+    ASSERT_TRUE(has(*wrongSigil.model,
+                    DiagnosticCode::S_InlineAsmPlaceholderOutOfRange))
+        << errorInventory(*wrongSigil.model);
+    {
+        std::string const msg = messageFor(
+            *wrongSigil.model, DiagnosticCode::S_InlineAsmPlaceholderOutOfRange);
+        EXPECT_NE(msg.find("names an `asm goto` LABEL"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("`%l0`"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("`%l[lbl]`"), std::string::npos)
+            << "the named form is the one an edited label list cannot silently "
+               "renumber, so it is offered alongside: " << msg;
+    }
+
+    // ── (g) THE BRACKETED SPELLING, unchanged: a name in the list clears this
+    // tier, a name that is not in it is refused. Without BOTH halves the pin
+    // above is satisfied by a compiler that accepts every `%l`.
     auto bracketed = analyzeFor(
         "x86_64", wrap("__asm__ goto (\"jmp %l[lbl]\" : : : : lbl);"));
     ASSERT_TRUE(bracketed.model.has_value());
-    EXPECT_EQ(countOf(*bracketed.model,
-                      DiagnosticCode::S_InlineAsmOperandModifierUnsupported), 0u)
-        << "the BRACKETED `%l[name]` is the spelling this build's grammar "
-           "declares — refusing it here would make the two tiers disagree in "
-           "the opposite direction: " << errorInventory(*bracketed.model);
+    EXPECT_FALSE(bracketed.model->hasErrors()) << errorInventory(*bracketed.model);
 
-    // ★★ POSITIVE CONTROL #2 — an ORDINARY operand placeholder is untouched.
-    // `%l` and `%0` share the `%` sigil, so a refusal keyed too loosely would
-    // take the operand form with it.
+    auto unknownName = analyzeFor(
+        "x86_64", wrap("__asm__ goto (\"jmp %l[nope]\" : : : : lbl);"));
+    ASSERT_TRUE(unknownName.model.has_value());
+    EXPECT_TRUE(has(*unknownName.model,
+                    DiagnosticCode::S_InlineAsmPlaceholderOutOfRange))
+        << "a `%l[name]` naming no declared label is the reference's 'undefined "
+           "named operand' and must stay refused: "
+        << errorInventory(*unknownName.model);
+
+    // ── (g2) AND THE NAMED MIRROR OF (d): a `%l[name]` whose name belongs to
+    // an OPERAND is the sigil being wrong, not the name. "that label does not
+    // exist" would be true and would send the author to add a label they do not
+    // want; the operand form is what they meant to write.
+    auto labelSigilOnAnOperandName = analyzeFor(
+        "x86_64",
+        wrap("__asm__ goto (\"jmp %l[o]\" : [o] \"=r\"(lo) : : : lbl);"));
+    ASSERT_TRUE(labelSigilOnAnOperandName.model.has_value());
+    ASSERT_TRUE(has(*labelSigilOnAnOperandName.model,
+                    DiagnosticCode::S_InlineAsmPlaceholderOutOfRange))
+        << errorInventory(*labelSigilOnAnOperandName.model);
+    {
+        std::string const msg =
+            messageFor(*labelSigilOnAnOperandName.model,
+                       DiagnosticCode::S_InlineAsmPlaceholderOutOfRange);
+        EXPECT_NE(msg.find("belongs to an OPERAND"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("`%[o]`"), std::string::npos)
+            << "the operand form built from the author's own name: " << msg;
+    }
+
+    // ── (h) A LABEL LISTED AND NEVER REFERENCED IS LEGAL, and silent, on both
+    // references. A tier that "helpfully" reported the unused edge would refuse
+    // working programs — the divergence this whole section just came back from.
+    auto unreferenced = analyzeFor(
+        "x86_64", wrap("__asm__ goto (\"nop\" : : : : lbl);"));
+    ASSERT_TRUE(unreferenced.model.has_value());
+    EXPECT_FALSE(unreferenced.model->hasErrors())
+        << errorInventory(*unreferenced.model);
+
+    // ── (i) AN ORDINARY OPERAND PLACEHOLDER IS UNTOUCHED. `%l` and `%0` share
+    // the `%` sigil, so a check keyed too loosely would take the operand form
+    // with it.
     auto operand = analyzeFor(
         "x86_64", wrap("__asm__ (\"m %0\" : \"=r\"(lo));"));
     ASSERT_TRUE(operand.model.has_value());
     EXPECT_FALSE(operand.model->hasErrors()) << errorInventory(*operand.model);
 
-    // ★ AND THE REFUSAL IS TARGET-INDEPENDENT, because the label form is GNU
-    // inline-asm vocabulary rather than a processor fact. arm64 must answer
-    // identically — a divergence here would mean the check had picked up a
-    // target dependency it has no business having.
-    auto arm = analyzeFor("arm64", wrap("__asm__ goto (\"b %l0\" : : : : lbl);"));
+    // ── (j) AND THE WHOLE RULE IS TARGET-INDEPENDENT, because label numbering
+    // is GNU inline-asm vocabulary rather than a processor fact. arm64 must
+    // answer identically in BOTH directions — accepting the valid index and
+    // refusing the out-of-range one — or the check has picked up a target
+    // dependency it has no business having.
+    auto armOk = analyzeFor("arm64", wrap("__asm__ goto (\"b %l0\" : : : : lbl);"));
+    ASSERT_TRUE(armOk.model.has_value());
+    EXPECT_FALSE(armOk.model->hasErrors()) << errorInventory(*armOk.model);
+
+    auto armBad = analyzeFor("arm64", wrap("__asm__ goto (\"b %l7\" : : : : lbl);"));
+    ASSERT_TRUE(armBad.model.has_value());
+    EXPECT_TRUE(has(*armBad.model,
+                    DiagnosticCode::S_InlineAsmPlaceholderOutOfRange))
+        << errorInventory(*armBad.model);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. ONE SYMBOLIC NAME USED TWICE — THE DEFECT THIS ARC OPENED, AND CLOSED
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ★★★ THE MEASUREMENT THAT MADE THIS TEST NECESSARY, AND IT IS THE STRONGEST
+// KIND: a WRONG ANSWER out of the shipped CLI, not a reasoned hazard.
+// ✔MEASURED 2026-08-19, `__asm__("movl %[v], %[out]" : [out] "=r"(r),
+// [v] "=r"(d) : [v] "r"(a))` with `a == 20`, compiled by the shipped
+// `dss-code-prime` for `x86_64:pe64-x86_64-windows-exec` at `--config=debug`
+// AND `--config=release`: rc=0 both times, and the program exited **0** where
+// 20 was written. `%[v]` bound the OUTPUT, because `mintTemplateSpellings` gives
+// both occurrences the same form and every spelling lookup below this tier is a
+// FIRST-MATCH scan over a list whose outputs come first
+// (D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-OPERAND).
+//
+// ★★ THE CYCLE THAT ADDED `%[name]` BINDING IS THE CYCLE THAT OPENED THIS. The
+// same shape used to be refused by name — "'%[v]' names neither a register this
+// target declares nor one of the N operand(s) bound" — so making the form bind
+// is precisely what turned a fail-loud refusal into a silent wrong answer.
+//
+// ★★ THE NAME SPACE IS ONE, AND THAT WAS MEASURED RATHER THAN ASSUMED.
+// ✔MEASURED 2026-08-19, `-std=gnu17`, EACH SHAPE PROBED SEPARATELY on gcc 13.3.0
+// and clang 19.1.1 — all three rejected, with the same message in each
+// ("duplicate 'asm' operand name" / "duplicate use of asm operand name" plus a
+// note at the first use): two OPERANDS sharing a name, two `asm goto` LABELS
+// sharing a name, and an OPERAND and a LABEL sharing a name.
+// ⇒ NOT ONE reference accepts any of them, which is what makes acceptance a
+// defect under the bidirectional half of the reference rule as §A.3b bounds it.
+// ⚠ DSS accepted all three; only the FIRST miscompiled. A fix scoped to the
+// operand list alone would have left the other two accepted and would have
+// looked complete, because the shape that miscompiles is the shape a probe finds
+// first.
+TEST(InlineAsmRefusals, ASymbolicNameUsedTwiceIsRefusedInAllThreeCollisions) {
+    // ── (a) TWO OPERANDS: the shape that returned the wrong answer. ──
+    auto twoOperands = analyzeFor(
+        "x86_64",
+        wrap("__asm__ (\"m %[v], %[o]\" : [o] \"=r\"(lo), [v] \"=r\"(hi) "
+             ": [v] \"r\"(lo));"));
+    ASSERT_TRUE(twoOperands.model.has_value());
+    EXPECT_TRUE(has(*twoOperands.model,
+                    DiagnosticCode::S_InlineAsmDuplicateSymbolicName))
+        << errorInventory(*twoOperands.model);
+    // ⚠ EXACTLY ONE REPORT, NOT ONE PER PAIR. A name used twice is ONE thing to
+    // fix; reporting the second occurrence against every earlier one would grow
+    // quadratically on a name used three times.
+    EXPECT_EQ(countOf(*twoOperands.model,
+                      DiagnosticCode::S_InlineAsmDuplicateSymbolicName), 1u)
+        << errorInventory(*twoOperands.model);
+
+    // ── (b) TWO `asm goto` LABELS. Both rows mint the same bracketed form. ──
+    auto twoLabels = analyzeShipped(
+        "c-subset",
+        {"int main(void){ unsigned a = 0; "
+         "__asm__ goto (\"jmp %l[hit]\" : : \"r\"(a) : : hit, hit); "
+         "return 0; hit: return 1; }\n"});
+    EXPECT_TRUE(has(twoLabels, DiagnosticCode::S_InlineAsmDuplicateSymbolicName))
+        << errorInventory(twoLabels);
+
+    // ── (c) AN OPERAND AND A LABEL. The DISCRIMINATING arm: `%[v]` and `%l[v]`
+    // are DIFFERENT template forms, so nothing here is ambiguous inside DSS and
+    // a check written over the operand list alone stays green. It is refused
+    // because GNU 6.47.2.3/6.47.2.7 keeps ONE name space and both references
+    // reject the pair — measured, not inferred. ──
+    auto crossKind = analyzeShipped(
+        "c-subset",
+        {"int main(void){ unsigned a = 0; "
+         "__asm__ goto (\"jmp %l[v]\" : : [v] \"r\"(a) : : v); "
+         "return 0; v: return 1; }\n"});
+    EXPECT_TRUE(has(crossKind, DiagnosticCode::S_InlineAsmDuplicateSymbolicName))
+        << errorInventory(crossKind);
+
+    // ── (d) THE MESSAGE NAMES BOTH OCCURRENCES AND CARRIES THE FIRST AS A
+    // `related` LOCATION. Without it the author is told a name is duplicated and
+    // left to find the other use — the half clang prints as a note. ──
+    bool sawRelated = false;
+    for (auto const& d : twoOperands.model->diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_InlineAsmDuplicateSymbolicName) continue;
+        EXPECT_NE(d.actual.find("duplicate inline-asm symbolic name `v`"),
+                  std::string::npos) << d.actual;
+        // ★ `[v]` is the SECOND output here, so "output operand 1" is the
+        // section-relative position — and that is exactly the discriminating
+        // assertion: its `%N` index is 1 as well, so a message that quoted the
+        // index would be indistinguishable on this statement. The INPUT half is
+        // what separates them: `[v]`'s `%N` is 2 and its section position is 0.
+        EXPECT_NE(d.actual.find("output operand 1"), std::string::npos)
+            << "the message must say WHERE the name was first used, in the "
+               "section the author wrote rather than as a `%N` index: "
+            << d.actual;
+        EXPECT_NE(d.actual.find("input operand 0"), std::string::npos)
+            << d.actual;
+        EXPECT_NE(d.actual.find("`%[v]`"), std::string::npos)
+            << "the ambiguous form is quoted through the language's own declared "
+               "lexemes, never as a hard-coded sigil: " << d.actual;
+        EXPECT_NE(d.actual.find(
+                      "D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-OPERAND"),
+                  std::string::npos) << d.actual;
+        sawRelated = !d.related.empty();
+    }
+    EXPECT_TRUE(sawRelated)
+        << "the first use must ride as a `related` location — the structured "
+           "form of clang's note";
+
+    // ── (e) THE CROSS-KIND MESSAGE SAYS SOMETHING DIFFERENT, because the
+    // consequence is different: nothing is ambiguous, the refusal is owed to the
+    // references. A single shared sentence would tell an author their two
+    // distinct forms collide, which is false. ──
+    for (auto const& d : crossKind.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_InlineAsmDuplicateSymbolicName) continue;
+        EXPECT_NE(d.actual.find("ONE name space"), std::string::npos) << d.actual;
+        EXPECT_NE(d.actual.find("`%[v]`"), std::string::npos) << d.actual;
+        EXPECT_NE(d.actual.find("`%l[v]`"), std::string::npos) << d.actual;
+    }
+
+    // ── (f) THE CONTROLS. Every one of these is a program both references
+    // COMPILE, and without them the pin is satisfied by refusing every named
+    // operand — the divergence in the other direction. ──
+    // Two DISTINCT operand names.
+    auto distinct = analyzeFor(
+        "x86_64",
+        wrap("__asm__ (\"m %[v], %[o]\" : [o] \"=r\"(lo) : [v] \"r\"(hi));"));
+    ASSERT_TRUE(distinct.model.has_value());
+    EXPECT_FALSE(distinct.model->hasErrors()) << errorInventory(*distinct.model);
+
+    // ONE name used ONCE on an operand ALSO referenced positionally — an operand
+    // answering to TWO forms is the normal case, not a duplicate.
+    auto twoFormsOneOperand = analyzeFor(
+        "x86_64", wrap("__asm__ (\"m %0, %[o]\" : [o] \"=r\"(lo));"));
+    ASSERT_TRUE(twoFormsOneOperand.model.has_value());
+    EXPECT_FALSE(twoFormsOneOperand.model->hasErrors())
+        << errorInventory(*twoFormsOneOperand.model);
+
+    // TWO ANONYMOUS operands. Their names are both empty, and folding empty
+    // names together would refuse the commonest shape in the language.
+    auto anonymous = analyzeFor(
+        "x86_64", wrap("__asm__ (\"m %0, %1\" : \"=r\"(lo) : \"r\"(hi));"));
+    ASSERT_TRUE(anonymous.model.has_value());
+    EXPECT_FALSE(anonymous.model->hasErrors()) << errorInventory(*anonymous.model);
+
+    // A NAMED operand beside a DIFFERENTLY-named label on the same statement.
+    auto namedBoth = analyzeShipped(
+        "c-subset",
+        {"int main(void){ unsigned a = 0; "
+         "__asm__ goto (\"jmp %l[hit]\" : : [v] \"r\"(a) : : hit); "
+         "return 0; hit: return 1; }\n"});
+    EXPECT_FALSE(namedBoth.hasErrors()) << errorInventory(namedBoth);
+
+    // ── (g) TARGET-INDEPENDENT. A repeated name is host-language vocabulary,
+    // not a processor fact, so arm64 must answer identically — and the check
+    // must fire with NO target at all, which is the LSP / FFI-header-parser
+    // path. ──
+    auto arm = analyzeFor(
+        "arm64",
+        wrap("__asm__ (\"m %[v], %[o]\" : [o] \"=r\"(lo), [v] \"=r\"(hi) "
+             ": [v] \"r\"(lo));"));
     ASSERT_TRUE(arm.model.has_value());
-    EXPECT_TRUE(has(*arm.model,
-                    DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
+    EXPECT_TRUE(has(*arm.model, DiagnosticCode::S_InlineAsmDuplicateSymbolicName))
         << errorInventory(*arm.model);
+    auto noTarget = analyzeShipped(
+        "c-subset",
+        {wrap("__asm__ (\"m %[v], %[o]\" : [o] \"=r\"(lo), [v] \"=r\"(hi) "
+              ": [v] \"r\"(lo));")});
+    EXPECT_TRUE(has(noTarget, DiagnosticCode::S_InlineAsmDuplicateSymbolicName))
+        << errorInventory(noTarget);
 }

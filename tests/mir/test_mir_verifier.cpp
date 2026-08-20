@@ -8,7 +8,11 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/substrate/arena_container.hpp"
 #include "mir/mir.hpp"
+#include "mir/mir_asm_descriptor.hpp"
+#include "mir/mir_node.hpp"
+#include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"
 #include "mir/mir_verifier.hpp"
 #include "diagnostic_count.hpp"
@@ -19,6 +23,8 @@
 #include <array>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 using namespace dss;
 using dss::test_support::countCode;
@@ -1669,4 +1675,297 @@ TEST(MirVerifier, CallSignatureRuleSkippedWithoutInterner) {
     MirVerifier v{m};                     // no interner
     EXPECT_TRUE(v.verify(r));
     EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE TERMINATOR-SUCCESSOR-ARITY BACKSTOP + THE INLINE-ASM POOL RANGE CHECK
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ★★★ THESE TWO RULES EXIST BECAUSE A DOCBLOCK CLAIMED A CHECK THAT DID NOT
+// EXIST — `MirBuilder::recordSuccessors_` justified itself by saying "ML3's
+// verifier re-runs the same descriptor check on any frozen module". It did not.
+// Shipping the replacement UNTESTED would be the same species one generation on:
+// mechanism present, nothing forcing it to matter. Every arm below is therefore
+// built through the DIRECT `Mir` ctor and not through `MirBuilder`, which is not
+// a workaround for an inconvenient builder — it IS the covered path. The builder
+// guards what it owns; these rules guard what it does not (the merge output, a
+// deserializer, a hand-built fixture, a future rebuild pass).
+//
+// ⚠ THE ASSERTIONS MATCH THE RULE'S OWN MESSAGE, never merely `I_VerifierFailure`
+// or `verify() == false`. A hand-built module is malformed in more than one way
+// by nature — an unreachable block, a missing edge — so a code-only assertion is
+// satisfied by a DIFFERENT rule firing, and would stay green with the rule under
+// test deleted.
+
+namespace {
+
+// The four arenas + the pools, assembled into a frozen `Mir` with no builder in
+// the loop. Slot 0 of every arena is the sentinel `ArenaBuilder` mints itself.
+struct RawModule {
+    substrate::ArenaBuilder<detail::MirInst,   MirInstId,   MirModuleId> insts{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirBlock,  MirBlockId,  MirModuleId> blocks{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirFunc,   MirFuncId,   MirModuleId> funcs{MirModuleId{1}};
+    substrate::ArenaBuilder<detail::MirGlobal, MirGlobalId, MirModuleId> globals{MirModuleId{1}};
+    std::vector<MirBlockId>      instBlock{InvalidMirBlock};   // slot 0
+    std::vector<MirBlockId>      succPool;
+    MirAsmDescriptorPool         asmPool;
+
+    // Append one instruction and record the block that owns it. `instBlock` must
+    // stay exactly as long as the instruction arena or the ctor aborts, which is
+    // why the two are written together and never separately.
+    MirInstId addInst(MirOpcode op, MirBlockId owner, std::uint32_t payload = 0) {
+        detail::MirInst pod;
+        pod.opcode  = op;
+        pod.payload = payload;
+        MirInstId const id = insts.addNode(pod);
+        instBlock.push_back(owner);
+        return id;
+    }
+
+    [[nodiscard]] Mir finish() && {
+        return Mir(std::move(insts).finish(), std::move(blocks).finish(),
+                   std::move(funcs).finish(), std::move(globals).finish(),
+                   std::move(instBlock), {}, {}, std::move(succPool),
+                   MirLiteralPool{}, std::move(asmPool),
+                   MirAliasingMode::Permissive, /*charTypesAliasAll=*/true);
+    }
+};
+
+// Does any diagnostic's text contain `needle`?
+[[nodiscard]] bool saidThat(DiagnosticReporter const& r, std::string_view needle) {
+    for (auto const& d : r.all()) {
+        if (d.actual.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// Everything reported, so a failure prints WHICH rules fired.
+[[nodiscard]] std::string said(DiagnosticReporter const& r) {
+    std::string out;
+    for (auto const& d : r.all()) { out += d.actual; out += "\n"; }
+    return out.empty() ? std::string{"(nothing reported)"} : out;
+}
+
+} // namespace
+
+// A `Br` — opcode row `[1, 1]` successors — in a block that carries NONE.
+// `MirBuilder::addBr` cannot produce this; the direct ctor can, and before this
+// rule existed the edge simply was not there and nothing said so.
+TEST(MirVerifier, TerminatorWithTooFewSuccessorsIsReported) {
+    RawModule m;
+    MirBlockId const entry = m.blocks.addNode({});
+    (void)m.addInst(MirOpcode::Br, entry);
+    {
+        auto& b     = m.blocks.at(entry);
+        b.instStart = 1;
+        b.instCount = 1;
+        b.succStart = 0;
+        b.succCount = 0;              // … and the row demands exactly one
+        b.func      = 1;
+        b.marker    = StructCfMarker::EntryBlock;
+    }
+    detail::MirFunc fn;
+    fn.signature  = kFnSig;
+    fn.blockStart = entry.v;
+    fn.blockCount = 1;
+    fn.symbol     = 1;
+    (void)m.funcs.addNode(fn);
+
+    Mir const mir = std::move(m).finish();
+    DiagnosticReporter r;
+    MirVerifier v{mir};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_TRUE(saidThat(r, "terminator br carries 0 CFG successor(s), "
+                            "outside [1, 1]")) << said(r);
+}
+
+// The MIRROR, and it is not decoration: a rule written as `n != min` would pass
+// this one, and a rule written as `n < min` alone would pass the over-max half.
+// A `CondBr` — row `[2, 2]` — given THREE edges.
+TEST(MirVerifier, TerminatorWithTooManySuccessorsIsReported) {
+    RawModule m;
+    MirBlockId const entry = m.blocks.addNode({});
+    MirBlockId const tgt   = m.blocks.addNode({});
+    MirInstId const cond   = m.addInst(MirOpcode::Const, entry);
+    m.insts.at(cond).typeId = kBool;      // Const is value-producing
+    (void)m.addInst(MirOpcode::CondBr, entry);
+    (void)m.addInst(MirOpcode::Return, tgt);
+    m.succPool = {tgt, tgt, tgt};         // three edges where the row allows two
+    {
+        auto& b     = m.blocks.at(entry);
+        b.instStart = 1;
+        b.instCount = 2;
+        b.succStart = 0;
+        b.succCount = 3;
+        b.func      = 1;
+        b.marker    = StructCfMarker::EntryBlock;
+    }
+    {
+        auto& b     = m.blocks.at(tgt);
+        b.instStart = 3;
+        b.instCount = 1;
+        b.succStart = 0;
+        b.succCount = 0;
+        b.func      = 1;
+        b.marker    = StructCfMarker::Linear;
+    }
+    detail::MirFunc fn;
+    fn.signature  = kFnSig;
+    fn.blockStart = entry.v;
+    fn.blockCount = 2;
+    fn.symbol     = 1;
+    (void)m.funcs.addNode(fn);
+
+    Mir const mir = std::move(m).finish();
+    DiagnosticReporter r;
+    MirVerifier v{mir};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_TRUE(saidThat(r, "terminator condbr carries 3 CFG successor(s), "
+                            "outside [2, 2]")) << said(r);
+}
+
+// ★★★ THE ONE THE OPCODE ROW CANNOT CATCH, AND THE REASON THE DESCRIPTOR CARRIES
+// ITS LABELS. `InlineAsmGoto`'s row is `[2, ∞)`, so a TWO-label `asm goto` that
+// LOST its fall-through edge still sits inside the range — and losing that edge
+// deletes the code after the statement, because the mandatory unreachable-prune
+// drops a block nothing reaches. Only `labelSpellings.size() + 1 == successors`
+// sees it.
+TEST(MirVerifier, InlineAsmGotoWhoseLabelCountDisagreesWithItsEdgesIsReported) {
+    RawModule m;
+    MirAsmDescriptor d;
+    d.templateText = "jmp %l1";
+    d.isExtended   = true;
+    d.labelSpellings.push_back({"%l0"});
+    d.labelSpellings.push_back({"%l1"});   // TWO labels ⇒ THREE edges are owed
+    (void)m.asmPool.add(std::move(d));
+
+    MirBlockId const entry = m.blocks.addNode({});
+    MirBlockId const one   = m.blocks.addNode({});
+    MirBlockId const two   = m.blocks.addNode({});
+    (void)m.addInst(MirOpcode::InlineAsmGoto, entry, /*payload=*/0);
+    (void)m.addInst(MirOpcode::Return, one);
+    (void)m.addInst(MirOpcode::Return, two);
+    m.succPool = {one, two};               // … and only TWO are present
+    {
+        auto& b     = m.blocks.at(entry);
+        b.instStart = 1;
+        b.instCount = 1;
+        b.succStart = 0;
+        b.succCount = 2;
+        b.func      = 1;
+        b.marker    = StructCfMarker::EntryBlock;
+    }
+    for (auto [blk, first] : {std::pair{one, 2u}, std::pair{two, 3u}}) {
+        auto& b     = m.blocks.at(blk);
+        b.instStart = first;
+        b.instCount = 1;
+        b.succStart = 0;
+        b.succCount = 0;
+        b.func      = 1;
+        b.marker    = StructCfMarker::Linear;
+    }
+    detail::MirFunc fn;
+    fn.signature  = kFnSig;
+    fn.blockStart = entry.v;
+    fn.blockCount = 3;
+    fn.symbol     = 1;
+    (void)m.funcs.addNode(fn);
+
+    Mir const mir = std::move(m).finish();
+    DiagnosticReporter r;
+    MirVerifier v{mir};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_TRUE(saidThat(r, "inlineasmgoto declares 2 label(s) but carries 2 CFG "
+                            "successor(s)")) << said(r);
+    // ⚠ AND THE OPCODE-ROW RULE MUST **NOT** HAVE FIRED: two successors is inside
+    // `[2, ∞)`. Without this the arm above could be satisfied by the range check,
+    // and the descriptor rule could be deleted with the test still green.
+    EXPECT_FALSE(saidThat(r, "outside [2,")) << said(r);
+}
+
+// ★★ THE POOL-RANGE CHECK, AND ITS REAL CLAIM IS THAT THE PROCESS SURVIVES.
+// `Mir::asmDescriptor` ABORTS on an out-of-range index, so before this rule a
+// module carrying a stale index KILLED the compiler inside the verifier instead
+// of being described by it — "a refusal that crashes is not a refusal". The
+// assertion is therefore as much about reaching the next line as about the text.
+TEST(MirVerifier, InlineAsmPayloadOutsideTheDescriptorPoolIsReported) {
+    RawModule m;                            // … with an EMPTY descriptor pool
+    MirBlockId const entry = m.blocks.addNode({});
+    (void)m.addInst(MirOpcode::InlineAsm, entry, /*payload=*/7);
+    (void)m.addInst(MirOpcode::Return, entry);
+    {
+        auto& b     = m.blocks.at(entry);
+        b.instStart = 1;
+        b.instCount = 2;
+        b.succStart = 0;
+        b.succCount = 0;
+        b.func      = 1;
+        b.marker    = StructCfMarker::EntryBlock;
+    }
+    detail::MirFunc fn;
+    fn.signature  = kFnSig;
+    fn.blockStart = entry.v;
+    fn.blockCount = 1;
+    fn.symbol     = 1;
+    (void)m.funcs.addNode(fn);
+
+    Mir const mir = std::move(m).finish();
+    DiagnosticReporter r;
+    MirVerifier v{mir};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_TRUE(saidThat(r, "inlineasm payload 7 out of inline-asm "
+                            "descriptor-pool range [0, 0)")) << said(r);
+}
+
+// ★★★ THE TWO RULES MEET HERE, AND THE ORDER BETWEEN THEM IS LOAD-BEARING. An
+// `InlineAsmGoto` whose payload is out of range is BOTH a pool-range violation
+// and a candidate for the label-arity rule — and the label rule would have to
+// call `Mir::asmDescriptor` to evaluate, which ABORTS on exactly this index.
+// `checkTerminatorSuccessorArity` therefore guards on the pool range before
+// reading the descriptor. This arm is that guard's only exercise: without it the
+// clause is a comment, and a future edit that drops the guard turns a reported
+// module into a killed process — which no code-only assertion would notice,
+// because a dead test binary reports nothing at all.
+TEST(MirVerifier, InlineAsmGotoWithAStalePoolIndexIsReportedRatherThanAborting) {
+    RawModule m;                            // … with an EMPTY descriptor pool
+    MirBlockId const entry = m.blocks.addNode({});
+    MirBlockId const one   = m.blocks.addNode({});
+    MirBlockId const two   = m.blocks.addNode({});
+    (void)m.addInst(MirOpcode::InlineAsmGoto, entry, /*payload=*/3);
+    (void)m.addInst(MirOpcode::Return, one);
+    (void)m.addInst(MirOpcode::Return, two);
+    m.succPool = {one, two};
+    {
+        auto& b     = m.blocks.at(entry);
+        b.instStart = 1;
+        b.instCount = 1;
+        b.succStart = 0;
+        b.succCount = 2;
+        b.func      = 1;
+        b.marker    = StructCfMarker::EntryBlock;
+    }
+    for (auto [blk, first] : {std::pair{one, 2u}, std::pair{two, 3u}}) {
+        auto& b     = m.blocks.at(blk);
+        b.instStart = first;
+        b.instCount = 1;
+        b.succStart = 0;
+        b.succCount = 0;
+        b.func      = 1;
+        b.marker    = StructCfMarker::Linear;
+    }
+    detail::MirFunc fn;
+    fn.signature  = kFnSig;
+    fn.blockStart = entry.v;
+    fn.blockCount = 3;
+    fn.symbol     = 1;
+    (void)m.funcs.addNode(fn);
+
+    Mir const mir = std::move(m).finish();
+    DiagnosticReporter r;
+    MirVerifier v{mir};
+    EXPECT_FALSE(v.verify(r));              // reaching this line IS the claim
+    EXPECT_TRUE(saidThat(r, "inlineasmgoto payload 3 out of inline-asm "
+                            "descriptor-pool range [0, 0)")) << said(r);
+    // The label-arity rule must have SKIPPED rather than read the stale index.
+    EXPECT_FALSE(saidThat(r, "inlineasmgoto declares")) << said(r);
 }

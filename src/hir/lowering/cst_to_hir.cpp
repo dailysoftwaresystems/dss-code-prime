@@ -5681,6 +5681,7 @@ struct Lowerer {
                     return;
                 }
                 auto const f = gatherInlineAsmFacts(tree(), n, ia,
+                                                    sem.inlineAsmTemplateLexemes,
                                                     sem.identifierToken,
                                                     cfg.stringBodyToken);
                 if (f.scanTruncated) {
@@ -5734,6 +5735,13 @@ struct Lowerer {
                     }
                     HirInlineAsmOperand rec;
                     rec.symbolicName = op.symbolicName;
+                    // ★ CARRIED, NEVER RE-DERIVED. The spellings were minted by
+                    // `mintTemplateSpellings` on the SOURCE operand list; a
+                    // tier that rebuilt them from its own list would count a
+                    // `"+"` operand twice (it is realized further down as an
+                    // output plus a synthesized tied input) and shift every
+                    // label index. Copying is what makes that unwritable.
+                    rec.spellings    = op.spellings;
                     rec.isOutput     = op.isOutput;
                     auto const parsed = parseAsmConstraint(op.constraint);
                     if (!parsed.ok()) {
@@ -5818,6 +5826,16 @@ struct Lowerer {
                 // Resolved through the SAME `labelOrdinals_` map `lowerGoto` uses,
                 // so an asm-goto edge and a plain `goto` to the same label carry
                 // the same ordinal and the MIR tier needs no second namespace.
+                //
+                // ★★ THE ORDINAL IS NOT THE WHOLE FACT, AND UNTIL P20 THE OTHER
+                // HALF WAS DROPPED HERE. An ordinal answers "which block does
+                // this edge go to"; it cannot answer "what does the template
+                // CALL this label", which is a LEXICAL fact of the statement and
+                // unreconstructible from a number. The two lists are pushed
+                // together, in lockstep, so they stay index-aligned by
+                // construction — `HirVerifier::checkInlineAsm` re-asserts the
+                // sizes so a later edit that pushes one and forgets the other
+                // fails loud instead of silently losing a spelling.
                 for (auto const& l : f.labels) {
                     auto it = labelOrdinals_.find(l.name);
                     if (it == labelOrdinals_.end()) {
@@ -5828,6 +5846,7 @@ struct Lowerer {
                         return;
                     }
                     desc.labelOrdinals.push_back(it->second);
+                    desc.labelSpellings.push_back(l.spellings);
                 }
 
                 std::uint32_t const handle = inlineAsm.add(std::move(desc));
