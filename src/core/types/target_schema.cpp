@@ -1512,6 +1512,73 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         checkRefs(i, "callerSaved", cc.callerSaved, TargetRegClass::None);
         checkRefs(i, "calleeSaved", cc.calleeSaved, TargetRegClass::None);
 
+        // ── D-TARGET-ARG-POOLS-WITHOUT-DWARF-NUMBERS-CANNOT-BE-RELATED ──
+        //
+        // Whether two arg pools share ONE cursor is DERIVED rather than
+        // declared: `lir_callconv::argPoolsShareACursor` compares the
+        // `dwarfNumber` of their slot-0 registers, because that is DWARF's own
+        // identifier for a PHYSICAL register and therefore the only field that
+        // says "these two class names are two widths of one file".
+        // ⚠ `hwEncoding` CANNOT answer it. ✔MEASURED over both shipped
+        // targets: it is a per-file register NUMBER, so arm64 `gpr × vr` share
+        // all 32 values and x86_64 `fpr × gpr` share 16 — a derivation reading
+        // it would relate the integer and vector files on both.
+        //
+        // The derivation is fail-CLOSED (an absent number means "cannot be
+        // shown to share", i.e. independent cursors), and independent cursors
+        // are the safe answer: the cost is a wasted register, never handing
+        // slot k out twice. But a target that declares two or more arg pools
+        // and OMITS the numbers that would relate them is describing a
+        // register file it cannot substantiate — it loads clean and gets an
+        // answer nobody chose. Refuse it here, where the config is judged,
+        // rather than letting a silent default stand in for a declaration.
+        {
+            std::vector<std::pair<char const*, std::vector<std::string> const*>>
+                const pools{{"argGprs", &cc.argGprs},
+                            {"argFprs", &cc.argFprs},
+                            {"argVrs",  &cc.argVrs}};
+            std::size_t declared = 0;
+            for (auto const& [name, pool] : pools) {
+                if (pool->empty()) continue;
+                ++declared;
+            }
+            // ⚠⚠ GATED ON THE TARGET HAVING OPTED INTO THE NUMBERING AT ALL —
+            // the SAME condition the frame-register rule above uses, and the
+            // first draft of this check omitted it and RED two deliberate
+            // contracts: `TargetDwarfNumbering.ATargetDeclaringNeitherHalfStillLoads`
+            // and the sub-register validation fixture both build a target that
+            // declares NO dwarf numbers anywhere, which must still load.
+            // ★ The rule is "if you number your registers, number the ones that
+            // carry ABI meaning" — not "you must number your registers". A
+            // target that declares none has opted out uniformly and its arg
+            // pools get independent cursors as a documented consequence; a
+            // target that numbers SOME registers and not its arg registers is
+            // the inconsistent case, and that is what this refuses.
+            bool anyRegNumbered = false;
+            for (auto const& r : registers) {
+                if (r.dwarfNumber.has_value()) { anyRegNumbered = true; break; }
+            }
+            if (anyRegNumbered && declared >= 2) {
+                for (auto const& [name, pool] : pools) {
+                    if (pool->empty()) continue;
+                    auto const it = registerIndex.find(pool->front());
+                    if (it == registerIndex.end()) continue;  // reported above
+                    if (registers[it->second].dwarfNumber.has_value()) continue;
+                    fail(std::format("/callingConventions/{}/{}/0", i, name),
+                         std::format(
+                             "calling convention '{}': arg register '{}' carries "
+                             "no 'dwarfNumber', so this pool cannot be related to "
+                             "the {} other arg pool(s) this convention declares — "
+                             "whether two pools are two WIDTHS of one physical "
+                             "register file (one shared cursor) or two separate "
+                             "files (independent cursors) is read off the DWARF "
+                             "numbers, and an absent number makes that answer a "
+                             "default rather than a declaration",
+                             cc.name, pool->front(), declared - 1));
+                }
+            }
+        }
+
         // Link register (AAPCS64-shape). When declared, must resolve to
         // a GPR-class register — ML7 will spill it in the prologue.
         // The loader pre-resolved name → ordinal atomically, so this

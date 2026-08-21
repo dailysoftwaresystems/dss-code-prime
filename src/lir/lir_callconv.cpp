@@ -551,16 +551,22 @@ functionLocalAllocaPayloads(Lir const& src, LirFuncId fn,
 // the cc's register pool). Per-call site overflow rules:
 //
 //   * Slot-aligned cc (`cc.slotAligned == true` — Win64 ms_x64):
-//     each arg consumes one shared slot regardless of class. Total
-//     slots = args.size(). Pool size = max(argGprs, argFprs).
-//     Overflow = max(0, total_slots - pool_size).
+//     each arg consumes one shared slot regardless of class.
 //   * Independent-counters cc (`cc.slotAligned == false` —
-//     SysV / AAPCS64): gpr and fpr counters advance separately.
-//     Overflow = max(0, gprArgs - argGprs.size()) +
-//                max(0, fprArgs - argFprs.size()).
+//     SysV / AAPCS64): each cursor GROUP advances separately, where
+//     a group is the set of classes whose arg pools are views of one
+//     physical register file (AAPCS64's single NSRN across the
+//     d-views and the v-views).
 //
-// Args are identified by their LirReg's class (GPR vs FPR). Callee
-// is operand[0] (a SymbolRef post-isel), so args are operands[1..N].
+// ★ BOTH RULES LIVE IN `ArgCursors`, NOT HERE, and the overflow is
+// counted rather than computed: an argument whose cursor slot reached
+// its bound is a stack argument. That replaces a per-class formula
+// which was written out for exactly two classes and filed a third
+// (VR) into the integer pool —
+// D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR.
+//
+// Args are identified by their LirReg's class. Callee is operand[0]
+// (a SymbolRef post-isel), so args are operands[1..N].
 //
 // Same `TargetOpcodeInfo::isCall` flag the prologue allocator + the
 // regalloc cross-call-live exclusion use — single source of truth.
@@ -568,12 +574,6 @@ functionLocalAllocaPayloads(Lir const& src, LirFuncId fn,
 computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                             TargetSchema const& schema,
                             TargetCallingConvention const& cc) noexcept {
-    std::uint32_t const gprPoolSize =
-        static_cast<std::uint32_t>(cc.argGprs.size());
-    std::uint32_t const fprPoolSize =
-        static_cast<std::uint32_t>(cc.argFprs.size());
-    std::uint32_t const slotAlignedPoolSize =
-        std::max(gprPoolSize, fprPoolSize);
     // FC12a-struct: the outgoing slot quantum (= GPR width) — the unit a by-value-
     // stack aggregate's bytes round up to. MUST equal FrameLayout.outgoingSlotSize
     // (computeFrameLayout sets it from widthForClass GPR), else the reservation and
@@ -627,14 +627,24 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
             // materialize placement loop exactly. A by-value-stack aggregate is a
             // (Reg, ByValueStackAgg) pair: the Reg is NOT a register arg (it does not
             // consume a class pool slot) and the pair occupies ceil(bytes / slot)
-            // OVERFLOW slots UNCONDITIONALLY (FC12a-struct, D-FC12A-VARIADIC-MEMORY-
-            // CLASS-STRUCT). `byValSlots` accumulates those; the per-class / slot-
-            // aligned tallies count only ordinary register args; `forcedVarargs`
-            // counts the always-stacked variadic region (carriers excluded — already
-            // in byValSlots). `argRegionIdx` (the materialize loop's index, advanced
-            // once per ARG-position incl. a carrier) gates the forced-vararg region.
-            std::uint32_t gprArgs = 0, fprArgs = 0;     // register-arg class counts
-            std::uint32_t slotArgs = 0;                 // slot-aligned register-arg count
+            // OVERFLOW slots UNCONDITIONALLY (FC12a-struct,
+            // D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT). `byValSlots` accumulates
+            // those; the CURSOR WALK counts only ordinary register args;
+            // `forcedVarargs` counts the always-stacked variadic region (carriers
+            // excluded — already in byValSlots). `argRegionIdx` (the materialize
+            // loop's index, advanced once per ARG-position incl. a carrier) gates
+            // the forced-vararg region.
+            // D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR:
+            // the class tallies and the three overflow formulas below used to be
+            // written out per class — `gprArgs`/`fprArgs`/`slotArgs` plus a
+            // `(cls == FPR) ? … : …`, so a VR argument was tallied against the
+            // INTEGER pool here and placed in an integer register at the
+            // materialize site, and the two agreed with each other while both
+            // being wrong. The pre-scan and the placement now walk the SAME
+            // object, so "mirrors the materialize placement loop exactly" is a
+            // structural fact rather than a comment two copies promise.
+            ArgCursors argCursors{schema, cc};
+            std::uint32_t regOverflow = 0;              // register args past their pool
             std::uint32_t byValSlots = 0;               // by-value-stack overflow slots
             std::uint32_t forcedVarargs = 0;            // always-stacked variadic region
             std::uint32_t argRegionIdx = 0;             // 0-based arg position
@@ -661,9 +671,9 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                     // below counts those later args (mirrors the materialize clamp).
                     std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
                     if (ex == kByValueStackArgExhaustGpr)
-                        gprArgs = std::max(gprArgs, gprPoolSize);
+                        argCursors.exhaust(LirRegClass::GPR);
                     else if (ex == kByValueStackArgExhaustFpr)
-                        fprArgs = std::max(fprArgs, fprPoolSize);
+                        argCursors.exhaust(LirRegClass::FPR);
                     ++argRegionIdx;
                     continue;
                 }
@@ -680,32 +690,27 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                 // audit fold, 2026-06-02): a non-Reg/non-marker operand is a future
                 // isel bug the materialize gate reports loud — don't silently count it.
                 if (argOp.kind != LirOperandKind::Reg) { ++argRegionIdx; continue; }
-                if (argOp.reg.regClass() == LirRegClass::FPR) ++fprArgs;
-                else ++gprArgs;
-                ++slotArgs;
+                // ★ ONE CURSOR WALK REPLACES THREE OVERFLOW FORMULAS. A slot
+                // whose index reached the bound is a stack argument — which is
+                // exactly what each of the three arms computed by subtraction,
+                // including the slot-aligned collapse (`ArgCursors` puts every
+                // class on one cursor bounded by the largest pool) and the
+                // always-stack variadic arm (a forced vararg `continue`s above
+                // and never consumes a cursor, so only NAMED args are counted
+                // here — the old `namedOverflow`).
+                // ⚠ A class with NO pool row counts as overflow: an argument
+                // that cannot go in a register goes on the stack, and this
+                // reservation only has to be big ENOUGH. The placement site
+                // REFUSES it loudly, so the conservative count here is not a
+                // silent answer standing in for a missing one.
+                auto const slot = argCursors.next(argOp.reg.regClass());
+                if (!slot.has_value() || slot->index >= slot->poolSize)
+                    ++regOverflow;
                 ++argRegionIdx;
             }
 
-            std::uint32_t overflow = byValSlots;
-            if (variadicForcesStack) {
-                // forcedVarargs already excludes carriers (counted in byValSlots).
-                // Named-arg overflow under independent counters (Apple is NOT
-                // slotAligned; bound by the larger pool defensively if it ever is).
-                std::uint32_t const namedOverflow =
-                    ((gprArgs > gprPoolSize) ? (gprArgs - gprPoolSize) : 0u)
-                    + ((fprArgs > fprPoolSize) ? (fprArgs - fprPoolSize) : 0u);
-                overflow += forcedVarargs + namedOverflow;
-            } else if (cc.slotAligned) {
-                // Each register arg consumes one shared slot regardless of class.
-                if (slotArgs > slotAlignedPoolSize)
-                    overflow += slotArgs - slotAlignedPoolSize;
-            } else {
-                std::uint32_t const gprOverflow =
-                    (gprArgs > gprPoolSize) ? (gprArgs - gprPoolSize) : 0u;
-                std::uint32_t const fprOverflow =
-                    (fprArgs > fprPoolSize) ? (fprArgs - fprPoolSize) : 0u;
-                overflow += gprOverflow + fprOverflow;
-            }
+            // forcedVarargs already excludes carriers (counted in byValSlots).
+            std::uint32_t const overflow = byValSlots + forcedVarargs + regOverflow;
             if (overflow > maxOverflow) maxOverflow = overflow;
         }
     }
@@ -783,8 +788,9 @@ LirInstId emitStackProbe(LirBuilder& b, std::uint16_t op, LirReg sp,
 // imm9 path is never hit). On x86_64 the swap is inert and the emitted bytes
 // are byte-identical. The genuinely-unencodable TAIL (negative beyond −256,
 // non-access-aligned, or scaled >4095) keeps `baseOp` and STAYS fail-loud at
-// the encoder — the narrower residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-
-// SCALED-IMM12 (register-offset / address-materialization, future).
+// the encoder — the narrower residual
+// D-ASM-AARCH64-FRAME-OFFSET-BEYOND-SCALED-IMM12 (register-offset /
+// address-materialization, future).
 //
 // accessSizeBytes: the chokepoint emits a default-width (flags=0 ⇒ width 64)
 // frame op, so the encoder's `instWidth` is 64 and its scaled field is
@@ -1481,47 +1487,196 @@ void maybeMov(LirBuilder& b, std::uint16_t movOp, LirReg dest, LirReg src) {
     if (dest.id != src.id) emitMov(b, movOp, dest, src);
 }
 
-// Lookup the i-th arg-passing source register for the given class.
-// GPR class uses `cc.argGprs`; FPR uses `cc.argFprs`. Returns nullopt
-// when `index >= pool.size()` (stack-passed; D-ML7-2.2).
-[[nodiscard]] std::optional<LirReg>
-argPassingReg(TargetSchema const&            schema,
-              TargetCallingConvention const& cc,
-              std::uint32_t                  index,
-              LirRegClass                    cls,
-              std::string_view               contextLabel,
-              DiagnosticReporter&            reporter) {
-    // ONE condition picks the pool AND names it, so the sentence cannot
-    // advertise a pool other than the one that was indexed
-    // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET). It was two:
-    // the selection here and a hand-typed `"FPR"`/`"GPR"` in the message below.
-    //
-    // ⚠ THE SELECTION ITSELF IS STILL TWO-WAY AND THAT IS A SEPARATE, LIVE
-    // HAZARD — reported, not silently patched here, because fixing it changes
-    // which register an arg is passed in and that is not this change's subject:
-    // `D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR`. A
-    // VR-class arg takes the ELSE branch into the INTEGER pool with no
-    // diagnostic — the same else-branch-default shape `returnReg` below records
-    // as a latent shipped defect it had to fix. The label now at least names the
-    // pool that was really consulted rather than the class that was asked for.
-    bool const        useFprPool = (cls == LirRegClass::FPR);
-    auto const&       pool       = useFprPool ? cc.argFprs : cc.argGprs;
-    LirRegClass const poolCls    = useFprPool ? LirRegClass::FPR : LirRegClass::GPR;
-    if (index >= pool.size()) {
+} // namespace
+
+// ── THE ARG-PASSING POOL LOOKUP (rows + spellings: `lir_callconv.hpp`) ───────
+//
+// D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR: this was
+// `argPassingReg` in this file's anonymous namespace, selecting its pool with
+// `(cls == FPR) ? cc.argFprs : cc.argGprs` over a register-class vocabulary
+// with more than two members. A VR-class argument took the ELSE branch into the
+// INTEGER pool and was passed in the wrong register file with no diagnostic.
+// The rows and this lookup are published for the reason the return side's twin
+// records: a refusal nothing can reach is a refusal nothing holds to.
+bool argPoolsShareACursor(TargetSchema const&            schema,
+                          TargetCallingConvention const& cc,
+                          LirRegClass                    a,
+                          LirRegClass                    b) noexcept {
+    if (a == b) return true;
+    auto const* poolA = argRegisterPool(cc, a);
+    auto const* poolB = argRegisterPool(cc, b);
+    if (poolA == nullptr || poolB == nullptr) return false;
+    if (poolA->empty() || poolB->empty()) return false;
+
+    // Slot 0 decides it, and slot 0 is enough: two pools are either two views
+    // of one register file or they are disjoint files. A config that aliased
+    // only SOME slots would be describing a register file that does not exist,
+    // and `TargetSchema::validate()` owns that question, not this walk.
+    auto const regs = schema.registers();
+    auto const dwarfOf = [&](std::string const& name) -> std::optional<std::uint16_t> {
+        auto const ord = schema.registerByName(name);
+        if (!ord.has_value()) return std::nullopt;
+        return regs[*ord].dwarfNumber;   // itself optional — absent means UNKNOWN
+    };
+    auto const da = dwarfOf((*poolA)[0]);
+    auto const db = dwarfOf((*poolB)[0]);
+    // ⚠ A MISSING `dwarfNumber` IS NOT EVIDENCE OF DISJOINTNESS, so it must not
+    // be silently read as "separate cursors" — that would hand slot k out twice
+    // on a target whose vector rows simply omit the field. It is read as
+    // UNKNOWN, and unknown means the pools do NOT share (the conservative
+    // direction is a wasted register, never a collision) — but a target that
+    // declares two arg pools and omits the numbers that would relate them is a
+    // config defect the loader should refuse, tracked as
+    // D-TARGET-ARG-POOLS-WITHOUT-DWARF-NUMBERS-CANNOT-BE-RELATED.
+    if (!da.has_value() || !db.has_value()) return false;
+    return *da == *db;
+}
+
+std::optional<LirReg>
+argPassingRegister(TargetSchema const&            schema,
+                   TargetCallingConvention const& cc,
+                   std::uint32_t                  index,
+                   LirRegClass                    cls,
+                   std::string_view               contextLabel,
+                   DiagnosticReporter&            reporter) {
+    // ONE walk over the rows DECIDES, and the refusals RENDER those same rows
+    // to advertise — so acceptance and advertisement cannot disagree
+    // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+    auto const* pool = argRegisterPool(cc, cls);
+    if (pool == nullptr) {
+        std::string accepted;
+        for (auto const& n : kArgPoolClassNames) {
+            if (!accepted.empty()) accepted += "/";
+            accepted += n;
+        }
+        report(reporter, DiagnosticCode::L_ArgClassHasNoRegisterPool,
+               DiagnosticSeverity::Error,
+               std::format("{}: register class '{}' has no arg-passing pool — "
+                           "only {} arguments can be passed in registers. A "
+                           "class with no row owns no pool and is NOT filed "
+                           "into another class's",
+                           contextLabel, lirRegClassName(cls), accepted));
+        return std::nullopt;
+    }
+    if (pool->empty()) {
+        // DISTINCT from exhaustion below, and the distinction is the point: an
+        // empty pool is what this target DECLARED, not a pool that ran out.
+        report(reporter, DiagnosticCode::L_ArgClassPoolUndeclared,
+               DiagnosticSeverity::Error,
+               std::format("{}: calling convention '{}' declares NO "
+                           "arg-passing registers of class '{}', so an "
+                           "argument of that class cannot be passed in one. "
+                           "This is what the target declared allocatable — not "
+                           "a full pool that the stack could absorb, which is "
+                           "why it is not reported as stack passing",
+                           contextLabel, cc.name, lirRegClassName(cls)));
+        return std::nullopt;
+    }
+    if (index >= pool->size()) {
         report(reporter, DiagnosticCode::L_StackPassedArgUnsupported,
                DiagnosticSeverity::Error,
                std::format("{}: arg index {} requires stack passing "
                            "(cc '{}' has only {} {} arg-passing registers); "
                            "stack-passed args are anchored at D-ML7-2.2",
-                           contextLabel,
-                           index, cc.name, pool.size(),
-                           lirRegClassName(poolCls)));
+                           contextLabel, index, cc.name, pool->size(),
+                           lirRegClassName(cls)));
         return std::nullopt;
     }
-    return resolveCcReg(schema, pool[index], cls, contextLabel, reporter);
+    return resolveCcReg(schema, (*pool)[index], cls, contextLabel, reporter);
 }
 
-} // namespace
+// ── ArgCursors — the ONE walk the three copies now share ─────────────────────
+//
+// D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR. The header
+// carries the measurement (the row table alone left the reproduction
+// byte-identical, because the cursor walk lived in three hand-kept copies).
+
+std::optional<std::size_t> ArgCursors::rowOf(LirRegClass cls) {
+    for (std::size_t i = 0; i < kArgPoolRows.size(); ++i) {
+        if (kArgPoolRows[i].cls == cls) return i;
+    }
+    return std::nullopt;
+}
+
+ArgCursors::ArgCursors(TargetSchema const& schema, TargetCallingConvention const& cc)
+    : slotAligned_(cc.slotAligned) {
+    // ★ THE GROUPING IS DERIVED FROM THE REGISTER TABLE, NOT DECLARED BESIDE
+    // IT — see `argPoolsShareACursor`. Row i joins the FIRST earlier row it
+    // aliases; a row that aliases nothing earlier starts its own group. Walking
+    // forward and taking the first match makes the relation's transitivity a
+    // property of the walk rather than an assumption about the config: three
+    // views of one file all land on the first of them.
+    for (std::size_t i = 0; i < kArgPoolRows.size(); ++i) {
+        group_[i] = static_cast<std::uint32_t>(i);
+        for (std::size_t j = 0; j < i; ++j) {
+            if (argPoolsShareACursor(schema, cc, kArgPoolRows[j].cls,
+                                     kArgPoolRows[i].cls)) {
+                group_[i] = group_[j];
+                break;
+            }
+        }
+    }
+    // Each group's bound is the LARGEST pool among its member rows. For a
+    // genuine shared-cursor group the members are views of one file and their pools are
+    // the same registers, so the max IS the common size (✔MEASURED on arm64:
+    // argFprs = d0..d7 and argVrs = v0..v7, both 8, sharing dwarf 64..71). The
+    // max is what keeps a config that declared them at different lengths from
+    // silently truncating the longer one without a diagnostic — it errs toward
+    // the register path, where `argPassingRegister` still refuses by name.
+    for (std::size_t i = 0; i < kArgPoolRows.size(); ++i) {
+        auto const* pool = argRegisterPool(cc, kArgPoolRows[i].cls);
+        auto const n = pool == nullptr
+            ? 0u : static_cast<std::uint32_t>(pool->size());
+        poolSize_[group_[i]] = std::max(poolSize_[group_[i]], n);
+    }
+    // ⓘ `slotAligned` collapses every class onto ONE positional cursor (Win64:
+    // arg k takes slot k whatever its class), so group 0 holds them all and its
+    // bound is the largest pool on the target. That is the `max(argGprs,
+    // argFprs)` the three copies each spelled by hand, now spelled once over
+    // whatever classes the vocabulary holds rather than over exactly two.
+    if (slotAligned_) {
+        std::uint32_t bound = 0;
+        for (auto const& row : kArgPoolRows) {
+            auto const* pool = argRegisterPool(cc, row.cls);
+            if (pool != nullptr)
+                bound = std::max(bound, static_cast<std::uint32_t>(pool->size()));
+        }
+        group_.fill(0);
+        poolSize_.fill(0);
+        poolSize_[0] = bound;
+    }
+}
+
+std::optional<ArgCursors::Slot> ArgCursors::next(LirRegClass cls) {
+    auto const row = rowOf(cls);
+    if (!row.has_value()) return std::nullopt;
+    auto const g = group_[*row];
+    return Slot{cursor_[g]++, poolSize_[g]};
+}
+
+void ArgCursors::exhaust(LirRegClass cls) {
+    // ⓘ INERT UNDER A SLOT-ALIGNED CC, and that is the semantics rather than a
+    // carve-out: "exhaust this class's registers" presupposes the class HAS a
+    // counter of its own, and a slot-aligned cc has exactly one positional
+    // cursor across every class. Clamping it would stack every later argument
+    // of ANY class. ✔The two shipped slot-aligned/by-value paths agree — the
+    // straddling-carrier rule this serves (AAPCS64
+    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS) is an independent-counter rule, and both
+    // pre-existing copies of this clamp wrote per-class counters that their own
+    // slot-aligned arm never read.
+    if (slotAligned_) return;
+    auto const row = rowOf(cls);
+    if (!row.has_value()) return;
+    auto const g = group_[*row];
+    cursor_[g] = std::max(cursor_[g], poolSize_[g]);
+}
+
+std::uint32_t ArgCursors::poolSizeFor(LirRegClass cls) const {
+    auto const row = rowOf(cls);
+    if (!row.has_value()) return 0;
+    return poolSize_[group_[*row]];
+}
+
 
 // ── THE RESULT-REGISTER POOL LOOKUP (rows + spellings: `lir_callconv.hpp`) ───
 //
@@ -2129,6 +2284,14 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     }
     LirReg const sp = makePhysicalReg(cc.stackPointer->ordinal, LirRegClass::GPR);
 
+    // D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR: the
+    // per-class arg-pool BOUND, asked of the one object that derives the cursor
+    // grouping from the target's own register table. Hoisted because it is a
+    // property of (schema, cc) and not of any one instruction; the CALL sites
+    // below build their own short-lived `ArgCursors` because a cursor WALK is
+    // per-call state.
+    ArgCursors const argPoolBounds{schema, cc};
+
     std::vector<LirReg> usedSaved = collectUsedCalleeSaved(src, fn, schema, cc);
     bool const hasCalls = functionHasCalls(src, fn, schema);
     // D-CSUBSET-VLA (C1b): a function containing a `sub_sp_reg` (a runtime `sub sp,
@@ -2543,19 +2706,21 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     return false;
                 }
                 LirRegClass const cls = result.regClass();
-                std::uint32_t const slotAlignedPoolSize = std::max(
-                    static_cast<std::uint32_t>(cc.argGprs.size()),
-                    static_cast<std::uint32_t>(cc.argFprs.size()));
-                std::uint32_t const classPoolSize = static_cast<std::uint32_t>(
-                    (cls == LirRegClass::FPR) ? cc.argFprs.size() : cc.argGprs.size());
-                std::uint32_t const poolSize = cc.slotAligned
-                    ? slotAlignedPoolSize : classPoolSize;
+                // ★ ONE QUERY, WHATEVER THE VOCABULARY HOLDS. This used to read
+                // `(cls == FPR) ? argFprs.size() : argGprs.size()`, so a VR
+                // parameter was measured against the INTEGER pool's bound and
+                // then fetched from the integer pool — the else-branch default
+                // D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR
+                // names. `poolSizeFor` answers for the class's own cursor group
+                // and already folds the slot-aligned collapse, so the
+                // hand-spelled `max(argGprs, argFprs)` is gone with it.
+                std::uint32_t const poolSize = argPoolBounds.poolSizeFor(cls);
                 if (payload < poolSize) {
                     // Register-resident: existing path. FC2 Part B:
                     // the copy mnemonic follows the param's class
                     // (FPR args move via movaps, not the GPR mov).
                     auto const argSrc =
-                        argPassingReg(schema, cc, payload, cls,
+                        argPassingRegister(schema, cc, payload, cls,
                                       "materializeOneFunc: arg", reporter);
                     if (!argSrc.has_value()) return false;
                     auto const argMov = classOpHandle(
@@ -3174,12 +3339,17 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // each arg consumes one shared slot index regardless
                 // of class. Under independent counters (SysV/AAPCS64),
                 // gpr/fpr counters advance separately.
-                std::uint32_t const slotAlignedPoolSize = std::max(
-                    static_cast<std::uint32_t>(cc.argGprs.size()),
-                    static_cast<std::uint32_t>(cc.argFprs.size()));
-                std::uint32_t gprIdx = 0;
-                std::uint32_t fprIdx = 0;
-                std::uint32_t slotIdx = 0;
+                // D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR:
+                // this was three hand-kept counters plus a `max(argGprs,
+                // argFprs)` — a two-way shape over a register-class vocabulary
+                // with more than two members, where a VR argument took the
+                // `else` branch and consumed an INTEGER cursor. `ArgCursors`
+                // owns the walk: it derives which classes share a cursor from
+                // the target's own `dwarfNumber`s (AAPCS64's single NSRN across
+                // the d-views and the v-views) and folds the slot-aligned
+                // collapse, so nothing here re-spells either rule. Per-CALL
+                // state, so it is constructed per call site.
+                ArgCursors argCursors{schema, cc};
                 std::uint32_t overflowIdx = 0;  // count of stack-arg SLOTS so far
                 // FC12a-struct: arg POSITION (advanced once per arg, incl. a by-value-
                 // stack aggregate carrier; NOT per raw operand — a carrier is a Reg +
@@ -3269,29 +3439,38 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         // SysV (exhaust 0) leaves the cursor = backfill. Independent-
                         // counter CCs only (a straddling carrier never arises slot-aligned).
                         std::uint8_t const ex = ops[i + 1].byValueAggExhaust;
+                        // ★ THE CLAMP NAMES A CLASS, NOT A CURSOR. Handing
+                        // `exhaust` the class is what makes clamping the WRONG
+                        // counter unwritable — and on a target whose FPR and VR
+                        // pools are one register file it clamps the shared
+                        // cursor once instead of leaving the sibling view free.
                         if (ex == kByValueStackArgExhaustGpr)
-                            gprIdx = std::max(gprIdx,
-                                static_cast<std::uint32_t>(cc.argGprs.size()));
+                            argCursors.exhaust(LirRegClass::GPR);
                         else if (ex == kByValueStackArgExhaustFpr)
-                            fprIdx = std::max(fprIdx,
-                                static_cast<std::uint32_t>(cc.argFprs.size()));
+                            argCursors.exhaust(LirRegClass::FPR);
                         ++argRegionIdx;
                         continue;
                     }
-                    std::uint32_t argIndex;
-                    std::uint32_t poolSize;
-                    if (cc.slotAligned) {
-                        argIndex  = slotIdx++;
-                        poolSize  = slotAlignedPoolSize;
-                    } else {
-                        if (cls == LirRegClass::FPR) {
-                            argIndex = fprIdx++;
-                            poolSize = static_cast<std::uint32_t>(cc.argFprs.size());
-                        } else {
-                            argIndex = gprIdx++;
-                            poolSize = static_cast<std::uint32_t>(cc.argGprs.size());
-                        }
+                    // ⚠ `nullopt` here is "this class names NO arg pool at
+                    // all" (`None`/`Flags`), which is a DIFFERENT fact from an
+                    // exhausted cursor — exhaustion returns a slot whose index
+                    // is past the bound and falls to the stack path below. The
+                    // old shape had no way to say the first thing, so it said
+                    // the GPR pool instead.
+                    auto const slot = argCursors.next(cls);
+                    if (!slot.has_value()) {
+                        report(reporter, DiagnosticCode::L_ArgClassHasNoRegisterPool,
+                               DiagnosticSeverity::Error,
+                               std::format("materializeOneFunc: call inst {} passes an "
+                                           "argument of register class '{}', which "
+                                           "names no arg-passing pool on this target — "
+                                           "refusing rather than consuming another "
+                                           "class's cursor",
+                                           inst.v, lirRegClassName(cls)));
+                        return false;
                     }
+                    std::uint32_t const argIndex = slot->index;
+                    std::uint32_t const poolSize = slot->poolSize;
                     // FC12c: a VARARG (operand past the fixed ones) under a CC that
                     // always-stacks varargs is forced to the overflow area even if a
                     // register slot is free. Named args (argRegionIdx < fixedOperandCnt)
@@ -3301,7 +3480,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     if (argIndex < poolSize && !forceStack) {
                         // Register-resident arg: existing path.
                         auto const destReg =
-                            argPassingReg(schema, cc, argIndex, cls,
+                            argPassingRegister(schema, cc, argIndex, cls,
                                           "materializeOneFunc: call", reporter);
                         if (!destReg.has_value()) return false;
                         // D-OPT-SQLITE-FPCONV1-RELEASE-FP-MISCOMPILE: a VARARG

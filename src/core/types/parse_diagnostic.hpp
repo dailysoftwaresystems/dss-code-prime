@@ -2802,8 +2802,9 @@ enum class DiagnosticCode : std::uint16_t {
     // (`linkageSpecifierIgnoredKinds` — e.g. `__attribute__`, parens) nor a
     // recognized entry in the language's `linkageSpecifiers` map — a typo
     // (`__attribute__((wek))`) or an attribute DSS has no sink for. Fail loud
-    // rather than silently ignore it (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-
-    // DIAGNOSTIC). Source-agnostic: the recognized + ignored sets are both
+    // rather than silently ignore it
+    // (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC). Source-agnostic: the
+    // recognized + ignored sets are both
     // per-language config; the engine never hardcodes a specifier identity.
     //   ★ The old example here was `((noinline))`, which has been WRONG since
     //   TF-C78 gave noinline a real sink (and TF-C81 always_inline, TF-C92
@@ -3273,6 +3274,41 @@ enum class DiagnosticCode : std::uint16_t {
     L_SideStructureIndexDangling   = 0xB010,
     L_SideStructurePoolShrank      = 0xB011,
     L_SideStructureReferenceLost   = 0xB012,
+
+    // ── D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR ──
+    //
+    // THREE FACTS, THREE CODES, and the split is the fix rather than a
+    // formality. Before this, `argPassingReg` selected its pool with
+    // `(cls == FPR) ? argFprs : argGprs` — so a VR-class argument took the ELSE
+    // branch into the INTEGER pool and was passed in the wrong register file
+    // with NO diagnostic at all.
+    //
+    // L_ArgClassHasNoRegisterPool: the class has no row in `kArgPoolRows` —
+    //   it is not an argument-passable class on any target (`None`, `Flags`).
+    //   An INTERNAL invariant: a value of such a class reached a call site.
+    //
+    // L_ArgClassPoolUndeclared: the class HAS a row and this calling convention
+    //   declares ZERO registers for it. A statement about what the target made
+    //   allocatable — NOT a capacity problem.
+    //   ⚠ THIS IS WHY IT CANNOT SHARE `L_StackPassedArgUnsupported`: that code
+    //   says "the pool ran out, so this argument goes on the stack", which is a
+    //   true and RECOVERABLE sentence about a full pool. Said of an EMPTY pool
+    //   it names the wrong fact — it would report the cc as having "only 0 VR
+    //   arg-passing registers" and point at stack passing, when the correct
+    //   sentence is that this target declares no allocatable VR registers at
+    //   all and the argument cannot be passed in one. ★ A refusal that
+    //   misattributes sends the reader to the one place the defect is not.
+    //   ⓘ It is NOT what arm64's `"w"` hits. That letter names a register FILE
+    //   whose two declared VIEWS (`fpr` = the d-registers, `vr` = the
+    //   v-registers) are one physical file, and the constraint now declares
+    //   BOTH — so an operand picks the narrowest view that holds it and lands
+    //   in a pool the cc actually declares. This code is what a class with a
+    //   genuinely empty pool hits, and widening it to paper over a view
+    //   selection would restore the silent miscompile it replaced.
+    // Both UNSUPPRESSABLE: suppressed, each is a wrong-register codegen with a
+    // green build.
+    L_ArgClassHasNoRegisterPool    = 0xB013,
+    L_ArgClassPoolUndeclared       = 0xB014,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //
@@ -4183,8 +4219,8 @@ enum class DiagnosticCode : std::uint16_t {
     //   dropped descriptor-malformed miss would silently synthesize no
     //   externs (or the wrong ones), compiling a program whose
     //   `#include <stdio.h>` symbols resolve to nothing. (Neutral
-    //   shipped-lib descriptor, closes D-FFI-SHIPPED-LIB-DESCRIPTOR-
-    //   AGNOSTIC, 2026-06-06.)
+    //   shipped-lib descriptor, closes
+    //   D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC, 2026-06-06.)
     F_ShippedLibDescriptorMalformed = 0x501B,
     // F_ShippedLibUnsupportedType: a shipped-library descriptor symbol's
     //   `signature` hir-text type string failed to decode —
@@ -4367,8 +4403,9 @@ enum class DiagnosticCode : std::uint16_t {
     //   the input.
     //
     //   ★★ IT EXISTS BECAUSE THE FAILURE IT REPLACES WAS SILENT, AND THAT IS THE
-    //   WHOLE POINT. `D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-
-    //   ATOM`: the COFF and Mach-O readers classify every NON-EXTERNAL defined
+    //   WHOLE POINT.
+    //   `D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM`: the
+    //   COFF and Mach-O readers classify every NON-EXTERNAL defined
     //   section symbol as an interior block label (an `&&label`), which is right
     //   for a label and wrong for a whole file-local (`static`) function — the
     //   two shapes are indistinguishable in those formats' symbol tables, which

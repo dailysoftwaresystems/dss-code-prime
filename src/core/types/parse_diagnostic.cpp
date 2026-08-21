@@ -357,6 +357,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_SideStructureIndexDangling:   return "L_SideStructureIndexDangling";
         case DiagnosticCode::L_SideStructurePoolShrank:      return "L_SideStructurePoolShrank";
         case DiagnosticCode::L_SideStructureReferenceLost:   return "L_SideStructureReferenceLost";
+        case DiagnosticCode::L_ArgClassHasNoRegisterPool:    return "L_ArgClassHasNoRegisterPool";
+        case DiagnosticCode::L_ArgClassPoolUndeclared:       return "L_ArgClassPoolUndeclared";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";

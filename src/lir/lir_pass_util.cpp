@@ -1,3 +1,4 @@
+#include "lir/lir_callconv.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <format>
@@ -18,14 +19,23 @@ incomingArgRegister(TargetSchema const&            schema,
     // (Win64) keep argGprs/argFprs the same length so `payload` (a flat slot
     // index) selects the same slot in either; independent-counter ccs
     // (SysV/AAPCS64) pass `payload` as the per-class index. Either way the
-    // per-class pool indexed by `payload` is the incoming register — the exact
-    // shape collectArgRegisterOccupied used before this was hoisted.
-    auto const& pool = (resultClass == LirRegClass::FPR) ? cc.argFprs
-                                                         : cc.argGprs;
-    if (payload >= pool.size()) {
+    // per-class pool indexed by `payload` is the incoming register.
+    //
+    // ★ THE POOL COMES FROM THE PUBLISHED ROW TABLE, NOT FROM A TWO-WAY TEST.
+    // This read `(resultClass == FPR) ? argFprs : argGprs`, so a VR-class
+    // parameter was looked up in the INTEGER pool and this pass reported the
+    // wrong register as occupied — the fifth copy of
+    // D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR.
+    // ⚠ A class with NO row answers `StackPassed` here rather than a register.
+    // This function's contract is a QUERY with no reporter, and the three
+    // placement sites refuse such a class loudly; answering "not in a register"
+    // is the conservative direction (a scratch pick stays available), whereas
+    // naming another class's register is the wrong-register answer itself.
+    auto const* pool = argRegisterPool(cc, resultClass);
+    if (pool == nullptr || payload >= pool->size()) {
         return {IncomingArgRegKind::StackPassed, 0};
     }
-    auto const ord = schema.registerByName(pool[payload]);
+    auto const ord = schema.registerByName((*pool)[payload]);
     if (!ord.has_value()) {
         return {IncomingArgRegKind::UnresolvableName, 0};
     }

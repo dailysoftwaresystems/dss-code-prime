@@ -63,3 +63,9 @@ target_link_libraries(dss_lir_test_fcmp_lowering PRIVATE nlohmann_json::nlohmann
 # its refusal, and retyping the accepted set as a literal reddened nothing.
 dss_add_test(NAME lir/test_lir_return_pool_projection
              SOURCES test_lir_return_pool_projection.cpp)
+
+# D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR — the ARG
+# side of the pool projection above, plus the cursor WALK the row table alone
+# was measured not to cover.
+dss_add_test(NAME lir/test_lir_arg_cursor_projection
+             SOURCES test_lir_arg_cursor_projection.cpp)

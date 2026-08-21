@@ -251,6 +251,194 @@ returnRegisterForClass(TargetSchema const&            schema,
                        std::string_view               contextLabel,
                        DiagnosticReporter&            reporter);
 
+// ── WHICH CLASSES HAVE AN ARG-PASSING POOL, AS ROWS ──────────────────────────
+//
+// D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR.
+//
+// ★★★ THIS IS `kReturnPoolRows`' TWIN, ONE CYCLE LATER, FOR THE IDENTICAL
+// DEFECT ON THE SIBLING FUNCTION — and it is deliberately the SAME pattern
+// rather than a second one. `returnRegisterForClass`'s banner above records
+// `returnVrs` as "declared ... populated by the loader ... and this function
+// never read it", with a VR result taking the GPR ELSE branch into the integer
+// pool and producing a wrong-file capture with no diagnostic. `argPassingReg`
+// had the same `(cls == FPR) ? argFprs : argGprs` selection over the same
+// >2-member vocabulary, and `argVrs` had the same never-read status.
+//
+// ⚠ THE ARG SIDE'S DEFECT WAS LIVE, NOT LATENT — the measurement lives in the
+// row: a `"w"`-constrained value passed to a `double` parameter compiled rc=0
+// with BOTH arguments wrong.
+//
+// ⚠⚠ AND THE ARG SIDE IS NOT A COPY OF THE RETURN SIDE, BECAUSE THE COUNTER IS
+// NOT THE SAME SHAPE. `returnRegisterForClass` takes an `ordinal` the caller
+// supplies and every class's pool is independent. Arg passing walks CURSORS, and
+// AAPCS64 §6.4.2 stage C.1 allocates a Half/Single/Double/Quad-precision
+// floating-point OR SHORT VECTOR argument to `v[NSRN]` — ONE counter across
+// what this codebase calls FPR (the d-views) and VR (the v-views). Two rows,
+// one cursor. `argPoolsShareACursor` below is why that is DERIVED, not declared.
+struct ArgPoolRow {
+    LirRegClass                                        cls;
+    std::vector<std::string> TargetCallingConvention::* pool;
+};
+inline constexpr std::array<ArgPoolRow, 3> kArgPoolRows{{
+    {LirRegClass::GPR, &TargetCallingConvention::argGprs},
+    {LirRegClass::FPR, &TargetCallingConvention::argFprs},
+    {LirRegClass::VR,  &TargetCallingConvention::argVrs},
+}};
+
+// Same anti-padding guarantee the return table carries, for the same measured
+// reason: `std::array<Row, N>` with fewer than N initializers is legal C++ and
+// value-initializes the remainder into a row whose `pool` is a NULL
+// pointer-to-member and whose class is `None` — which `argRegisterPool` would
+// then match against `LirRegClass::None` and dereference. The BUILD stops.
+static_assert([] {
+    for (auto const& row : kArgPoolRows) {
+        if (row.pool == nullptr) return false;
+        if (row.cls == LirRegClass::None) return false;
+    }
+    return true;
+}(), "kArgPoolRows has a padding row — the array's declared size outruns its "
+     "initializers, and a row with a null pointer-to-member would be matched "
+     "against LirRegClass::None and dereferenced");
+
+// The rendered accepted set, built ONCE off those rows — so ACCEPTANCE and
+// ADVERTISEMENT are one walk over one row set and cannot drift apart.
+inline constexpr auto kArgPoolClassNames = [] {
+    std::array<std::string_view, kArgPoolRows.size()> out{};
+    for (std::size_t i = 0; i < kArgPoolRows.size(); ++i) {
+        out[i] = lirRegClassName(kArgPoolRows[i].cls);
+    }
+    return out;
+}();
+
+// The cc pool an argument of class `cls` is passed in, or `nullptr` when this
+// class has no row. A class with no row owns no pool and is NOT silently filed
+// into somebody else's — which is the whole defect this table closes.
+//
+// ⚠ `nullptr` (no row at all) and an EMPTY pool (a row exists; the cc declares
+// no registers for it) are DIFFERENT FACTS and get different refusals — see
+// `argPassingRegister`.
+[[nodiscard]] constexpr std::vector<std::string> const*
+argRegisterPool(TargetCallingConvention const& cc, LirRegClass cls) noexcept {
+    for (auto const& row : kArgPoolRows) {
+        if (row.cls == cls) return &(cc.*row.pool);
+    }
+    return nullptr;
+}
+
+// ★★★ THE COUNTER IDENTITY, DERIVED FROM THE TARGET RATHER THAN DECLARED
+// BESIDE IT.
+//
+// Two arg pools share ONE cursor exactly when their k-th entries are the SAME
+// PHYSICAL REGISTER. That is not a new fact needing a new schema key — it is
+// already in every register row: `dwarfNumber` is DWARF's own identifier for a
+// physical register, so two register declarations carrying the same
+// `dwarfNumber` ARE one register wearing two widths.
+//
+// ✔MEASURED over the shipped targets: arm64 has exactly 32 shared
+// `dwarfNumber`s, each pairing a `d_k` (class fpr) with a `v_k` (class vr) —
+// the whole V-register file and nothing else; x86_64 has ZERO, so the
+// derivation is correctly inert there.
+//
+// ⚠ WHY NOT A `sharedCounter` KEY ON THE CALLING CONVENTION: it would be a
+// SECOND OWNER of a fact the register table already carries, and the loader
+// could not detect the two disagreeing — the shape §A.1b records as "a fact
+// with an owner does not get a second owner" (the reverted `asmSyntax` facet,
+// and the `views`-vs-`subOf` duplicate). A cc declaring `sharedCounter: false`
+// over two aliasing pools would hand slot k out twice, silently.
+//
+// ⓘ `cc.slotAligned` is a DIFFERENT, independent fact — Win64's ONE positional
+// cursor across ALL classes, where arg k takes slot k whatever its class. It
+// already has an owner and still wins; this derivation answers only the
+// non-slot-aligned case.
+[[nodiscard]] DSS_EXPORT bool
+argPoolsShareACursor(TargetSchema const&            schema,
+                     TargetCallingConvention const& cc,
+                     LirRegClass                    a,
+                     LirRegClass                    b) noexcept;
+
+// Lookup the `index`-th arg-passing register of the given class.
+//
+// ★ PUBLISHED, for the reason `
+// D-LIR-RETURN-REG-REFUSAL-IS-UNREACHABLE-FROM-THE-TEST-TIER` measured on the return side: a refusal in an anonymous
+// namespace is worth nothing, because retyping its accepted set back into a
+// hand-written literal left `ctest` green. These refusals are this change's
+// deliverable, so they are reachable from the test tier.
+//
+// Returns `nullopt` + a loud diagnostic in three DISTINCT cases, which are three
+// distinct facts and never share a message:
+//   * the class has NO ROW — `argRegisterPool` is nullptr;
+//   * the class has a row and the cc declares NO REGISTERS for it — an empty
+//     pool states what this target made allocatable, and is NOT a capacity
+//     overflow the stack could absorb;
+//   * the pool is EXHAUSTED — `index >= pool.size()`, which IS stack passing
+//     (D-ML7-2.2).
+[[nodiscard]] DSS_EXPORT std::optional<LirReg>
+argPassingRegister(TargetSchema const&            schema,
+                   TargetCallingConvention const& cc,
+                   std::uint32_t                  index,
+                   LirRegClass                    cls,
+                   std::string_view               contextLabel,
+                   DiagnosticReporter&            reporter);
+
+// ── THE ARG CURSORS, AS ONE OBJECT INSTEAD OF THREE HAND-KEPT COPIES ─────────
+//
+// D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR.
+//
+// ★★★ THE ROW TABLE ALONE DOES NOT CLOSE THIS DEFECT, AND THAT IS THE MEASURED
+// FINDING RATHER THAN A DESIGN PREFERENCE. ✔With `argPassingRegister` converted
+// to the rows, the reproduction was recompiled and came out **byte-identical** —
+// because the register an outgoing argument lands in is decided by a cursor walk
+// that existed in THREE separate copies, none of them `argPassingRegister`:
+// `lir_rewrite::classifyCallRegArgs`, `lir_wide_call_args::lowerOneFunc`, and
+// the outgoing-area counting in `lir_callconv`. Each carried its own
+// `(cls == FPR) ? fprIdx++ : gprIdx++`, and two of them carried a comment
+// promising to "advance the shared cursors exactly as callconv does" — a
+// promise kept by hand, which is the shape that lets three passes disagree.
+//
+// ⇒ ONE object owns the walk; the copies call it. The hazard the row describes
+// as "four more copies must move together or the passes will disagree" stops
+// being a discipline and becomes a structural impossibility.
+//
+// THE GROUPING IS DERIVED, NOT DECLARED — see `argPoolsShareACursor`. Classes
+// whose pools are two views of one physical register file share one cursor
+// (AAPCS64's single NSRN across the d-views and the v-views); disjoint files get
+// their own. `cc.slotAligned` overrides both into ONE positional cursor across
+// every class (Win64: arg k takes slot k whatever its class).
+class DSS_EXPORT ArgCursors {
+public:
+    ArgCursors(TargetSchema const& schema, TargetCallingConvention const& cc);
+
+    struct Slot {
+        std::uint32_t index;     // the cursor value this argument consumed
+        std::uint32_t poolSize;  // the pool it must fit inside
+    };
+
+    // Consume one cursor slot for an argument of class `cls`.
+    //
+    // `nullopt` ⇔ `cls` names no arg pool at all (`kArgPoolRows` has no row for
+    // it — `None`, `Flags`). That is a DIFFERENT fact from an exhausted cursor,
+    // which returns a `Slot` whose `index >= poolSize`, and callers must keep
+    // them apart: exhaustion is stack passing, no-row is a refusal.
+    [[nodiscard]] std::optional<Slot> next(LirRegClass cls);
+
+    // The by-value-stacked-aggregate clamp: an aggregate that exhausted a
+    // class's registers pushes that class's cursor to its pool size, so every
+    // later argument of that class overflows too. Takes the CLASS rather than a
+    // hand-passed cursor, so a caller cannot clamp the wrong one.
+    void exhaust(LirRegClass cls);
+
+    [[nodiscard]] std::uint32_t poolSizeFor(LirRegClass cls) const;
+
+private:
+    // One entry per row in `kArgPoolRows`, plus the slot-aligned collapse.
+    std::array<std::uint32_t, kArgPoolRows.size()> group_{};   // class row -> cursor group
+    std::array<std::uint32_t, kArgPoolRows.size()> cursor_{};  // group -> next index
+    std::array<std::uint32_t, kArgPoolRows.size()> poolSize_{};// group -> bound
+    bool slotAligned_ = false;
+
+    [[nodiscard]] static std::optional<std::size_t> rowOf(LirRegClass cls);
+};
+
 // Per-function frame layout computed before emission. Stored so
 // downstream passes (AS1 unwind info, debug-info DWARF .debug_frame
 // generation) can read it without re-computing.

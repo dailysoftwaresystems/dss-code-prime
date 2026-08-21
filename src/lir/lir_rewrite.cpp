@@ -8,6 +8,7 @@
 // spilled scalar arg's register-vs-overflow decision matches theirs.
 #include "mir/mir_opcode.hpp"
 #include "lir/lir_node.hpp"
+#include "lir/lir_callconv.hpp"
 #include "lir/lir_pass_util.hpp"
 #include "lir/lir_reg_constraints.hpp"
 
@@ -244,13 +245,14 @@ resolveReg(LirReg r, LirFuncAllocation const& alloc,
 // value (a call has few operands); indexed by the operand loop below.
 [[nodiscard]] std::vector<std::optional<LirRegClass>>
 classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
+                    TargetSchema const& schema,
                     TargetCallingConvention const& cc) {
     std::vector<std::optional<LirRegClass>> out(ops.size(), std::nullopt);
-    std::uint32_t const gprPoolSize =
-        static_cast<std::uint32_t>(cc.argGprs.size());
-    std::uint32_t const fprPoolSize =
-        static_cast<std::uint32_t>(cc.argFprs.size());
-    std::uint32_t const slotAlignedPoolSize = std::max(gprPoolSize, fprPoolSize);
+    // ★ ONE OBJECT, SHARED WITH callconv AND lir_wide_call_args — see
+    // D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR. The
+    // `schema` parameter is what the cursor GROUPING needs: which classes share
+    // a counter is read off the target's own `dwarfNumber`s, not declared.
+    ArgCursors argCursors{schema, cc};
 
     bool const hasIrr = ::dss::call_payload::hasIndirectResult(payload);
     std::size_t const firstArgIdx = hasIrr ? 2u : 1u;
@@ -258,7 +260,6 @@ classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
         cc.variadicArgsAlwaysStack && ::dss::call_payload::isVariadic(payload);
     std::uint32_t const fixedOps = ::dss::call_payload::fixedOperandCount(payload);
 
-    std::uint32_t gprIdx = 0, fprIdx = 0, slotIdx = 0;
     std::uint32_t argRegionIdx = 0;
     for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
         LirOperand const& argOp = ops[k];
@@ -271,25 +272,21 @@ classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
             // Advance the shared cursors + class-exhaust clamp as callconv does.
             std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
             if (ex == kByValueStackArgExhaustGpr)
-                gprIdx = std::max(gprIdx, gprPoolSize);
+                argCursors.exhaust(LirRegClass::GPR);
             else if (ex == kByValueStackArgExhaustFpr)
-                fprIdx = std::max(fprIdx, fprPoolSize);
+                argCursors.exhaust(LirRegClass::FPR);
             ++argRegionIdx;
             continue;
         }
         if (argOp.kind != LirOperandKind::Reg) { ++argRegionIdx; continue; }
         LirRegClass const cls = argOp.reg.regClass();
-        std::uint32_t argIndex, poolSize;
-        if (cc.slotAligned) {
-            argIndex = slotIdx++;
-            poolSize = slotAlignedPoolSize;
-        } else if (cls == LirRegClass::FPR) {
-            argIndex = fprIdx++;
-            poolSize = fprPoolSize;
-        } else {
-            argIndex = gprIdx++;
-            poolSize = gprPoolSize;
-        }
+        // ⚠ A class with no pool row gets index 0 / poolSize 0, i.e. NOT
+        // register-passed — which keeps the ordinary scratch-reload path (the
+        // safe branch this function's own comment names) and leaves the loud
+        // refusal to the placement site that owns it.
+        auto const slot = argCursors.next(cls);
+        std::uint32_t const argIndex = slot.has_value() ? slot->index : 0u;
+        std::uint32_t const poolSize = slot.has_value() ? slot->poolSize : 0u;
         bool const forceStack =
             variadicForcesStack && argRegionIdx >= fixedOps;
         if (argIndex < poolSize && !forceStack) {
@@ -520,7 +517,8 @@ rewriteOneFunc(Lir const&               src,
             // scratch (the func-2088 exhaustion). Empty for non-calls / no cc.
             std::vector<std::optional<LirRegClass>> callRegArgClass;
             if (info != nullptr && info->isCall && ccForArgs != nullptr) {
-                callRegArgClass = classifyCallRegArgs(ops, payload, *ccForArgs);
+                callRegArgClass =
+                    classifyCallRegArgs(ops, payload, schema, *ccForArgs);
             }
 
             // D-AS-REGALLOC-ARG-REGISTER-OCCUPIED (c75 correctness fix,

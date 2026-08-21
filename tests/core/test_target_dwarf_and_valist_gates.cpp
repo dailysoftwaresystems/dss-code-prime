@@ -175,6 +175,51 @@ TEST(TargetDwarfNumbering, ATargetDeclaringNeitherHalfStillLoads) {
     EXPECT_FALSE((*r)->dwarfReturnAddressColumn().has_value());
 }
 
+// ── D-TARGET-ARG-POOLS-WITHOUT-DWARF-NUMBERS-CANNOT-BE-RELATED ─────────────
+//
+// Whether two arg pools share ONE cursor is DERIVED — `argPoolsShareACursor`
+// compares the `dwarfNumber` of their slot-0 registers, because that is the
+// only field that says "these two class names are two widths of one physical
+// file" (`hwEncoding` is a per-file register NUMBER and ✔MEASURED not to
+// discriminate: arm64 gpr×vr share all 32 values). The derivation is
+// fail-closed, so an absent number yields INDEPENDENT cursors — a safe answer,
+// but one nobody chose. A target that numbers its registers and then omits the
+// numbers on the pools that carry its ABI is refused.
+TEST(TargetDwarfNumbering, ArgPoolsThatCannotBeRelatedToEachOtherAreRejected) {
+    auto r = mutateShippedTargetSchemaDoc("x86_64", [](nlohmann::json& doc) {
+        // x86_64 declares both argGprs and argFprs, so the two pools exist and
+        // the question "are these one file or two?" is live. Strip the number
+        // from the FIRST integer arg register only — the numbering as a whole
+        // stays declared, which is what separates this from the opt-out case.
+        for (auto& reg : doc["registers"]) {
+            if (reg.value("name", std::string{}) == "rdi") reg.erase("dwarfNumber");
+        }
+    });
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(saysAny(r.error(), "cannot be related to")) << summarize(r.error());
+}
+
+// ⚠ THE COMPLEMENT, AND IT IS THE ARM THAT KEEPS THE ONE ABOVE HONEST: the
+// refusal must NOT fire on a target that declares no numbering at all. That is
+// the contract `ATargetDeclaringNeitherHalfStillLoads` states, and the first
+// draft of the check above broke it — the rule is "if you number your
+// registers, number the ones that carry ABI meaning", never "you must number
+// your registers". Without this arm the check could be widened back to the
+// broken form and only a different test file would notice.
+TEST(TargetDwarfNumbering, ArgPoolsNeedNoDwarfNumbersWhenTheTargetDeclaresNone) {
+    auto r = mutateShippedTargetSchemaDoc("x86_64", [](nlohmann::json& doc) {
+        doc["target"].erase("dwarfReturnAddressColumn");
+        for (auto& reg : doc["registers"]) { reg.erase("dwarfNumber"); }
+    });
+    ASSERT_TRUE(r.has_value()) << summarize(r.error());
+    // …and this target really does declare two arg pools, so the arm is not
+    // passing because the precondition was absent.
+    auto const* cc = (*r)->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_FALSE(cc->argGprs.empty());
+    EXPECT_FALSE(cc->argFprs.empty());
+}
+
 TEST(TargetDwarfNumbering, AnOutOfRangeDwarfNumberIsRejected) {
     auto r = mutateShippedTargetSchemaDoc("x86_64", [](nlohmann::json& doc) {
         doc["registers"][0]["dwarfNumber"] = -1;

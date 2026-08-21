@@ -1,3 +1,4 @@
+#include "lir/lir_callconv.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
@@ -6637,7 +6638,7 @@ struct Lowerer {
         // indirect: [callee_reg, args...]. A by-value-stack aggregate carrier
         // (an F80/SysV arg, or a stacked struct) expands to (addrReg,
         // ByValueStackAgg). An F128 arg is collected for the v-register burst,
-        // NOT operand-listed; `nsrn` tracks each F128 arg's shared FPR ordinal.
+        // NOT operand-listed; `nsrnCursors` tracks its shared FPR/VR ordinal.
         std::vector<LirOperand> ops;
         ops.reserve(operands.size() + 2);
         if (calleeIsGlobalAddr) {
@@ -6648,17 +6649,37 @@ struct Lowerer {
             ops.push_back(LirOperand::makeReg(*callee));
         }
         std::vector<std::pair<LirReg, std::uint16_t>> f128Marshals;  // (home, vrOrd)
-        std::uint32_t nsrn = 0;
+        // ★★★ THE SIXTH COPY OF THE ARG CURSOR, NOW THE SAME OBJECT AS THE
+        // OTHER FIVE (D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR).
+        // This was a private `std::uint32_t nsrn` indexing `cc->argVrs`, with a
+        // hand-written `++nsrn` on the F32/F64 arm carrying the AAPCS64 fact
+        // that the d-views and the v-views share ONE counter. That fact is now
+        // DERIVED from the target's `dwarfNumber`s, so the sharing cannot be
+        // half-remembered here and spelled differently three files away.
+        // ⚠ A GPR argument also advances its own (independent) cursor through
+        // this object; only the vector slot is read, so that costs nothing and
+        // keeps the walk identical to the one every other site performs.
+        // ⚠ The cc must exist before the cursors can: the old code deferred that
+        // check to the first F128 argument, so a target with no calling
+        // convention reached this point and only refused if a 128-bit float
+        // happened to be present. Refusing here is the same fact, asked once.
+        if (cc == nullptr) {
+            reportUnsupported(MirOpcode::Call, id);
+            poisonIfValueResult();
+            return;
+        }
+        ArgCursors nsrnCursors{target, *cc};
         for (std::size_t i = 1; i < operands.size(); ++i) {
             MirInstId const operandMir = operands[i];
             TypeKind const ak = interner.kind(mir.instType(operandMir));
             if (ak == TypeKind::F128) {
-                if (cc == nullptr || nsrn >= cc->argVrs.size()) {
+                auto const slot = nsrnCursors.next(LirRegClass::VR);
+                if (!slot.has_value() || slot->index >= cc->argVrs.size()) {
                     reportUnsupported(MirOpcode::Call, id);
                     poisonIfValueResult();
                     return;
                 }
-                auto const vrOrd = target.registerByName(cc->argVrs[nsrn]);
+                auto const vrOrd = target.registerByName(cc->argVrs[slot->index]);
                 if (!vrOrd.has_value()) {
                     reportUnsupported(MirOpcode::Call, id);
                     poisonIfValueResult();
@@ -6667,7 +6688,6 @@ struct Lowerer {
                 std::optional<LirReg> const home = regForValue(operandMir);
                 if (!home.has_value()) return;
                 f128Marshals.emplace_back(*home, *vrOrd);
-                ++nsrn;
                 continue;
             }
             std::optional<LirReg> const r = regForValue(operandMir);
@@ -6686,7 +6706,11 @@ struct Lowerer {
                     static_cast<std::uint8_t>(
                         (bvPayload >> kByValueStackArgExhaustShift) & 0x3u)));
             } else if (ak == TypeKind::F32 || ak == TypeKind::F64) {
-                ++nsrn;   // a non-F128 FPR arg consumes an NSRN slot too
+                // A non-F128 FPR arg consumes an NSRN slot too — and on a target
+                // whose d-views and v-views are one register file, advancing the
+                // FPR cursor advances the vector one, because they ARE one
+                // cursor. Nothing here asserts that; the register table does.
+                (void)nsrnCursors.next(LirRegClass::FPR);
             }
         }
 

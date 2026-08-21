@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-21 — cycles **P14 … P24**. ★★★ **P24 SPLIT `integrated_tests` INTO 616 ctest ENTRIES — 677.97 s in ONE entry became 83.81 s over many, 8.1×, and every example now reports its own pass/fail.** Operator-instructed, and the ruling that shaped it is the portable part: **a UNIVERSAL claim is per-example; an EXISTENCE claim is about the corpus and stays one.** Balance **1034 → 1033, net −1** — the burn-down after P23. Earlier: ★★★ **P23 SHIPPED WEAK DEFINITIONS *AND* WEAK ALIASES ON PE/COFF AND MACH-O, FINISHED THE RETYPED-CLOSED-SET CLASS, AND CLOSED THE pe64 ACQUISITION ROW ON A MEASUREMENT NOBODY HAD EVER TAKEN.** All four queued rows closed plus three more. ⚠ **The BALANCE went the other way and the number is said plainly: OPEN 1018 → 1033, closed 7, opened 22 (21 created + 1 disclosed pre-existing), net +14 created-over-closed, and 55 further rows BORN CLOSED** — because a step-10 independent audit, six fold lanes and a four-leg gate found twenty-nine further defects, and an operator ruling authorized shipping the positive balance with every one of them queued as the next cycle's first work. Two operator rulings, neither to be re-litigated: a weak DEFINITION in COFF is **COMDAT select-any**, not `WEAK_EXTERNAL` (*"an implementation gap and a format incapability are different facts"*); and `WEAK_EXTERNAL` IS right for a weak **alias**, built reader-first. ⚠ The brief that ordered the second routed the decision onto `Characteristics`, and ✔gcc emits **1 for all four weak shapes** — the discriminator is the aux record’s `TagIndex`. Earlier: ★★★ **P22 MADE A `static` HELPER LINK OUT OF AN ARCHIVE ON EVERY LEG** — pe64 and macho64 readers were classifying a non-external defined symbol as a bodyless block label, so its bytes never entered the image. Earlier: ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
+**Last updated:** 2026-08-21 — cycles **P14 … P25**. ★★★ **P25 CLOSED THE BRANCH'S ONLY 🔴 HIGH — A LIVE SILENT MISCOMPILE IN ARGUMENT PLACEMENT.** A two-way pool rule over a three-member register-class vocabulary filed every `VR` argument into the INTEGER pool; ✔MEASURED at the disassembly, the mutant emits `ldur q0` **over an already-placed argument** at rc=0 with no diagnostic, the fix emits `ldur q2` (AAPCS64 NSRN 2), and gcc agrees. ★★★ The portable finding is that **the pool TABLE alone fixed nothing — the reproduction recompiled byte-identical** — because the decision lives in a CURSOR WALK that existed in **six** hand-kept copies, two of them carrying comments promising to stay in step by hand. One object owns it now. ⚠ **Two claims I wrote were refuted by reading the thing they were about**, both recorded in §0.000000000000000000000000000 rather than dropped: the `"w"` view-selection premise (the config's own measurement was right and the whole schema migration was reverted) and a row I had opened hours earlier in the same cycle. Balance **1033 → 1033, net ±0**. Earlier: ★★★ **P24 SPLIT `integrated_tests` INTO 616 ctest ENTRIES — 677.97 s in ONE entry became 83.81 s over many, 8.1×, and every example now reports its own pass/fail.** Operator-instructed, and the ruling that shaped it is the portable part: **a UNIVERSAL claim is per-example; an EXISTENCE claim is about the corpus and stays one.** Balance **1034 → 1033, net −1** — the burn-down after P23. Earlier: ★★★ **P23 SHIPPED WEAK DEFINITIONS *AND* WEAK ALIASES ON PE/COFF AND MACH-O, FINISHED THE RETYPED-CLOSED-SET CLASS, AND CLOSED THE pe64 ACQUISITION ROW ON A MEASUREMENT NOBODY HAD EVER TAKEN.** All four queued rows closed plus three more. ⚠ **The BALANCE went the other way and the number is said plainly: OPEN 1018 → 1033, closed 7, opened 22 (21 created + 1 disclosed pre-existing), net +14 created-over-closed, and 55 further rows BORN CLOSED** — because a step-10 independent audit, six fold lanes and a four-leg gate found twenty-nine further defects, and an operator ruling authorized shipping the positive balance with every one of them queued as the next cycle's first work. Two operator rulings, neither to be re-litigated: a weak DEFINITION in COFF is **COMDAT select-any**, not `WEAK_EXTERNAL` (*"an implementation gap and a format incapability are different facts"*); and `WEAK_EXTERNAL` IS right for a weak **alias**, built reader-first. ⚠ The brief that ordered the second routed the decision onto `Characteristics`, and ✔gcc emits **1 for all four weak shapes** — the discriminator is the aux record’s `TagIndex`. Earlier: ★★★ **P22 MADE A `static` HELPER LINK OUT OF AN ARCHIVE ON EVERY LEG** — pe64 and macho64 readers were classifying a non-external defined symbol as a bodyless block label, so its bytes never entered the image. Earlier: ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
 **Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P21). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
@@ -109,7 +109,76 @@ commit that lands it, and never delete a ticked row.
       CONTROL returning **0/5** so the instrument can say no. Closed its ELF sibling on the same evidence.
 - [x] **P24 — `D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD`. ✅ DONE 2026-08-21**,
       pulled ahead of P25 by operator instruction. Closed 1, opened 0, four rows born closed.
-- [ ] **P25 — EVERY ROW CYCLE P23 OPENED. ✔MEASURED at the committed tree: 22 opened — 19 PICKABLE,
+- [x] **P25 — `D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR`. ✅ DONE
+      2026-08-21.** The branch's only 🔴 HIGH, closed with a four-mutant red-on-disable pin.
+      Closed 1, opened 1 (trigger-gated), 1 born closed, 1 opened-and-closed inside the cycle.
+- [ ] **P26 — THE REST OF THE P25 BATCH: every row P23 opened that P25 did not reach.** ⚠ The
+      four-lane partition below is unchanged EXCEPT that the LIR lane is DONE — re-derive from
+      the REGISTRY at the pick, never from this list. ⛔ **`D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS`
+      IS NOT IN THIS QUEUE AND MUST NOT BE PICKED**: it is TRIGGER-GATED and MUST-NOT-BUILD until
+      a source construct can form a 128-bit operand that reaches the allocator as a VR-class
+      value. Report "trigger not fired"; do not treat backlog order as a licence.
+- [ ] **P25 (ORIGINAL SCOPE, FOR REFERENCE). Every row P23 opened, in FOUR DISJOINT FILE SETS, plus a §B the operator
+      resolved as OPTION 3.** ✔Re-derived from the REGISTRY 2026-08-21 at commit `c6ef80e4`: **14 of the
+      15 listed rows are still OPEN**; the one P24 closed is
+      `D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD`. Partitioned by **disjoint file
+      sets**, which is the axis that actually bounds a cycle — not row count.
+      * **LIR lane** (`src/lir/*`, `src/dss-config/targets/arm64.target.json`) —
+        `D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR`, the only 🔴 HIGH. Scope
+        set by the operator ruling below: **OPTION 3 — the total row map + the no-pool refusal land
+        HERE; the sub-register-aware allocator is P26 entry 1.**
+      * **Text-tier lane** (`src/hir/hir_text.cpp`, `src/mir/mir_text.{cpp,hpp}`, `src/mir/mir.cpp`,
+        `src/mir/mir_opcode.hpp`) — `D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM`,
+        `D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET`, `D-MIR-TEXT-DIAG-CODE-CAST-IS-UNVALIDATED`,
+        `D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS`. ⚠ The four are ONE lane because
+        they SHARE `hir_text.cpp`/`mir_text.cpp` — splitting them would collide, not parallelise. ⏳ The
+        last is a SUSPECT: **verify or discharge, never patch on suspicion.**
+      * **Linker lane** (`src/link/format/{elf,macho,coff_object_reader}.cpp`) —
+        `D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS` (take the
+        `weakDefinitionDialects()` backend accessor in the SAME change — with one consulting writer it
+        would have exactly one row to check), `D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED`.
+      * **Harness lane** (`real-examples/c/sqlite/*`, `scripts/ssh-arm64-vps/`) —
+        `D-HARNESS-ARM64-VPS-CHECKOUT-IS-STALE-AND-ITS-PREBUILT-COMPILER-REFUSES-ITS-OWN-CONFIG`,
+        `D-HARNESS-ACQUISITION-REPORT-HAS-NO-ROLE-SO-BOTH-DRIVERS-RE-PICK-THE-TCL-Z-PAIR`. ★ **Runs
+        EARLY, and for a reason that is not tidiness: the stale VPS checkout will bite THIS cycle's own
+        gate leg.** The two are one lane because they share `build-and-test.sh`.
+      * **Wave 2, if the cycle has room — they COLLIDE with wave 1 and must follow it:**
+        `D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY` (shares `enum_name_table.hpp`
+        with the text tier and `object_format_kind.hpp` with the linker),
+        `D-TYPEKIND-PASCALCASE-SPELLINGS-HAVE-TWO-OWNERS` +
+        `D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN` (both share
+        `grammar_schema_json.cpp`), `D-GATE-ANCHOR-BALANCE-SELFTEST-FIXTURES-ARE-ANCHOR-SHAPED`
+        (standalone, cheap).
+      ⚠ **DELIBERATELY NOT BUILT, and that is the correct call rather than an omission:**
+      `D-GATE-WRAPPED-CITATION-WITH-LEADING-HYPHEN-CONTINUATION-UNRECOVERED` — its own cell argues
+      against building it (no failing case, known false-positive surface). Building what a row argues
+      against is the speculative build §A.2 forbids, pointing the other way.
+      ⚠ **NOT PICKABLE, said rather than silently skipped:**
+      `D-CYCLE-LANE-SOURCE-TREE-IS-SHARED-SO-ONE-LANE-CAN-BLOCK-ANOTHERS-BUILD` is **§B — operator
+      decision** (per-lane worktrees vs. the shared tree), and
+      `D-CONFIG-GRAMMAR-ISA-AND-IDENTIFIERCLASS-BELONG-IN-THE-LANGUAGE-BLOCK` is **TRIGGER-GATED**.
+- [ ] **P26 ENTRY 1 — THE SUB-REGISTER-AWARE ALLOCATOR (the AAPCS64 v/d register-view arc).
+      ★★★ PLACED HERE BY OPERATOR CONDITION 3, 2026-08-21, AND THE PLACEMENT IS THE POINT.** Verbatim:
+      *"'P26's headline' is not sufficient. It must be P26's FIRST queue entry. … 'Headline' is a
+      softer word than the rule allows, and the difference is exactly how a queued row becomes a
+      permanent one."* This entry is what makes P25's Option 3 **sequencing rather than deferral**; it
+      pushes `P26+ — THE REST OF WHAT P21 AND P22 FOUND` down one slot.
+      **What it must build:** declare the aliasing through the EXISTING facility (`d_k.subOf = v_k` —
+      `w0.subOf = x0` is declared today and the vector file's identical relationship is not), flip the
+      AAPCS64 cc lists to the v-views, and teach the allocator that assigning a parent CONSUMES its
+      children. ⚠ **`TargetSchema::validate()` refuses a cc list naming a sub-register TODAY**, and its
+      own comment states why the shortcut is not available: *"'make sub-registers allocatable' is not
+      the alternative — a sub-register-aware allocator is, and that is a cycle, not a config edit."*
+      `arm64.target.json`'s `v0` row says the same thing independently: *"A future SIMD/vector cycle
+      that makes VR allocatable must add the subOf aliasing + callerSaved membership then."*
+      ★ **P25 leaves this STRICTLY EASIER, not merely pending:** the arg-side row table is a
+      prerequisite either way, and P25 builds it with the counter identity already expressed
+      (operator Condition 1), so this entry touches the ALLOCATOR and not the call-convention tables.
+      ★★ **AND IT MUST FLIP AN INVERTED PIN BACK** — P25's no-pool refusal test names this anchor in
+      the test body precisely so this entry cannot close green without restoring the capability
+      (operator Condition 4). ⚠ A guard rewritten to match whatever the code now does asserts nothing;
+      the one P25 leaves behind names what it is temporarily standing in for.
+- [ ] **P25 DETAIL (the sizing P23 wrote; re-derive each row from the REGISTRY before starting it) — EVERY ROW CYCLE P23 OPENED. ✔MEASURED at the committed tree: 22 opened — 19 PICKABLE,
       2 GATED, and 1 DISCLOSED PRE-EXISTING** (the instrument counts that last one separately:
       *opened 22 (created 21, disclosed-pre-existing 1)*, so it is NOT one of the 21 this cycle made). ★★★ **OPERATOR RULING 2026-08-21, verbatim:** *"we can commit
       + push with the positive balance due to the really long cycle this time, but record in handoff so these
@@ -219,6 +288,221 @@ trigger NOT fired `D-ASM-TARGET-DECLARES-NO-BYTE-ORDER`, `D-ASM-COND-ON-TERMINAT
 ⓘ Two rows a family-grep catches that are NOT defects: `D-OPT-REBUILD-POLICY-NEUTERED-STATE-HOOK` is a 🟢
 SHIPPED design record, and `D-TEST-MACOS-LEG-EMSDK-PROFILE-REPLACES-PATH-HIDING-HOMEBREW` is a 🔵 DISCLOSED
 pre-existing environment fact.
+
+---
+
+### ★★★ THE §B RULING THAT SET P25's LIR SCOPE — OPERATOR 2026-08-21, NOT TO BE RE-LITIGATED
+
+**DECISION: OPTION 3** — the total arg-side row map and the no-pool refusal land in P25; the
+sub-register-aware allocator is P26 entry 1. The other eight rows stay in P25.
+
+★★★ **THE ARGUMENT THAT SETTLED IT, AND IT CORRECTED THE BRIEF THAT PROPOSED THE FORK.** The options
+were presented with "Option 2 makes `w` a diagnostic, and gcc supports it, so by §A.3b this is not the
+end state." Operator, verbatim: *"DSS DOES NOT SUPPORT `w` TODAY. … That is not a capability. It is a
+SILENT MISCOMPILE WEARING A CAPABILITY'S CLOTHES. So the choice is not 'capability vs refusal'. It is
+SILENT-WRONG vs LOUD-REFUSED, and the bar answers that with no discretion at all."* ★ **Option 2
+removes a FALSE capability; it does not create an under-capability** — the under-capability against gcc
+already existed, for as long as the else-branch has. §A.3b bites on the END STATE, which is why P26
+entry 1 is mandatory rather than aspirational.
+
+★★ **AND IT IS NOT A NEW DESIGN — IT IS THE RETURN SIDE'S PROVEN TWIN, ONE CYCLE LATER.**
+`returnRegisterForClass`'s own banner records the IDENTICAL defect on the sibling function in the same
+words: `returnVrs` *"was declared … populated by the loader … and this function never read it"*, the VR
+result took the GPR ELSE branch, wrong-file capture, no diagnostic. ⇒ **build the same answer**: an
+arg-side row table mirroring `kReturnPoolRows`, with the same anti-padding `static_assert` (a short
+initializer list value-initializes a null pointer-to-member and compiles clean — that mutant was
+already measured on the return side) and the accepted set RENDERED FROM THE ROWS. **Do not mint a
+second pattern beside the one P23 built and pinned.**
+
+**THE FOUR BINDING CONDITIONS:**
+1. ★★ **THE COUNTER IDENTITY IS THE ONE THING THIS MUST NOT GET WRONG.** The return table can index
+   each class's pool independently; **the arg side cannot** — AAPCS64 has ONE NSRN, so a v-view and a
+   d-view arg draw from the SAME cursor. The table must express **which counter a row draws from,
+   distinctly from which pool it names**. Get it right now and P26 touches only the allocator; get it
+   wrong and P26 REWRITES this table, which would make P25 a down-payment on nothing.
+2. ★ **"NO POOL" AND "POOL EXHAUSTED" ARE DIFFERENT FACTS AND MUST NOT SHARE A DIAGNOSTIC.** Once
+   `argVrs` is read, an arm64 VR arg hits `index >= pool.size()` against an EMPTY pool and falls into
+   `L_StackPassedArgUnsupported`, which would say the cc *"has only 0 VR arg-passing registers"* and
+   point at stack passing — naming the wrong fact. The cc declares **no VR arg pool at all**: a config
+   statement about what the target declared allocatable, not a capacity overflow the stack could
+   absorb. Its own refusal names the class, the cc, and that fact — and that refusal is what pays for
+   `D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME`.
+3. ★★★ **P26 ENTRY 1, NOT "P26's HEADLINE"** — see the queue above. *"'Headline' is a softer word than
+   the rule allows, and the difference is exactly how a queued row becomes a permanent one."*
+4. ★★ **THE `w` PIN IS INVERTED, NEVER DELETED**, and it names the anchor P26 must flip back.
+   ⚠ **THE CONDITION AS WRITTEN ASSUMED A TEST THAT DOES NOT EXIST, and that is recorded rather than
+   quietly satisfied:** ✔MEASURED — the only `w` witness in the tree is
+   `InlineAsmConstraintParse.OneLetterTwoTargetsIsAConfigAnswerNotACodeBranch`, which asserts the
+   LETTER IS DECLARED BY CONFIG (`arm->asmConstraint("w") != nullptr`) and stays TRUE under Option 2.
+   **There is no end-to-end `w` codegen test to invert.** ⇒ P25's no-pool refusal pin becomes the FIRST
+   end-to-end `w` witness the tree has ever had, and it carries the marker naming what P26 restores.
+
+### ✔ WHAT THE §B's OWN MEASUREMENTS FOUND — INCLUDING TWO THINGS THAT REFUTE THE BRIEF
+
+- ★★ **THE ROW'S DISASSEMBLY IS CORRECTED, NOT RE-QUOTED.** The row records `ldur q1` and *"the
+  `double` lands in d1/q1 where AAPCS64 requires d0"*. ✔RE-MEASURED at `c6ef80e4`, release,
+  `elf64-aarch64-linux`: it is **q0**, and **BOTH arguments are wrong, not one** —
+  `ldur q0, [sp,#24]` reloads the `"w"` output, then `fmov d0, d15` **destroys it** (d0 is the low
+  half of q0) while placing the second argument, and **d1 is never set at all**. rc=0, no diagnostic.
+  ✔CONTROL, `aarch64-linux-gnu-gcc -O2`, identical source: `fmov d1, #1.0` / `nop` / `b sink` — the
+  `"w"` output allocated straight into d0, `1.0` into d1, tail call.
+- ⚠ **"NOTHING READS `argVrs`" IS FALSE.** ✔MEASURED: the AAPCS64 binary128 boundary in
+  `mir_to_lir.cpp` reads `cc->argVrs` and `cc->returnVrs` at several sites, with a cursor **literally
+  named `nsrn`**. The field is not inert; it has a live consumer whose counter this cycle must join
+  rather than duplicate — *a fact with an owner does not get a second owner*.
+- ⏳ **AND THAT CONSUMER'S CURSOR COUNTS ONLY F128 ARGS** — a `double` never advances it — which
+  predicts exactly the collision `TargetCallingConvention::argVrs`'s own comment says is impossible
+  (*"an F64 and an F128 sharing a signature never collide by ordinal"*). ✔**NOT REPRODUCED: two
+  source shapes (`sink(double, long double)` by constant and by parameter) BOTH refuse upstream with
+  `L_UnsupportedLoweringForOpcode`**, so the door is closed and this is **LATENT, NOT LIVE**. Filed as
+  a SUSPECT ⇒ `D-LIR-F128-ARG-NSRN-CURSOR-COUNTS-ONLY-F128-ARGS`. ★ It was predicted as live and the
+  measurement refuted it; the refutation is the deliverable.
+- ✔ **THE BLAST-RADIUS PREMISE IS VERIFIED, NOT RELAYED** — it is what makes Option 3 tolerable.
+  **INSTRUMENT:** both corpus runners enumerate one glob, `DSS_EXAMPLE_MANIFESTS` =
+  `examples/*/*/expected.json` (**613** examples, hoisted to the root `CMakeLists.txt` in P24); a
+  `"[=+]?w"` constraint search over `.c/.h/.s/.S/.json` under `examples/` returns **0 files**, and the
+  same search over the sqlite real-example tree returns **0**. No corpus example exercises `"w"`.
+
+---
+
+## 0.000000000000000000000000000 ★★★ CYCLE P25 — THE ARG CURSOR IS ONE OBJECT INSTEAD OF SIX, AND THE POOL TABLE ALONE FIXED NOTHING
+
+**Priority:** `D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR` — the branch's only
+🔴 HIGH, and a **LIVE SILENT MISCOMPILE** rather than a latent defect. ✅ CLOSED.
+
+### The defect, and the measurement that says it was live
+
+Argument placement selected its register pool with a two-way rule — `(cls == FPR) ? argFprs :
+argGprs` — over a register-class vocabulary with **three** members, so a `VR`-class argument took the
+`else` branch into the **integer** pool.
+
+✔MEASURED at the disassembly, arm64 `--config=release`, `aarch64-linux-gnu-objdump -d`, on
+`s3(a, b, y)` where `a`/`b` are `double` parameters and `y` is a `"w"` (VR-class) inline-asm output:
+
+| arm | third argument | verdict |
+| --- | --- | --- |
+| mutant M1 (the two-way rule rebuilt) | `ldur q0, [sp,#24]` — **clobbers argument 0** | **rc=0, no diagnostic** |
+| fixed tree | `ldur q2, [sp,#24]` — AAPCS64 NSRN 2 | rc=0 |
+| `aarch64-linux-gnu-gcc 13.3.0 -O2` | the third `double` in `d2` | — |
+
+Five shapes checked, every one correct after the fix: `s1(y)`→q0, `s2(a,y)`→q1, `s2(y,a)`→q0,
+`s2(y,z)`→q0/q1, `s3(a,b,y)`→q2.
+
+### ★★★ THE FINDING WORTH CARRYING: THE ROW TABLE ALONE WAS MEASURED INSUFFICIENT
+
+With `argPassingRegister` already converted to a published row table, **the reproduction recompiled
+byte-identical.** The register an outgoing argument lands in is decided by a **cursor walk**, and that
+walk existed in **six** hand-kept copies — none of them the lookup:
+
+`lir_callconv::computeMaxOutgoingStackArgs` · `lir_callconv::materializeOneFunc` (twice: the incoming
+bound and the call placement) · `lir_rewrite::classifyCallRegArgs` · `lir_wide_call_args::lowerOneFunc`
+· `lir_pass_util::incomingArgRegister` · `mir_to_lir`'s F128 marshal cursor.
+
+Two of them carried comments promising to *"advance the shared cursors exactly as callconv does"* — a
+promise kept by hand, which is the shape that lets six passes disagree. **One object (`ArgCursors`)
+now owns the walk and the copies call it**, so the promise is structural.
+
+### ★★ THE COUNTER IDENTITY IS DERIVED FROM THE TARGET, AND FROM THE ONE FIELD THAT DISCRIMINATES
+
+AAPCS64 §6.4.2 stage C.1 gives the d-views and the v-views **ONE** NSRN. That is not a new schema key:
+`dwarfNumber` is DWARF's identifier for a *physical* register, so two register rows carrying the same
+number **are** one register wearing two widths.
+
+⚠⚠ **AND THE FIELD THAT LOOKS RIGHT DOES NOT DISCRIMINATE AT ALL.** ✔MEASURED over both shipped
+targets: `hwEncoding` is a per-file register NUMBER — arm64 `gpr × vr` share **all 32** values
+(x0/w0/v0 all encode 0) and x86_64 `fpr × gpr` share **16** — so an hwEncoding-based derivation would
+relate the integer and vector files on *both* targets, which is the same wrong answer the two-way rule
+gave, reached from the other direction. `dwarfNumber`: arm64 `fpr × vr` = **32 shared**, `fpr × gpr`
+= **0**, `gpr × vr` = **0**; x86_64 every pair **0**.
+
+⚠ `subOf` is not the alternative either: `validate()` REFUSES a cc naming a register with a non-empty
+`subOf`, so expressing d/v aliasing that way would make the arg pools unloadable.
+
+### ★★★ TWO CLAIMS I WROTE WERE REFUTED BY READING THE THING THEY WERE ABOUT
+
+Both are recorded here rather than quietly dropped, because both were about to become edits.
+
+1. **The `"w"` view-selection premise was wrong, and the config had already measured it right.**
+   I reported to the operator that arm64 `"w"` should name a register FILE and let the operand's
+   width pick the VIEW (`fpr` for 8 bytes, `vr` for 16) — and began a `registerClass` →
+   `registerClasses` schema migration on that basis. `arm64.target.json`'s own
+   `$asmConstraintsComment` said otherwise, in a cell that begins *"AND THE MEASUREMENT SETTLES IT
+   RATHER THAN INTUITION"*. ✔RE-MEASURED against the reference rather than against my notes:
+   `aarch64-linux-gnu-gcc 13.3.0 -O2` prints **`v0` for every width** — `float`, `double`, and a
+   16-byte vector all give `# W v0 v0`. The `d0`/`s0` spellings come from the `%d0`/`%s0` operand
+   MODIFIERS, exactly as that comment says. **`registerClass: "vr"` is correct; the migration was
+   reverted in full** (schema, loader, and both target files are byte-identical to `c6ef80e4`).
+   ★ The rule this earns: *when the config carries a measurement and my notes carry a conclusion, the
+   measurement wins* — and the cheapest way to find out is to re-run it, which cost one probe.
+2. **`D-LIR-F128-ARG-NSRN-CURSOR-COUNTS-ONLY-F128-ARGS` was wrong when I wrote it, earlier in this
+   same cycle.** It asserted the F128 marshal cursor "is advanced only when the argument's `TypeKind`
+   is F128". ✔The loop already carried `else if (ak == F32 || ak == F64) { ++nsrn; }` with the comment
+   *"a non-F128 FPR arg consumes an NSRN slot too"*. Closed on that measurement — and closed
+   STRUCTURALLY, by converting that site to `ArgCursors` so the sharing is derived there too.
+
+### The red-on-disable proof
+
+`lir/test_lir_arg_cursor_projection`, 8 arms. Four mutants, each applied to the real tree, rebuilt,
+and restored from a saved copy whose sha256 was re-verified in a `finally`:
+
+| mutant | arms red |
+| --- | --- |
+| **M1** VR draws from the integer pool (the original else-branch) | 4, incl. the ABI corpus arm |
+| **M2** no two pools ever share a cursor | 3 |
+| **M3** an undeclared pool falls through to the exhaustion refusal | 1 |
+| **M4** the by-value-aggregate exhaust clamp does nothing | 1 |
+
+★ **The ABI corpus arm exists because of the P23 lesson on the return side:** a pin whose expectation
+comes off the same table as the code moves BOTH HALVES OF THE COMPARISON TOGETHER, so deleting the VR
+row reddened nothing. That arm states the ABI fact directly (`*vrPool == cc.argVrs`,
+`!= cc.argGprs`) and refuses to pass vacuously if no shipped target populates a vector pool.
+
+### ⛔ WHAT DID NOT LAND, AND IS NOT A FOLLOW-UP
+
+`D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS` — **TRIGGER-GATED, MUST-NOT-BUILD,
+MUST-NOT-CLOSE**, by operator ruling 2026-08-21. arm64 declares no vector registers in
+`callerSaved`/`calleeSaved`, so the VR free list is empty and every `"w"` operand spills; at debug the
+shape refuses loud with `rewriteOneFunc: … exhausted the per-class scratch pool`.
+
+* **TRIGGER, as a measurable predicate:** *a source construct can form a 128-bit operand that reaches
+  the allocator as a VR-class value.*
+* **INSTRUMENT:** compile a corpus example declaring such an operand and assert the build does NOT
+  emit `R_SpilledDueToPressure` for it. Today it always does.
+* **A loud refusal is not a miscompile.** The miscompile is what P25 closed; the capability gap is
+  what this row holds.
+* ★ Operator ruling, verbatim: *"Do not let one absorb the other — that is how a gate disappears."*
+  Closing the arg-pool row did **not** close this, and this row is **not** a follow-up of it.
+
+### Found in passing, handled
+
+* `D-TARGET-ARG-POOLS-WITHOUT-DWARF-NUMBERS-CANNOT-BE-RELATED` — **BORN CLOSED.** `validate()` now
+  refuses a cc declaring two or more non-empty arg pools when any pool's slot-0 register carries no
+  `dwarfNumber`: a fail-closed default is still a default, and a default is not a declaration.
+* A `cc == nullptr` check that sat **inside** the per-argument loop in `mir_to_lir`'s call lowering,
+  so a target with no calling convention was refused only if a 128-bit float happened to be in the
+  signature. Asked once now, before the walk.
+* **Three ways the arm64 dialect cannot use a `"w"` operand**, folded into
+  `D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME` rather than opened as a new row:
+  no FP/SIMD mnemonics, no SIMD **arrangement** suffix (`%0.16b` → `expected 'LineEnd' — got '.'`),
+  and no width-**view** modifier (`%d0` → `S0067`). ✔The gcc build of the arrangement form RUNS
+  correctly under qemu (prints `304.0`), so by §A.3b all three are required.
+* **17 wrapped anchor ids** across the files this cycle touched — an id split over two lines is
+  invisible to every grep, which is the one failure mode a fail-loud project cannot detect by
+  watching for a failure. Unwrapped in `lir_callconv.{hpp,cpp}` and `parse_diagnostic.hpp`.
+
+### Gate
+
+| leg | result |
+| --- | --- |
+| Windows `build/dbg` ctest `-j 8` (`run-gate.ps1`, witness `100% tests passed`) | ✅ **1538/1538, 0 failed, 501.82 s** |
+| WSL x86_64 ctest (`wsl-leg.sh`, clean configure + build) | ✅ **1538/1538, 0 failed, 344.65 s** |
+| qemu arm64, `DSS_STRICT_ARM_VERDICTS=ON`, scoped `-R 'examples/.*\|lir/.*\|core/test_target.*'` | ✅ **636/636, 0 failed, 94.89 s** — arm-ledger `4 verified (4 ran)`, structural skips named, so the leg is NOT vacuous |
+| **arm64 VPS, NATIVE aarch64** (`remote-leg.sh --carriage arm64-vps`, `ctest -j 4`) | ✅ **1538/1538, 0 failed, 1044.99 s**, clean build |
+| **macOS arm64, REAL Apple Silicon** (`remote-leg.sh --carriage macos`, `ctest -j 10`) | ✅ **1538/1538, 0 failed, 3703.68 s**, clean build |
+
+**Balance: 1033 → 1033, net ±0** — closed `D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR`,
+opened `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS`, one row born closed, one row opened and
+closed inside the cycle.
 
 ---
 
