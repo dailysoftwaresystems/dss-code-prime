@@ -73,9 +73,16 @@ dss_pch_reproducible(dss_examples_runner)  # consumer must match producer's PCH 
 target_compile_definitions(dss_examples_runner PRIVATE
     DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 
-file(GLOB_RECURSE EXAMPLE_MANIFESTS
-    CONFIGURE_DEPENDS
-    "${CMAKE_SOURCE_DIR}/examples/*/*/expected.json")
+# ★★ THE GLOB MOVED TO THE ROOT `CMakeLists.txt` AND THIS FILE NOW READS IT.
+# D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD gave the CLI-
+# subprocess sibling per-example ctest entries too, so BOTH harnesses derive
+# their entry set from the corpus. Two independent globs would let them
+# enumerate different corpora while both stayed green — the
+# [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] divergence in its most basic
+# form. One glob, hoisted, read here and in `integrated_tests/CMakeLists.txt`;
+# the root also REFUSES a collapsed result, which this file could not do alone
+# because a collapse looks identical to a small corpus from inside one consumer.
+set(EXAMPLE_MANIFESTS ${DSS_EXAMPLE_MANIFESTS})
 
 # D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR: the corpus emulator lint is a
 # CORPUS-wide question with one corpus-wide answer, so it is ONE entry, not 611

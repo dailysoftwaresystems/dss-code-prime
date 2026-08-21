@@ -385,6 +385,30 @@ if(DSS_BUILD_TESTS)
     # is off (no testing context in the calling scope) and CI would
     # build the binary but never invoke it through ctest. This gate
     # IS the fix; no separate anchor is tracked.
+    # ★★★ ONE MANIFEST GLOB, READ BY BOTH CORPUS HARNESSES.
+    # D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD gave
+    # `integrated_tests` per-example ctest entries, which means BOTH harnesses now
+    # derive their entry set from the corpus. Hoisted here rather than globbed
+    # twice so the two cannot disagree about WHICH examples exist —
+    # [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] is about capability parity, and
+    # a harness that silently enumerates a different corpus than its sibling is
+    # that divergence in its most basic form.
+    # ⚠ `CONFIGURE_DEPENDS` so a NEW example re-runs cmake instead of being
+    # silently absent until someone reconfigures by hand.
+    file(GLOB_RECURSE DSS_EXAMPLE_MANIFESTS
+        CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/examples/*/*/expected.json")
+    list(LENGTH DSS_EXAMPLE_MANIFESTS DSS_EXAMPLE_MANIFEST_COUNT)
+    # A glob that collapses to nothing would silently retire every corpus entry in
+    # BOTH harnesses and leave a green suite asserting nothing about the corpus.
+    # Refuse at configure time, where it is one line, instead of at review time.
+    if(DSS_EXAMPLE_MANIFEST_COUNT LESS 100)
+        message(FATAL_ERROR
+            "examples/ yielded only ${DSS_EXAMPLE_MANIFEST_COUNT} manifest(s). "
+            "Both corpus harnesses derive their ctest entries from this glob, so "
+            "a collapsed result silently empties the corpus suite. Refusing.")
+    endif()
+
     add_subdirectory(integrated_tests)
     add_subdirectory(tests)
 

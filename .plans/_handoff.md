@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-20 — cycles **P14 … P23**. ★★★ **P23 SHIPPED WEAK DEFINITIONS *AND* WEAK ALIASES ON PE/COFF AND MACH-O, FINISHED THE RETYPED-CLOSED-SET CLASS, AND CLOSED THE pe64 ACQUISITION ROW ON A MEASUREMENT NOBODY HAD EVER TAKEN.** All four queued rows closed plus three more. ⚠ **The BALANCE went the other way and the number is said plainly: OPEN 1018 → 1033, closed 7, opened 22 (21 created + 1 disclosed pre-existing), net +14 created-over-closed, and 55 further rows BORN CLOSED** — because a step-10 independent audit, six fold lanes and a four-leg gate found twenty-nine further defects, and an operator ruling authorized shipping the positive balance with every one of them queued as the next cycle's first work. Two operator rulings, neither to be re-litigated: a weak DEFINITION in COFF is **COMDAT select-any**, not `WEAK_EXTERNAL` (*"an implementation gap and a format incapability are different facts"*); and `WEAK_EXTERNAL` IS right for a weak **alias**, built reader-first. ⚠ The brief that ordered the second routed the decision onto `Characteristics`, and ✔gcc emits **1 for all four weak shapes** — the discriminator is the aux record’s `TagIndex`. Earlier: ★★★ **P22 MADE A `static` HELPER LINK OUT OF AN ARCHIVE ON EVERY LEG** — pe64 and macho64 readers were classifying a non-external defined symbol as a bodyless block label, so its bytes never entered the image. Earlier: ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
+**Last updated:** 2026-08-21 — cycles **P14 … P24**. ★★★ **P24 SPLIT `integrated_tests` INTO 616 ctest ENTRIES — 677.97 s in ONE entry became 83.81 s over many, 8.1×, and every example now reports its own pass/fail.** Operator-instructed, and the ruling that shaped it is the portable part: **a UNIVERSAL claim is per-example; an EXISTENCE claim is about the corpus and stays one.** Balance **1034 → 1033, net −1** — the burn-down after P23. Earlier: ★★★ **P23 SHIPPED WEAK DEFINITIONS *AND* WEAK ALIASES ON PE/COFF AND MACH-O, FINISHED THE RETYPED-CLOSED-SET CLASS, AND CLOSED THE pe64 ACQUISITION ROW ON A MEASUREMENT NOBODY HAD EVER TAKEN.** All four queued rows closed plus three more. ⚠ **The BALANCE went the other way and the number is said plainly: OPEN 1018 → 1033, closed 7, opened 22 (21 created + 1 disclosed pre-existing), net +14 created-over-closed, and 55 further rows BORN CLOSED** — because a step-10 independent audit, six fold lanes and a four-leg gate found twenty-nine further defects, and an operator ruling authorized shipping the positive balance with every one of them queued as the next cycle's first work. Two operator rulings, neither to be re-litigated: a weak DEFINITION in COFF is **COMDAT select-any**, not `WEAK_EXTERNAL` (*"an implementation gap and a format incapability are different facts"*); and `WEAK_EXTERNAL` IS right for a weak **alias**, built reader-first. ⚠ The brief that ordered the second routed the decision onto `Characteristics`, and ✔gcc emits **1 for all four weak shapes** — the discriminator is the aux record’s `TagIndex`. Earlier: ★★★ **P22 MADE A `static` HELPER LINK OUT OF AN ARCHIVE ON EVERY LEG** — pe64 and macho64 readers were classifying a non-external defined symbol as a bodyless block label, so its bytes never entered the image. Earlier: ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
 **Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P21). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
@@ -107,6 +107,8 @@ commit that lands it, and never delete a ticked row.
       ✔5 of 5 legs resolve build inputs from a COLD cache on the native aarch64 VPS (`ls /mnt` EMPTY),
       8 pinned archives / 11,621,552 B / 8-of-8 sha256 verified, plus an OFFLINE warm 5/5 and a NEGATIVE
       CONTROL returning **0/5** so the instrument can say no. Closed its ELF sibling on the same evidence.
+- [x] **P24 — `D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD`. ✅ DONE 2026-08-21**,
+      pulled ahead of P25 by operator instruction. Closed 1, opened 0, four rows born closed.
 - [ ] **P25 — EVERY ROW CYCLE P23 OPENED. ✔MEASURED at the committed tree: 22 opened — 19 PICKABLE,
       2 GATED, and 1 DISCLOSED PRE-EXISTING** (the instrument counts that last one separately:
       *opened 22 (created 21, disclosed-pre-existing 1)*, so it is NOT one of the 21 this cycle made). ★★★ **OPERATOR RULING 2026-08-21, verbatim:** *"we can commit
@@ -217,6 +219,174 @@ trigger NOT fired `D-ASM-TARGET-DECLARES-NO-BYTE-ORDER`, `D-ASM-COND-ON-TERMINAT
 ⓘ Two rows a family-grep catches that are NOT defects: `D-OPT-REBUILD-POLICY-NEUTERED-STATE-HOOK` is a 🟢
 SHIPPED design record, and `D-TEST-MACOS-LEG-EMSDK-PROFILE-REPLACES-PATH-HIDING-HOMEBREW` is a 🔵 DISCLOSED
 pre-existing environment fact.
+
+---
+
+## 0.00000000000000000000000000 ★★★ CYCLE P24 — `integrated_tests` IS 616 ENTRIES INSTEAD OF ONE, AND SEPARATING TWO FLOORS BY SCOPE WAS THE WHOLE PROBLEM
+
+**Operator instruction, verbatim:** *"please create an anchor to paralelize integrated_tests + report
+each integrated test item as pass or fail as a sub item of integrated tests unit (our runner to do
+that)"*, then *"can you please address D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD now?
+using a /dss-cycle"*.
+
+**Anchors: OPEN 1034 → 1033, closed 1, opened 0, net −1** — plus **four rows BORN CLOSED**. The
+balance gate PASSES; this is the burn-down cycle after P23's operator-authorised +14.
+
+### ★★★ THE RULING THAT DECIDED IT — AND IT REJECTED ALL THREE OPTIONS AS OFFERED
+
+The cycle paused on a §B: the optimized-arm instrument's floors are corpus-aggregate over EXECUTION,
+and a per-example entry sees only its own example. Three options went up (a manifest key, a hand-listed
+witness subset, a whole-corpus execution entry). **Operator ruling 2026-08-21, verbatim:** *"NONE OF THE
+THREE AS OFFERED. The fork is really TWO floors with DIFFERENT SCOPES, and once they are separated only
+ONE is homeless — and its home is not a manifest key. No new schema key. Nothing hand-listed. Nothing
+deferred."*
+
+★★★ **THE RULE, AND IT IS THE MOST PORTABLE THING THIS CYCLE PRODUCED: A UNIVERSAL CLAIM IS
+PER-EXAMPLE; AN EXISTENCE CLAIM IS ABOUT THE CORPUS AND STAYS ONE.**
+- **Floor A** — *"every declared optimized arm was BUILT through `--config`, or carries a classified
+  not-built token"* — is universal, so it lives per-example as an ACCOUNTING IDENTITY rather than a
+  `> 0` floor: `built + notExpressibleOnCli >= declared`, and any other shortfall reds. The token was
+  not invented for this: `optimizedArmsNotExpressibleOnCli` already existed, already printed a
+  classified `[SKIP]`, and is already witnessed by the in-process sibling. ✔The identity holds
+  corpus-wide at **329 + 248 = 577 = declared** — ZERO unclassified not-built arms over 613 examples.
+  ★ The house rule verbatim: **a not-done outcome carries a classified token from a closed vocabulary,
+  and an unclassified not-done is the failure.** A third legitimate reason gets a TOKEN, never a waiver.
+- **Floor B** — *"at least one artifact DIFFERS byte-wise"* — and the stdout-capture floor are
+  existence claims and keep their scope. ✔**9 of 24 sampled** optimized-arm examples emit a
+  byte-identical image, which is the CORRECT result where the optimizer has nothing to do; one such
+  example refutes a universal must-differ floor and nine were found in the first sample.
+
+⚠ **WHY THE MANIFEST KEY WAS REFUSED, recorded so it is not re-proposed:** `optimizerMustChangeImage`
+would be set from **what the compiler emits today** — a guard configured from current behaviour asserts
+nothing about correct behaviour — and it INVERTS THE BURDEN: mark the handful that differ and ~480
+optimized-arm examples assert nothing about the optimizer ever again.
+
+### ★★★ THE ANSWER: THE 613 ENTRIES HAD ALREADY ANSWERED THE QUESTION
+
+Each per-example entry emits a **CELL** — declared / built / differed / notExpressible / stdout pins —
+and ONE cheap adjudicator entry reads them and asserts both corpus-wide floors over exactly the same
+population. No rebuild, no hand-list, and the subject is derived from the manifests so it cannot rot
+when an example is renamed.
+- ★★ **ONE FILE PER ENTRY, NEVER A SHARED APPEND.** 613 writers under `-j 8` appending to one file is a
+  data race whose torn-line failure is intermittent and would be blamed on codegen.
+- ★ **The cell is written even when the entry FAILS**, so a red example still contributes its
+  observations and the adjudicator does not red for a second, unrelated reason.
+- ★ A `FIXTURES_SETUP` entry clears the directory first. ✔Proven by planting a stale cell and watching
+  it not survive — a cell from a previous run would otherwise satisfy a floor nobody measured today.
+
+### ⚠ FIVE DEFECTS, ALL FOUND BY EXERCISING RATHER THAN READING — AND EVERY ONE WAS IN THE THING MEANT TO CATCH DEFECTS
+
+1. **A floor that could not pass.** The first draft wired the corpus-wide DECLARATION floor into the
+   parse-only `--only=corpus-lints` entry; ✔that counter is incremented during EXECUTION, and the entry
+   binds no target and runs in 0.1 s, so the floor read `0 declared` and was **ALWAYS RED**. ★ The
+   premise was named correctly and the CONSEQUENCE was not drawn — naming a premise is not the same as
+   following it to what it breaks. Caught by the operator reading the diff.
+2. **The adjudicator was scheduled at 611 of 617 and SKIPPED on a full run**, so the unit reported
+   `100% tests passed` with the corpus-wide floors asserting nothing. `FIXTURES_REQUIRED` orders a test
+   after the SETUP, not after the tests that share the fixture. ★★★ **A skip that always fires is
+   exactly as vacuous as a pass that always fires, and it is harder to notice because it looks
+   deliberate.** Fixed with `DEPENDS` on all 613 — and `DEPENDS` rather than a fixture *because* ctest
+   skips a test whose fixture failed, which would hide the adjudicator the moment one example reddened.
+3. **A torn cell returned 77** — the classified SKIP — because the short-population branch was reached
+   before the parse failures were consulted. ★★ **A corrupt observation is not a smaller population**;
+   filing it as "subset" puts it under the one verdict nobody investigates.
+4. **The token-witness check could not fail.** `body.find("pipelineOverride")` is a substring search, so
+   renaming the member to `pipelineOverrideXX` LEFT THE PIN GREEN — satisfied by the very rename it
+   exists to detect. ★ **A witness that survives the disappearance of what it witnesses is not a
+   witness.** Replaced with an identifier-boundary match.
+5. **A fail-loud message that named the wrong subsystem.** Folding `corpus-lints` into `adjudicate`
+   on the operator's instruction put the parse-fed lints in the SAME entry, so the global `failures`
+   counter is no longer zero when the adjudicator starts — and it was branching on exactly that to
+   decide whether cells were unreadable. ✔A failing LINT would have printed *"1 cell(s) could not be
+   read. Refusing to adjudicate"*. ★★ **A fail-loud message that names the wrong subsystem is not
+   fail-loud: it sends the reader to the one place the defect is not** — and this one was BORN of the
+   fold, which is the argument for re-exercising a harness after a simplification rather than
+   re-reading it. Counted locally now, and proven by three arms over the real 613-cell population:
+   ✔control rc=0 with the identity `329 + 248 = 577`; ✔a torn cell ⇒ rc=1 naming **1** cell (not the
+   77 skip); ✔a deliberately broken manifest ⇒ red on the LINT, `cells=613 population=613`, and no
+   mention of unreadable cells at all.
+
+### ★★ THE VOCABULARY GAP THE OPERATOR ASKED FOR BY NAME — AND IT WAS REAL
+
+`runRunnerVocabularyPin` compares **manifest key literals** between the two runners and never covered
+the classified-token set. It matters now because a per-example entry EXCUSES a declared-but-unbuilt arm
+on the strength of `notExpressibleOnCli`, whose whole claim is that the in-process sibling drives
+`CompileOptions::pipelineOverride` and IS the witness. Remove the witness and this runner keeps
+excusing those arms while BOTH harnesses stay green — `D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE`
+arriving through a CLASSIFICATION rather than a capability. The pin now asserts it.
+
+### ⚠ THE SPLIT QUIETLY COST THE UN-SPLIT PATH A FLOOR, AND THE ASSERTION COUNT IS WHAT SAID SO
+
+Relocating the three corpus-wide floors to the adjudicator dropped the whole-corpus default invocation
+from **6659 to 6658** assertions. That path executes every example in ONE process and is perfectly able
+to judge those floors. `corpusWideFloors` now has ONE definition and TWO callers — in-process totals for
+the default run, cell-reconstructed totals for the adjudicator — rather than two copies that would drift.
+✔Re-measured at this tree: **rc=0, 6661 passed, 0 failed**, arm ledger unchanged at `3675 of 4509`. The
++2 over baseline are both required by the ruling: assert the classification against the ledger, and
+close the token-witness gap.
+
+### ✔ MEASURED
+
+| | before | after |
+|---|---|---|
+| `integrated_tests` wall clock | **677.97 s**, one ctest entry | **83.81 s**, 616 entries at `-j 8` — **8.1×** |
+| ctest entries, whole suite | 922 | **1537** |
+| per-process overhead | — | ✔**0.10 s** fixed, 1.15 s marginal (N=1/2/4/8 curve) |
+| corpus accounting identity | not asserted | ✔**329 built + 248 classified = 577 declared** |
+| byte-identical optimized example | reds under a per-example must-differ floor | **passes, and contributes its cell** |
+
+★ One glob now feeds BOTH corpus harnesses (`DSS_EXAMPLE_MANIFESTS`, hoisted to the root
+`CMakeLists.txt`, with a configure-time REFUSAL if it collapses below 100). Two independent globs would
+let the two runners enumerate different corpora while both stayed green.
+
+### ✔ THE FOUR-LEG GATE — ALL FOUR GREEN AT 1537/1537, AND THE SPLIT MADE EVERY LEG FASTER
+
+Same carriage as P23: `scripts/remote-leg/remote-leg.sh` pushes the WORKING TREE to both remote
+checkouts, because this cycle's work is uncommitted until the commit that carries this file. ⚠ Read
+`.dss-leg-stamp` at the remote root, never the remote `git log`.
+
+| leg | result |
+| --- | --- |
+| Windows `build/dbg` ctest (`run-gate.ps1`, witness `100% tests passed`) | ✅ **1537/1537, 0 failed, 516.88 s** — **67% more entries** than P23's 922 and **24% faster** than P23's 678.01 s |
+| WSL x86_64 clean configure+build+ctest (`scripts/wsl-leg/wsl-leg.sh`) | ✅ **1537/1537, 0 failed, 350.84 s**, clean 766-target build |
+| qemu arm64 (`QEMU_LD_PREFIX=/usr/aarch64-linux-gnu`, folded into the WSL leg) | ✅ same run |
+| **arm64 VPS, NATIVE aarch64** (`remote-leg.sh --carriage arm64-vps`, probed `ctest -j 4`) | ✅ **1537/1537, 1031.98 s**, clean build |
+| **macOS arm64, REAL Apple Silicon** (`remote-leg.sh --carriage macos`, probed `ctest -j 10`) | ✅ **1537/1537, 0 failed, 1651.95 s** — P23 spent **5030.41 s** on 922 entries here, so the split is **3.0× on the slowest leg** |
+| `check-anchor-balance` | ✅ **1034 → 1033, closed 1, opened 0, net −1 — PASSES**, the burn-down after P23's operator-authorised +15 |
+| `check-anchor-registry` | ✅ 0 cell-width violations across 300 tables / 4,178 rows in 41 files; every `src/` anchor resolves — ⚠ 300/4,178 and not the 299/4,168 measured minutes earlier, because THIS TABLE is itself a governed table in a governed document |
+| `check-plan-citations` | ✅ 3,127 positional citations across 283 documents, ratchet unbroken |
+| `check-scripts-index` · `check-line-endings` · `check-diagnostic-codes` · `check-enum-name-table-guards` | ✅ 25 scripts · no CR in 2,579 tracked paths · 386 codes, 0 collisions · 66 vocabularies, all guarded |
+
+⚠ **THE VPS's ctest PRINTS `100% tests passed out of 1537` WITH NO `, 0 tests failed` CLAUSE** — an
+older CMake on that host, and `run-gate.sh`'s witness regex matches either spelling. ★ So the green was
+not taken from the summary line: it was CONFIRMED BY COUNTING the log — **1537 verdict lines, 1537
+`Passed`, zero `***`, zero `Skipped`**. A summary line whose shape varies per host is exactly the kind
+of witness this project has been burned by before; counting the verdicts is host-independent.
+
+⚠ **THE REMOTE `-j` IS PROBED, NOT ASSUMED — AND WITHOUT THAT, TWO OF THESE FOUR LEGS WOULD STILL BE
+SERIAL.** P23's remote legs both ran one test at a time and **neither said so**: `ssh` forwards no
+environment without `SendEnv`/`AcceptEnv`, so `CTEST_PARALLEL_LEVEL` never crossed the carriage.
+`remote-leg.sh` now reads the remote's own `getconf _NPROCESSORS_ONLN` — the portable probe, since
+`nproc` is GNU-only and `sysctl -n hw.ncpu` is BSD-only — and passes `-j` explicitly, so the value is
+visible in the recorded command line rather than inferred. ★ The confirming check is worth reusing:
+**a ctest log states its own concurrency**, as started-minus-completed at each verdict line, with no
+access to the host at all.
+
+⚠ **THREE EDITS LANDED AFTER THE GATE AND ARE NAMED HERE RATHER THAN LEFT FOR A READER TO NOTICE.**
+Re-measuring the headline figures at the frozen tree found them stale by exactly the one entry the
+`corpus-lints` fold removed: the unit is **616** entries and the suite **1537**, not 617/1538, and the
+wall clock re-measured **83.81 s** (from **677.97 s**, the figure in `build/ctest-p23-final.log`, not
+the 677.95 s that had been re-quoted) — **8.1×**, not 7.6×. The corrections touch this file, the
+registry row, and one COMMENT in `integrated_tests/CMakeLists.txt`. ✔The CMake edit was re-configured
+and the entry count re-counted at **1537**, unchanged; all seven guards were re-run green afterwards.
+⚠ **AND THEN A FIFTH DEFECT WAS FOUND AND FIXED AFTER THE LEGS RAN** (the misattributed
+unreadable-cell count, above), so the Windows gate was RE-RUN on the committed tree: ✅**1537/1537, 0
+failed, 404.35 s**. The three remote legs ran the pre-fix tree. That is said plainly rather than
+implied away — and the reason it does not invalidate them is specific, not general: the change is
+confined to the adjudicator's ERROR-REPORTING path, which no green run reaches.
+★ This is the standing rule catching its own author: **never re-quote a gate figure from a previous
+message — re-measure at the commit that carries it.** Every one of those four numbers had been carried
+forward from before the fold that invalidated them.
 
 ---
 
@@ -3575,7 +3745,8 @@ stray build artifacts (`*.preMutant`, `*.orig`) left by tooling.
 
 | Date | Commit | What shipped | Gate |
 |---|---|---|---|
-| 2026-08-21 | *(this cycle, P23)* | **Weak DEFINITIONS and weak ALIASES ship on pe/coff and mach-o**, the retyped-closed-set class is finished for its three published owner shapes, and `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` closes on the cross-host measurement P13 never took. Then a step-10 independent audit **refuted one of the cycle's own closure claims**, six fold lanes turned that into 26 more defects, and a FOURTH gate leg found two host-capability defects three legs could not see. +14 ctest entries (908 → 922); new `scripts/remote-leg/remote-leg.sh` | **FOUR legs, all 922/922**: Win 678.01 s · WSL 336.99 s (clean build) · **native aarch64 VPS** · **real Apple Silicon**. balance ⚠ **1018 → 1034, +15 created-over-closed — FAILS, shipped on an operator ruling** |
+| 2026-08-21 | *(this cycle, P24)* | **`integrated_tests` became 616 ctest entries instead of one**, so the corpus parallelises and every example reports its own pass/fail. The operator ruling that shaped it is the portable part — **a UNIVERSAL claim is per-example; an EXISTENCE claim is about the corpus and stays one** — and it rejected all three options as offered. Four defects found by EXERCISING the new harness, every one of them in the thing meant to catch defects: a floor that could not pass, an adjudicator that always SKIPPED, a torn cell filed as a subset, and a witness satisfied by the rename it exists to detect. 922 → 1537 entries | **FOUR legs, all 1537/1537**: Win 516.88 s (24% faster than P23 at 67% more entries) · WSL 350.84 s (clean build) · native aarch64 VPS 1031.98 s · real Apple Silicon 1651.95 s (**3.0×** P23). balance ✅ **1034 → 1033, net −1 — PASSES** |
+| 2026-08-21 | `649b0730` | **Weak DEFINITIONS and weak ALIASES ship on pe/coff and mach-o**, the retyped-closed-set class is finished for its three published owner shapes, and `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` closes on the cross-host measurement P13 never took. Then a step-10 independent audit **refuted one of the cycle's own closure claims**, six fold lanes turned that into 26 more defects, and a FOURTH gate leg found two host-capability defects three legs could not see. +14 ctest entries (908 → 922); new `scripts/remote-leg/remote-leg.sh` | **FOUR legs, all 922/922**: Win 678.01 s · WSL 336.99 s (clean build) · **native aarch64 VPS** · **real Apple Silicon**. balance ⚠ **1018 → 1034, +15 created-over-closed — FAILS, shipped on an operator ruling** |
 | 2026-08-18 | *(this cycle, P8)* | **Path identity becomes a TYPE.** `core::PathIdentity` + 14 containers re-keyed + `scripts/check-path-identity/check-path-identity.py`; the 8.3 blindness of `weakly_canonical` under libstdc++ measured and closed. Plus `mustDifferFromBaseline` on the CLI runner (455 manifests / 548 arms armed) and a `--rsync` transport on both ssh carriages (the Mac's profile eats stdin) | Win **898/898** · WSL **898/898** · arm64 + macOS below |
 | 2026-08-16 | *(P7 predecessor)* | **`module` corpus example** — `project_module_standalone_build`, the first corpus proof that a `module` project builds standalone (B.13.3). Closed on the standalone half only; artifact-content and must-not-exist assertions are inexpressible in the corpus and stay in unit pins | Win **866/866** · ⚠ example not re-run on the 3 non-Windows legs |
 | 2026-08-16 | `f0695b7` | **AP5/AP6 close-out**, 509 files: `scripts/check-diagnostic-codes/check-diagnostic-codes.py` (the ordinal-allocation gate, built after two lanes both took `0xD029`) · `-Werror=switch` tree-wide at one chokepoint (closes G-711) · the ISA-mismatch diagnostic + its unsuppressable row · corpus arming | **All four legs 865/865**: Win · WSL gcc · qemu-aarch64 strict · macOS arm64 |
