@@ -46,6 +46,7 @@ repo already uses the python-core/thin-shell-wrapper shape in scripts/.
 
 USAGE
   harness_legs.py --verdict-vocabulary
+  harness_legs.py --library-providers
   harness_legs.py --plan [--host-os OS] [--host-arch ARCH] [--format json|sh]
                          [--launchers-available a,b,... | --launchers-none]
   harness_legs.py --header-stages
@@ -8852,6 +8853,24 @@ DSS_REGIONS = {
                         "verifiers": ["test-confound-scope.sh"]},
     "verdict-vocabulary": {"drivers": ["build-and-test.sh"],
                            "verifiers": ["test-driver-contracts.sh"]},
+    # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+    # D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT
+    # `mirror` IS claimed, and this is the case the claim was written for. The two
+    # drivers used to answer ONE condition -- a leg declaring a library provider
+    # NEITHER driver implements -- with two different outcomes: the .sh `die`d
+    # (exit 1 from a top-level loop, so one leg cost the whole run) while the .ps1
+    # returned a per-leg `Ok = $false`, which its own docblock defines as
+    # `skipped-build-input-missing` -- an ENVIRONMENTAL skip that only warns, so
+    # the same tree gave exit 1 on one host and exit 0 on the other, and the
+    # second one filed a harness bug as a fact about the operator's machine.
+    # Neither half was visible to a pin that READ the drivers: both spellings were
+    # correct in their own file. The decision is now ONE pure function of six
+    # scalars, mirrored, and the differential battery EXECUTES both copies on
+    # byte-identical input and compares the answers -- plus an `expect`, so the
+    # two agreeing on a WRONG token still reds.
+    "unknown-library-provider": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["harness_legs.py"], "mirror": True},
     # ── the regions that are READER MARKERS and nothing more ────────────────
     # Each states WHY, because "nobody checks this" must be a decision on the
     # record rather than a gap someone has to notice.
@@ -8989,6 +9008,11 @@ MIRROR_PAIRS = [
     # ── dss:confound-report ─────────────────────────────────────────────────
     {"sh": "print_confound_report", "ps1": "Write-ConfoundReport",
      "differential": "confound-report"},
+    # ── dss:unknown-library-provider ────────────────────────────────────────
+    # D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT
+    {"sh": "unknown_library_provider_verdict",
+     "ps1": "Get-UnknownLibraryProviderVerdict",
+     "differential": "unknown-library-provider"},
 ]
 
 # The symbol-definition grammar of each driver language, used to enumerate what
@@ -9297,6 +9321,38 @@ MIRROR_CASES = {
             "REPORT> [elf64-x86_64] confound row INACTIVE: ^walsetlk- - NOT honoured here: clock-realtime-steps: absent",
         ],
     },
+    # ── THE VERDICT FOR A PROVIDER NEITHER DRIVER IMPLEMENTS ────────────────
+    #
+    # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+    # D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT
+    #
+    # ★ THIS IS THE CASE THAT CATCHES A DISAGREEMENT NO READER OF THE DRIVERS
+    # COULD SEE. The two arms are executed and their answers compared, so a
+    # driver that changed the TOKEN (say back to `skipped-build-input-missing`,
+    # which is what the .ps1 really returned until 2026-08-20) reds -- and so
+    # does one that changed a single word of the message, because the two drivers
+    # saying different things about the same defect is how a reader comes to
+    # believe they behave differently.
+    #
+    # ★ AND IT CARRIES AN `expect`, for the reason abort-file-from-traceback
+    # does: two copies that both answer `skipped-build-input-missing` agree
+    # perfectly. The token is pinned to `poisoned` -- the closed vocabulary's
+    # FAILURE class -- per arm, so a wrong-but-identical pair reds too.
+    #
+    # ⓘ A `die`/`Die` in EITHER arm is caught by construction and needs no
+    # assertion of its own: the shared prelude defines them as `exit 9`, and an
+    # arm that exits non-zero is reported as "the .<lang> copy RAN: FAIL". That
+    # is exactly the control-flow half of the original divergence.
+    "unknown-library-provider": {
+        "region": "unknown-library-provider",
+        "sh": ('unknown_library_provider_verdict "$UNKNOWN_DRIVER" "$UNKNOWN_LEG" '
+               '"$UNKNOWN_PROVIDER" "$UNKNOWN_TCL" "$UNKNOWN_Z" "$UNKNOWN_KNOWN"'),
+        "ps1": ("Get-UnknownLibraryProviderVerdict $UNKNOWN_DRIVER $UNKNOWN_LEG "
+                "$UNKNOWN_PROVIDER $UNKNOWN_TCL $UNKNOWN_Z $UNKNOWN_KNOWN"),
+        # ONE line: "<verdict>	<detail>". The TAB is the separator both drivers
+        # split on, so it is part of the answer and not formatting.
+        "expect": ["poisoned\t" + "HARNESS DEFECT: leg 'elf64-arm64' declares library provider 'ubuntu-ports-arm64', which driver-under-test has no dispatch arm for, so this driver cannot obtain that leg's DECLARED inputs (tcl: libtcl8.6.so libtcl8.6.so.0 / z: libz.so.1). ACQUISITION IS NOT DRIVER-LOCAL - pinned-archive is performed by harness_legs.py --acquire, on every host - so NO declared provider should reach this arm; reaching it means the catalogue or LIBRARY_PROVIDERS grew a provider and this driver was not extended in the same change. Add the arm to BOTH drivers: a capability in one driver and not the other is this project's canonical silent harness bug. Known providers: host-system pinned-archive search-paths (printed by harness_legs.py --library-providers, never copied here)."],
+    },
 }
 
 
@@ -9563,12 +9619,29 @@ def _mirror_write_fixtures(work):
               "[elf64-x86_64] confound rows ACTIVE (1 of 2): ^zipfile-25.0$\r\n"
               "[elf64-x86_64] confound row INACTIVE: ^walsetlk- - NOT honoured "
               "here: clock-realtime-steps: absent")
+    # ── dss:unknown-library-provider: SIX SCALARS, NO FILE ──────────────────
+    # The pair is a pure function of its arguments, so a fixture file would add a
+    # parsing step to each arm whose divergence this case would then be measuring
+    # instead of the thing it exists to measure -- the same reasoning
+    # zero-progress-signature states for its literals.
+    # ⚠ `UNKNOWN_KNOWN` IS INPUT DATA, NOT A CLAIM ABOUT THE LIVE VOCABULARY. The
+    # real value is whatever `--library-providers` prints at run time; this is a
+    # fixed argument so the two arms can be driven on byte-identical input. It is
+    # NOT a second copy of LIBRARY_PROVIDERS and nothing reads it as one.
+    # `UNKNOWN_PROVIDER` is the RETIRED name on purpose: it is the provider that
+    # really did reach this arm, so the case reads as the history it came from.
     return {"CORPUSDIR": "corpus", "PERMSFILE": "corpus/permutations.test",
             "TIERFILE": "tier.test", "LISTFILE": "corpus.lst",
             "NAMESFILE": "names.lst", "LOGFILE": "segment.log",
             "FACTFILE": "facts.tsv", "BOUNDARY": "swarmvtab.test",
             "ABORTLOG": "abort-segment.log", "ABORTFACTS": "abort-facts.tsv",
-            "REPORT": report}
+            "REPORT": report,
+            "UNKNOWN_DRIVER": "driver-under-test",
+            "UNKNOWN_LEG": "elf64-arm64",
+            "UNKNOWN_PROVIDER": "ubuntu-ports-arm64",
+            "UNKNOWN_TCL": "libtcl8.6.so libtcl8.6.so.0",
+            "UNKNOWN_Z": "libz.so.1",
+            "UNKNOWN_KNOWN": "host-system pinned-archive search-paths"}
 
 
 # The two languages a mirrored region is written in, in the order every report
@@ -14651,6 +14724,21 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="harness_legs.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--catalogue", default=CATALOGUE)
+    # ── THE LIBRARY-PROVIDER VOCABULARY, PRINTED ─────────────────────────────
+    # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+    # D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
+    # Same shape and same reason as `--verdict-vocabulary` below it: the closed
+    # set lives in ONE place, and every other file that needs to name it asks
+    # rather than re-typing it. `build-and-test.sh` used to hard-code the list
+    # into its unknown-provider refusal and drifted — it advertised
+    # `ubuntu-ports-arm64` as KNOWN from `3e86a187` (2026-08-10) to 2026-08-20,
+    # after `LIBRARY_PROVIDERS`
+    # stopped containing it, so the message sent a reader toward a declaration
+    # `--lint` refuses. A printed vocabulary cannot drift from the set it prints.
+    p.add_argument("--library-providers", action="store_true",
+                   help="print the closed LIBRARY_PROVIDERS vocabulary, one per "
+                        "line, sorted. The drivers' unknown-provider refusals "
+                        "read THIS instead of carrying their own copy.")
     p.add_argument("--verdict-vocabulary", action="store_true",
                    help="print the closed verdict names, one per line, in order")
     p.add_argument("--plan", action="store_true")
@@ -15078,7 +15166,8 @@ def main(argv=None):
                         "leg matches / this host cannot run it (rc 3).")
     args = p.parse_args(argv)
 
-    if not (args.verdict_vocabulary or args.plan or args.lint or args.self_test
+    if not (args.verdict_vocabulary or args.library_providers
+            or args.plan or args.lint or args.self_test
             or args.header_stages or args.config_stages or args.path_translations
             or args.translate_path or args.assert_translated
             or args.env_transfers or args.env_transfer
@@ -15092,7 +15181,8 @@ def main(argv=None):
             or args.launcher_for_target
             or args.registry_controls or args.check_regions
             or args.probe_environment or args.print_probe_budget):
-        p.error("one of --verdict-vocabulary / --plan / --probe-environment / "
+        p.error("one of --verdict-vocabulary / --library-providers / "
+                "--plan / --probe-environment / "
                 "--print-probe-budget / "
                 "--header-stages / "
                 "--config-stages / --stage-build / --lint "
@@ -15124,6 +15214,14 @@ def main(argv=None):
     try:
         if args.verdict_vocabulary:
             sys.stdout.write("\n".join(VERDICTS) + "\n")
+            return 0
+        if args.library_providers:
+            # ⓘ NO local newline handling: `main` already reconfigured both
+            # streams to `newline="\n"` at the SOURCE (TF-C124), precisely so no
+            # mode has to carry its own copy. A driver reads these back through
+            # `$( )`, where a stray CR would make every name match nothing.
+            for name in sorted(LIBRARY_PROVIDERS):
+                sys.stdout.write("%s\n" % name)
             return 0
         if args.path_translations:
             for verb in sorted(PATH_TRANSLATIONS):

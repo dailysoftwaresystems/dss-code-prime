@@ -28,6 +28,7 @@
 #include "core/types/target_schema.hpp"
 #include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "link/format/macho.hpp"
+#include "link/format/macho_object_reader.hpp"   // the round-trip acceptance test
 #include "link/format/macho_chained_fixups.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
@@ -53,6 +54,20 @@ using dss::link_format::test::countAtPath;
 using dss::link_format::test::errorCount;
 using dss::link_format::test::countWithMessage;
 using dss::link_format::test::rejectSummary;
+
+namespace {
+// Every diagnostic a reporter collected, so a failure names the cause rather
+// than only the count. `rejectSummary` reads a schema LOAD result, not a
+// writer's reporter, so the two are not interchangeable.
+[[nodiscard]] std::string diagSummary(dss::DiagnosticReporter const& rep) {
+    std::string out;
+    for (auto const& d : rep.all()) {
+        out += "\n  [" + std::to_string(static_cast<int>(d.code))
+               + "] " + d.actual;
+    }
+    return out.empty() ? std::string{"(no diagnostics)"} : out;
+}
+}  // namespace
 
 namespace {
 
@@ -464,53 +479,297 @@ TEST(MachOWriter, ObjectNlistCouplesNameAndBindingStaticLocalDropsNExt) {
         << "no other n_desc bit is claimed for a defined function either";
 }
 
-// ── D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined symbol fails loud ──
+// ── D-LK-OBJECT-WEAK-DEF-RELOCATABLE: N_WEAK_DEF, and NOTHING ELSE ──
 //
-// The relocatable Mach-O (MH_OBJECT) writer cannot faithfully emit a WEAK
-// DEFINED symbol (N_WEAK_DEF + MH_WEAK_DEFINES is not wired). Degrading it to
-// N_SECT|N_EXT would SILENTLY lose the weak-override semantics, so the writer
-// fails loud instead — the same posture the MH_DYLIB export arm already takes
-// (`macho::encodeExecDynamic`'s export-trie loop, D-LK3-DYLIB-WEAK-EXPORT).
-// RED-ON-DISABLE: reverting the
-// fail-loud arm makes the writer emit the weak fn as N_SECT|N_EXT (0x0F) with 0
-// errors — this pin (empty bytes + exactly one K_NoMatchingObjectFormat citing
-// the anchor) goes red. The ELF sibling (Weak → STB_WEAK, native) + the EXEC
-// arms (weak forced Global / merge-resolved) are unaffected.
-TEST(MachOWriter, ObjectWeakDefinedFunctionFailsLoud) {
+// Mach-O expresses a weak DEFINITION with one n_desc bit, N_WEAK_DEF (0x0080),
+// on an otherwise ordinary N_SECT|N_EXT symbol. There is no second bit and no
+// header flag to go with it AT THE RELOCATABLE TIER.
+//
+// ⚠ THE ANCHOR ROW SAID "N_WEAK_DEF + MH_WEAK_DEFINES" AND THAT IS WRONG FOR
+// AN OBJECT. ✔MEASURED 2026-08-20 on the operator's Apple Silicon host:
+// `/usr/bin/clang -c` on `__attribute__((weak)) int wk(void)` emits n_desc
+// 0x0080 for `_wk` and a mach_header whose flags are 0x00002000 —
+// MH_SUBSECTIONS_VIA_SYMBOLS ONLY. MH_WEAK_DEFINES (0x8000) shows up only
+// after LINKING (the exec from that object reads 0x00218085; a weak-free
+// control exec reads 0x00200085), and `<mach-o/loader.h>` documents it as a
+// property of "the final linked image". So this pin asserts the bit IS set on
+// the symbol and IS NOT set on the object header — the second half is the one
+// that keeps a future reader of the anchor row from "fixing" the writer into
+// emitting a flag no reference encoder emits on a `.o`.
+//
+// RED-ON-DISABLE: drop N_WEAK_DEF from the n_desc decision → the weak symbol
+// becomes byte-identical to the strong one and every assertion below reds.
+TEST(MachOWriter, ObjectWeakDefinedFunctionEmitsNWeakDefAndNoHeaderFlag) {
     auto loaded = loadShipped();
     ASSERT_TRUE(loaded.target && loaded.format);
 
     AssembledModule mod;
-    mod.expectedFuncCount = 1;
+    mod.expectedFuncCount = 2;
+    AssembledFunction st;
+    st.symbol = SymbolId{10};
+    st.bytes  = {0xC3};
+    mod.functions.push_back(std::move(st));
     AssembledFunction w;
-    w.symbol = SymbolId{10};
-    w.bytes  = {0xC3};
+    w.symbol = SymbolId{11};
+    w.bytes  = {0x90, 0xC3};
     mod.functions.push_back(std::move(w));
-    // A WEAK, externally-visible defined function (the `__attribute__((weak))`
-    // shape c-subset.lang.json produces). `definedBinding` returns Weak.
-    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_weakfn",
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_strongfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    // The `__attribute__((weak))` shape c-subset.lang.json produces;
+    // `definedBinding` returns Weak for it.
+    mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "_weakfn",
                                        SymbolBinding::Weak,
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty())
-        << "a weak defined symbol must emit no bytes (loud-fail path), never a "
-           "silently-degraded N_SECT|N_EXT record";
-    EXPECT_EQ(rep.errorCount(), 1u)
-        << "exactly one fail-loud diagnostic must fire for the weak def";
-    bool found = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat &&
-            d.actual.find("D-LK-OBJECT-WEAK-DEF-RELOCATABLE") !=
-                std::string::npos) {
-            found = true;
-            break;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // mach_header_64.flags sits at offset 24.
+    EXPECT_EQ(readU32LE(bytes, 24) & 0x8000u, 0u)
+        << "MH_WEAK_DEFINES is a FINAL-IMAGE flag; an MH_OBJECT that claims it "
+           "asserts something about a linked image it is not, and no reference "
+           "encoder sets it on a `.o`";
+
+    std::uint32_t const symoff = readU32LE(bytes, 216);
+    std::uint32_t const nsyms  = readU32LE(bytes, 220);
+    ASSERT_EQ(nsyms, 2u);
+    // Emission order is module order: [0] strong, [1] weak.
+    EXPECT_EQ(bytes[symoff + 4], 0x0Fu) << "strong: N_SECT|N_EXT";
+    EXPECT_EQ(readU16LE(bytes, symoff + 6), 0u)
+        << "a STRONG definition carries no n_desc bits";
+    EXPECT_EQ(bytes[symoff + 16 + 4], 0x0Fu)
+        << "a weak definition is still N_SECT|N_EXT - the weakness is in "
+           "n_desc, and demoting n_type would make it undefined or local";
+    EXPECT_EQ(readU16LE(bytes, symoff + 16 + 6), 0x0080u)
+        << "N_WEAK_DEF (0x0080). NOT 0x0040 (N_WEAK_REF, a weak REFERENCE), "
+           "NOT 0x0020 (N_NO_DEAD_STRIP) and NOT 0x0200 (N_ALT_ENTRY, which "
+           "would mark the body an interior label and lose it)";
+}
+
+// ★★★ The Mach-O half of the round-trip acceptance test: the DSS writer
+// emits N_WEAK_DEF and DSS'S OWN Mach-O reader reads the binding back as Weak.
+// The writer bit and the reader lift are one mechanism; a bit nobody reads is
+// indistinguishable from a bit never written.
+//
+// RED-ON-DISABLE: drop either half → the read-back binding is Global.
+TEST(MachOWriter, ObjectWeakDefinitionRoundTripsBackToWeakThroughDssReader) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction st;
+    st.symbol = SymbolId{10};
+    st.bytes  = {0xC3};
+    mod.functions.push_back(std::move(st));
+    AssembledFunction w;
+    w.symbol = SymbolId{11};
+    w.bytes  = {0x90, 0xC3};
+    mod.functions.push_back(std::move(w));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_strongfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "_weakfn",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter wrep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+
+    DiagnosticReporter rrep;
+    auto back = macho::readRelocatableObject(bytes, *loaded.target,
+                                             *loaded.format, rrep);
+    ASSERT_TRUE(back.has_value());
+    ASSERT_EQ(rrep.errorCount(), 0u);
+
+    auto bindingOf = [&](std::string const& name)
+        -> std::optional<SymbolBinding> {
+        for (auto const& sym : back->symbols) {
+            if (sym.name == name) return sym.binding;
         }
+        return std::nullopt;
+    };
+    auto const weak = bindingOf("_weakfn");
+    ASSERT_TRUE(weak.has_value());
+    EXPECT_EQ(*weak, SymbolBinding::Weak)
+        << "N_WEAK_DEF must read back as Weak";
+    auto const strong = bindingOf("_strongfn");
+    ASSERT_TRUE(strong.has_value());
+    EXPECT_EQ(*strong, SymbolBinding::Global)
+        << "the strong sibling must not be dragged weak by its neighbour";
+}
+
+// ── D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB, Mach-O arm ──
+//
+// Several names on one atom, each with ITS OWN binding — Mach-O says that per
+// SYMBOL (N_EXT plus the N_WEAK_DEF n_desc bit), so a weak alias of a strong
+// definition needs nothing special here. Two things must hold together:
+// the alias record must be PRESENT at the canonical's n_sect/n_value, and the
+// relocation against the atom must still name the CANONICAL index. The second
+// is the one that fails silently: this writer REGISTERS indices in one pass and
+// EMITS records in another, so an alias the emission adds and the registration
+// does not count shifts every later record while the index map keeps the old
+// values — a well-formed object whose relocations name the wrong symbols.
+//
+// ★ Emitting an alias at all is safe under MH_SUBSECTIONS_VIA_SYMBOLS, and that
+// was MEASURED, not assumed: scripts/macho-alias-ld64-matrix, 8 cells on real
+// Apple Silicon (plain second label / `.alt_entry` / a clang `.globl`+`.set`
+// control, each × with and without `-dead_strip`, linked against a caller
+// referencing ONLY the alias, plus a canonical-only control). Every cell: both
+// names present at the SAME address, the program RAN and returned 42, `__text`
+// unchanged at 0x28 bytes. No zero-length atom, no stripped body.
+//
+// RED-ON-DISABLE: drop the alias emission → nsyms falls and `_othername` is
+// absent; drop the registration-side alias accounting → the r_symbolnum
+// assertion reds (and the writer's own index tripwire fires first).
+TEST(MachOWriter, ObjectSymtabCarriesEveryAliasNameAndRelocKeepsTheCanonical) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction target;
+    target.symbol = SymbolId{10};
+    target.bytes  = {0x90, 0xC3};
+    mod.functions.push_back(std::move(target));
+    AssembledFunction caller;
+    caller.symbol = SymbolId{11};
+    caller.bytes  = {0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    caller.relocations.push_back(
+        Relocation{/*offset=*/1u, /*target=*/SymbolId{10},
+                   /*kind=*/RelocationKind{1}, /*addend=*/0});
+    mod.functions.push_back(std::move(caller));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_realname",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_weakalias",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "_callerfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    ASSERT_FALSE(bytes.empty());
+
+    std::uint32_t const symoff = readU32LE(bytes, 216);
+    std::uint32_t const nsyms  = readU32LE(bytes, 220);
+    std::uint32_t const stroff = readU32LE(bytes, 224);
+    ASSERT_EQ(nsyms, 3u) << "canonical + alias + caller";
+    auto nameAt = [&](std::uint32_t i) {
+        std::uint32_t const strx = readU32LE(bytes, symoff + i * 16);
+        std::string name;
+        for (std::size_t q = stroff + strx;
+             q < bytes.size() && bytes[q] != 0; ++q) {
+            name.push_back(static_cast<char>(bytes[q]));
+        }
+        return name;
+    };
+    EXPECT_EQ(nameAt(0), "_realname");
+    EXPECT_EQ(nameAt(1), "_weakalias")
+        << "the alias NAME must reach the re-emitted symbol table";
+    EXPECT_EQ(readU64LE(bytes, symoff + 1 * 16 + 8),
+              readU64LE(bytes, symoff + 0 * 16 + 8))
+        << "both names must resolve to ONE address";
+    EXPECT_EQ(bytes[symoff + 1 * 16 + 5], bytes[symoff + 0 * 16 + 5])
+        << "same n_sect";
+    EXPECT_EQ(readU16LE(bytes, symoff + 1 * 16 + 6), 0x0080u)
+        << "the alias carries ITS OWN binding: N_WEAK_DEF, not the "
+           "canonical's n_desc of 0";
+    EXPECT_EQ(readU16LE(bytes, symoff + 0 * 16 + 6), 0u)
+        << "and the canonical is NOT dragged weak by its alias";
+
+    // The caller's relocation lives in __text's relocation_info table.
+    // section_64 for __text starts at 32 + 72 = 104. Its layout:
+    // sectname[16] segname[16] addr[8] size[8] offset[4] align[4]
+    // reloff[4] nreloc[4] flags[4] ... - so reloff @ +56, nreloc @ +60.
+    std::uint32_t const reloff = readU32LE(bytes, 104 + 56);
+    ASSERT_EQ(readU32LE(bytes, 104 + 60), 1u);
+    std::uint32_t const rinfo = readU32LE(bytes, reloff + 4);
+    EXPECT_EQ(nameAt(rinfo & 0x00FFFFFFu), "_realname")
+        << "the relocation must still name the CANONICAL record - an alias "
+           "counted in emission but not in registration points every later "
+           "relocation at the wrong symbol";
+}
+
+// ★ The Mach-O half of the read/re-emit round trip the alias anchor's closing
+// work names. Building an `AssembledModule` by hand proves the writer but not
+// that the READER hands the writer a module carrying both names, and the two
+// halves are one mechanism. This drives the real reader over a real object.
+//
+// RED-ON-DISABLE: drop the alias emission → the first re-emission already loses
+// the name, so the second read finds one name where there were two.
+TEST(MachOWriter, AliasedObjectSurvivesReadThenReEmitThroughTheRealReader) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{10};
+    f.bytes  = {0x90, 0x90, 0xC3};
+    mod.functions.push_back(std::move(f));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_realname",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_weakalias",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep1;
+    auto first = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep1);
+    ASSERT_EQ(rep1.errorCount(), 0u) << diagSummary(rep1);
+
+    DiagnosticReporter rrep;
+    auto read = macho::readRelocatableObject(first, *loaded.target,
+                                             *loaded.format, rrep);
+    ASSERT_TRUE(read.has_value()) << diagSummary(rrep);
+    ASSERT_EQ(read->functions.size(), 1u)
+        << "two names at one address are ONE atom, not two";
+    int named = 0;
+    for (auto const& sym : read->symbols) {
+        if (sym.name == "_realname" || sym.name == "_weakalias") ++named;
     }
-    EXPECT_TRUE(found)
-        << "the diagnostic must cite D-LK-OBJECT-WEAK-DEF-RELOCATABLE (the "
-           "Mach-O N_WEAK_DEF deferral) for future-grep navigability";
+    EXPECT_EQ(named, 2) << "both names must come back off the wire";
+
+    DiagnosticReporter rep2;
+    auto second =
+        encodeUntrampolined(*read, *loaded.target, *loaded.format, rep2);
+    ASSERT_EQ(rep2.errorCount(), 0u) << diagSummary(rep2);
+
+    std::uint32_t const symoff = readU32LE(second, 216);
+    std::uint32_t const nsyms  = readU32LE(second, 220);
+    std::uint32_t const stroff = readU32LE(second, 224);
+    auto nameAt = [&](std::uint32_t i) {
+        std::uint32_t const strx = readU32LE(second, symoff + i * 16);
+        std::string name;
+        for (std::size_t q = stroff + strx;
+             q < second.size() && second[q] != 0; ++q) {
+            name.push_back(static_cast<char>(second[q]));
+        }
+        return name;
+    };
+    std::optional<std::uint32_t> a;
+    std::optional<std::uint32_t> b;
+    for (std::uint32_t i = 0; i < nsyms; ++i) {
+        if (nameAt(i) == "_realname")  a = i;
+        if (nameAt(i) == "_weakalias") b = i;
+    }
+    ASSERT_TRUE(a.has_value());
+    ASSERT_TRUE(b.has_value())
+        << "the alias name must survive a full read/re-emit cycle";
+    EXPECT_EQ(readU64LE(second, symoff + *a * 16 + 8),
+              readU64LE(second, symoff + *b * 16 + 8))
+        << "and both must still resolve to ONE address";
+    EXPECT_EQ(readU16LE(second, symoff + *b * 16 + 6), 0x0080u)
+        << "the alias must still be WEAK after the round trip - the reader "
+           "lifted N_WEAK_DEF and the writer put it back";
 }
 
 // ── relocation_info r_info packing ─────────────────────────────
@@ -1139,12 +1398,17 @@ TEST(MachOWriter, Arm64ObjectStaticDataItemDropsNExt) {
         << "static data drops N_EXT (0x0E), not the pre-fix N_SECT|N_EXT (0x0F)";
 }
 
-// D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined DATA symbol fails loud — the
-// data-site twin of ObjectWeakDefinedFunctionFailsLoud. The data loop has its
-// OWN weak guard (macho.cpp); reverting it silently degrades a weak data def to
-// N_SECT|N_EXT with no diagnostic. RED-ON-DISABLE: revert the data-site guard →
-// non-empty bytes + errorCount 0 → this pin goes red.
-TEST(MachOWriter, Arm64ObjectWeakDefinedDataFailsLoud) {
+// D-LK-OBJECT-WEAK-DEF-RELOCATABLE, the DATA twin, on the arm64 leg. The data
+// emit site is separate code from the function site and the two drifting apart
+// is the exact defect D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION
+// was, so it gets its own pin. Asserts the bit AND the round trip: the bit
+// alone would pass over a reader that ignores it, and the round trip alone
+// would pass over a writer that set the wrong bit if the reader read the same
+// wrong bit.
+//
+// RED-ON-DISABLE: route the data site around `definedNDesc` → n_desc reads 0
+// and the read-back binding falls to Global.
+TEST(MachOWriter, Arm64ObjectWeakDefinedDataEmitsNWeakDefAndRoundTrips) {
     auto loaded = loadShippedArm64();
     ASSERT_TRUE(loaded.target && loaded.format);
 
@@ -1155,6 +1419,15 @@ TEST(MachOWriter, Arm64ObjectWeakDefinedDataFailsLoud) {
     fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // arm64 RET
     mod.functions.push_back(std::move(fn));
     mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_anchor",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    AssembledData sd;
+    sd.symbol    = SymbolId{9};
+    sd.section   = DataSectionKind::Data;
+    sd.bytes     = {9, 9, 9, 9};
+    sd.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(sd));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{9}, "_strongdat",
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
     AssembledData d;
@@ -1169,20 +1442,58 @@ TEST(MachOWriter, Arm64ObjectWeakDefinedDataFailsLoud) {
 
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty())
-        << "a weak defined DATA symbol must emit no bytes (loud-fail path)";
-    EXPECT_EQ(rep.errorCount(), 1u)
-        << "exactly one fail-loud diagnostic must fire for the weak data def";
-    bool found = false;
-    for (auto const& dg : rep.all()) {
-        if (dg.code == DiagnosticCode::K_NoMatchingObjectFormat &&
-            dg.actual.find("D-LK-OBJECT-WEAK-DEF-RELOCATABLE") != std::string::npos) {
-            found = true;
-            break;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(readU32LE(bytes, 24) & 0x8000u, 0u)
+        << "MH_WEAK_DEFINES stays off an MH_OBJECT on the data path too";
+
+    DiagnosticReporter rrep;
+    auto back = macho::readRelocatableObject(bytes, *loaded.target,
+                                             *loaded.format, rrep);
+    ASSERT_TRUE(back.has_value());
+    auto bindingOf = [&](std::string const& name)
+        -> std::optional<SymbolBinding> {
+        for (auto const& sym : back->symbols) {
+            if (sym.name == name) return sym.binding;
+        }
+        return std::nullopt;
+    };
+    EXPECT_EQ(bindingOf("_weakdat").value_or(SymbolBinding::Global),
+              SymbolBinding::Weak)
+        << "a weak DATA definition must round-trip back to Weak";
+    EXPECT_EQ(bindingOf("_strongdat").value_or(SymbolBinding::Weak),
+              SymbolBinding::Global);
+    // ★ THE COUNTERS ARE LOAD-BEARING, not bookkeeping. Both byte comparisons
+    // below sit inside a NESTED MATCH LOOP with no floor on how often the match
+    // succeeds: if the reader handed back no data items at all -- or items whose
+    // SymbolIds matched no `symbols` row -- neither `EXPECT_EQ` would execute
+    // and this test would pass having compared NOTHING. The bytes are the half
+    // that separates "the right binding" from "the right binding over the wrong
+    // bytes", which is the silent miscompile this cell exists for, so the pin
+    // must state that it reached them. EXACTLY once each: a duplicate row would
+    // mean the round-trip invented a second item for one atom.
+    unsigned weakByteChecks = 0;
+    unsigned strongByteChecks = 0;
+    for (auto const& item : back->dataItems) {
+        for (auto const& sym : back->symbols) {
+            if (sym.symbol != item.symbol) continue;
+            if (sym.name == "_weakdat") {
+                ++weakByteChecks;
+                EXPECT_EQ(item.bytes, (std::vector<std::uint8_t>{1, 2, 3, 4}))
+                    << "the weak item's bytes must survive intact - the right "
+                       "binding over the wrong bytes is a silent miscompile";
+            } else if (sym.name == "_strongdat") {
+                ++strongByteChecks;
+                EXPECT_EQ(item.bytes, (std::vector<std::uint8_t>{9, 9, 9, 9}));
+            }
         }
     }
-    EXPECT_TRUE(found)
-        << "the diagnostic must cite D-LK-OBJECT-WEAK-DEF-RELOCATABLE at the data site";
+    EXPECT_EQ(weakByteChecks, 1u)
+        << "the weak item's bytes must have been COMPARED exactly once - zero "
+           "means the loop above never matched and this cell asserted nothing "
+           "about the bytes";
+    EXPECT_EQ(strongByteChecks, 1u)
+        << "and so must the strong item's, for the same reason";
 }
 
 // (2) A RelRoConst item carrying an abs64 reloc to a DEFINED function (a

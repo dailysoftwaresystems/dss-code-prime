@@ -73,6 +73,103 @@ constexpr std::uint8_t kSymClassExternal = 2;
 // labels are all class STATIC. What separates them is the DERIVED-TYPE field
 // below (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
 constexpr std::uint8_t kSymClassStatic   = 3;
+// WEAK_EXTERNAL (105 == 0x69) -- an UNDEF name that DEFERS TO ANOTHER NAME.
+// PE/COFF 5.5.3's own words: a weak external is "a symbol table record with
+// EXTERNAL storage class, UNDEF section number, and a value of zero" plus an
+// auxiliary record naming the symbol to use instead. Decoded in `weakExternDefault`.
+constexpr std::uint8_t kSymClassWeakExternal = 105;
+//
+// ── THE CLASSES THAT NAME NO RECONSTRUCTIBLE BODY ──────────────────────────
+//
+// COFF's storage class is an ON-THE-WIRE ENUM, and until this list existed the
+// dispatch below tested for the two classes it modeled and let EVERY OTHER
+// VALUE fall into the interior-block-label bucket. That is the partial-and-
+// silent shape GATE 3 was deliberately written NOT to have, twenty lines away
+// in this same file, and it is what let class 105 be read as a plain strong
+// extern. The dispatch is now TOTAL: a class either resolves to a
+// `CoffSymbolRole` or FAILS LOUD, so the next producer to use a class nobody
+// modeled gets a diagnostic instead of a silent reclassification.
+//
+// These are the classes whose SPEC DEFINITION is a debug/bookkeeping record or
+// a code address interior to a body -- never a body DSS reconstructs. They keep
+// EXACTLY the behaviour the old open-ended fallback gave them (a bodiless
+// ModuleSymbol staged for the geometry pass), which is why adding the
+// enumeration changes no existing reconstruction.
+// ✔VERIFIED value-by-value against this host's Windows SDK
+// `um/winnt.h` (10.0.26100.0) `IMAGE_SYM_CLASS_*` block -- NOT quoted from
+// memory, and NOT from the reader's own prior belief.
+constexpr std::uint8_t kSymClassNull           = 0;
+constexpr std::uint8_t kSymClassAutomatic      = 1;
+constexpr std::uint8_t kSymClassRegister       = 4;
+constexpr std::uint8_t kSymClassExternalDef    = 5;
+constexpr std::uint8_t kSymClassLabel          = 6;    // a code address IN a module
+constexpr std::uint8_t kSymClassUndefinedLabel = 7;
+constexpr std::uint8_t kSymClassMemberOfStruct = 8;
+constexpr std::uint8_t kSymClassArgument       = 9;
+constexpr std::uint8_t kSymClassStructTag      = 10;
+constexpr std::uint8_t kSymClassMemberOfUnion  = 11;
+constexpr std::uint8_t kSymClassUnionTag       = 12;
+constexpr std::uint8_t kSymClassTypeDefinition = 13;
+constexpr std::uint8_t kSymClassUndefinedStatic= 14;
+constexpr std::uint8_t kSymClassEnumTag        = 15;
+constexpr std::uint8_t kSymClassMemberOfEnum   = 16;
+constexpr std::uint8_t kSymClassRegisterParam  = 17;
+constexpr std::uint8_t kSymClassBitField       = 18;
+constexpr std::uint8_t kSymClassBlock          = 100;  // `.bb` / `.eb`
+constexpr std::uint8_t kSymClassFunction       = 101;  // `.bf` / `.ef` / `.lf`
+constexpr std::uint8_t kSymClassEndOfStruct    = 102;
+constexpr std::uint8_t kSymClassFile           = 103;  // the source file name
+constexpr std::uint8_t kSymClassSection        = 104;
+constexpr std::uint8_t kSymClassClrToken       = 107;
+constexpr std::uint8_t kSymClassEndOfFunction  = 0xFFu;  // (BYTE)-1
+
+// ── AUXILIARY FORMAT 3 (PE/COFF 5.5.3, "Weak Externals") ───────────────────
+//
+// The 18-byte auxiliary record that follows a WEAK_EXTERNAL symbol:
+//   [0]  u32 TagIndex         -- the symtab index of the DEFAULT symbol (sym2)
+//   [4]  u32 Characteristics  -- the search policy for sym1
+//   [8]  10 bytes unused
+// ✔VERIFIED, and by a CROSS-CHECK rather than by trusting one source: the
+// SDK's `IMAGE_AUX_SYMBOL_EX::Sym` spells the same two fields in the same order
+// at the same offsets as `WeakDefaultSymIndex` (DWORD @0) + `WeakSearchType`
+// (DWORD @4) -- so BOTH the ORDER and the 32-bit WIDTH are confirmed by a
+// declaration independent of the prose. (`IMAGE_AUX_SYMBOL_EX` is the bigobj
+// 20-byte form; the two leading DWORDs are shared with the 18-byte form.)
+constexpr std::size_t kAuxWeakExternTagIndexOff        = 0;  // u32
+constexpr std::size_t kAuxWeakExternCharacteristicsOff = 4;  // u32
+
+// IMAGE_WEAK_EXTERN_SEARCH_* -- the Characteristics vocabulary, ✔VERIFIED
+// against the same `winnt.h`.
+constexpr std::uint32_t kWeakExternSearchNoLibrary = 1;
+constexpr std::uint32_t kWeakExternSearchLibrary   = 2;
+constexpr std::uint32_t kWeakExternSearchAlias     = 3;
+// ANTI_DEPENDENCY(4) and every other value -> FAIL LOUD (see the decode).
+//
+// ⚠⚠ CHARACTERISTICS IS **NOT** THE DEFINITION-VS-UNRESOLVABLE DISCRIMINATOR,
+// AND BELIEVING IT WAS IS A MEASURED ERROR THIS CYCLE ALMOST SHIPPED.
+// The plan for this reader said to route on it: ALIAS(3) => bind the name to
+// the canonical, SEARCH_*(1,2) => a weak undefined reference. ✔MEASURED on
+// mingw gcc 13.2.0 (`objdump -t` plus a raw 18-byte aux dump, because objdump
+// renders a format-3 aux as though it were a function aux and never prints
+// Characteristics at all), over FOUR source shapes:
+//     `__attribute__((weak))` on a FUNCTION      -> Characteristics 1
+//     `__attribute__((weak))` on a DATA object   -> Characteristics 1
+//     `__attribute__((weak, alias("real_fn")))`  -> Characteristics 1
+//     an UNDEFINED `extern __attribute__((weak))`-> Characteristics 1
+// It is CONSTANT at NOLIBRARY(1) across every shape gcc produces, so routing on
+// it would have classified every gcc weak DEFINITION as an unresolvable
+// reference -- i.e. left the body under the `.weak.<n>.<n>` name and kept
+// reporting "undefined symbol" for the name that IS defined, which is the exact
+// defect this arm exists to remove.
+// ★ What the field actually states is the SEARCH POLICY FOR sym1, which is a
+// different question from what sym2 IS. The role is stated by the record's OWN
+// TagIndex: what the DEFAULT symbol is. A section-backed default is a body this
+// name resolves to; a non-section-backed one is not. **Route on that.**
+// (This is D-LK-MACHO-ISDATA-NO-CALL-SIGNAL's lesson arriving from the other
+// direction -- there a reader used a relocation's arithmetic FORMULA as a proxy
+// for its ROLE; here a plan proposed using a SEARCH POLICY as a proxy for a
+// DEFINITION STATE. Both substitute a field that correlates for the field that
+// states.)
 
 // IMAGE_SECTION_NUMBER specials (SectionNumber is a signed i16).
 constexpr std::uint16_t kSymUndefined = 0x0000u;  // extern
@@ -110,9 +207,18 @@ constexpr std::uint32_t kScnCntUninitializedData = 0x00000080u;
 // function-level-linked (`/Gy`) / `__declspec(selectany)` / inline / template
 // body in its OWN COMDAT section; the duplicate-resolution policy lives in the
 // section-definition auxiliary record's Selection byte (decoded below --
-// D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION). DSS's own writer emits NO COMDAT
-// sections, so this bit is only ever set by a FOREIGN object
-// (D-LK-COFF-READER-FOREIGN-OBJECT).
+// D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION).
+// ⚠ THIS BIT IS NO LONGER FOREIGN-ONLY. It said so until D-LK-OBJECT-WEAK-DEF-
+// RELOCATABLE landed: COFF has no per-symbol weak-DEFINITION encoding, so DSS's
+// own writer now spells every weak definition as a per-body IMAGE_SCN_LNK_COMDAT
+// section with Selection = IMAGE_COMDAT_SELECT_ANY (`pe.cpp`, the COMDAT
+// sections walk). The COMDAT path below therefore runs on DSS's OWN output as
+// well as on a foreign `.obj` (D-LK-COFF-READER-FOREIGN-OBJECT), and is
+// round-tripped as such -- `PeWriter.ObjectWeakDefinitionRoundTripsBackToWeak
+// ThroughDssReader` and `PeWriter.ObjectWeakDefinedDataEmitsOwnComdatAndRound
+// Trips` both write with `pe::encode` and read back through this reader.
+// Weakening this decode to suit a foreign producer would now silently change
+// what DSS reads back from its own objects.
 constexpr std::uint32_t kScnLnkComdat = 0x00001000u;
 
 // IMAGE_COMDAT_SELECT_* -- the COMDAT Selection byte (aux format 5, offset 14).
@@ -247,6 +353,63 @@ struct Sym {
     std::uint16_t type    = 0;
     std::uint8_t  storage = 0;
 };
+
+// ── THE STORAGE-CLASS ROLE — a TOTAL map, in GATE 3's shape ────────────────
+//
+// The four roles this reader's symbol model actually distinguishes. Every COFF
+// storage class resolves to exactly one of them or FAILS LOUD; there is no
+// "everything else" arm. `Bodiless` is a ROLE, not a fallback: it is the set of
+// classes whose SPEC DEFINITION is a debug/bookkeeping record or an address
+// interior to another symbol's body.
+enum class CoffSymbolRole {
+    External,      // 2   -- a definition or reference visible to other objects
+    Static,        // 3   -- COFF's internal-linkage class (see kSymClassStatic)
+    WeakExternal,  // 105 -- an UNDEF name that defers to another name (5.5.3)
+    Bodiless,      // names no body DSS reconstructs (debug records, labels, ...)
+};
+
+// Resolve a storage class to its role. `nullopt` == UNMODELED -> the caller
+// FAILS LOUD. Deliberately a switch over the raw wire value with no `default:`
+// swallow, so adding a class is a compile-visible edit here rather than a
+// silent behaviour change at every use site.
+[[nodiscard]] constexpr std::optional<CoffSymbolRole>
+roleForStorageClass(std::uint8_t storage) noexcept {
+    switch (storage) {
+        case kSymClassExternal:     return CoffSymbolRole::External;
+        case kSymClassStatic:       return CoffSymbolRole::Static;
+        case kSymClassWeakExternal: return CoffSymbolRole::WeakExternal;
+        // Bodiless: a C-debug bookkeeping record, a type/scope tag, or a code
+        // address INTERIOR to a body. None names a body; each keeps exactly the
+        // treatment the pre-total dispatch's open-ended fallback gave it.
+        case kSymClassNull:
+        case kSymClassAutomatic:
+        case kSymClassRegister:
+        case kSymClassExternalDef:
+        case kSymClassLabel:
+        case kSymClassUndefinedLabel:
+        case kSymClassMemberOfStruct:
+        case kSymClassArgument:
+        case kSymClassStructTag:
+        case kSymClassMemberOfUnion:
+        case kSymClassUnionTag:
+        case kSymClassTypeDefinition:
+        case kSymClassUndefinedStatic:
+        case kSymClassEnumTag:
+        case kSymClassMemberOfEnum:
+        case kSymClassRegisterParam:
+        case kSymClassBitField:
+        case kSymClassBlock:
+        case kSymClassFunction:
+        case kSymClassEndOfStruct:
+        case kSymClassFile:
+        case kSymClassSection:
+        case kSymClassClrToken:
+        case kSymClassEndOfFunction:
+            return CoffSymbolRole::Bodiless;
+        default:
+            return std::nullopt;
+    }
+}
 
 // A defined symbol staged for atom slicing: its section-relative Value IS an
 // atom boundary. Every linkage reaches here -- an EXTERNAL symbol, a
@@ -525,10 +688,21 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
 
     // -- (5) Decode every IMAGE_SYMBOL; assign SymbolId = symtab index ----
     //
-    // DSS emits ZERO auxiliary records, so a record's ordinal equals its
-    // symbol index. A foreign object's NumberOfAuxSymbols>0 record is
-    // followed by that many AUX slots that are NOT IMAGE_SYMBOLs: they are
-    // SKIPPED (not decoded), and a reloc naming an aux slot fails loud below.
+    // A record's ordinal is NOT its symbol index, and it never was safe to
+    // assume so: a record declaring NumberOfAuxSymbols>0 is followed by that
+    // many AUX slots that are NOT IMAGE_SYMBOLs. They are SKIPPED (not decoded)
+    // and marked in `auxSlot`, the cursor advances by `1 + numAux`, and a reloc
+    // naming an aux slot fails loud below.
+    // ⚠ THIS IS NOT A FOREIGN-OBJECT-ONLY CONCERN ANY MORE. This comment used to
+    // read "DSS emits ZERO auxiliary records, so a record's ordinal equals its
+    // symbol index" -- true when it was written and false since
+    // D-LK-OBJECT-WEAK-DEF-RELOCATABLE: DSS's own writer now emits BOTH aux
+    // shapes -- a section-definition aux (format 5) on every COMDAT section
+    // symbol it mints for a weak definition, and an Auxiliary Format 3 record on
+    // every WEAK_EXTERNAL alias. So DSS's own `.obj` shifts symbol indices past
+    // its aux slots, and the `1 + numAux` walk is what keeps a relocation's
+    // symbol index meaning the same record on the way back in as it did on the
+    // way out (`PeWriter.RelocationToAWeakDefinitionResolvesPastTheAuxSlot`).
     std::vector<Sym>  syms(numSymbols);
     std::vector<bool> auxSlot(numSymbols, false);
     // A `std::size_t` cursor (not u32): the `+= 1 + numAux` skip past a
@@ -586,6 +760,99 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         if (s.name != sections[s.sectNum - 1u].name) return false;
         std::size_t const auxIdx = k + 1u;
         return auxIdx < numSymbols && auxSlot[auxIdx];
+    };
+
+    // -- (5.2) WEAK EXTERNALS: decode Auxiliary Format 3 (PE/COFF 5.5.3) ----
+    //
+    // A WEAK_EXTERNAL record names sym1 (always UNDEF) and its auxiliary record
+    // names sym2, the DEFAULT used when sym1 is not otherwise defined. Both
+    // facts live in the AUX record, which the symbol loop used to discard whole
+    // (`if (auxSlot[i]) continue;`) -- so the two fields that make the record
+    // mean anything were thrown away before anything looked at them.
+    //
+    // ★ THE ROLE COMES FROM WHAT sym2 IS, NOT FROM Characteristics -- see the
+    // measurement recorded at `kWeakExternSearchNoLibrary`. This returns sym2's
+    // symtab index; the caller reads sym2's own SectionNumber to decide what the
+    // record means. Every structural violation FAILS LOUD here rather than
+    // yielding a half-decoded record: a weak external the reader cannot decode
+    // is a name whose binding it would otherwise silently promote to strong.
+    //
+    // Returns `nullopt` AFTER emitting a diagnostic (the caller propagates).
+    auto weakExternDefault =
+        [&](std::uint32_t i) -> std::optional<std::uint32_t> {
+        Sym const& s = syms[i];
+        auto refuse = [&](std::string detail) -> std::optional<std::uint32_t> {
+            fail(DiagnosticCode::F_CorruptedBinary,
+                 "pe::readRelocatableObject: weak external '" + s.name + "' "
+                 + std::move(detail)
+                 + " D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB.");
+            return std::nullopt;
+        };
+        // 5.5.3 states the record's own shape as a conjunction; check it rather
+        // than assume it, because a record that is NOT that shape is not a weak
+        // external and reading its aux as format 3 would decode arbitrary bytes
+        // as a symbol index.
+        if (s.sectNum != kSymUndefined) {
+            return refuse("has SectionNumber " + std::to_string(
+                              static_cast<std::int16_t>(s.sectNum))
+                          + " but PE/COFF 5.5.3 requires UNDEF (0) -- a weak "
+                            "external DEFINES nothing.");
+        }
+        if (s.value != 0u) {
+            return refuse("has Value " + std::to_string(s.value)
+                          + " but PE/COFF 5.5.3 requires zero.");
+        }
+        std::size_t const auxIdx = static_cast<std::size_t>(i) + 1u;
+        if (auxIdx >= numSymbols || !auxSlot[auxIdx]) {
+            return refuse("carries no auxiliary record, so the DEFAULT symbol it "
+                          "defers to (Auxiliary Format 3 TagIndex) is unstated. "
+                          "Refusing to read it as a plain strong extern -- that "
+                          "would silently promote a name that may legally be "
+                          "overridden or absent.");
+        }
+        std::size_t const ao =
+            static_cast<std::size_t>(symTabPtr) + auxIdx * kSymbolSz;
+        std::uint32_t const tagIndex =
+            rdU32(bytes, ao + kAuxWeakExternTagIndexOff);
+        std::uint32_t const characteristics =
+            rdU32(bytes, ao + kAuxWeakExternCharacteristicsOff);
+        // A TOTAL enumeration, GATE 3's shape. All three modelled values
+        // reconstruct the SAME relation here, and the reader must accept all
+        // three because the producers disagree about which to write: gcc emits
+        // NOLIBRARY(1) for every weak shape, while DSS's own writer emits
+        // ALIAS(3) -- ✔MEASURED as the only value under which a foreign linker
+        // resolves the alias from another object (see `pe.cpp`'s
+        // `IMAGE_WEAK_EXTERN_SEARCH_ALIAS`). The difference between them is a
+        // LINKER SEARCH POLICY for sym1, which the object tier does not act on:
+        // DSS's resolution set is the modules actually merged, not an import
+        // library search order. ANTI_DEPENDENCY(4) is an MSVC-internal marker
+        // whose whole point is that sym1 must NOT force sym2 to be pulled from
+        // an archive; treating it as a plain weak external would change which
+        // members a static link pulls, so it FAILS LOUD instead.
+        switch (characteristics) {
+            case kWeakExternSearchNoLibrary:
+            case kWeakExternSearchLibrary:
+            case kWeakExternSearchAlias:
+                break;
+            default:
+                return refuse("has Auxiliary Format 3 Characteristics "
+                              + std::to_string(characteristics)
+                              + ", which is neither SEARCH_NOLIBRARY(1), "
+                                "SEARCH_LIBRARY(2) nor SEARCH_ALIAS(3). "
+                                "ANTI_DEPENDENCY(4) and unknown values are not "
+                                "modeled -- refusing to default a weak-external "
+                                "policy.");
+        }
+        if (tagIndex >= numSymbols) {
+            return refuse("names default symbol index " + std::to_string(tagIndex)
+                          + ", past the symbol table's " + std::to_string(numSymbols)
+                          + " records.");
+        }
+        if (auxSlot[tagIndex]) {
+            return refuse("names default symbol index " + std::to_string(tagIndex)
+                          + ", which is an AUXILIARY slot, not a symbol.");
+        }
+        return tagIndex;
     };
 
     // -- (5.5) GATE 3: COMDAT selection -> the section's external-symbol binding.
@@ -714,7 +981,121 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     for (std::uint32_t i = 0; i < numSymbols; ++i) {
         if (auxSlot[i]) continue;  // an auxiliary record, not a symbol
         Sym const& s = syms[i];
-        bool const isExt = (s.storage == kSymClassExternal);
+        // GATE: the storage class resolves to a ROLE or the object is refused.
+        // The old dispatch tested `== kSymClassExternal` / `== kSymClassStatic`
+        // and let every other value fall through to the block-label arm, which
+        // is how class 105 became a strong extern.
+        std::optional<CoffSymbolRole> const roleOpt =
+            roleForStorageClass(s.storage);
+        if (!roleOpt.has_value()) {
+            return fail(DiagnosticCode::F_CorruptedBinary,
+                "pe::readRelocatableObject: symbol '" + s.name
+                + "' has storage class " + std::to_string(s.storage)
+                + ", which this reader does not model. Refusing to classify it "
+                  "by its section alone -- the storage class is what says "
+                  "whether a record names a body, a reference, or a "
+                  "bookkeeping entry, and guessing it silently mis-slices the "
+                  "section (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-"
+                  "LABEL-NOT-ATOM).");
+        }
+        CoffSymbolRole const role = *roleOpt;
+
+        if (role == CoffSymbolRole::WeakExternal) {
+            // ── A WEAK EXTERNAL: this NAME defers to THAT NAME (5.5.3) ──────
+            //
+            // Decode the aux record, then route on WHAT THE DEFAULT SYMBOL IS.
+            //
+            // ★ A NAMELESS WEAK EXTERNAL IS REFUSED, NOT SKIPPED. This arm read
+            // `if (s.name.empty()) continue;` -- "names nothing and defers
+            // nothing" -- which is a SILENT DROP of a record that is still
+            // counted in NumberOfSymbols and can still be the target of a
+            // relocation BY INDEX. Skipped, that relocation retargets to a
+            // SymbolId this reader never produced, and the object surfaces much
+            // later as an unresolved symbol attributed to whoever merged it.
+            // PE/COFF 5.5.3 gives sym1 a name precisely so another object can
+            // satisfy it; a nameless one is a malformed record, and every other
+            // structural violation of 5.5.3 in `weakExternDefault` fails loud
+            // for the same reason -- refusing a half-decoded weak external beats
+            // guessing what its binding was.
+            if (s.name.empty()) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: symbol #" + std::to_string(i)
+                    + " is a WEAK_EXTERNAL record (storage class 105) with an "
+                      "EMPTY name. PE/COFF 5.5.3 makes the record a NAME that "
+                      "defers to its Auxiliary Format 3 default; a nameless one "
+                      "defers a name nothing can refer to, and dropping it "
+                      "silently leaves any relocation naming this record BY "
+                      "INDEX pointing at a symbol the reader never produced -- "
+                      "which surfaces as an unresolved symbol against the wrong "
+                      "object, long after the malformed record that caused it. "
+                      "D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB.");
+            }
+            auto const tag = weakExternDefault(i);
+            if (!tag.has_value()) return std::nullopt;   // already diagnosed
+            Sym const& def = syms[*tag];
+            if (def.sectNum >= 1u && def.sectNum <= numSections) {
+                // The default is SECTION-BACKED: it is a body in THIS object,
+                // and `s.name` is a second name for it. That covers BOTH shapes
+                // mingw gcc emits this way -- a `__attribute__((weak))`
+                // DEFINITION (whose body it renames to `.weak.<n>.<n>`) and a
+                // `__attribute__((weak, alias("target")))`.
+                //
+                // ★ BINDING IS `Weak`, AND IT IS THE RECORD'S OWN STATEMENT,
+                // not an inference. A weak external is by construction the name
+                // that YIELDS: 5.5.3's "if sym1 is not present at link time,
+                // sym2 is used to resolve references instead" is precisely the
+                // rule `SymbolBinding::Weak` already means to the format-blind
+                // merge (a strong definition elsewhere shadows it;
+                // `resolveCrossCuDefs` breaks an all-weak tie lowest-key).
+                // Reading it as Global -- which is what happened before this
+                // arm existed, via the extern path -- makes a name that may
+                // legally be overridden into one that collides.
+                //
+                // ★ WHY THIS NEEDS NO NEW MECHANISM: two boundaries at ONE
+                // section offset are already ONE atom under SEVERAL NAMES
+                // (`object_atom_coverage.hpp`,
+                // D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS). Its
+                // `outranksAsAtomIdentity` gives the atom to the STRONG name
+                // and leaves the weak one its own row at the same address,
+                // which is exactly the reconstruction this shape wants, and it
+                // remaps every relocation naming either index to the owner.
+                defsBySection[def.sectNum].push_back(
+                    DefSym{i, def.value, s.name, SymbolBinding::Weak,
+                           SymbolVisibility::Default});
+                continue;
+            }
+            // The default is NOT section-backed -- an ABSOLUTE or UNDEF
+            // fallback. ✔MEASURED: this is how mingw gcc encodes a weak
+            // UNDEFINED REFERENCE (`extern __attribute__((weak)) int f(void);`
+            // with no definition) -- the default is an ABSOLUTE symbol of value
+            // 0, so an unresolved `f` tests as 0, which is the GNU semantics.
+            //
+            // ⚠ DSS CANNOT YET REPRESENT THAT, AND THE GAP IS NOT IN THIS FILE.
+            // A "weak undefined reference" needs a reference that may LEGALLY
+            // stay unresolved, and `ExternImport` carries no binding at all --
+            // measured, on EVERY format, not just COFF: the ELF object reader
+            // drops STB_WEAK on an undefined symbol the same way. Nothing in
+            // `symbolVa` is fed from `module.symbols` either, so binding the
+            // name to the absolute-0 default does not resolve it; it only moves
+            // the refusal from the unbound-extern gate to the compound index.
+            // ⇒ FAIL LOUD AND SAY WHICH FACT IS MISSING. The alternative is a
+            // SILENT weak->strong downgrade on re-emission, and the diagnostic
+            // it used to produce ("undefined symbol f") named the wrong defect.
+            return fail(DiagnosticCode::F_CorruptedBinary,
+                "pe::readRelocatableObject: weak external '" + s.name
+                + "' defers to '" + def.name + "', which is not defined in this "
+                  "object (SectionNumber "
+                + std::to_string(static_cast<std::int16_t>(def.sectNum))
+                + "). That is a WEAK UNDEFINED REFERENCE -- a reference that may "
+                  "legally stay unresolved and test as zero -- and DSS's "
+                  "link-tier symbol model has no way to carry it: ExternImport "
+                  "declares no binding on ANY format, so reading this as a plain "
+                  "strong extern would silently drop the one property that makes "
+                  "it weak. Refusing rather than downgrading it. "
+                  "D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE.");
+        }
+
+        bool const isExt = (role == CoffSymbolRole::External);
         SymbolBinding const binding =
             isExt ? SymbolBinding::Global : SymbolBinding::Local;
 
@@ -722,6 +1103,34 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // An UNDEFINED symbol -> an extern import. A nameless slot carries
             // no import identity.
             if (s.name.empty()) continue;
+            // ⚠ EXCEPT WHEN IT IS A COMMON SYMBOL, WHICH IS A DEFINITION.
+            // PE/COFF 5.4.2: an EXTERNAL record with SectionNumber UNDEF(0) and
+            // a NON-ZERO Value is a COMMON symbol, and the Value is its SIZE in
+            // bytes -- the ELF SHN_COMMON analog. Reading one as an import is a
+            // SILENT WRONG ANSWER in the worst direction: the object DEFINES
+            // storage the reader would then demand somebody else provide, and
+            // on a relocatable re-emission the definition simply vanishes.
+            // ✔MEASURED, mingw gcc 13.2.0 `-fcommon`: `int commonvar;` emits
+            // `(sec 0)(ty 0)(scl 2)` with Value 4. gcc has defaulted to
+            // `-fno-common` since GCC 10 and cl.exe never emits it for C, which
+            // is why no shipped path has produced one -- but "no producer we
+            // have run" is not "unreachable", and allocation across CUs
+            // (pick-max-size into `.bss`) is a merge concern this reader must
+            // not fabricate. Fail loud instead of misreading it.
+            // EXTERNAL specifically -- 5.4.2 scopes the common form to that
+            // class, and reading the rule off the section number alone would
+            // claim a debug record's stray Value means a size.
+            if (isExt && s.value != 0u) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: symbol '" + s.name
+                    + "' is a COMMON symbol (SectionNumber UNDEF with non-zero "
+                      "Value " + std::to_string(s.value)
+                    + ", which PE/COFF 5.4.2 defines as the object's SIZE) -- a "
+                      "tentative DEFINITION, not an import. DSS's link tier has "
+                      "no common-block allocation pass, and reading it as an "
+                      "extern import would silently discard a definition this "
+                      "object makes. D-LK-COFF-READER-FOREIGN-OBJECT.");
+            }
             ExternImport ext;
             ext.symbol      = SymbolId{i};
             ext.mangledName = s.name;
@@ -773,7 +1182,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             defsBySection[s.sectNum].push_back(
                 DefSym{i, s.value, s.name, extBinding,
                        SymbolVisibility::Default});
-        } else if (s.storage == kSymClassStatic && declaresFunction(s)) {
+        } else if (role == CoffSymbolRole::Static && declaresFunction(s)) {
             // A FILE-LOCAL (`static`) FUNCTION -- an atom BOUNDARY, exactly like
             // an external one. D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-
             // LABEL-NOT-ATOM: the only thing internal linkage changes is WHO MAY
@@ -824,7 +1233,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             defsBySection[s.sectNum].push_back(
                 DefSym{i, s.value, s.name, SymbolBinding::Local,
                        SymbolVisibility::Default});
-        } else if (s.storage == kSymClassStatic
+        } else if (role == CoffSymbolRole::Static
                    && sections[s.sectNum - 1u].kind.has_value()
                    && *sections[s.sectNum - 1u].kind != SectionKind::Text
                    && !isSectionDefinitionSymbol(i)) {

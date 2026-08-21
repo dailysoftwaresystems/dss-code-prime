@@ -101,6 +101,17 @@ if ($HostName -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
         $ip = (Test-Connection $HostName -Count 1 -ErrorAction SilentlyContinue |
                Select-Object -First 1).IPv4Address.IPAddressToString
     }
+    # ★★ PAIRING NOTE, WRITTEN DOWN BECAUSE IT IS A DELIBERATE ASYMMETRY AND NOT
+    # DRIFT (2026-08-21, cycle P23). The `.sh` twin prints a THIRD cause here that
+    # this file deliberately does not:
+    # D-SCRIPT-MACOS-HOST-OVERRIDE-DOES-NOT-CROSS-THE-WSLENV-BOUNDARY — a
+    # `DSS_MACOS_HOST` set in a Windows parent does not reach a `wsl.exe` child
+    # unless `WSLENV` names it. That cause CANNOT ARISE in PowerShell, where
+    # `$env:DSS_MACOS_HOST` is simply read by this process, so printing it here
+    # would be advice about a boundary this file never crosses. The twins still
+    # exit **3** for the same condition with the same first two causes; only the
+    # WSL-only third line differs, and it is runtime-gated on `WSL_DISTRO_NAME`
+    # over there rather than always printed.
     if (-not $ip) {
         Write-Error @"
 cannot resolve '$HostName' on this network.

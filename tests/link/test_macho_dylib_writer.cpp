@@ -55,6 +55,9 @@
 #include "core/types/target_schema.hpp"
 #include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "link/format/macho.hpp"
+#include "link/format/macho_indirect_symbols.hpp"
+#include "core/types/enum_name_table.hpp"
+#include "core/types/object_format_kind.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "macho_test_support.hpp"
@@ -1973,4 +1976,520 @@ TEST(MachoImageLinkeditAlignment,
         runCell(port, /*isDylibCell=*/false);
         runCell(port, /*isDylibCell=*/true);
     }
+}
+
+// ── D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB, IMAGE tier ────────
+//
+// The relocatable half of this anchor taught the three ET_REL writers to emit
+// every name bound to an atom. The FINAL IMAGE had the same gap, and on Mach-O
+// it produced an image that contradicted itself: the MH_DYLIB export trie walks
+// `module.symbols` DIRECTLY, so `dlsym` resolved BOTH names of an aliased atom
+// while `nm`, `lldb`, `atos` and the macOS crash reporter — all of which read
+// nlist — saw only the first.
+//
+// ★★ WHY THE INDEX HALF IS THE POINT, NOT A BONUS. A pin asserting only "both
+// names present, one address" stays GREEN over an image whose imports are
+// mis-bound. Every `indirectSyms` entry and both LC_DYSYMTAB defined/undefined
+// bands are stated as `numDefs + <extern index>`, where `numDefs` is how many
+// DEFINED nlist entries precede the undefined band. Adding an alias grows that
+// band, so a `numDefs` that is still predicted from `module.functions.size()`
+// leaves every one of those indices pointing one slot short — into the DEFINED
+// band. An indirect-symbol entry that lands on a defined symbol does not fail
+// to load: it silently binds a lazy/non-lazy pointer to the wrong symbol, on a
+// platform this build host cannot execute. So this pin follows each indirect
+// entry into the nlist and asserts what it actually lands on.
+//
+// ★ THE ALIAS IS GLOBAL, NOT WEAK, and that is a real boundary rather than a
+// convenience: the MH_DYLIB arm REFUSES a WEAK `ModuleSymbol` row loud today
+// (D-LK3-DYLIB-WEAK-EXPORT — Mach-O weak definitions need
+// EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION + MH_WEAK_DEFINES + weak-bind machinery
+// that is not shipped), so a weak alias cannot reach a dylib's nlist at all.
+// Two STRONG names for one body is the shape that CAN, and the one the object
+// readers hand back for any equal-offset defined pair
+// (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS).
+TEST(MachoImageSymbolNames,
+     ImageNlistCarriesEveryAliasNameAtOneAddressAndKeepsEveryDerivedIndex) {
+    std::vector<MachoPortSpec> const ports{
+        {"arm64", "arm64",
+         "macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib",
+         {0xC0, 0x03, 0x5F, 0xD6}},                     // RET
+        {"x86_64", "x86_64",
+         "macho64-x86_64-darwin-exec", "macho64-x86_64-darwin-dylib",
+         {0xC3}},                                       // ret
+    };
+
+    auto runCell = [](MachoPortSpec const& port, ImageArm arm) -> void {
+        char const* const armLabel =
+            arm == ImageArm::StaticExec  ? " [static exec arm]"
+          : arm == ImageArm::DynamicExec ? " [dynamic exec arm]"
+                                         : " [dylib arm]";
+        std::string const label = std::string{port.label} + armLabel;
+        bool const isDylibCell = arm == ImageArm::Dylib;
+        bool const wantsExtern = arm != ImageArm::StaticExec;
+
+        auto target = TargetSchema::loadShipped(port.targetName);
+        ASSERT_TRUE(target.has_value()) << label;
+        auto fmt = ObjectFormatSchema::loadShipped(
+            isDylibCell ? port.dylibFormat : port.execFormat);
+        ASSERT_TRUE(fmt.has_value()) << label;
+
+        AssembledModule mod;
+        mod.expectedFuncCount = 2;
+
+        // fn #7 — ONE atom, TWO names.
+        AssembledFunction f7;
+        f7.symbol = SymbolId{7};
+        f7.bytes  = port.retBytes;
+        mod.functions.push_back(std::move(f7));
+
+        // fn #9 — no `ModuleSymbol` row at all (the injected trampoline's
+        // shape), so the cell also proves an alias-free symbol is unaffected.
+        AssembledFunction f9;
+        f9.symbol = SymbolId{9};
+        f9.bytes  = port.retBytes;
+        mod.functions.push_back(std::move(f9));
+
+        // TWO rows for ONE SymbolId: canonical first (first-row-wins), then the
+        // extra name. That order is part of the readers' contract.
+        mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "_alias_canonical_fn",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+        mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "_alias_second_name",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+
+        // The extern is what routes an exec to `encodeExecDynamic`, and what
+        // gives BOTH dynamic arms a stub + a __got slot — i.e. the indirect
+        // symbol table this pin follows.
+        if (wantsExtern) {
+            ExternImport imp;
+            imp.symbol      = SymbolId{99};
+            imp.mangledName = "_puts";
+            imp.libraryPath = "/usr/lib/libSystem.B.dylib";
+            mod.externImports.push_back(std::move(imp));
+        }
+        if (!isDylibCell) mod.imageEntryOverride = std::size_t{0};
+
+        // The arm64 exec schema declares `image.buildVersion`, and the static
+        // walker emits no LC_BUILD_VERSION, so it REFUSES such a schema loud
+        // (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION). That boundary is already
+        // pinned by the sibling naming test; here the cell simply has nothing
+        // to say, so it asserts the refusal and stops.
+        bool const staticArmRefusedByBuildVersion =
+            arm == ImageArm::StaticExec
+            && (*fmt)->machoImage().buildVersion.has_value();
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        std::string diags;
+        for (auto const& d : rep.all()) diags += d.actual + "\n";
+
+        if (staticArmRefusedByBuildVersion) {
+            EXPECT_TRUE(bytes.empty()) << label << "\n" << diags;
+            return;
+        }
+
+        ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
+        ASSERT_FALSE(bytes.empty()) << label << "\n" << diags;
+
+        // Each cell must really reach the arm it NAMES, or the matrix would be
+        // asserting three times about one walker.
+        std::uint32_t const filetype = readU32LE(bytes, 12);
+        EXPECT_EQ(filetype, isDylibCell ? 6u : 2u)
+            << label << ": wrong MH_ filetype for the arm this cell names";
+        if (!isDylibCell) {
+            EXPECT_EQ(findSegment(bytes, "__LINKEDIT").has_value(),
+                      arm == ImageArm::DynamicExec)
+                << label
+                << ": this cell did not reach the exec walker it names";
+        }
+
+        // ── nlist: both names, one address ─────────────────────────────────
+        auto const symtabLc = findLoadCommand(bytes, /*LC_SYMTAB=*/0x02u);
+        ASSERT_TRUE(symtabLc.has_value()) << label;
+        std::uint32_t const symOff = readU32LE(bytes, *symtabLc + 8);
+        std::uint32_t const nsyms  = readU32LE(bytes, *symtabLc + 12);
+        std::uint32_t const strOff = readU32LE(bytes, *symtabLc + 16);
+        ASSERT_GT(nsyms, 0u) << label;
+
+        auto recAt = [&](std::uint32_t i) {
+            return static_cast<std::size_t>(symOff) + i * 16u;
+        };
+        auto nameAt = [&](std::uint32_t i) {
+            std::size_t p = static_cast<std::size_t>(strOff)
+                            + readU32LE(bytes, recAt(i));
+            std::string s;
+            while (p < bytes.size() && bytes[p] != 0)
+                s.push_back(static_cast<char>(bytes[p++]));
+            return s;
+        };
+        auto typeAt  = [&](std::uint32_t i) { return bytes[recAt(i) + 4]; };
+        auto valueAt = [&](std::uint32_t i) {
+            return readU64LE(bytes, recAt(i) + 8);
+        };
+
+        std::optional<std::uint32_t> canonIdx;
+        std::optional<std::uint32_t> aliasIdx;
+        for (std::uint32_t i = 0; i < nsyms; ++i) {
+            if (nameAt(i) == "_alias_canonical_fn") canonIdx = i;
+            if (nameAt(i) == "_alias_second_name")  aliasIdx = i;
+        }
+        ASSERT_TRUE(canonIdx.has_value()) << label;
+        ASSERT_TRUE(aliasIdx.has_value())
+            << label
+            << ": the alias NAME must reach the FINAL IMAGE's nlist — that is "
+               "what `nm`, `lldb` and the macOS crash reporter read, and the "
+               "export trie already carries it";
+        EXPECT_LT(*canonIdx, *aliasIdx)
+            << label << ": the canonical row must stay FIRST";
+        EXPECT_EQ(valueAt(*canonIdx), valueAt(*aliasIdx))
+            << label << ": both names must resolve to ONE address";
+        EXPECT_GT(valueAt(*canonIdx), 0u)
+            << label
+            << ": n_value must be the function's runtime VA — an alias pair "
+               "agreeing at 0 would satisfy the equality while naming nothing";
+        // N_SECT|N_EXT on both: this format's image-tier binding question is
+        // owned by D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT, and an alias
+        // must not become a second, undeclared answer to it.
+        EXPECT_EQ(typeAt(*canonIdx), 0x0Fu) << label;
+        EXPECT_EQ(typeAt(*aliasIdx), 0x0Fu)
+            << label << ": the alias is a DEFINED symbol in this section, like "
+                        "its canonical";
+
+        // ── THE INDEX HALF ─────────────────────────────────────────────────
+        auto const dysymLc = findLoadCommand(bytes, /*LC_DYSYMTAB=*/0x0Bu);
+        if (arm == ImageArm::StaticExec) {
+            EXPECT_FALSE(dysymLc.has_value())
+                << label
+                << ": the static walker emits no LC_DYSYMTAB — if one appeared, "
+                   "this cell's index assertions would be silently skipped";
+            return;
+        }
+        ASSERT_TRUE(dysymLc.has_value()) << label;
+        std::uint32_t const iextdefsym    = readU32LE(bytes, *dysymLc + 16);
+        std::uint32_t const nextdefsym    = readU32LE(bytes, *dysymLc + 20);
+        std::uint32_t const iundefsym     = readU32LE(bytes, *dysymLc + 24);
+        std::uint32_t const nundefsym     = readU32LE(bytes, *dysymLc + 28);
+        std::uint32_t const indirectsymoff = readU32LE(bytes, *dysymLc + 56);
+        std::uint32_t const nindirectsyms  = readU32LE(bytes, *dysymLc + 60);
+
+        // The bands must TILE the table: [0, nextdefsym) defined, then
+        // [iundefsym, +nundefsym) undefined, ending exactly at nsyms. An alias
+        // that grew the defined band without moving the boundary shows up here
+        // as a defined symbol sitting inside the undefined band.
+        EXPECT_EQ(iextdefsym, 0u) << label;
+        EXPECT_EQ(iundefsym, nextdefsym)
+            << label
+            << ": the undefined band must start exactly where the defined band "
+               "ends";
+        EXPECT_EQ(nextdefsym + nundefsym, nsyms)
+            << label << ": the two bands must tile LC_SYMTAB.nsyms exactly";
+        EXPECT_LT(*aliasIdx, nextdefsym)
+            << label
+            << ": the alias is a DEFINED symbol and must sit inside the defined "
+               "band — if it spilled past `nextdefsym`, every indirect-symbol "
+               "index would be short by one";
+        for (std::uint32_t i = 0; i < nextdefsym; ++i) {
+            EXPECT_EQ(typeAt(i), 0x0Fu)
+                << label << ": nlist #" << i
+                << " sits in the DEFINED band but is not N_SECT|N_EXT";
+        }
+        for (std::uint32_t i = iundefsym; i < nsyms; ++i) {
+            EXPECT_EQ(typeAt(i), 0x01u)
+                << label << ": nlist #" << i
+                << " sits in the UNDEFINED band but is not N_UNDF|N_EXT";
+        }
+
+        // Every indirect-symbol entry must land on an UNDEFINED extern, and on
+        // the RIGHT one. This is the assertion an off-by-the-alias-count
+        // `numDefs` fails: the entry would point into the defined band and name
+        // the alias instead of the import.
+        ASSERT_GT(nindirectsyms, 0u)
+            << label
+            << ": this arm must build an indirect symbol table, or the index "
+               "assertions below assert nothing";
+        for (std::uint32_t k = 0; k < nindirectsyms; ++k) {
+            std::uint32_t const idx =
+                readU32LE(bytes, static_cast<std::size_t>(indirectsymoff)
+                                     + k * 4u);
+            ASSERT_LT(idx, nsyms) << label << ": indirect entry #" << k
+                                  << " indexes past the end of nlist";
+            EXPECT_GE(idx, iundefsym)
+                << label << ": indirect entry #" << k
+                << " points at nlist #" << idx << " (`" << nameAt(idx)
+                << "`), which is inside the DEFINED band — a stub or __got slot "
+                   "would bind to a local definition instead of its import";
+            EXPECT_EQ(typeAt(idx), 0x01u)
+                << label << ": indirect entry #" << k
+                << " must name an N_UNDF|N_EXT symbol";
+            EXPECT_EQ(nameAt(idx), "_puts")
+                << label << ": indirect entry #" << k
+                << " must name the import its slot serves";
+        }
+    };
+
+    for (auto const& port : ports) {
+        runCell(port, ImageArm::StaticExec);
+        runCell(port, ImageArm::DynamicExec);
+        runCell(port, ImageArm::Dylib);
+    }
+}
+
+// ── EXERCISING THE REFUSAL ARM, NOT READING IT ─────────────────────────────
+//
+// `machoIndirectSymbolBreach` is the decision behind `encodeExecDynamic`'s
+// indirect-symbol belt. No legitimate MODULE can drive it — every index the
+// writer mints is in range by construction — so the writer-level arm guards a
+// FUTURE edit, and the only way to exercise it is to drive the decision
+// directly. It replaced two arms that could not fire at all; see the header.
+namespace {
+
+// nlist_64 records carrying only the n_type this predicate reads.
+[[nodiscard]] std::vector<std::uint8_t>
+nlistWithTypes(std::vector<std::uint8_t> const& types) {
+    std::vector<std::uint8_t> out(types.size() * 16, 0u);
+    for (std::size_t i = 0; i < types.size(); ++i) out[i * 16 + 4] = types[i];
+    return out;
+}
+constexpr std::uint8_t kNTypeSectExt = 0x0F;   // N_SECT|N_EXT  (defined)
+constexpr std::uint8_t kNTypeUndfExt = 0x01;   // N_UNDF|N_EXT  (undefined)
+
+} // namespace
+
+TEST(MachoIndirectSymbols, HoldsWhenEveryEntryNamesAnUndefinedExtern) {
+    auto const nlist = nlistWithTypes({kNTypeSectExt, kNTypeSectExt,
+                                       kNTypeUndfExt, kNTypeUndfExt});
+    std::vector<std::uint32_t> const ok{2u, 3u, 2u};
+    EXPECT_EQ(dss::link::format::machoIndirectSymbolBreach(nlist, ok), "");
+    // An image with no indirect entries at all (the chained-fixups path, and
+    // every import-free image) is trivially consistent.
+    std::vector<std::uint32_t> const none;
+    EXPECT_EQ(dss::link::format::machoIndirectSymbolBreach(nlist, none), "");
+}
+
+TEST(MachoIndirectSymbols, EveryBreachArmFiresAndNamesTheOffender) {
+    auto const nlist = nlistWithTypes({kNTypeSectExt, kNTypeSectExt,
+                                       kNTypeUndfExt});
+
+    // (1) THE ONE THAT MATTERS: an index that lands inside the DEFINED band.
+    //     This is exactly what an origin still predicted from
+    //     `module.functions.size()` produces once an alias grows that band —
+    //     the shape mutant M5 drove, where every "both names, one address"
+    //     assertion stayed green while the stub bound to a local definition.
+    std::vector<std::uint32_t> const intoDefined{1u};
+    std::string const b1 =
+        dss::link::format::machoIndirectSymbolBreach(nlist, intoDefined);
+    EXPECT_NE(b1, "");
+    EXPECT_NE(b1.find("indirect entry #0"), std::string::npos) << b1;
+    EXPECT_NE(b1.find("symbol #1"), std::string::npos) << b1;
+    EXPECT_NE(b1.find("N_UNDF|N_EXT"), std::string::npos) << b1;
+    // The n_type is rendered in the base its prefix claims. A decimal number
+    // behind `0x` reported 0x0F as "0x15" in this predicate's first draft.
+    EXPECT_NE(b1.find("0x0f"), std::string::npos) << b1;
+
+    // (2) an index past the end of the table. Only the out-of-range entry is
+    //     present: with a defined-band index in front of it the FIRST arm fires
+    //     and this one is never reached — which is how the first draft of this
+    //     cell asserted the wrong message and reddened.
+    std::vector<std::uint32_t> const pastEnd{9u};
+    std::string const b2 =
+        dss::link::format::machoIndirectSymbolBreach(nlist, pastEnd);
+    EXPECT_NE(b2, "");
+    EXPECT_NE(b2.find("only 3 symbols"), std::string::npos) << b2;
+
+    // (3) a table that is not a whole number of records.
+    std::vector<std::uint8_t> const ragged(17, 0u);
+    std::vector<std::uint32_t> const any{0u};
+    std::string const b3 =
+        dss::link::format::machoIndirectSymbolBreach(ragged, any);
+    EXPECT_NE(b3, "");
+    EXPECT_NE(b3.find("16-byte records"), std::string::npos) << b3;
+}
+
+// ── A WEAK ALIAS IS REFUSED ON EVERY MACH-O IMAGE ARM ──────────────────────
+//
+// D-LK3-DYLIB-WEAK-EXPORT. Before this, the two image arms answered the same
+// question differently and by accident: the DYLIB was covered because the
+// export trie refuses a WEAK `ModuleSymbol` row before the nlist is built,
+// while a DYNAMIC EXEC builds no trie — so a weak alias reached the nlist and
+// went out `N_SECT|N_EXT`, n_desc 0, i.e. SILENTLY STRONG. The ELF image arm
+// carries the same alias's WEAK binding faithfully through `stbForBinding`, so
+// the two formats disagreed about the same input with no rule saying why.
+//
+// The answer is the loud one and the reason is measured, not chosen: N_WEAK_DEF
+// on an IMAGE needs MH_WEAK_DEFINES in the mach header for dyld to coalesce it
+// (✔MEASURED on Apple Silicon in this file's own N_WEAK_DEF docblock — the
+// linked exec reads flags 0x00218085 against a weak-free control's 0x00200085),
+// and these writers copy the schema's header flags verbatim. Emitting the bit
+// would state half the fact; emitting it strong changes cross-image coalescing.
+TEST(MachoImageWeakAlias, EveryImageArmRefusesAWeakAliasAndNamesIt) {
+    std::vector<MachoPortSpec> const ports{
+        {"arm64", "arm64",
+         "macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib",
+         {0xC0, 0x03, 0x5F, 0xD6}},
+        {"x86_64", "x86_64",
+         "macho64-x86_64-darwin-exec", "macho64-x86_64-darwin-dylib",
+         {0xC3}},
+    };
+
+    auto runCell = [](MachoPortSpec const& port, ImageArm arm,
+                      SymbolBinding aliasBinding) -> void {
+        bool const wantRefusal = aliasBinding == SymbolBinding::Weak;
+        char const* const armLabel =
+            arm == ImageArm::StaticExec  ? " [static exec arm]"
+          : arm == ImageArm::DynamicExec ? " [dynamic exec arm]"
+                                         : " [dylib arm]";
+        std::string const label = std::string{port.label} + armLabel
+                                  + (wantRefusal ? " weak" : " global CONTROL");
+        bool const isDylibCell = arm == ImageArm::Dylib;
+
+        auto target = TargetSchema::loadShipped(port.targetName);
+        ASSERT_TRUE(target.has_value()) << label;
+        auto fmt = ObjectFormatSchema::loadShipped(
+            isDylibCell ? port.dylibFormat : port.execFormat);
+        ASSERT_TRUE(fmt.has_value()) << label;
+
+        AssembledModule mod;
+        mod.expectedFuncCount = 1;
+        AssembledFunction f7;
+        f7.symbol = SymbolId{7};
+        f7.bytes  = port.retBytes;
+        mod.functions.push_back(std::move(f7));
+        mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "_wk_canonical",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+        mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "_wk_alias_name",
+                                           aliasBinding,
+                                           SymbolVisibility::Default});
+        if (arm == ImageArm::DynamicExec) {
+            ExternImport imp;
+            imp.symbol      = SymbolId{99};
+            imp.mangledName = "_puts";
+            imp.libraryPath = "/usr/lib/libSystem.B.dylib";
+            mod.externImports.push_back(std::move(imp));
+        }
+        if (!isDylibCell) mod.imageEntryOverride = std::size_t{0};
+
+        // The arm64 static exec schema declares image.buildVersion, which that
+        // walker refuses outright — a boundary its sibling test already pins,
+        // and one that would mask this cell's own verdict.
+        if (arm == ImageArm::StaticExec
+            && (*fmt)->machoImage().buildVersion.has_value()) {
+            return;
+        }
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        std::string diags;
+        for (auto const& d : rep.all()) diags += d.actual + "\n";
+
+        if (!wantRefusal) {
+            // THE CONTROL, and it is what makes the refusal mean "weak" rather
+            // than "alias": the identical module with a GLOBAL second name must
+            // encode cleanly and carry both names.
+            ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
+            ASSERT_FALSE(bytes.empty()) << label;
+            auto const names = imageNlistNames(bytes);
+            EXPECT_NE(std::find(names.begin(), names.end(), "_wk_alias_name"),
+                      names.end())
+                << label << ": a GLOBAL alias must still be emitted";
+            return;
+        }
+
+        EXPECT_TRUE(bytes.empty())
+            << label
+            << ": a weak alias must NOT be emitted - N_SECT|N_EXT would publish "
+               "it as a STRONG definition and silently change cross-image "
+               "coalescing";
+        EXPECT_GT(rep.errorCount(), 0u) << label;
+        EXPECT_TRUE(sawDiagnosticContaining(rep, "D-LK3-DYLIB-WEAK-EXPORT"))
+            << label
+            << ": the refusal must NAME the anchor that has to close before the "
+               "capability can exist\n" << diags;
+        // On the EXEC arms the refusal is the new one and it must name the
+        // offending symbol. The DYLIB arm is refused earlier by the export
+        // trie, whose message names the symbol too but through a different
+        // sentence - so the shared assertion is the symbol NAME, which both owe.
+        EXPECT_TRUE(sawDiagnosticContaining(rep, "_wk_alias_name")
+                    || sawDiagnosticContaining(rep, "_wk_canonical"))
+            << label << ": the refusal must name the symbol it refused\n"
+            << diags;
+    };
+
+    for (auto const& port : ports) {
+        for (auto arm : {ImageArm::StaticExec, ImageArm::DynamicExec,
+                         ImageArm::Dylib}) {
+            runCell(port, arm, SymbolBinding::Weak);
+            runCell(port, arm, SymbolBinding::Global);
+        }
+    }
+}
+
+// ── D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET ────────────
+//
+// The `externCallDispatch` coherence guard's message used to spell BOTH the
+// value it refused and the value to set as string literals, while acceptance
+// was decided by `externCallUsesIndirectShape`. It had not drifted — the
+// vocabulary has two rows and the predicate really does refuse exactly one —
+// but the sentence asserted which spelling the format declared without reading
+// it back, so a third indirect-shaped spelling would have been reported by the
+// wrong name.
+//
+// ★ THIS PINS THE PROPERTY, NOT THE SENTENCE. It asserts the message names the
+// DECLARED spelling and names every spelling the guard ACCEPTS, both derived
+// here from the same table and the same predicate the writer uses — so
+// widening the vocabulary cannot leave this test asserting a stale string.
+TEST(MachoExternCallDispatch, RefusalNamesTheDeclaredSpellingAndTheAcceptedSet) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        dylibJsonWith(R"("externCallDispatch": "indirect-slot",)"));
+    ASSERT_TRUE(fmt.has_value()) << "the fixture format must LOAD - a load "
+                                    "failure would make this cell assert "
+                                    "nothing about the walker";
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{7};
+    f.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(f));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "_fn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    ExternImport imp;
+    imp.symbol      = SymbolId{99};
+    imp.mangledName = "_puts";
+    imp.libraryPath = "/usr/lib/libSystem.B.dylib";
+    mod.externImports.push_back(std::move(imp));
+
+    DiagnosticReporter rep;
+    auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+    std::string diags;
+    for (auto const& d : rep.all()) diags += d.actual + "\n";
+    EXPECT_TRUE(bytes.empty()) << diags;
+    ASSERT_GT(rep.errorCount(), 0u) << diags;
+
+    // The DECLARED spelling, rendered from the table that owns it — never a
+    // literal here either, or this test would retype the set it is policing.
+    std::string const declared{
+        externCallDispatchName(ExternCallDispatch::IndirectSlot)};
+    EXPECT_TRUE(sawDiagnosticContaining(rep, "externCallDispatch='" + declared + "'"))
+        << "the refusal must name the spelling the format actually declared\n"
+        << diags;
+
+    // ...and every spelling the guard accepts, by the SAME predicate.
+    auto const accepted = dss::namesWhere<1>(
+        kExternCallDispatchTable,
+        [](ExternCallDispatch d) { return !externCallUsesIndirectShape(d); });
+    for (std::string_view name : accepted) {
+        EXPECT_TRUE(sawDiagnosticContaining(rep, "'" + std::string{name} + "'"))
+            << "the refusal must name '" << name
+            << "', a spelling this walker accepts - a message that omits an "
+               "accepted spelling tells a config author a legal value is not "
+               "legal\n"
+            << diags;
+    }
+    EXPECT_TRUE(sawDiagnosticContaining(rep, "D-FFI-EXTERN-CALL-DISPATCH"))
+        << diags;
 }

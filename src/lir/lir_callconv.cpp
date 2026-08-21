@@ -1,6 +1,7 @@
 #include "lir/lir_callconv.hpp"
 
 #include "core/types/call_payload.hpp"
+#include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList — the ONE closed-set renderer
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
 // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the shared by-value-stack-arg
@@ -1490,7 +1491,22 @@ argPassingReg(TargetSchema const&            schema,
               LirRegClass                    cls,
               std::string_view               contextLabel,
               DiagnosticReporter&            reporter) {
-    auto const& pool = (cls == LirRegClass::FPR) ? cc.argFprs : cc.argGprs;
+    // ONE condition picks the pool AND names it, so the sentence cannot
+    // advertise a pool other than the one that was indexed
+    // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET). It was two:
+    // the selection here and a hand-typed `"FPR"`/`"GPR"` in the message below.
+    //
+    // ⚠ THE SELECTION ITSELF IS STILL TWO-WAY AND THAT IS A SEPARATE, LIVE
+    // HAZARD — reported, not silently patched here, because fixing it changes
+    // which register an arg is passed in and that is not this change's subject:
+    // `D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR`. A
+    // VR-class arg takes the ELSE branch into the INTEGER pool with no
+    // diagnostic — the same else-branch-default shape `returnReg` below records
+    // as a latent shipped defect it had to fix. The label now at least names the
+    // pool that was really consulted rather than the class that was asked for.
+    bool const        useFprPool = (cls == LirRegClass::FPR);
+    auto const&       pool       = useFprPool ? cc.argFprs : cc.argGprs;
+    LirRegClass const poolCls    = useFprPool ? LirRegClass::FPR : LirRegClass::GPR;
     if (index >= pool.size()) {
         report(reporter, DiagnosticCode::L_StackPassedArgUnsupported,
                DiagnosticSeverity::Error,
@@ -1499,24 +1515,27 @@ argPassingReg(TargetSchema const&            schema,
                            "stack-passed args are anchored at D-ML7-2.2",
                            contextLabel,
                            index, cc.name, pool.size(),
-                           (cls == LirRegClass::FPR) ? "FPR" : "GPR"));
+                           lirRegClassName(poolCls)));
         return std::nullopt;
     }
     return resolveCcReg(schema, pool[index], cls, contextLabel, reporter);
 }
 
-// Lookup the `ordinal`-th return register of the given class. Slot 0 is the
-// primary return register (the scalar / first-eightbyte result); higher slots
-// are the additional eightbyte pieces of an in-register struct return (SysV's
-// rax+rdx / xmm0+xmm1 — FC7 C1c, D-FC7-SYSV-STRUCT-RETURN-IN-REGS). `ordinal` is
-// the PER-CLASS index (GPR and FPR pieces counted separately).
-[[nodiscard]] std::optional<LirReg>
-returnReg(TargetSchema const&            schema,
-          TargetCallingConvention const& cc,
-          LirRegClass                    cls,
-          std::uint32_t                  ordinal,
-          std::string_view               contextLabel,
-          DiagnosticReporter&            reporter) {
+} // namespace
+
+// ── THE RESULT-REGISTER POOL LOOKUP (rows + spellings: `lir_callconv.hpp`) ───
+//
+// D-LIR-RETURN-REG-REFUSAL-IS-UNREACHABLE-FROM-THE-TEST-TIER: this used to sit
+// in this file's anonymous namespace, which made its refusal unobservable and
+// therefore unpinnable — see the header's banner for the measurement. The rows
+// and `returnRegisterPool` moved to the header WITH it; the body is unchanged.
+std::optional<LirReg>
+returnRegisterForClass(TargetSchema const&            schema,
+                       TargetCallingConvention const& cc,
+                       LirRegClass                    cls,
+                       std::uint32_t                  ordinal,
+                       std::string_view               contextLabel,
+                       DiagnosticReporter&            reporter) {
     // *** THE POOL IS SELECTED PER CLASS, AND THE SELECTION USED TO BE TWO-WAY.
     // A latent shipped defect, fixed here rather than walked past (plan 29
     // §4.4.5's "AND A LATENT BUG FOUND IN PASSING"). `cc.returnVrs` was declared in
@@ -1527,26 +1546,51 @@ returnReg(TargetSchema const&            schema,
     // wrong-file capture with no diagnostic anywhere. Same else-branch-default
     // shape as the discarded piece class this cycle also fixed.
     //
-    // The class-to-pool map is now total and EXHAUSTIVE: every enumerator is
-    // named, and the two that can never hold a value (`None`, `Flags`) fail loud
-    // rather than falling into somebody's pool. Adding a sixth register class
-    // now fails to compile here instead of silently becoming an integer.
-    std::vector<std::string> const* pool     = nullptr;
-    char const*                     poolName = nullptr;
+    // The class-to-pool map is total and EXHAUSTIVE: every enumerator is
+    // considered, and the two that can never hold a value (`None`, `Flags`) fail
+    // loud rather than falling into somebody's pool.
+    //
+    // ★★ AND THE MAP IS NOW THE ROWS RATHER THAN A SWITCH, BECAUSE THE
+    // MESSAGE HAS TO STATE THE SAME SET AND WAS STATING IT TWICE
+    // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET). The refusal
+    // read "only gpr/fpr/vr results can be returned in registers" — a hand-typed
+    // list of exactly the classes the switch happened to have arms for, in a
+    // sentence nothing connected to the switch. Adding a `returnPredicateRegs`
+    // pool, or dropping one, would have left it advertising the old set. Now
+    // ACCEPTANCE and ADVERTISEMENT are one walk over one row set, and the
+    // spellings are `kTargetRegClassTable`'s (via `lirRegClassName`) rather than
+    // a second spelling of the same classes typed in prose.
+    //
+    // ★ ONE WALK, AND IT IS THE HEADER'S. `returnRegisterPool` is the same query
+    // a caller can ask before it ever reaches here, so a pass that wants to know
+    // "is this class returnable?" cannot re-derive a different answer — which is
+    // exactly how the two-way selection this replaced got its second owner.
+    // There is no separate `poolCls`: a row is matched by class EQUALITY, so the
+    // pool consulted is always THIS class's pool, and a variable that could only
+    // ever equal `cls` is a second name for one fact.
+    std::vector<std::string> const* pool = returnRegisterPool(cc, cls);
+    // The `-Werror=switch` backstop, and it owns no pool and no spelling: a new
+    // register class fails the BUILD here instead of silently having no row and
+    // becoming a fail-loud refusal at runtime. Same construct, same guarantee as
+    // before the rows existed — `lirRegClassName` keeps its own copy of this
+    // pattern for the same reason.
     switch (cls) {
-        case LirRegClass::GPR:   pool = &cc.returnGprs; poolName = "GPR";   break;
-        case LirRegClass::FPR:   pool = &cc.returnFprs; poolName = "FPR";   break;
-        case LirRegClass::VR:    pool = &cc.returnVrs;  poolName = "VR";    break;
         case LirRegClass::None:
-        case LirRegClass::Flags: break;
+        case LirRegClass::GPR:
+        case LirRegClass::FPR:
+        case LirRegClass::VR:
+        case LirRegClass::Flags:
+            break;
     }
     if (pool == nullptr) {
         report(reporter, DiagnosticCode::L_CcRegLookupFailed,
                DiagnosticSeverity::Error,
                std::format("{}: a result of register class '{}' has no "
                            "result-register pool in calling convention '{}' -- "
-                           "only gpr/fpr/vr results can be returned in registers",
-                           contextLabel, lirRegClassName(cls), cc.name));
+                           "only {} results can be returned in registers",
+                           contextLabel, lirRegClassName(cls), cc.name,
+                           ::dss::detail::renderAllowedList(
+                               kReturnPoolClassNames, " / ")));
         return std::nullopt;
     }
     if (ordinal >= pool->size()) {
@@ -1555,12 +1599,15 @@ returnReg(TargetSchema const&            schema,
                std::format("{}: calling convention '{}' has only {} {} return "
                            "register(s) but a result needs {} return-register "
                            "ordinal {}",
-                           contextLabel, cc.name, pool->size(), poolName,
-                           poolName, ordinal));
+                           contextLabel, cc.name, pool->size(),
+                           lirRegClassName(cls), lirRegClassName(cls),
+                           ordinal));
         return std::nullopt;
     }
     return resolveCcReg(schema, (*pool)[ordinal], cls, contextLabel, reporter);
 }
+
+namespace {
 
 // *** WHERE DO THIS PRODUCER'S RESULT PIECES LIVE? (plan 29 4.4.1 / 4.4.6)
 //
@@ -1600,7 +1647,8 @@ resultPieceReg(Lir const&                     src,
                DiagnosticReporter&            reporter) {
     ImplicitRegisterConstraint const* declared = src.instRegConstraints(producer);
     if (declared == nullptr || declared->outputOrdinals.empty()) {
-        return returnReg(schema, cc, cls, ordinal, contextLabel, reporter);
+        return returnRegisterForClass(schema, cc, cls, ordinal,
+                                      contextLabel, reporter);
     }
     // Bounded on `outputNames`, which is the array indexed two lines down.
     // `outputOrdinals` is its validator-populated parallel (empty iff the names
@@ -3959,9 +4007,9 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                             LirRegClass const cls = o.reg.regClass();
                             std::uint32_t const ord =
                                 (cls == LirRegClass::FPR) ? fprRet++ : gprRet++;
-                            auto const rr =
-                                returnReg(schema, cc, cls, ord,
-                                          "materializeOneFunc: ret", reporter);
+                            auto const rr = returnRegisterForClass(
+                                schema, cc, cls, ord,
+                                "materializeOneFunc: ret", reporter);
                             if (!rr.has_value()) return false;
                             retMoves.push_back({*rr, o.reg});
                         }

@@ -3933,7 +3933,26 @@ enum class DiagnosticCode : std::uint16_t {
     //   previously borrowed: that code is about a FORMAT that could not be
     //   selected, not about a frame it could not describe.
     K_UnwindRuleUnrepresentable    = 0x8021,
-    // K-NEXT-SLOT: 0x8022 — grep this marker before adding a K_* code.
+    // K_FormatLacksWeakDefinitionDialect
+    //   (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED): the module carries a
+    //   WEAK DEFINITION — a symbol several translation units may define, of
+    //   which the linker keeps one — and the walker cannot spell it under the
+    //   schema it was handed: the format declares no `weakDefinition.dialect`
+    //   at all, or declares one this walker has no encoder for.
+    //   ★ IT EXISTS BECAUSE BOTH SILENT ALTERNATIVES CHANGE PROGRAM MEANING.
+    //   Assuming a dialect emits the weak body under whatever spelling the
+    //   walker happens to implement, which on the wrong format is a STRONG
+    //   definition — and a strong duplicate is a link error at best and a
+    //   silently-chosen winner at worst. Dropping the symbol loses the body.
+    //   So the declaration is ASKED FOR at the point the body is encoded, and
+    //   its absence is a refusal rather than a default.
+    //   ⓘ Distinct from K_NoMatchingObjectFormat, which is about a FORMAT that
+    //   could not be selected at all, not about a spelling it never declared.
+    //   ⓘ Fires only when a weak definition is actually present: a format that
+    //   never sees one never needs the key, so this is not a back-door
+    //   requirement on every schema.
+    K_FormatLacksWeakDefinitionDialect = 0x8022,
+    // K-NEXT-SLOT: 0x8023 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

@@ -33,7 +33,7 @@ runs **that project's own test suite**, classifying every failure.
 
 | Entry | What it proves |
 |---|---|
-| [`real-examples/c/sqlite`](../../../real-examples/c/sqlite) | SQLite, full upstream source — **189 translation units** through one `--project` manifest → SQLite's own `testfixture` → SQLite's own unit corpus. `full` tier green on three legs — Linux x86_64 **7 / 1,061,830**, Linux arm64-under-qemu **12 / 1,060,828**, Windows pe64 **0 / 979,736** (the pe64 count is lower because platform gating reaches fewer test files, not because anything was skipped). Every residual failure is a matched-control confound. The amalgamation (`sqlite3.c` + `shell.c`) is compiled and run as a separate, much faster probe |
+| [`real-examples/c/sqlite`](../../../real-examples/c/sqlite) | SQLite, full upstream source — **189 translation units** through one `--project` manifest → SQLite's own `testfixture` → SQLite's own unit corpus. `full` tier green on three legs — Linux x86_64 **7 / 1,061,830**, Linux arm64-under-qemu **12 / 1,060,828**, Windows pe64 **0 / 979,736** (the pe64 count is lower because platform gating reaches fewer test files, not because anything was skipped). Every residual failure is a matched-control confound. The `sqlite3` CLI is ALSO built from full source — **103 TUs**, not the amalgamation (`real-examples/c/sqlite/gen-pe64-manifest.py` emits its manifest). The single-file amalgamation is compiled and run as a separate, much faster probe — an ADDITIONAL check, never a stand-in for the real build |
 
 Each entry ships **both drivers** — `build-and-test.sh` (Linux; adds an arm64-under-qemu leg on
 an x86_64 host) and `build-and-test.ps1` (Windows pe64). Tiers: `veryquick | quick | full | all`.

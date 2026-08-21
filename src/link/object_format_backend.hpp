@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList — the ONE closed-set renderer
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind (the BRIDGE type — see the tier note)
 
 #include <cstdint>
@@ -311,6 +312,40 @@ objectFormatBackendByConfigName(std::string_view configName) noexcept;
 objectFormatBackendName(ObjectFormatBackend const* backend) noexcept {
     return backend != nullptr ? backend->configName()
                               : kObjectFormatKindSentinelName;
+}
+
+// The set of `"kind"` spellings a `.format.json` may declare, rendered as the
+// "expected one of …" half of a diagnostic.
+// D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET.
+//
+// ★★ PROJECTED FROM THE REGISTRY, BECAUSE THE REGISTRY IS THE HALF THAT
+// DECIDES. `objectFormatBackendByConfigName` resolves a declared spelling by
+// walking `objectFormatBackendTable()` and asking each entry for its OWN name,
+// so the accepted set is exactly this list — it is NOT
+// `kSelectableObjectFormatKindNames`, which projects the ENUM table.
+//
+// ⚠ THOSE TWO ARE DIFFERENT OWNERS OF ONE FACT AND NOTHING PINS THEM TOGETHER.
+// ✔MEASURED 2026-08-20 by reading `tests/link/test_object_format_backend_
+// registry.cpp`: it pins that every registered name is non-empty, unique, and
+// resolves back to its own entry — and never that the registered names ARE the
+// selectable enum spellings. They coincide today at five. A sixth backend whose
+// config name has no enum row (or an enum row no backend claims) would leave
+// every "expected one of …" sentence in the schema tier quietly wrong, in the
+// direction that tells a config author a spelling the loader ACCEPTS is not
+// allowed. Rendering from the registry removes the second owner rather than
+// pinning the two halves together.
+//
+// `sep` — the schema tier's house separator is ` / `; the call sites that read
+// `'a', 'b'` pass `", "`. The QUOTING is not a parameter (see
+// `renderAllowedList`).
+[[nodiscard]] inline std::string
+objectFormatBackendNameList(std::string_view sep = " / ") {
+    std::vector<std::string_view> names;
+    names.reserve(objectFormatBackendTable().size());
+    for (auto const* b : objectFormatBackendTable()) {
+        names.push_back(b->configName());
+    }
+    return ::dss::detail::renderAllowedList(names, sep);
 }
 
 } // namespace link

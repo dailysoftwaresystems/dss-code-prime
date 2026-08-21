@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-20 — cycles **P14 … P21**. ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
+**Last updated:** 2026-08-20 — cycles **P14 … P23**. ★★★ **P23 SHIPPED WEAK DEFINITIONS *AND* WEAK ALIASES ON PE/COFF AND MACH-O, FINISHED THE RETYPED-CLOSED-SET CLASS, AND CLOSED THE pe64 ACQUISITION ROW ON A MEASUREMENT NOBODY HAD EVER TAKEN.** All four queued rows closed plus three more. ⚠ **The BALANCE went the other way and the number is said plainly: OPEN 1018 → 1033, closed 7, opened 22 (21 created + 1 disclosed pre-existing), net +14 created-over-closed, and 55 further rows BORN CLOSED** — because a step-10 independent audit, six fold lanes and a four-leg gate found twenty-nine further defects, and an operator ruling authorized shipping the positive balance with every one of them queued as the next cycle's first work. Two operator rulings, neither to be re-litigated: a weak DEFINITION in COFF is **COMDAT select-any**, not `WEAK_EXTERNAL` (*"an implementation gap and a format incapability are different facts"*); and `WEAK_EXTERNAL` IS right for a weak **alias**, built reader-first. ⚠ The brief that ordered the second routed the decision onto `Characteristics`, and ✔gcc emits **1 for all four weak shapes** — the discriminator is the aux record’s `TagIndex`. Earlier: ★★★ **P22 MADE A `static` HELPER LINK OUT OF AN ARCHIVE ON EVERY LEG** — pe64 and macho64 readers were classifying a non-external defined symbol as a bodyless block label, so its bytes never entered the image. Earlier: ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
 **Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P21). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
@@ -86,40 +86,105 @@ commit that lands it, and never delete a ticked row.
       mentioned was not two honest encodings — the image documents were SELF-REFUTING under the packing
       their own comments state. And the leg it did not mention at all, `D-LK-MACHO-ISDATA-NO-CALL-SIGNAL`,
       turned out to mean macho64-x86_64 had **no working static-library path whatsoever**. Net −2.
-- [ ] **P23 — THE TWO ROWS CYCLE P22 OPENED. OPERATOR RULING 2026-08-20**, verbatim: *"we don't want no
-      open anchors, so this cycle can end with it opened, but next one must address it if addressable (use
-      /dss-cycle)"*, narrowed the same day to *"only if strictly needed due to cycle size, amount of
-      changes or bigger stuff"*. ⚠ **APPLYING THE NARROWING HONESTLY REMOVED ONE OF THE THREE DEFERRALS AND
-      CORRECTED THE SIZING OF THE OTHER TWO — do the same before assuming these two are big.**
-      * `D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB` — the non-canonical name of an aliased atom
-        does not reach a RE-EMITTED relocatable object's symtab. ✔Sized: `definedName` has ~5–6 ET_REL call
-        sites behind ONE `ObjectSymbolNames` helper, and the alias rows already carry the owner's
-        `SymbolId`. ⚠ Size the CONSUMER first — no shipped corpus example round-trips an aliased object, so
-        this is a correctness gap with no current victim.
-      * `D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP` — instance closed, CLASS open.
-        ✔Sizing corrected in the row: about **fourteen** exported pipeline entry points, not the "76 test
-        files" first reported (that number sizes a different question and was attached by mistake).
-      * `D-CONFIG-UNKNOWN-KEY-CHECK-HAND-ROLLED-SITES-REMAIN` — ✔the report that opened this class said
-        "a fourth hand-rolled copy"; MEASURED, it was **58**. Two of them held LIVE defects (loaders
-        REFUSING valid `$…Comment` documentation keys), both fixed this cycle. **49 sites remain** —
-        44 in `grammar_schema_json.cpp`, 5 in `predefined_macro_json.cpp` — all measured correct on the
-        `$` axis, so no live defect is known in them today. ⚠ **ELEVEN of the grammar sites have NO
-        allow-list table at all** (chained `key != "a" && key != "b"`), so converting them means MINTING
-        the table from the parse arm first, not routing a call — and this cycle found three shipped
-        messages that disagreed with their own parse code, so the conditions are not a trustworthy
-        source for it.
-      ⇒ All three are ordinary lanes. They were deferred on **P22's** size — a shipping wire-format change
-      gated on hardware evidence, a new object-format schema field declared across 13 documents, three
-      object readers rewritten, a shared unknown-key check promoted across five loaders, five lanes,
-      ~70 files — not on their own.
-      ⚠ **NET −1 IS THIN AND IS SAID PLAINLY RATHER THAN DRESSED UP:** OPEN 1019 → 1018, closed 4, opened 3.
-      Every one of the three is a defect this cycle FOUND rather than inherited, and each was sized before
-      being written down — but a cycle that closes four and opens three has not moved the number much, and
-      the next one should expect to spend itself on these rather than on new ground.
-- [ ] **P24 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH).** Trigger FIRED; the only HIGH in either
-      family, and it gates the pe64 sqlite CLI. ✔Measured to shrink to ONE library for the CLI case.
-      ⓘ Was P23 until 2026-08-20; pushed down one slot by the ruling above, not deprioritised.
-- [ ] **P25+ — THE REST OF WHAT P21 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
+- [x] **P23 — THE THREE ROWS P22 OPENED, PLUS `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT`. ✅ DONE 2026-08-20.**
+      Operator argument, verbatim: *"keep going. address all three rows +
+      D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT in this cycle"*. **All four CLOSED**, plus three more
+      that fell out on the way (`D-HARNESS-ELF-LEG-HOST-SYSTEM-PROVIDER-UNSATISFIABLE-OFF-LINUX`,
+      `D-LK-OBJECT-WEAK-DEF-RELOCATABLE`, `D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE`). Net **−1**
+      (1018 → 1017, closed 7, opened 6) — the first improvement in three cycles, and still thin.
+      **TWO OPERATOR RULINGS WERE TAKEN MID-CYCLE AND MUST NOT BE RE-LITIGATED** (both are recorded in full
+      in the cycle section below): (1) build the weak-DEFINITION machinery, whose COFF spelling is **COMDAT
+      select-any**, NOT `WEAK_EXTERNAL` — *"an implementation gap and a format incapability are different
+      facts; never let the first be recorded as the second"*; (2) build the `WEAK_EXTERNAL` reader+writer pair,
+      **reader first**, as a DIFFERENT MECHANISM FOR A DIFFERENT FACT (a weak ALIAS, not a weak definition).
+      ⚠ The alias row closed on **both tiers, all three formats** — object and final image — and the
+      arc was not finished until `mergeModules` stopped dropping every alias name the moment more than one
+      module was linked. **A capability nothing can reach is not a capability.**
+- [x] **P24 — `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH). ✅ DONE 2026-08-20 in cycle P23**,
+      pulled forward by the operator argument above rather than run as its own cycle. Its prescribed work had
+      ALREADY LANDED at `3e86a187` without the row being marked; what was outstanding was the clause that
+      DECIDES it — the cross-host re-measurement, which is the measurement P13 never took.
+      ✔5 of 5 legs resolve build inputs from a COLD cache on the native aarch64 VPS (`ls /mnt` EMPTY),
+      8 pinned archives / 11,621,552 B / 8-of-8 sha256 verified, plus an OFFLINE warm 5/5 and a NEGATIVE
+      CONTROL returning **0/5** so the instrument can say no. Closed its ELF sibling on the same evidence.
+- [ ] **P25 — EVERY ROW CYCLE P23 OPENED. ✔MEASURED at the committed tree: 22 opened — 19 PICKABLE,
+      2 GATED, and 1 DISCLOSED PRE-EXISTING** (the instrument counts that last one separately:
+      *opened 22 (created 21, disclosed-pre-existing 1)*, so it is NOT one of the 21 this cycle made). ★★★ **OPERATOR RULING 2026-08-21, verbatim:** *"we can commit
+      + push with the positive balance due to the really long cycle this time, but record in handoff so these
+      4 are closed next cycle."* ⚠ Said exactly: the ruling was given while the visible count was four; the
+      fold then finished and the true count is the list below. **The RULING is what governs — this cycle's
+      openings are next cycle's first work — and the LIST is what it governs.** The gate itself is NOT
+      softened: `check-anchor-balance` still refuses `after > before` and still reported FAIL at +13.
+      Standing order refined by the operator 2026-08-20:
+      a cycle MAY end with rows it opened still OPEN, **provided the NEXT `/dss-cycle` addresses them first if
+      addressable** — they become the next numbered entry and push what was queued down a slot. ★ Re-derive
+      each from the REGISTRY before starting it; the sizing below is this cycle's and is not a verdict.
+      * `D-TYPEKIND-PASCALCASE-SPELLINGS-HAVE-TWO-OWNERS` — ✔**the two owners ALREADY DISAGREE.**
+        `lir_text.cpp`'s `typeKindName` and `type_reintern.cpp`'s `typeKindName` are two independent
+        exhaustive switches over one PascalCase vocabulary. Ordinary lane: mint the table, delegate both.
+      * `D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS` — the dialect key ships with
+        **one** consulting writer (`pe::encode`'s Obj arm) because declaring it on the 10 ELF and 8 Mach-O
+        documents today would create the very drift its parent row exists to prevent. ★★ Take the
+        `weakDefinitionDialects()` backend accessor (mirroring `stackReserveVehicles()`) **in that same
+        change and not before** — with one consulting writer it would have had exactly one row to check.
+      * `D-HARNESS-ARM64-VPS-CHECKOUT-IS-STALE-AND-ITS-PREBUILT-COMPILER-REFUSES-ITS-OWN-CONFIG` — OPERATIONAL,
+        and ✔it will bite the next cross-leg run: the VPS checkout sits at **`b52784a6` (P5c)** with **2,501**
+        dirty files and a prebuilt compiler that refuses its own pipeline config, while the harness uses
+        `SRC_DIR` as-is and never pulls.
+      * `D-HARNESS-ACQUISITION-REPORT-HAS-NO-ROLE-SO-BOTH-DRIVERS-RE-PICK-THE-TCL-Z-PAIR` — `--acquire`
+        reports `libraries[].as` and `.path` but not WHICH acquired file is Tcl and which is zlib, so both
+        drivers re-pick by filename downstream of the instrument that already knew.
+      ★★★ **AND THIRTEEN MORE, ALL OPENED BY THE STEP-10 AUDIT FOLD. Deliberately UNSIZED here:** a sizing
+      written without re-measuring is exactly what the standing order forbids, and every one of these was
+      named hours after the four above. Re-derive each from the REGISTRY at the pick.
+      * `D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR` — 🔴 **HIGH, and the only one.**
+        Reframed by lane R as a **LIVE SILENT MISCOMPILE**, not a latent gap. Take it FIRST.
+      * `D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY` — five sites whose compile-time
+        guard cannot fail on the case all four of their comments claim it catches.
+      * `D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED` — the twin of a row lane P closed.
+      * `D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM` — made LOUD this cycle, not closed.
+      * `D-MIR-TEXT-DIAG-CODE-CAST-IS-UNVALIDATED` · `D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET` ·
+        `D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS` (⏳ SUSPECT — INFERRED, NOT EXECUTED;
+        verify or discharge, never patch on suspicion) — the `.dssir` text tier.
+      * `D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN` — 12 chain vocabularies, 16 hits, all in
+        one file. Enumerated and mechanical; this is WORK, not a row, and it was left only because the
+        operator closed the cycle to new lanes.
+      * `D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME` — the precondition lane R named.
+      * `D-TEST-VOCABULARY-PROBE-HELPER-FOURTH-COPY-OUTSIDE-THE-EXTRACTED-HEADER` — a fourth copy.
+      * `D-COMMENT-POSITIONAL-CITATIONS-IN-SRC-AND-TESTS` — the never-cite-a-line-number rule reaches
+        `.plans/**` and `.claude/**` through `plan_citations_guard` and NOTHING checks `src/` or `tests/`;
+        ✔3 of 4 sampled in one file were already pointing at the wrong code.
+      * `D-GATE-BALANCE-EXEMPTS-A-DISCLOSED-OPENING-BUT-NOT-A-BOOKKEEPING-CLOSURE` — ⚠ read its row before
+        touching it: the 6 stale closure glyphs it carries were deliberately NOT repaired this cycle,
+        because repairing them while the gate was red is motivated measurement however correct each is.
+      * ★★★ `D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD` — **OPERATOR-INSTRUCTED
+        2026-08-21, verbatim:** *"please create an anchor to paralelize integrated_tests + report each
+        integrated test item as pass or fail as a sub item of integrated tests unit (our runner to do
+        that)"*. **TWO required properties: the examples run CONCURRENTLY, and EVERY example reports its
+        OWN pass/fail as a sub-item — one aggregate verdict is not acceptable.** Today the corpus has TWO
+        runners and only one does either: `tests/examples/` is ~450 separate ctest entries,
+        `integrated_tests` is ONE entry walking every example in a single thread. ✔423 s on the VPS,
+        3,317 s on macOS, 566 s on Windows — the floor under every `-j` number this project quotes, and a
+        red example names only the aggregate.
+        ⚠ **Read the row before sizing — it CORRECTS ITSELF.** Its first draft rejected per-example ctest
+        entries as "a second copy of the corpus walk in CMake"; ✔re-measured, `tests/examples/CMakeLists.txt`
+        ALREADY does that walk (`GLOB_RECURSE` + `foreach`) and is where its 450 entries come from. The
+        objection was to HAND-LISTING, not to discovery. ⇒ recommended shape: reuse that discovery, one
+        entry per example, which satisfies BOTH properties at once. The real work is the prerequisites:
+        per-ENTRY (not per-run) scratch identity, a race-free `dependsOn` prerequisite cache, and the
+        `CwdGuard` chdir — which is safe one-process-per-entry and would NOT be under a thread pool.
+        ⓘ ✔`integrated_tests` is NOT a gtest binary (plain `main()`), and this repo uses
+        `gtest_discover_tests` nowhere — so sub-items cannot come from gtest discovery as things stand.
+      * `D-GATE-ANCHOR-BALANCE-SELFTEST-FIXTURES-ARE-ANCHOR-SHAPED` ·
+        `D-GATE-WRAPPED-CITATION-WITH-LEADING-HYPHEN-CONTINUATION-UNRECOVERED` (⚠ the second is
+        DELIBERATELY NOT BUILT — it has no failing case and a known false-positive surface).
+      ⚠ **TWO MORE ROWS P23 OPENED ARE NOT PICKABLE, AND THAT IS SAID RATHER THAN SILENTLY SKIPPED:**
+      `D-CYCLE-LANE-SOURCE-TREE-IS-SHARED-SO-ONE-LANE-CAN-BLOCK-ANOTHERS-BUILD` is **§B — OPERATOR DECISION**
+      (per-lane worktrees vs. the shared tree; bring it AS a §B, do not decide it in a lane), and
+      `D-CONFIG-GRAMMAR-ISA-AND-IDENTIFIERCLASS-BELONG-IN-THE-LANGUAGE-BLOCK` is **TRIGGER-GATED**.
+      ⚠ **AND ONE IS NOT THIS CYCLE'S DEBT AT ALL:** `D-HARNESS-VPS-SSH-PS1-DOES-NOT-EXPAND-HOME` is
+      🔵 **DISCLOSED PRE-EXISTING** — surfaced by lane Q, exempt from the net, and real regardless.
+- [ ] **P26+ — THE REST OF WHAT P21 AND P22 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
       /loop using /dss-cycle each iteration to address ALL anchors found in _handoff §0."* Re-derive each pick
       from the REGISTRY, never from this list.
 - [x] **OPERATOR CALL — ✅ FILED 2026-08-19: <https://sqlite.org/bugs/forumpost/97cd29ca44624113c73b30f5d2504729e6ffc5c5ebcba137078ea1a868cd97c9>.**
@@ -152,6 +217,640 @@ trigger NOT fired `D-ASM-TARGET-DECLARES-NO-BYTE-ORDER`, `D-ASM-COND-ON-TERMINAT
 ⓘ Two rows a family-grep catches that are NOT defects: `D-OPT-REBUILD-POLICY-NEUTERED-STATE-HOOK` is a 🟢
 SHIPPED design record, and `D-TEST-MACOS-LEG-EMSDK-PROFILE-REPLACES-PATH-HIDING-HOMEBREW` is a 🔵 DISCLOSED
 pre-existing environment fact.
+
+---
+
+## 0.0000000000000000000000000 ★★★ CYCLE P23 — WEAK DEFINITIONS *AND* WEAK ALIASES SHIP ON PE/COFF AND MACH-O, THE RETYPED-CLOSED-SET CLASS IS FINISHED, AND THE pe64 ACQUISITION ROW CLOSED ON A MEASUREMENT NOBODY HAD EVER TAKEN
+
+**Operator argument for this cycle, verbatim:** *"keep going. address all three rows +
+D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT in this cycle"* — the three rows P22 opened plus the
+only HIGH in the harness family. ✅ **All four are CLOSED**, and so are three more that fell out on the
+way. Two operator rulings were taken mid-cycle; both are recorded below and **must not be
+re-litigated**.
+
+**Anchors: OPEN 1018 → 1033, closed 7, opened 22 (21 CREATED + 1 disclosed pre-existing), net +14
+created-over-closed.** ⚠ **THE BALANCE GATE REFUSES THIS, AND IT SHIPPED ANYWAY ON AN OPERATOR RULING** —
+see the audit-fold section below for the ruling verbatim and for what the +13 is made of. Every one of the
+21 created is a defect this cycle FOUND rather than inherited, each was sized before being written down,
+and all of them are the NEXT cycle's first work (§0.00000000000000000 P25). ★ The mid-cycle claim of
+"net −1" was true of the tree at the time and is superseded here rather than deleted, because the reason
+it moved — an independent audit refuting one of this cycle's own closure claims — is the finding.
+
+### ★★★ RULING 1 — BUILD THE WEAK-DEFINITION MACHINERY, AND THE OPTION AS WRITTEN NAMED THE WRONG COFF MECHANISM
+
+Closing `D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB` means emitting each alias name with ITS
+OWN binding — decoupling name from binding is what caused
+`D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION` in the first place. But gcc's alias shape
+is WEAK-against-STRONG, and a weak defined symbol hit an existing loud refusal in the PE and Mach-O
+relocatable writers (`D-LK-OBJECT-WEAK-DEF-RELOCATABLE`, open since 2026-07-23). Three options went
+to the operator: declare a FORMAT INCAPABILITY and warn; let the refusal fire; or build the machinery.
+
+**The ruling, verbatim:** *"OPTION 3 — build the weak-definition machinery — but its COFF half as
+WRITTEN IN THE FORK IS THE WRONG MECHANISM and would break DSS's own round-trip."* The fork said
+`IMAGE_SYM_CLASS_WEAK_EXTERNAL`; that is a weak *REFERENCE* with a fallback alias (the
+`/ALTERNATENAME` shape), not a weak *DEFINITION*. **A weak definition in COFF is COMDAT select-any.**
+Building WEAK_EXTERNAL here would have emitted objects DSS's OWN READER reads back with the wrong
+semantics — a round-trip break in a project that keeps a round-trip encoding oracle.
+
+★★★ **THE REUSABLE RULE, AND IT IS THE MOST PORTABLE THING THIS CYCLE PRODUCED** — operator's words:
+*"An implementation gap and a format incapability are different facts. Never let the first be recorded
+as the second."* A `.format.json` row saying *"this format cannot express a weak definition"* would
+have been FALSE — gcc and clang emit weak definitions on PE/COFF and on Mach-O — and it would have put
+that falsehood in the place most likely to be trusted later, permanently under-capabilitying DSS
+against the references on two of three formats. It is also the decision that does not reverse cleanly
+once a config document asserts it.
+
+📄 Spec-verified before implementing (PE/COFF §5.5.3, §5.5.6): a weak external is *"a symbol table
+record with EXTERNAL storage class, UNDEF section number, and a value of zero"* — it defines nothing;
+`IMAGE_COMDAT_SELECT_ANY(2)` is *"any section that defines the same COMDAT symbol can be linked; the
+rest are removed"*, with the Selection byte at offset 14 of Auxiliary Format 5, matching the reader's
+own `kAuxSectionDefSelectionOff`. ✔The row's *"INFERRED, WITH ZERO CODE EVIDENCE IN THIS TREE"* caveat
+was discharged **from the tree itself**: `coff_object_reader.cpp`'s `GATE 3` already lifted select-any
+to `SymbolBinding::Weak` while `grep -c -i comdat src/link/format/pe.cpp` returned **0**. Reader and
+writer disagreed about what a COFF weak definition IS, and that asymmetry was the evidence.
+
+### ★★ AND THE ROW WAS WRONG ABOUT MACH-O TOO, IN A WAY THAT WOULD HAVE PUT A FALSE STATEMENT ON THE WIRE
+
+The row asked for `N_WEAK_DEF` **plus `MH_WEAK_DEFINES`**. ✔MEASURED on the operator's Mac: clang's
+`.o` for `__attribute__((weak))` carries `n_desc = 0x0080` with header flags `0x00002000` —
+`MH_SUBSECTIONS_VIA_SYMBOLS` ONLY. `MH_WEAK_DEFINES (0x8000)` appears only AFTER linking (`otool -h`:
+`0x00218085` exec / `0x00118085` dylib against a weak-free control's `0x00200085`), and
+`<mach-o/loader.h>` documents it as a property of *the final linked image*. Setting it on an
+`MH_OBJECT` would assert a fact about a linked image the file is not, and no reference encoder does
+it. **The shipped pin asserts `N_WEAK_DEF` IS set and `MH_WEAK_DEFINES` is NOT**, with the measurement
+in the test comment so the next reader does not "fix" it back.
+
+⚠ This is the SECOND cycle running in which a brief handed a lane a wrong Mach-O constant or flag from
+the registry (P22: `N_ALT_ENTRY` given as 0x0020, which is `N_NO_DEAD_STRIP`). The SDK header was
+re-read this time and all four values confirmed: `N_WEAK_DEF 0x0080`, `N_WEAK_REF 0x0040`,
+`N_NO_DEAD_STRIP 0x0020`, `N_ALT_ENTRY 0x0200`.
+
+### ★★★ RULING 2 — THE COFF WEAK-EXTERNAL PAIR, READER FIRST. AND THE BRIEF NAMED THE WRONG FIELD
+
+COFF puts the coalescing policy on the SECTION, and an alias shares its canonical's section by
+definition — so **a WEAK alias of a STRONG definition is unrepresentable in the COMDAT shape**. ★ Note
+the inversion, because it is the interesting part: `IMAGE_SYM_CLASS_WEAK_EXTERNAL` is WRONG for a weak
+DEFINITION (ruling 1) and **PRECISELY RIGHT for a weak ALIAS** — §5.5.3's own words are *"sym1 is an
+alias for sym2"*, via `IMAGE_WEAK_EXTERN_SEARCH_ALIAS`. The operator ruled: *"BUILD IT — the
+WEAK_EXTERNAL reader+writer pair, READER FIRST. This is NOT a re-litigation of the weak-DEFINITION
+ruling; it is a DIFFERENT MECHANISM FOR A DIFFERENT FACT."*
+
+The ruling also said to route on the auxiliary record's **role**, never on storage class as a proxy.
+**The lane measured that routing instruction FALSE before implementing anything.** ✔MEASURED with a
+raw 18-byte aux dump over mingw gcc 13.2.0: **gcc emits `Characteristics = 1` for all four weak
+shapes** — weak function definition, weak data definition, `weak, alias(...)`, and weak undefined
+reference. Routing on it would have classified every gcc weak DEFINITION as unresolvable, which is
+precisely the defect the lane existed to fix. **The field that discriminates is the record's own
+`TagIndex`: whether the default symbol it names is section-backed.**
+
+★★ This is `D-LK-MACHO-ISDATA-NO-CALL-SIGNAL` in a new costume — there a relocation's *arithmetic*
+stood in for its *role*; here a search *policy* stood in for a definition *state*. **The trap is not
+any particular field. It is reaching for whichever field sits nearest the decision and assuming it
+carries it.** Third consecutive cycle in which a brief handed a lane a wrong fact about an object
+format, and the first in which the wrong fact was a MECHANISM rather than a constant — so the existing
+*"a brief may state an INTERFACE only if its author has run it"* rule is now widened to MECHANISMS.
+
+**A second brief claim, refuted with the right control.** The brief said the witness should be
+`gcc main.c dss.o` producing a running binary. ✔MEASURED: GNU `ld`'s PE backend does not resolve a
+weak external across objects **for gcc's own object either** — at every `Characteristics` value, both
+link orders, and through an archive. Pinning that would have asserted a capability *no reference has*,
+and the pin would have gone red forever with the blame pointed at DSS. MSVC `link.exe` does resolve it
+— links, runs, returns 42 — so bar §A.3b makes it the working reference and `ld`'s refusal a confound,
+recorded in-source beside the witness so nobody "repairs" it back.
+
+**`IMAGE_WEAK_EXTERN_SEARCH_ALIAS` (3) is the only value that works.** The lane first chose 1 on a
+semantic reading of §5.5.3's *"if sym1 is not present"* clause; `link.exe` refuses 1 and 2. ★ The
+registry row had said ALIAS(3) all along — **the lane's reasoning contradicted the record, and the
+record won.**
+
+**What the reader half turned out to be — and it was not in the row.** DSS's COFF reader had no
+`WEAK_EXTERNAL` path at all and its storage-class dispatch was two constants with an open-ended
+fallback, so a mingw weak undefined reference made **DSS refuse a link that gcc and clang accept**.
+That is a live capability gap against both references, not plumbing for a writer. The dispatch is now
+TOTAL: every storage class resolves to a named role or fails loud — and making it total is what
+surfaced `D-LK-COFF-READER-COMMON-SYMBOL-READ-AS-IMPORT` (§5.4.2: EXTERNAL + UNDEF section +
+**non-zero Value** is a tentative definition whose Value is its SIZE, and DSS was reading it as an
+import), invisible while the UNDEF arm was a single untotalled branch.
+
+### ★★ A CLASS MADE UNREPRESENTABLE RATHER THAN GUARDED, AND THE ONE PIN THAT CAUGHT IT
+
+The design audit found that PE and Mach-O minted symbol-table indices in a REGISTRATION pass separate
+from the EMISSION pass, coupled **only by a comment**. An added record shifts every later relocation's
+symbol index — a well-formed file, wrong program, no diagnostic. The PE object writer now has ONE
+ordered entry list with a single slot-minting site, so the class is unrepresentable, and both writers
+gained a `minted == emitted` tripwire.
+
+★ The tripwire FIRED during mutant testing. And under a mutant that added a record without counting it
+**and** disabled the tripwire, **exactly one pin survived to catch it** — the relocation-index
+assertion the design audit demanded, because *"both names present, one address"* stays GREEN in that
+state. That is finding A-3 reproduced live: the obvious pin passes both ways.
+
+### ★★ THE MACH-O DEAD-STRIP HAZARD IS MEASURED SAFE, NOT ASSUMED SAFE
+
+P22 shipped `MH_SUBSECTIONS_VIA_SYMBOLS` as a licence for ld64 to dead-strip at SYMBOL granularity, so
+a second defined symbol at an atom's start could have minted a ZERO-LENGTH atom and let the body be
+stripped — perfect bytes, wrong program. ✔MEASURED on real Apple Silicon via a new
+`scripts/macho-alias-ld64-matrix`: **8 of 8 cells green** — a plain second `.globl` label, an
+`.alt_entry`, and a clang `.globl`+`.set` CONTROL, each ± `-dead_strip`, each linked against a caller
+referencing ONLY the alias, plus a canonical-only control. Every cell: both names present, same
+address, `__text` = 0x28, and **the program RAN and returned 42** — which is the observable that
+catches a stripped body behind a zero-length atom. `rc=0` is not.
+
+### ★★★ THE IMAGE TIER OF THE ALIAS ROW — AND THE ARM THAT CARRIED IT HAD A SECOND, OLDER DEFECT IN THE SAME TABLE
+
+Item (2) of the alias row — the FINAL IMAGE's symbol table — is closed on all four image arms: ELF
+static `ET_EXEC`, ELF dynamic, Mach-O exec and Mach-O dylib, each on both ports. PE images were never
+affected and this was verified before touching anything: the PE image header writes
+`PointerToSymbolTable = 0` / `NumberOfSymbols = 0`, so a PE image has no COFF symbol table to lose a
+name from.
+
+**Witnessed by execution on real hardware, not by re-reading the writer.** A gcc-built `dlopen` probe
+against a DSS-emitted `.so` resolved BOTH names to the same pointer and both calls returned 42 (probe
+exit 42); an Apple-clang-built probe did the same against a DSS-emitted arm64 dylib on real Apple
+Silicon, `codesign -dv` intact. The reference control was measured on the matching platform first —
+`gcc -shared -fPIC` of `__attribute__((weak, alias("strong_fn")))` puts `weak_alias` FUNC **WEAK** and
+`strong_fn` FUNC **GLOBAL** at one `st_value` with one `st_size`, and that is the shape the pins
+assert.
+
+**`D-LINK-ELF-STATIC-EXEC-SYMTAB-ST-VALUE-NOT-A-VA` — found on the way, born CLOSED.** The static
+`ET_EXEC` arm wrote every `.symtab` `st_value` as an offset within `.text`; gABI 4.18 defines that
+spelling for RELOCATABLE files only — in an image `st_value` is a virtual address. `nm`, `gdb` and any
+profiler would have placed every function near address zero. ★ It is the ADDRESS column of exactly the
+defect `D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS` fixed the NAME column of — same table,
+same arm, one cycle apart, and **the first fix did not go looking for the second.** ⚠ It survived
+because the arm is unreachable from every shipped format: every exec/PIE format spells `processExit`
+as a by-name import, so every real executable takes the DYNAMIC arm, which never had the bug. Nothing
+inside DSS reads an image's `.symtab`, so no internal consumer could witness it either. It took a lane
+building an image and running `readelf` over it.
+
+**★★ The red-on-disable that earned its place: M5.** Mach-O's `encodeExecDynamic` derived `nextdefsym`
+/ `iundefsym` and every `indirectSyms` origin from `module.functions.size()` — a PREDICTION of how
+many defined nlists the loop would emit. Adding aliases falsifies the prediction. With the alias band
+emitted but the origin still predicted, **every "both names present, one address" assertion stayed
+GREEN**; only the index half went red, reporting an indirect entry pointing INSIDE the defined band —
+a stub or `__got` slot that would bind to a local definition instead of its import. **A pin without
+the index half would have shipped a silently mis-bound import.** The fix is not a guard: `numDefs` is
+now read off the emitted band, so the prediction cannot exist. This is the third writer in two cycles
+to carry the registration-split shape.
+
+**A design choice worth knowing about.** The image tier reuses `definedAliases` — the same accessor
+the object tier uses, visibility gate included — rather than gaining an ungated `imageAliases`
+companion. Measured reason: the object readers fold clang's `ltmp0`, a module-private section label
+sitting at the exact `n_value` of the first function of every ordinary TU, in as a
+non-externally-visible extra name. Admitting those into an image would add a row denoting an address
+the real name already denotes, and `ld`/`ld64` drop exactly these when they build an image. So both
+tiers want the same externally-visible set, for two different reasons — both now written on the
+accessor.
+
+### ★★★ THE ALIAS ARC WAS UNREACHABLE FROM THE SHIPPED PATH, AND FIXING THAT FOUND A SILENT MISCOMPILE
+
+`mergeModules` dedups the combined `.symtab` on the merged symbol id alone, and an alias is by
+construction a second row for that id — so every alias name was dropped the moment more than one
+module was linked, which the shipped static-archive path always is. **A capability nothing can reach
+is not a capability**, so the arc was not finished until this closed.
+
+The row named one defect. There were **four**, and the dedup was the least serious:
+
+- **The merged-id pre-assignment minted one id per NAME rather than per WINNING KEY**, leaving the
+  name→id map pointing at ids no definition carries. ✔MEASURED as a **clean link** — `img.ok()`, zero
+  error diagnostics — whose call through the alias branched to `.text` base **4198400**, the injected
+  entry trampoline, instead of the winning body at **4198431**. A wrong program that links.
+- **The shadow test decided whether an atom's BYTES survive by reading the CANONICAL row**, so an atom
+  that lost its canonical while *winning* an alias was deleted outright, and one whose first row is a
+  compiler-private label escaped folding entirely.
+- **No refusal existed** for a definition whose several names resolve to different definitions.
+
+★★ Two pieces of discipline worth copying. The lane established **what the old dedup protected**
+before changing it — ✔exactly one non-alias shape, a byte-identical repeated row, still reachable for
+Weak and Local — so the re-key to `(merged id, name)` keeps that collapse and drops only the alias
+suppression. And a mutant **survived**: rather than declaring it unreachable, the lane found the shape
+it really guards (an atom that won nothing whose FIRST row is a private label — precisely the order a
+re-read ELF object presents, locals before globals) and added the missing pin.
+
+A second defect fell out of a pin written for a different property: a byte-identical repeated GLOBAL
+row was ranked against its own key and refused a legal object with *"multiple strong definitions
+across CompilationUnits (**CU #1 and CU #1**)"*. ★ The refusal is bad; **the diagnostic is worse** —
+it sends the reader hunting a second definition that does not exist, in a second CU that is the same
+CU, and `(CU #1 and CU #1)` reads as a formatting slip rather than as the message telling you exactly
+what happened. A fail-loud that misdescribes its own cause costs more than a silent one, because it is
+trusted.
+
+### ★★★ THE RETYPED-CLOSED-SET CLASS — AND THE INSTRUMENT THAT MEASURED ITS OWN BLIND SPOT AS COMPLETION
+
+A **retyped closed set** is a diagnostic that renders the accepted spellings as a string literal while
+acceptance is decided by a table. The two owners drift, and the drift is invisible: the message is
+what a config author reads.
+
+★★ **The instrument was the story.** The harvester that reported the class *"finished"* in one tier
+was **single-quote-only** and required **≥2 quoted tokens**. ✔MEASURED: adding a double-quoted arm
+took the tree-wide census **40 → 77**, and the ≥2 threshold had been hiding single-element closed sets
+entirely — three real sites in one file alone. So the earlier report of *"`target_schema_json.cpp`
+15 → 0"* was true **only of the instrument that produced it**; two sites remained. A census is a
+measurement, and a measurement that cannot see half its subject is not a smaller measurement — it is a
+different one wearing the same number.
+
+**Four live drifts, each telling a config author by name that a spelling the loader accepts is not
+allowed:**
+- `/sections/{}/kind` advertised **11 of 16** rows — and ✔the shipped corpus DECLARES all five omitted
+  spellings (`shstrtab` 10 rows, `relro` 10, `tdata` 5, `tbss` 4, `tvars` 2). A config author copying
+  a shipped document would have been told their copy was invalid.
+- ELF `osabi` accepted **7** spellings and advertised **6**: `linux`, the conventional alias of
+  `ELFOSABI_GNU`, was accepted and denied at once. ★ An ALIAS is the shape this class hides best — a
+  human writing a list writes the names they were thinking of.
+- The FFI descriptor's four format refusals named **3 of 5**.
+- The accepted `format.kind` set is the backend REGISTRY, with an enum-derived list beside it as a
+  second owner and ✔nothing in `test_object_format_backend_registry.cpp` tying them together.
+
+**A pin that fails at COMPILE time.** `lirRegClassFromName` was a hand-written if-chain over
+`kTargetRegClassTable`'s spellings. The two enums already carried `static_assert`s tying their VALUES
+in lockstep — which is exactly what made this invisible, because *the file looks pinned*. A
+target-side rename would have split `.target.json` from `.dsslir` silently. Now delegated, with a
+totality `static_assert`: ✔the mutant that splits the spellings **with the assert left in fails to
+build**, and the compiler names the assert's own text.
+
+**A vocabulary table can now assert its own well-formedness.** `EnumNameTable<E,N>` written with `N−1`
+initializers is legal C++ — the missing row value-initializes to `{E(0), ""}`, so `fromName("")`
+starts resolving, and for a vocabulary whose zero is a sentinel an empty string silently selects
+*"this knob does nothing"*. A dropped row would not break the build; it would make `"lowering": ""`
+load clean and disable the intrinsic. **137 vocabularies were exposed.** New
+`isWellFormedEnumNameTable` + `DSS_CHECK_ENUM_NAME_TABLE`, exercised out of tree in both directions
+before wiring (well-formed control rc=0; under-filled rc=1; duplicate-spelling rc=1, each naming the
+assert's text), and it catches one case the hand-written assert in `semantic_config.hpp` could not:
+two rows sharing an *enumerator*.
+
+### ★★★ TWO SILENT DEFECTS IN THE `.dssir` READER, FOUND BY A MESSAGE-QUALITY SWEEP
+
+The block-header parser read `[marker]` and had **no `else`** — an unrecognized marker left `Linear`
+and the parse *succeeded*, so a `.dssir` with a typo'd or merely newer marker round-tripped to a
+module whose block had lost its structural role. The format's entire contract is that it is lossless,
+which is exactly why this was invisible: the round trip that would have caught it is the thing that
+was broken.
+
+The second is worse. `parseType`'s `cc <name>` arm did the same and left `CcSysV` — not a lost
+annotation but **a different calling convention applied to a function signature**: different argument
+registers, different stack discipline, no diagnostic. It was found only because the first one was
+found and the lane went looking for siblings. ★ That is the transferable part — **a silent default is
+a SHAPE, and a file containing one is worth searching rather than a file to fix one line of.**
+
+⚠ The worst message drift in the whole class was also here: a sentence saying a referenced document
+*"may declare only"* seven blocks, while the loop accepts fifteen — and `asm.lang.json` declares four
+of the eight it called forbidden. A config author reading that would have concluded a shipped document
+was illegal.
+
+★ The lane declined 26 remaining hits **with a classification for each** rather than converting to
+satisfy a count — 2 where projecting the accepted table would make a required-field sentence false, 12
+mutual-exclusion prose, 8 naming a block by role — and stated that the `--min-tokens 1` census is
+**277** and was not reviewed, so the 26 is not read as a clean bill.
+
+### ★★★ THE ENUM-VOCABULARY ROW CLOSED — AND ITS OWN HEADLINE CLAIM WAS FALSE, FOR A REASON WORTH KEEPING
+
+`D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET` said in bold *"NOT A LIVE DEFECT AND THE
+ROW SAYS SO"*. It was right about the five sites it listed and wrong about the class it named: **three
+messages had already drifted**, each telling a config author by name that a spelling the loader
+accepts is not allowed — `operandKinds` named 3 of 7 table rows, `resultSlot`/`slotKind` named 8 of 32
+grouped by an encoding shape no table owns, `terminatorKind` named 6 of 7.
+
+★★ **The reason is the transferable part: the row had CHECKED the five sites.** An inventory taken by
+re-reading the places you already suspect measures your suspicion, not the tree. The lane replaced it
+with a **generic** harvester — harvest every `EnumNameTable` and every `…FromName` if-chain, then find
+every string literal whose quoted tokens are one of those vocabularies — and the class came back at
+**29** sites needing conversion in the two loaders, not five. Same shape as the survey that *"searched
+for the names it expected to find"* and missed `ubuntu-ports-arm64`.
+
+The row also mis-classified its own list. `signatureByDataModel` and the `synthesizedTypes` role map
+name **no set at all** — under-informative, not drifted. And the `synthesizedTypes` retype is a
+hand-listed *enumerator* array whose comment claimed listing them explicitly is what makes a new data
+model fail loudly. That is **backwards**: a hand-written list is precisely the construct a new
+enumerator never reaches.
+
+**★★ The blocker the row sized was not the blocker.** It said converting `dataModelFromName` was risky
+because it is widely used, and told the lane to measure call sites. Measured: 9, and 8 for
+`dataModelName`, and **none had to change** — the signatures are identical. The real blocker was
+documented in the tree and not in the row: `EnumNameTable::name()` **falls back to `rows[0]`**, while
+`ObjectFormatData::validate()` detects an undeclared data model via `dataModelName(dataModel).empty()`
+— so a naive conversion would have rendered a never-declared model as `"LP64"` and **`validate()`
+would have accepted it**. The fix belonged in the core (`nameOrEmpty`, a strict projection), not at
+the call sites.
+
+Two stale premises corrected in place: `data_model.hpp` and `header_name_matching.hpp` each justified
+being hand-rolled with *"`EnumNameTable` lives in `target_schema.hpp`, which this header CANNOT
+include"* — it has lived in the dependency-free `enum_name_table.hpp` since that extraction, and that
+header's own comment names `data_model.hpp` as one of its two motivating cases.
+
+✔Dry run over the shipped corpus: **84 documents, 0 violations, all 12 projected or narrowed sets
+exercised, `src/dss-config/**` needed ZERO edits** — including the one behaviour narrowing
+(`registerClassOps[].class` now refuses the `none` sentinel it previously loaded while the sentence
+beside it said otherwise).
+
+**The red-on-disable that states the property exactly.** M1 deletes `LLP64` from `kDataModelTable`: 11
+of 59 core tests red, and the diagnostic follows the table with no edit — *before this change,
+deleting the name from the MESSAGE reddened nothing*, which is the whole defect in one sentence.
+
+### ★★★ THE WEAK-DEFINITION DIALECT IS NOW A KEY THE WRITER ACTUALLY READS
+
+The operator ordered one config row naming which weak-definition dialect a format's writer emits —
+default COMDAT, and explicitly **not** a capability flag, because
+`D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE` is the record of why an implementation gap recorded as a
+format incapability is a false fact in the place most likely to be trusted later.
+
+★★ **The consultation is ordered so that ABSENCE COSTS NOTHING**: the walker scans for a weak
+definition first and only *then* asks the schema, so a format that never emits one needs no
+declaration — pinned as its own cell, because the obvious implementation makes the key effectively
+required, which is the shape the ruling rejected. The vocabulary names MECHANISMS (`comdat`,
+`symbol-binding`, `symbol-flag`), not formats, so it says what is emitted rather than who emits it.
+
+✔**The red-on-disable that proves the key is READ**: deleting the declaration from the shipped pe
+object document — with **no rebuild**, observed through `ctest` because that is what sets
+`DSS_CONFIG_ROOT` — reds seven pre-existing COMDAT writer pins plus the three new config pins.
+
+⚠ **It ships with ONE consulting writer, and that asymmetry is deliberate.** ✔MEASURED: `elf.cpp` maps
+Weak → `STB_WEAK` unconditionally and `macho.cpp` sets `N_WEAK_DEF` unconditionally. Declaring the key
+on their documents today would create exactly what the parent row exists to prevent — a key the writer
+does not read, drifting silently while reading as authoritative — so the lane declared it nowhere
+rather than everywhere, and **pinned the scope** (2 of 24) so it is asserted rather than remembered.
+`D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS` carries the rest, including the
+generalization to take *at that moment and not before*: a backend accessor mirroring
+`stackReserveVehicles()` so a mis-declared dialect fails at LOAD rather than at emit. Not built now
+because with one consulting writer it would have had exactly one row to check — a mechanism ahead of
+its second consumer.
+
+### THE OTHER THREE ROWS
+
+**`D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` (HIGH) — CLOSED, and its prescribed work had
+already landed without the row being marked.** All five legs have declared `pinned-archive` since
+`3e86a187`; what was outstanding was the clause that DECIDES the row — the cross-host re-measurement.
+✔MEASURED 2026-08-20 on the native aarch64 VPS (`ls /mnt` EMPTY, `mount | grep -ci drvfs` = 0): **5 of
+5 legs resolve build inputs from a COLD cache**, 8 pinned archives, 11,621,552 bytes, every sha256
+re-verified independently 8/8, plus an OFFLINE warm 5/5 and a NEGATIVE CONTROL that correctly returns
+**0/5** — so the instrument can say no. This is the measurement P13 never took, and it also closed
+`D-HARNESS-ELF-LEG-HOST-SYSTEM-PROVIDER-UNSATISFIABLE-OFF-LINUX` on the same evidence. ⚠ Clause (2) of
+the closing work was deliberately INVERTED (`search-paths` removed rather than kept as a fast path)
+and that divergence is recorded IN the row with the three measurements that justify it, rather than
+quietly satisfied.
+
+**`D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP` — CLOSED, including the merged
+route.** The finding nobody had named: **the classification is per ROUTE, not per entry point** — the
+driver reaches `linkAndWriteWithStaticArchives` by three routes and `optimizeModule` by three. The
+headline defect the row never mentioned: three link-and-write exports took `ImageRequest` DEFAULTED to
+`{}`, which the file's own docblock forbids on a sibling export. Fourteen driver-level pins now exist;
+under every mutant planted AT THE DRIVER, the in-process unit suites for the same callee stay GREEN —
+that contrast IS the class. ⚠ Two witnesses had to CHANGE rather than two pins weaken: a
+static-archive probe was silently vacuous (that route short-circuits before the merge), and
+`dataModel` cannot be witnessed by an LP64↔LLP64 mis-supply at all, because `pointerBytes` returns 8
+for both.
+
+**`D-CONFIG-UNKNOWN-KEY-CHECK-HAND-ROLLED-SITES-REMAIN` — CLOSED.** Every closed-key block in both
+loaders routes through the shared check: 12 table-less chained conditions → 0, 26 hand-rolled loops →
+1 documented carve-out, 58 `isDocumentationKey` sites → 20, and **77 lines FEWER while adding comment
+blocks**. Tables derived from the PARSE ARM and dry-run against all **84** shipped documents BEFORE
+any code — 0 violations, so `src/dss-config/**` needed zero edits. ⚠ The row's own list said ELEVEN
+table-less sites and there are TWELVE: it omits `gatedMarkers` and mis-describes `synthesizedTypes`,
+so a sweep sized on that list leaves one behind.
+
+### ★ FOUR THINGS THIS CYCLE FOUND THAT NOBODY WAS LOOKING FOR
+
+1. **A retired provider lived in both harness drivers for ten days.** `ubuntu-ports-arm64` was gone
+   from `LIBRARY_PROVIDERS` — so `--lint` refused any leg declaring it — while `build-and-test.sh`
+   kept a LIVE dispatch arm, a ~45-line acquisition function and an env override, and BOTH drivers
+   advertised the name as KNOWN in the one message whose job is to say what is accepted. The existing
+   guard could not see it: it iterates the DECLARED set, so a name nothing declares is outside its
+   domain by construction. ⚠ The cycle's own survey missed it too — **the grep searched for the names
+   it expected to find.**
+2. **A table that disagreed with its own block, exposed BY the routing.** `kAssemblyKeys` declared 14
+   keys while `assembly` accepts 16, the other two carved out by `continue`s below the table.
+   Survivable only while the diagnostic never RENDERED the list — the shared check does, so a naive
+   route would have printed a list refusing two keys the loader reads two hundred lines later, and
+   reddened both shipped asm dialects.
+3. **A local lambda named `rejectUnknownKeys` shadowed the shared helper** for its whole scope, so the
+   file grepped as though it used the shared check and had **zero** calls to it.
+4. **Four `$`-carve-out absences are deliberate and the first sweep read all four as live defects.**
+   `tokens`, `linkageSpecifiers` and `entryFunctions` are key-spaces whose keys are SOURCE TEXT, not
+   loader vocabulary. The record won; working code was not "fixed".
+
+### ⚠ THE CYCLE'S OWN PROCESS DEFECTS, MEASURED AND FIXED
+
+* **Lane isolation stops at the build tree.** P22's per-lane build tree isolates ARTIFACTS only.
+  ✔MEASURED twice here: four lanes shared one scratchpad and one lane's mutation harness was
+  OVERWRITTEN mid-run (three red-on-disable cycles then ran the WRONG SCRIPT); and a lane left a
+  shared source file non-compiling across ~25 minutes of another lane's cycle. Fixed as rules; the
+  SOURCE-TREE half is a §B and is now its own OPEN row. ★ A third instance is the first that CORRUPTS
+  a build rather than blocking it: a lane build failed with `nlohmann/json.hpp: No such file` on a TU
+  whose target already linked the library — ninja compiled it with an include set captured before
+  another lane's `CMakeLists.txt` edit landed mid-build. **It cost a mutant arm and was caught only
+  because the subject binary's mtime had not advanced.**
+* **The orchestrator's row-editing script truncated the registry to ZERO LINES** on an encoding error,
+  recovered from HEAD only because that file happened to be clean at that moment. Root cause
+  underneath: the repo's OWN documented heredoc-eats-backslashes trap, walked into three times because
+  every failure was silent. Row editing is now atomic and refuses to shrink the document.
+* **A brief stated an invocation its author had never run** (`run-gate.sh`'s argument form). Two lanes
+  hit it, it refused fail-closed, one left a file named `--` in the repo root. New rule: a brief may
+  state an INTERFACE only if its author has run it — P22's instrument rule, one level up — now widened
+  to MECHANISMS (see ruling 2).
+* **A lane message went to the WRONG LANE.** An ownership-narrowing message reassigning a file set was
+  delivered to a lane that did not own it. Had it been obeyed, two lanes would have edited one file
+  set and **both** reports would have become unattributable. It cost nothing for exactly one reason:
+  **the recipient's brief named its own subject and listed those paths as FORBIDDEN**, so the
+  instruction contradicted a written boundary instead of arriving into a vacuum. The lane refused it
+  and answered with a measurement rather than a denial. ★ **An instruction that names the recipient's
+  scope can be REFUTED by the recipient; one that only names the work cannot.** Now a rule in the
+  skill.
+* **A citation went stale INSIDE the cycle again**: a new comment cited `grep -c 'DSS_EXPORT'` → 21,
+  and the comment's own text contains the token, so the real answer is 22.
+
+### ⚠ THREE MORE INSTRUMENTS THAT LIED, ALL MINE OR THE CYCLE'S OWN
+
+- **`local-build.sh` runs under `set -euo pipefail`, so the toolchain-read classifier added this cycle
+  would never have executed** — `set -e` aborts the moment the build pipeline fails, before anything
+  can name the failure, leaving exactly the misattribution the code exists to prevent. Caught by
+  reading the script before writing the patch, not by running it. (The classifier exists because a
+  transient g++ failure to *read* a standard-library header cascaded into ~6 bogus C++ diagnostics
+  during a red-on-disable **restore** — the one measurement this project treats as proof.
+  `local-build` now exits **9** for a toolchain READ failure so no reader can mistake it for a fact
+  about the source.)
+- **The PowerShell self-test's capture was empty on its first run** because `Write-Host` emits on the
+  INFORMATION stream: a bare `| Out-String` catches nothing and the text goes to the console, so the
+  arm reported *"incomplete"* over a message that was perfectly correct.
+- **Self-test fixtures reddened the citation ratchet**: sample compiler output containing `path:line`
+  is indistinguishable from a citation to `check-plan-citations`. The fixtures are now assembled
+  rather than written literally, with the reason in a comment — the runtime strings are byte-identical
+  to what gcc prints.
+
+★ All three are the same lesson one level down: **an instrument is only proven by being driven the way
+a caller drives it** — redirection, shell options and all.
+
+### ★★★ THE STEP-10 AUDIT FOUND A FALSE CLOSURE CLAIM, AND SIX LANES OF FOLD FOUND TWENTY-SIX MORE DEFECTS
+
+The independent self-audit at step 10 did not merely check the cycle's work — **it refuted one of its
+claims.** `D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET` was marked ✅ CLOSED on a
+count from a harvester that requires a `…FromName(std::string_view)` function to recognise a
+vocabulary owner. An inline `==` chain in a loader body is also an owner, and it was outside that
+instrument's domain entirely.
+
+★★★ **THE RULE THIS PRODUCES IS THE MOST PORTABLE THING IN THE FOLD: A CLOSURE CLAIM INHERITS THE
+BLINDNESS OF THE INSTRUMENT THAT MEASURED IT.** The count was honest about what the harvester found;
+the *closure* is what was false. ✔MEASURED once the fourth owner shape was added, both halves in ONE
+process: **+82 vocabulary owners and +22 hits** tree-wide — more owners than the three published arms
+harvest between them — with **16 hits across 12 chain vocabularies still in `grammar_schema_json.cpp`
+alone**. And the survivor had already drifted: three sentences about `compositeKind`, one saying
+`'struct' or 'union'` three lines above a chain that accepts `enum`.
+
+⚠ Read the row's *"13 → 3"* as **"3 of the shapes the instrument could see"**. The published **51**
+was true when measured and is NOT stable — the same configuration read 53–56 an hour later under
+concurrent lanes. Quote it with its timestamp and its arms, or not at all.
+
+### ★★★ THE CYCLE SHIPPED A DEFECT AND THE FOLD CAUGHT IT: A COFF OBJECT THE REFERENCE LINKER REFUSES
+
+Reachable **only** because the COMDAT weak-definition writer landed in this same commit. In
+`pe::encode`'s Obj arm the block-symbol walk ran BEFORE the weak-definition group loop, so the first
+symbol-table record bearing the COMDAT ordinal was a compiler-private block label rather than the
+section definition symbol — violating PE/COFF §5.5.6.
+
+✔**MEASURED WITH THREE INSTRUMENTS, NOT READ.** A walk over the emitted bytes; `dumpbin.exe`
+14.51.36252.0 reading **`COMDAT; sym= sym_77`** before and **`COMDAT; sym= weakfn`** after; and
+`link.exe` 14.51.36252.0 on a **single object with nothing else on the command line** —
+**`fatal error LNK1162: expected aux symbol for COMDAT section 0x2`, NO IMAGE**, against a clean
+1536-byte `.exe` after.
+
+⚠⚠ **THE AUDIT PREDICTED A SILENT MIS-KEY ("two TUs' copies do not coalesce") AND THE TRUTH IS A HARD
+REFUSAL.** Higher severity than the finding assumed. ★ DSS's own round trip is structurally blind to
+it — the reader locates the section symbol BY NAME — so the oracle stayed green over the object
+`link.exe` rejects. That limit is now written down: **when an oracle is defined by what it can
+RECONSTRUCT, every property that survives reconstruction is invisible to it** — ordering, padding,
+alignment, record position. Each needs a byte-level pin, never a round trip.
+
+### ★★★ A NEGATIVE PIN WITHOUT A POSITIVE CONTROL CANNOT TELL "REFUSED" FROM "NEVER PARSED"
+
+✔MEASURED: both `.dssir` fixtures in the text-tier suite spelled the terminator `ret`; the mnemonic is
+`return`. **Every module those templates built was refused for `unknown opcode 'ret'`, so the
+`EXPECT_FALSE(res->ok)` assertions had been VACUOUSLY TRUE since the day they were written** — including
+the `cc` arm this very cycle had just added to close
+`D-MIR-TEXT-UNKNOWN-CALLING-CONVENTION-SILENTLY-DEGRADED-TO-SYSV`. Found only because a lane added a
+POSITIVE CONTROL and the control reddened. ⇒ any pin asserting a refusal owes a sibling asserting
+acceptance of the same fixture minus the defect.
+
+### ★★ THE TEXT TIERS HELD TEN SILENT DEFAULTS, NOT THE FOUR THE AUDIT LISTED
+
+The audit named four; searching for the SHAPE rather than the list found ten. Two are worth carrying:
+
+- **`parsePercentValue` let a class letter with no digits fall out as handle `0` — a LIVE SLOT, not a
+  sentinel.** ✔MEASURED with the guard removed: in a function whose entry is `%b0`, `br %b` became a
+  **self-loop on the entry block**. Well-formed module, wrong program, no diagnostic. ★★ The general
+  hazard: **a malformed parse that lands on a VALID id is invisible in a way that landing on an
+  invalid one never is** — every id space with a meaningful zero has it.
+- **`resolveBlockRef`'s comment said the verifier would catch an undeclared branch target.** ✔MEASURED
+  FALSE: verify-on-load runs *after* `finish()`, and `finish()` is what aborts (`0xc0000409`). The
+  delegation reads as diligence while pointing at a pass downstream of the failure.
+
+⚠ Severity is bounded by a measurement the brief did not have: ✔`emitMir`/`parseMir`/`emitHir`/
+`parseHir` have **ZERO** callers in `src/` outside their own TUs. Both text tiers are debug/test
+surfaces; `parseTypeFromText` is the one shipped door.
+
+### ★★ A COMPILE-TIME GUARD THAT CANNOT FAIL, AND FOUR COMMENTS SWEARING IT DOES
+
+`namesWhere<kTable.rows.size() - 1>(..., isSelectableX)` is `x == x` whenever the predicate rejects
+exactly one row: both sides derive from the same table. ✔MEASURED with `g++ -fsyntax-only` over six
+arms — a 4-row table with a **new selectable enumerator COMPILES** under the derived count and is a
+**compile error** under the literal. So it fires only if someone widens the predicate without touching
+the count — **never on a new enumerator, which is the case every comment on it claims.** Five sites
+remain; `D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY` carries them.
+
+### ⚠ THE BALANCE GATE FAILS, BY OPERATOR DECISION, AND THE NUMBER IS SAID PLAINLY
+
+**OPEN 1018 → 1033: 7 closed, 22 opened (21 CREATED + 1 disclosed pre-existing), net +14 created-over-closed.** Operator ruling 2026-08-21, verbatim: *"we can
+commit + push with the positive balance due to the really long cycle this time, but record in handoff
+so these 4 are closed next cycle."*
+
+★ **This is the §B escape hatch the rule reserves, used deliberately by the operator with the number in
+front of them — NOT the gate being softened.** Every one of the 21 is a defect this cycle FOUND rather
+than inherited, and each was sized before being written down. They are the next cycle's first work
+(§0.00000000000000000 P25).
+
+⚠⚠ **ONE THING WAS DELIBERATELY *NOT* DONE, AND IT MATTERS MORE THAN THE +14.** ✔MEASURED over 1,737
+registry rows: **45** rows whose status cell OPENS with a closure word are not marked closed; a strict
+filter (the row's own opening verdict is a closure AND nothing walks it back) leaves **6**. Repairing
+those glyphs would have taken this cycle's failing gate from +3 to roughly −2 **while closing no
+actual work.** The balance instrument exempts a *disclosed opening* from the net but has **no mirror
+for a bookkeeping closure**, so the repair would have registered as burn-down. **That is motivated
+measurement no matter how correct each individual repair is, so the repairs were not made** —
+`D-GATE-BALANCE-EXEMPTS-A-DISCLOSED-OPENING-BUT-NOT-A-BOOKKEEPING-CLOSURE` carries them, and the
+script's own header already records that this instrument has flattered the cycle three times before.
+
+### ⚠ FOUR MORE PROCESS DEFECTS THE FOLD MEASURED
+
+* **Per-lane build trees isolate ARTIFACTS, not SOURCE.** Two independent lanes were blocked or
+  corrupted by a third's mid-edit file — one could not build at all (`'TypeInterner' was not declared`),
+  one compiled against a half-written table and reported a config refusal **that reads exactly like a
+  real regression**. The last step of every lane is the tree-wide gate, which is precisely the step a
+  shared source tree makes unattributable. ⇒ a git worktree per lane, or "gate your own targets, then
+  ONE serialized tree-wide gate". That is the §B this row already carries.
+* **A row SKILL.md had cited for hours did not exist**, and the citation was LINE-WRAPPED, so neither
+  the guard nor a grep could see it. ✔17 of the 78 anchor ids on this cycle's added lines are wrapped.
+  ★ **A wrapped id does not fail — it DISAPPEARS**, the one failure mode a fail-loud project cannot
+  catch by watching for failures.
+* **`local-build`'s toolchain-failure detector saw READS and missed WRITES.** A write to gcc's own temp
+  exits 1, indistinguishable from a real compile error — the exact misattribution it exists to prevent,
+  in the half it could not see. Fixed in both twins (6 self-test arms each, parity proven by
+  EXECUTION). ⚠ My own patch had two defects, both caught only by running it: the path fragment was
+  `[^:]+`, which **cannot match a Windows path at all** because the drive colon ends the class.
+* **Three of four positional citations in one file were already pointing at the wrong code** when
+  measured — one at a range holding unrelated logic, one at pure comment, and one that **said "grep the
+  predicate, not the line" and then wrote the line.**
+
+### ★★★ THE FOURTH LEG EARNED ITS KEEP ON ITS FIRST RUN — AND FOUND SOMETHING NO AMOUNT OF RE-READING WOULD
+
+The operator's instruction to add the macOS and arm64-VPS legs produced, in one run, a red that had
+survived a full cycle of review: `CoffLocalFunctionInArchive.DssBuiltLibMemberCallingAStaticHelperExitsFortyTwo`
+(added P22) builds a `pe64-x86_64-windows-exec` image from any host — correct, that is what a cross
+compiler is for — and then **EXECUTES it with no host gate**. ✔MEASURED on the native aarch64 VPS:
+`posix_spawn('.../main.exe') failed: rc=8` (ENOEXEC), the single red in 922.
+
+★★★ **IT SHIPPED BECAUSE BOTH LEGS THAT COULD SEE IT CAN RUN A PE — Windows natively, and WSL through
+the interop binfmt handler**, so `posix_spawn` succeeds under WSL and the arm reads as portable. ⚠ The
+same shape would red any plain ubuntu CI runner. Fixed in this commit: the spawn is `_WIN32`-gated, the
+BUILD half stays on every leg because it is host-neutral and it is the half that pins the reader —
+the split `tests/program/test_static_link.cpp` already spells for its pe / elf / Mach-O run arms.
+
+★★ **THE PORTABLE RULE, and it is the host-matrix twin of this cycle's instrument rule: A GATE'S BLIND
+SPOT IS A PROPERTY OF ITS HOSTS, NOT OF ITS ASSERTIONS — so the way to test the gate is to ADD A HOST,
+never to re-read the tests.** ✔The sweep that followed is the other half of the result: 44 `runBinary`
+call sites, 27 platform-gated, 17 ungated, and every one of the other 16 spawns a NATIVE artifact or
+retargets to the host — each confirmed passing on the VPS. One defect, and exactly one.
+Carried by `D-TEST-COFF-ARCHIVE-RUN-ARM-NOT-HOST-GATED` and
+`D-GATE-A-LEG-THAT-NEVER-RAN-CANNOT-REFUTE-A-HOST-ASSUMPTION`, both BORN CLOSED.
+
+### ✔ GATE STATE — measured at the committed tree, not re-quoted from a lane
+
+★★★ **THIS CYCLE'S GATE IS FOUR LEGS, ON THE OPERATOR'S EXPLICIT INSTRUCTION 2026-08-21:** *"don't forget
+to run macos leg too, and vps arm64 in the end of cycle"*. Both remote legs go through
+`scripts/remote-leg/remote-leg.sh` (added this cycle), which pushes the WORKING TREE — neither remote
+checkout can be a `git pull`, because this cycle's work is uncommitted until the commit that carries this
+file. ⚠ Read `.dss-leg-stamp` at the remote root, never the remote `git log`.
+
+| leg | result |
+| --- | --- |
+| Windows `build/dbg` ctest (`run-gate.ps1`, witness `100% tests passed`) | ✅ **922/922, 0 failed, 678.01 s** |
+| WSL x86_64 clean configure+build+ctest (`scripts/wsl-leg/wsl-leg.sh`) | ✅ **922/922, 0 failed, 336.99 s**, clean 766-target build |
+| qemu arm64 (`QEMU_LD_PREFIX=/usr/aarch64-linux-gnu`, folded into the WSL leg) | ✅ same run |
+| **arm64 VPS, NATIVE aarch64** (`remote-leg.sh --carriage arm64-vps`, `ctest -j 4`) | ✅ **922/922**, `rc=0`, clean 766-target build. ⚠ Its wall-clock figure is NOT citable — see `D-GATE-VPS-CTEST-TOTAL-TIME-REPEATED-EXACTLY-ACROSS-TWO-DIFFERENT-RUNS` |
+| **macOS arm64, REAL Apple Silicon** (`remote-leg.sh --carriage macos`, `ctest -j 10`) | ✅ **922/922, 0 failed, 5030.41 s** |
+| `check-anchor-balance` | ⚠ **FAILS BY DESIGN, ON AN OPERATOR RULING: 1018 → 1034, closed 7, opened 23 (22 created + 1 disclosed pre-existing), +15 created-over-closed.** The gate is NOT softened — it printed FAIL and this commit ships anyway, on the ruling recorded above, with all 22 queued as P25 |
+| `check-anchor-registry` | ✅ 0 cell-width violations across 297 tables / 4,149 rows in 41 files; every `src/` anchor resolves |
+| `check-plan-citations` | ✅ 3,127 positional citations across 283 documents, ratchet unbroken |
+| `check-scripts-index` · `check-line-endings` · `check-diagnostic-codes` · `check-enum-name-table-guards` | ✅ 25 scripts · no CR in 2,558 paths · 386 codes, 0 collisions · 66 vocabularies, all guarded |
+
+⚠ **WHAT THE FOUR-LEG GATE COST, SAID PLAINLY BECAUSE IT IS THE USEFUL PART:** it took **four**
+rounds, and three of the four restarts were the ORCHESTRATOR'S OWN doing, not the hosts'. In order:
+a `pe64` spawn arm with no host gate (`D-TEST-COFF-ARCHIVE-RUN-ARM-NOT-HOST-GATED`); a driver
+differential needing a PowerShell interpreter neither remote host has
+(`D-TEST-HARNESS-DIFFERENTIAL-NEEDS-A-POWERSHELL-INTERPRETER-AND-DOES-NOT-SAY-SO`); both legs
+silently running SERIAL because `ssh` forwards no environment
+(`D-SCRIPT-REMOTE-LEG-CTEST-TAKES-THE-REMOTE-SERIAL-DEFAULT`); and a leg rsync'd mid-edit, so it
+carried a citation whose registry row did not exist yet and `anchor_registry_guard` correctly
+reddened. ★★ **That last one is [[D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-OWNERSHIP]] with
+a WIDER WINDOW: a remote leg SNAPSHOTS the tree at rsync, so "the orchestrator is a lane too" bites
+harder across a carriage than it does locally — the tree it is testing stopped existing the moment
+the next edit landed.** ⇒ freeze the tree BEFORE the first rsync, not before the commit.
+
 
 ---
 
@@ -2876,6 +3575,7 @@ stray build artifacts (`*.preMutant`, `*.orig`) left by tooling.
 
 | Date | Commit | What shipped | Gate |
 |---|---|---|---|
+| 2026-08-21 | *(this cycle, P23)* | **Weak DEFINITIONS and weak ALIASES ship on pe/coff and mach-o**, the retyped-closed-set class is finished for its three published owner shapes, and `D-HARNESS-PE64-LIB-ACQUISITION-IS-HOST-DEPENDENT` closes on the cross-host measurement P13 never took. Then a step-10 independent audit **refuted one of the cycle's own closure claims**, six fold lanes turned that into 26 more defects, and a FOURTH gate leg found two host-capability defects three legs could not see. +14 ctest entries (908 → 922); new `scripts/remote-leg/remote-leg.sh` | **FOUR legs, all 922/922**: Win 678.01 s · WSL 336.99 s (clean build) · **native aarch64 VPS** · **real Apple Silicon**. balance ⚠ **1018 → 1034, +15 created-over-closed — FAILS, shipped on an operator ruling** |
 | 2026-08-18 | *(this cycle, P8)* | **Path identity becomes a TYPE.** `core::PathIdentity` + 14 containers re-keyed + `scripts/check-path-identity/check-path-identity.py`; the 8.3 blindness of `weakly_canonical` under libstdc++ measured and closed. Plus `mustDifferFromBaseline` on the CLI runner (455 manifests / 548 arms armed) and a `--rsync` transport on both ssh carriages (the Mac's profile eats stdin) | Win **898/898** · WSL **898/898** · arm64 + macOS below |
 | 2026-08-16 | *(P7 predecessor)* | **`module` corpus example** — `project_module_standalone_build`, the first corpus proof that a `module` project builds standalone (B.13.3). Closed on the standalone half only; artifact-content and must-not-exist assertions are inexpressible in the corpus and stay in unit pins | Win **866/866** · ⚠ example not re-run on the 3 non-Windows legs |
 | 2026-08-16 | `f0695b7` | **AP5/AP6 close-out**, 509 files: `scripts/check-diagnostic-codes/check-diagnostic-codes.py` (the ordinal-allocation gate, built after two lanes both took `0xD029`) · `-Werror=switch` tree-wide at one chokepoint (closes G-711) · the ISA-mismatch diagnostic + its unsuppressable row · corpus arming | **All four legs 865/865**: Win · WSL gcc · qemu-aarch64 strict · macOS arm64 |

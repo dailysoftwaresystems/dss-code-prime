@@ -1,9 +1,11 @@
 #include "hir/hir_text.hpp"
 
+#include "core/types/config_key_vocabulary.hpp"  // renderAllowedList (orMalformed projects the table)
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/enum_name_table.hpp"  // EnumNameTable / allNames — the ONE owner of each text spelling set
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_span.hpp"
-#include "core/types/target_schema.hpp"  // callConvName / callConvFromName
+#include "core/types/target_schema.hpp"  // callConvName / kCallConvTable
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_registry.hpp"
 #include "hir/attributes/diagnostic_info.hpp"
@@ -59,7 +61,46 @@ namespace dss {
 namespace {
 
 // ── shared name tables (small fixed enums local to the grammar) ──────────────
-
+//
+// ★★★ D-TEXT-TIER-READERS-KEEP-HAND-WRITTEN-FROMNAME-IF-CHAINS. Every vocabulary
+// below used to exist TWICE in this file: a `…Name(e)` switch for the writer and
+// a `…FromName(s)` if-chain for the reader, spelling the same set in the same
+// order. Two owners of one fact, and the failure they produce is not a wrong
+// message — it is a BROKEN ROUND TRIP IN ONE DIRECTION. `.dsshir` is a
+// write-then-read surface: rename a spelling in the writer's switch and the
+// emitter starts producing text its own reader refuses; rename it in the reader
+// and a hand-written `.dsshir` stops loading. Both halves compile, both halves
+// look right beside each other, and no round-trip test that writes its own input
+// can see either one, because such a test only ever feeds the reader names the
+// writer just emitted.
+//
+// Each vocabulary is now ONE `EnumNameTable` and both directions project from
+// it, so the two cannot disagree — the `lir_reg.hpp` /
+// `D-LIR-REG-CLASS-SPELLINGS-HAD-A-SECOND-OWNER` shape.
+//
+// ★ WHY THE TABLES LIVE HERE AND NOT BESIDE THEIR ENUMS. These spellings are the
+// `.dsshir` TEXT SURFACE, not a property of the enum: ✔MEASURED with
+// `grep -rn '"tess_control"' src/` (and the same for `"guard_clause"`,
+// `"substituted"`, `"strong"`) — every one resolves to this file only, twice
+// each, which were exactly the two owners. Nothing in config declares them and
+// no other tier reads them. `kCallConvTable` is the deliberate contrast and the
+// reason the rule is not "always put the table beside the enum": a calling
+// convention is spelled in `.target.json`, so the CONFIG owns that vocabulary
+// and the table belongs in `target_schema.hpp` where the loader can reach it.
+// Putting a serialization vocabulary into `hir/attributes/*.hpp` would push the
+// text format's surface syntax into the semantic model that every HIR consumer
+// includes, and would add an include edge for a set with one reader.
+//
+// ★ THE TWO COMPILE-TIME GUARDS EACH TABLE CARRIES, and what each one catches:
+//   * `DSS_CHECK_KEY_VOCABULARY(allNames(kTable))` walks every row and refuses
+//     an EMPTY or DUPLICATE spelling. A duplicate makes the second row
+//     unreachable from `fromName`, so a value would write a name that reads back
+//     as a DIFFERENT value — a silent round-trip miscompile, not a diagnostic.
+//   * a `-Werror=switch` backstop over the enum in the `…Name` projection. A new
+//     enumerator with no table row would otherwise take `EnumNameTable::name`'s
+//     row-0 fall-back and be written out wearing the SENTINEL's spelling; the
+//     switch makes it a BUILD failure instead of a wrong `.dsshir` file.
+//
 // CallConv name mapping previously hand-rolled here (and in
 // mir_text.cpp) — duplication caught in the 2026-06-02 cross-
 // codebase audit. Call sites now use `callConvName(cc)` /
@@ -70,39 +111,58 @@ namespace {
 // remaining value was diff-minimalism, which the explicit call-
 // site migration removes.
 
+// The ONE spelling of the marker `appendLiteralValue` writes in place of a value
+// this format cannot serialize, and `parseLiteralValue` refuses by name. It lives
+// here rather than as a literal at each end for the reason the whole file has been
+// converging on: a write-then-read surface with two copies of one spelling breaks
+// in ONE direction, with both halves compiling and the suite green.
+inline constexpr std::string_view kHirTextUnspelledAggregateTag = "unspelled_aggregate";
+
+// The `.dsshir` bare-keyword type spellings. A deliberate SUBSET of `TypeKind`:
+// the aggregate / pointer / function kinds have their own bracketed syntax
+// (`ptr<T>`, `arr<T,N>`, `fn(...) -> T`) and are never spelled as a keyword, so
+// this table is NOT total over the enum and must not be read as if it were.
+//
+// ⚠ THEREFORE `nameOrEmpty`, NEVER `name`. `EnumNameTable::name` falls back to
+// `rows[0].second`, which here is `"bool"` — so a `Struct` reaching the writer
+// would be emitted as the keyword `bool` and read back as a bool. Empty is the
+// answer the caller already tests for (`primName(k).empty()` is how the type
+// writer decides to take the structural path), and it is the reason this table
+// gets no `-Werror=switch` backstop: totality over `TypeKind` is not the
+// property, agreement between the two directions is.
+inline constexpr EnumNameTable<TypeKind, 20> kHirTextPrimTable{{{
+    { TypeKind::Bool, "bool" },
+    { TypeKind::I8,   "i8"   }, { TypeKind::I16,  "i16"  },
+    { TypeKind::I32,  "i32"  }, { TypeKind::I64,  "i64"  },
+    { TypeKind::I128, "i128" },
+    { TypeKind::U8,   "u8"   }, { TypeKind::U16,  "u16"  },
+    { TypeKind::U32,  "u32"  }, { TypeKind::U64,  "u64"  },
+    { TypeKind::U128, "u128" },
+    { TypeKind::F16,  "f16"  }, { TypeKind::F32,  "f32"  },
+    { TypeKind::F64,  "f64"  }, { TypeKind::F80,  "f80"  },
+    { TypeKind::F128, "f128" },
+    { TypeKind::Char, "char" }, { TypeKind::Byte, "byte" },
+    { TypeKind::Void, "void" },
+    { TypeKind::NullptrT, "nullptr_t" },  // C23 (debug-dump only)
+    // ⚠ `Complex` is deliberately ABSENT and the absence is load-bearing:
+    // `complex` is a WRAP-1 keyword (`complex<f64>`), decoded further down
+    // parseType, and `primFromName` is consulted FIRST. A row here would make
+    // the bare keyword `complex` resolve to a prim and the `<elem>` operand
+    // would never be read. The comment at that decode site records the same
+    // fact from the other side.
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextPrimTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextPrimTable));
+
 [[nodiscard]] std::string_view primName(TypeKind k) noexcept {
-    switch (k) {
-        case TypeKind::Bool: return "bool";
-        case TypeKind::I8:   return "i8";   case TypeKind::I16: return "i16";
-        case TypeKind::I32:  return "i32";  case TypeKind::I64: return "i64";
-        case TypeKind::I128: return "i128";
-        case TypeKind::U8:   return "u8";   case TypeKind::U16: return "u16";
-        case TypeKind::U32:  return "u32";  case TypeKind::U64: return "u64";
-        case TypeKind::U128: return "u128";
-        case TypeKind::F16:  return "f16";  case TypeKind::F32: return "f32";
-        case TypeKind::F64:  return "f64";  case TypeKind::F80: return "f80";
-        case TypeKind::F128: return "f128";
-        case TypeKind::Char: return "char"; case TypeKind::Byte: return "byte";
-        case TypeKind::Void: return "void";
-        case TypeKind::NullptrT: return "nullptr_t";  // C23 (debug-dump only)
-        default: return {};
-    }
+    return kHirTextPrimTable.nameOrEmpty(k);
 }
 [[nodiscard]] std::optional<TypeKind> primFromName(std::string_view s) noexcept {
-    if (s == "bool") return TypeKind::Bool;
-    if (s == "i8")   return TypeKind::I8;   if (s == "i16") return TypeKind::I16;
-    if (s == "i32")  return TypeKind::I32;  if (s == "i64") return TypeKind::I64;
-    if (s == "i128") return TypeKind::I128;
-    if (s == "u8")   return TypeKind::U8;   if (s == "u16") return TypeKind::U16;
-    if (s == "u32")  return TypeKind::U32;  if (s == "u64") return TypeKind::U64;
-    if (s == "u128") return TypeKind::U128;
-    if (s == "f16")  return TypeKind::F16;  if (s == "f32") return TypeKind::F32;
-    if (s == "f64")  return TypeKind::F64;  if (s == "f80") return TypeKind::F80;
-    if (s == "f128") return TypeKind::F128;
-    if (s == "char") return TypeKind::Char; if (s == "byte") return TypeKind::Byte;
-    if (s == "void") return TypeKind::Void;
-    if (s == "nullptr_t") return TypeKind::NullptrT;  // C23 (debug-dump only)
-    return std::nullopt;
+    return kHirTextPrimTable.fromName(s);
 }
 
 [[nodiscard]] std::optional<HirOpKind> coreOpFromName(std::string_view s) noexcept {
@@ -113,112 +173,161 @@ namespace {
     return std::nullopt;
 }
 
+// The six ATTRIBUTE vocabularies. Each table lists its `None`/`Default`
+// sentinel as ROW 0, which is what makes `EnumNameTable::name`'s row-0
+// fall-back reproduce the exact string the hand-written switches returned for an
+// out-of-range value — so `name()` is correct here, and `nameOrEmpty` (which the
+// prim table above needs) would be a behaviour change.
+inline constexpr EnumNameTable<FfiLinkage, 3> kHirTextFfiLinkageTable{{{
+    { FfiLinkage::Strong, "strong" },
+    { FfiLinkage::Weak,   "weak"   },
+    { FfiLinkage::Common, "common" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextFfiLinkageTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextFfiLinkageTable));
+
 [[nodiscard]] std::string_view ffiLinkageName(FfiLinkage l) noexcept {
-    switch (l) { case FfiLinkage::Strong: return "strong";
-                 case FfiLinkage::Weak:   return "weak";
-                 case FfiLinkage::Common: return "common"; }
-    return "strong";
-}
-[[nodiscard]] std::optional<FfiLinkage> ffiLinkageFromName(std::string_view s) noexcept {
-    if (s == "strong") return FfiLinkage::Strong;
-    if (s == "weak")   return FfiLinkage::Weak;
-    if (s == "common") return FfiLinkage::Common;
-    return std::nullopt;
-}
-[[nodiscard]] std::string_view ffiVisName(FfiVisibility v) noexcept {
-    switch (v) { case FfiVisibility::Default:   return "default";
-                 case FfiVisibility::Hidden:    return "hidden";
-                 case FfiVisibility::Protected: return "protected"; }
-    return "default";
-}
-[[nodiscard]] std::optional<FfiVisibility> ffiVisFromName(std::string_view s) noexcept {
-    if (s == "default")   return FfiVisibility::Default;
-    if (s == "hidden")    return FfiVisibility::Hidden;
-    if (s == "protected") return FfiVisibility::Protected;
-    return std::nullopt;
+    // The `-Werror=switch` backstop: it owns no spelling, and a new enumerator
+    // with no table row fails the BUILD instead of being written as `strong`.
+    switch (l) {
+        case FfiLinkage::Strong: case FfiLinkage::Weak: case FfiLinkage::Common:
+            break;
+    }
+    return kHirTextFfiLinkageTable.name(l);
 }
 
+inline constexpr EnumNameTable<FfiVisibility, 3> kHirTextFfiVisibilityTable{{{
+    { FfiVisibility::Default,   "default"   },
+    { FfiVisibility::Hidden,    "hidden"    },
+    { FfiVisibility::Protected, "protected" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextFfiVisibilityTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextFfiVisibilityTable));
+
+[[nodiscard]] std::string_view ffiVisName(FfiVisibility v) noexcept {
+    switch (v) {
+        case FfiVisibility::Default: case FfiVisibility::Hidden:
+        case FfiVisibility::Protected:
+            break;
+    }
+    return kHirTextFfiVisibilityTable.name(v);
+}
+
+inline constexpr EnumNameTable<ShaderStage, 7> kHirTextShaderStageTable{{{
+    { ShaderStage::None,        "none"         },
+    { ShaderStage::Vertex,      "vertex"       },
+    { ShaderStage::Fragment,    "fragment"     },
+    { ShaderStage::Compute,     "compute"      },
+    { ShaderStage::Geometry,    "geometry"     },
+    { ShaderStage::TessControl, "tess_control" },
+    { ShaderStage::TessEval,    "tess_eval"    },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextShaderStageTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextShaderStageTable));
+
 [[nodiscard]] std::string_view stageName(ShaderStage s) noexcept {
-    switch (s) { case ShaderStage::None: return "none";
-                 case ShaderStage::Vertex: return "vertex";
-                 case ShaderStage::Fragment: return "fragment";
-                 case ShaderStage::Compute: return "compute";
-                 case ShaderStage::Geometry: return "geometry";
-                 case ShaderStage::TessControl: return "tess_control";
-                 case ShaderStage::TessEval: return "tess_eval"; }
-    return "none";
+    switch (s) {
+        case ShaderStage::None: case ShaderStage::Vertex:
+        case ShaderStage::Fragment: case ShaderStage::Compute:
+        case ShaderStage::Geometry: case ShaderStage::TessControl:
+        case ShaderStage::TessEval:
+            break;
+    }
+    return kHirTextShaderStageTable.name(s);
 }
-[[nodiscard]] std::optional<ShaderStage> stageFromName(std::string_view s) noexcept {
-    if (s == "none") return ShaderStage::None;
-    if (s == "vertex") return ShaderStage::Vertex;
-    if (s == "fragment") return ShaderStage::Fragment;
-    if (s == "compute") return ShaderStage::Compute;
-    if (s == "geometry") return ShaderStage::Geometry;
-    if (s == "tess_control") return ShaderStage::TessControl;
-    if (s == "tess_eval") return ShaderStage::TessEval;
-    return std::nullopt;
-}
+
+inline constexpr EnumNameTable<ShaderBuiltin, 12> kHirTextShaderBuiltinTable{{{
+    { ShaderBuiltin::None,               "none"                 },
+    { ShaderBuiltin::Position,           "position"             },
+    { ShaderBuiltin::PointSize,          "point_size"           },
+    { ShaderBuiltin::VertexIndex,        "vertex_index"         },
+    { ShaderBuiltin::InstanceIndex,      "instance_index"       },
+    { ShaderBuiltin::FragCoord,          "frag_coord"           },
+    { ShaderBuiltin::FragDepth,          "frag_depth"           },
+    { ShaderBuiltin::FrontFacing,        "front_facing"         },
+    { ShaderBuiltin::GlobalInvocationId, "global_invocation_id" },
+    { ShaderBuiltin::LocalInvocationId,  "local_invocation_id"  },
+    { ShaderBuiltin::WorkgroupId,        "workgroup_id"         },
+    { ShaderBuiltin::NumWorkgroups,      "num_workgroups"       },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextShaderBuiltinTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextShaderBuiltinTable));
+
 [[nodiscard]] std::string_view builtinName(ShaderBuiltin b) noexcept {
-    switch (b) { case ShaderBuiltin::None: return "none";
-                 case ShaderBuiltin::Position: return "position";
-                 case ShaderBuiltin::PointSize: return "point_size";
-                 case ShaderBuiltin::VertexIndex: return "vertex_index";
-                 case ShaderBuiltin::InstanceIndex: return "instance_index";
-                 case ShaderBuiltin::FragCoord: return "frag_coord";
-                 case ShaderBuiltin::FragDepth: return "frag_depth";
-                 case ShaderBuiltin::FrontFacing: return "front_facing";
-                 case ShaderBuiltin::GlobalInvocationId: return "global_invocation_id";
-                 case ShaderBuiltin::LocalInvocationId: return "local_invocation_id";
-                 case ShaderBuiltin::WorkgroupId: return "workgroup_id";
-                 case ShaderBuiltin::NumWorkgroups: return "num_workgroups"; }
-    return "none";
+    switch (b) {
+        case ShaderBuiltin::None: case ShaderBuiltin::Position:
+        case ShaderBuiltin::PointSize: case ShaderBuiltin::VertexIndex:
+        case ShaderBuiltin::InstanceIndex: case ShaderBuiltin::FragCoord:
+        case ShaderBuiltin::FragDepth: case ShaderBuiltin::FrontFacing:
+        case ShaderBuiltin::GlobalInvocationId:
+        case ShaderBuiltin::LocalInvocationId: case ShaderBuiltin::WorkgroupId:
+        case ShaderBuiltin::NumWorkgroups:
+            break;
+    }
+    return kHirTextShaderBuiltinTable.name(b);
 }
-[[nodiscard]] std::optional<ShaderBuiltin> builtinFromName(std::string_view s) noexcept {
-    if (s == "none") return ShaderBuiltin::None;
-    if (s == "position") return ShaderBuiltin::Position;
-    if (s == "point_size") return ShaderBuiltin::PointSize;
-    if (s == "vertex_index") return ShaderBuiltin::VertexIndex;
-    if (s == "instance_index") return ShaderBuiltin::InstanceIndex;
-    if (s == "frag_coord") return ShaderBuiltin::FragCoord;
-    if (s == "frag_depth") return ShaderBuiltin::FragDepth;
-    if (s == "front_facing") return ShaderBuiltin::FrontFacing;
-    if (s == "global_invocation_id") return ShaderBuiltin::GlobalInvocationId;
-    if (s == "local_invocation_id") return ShaderBuiltin::LocalInvocationId;
-    if (s == "workgroup_id") return ShaderBuiltin::WorkgroupId;
-    if (s == "num_workgroups") return ShaderBuiltin::NumWorkgroups;
-    return std::nullopt;
-}
+
+inline constexpr EnumNameTable<TranspileIdiom, 6> kHirTextTranspileIdiomTable{{{
+    { TranspileIdiom::Default,     "default"      },
+    { TranspileIdiom::EarlyReturn, "early_return" },
+    { TranspileIdiom::GuardClause, "guard_clause" },
+    { TranspileIdiom::TernaryExpr, "ternary_expr" },
+    { TranspileIdiom::RangeFor,    "range_for"    },
+    { TranspileIdiom::WhileLoop,   "while_loop"   },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextTranspileIdiomTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextTranspileIdiomTable));
+
 [[nodiscard]] std::string_view idiomName(TranspileIdiom i) noexcept {
-    switch (i) { case TranspileIdiom::Default: return "default";
-                 case TranspileIdiom::EarlyReturn: return "early_return";
-                 case TranspileIdiom::GuardClause: return "guard_clause";
-                 case TranspileIdiom::TernaryExpr: return "ternary_expr";
-                 case TranspileIdiom::RangeFor: return "range_for";
-                 case TranspileIdiom::WhileLoop: return "while_loop"; }
-    return "default";
+    switch (i) {
+        case TranspileIdiom::Default: case TranspileIdiom::EarlyReturn:
+        case TranspileIdiom::GuardClause: case TranspileIdiom::TernaryExpr:
+        case TranspileIdiom::RangeFor: case TranspileIdiom::WhileLoop:
+            break;
+    }
+    return kHirTextTranspileIdiomTable.name(i);
 }
-[[nodiscard]] std::optional<TranspileIdiom> idiomFromName(std::string_view s) noexcept {
-    if (s == "default") return TranspileIdiom::Default;
-    if (s == "early_return") return TranspileIdiom::EarlyReturn;
-    if (s == "guard_clause") return TranspileIdiom::GuardClause;
-    if (s == "ternary_expr") return TranspileIdiom::TernaryExpr;
-    if (s == "range_for") return TranspileIdiom::RangeFor;
-    if (s == "while_loop") return TranspileIdiom::WhileLoop;
-    return std::nullopt;
-}
+
+inline constexpr EnumNameTable<HirRecovery, 4> kHirTextRecoveryTable{{{
+    { HirRecovery::None,        "none"        },
+    { HirRecovery::Substituted, "substituted" },
+    { HirRecovery::Dropped,     "dropped"     },
+    { HirRecovery::Synthesized, "synthesized" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextRecoveryTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextRecoveryTable));
+
 [[nodiscard]] std::string_view recoveryName(HirRecovery r) noexcept {
-    switch (r) { case HirRecovery::None: return "none";
-                 case HirRecovery::Substituted: return "substituted";
-                 case HirRecovery::Dropped: return "dropped";
-                 case HirRecovery::Synthesized: return "synthesized"; }
-    return "none";
-}
-[[nodiscard]] std::optional<HirRecovery> recoveryFromName(std::string_view s) noexcept {
-    if (s == "none") return HirRecovery::None;
-    if (s == "substituted") return HirRecovery::Substituted;
-    if (s == "dropped") return HirRecovery::Dropped;
-    if (s == "synthesized") return HirRecovery::Synthesized;
-    return std::nullopt;
+    switch (r) {
+        case HirRecovery::None: case HirRecovery::Substituted:
+        case HirRecovery::Dropped: case HirRecovery::Synthesized:
+            break;
+    }
+    return kHirTextRecoveryTable.name(r);
 }
 
 [[nodiscard]] bool isExprKind(HirKind k) noexcept {
@@ -471,18 +580,49 @@ private:
             }
             // D5.5: enum is nominal-by-name; underlying TypeKind lives in
             // scalars[0]. Round-trip the underlying explicitly when it
-            // diverges from the default I32 (`enum "E" : kindOrdinal`);
-            // omit the suffix when underlying = I32 to keep the common
-            // form readable. Parser defaults to I32 when the suffix is
+            // diverges from the default I32 (`enum "E" : u8`); omit the
+            // suffix when underlying = I32 to keep the common form
+            // readable. Parser defaults to I32 when the suffix is
             // absent — emission elision MUST stay in lockstep with the
             // parser default for round-trip correctness.
+            //
+            // ★★ THE UNDERLYING KIND IS SPELLED BY NAME, NOT BY ITS ORDINAL. This
+            // arm wrote `std::to_string(sc[0])` — the raw `TypeKind` integer — and
+            // the reader cast it back, which contradicts the rule `core_type.hpp`
+            // states at each of its three "appended so every pre-existing kind keeps
+            // its integer value" notes: NO TypeKind ordinal is serialized. The
+            // `wfloat` literal arm in this same file had already written the reason
+            // out — serialize "a STABLE semantic discriminator, NOT the
+            // version-fragile TypeKind ordinal". The name comes off
+            // `kHirTextPrimTable`, the table the rest of this grammar already reads
+            // in both directions
+            // (D-TEXT-TIER-ENUM-UNDERLYING-SERIALIZED-AS-A-TYPEKIND-ORDINAL).
             case TypeKind::Enum: {
                 out_ += "enum ";
                 out_ += quote(in.name(t));
                 auto sc = in.scalars(t);
                 if (!sc.empty() && static_cast<TypeKind>(sc[0]) != TypeKind::I32) {
-                    out_ += " : ";
-                    out_ += std::to_string(sc[0]);
+                    std::string_view const n = primName(static_cast<TypeKind>(sc[0]));
+                    if (n.empty()) {
+                        // No keyword for it ⇒ say so and emit NOTHING rather than a
+                        // number the reader would have to guess at. The text then
+                        // reads back as the plain `enum "N"` default, which is a
+                        // stated loss instead of a silent re-point.
+                        // Error, by this emitter's DEFAULT and for its stated
+                        // reason: output that does not read back as the module it
+                        // came from is not round-trippable, and `reporter
+                        // .hasErrors()` is how a caller learns that. The one
+                        // documented Warning exception here is the deliberately
+                        // absent interner, which is a MODE, not a loss.
+                        report(std::format(
+                            "enum '{}' has an underlying TypeKind (ordinal {}) this "
+                            "format has no keyword for; the underlying type is NOT "
+                            "rendered and the text reads back as the I32 default",
+                            in.name(t), sc[0]));
+                    } else {
+                        out_ += " : ";
+                        out_ += n;
+                    }
                 }
                 return;
             }
@@ -1138,7 +1278,37 @@ private:
             out_ += std::format("wfloat {} {} {}", bits, p.hi, p.lo);
             return;
         }
+        // ★★★ THE ARM THAT FALLS OFF THE END, AND IT WAS SILENT. Nine of
+        // `HirLiteralValue`'s TEN variant arms are spelled above; the tenth —
+        // `HirAggregateValue`, the D5.3 folded struct/union/array constant — has no
+        // spelling in this format, and with no final arm here it rendered NOTHING:
+        // `lit ` followed straight by the type annotation, the whole constant
+        // dropped, no diagnostic on either side. The MIR tier spells its aggregate
+        // arm (`agg { … }`) and this one does not, so the two text tiers of one
+        // compiler disagree about what is serializable
+        // (D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM).
+        //
+        // ★ ONE TOKEN AND IDENTIFIER-SHAPED, for the reason the MIR emitter's
+        // `<asm-descriptor-unspelled>` marker states FROM MEASUREMENT: the parser's
+        // recovery re-tokenizes what follows a refusal, and prose in the output can
+        // hand it a real keyword. Identifier-shaped (not `<…>`, which this lexer
+        // splits into seven tokens) so it arrives at `parseLiteralValue`'s tag
+        // dispatch as ONE token and is refused THERE, by name, with the reason.
+        report(std::format(
+            "this format has no spelling for an aggregate literal value (a folded "
+            "struct/union/array constant); rendered as '{}', which the reader "
+            "REFUSES", kHirTextUnspelledAggregateTag));
+        out_ += kHirTextUnspelledAggregateTag;
     }
+
+    // The count is the guard the chain above cannot give itself: every arm returns,
+    // so "did I cover them all" is not something the compiler checks. Adding an arm
+    // to `HirLiteralValue::value` now FAILS THE BUILD here, naming this writer,
+    // instead of serializing the new value as nothing.
+    static_assert(std::variant_size_v<decltype(HirLiteralValue::value)> == 10,
+                  "HirLiteralValue gained (or lost) a variant arm — add its "
+                  "spelling to appendLiteralValue AND its tag to "
+                  "parseLiteralValue, then update this count");
 
     void appendOpName(std::uint32_t payload) {
         if (isCoreOp(payload)) out_ += opName(decodeCoreOp(payload));
@@ -1561,6 +1731,19 @@ private:
             TypeKind const k = (bits == 128) ? TypeKind::F128 : TypeKind::F80;
             v.value = WideFloatValue::fromPacked(lo, hi, k);
         }
+        else if (tag == kHirTextUnspelledAggregateTag) {
+            // The writer's own marker for a value it could not serialize (a D5.3
+            // folded struct/union/array constant). Refused BY NAME with the reason,
+            // rather than falling into the generic "unknown tag" arm: the author of
+            // this text did not typo a tag, they hit a stated limit of the format,
+            // and a reader that cannot tell those apart sends them looking for a
+            // spelling error that is not there.
+            malformed(std::format(
+                "'{}' marks an aggregate literal the .dsshir writer had no spelling "
+                "for — the value was NOT serialized, so this text cannot be read "
+                "back into the module it came from",
+                kHirTextUnspelledAggregateTag));
+        }
         else malformed(std::format("unknown literal value tag '{}'", tag));
         return v;
     }
@@ -1596,14 +1779,26 @@ private:
         d.actual = std::move(detail);
         reporter_.report(std::move(d));
     }
-    // Resolve a parsed enum-name `opt`; report (not silently default) on a miss so
-    // an unrecognized token can never coerce to a wrong value and silently diverge
-    // on re-emit. Mirrors parseOp's unknown-operator handling.
-    template <class E>
-    [[nodiscard]] E orMalformed(std::optional<E> opt, std::string_view name,
-                                char const* what, E dflt) {
-        if (opt) return *opt;
-        malformed(std::format("unknown {} '{}'", what, name));
+    // Resolve a parsed enum name against the vocabulary's OWN table; report (not
+    // silently default) on a miss so an unrecognized token can never coerce to a
+    // wrong value and silently diverge on re-emit. Mirrors parseOp's
+    // unknown-operator handling.
+    //
+    // ★ THE TABLE IS THE PARAMETER, NOT AN ALREADY-RESOLVED `std::optional`.
+    // This used to take the result of a hand-written `…FromName` if-chain and
+    // report `unknown {what} '{name}'` — a refusal that named NO ACCEPTED SET AT
+    // ALL, so an author holding a `.dsshir` with a typo'd attribute learned only
+    // that their name was wrong, never what the reader would have taken. Passing
+    // the TABLE makes the lookup and the advertised set come off the same rows,
+    // so the message cannot be narrower, wider or staler than the check: there
+    // is no second copy of the set to go stale
+    // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+    template <class E, std::size_t N>
+    [[nodiscard]] E orMalformed(EnumNameTable<E, N> const& table,
+                                std::string_view name, char const* what, E dflt) {
+        if (auto const v = table.fromName(name)) return *v;
+        malformed(std::format("unknown {} '{}' — accepted: {}", what, name,
+                              detail::renderAllowedList(allNames(table))));
         return dflt;
     }
     void recordIndex(std::uint32_t idx, HirNodeId id) {
@@ -1745,8 +1940,8 @@ private:
         FfiMetadata m;
         for (;;) {
             if (acceptKeyword("name")) m.mangledName = takeStr();
-            else if (acceptKeyword("link")) { std::string n = takeIdent(); m.linkage = orMalformed(ffiLinkageFromName(n), n, "ffi linkage", FfiLinkage::Strong); }
-            else if (acceptKeyword("vis")) { std::string n = takeIdent(); m.visibility = orMalformed(ffiVisFromName(n), n, "ffi visibility", FfiVisibility::Default); }
+            else if (acceptKeyword("link")) { std::string n = takeIdent(); m.linkage = orMalformed(kHirTextFfiLinkageTable, n, "ffi linkage", FfiLinkage::Strong); }
+            else if (acceptKeyword("vis")) { std::string n = takeIdent(); m.visibility = orMalformed(kHirTextFfiVisibilityTable, n, "ffi visibility", FfiVisibility::Default); }
             else if (acceptKeyword("lib")) m.importLibrary = takeStr();
             else if (acceptKeyword("soname")) m.soname = takeStr();
             else if (acceptKeyword("version")) m.version = takeStr();  // c156
@@ -1758,8 +1953,8 @@ private:
     [[nodiscard]] ShaderIntrinsic parseShader() {
         ShaderIntrinsic m;
         for (;;) {
-            if (acceptKeyword("stage")) { std::string n = takeIdent(); m.stage = orMalformed(stageFromName(n), n, "shader stage", ShaderStage::None); }
-            else if (acceptKeyword("builtin")) { std::string n = takeIdent(); m.builtin = orMalformed(builtinFromName(n), n, "shader builtin", ShaderBuiltin::None); }
+            if (acceptKeyword("stage")) { std::string n = takeIdent(); m.stage = orMalformed(kHirTextShaderStageTable, n, "shader stage", ShaderStage::None); }
+            else if (acceptKeyword("builtin")) { std::string n = takeIdent(); m.builtin = orMalformed(kHirTextShaderBuiltinTable, n, "shader builtin", ShaderBuiltin::None); }
             else if (acceptKeyword("wg")) {
                 m.workgroup.x = static_cast<std::uint32_t>(takeInt());
                 m.workgroup.y = static_cast<std::uint32_t>(takeInt());
@@ -1780,7 +1975,7 @@ private:
         for (;;) {
             if (acceptKeyword("target")) m.targetLanguage = takeStr();
             else if (acceptKeyword("override")) m.overrideKind = takeStr();
-            else if (acceptKeyword("idiom")) { std::string n = takeIdent(); m.idiom = orMalformed(idiomFromName(n), n, "transpile idiom", TranspileIdiom::Default); }
+            else if (acceptKeyword("idiom")) { std::string n = takeIdent(); m.idiom = orMalformed(kHirTextTranspileIdiomTable, n, "transpile idiom", TranspileIdiom::Default); }
             else break;
             if (!accept(Tk::Comma)) break;
         }
@@ -1790,7 +1985,7 @@ private:
         DiagnosticInfo info;
         for (;;) {
             if (acceptKeyword("code")) info.code = static_cast<DiagnosticCode>(static_cast<std::uint16_t>(takeInt()));
-            else if (acceptKeyword("recovery")) { std::string n = takeIdent(); info.recovery = orMalformed(recoveryFromName(n), n, "diag recovery", HirRecovery::None); }
+            else if (acceptKeyword("recovery")) { std::string n = takeIdent(); info.recovery = orMalformed(kHirTextRecoveryTable, n, "diag recovery", HirRecovery::None); }
             else if (acceptKeyword("origin")) { a.diagHasOrigin = true; a.diagOriginPre = static_cast<std::uint32_t>(takeInt()); }
             else if (acceptKeyword("detail")) info.detail = takeStr();
             else break;
@@ -2418,10 +2613,25 @@ private:
             std::string name = takeStr();
             TypeKind underlying = TypeKind::I32;
             if (accept(Tk::Colon)) {
-                std::uint64_t const ord = takeInt();
-                if (ord < static_cast<std::uint64_t>(TypeKind::Count_)) {
-                    underlying = static_cast<TypeKind>(ord);
-                }
+                // ⚠ FAIL LOUD. This read an ordinal and kept `I32` when it fell
+                // outside `Count_` — a SUCCESSFUL parse of `enum "E" : 9999` that
+                // returned an enumeration with the WRONG underlying type and no
+                // diagnostic, on a decoder `parseTypeFromText` puts on the shipped
+                // FFI-descriptor and builtin-signature paths. The range check was
+                // the tell: it is the half of a validation whose other half — the
+                // refusal — was never written, and an in-range ordinal naming a
+                // NON-integer kind slipped through it untouched. `orMalformed`
+                // projects the accepted set off the same table the lookup uses
+                // (D-TEXT-TIER-ENUM-UNDERLYING-SERIALIZED-AS-A-TYPEKIND-ORDINAL).
+                //
+                // ⓘ WHETHER THE NAMED KIND IS AN INTEGER IS NOT DECIDED HERE. The
+                // semantic tier already owns that rule (`S_InvalidEnumUnderlyingType`,
+                // c-subset.lang.json's `enumUnderlyingType`); re-deciding it in the
+                // text reader would be a second owner of one fact, which is the
+                // defect this whole file has been closing.
+                std::string const n = takeIdent();
+                underlying = orMalformed(kHirTextPrimTable, n,
+                                         "enum underlying type", TypeKind::I32);
             }
             return interner_.enumType(name, underlying); }
         if (kw == "fn") {
@@ -2440,7 +2650,7 @@ private:
             expect(Tk::RParen, "')'");
             expect(Tk::Arrow, "'->'"); TypeId result = parseType();
             CallConv cc = CallConv::CcSysV;
-            if (acceptKeyword("cc")) { std::string n = takeIdent(); cc = orMalformed(callConvFromName(n), n, "calling convention", CallConv::CcSysV); }
+            if (acceptKeyword("cc")) { std::string n = takeIdent(); cc = orMalformed(kCallConvTable, n, "calling convention", CallConv::CcSysV); }
             return interner_.fnSig(params, result, cc, isVariadic);
         }
         if (kw == "ext") {

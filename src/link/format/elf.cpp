@@ -6,6 +6,7 @@
 #include "core/types/symbol_attrs.hpp"  // isExternallyVisible (ET_DYN exports)
 #include "link/format/byte_emit.hpp"
 #include "link/format/dwarf_cfi.hpp"
+#include "link/format/elf_symtab_partition.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
@@ -91,6 +92,7 @@ constexpr std::uint16_t SHN_UNDEF = 0;
     }
     return STB_GLOBAL;  // unreachable: SymbolBinding is a closed 3-value enum
 }
+
 
 // Elf64 sh_type / sh_flags (gABI 4.7-4.8) — used by the dynamic
 // walker (cycle 2b.2). Named to match `<elf.h>`; type-design #2
@@ -1574,6 +1576,31 @@ encodeElfExecDynamic(
 
     std::uint64_t const dynsymOff = alignUp(pltOff + pltSize, 8);
     std::uint64_t const dynsymVa  = baseImageVa + dynsymOff;
+    // `.dynsym.sh_info` = the first non-LOCAL index, DERIVED from the emitted
+    // `.dynsym` exactly as `.symtab`'s is, and then VERIFIED with the same
+    // predicate — the two tables share Elf64_Sym's layout and the gABI's
+    // local-before-global rule, so they get one implementation, not two.
+    // It was the literal `1` until this cycle: true today (only STN_UNDEF is
+    // local) and the last boundary constant of exactly the class this change
+    // set out to derive, sitting outside the `.symtab` checker's reach.
+    std::uint32_t firstNonLocalDynsymIdx =
+        static_cast<std::uint32_t>(dynsym.size() / 24);
+    for (std::size_t i = 0; i < dynsym.size() / 24; ++i) {
+        if ((dynsym[i * 24 + 4] >> 4) != STB_LOCAL) {
+            firstNonLocalDynsymIdx = static_cast<std::uint32_t>(i);
+            break;
+        }
+    }
+    if (std::string const breach = link::format::elfSymtabPartitionBreach(
+            dynsym, firstNonLocalDynsymIdx);
+        !breach.empty()) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "elf::encodeElfExecDynamic: the `.dynsym` local/global partition "
+             "is malformed — " + breach
+                 + ". ld.so reads sh_info to find the first global; a wrong "
+                   "boundary mis-resolves every dynamic symbol after it.");
+        return {};
+    }
     std::uint64_t const dynsymSz  = dynsym.size();
 
     std::uint64_t const dynstrOff = dynsymOff + dynsymSz;
@@ -1942,9 +1969,32 @@ encodeElfExecDynamic(
     appendSymtabEntry(0, 0, 0, 0, 0);                  // STN_UNDEF
     // shndx = IDX_TEXT (c150 — computed, not the pre-dyn literal 2:
     // the ET_DYN image has no `.interp`, shifting `.text` to 1).
+    // st_value = `.text`'s LOAD ADDRESS, not 0. gABI 4.18 makes st_value a
+    // VIRTUAL ADDRESS for a defined symbol in an executable or shared object,
+    // and a section symbol is a defined symbol; only a RELOCATABLE file's
+    // st_value is a section offset. Same rule, same reason and same cycle as
+    // D-LINK-ELF-STATIC-EXEC-SYMTAB-ST-VALUE-NOT-A-VA — that anchor's fix
+    // covered the FUNCTION symbols in the static arm and left this one behind,
+    // which is the half-done shape the anchor exists to stop.
+    // ⚠ THERE IS NO REFERENCE VALUE TO COPY, so this is gABI's definition and
+    // not a match: ✔MEASURED with binutils 2.42 on WSL, `readelf -sW` over a
+    // gcc `-shared` `.so`, a gcc `-no-pie` exec and a gcc PIE exec finds
+    // ZERO STT_SECTION rows in `.symtab` in all three — references emit none
+    // at all. Emitting none is therefore also defensible; emitting one whose
+    // address is a lie is not. The row is kept because the ET_REL arm needs it
+    // at a fixed index (`kTextSectionSymIdx`, every `.rela.eh_frame` FDE names
+    // it) and one shape across both arms is what keeps that index honest.
     appendSymtabEntry(0, makeStInfo(STB_LOCAL, STT_SECTION),
-                      IDX_TEXT, 0, 0);
-    std::uint32_t const firstNonLocal = 2;
+                      IDX_TEXT, textVa, 0);
+    // `.symtab.sh_info` = the first non-LOCAL index = the count of the LOCAL
+    // prefix. DERIVED from the bytes just emitted rather than written as a
+    // literal `2`: every symbol appended below is non-local, so the two are
+    // equal today, but a literal encodes an assumption about the emission
+    // ABOVE it that nothing rechecks — and this arm is where the ordering
+    // hazard lives (see `elfSymtabPartitionBreach`, called once the table is
+    // complete).
+    std::uint32_t const firstNonLocal =
+        static_cast<std::uint32_t>(symtab.size() / 24);
     // Real DECLARED function names in the FINAL IMAGE's `.symtab`, from the
     // format-neutral `module.symbols` carrier through the shared
     // `ObjectSymbolNames` owner — the SAME table the (b.7) `.dynsym` export set
@@ -1963,21 +2013,67 @@ encodeElfExecDynamic(
     // functions[0] and carries no `ModuleSymbol` row. See `imageName`'s docblock.
     //
     // ★ THE BINDING IS DELIBERATELY UNCHANGED (STB_GLOBAL for every function,
-    // and `firstNonLocal` stays 2 because of it). gcc emits a static as
-    // STB_LOCAL, and matching that is a REAL improvement — but it would move
-    // statics into a local-first prefix and make this hardcoded `2` wrong, so it
-    // is its own change with its own witness, not a silent rider on the names:
+    // which is also why the derived `firstNonLocal` above comes out at 2). gcc
+    // emits a static as STB_LOCAL, and matching that is a REAL improvement — but
+    // it would move statics into a local-first prefix, so it is its own change
+    // with its own witness, not a silent rider on the names:
     // D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL.
+    //
+    // ── EVERY name bound to the atom, not just the canonical one ───────────
+    // D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB, IMAGE tier. One
+    // `SymbolId` can carry several `module.symbols` rows (equal-offset defined
+    // symbols collapse to ONE atom under several names —
+    // D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS), and `imageName`
+    // is first-row-wins because a `.symtab` entry needs exactly one answer. The
+    // later rows were therefore dropped from every FINAL IMAGE.
+    //
+    // ⚠ THE TWO SURFACES DISAGREED, AND ONLY ON ET_DYN. The `.dynsym` export
+    // set at (b.7) ABOVE walks `module.symbols` row by row, so it already
+    // carried BOTH names — but it is built under `if (isDyn)`, i.e. for a `.so`
+    // and a PIE only; an ET_EXEC's `.dynsym` stays imports-only and exports
+    // nothing (its own comment there says exactly that). ✔MEASURED on a
+    // DSS-written `.so` with binutils 2.42: before this change `nm -D` listed
+    // both names and `nm` listed one. On an ET_EXEC there was no such
+    // contradiction — just the plain loss of the second name to `nm`, `gdb`
+    // and every profiler. Either way the fix is the same and it is here.
+    //
+    // The alias carries ITS OWN binding: ELF says this per SYMBOL in st_info, so
+    // a WEAK alias of a GLOBAL definition (what gcc emits for
+    // `__attribute__((weak, alias("strong_fn")))`) needs nothing special. It is
+    // emitted at the canonical's shndx / st_value / st_size — one address, one
+    // extent; a zero-size alias would invite a dead-strip.
     link::format::ObjectSymbolNames const imgNames{module};
     for (std::size_t i = 0; i < module.functions.size(); ++i) {
         auto const& fn = module.functions[i];
         std::string const name = imgNames.imageName(fn.symbol, "sym_");
         std::uint32_t const nameOff = strtab.add(name);
+        std::uint64_t const symVa   = textVa + funcTextStart[i];
         appendSymtabEntry(nameOff,
                           makeStInfo(STB_GLOBAL, STT_FUNC),
                           IDX_TEXT,
-                          textVa + funcTextStart[i],
+                          symVa,
                           fn.bytes.size());
+        for (ModuleSymbol const* alias : imgNames.definedAliases(fn.symbol)) {
+            appendSymtabEntry(strtab.add(alias->name),
+                              makeStInfo(stbForBinding(alias->binding),
+                                         STT_FUNC),
+                              IDX_TEXT, symVa, fn.bytes.size());
+        }
+    }
+    // The finished partition, checked rather than assumed — see
+    // `elfSymtabPartitionBreach`. The alias pass above is the one emission here
+    // that is not driven by a binding-ordered walk, so this is where a future
+    // Local-resolving alias row would break the section header's own claim.
+    if (std::string const breach =
+            link::format::elfSymtabPartitionBreach(symtab, firstNonLocal);
+        !breach.empty()) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "elf::encodeElfExecDynamic: the `.symtab` local/global partition "
+             "is malformed — " + breach
+                 + ". ELF requires every STB_LOCAL symbol to precede sh_info; "
+                   "emitting this image would silently mis-partition in ld, "
+                   "readelf, nm and gdb.");
+        return {};
     }
 
     StringTable shstrtab;
@@ -2734,7 +2830,7 @@ encodeElfExecDynamic(
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsDynsym, .type = SHT_DYNSYM, .flags = SHF_ALLOC,
         .addr = dynsymVa, .offset = dynsymOff, .size = dynsymSz,
-        .link = IDX_DYNSTR, .info = 1 /*first non-local symtab idx*/,
+        .link = IDX_DYNSTR, .info = firstNonLocalDynsymIdx,
         .addr_align = 8, .entry_size = 24});
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsDynstr, .type = SHT_STRTAB, .flags = SHF_ALLOC,
@@ -3626,8 +3722,42 @@ encode(AssembledModule const&    module,
     // than a re-derivation because the symbol is emitted unconditionally at
     // a fixed position; the static_assert-style guard is the append order
     // itself (STN_UNDEF at 0, this at 1, everything else after).
+    // ── st_value's MEANING IS TIER-DEPENDENT (gABI 4.18) ──────────────────
+    //
+    // "In relocatable files, st_value holds a section offset […] In executable
+    // and shared object files, st_value holds a virtual address." Every
+    // `.text`-resident symbol below is placed by its offset within `.text`, so
+    // the image tier needs `.text`'s own load address added — the SAME
+    // `secText->virtualAddress` this arm already uses for `sh_addr`
+    // (`hText.addr`), for `e_entry`, and for the `symbolVa` map the in-place
+    // relocation applier reads.
+    //
+    // ✔MEASURED 2026-08-20:
+    // D-LINK-ELF-STATIC-EXEC-SYMTAB-ST-VALUE-NOT-A-VA
+    // this arm emitted the raw offset in an ET_EXEC, so the first
+    // function's symbol read `st_value = 0` in an image whose `.text` sits at
+    // `sh_addr = secText->virtualAddress`. `nm`/`gdb`/a profiler would place
+    // every function near address zero — the address column of exactly the
+    // defect D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS fixed the
+    // NAME column of. Nothing inside DSS reads an image's `.symtab` (the object
+    // reader refuses non-ET_REL and entry resolution re-derives from the
+    // SymbolId), which is why it survived: the only readers are external.
+    // ⚠ The DYNAMIC image arm never had this — `encodeElfExecDynamic` writes
+    // `textVa + funcTextStart[i]` — and because every shipped exec/PIE format
+    // spells `processExit` as a by-name import, every REAL executable takes that
+    // arm. This one is reachable only with zero extern imports.
+    //
+    // `isExec` is an artifact-KIND question answered by the loaded schema, not a
+    // format/target/language identity test.
+    std::uint64_t const symtabValueBase =
+        isExec ? secText->virtualAddress : std::uint64_t{0};
+
+    // st_value = the VA in an image, 0 (a section offset) in a `.o` — the
+    // section symbol obeys the SAME gABI 4.18 rule as every other defined
+    // symbol here. See the dynamic arm's matching note for the measurement
+    // that no reference emits this row at all.
     appendSym(0, makeStInfo(STB_LOCAL, STT_SECTION),
-              0, /*shndx=.text*/ 1, 0, 0);
+              0, /*shndx=.text*/ 1, symtabValueBase, 0);
     if (symtab.size() / 24 != kTextSectionSymIdx + 1u) {
         emit(reporter, DiagnosticCode::K_SymbolUndefined,
              std::format("elf::encode: the .text STT_SECTION symbol landed at "
@@ -3640,6 +3770,7 @@ encode(AssembledModule const&    module,
 
     // Map each SymbolId to its symtab index (for relocs).
     std::unordered_map<SymbolId, std::uint32_t> symIdxBySymbol;
+
 
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols (the `&&label`
     // block-address `lea` relocation sources) are intra-module DEFINED
@@ -3667,7 +3798,8 @@ encode(AssembledModule const&    module,
                 static_cast<std::uint32_t>(symtab.size() / 24);
             appendSym(nameOff, makeStInfo(STB_LOCAL, STT_NOTYPE), 0,
                       /*shndx=.text*/ 1,
-                      funcTextStart[fi] + bs.blockByteOffset, 0);
+                      symtabValueBase + funcTextStart[fi] + bs.blockByteOffset,
+                      0);
             symIdxBySymbol.emplace(bs.symbol, idx);
         }
     }
@@ -3708,6 +3840,30 @@ encode(AssembledModule const&    module,
         return isExec ? SymbolBinding::Global : objNames.definedBinding(id);
     };
 
+    // ── ALIAS SITES — D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB ──
+    //
+    // Where each defined symbol ENDED UP, recorded as its canonical row is
+    // emitted, so the extra names bound to the same atom can be emitted at the
+    // identical shndx / st_value / st_size afterwards.
+    //
+    // ★ WHY A SEPARATE PASS RATHER THAN "right after the canonical". ELF is
+    // the ONE format here with a binding-driven ORDERING rule: `.symtab`
+    // sh_info is snapshotted BETWEEN the LOCAL pass and the GLOBAL pass, so a
+    // symbol must be emitted in the pass matching ITS OWN binding. A canonical
+    // may be Local (a `static` carved to `sym_<id>`) while an alias of it is
+    // Global — emitting the alias beside its canonical would put a non-local
+    // symbol before sh_info, which makes the section's own header lie about
+    // where the locals end. `definedAliases` only yields externally-visible
+    // rows, so every alias belongs to the GLOBAL pass and is emitted there.
+    struct AliasSite {
+        SymbolId      symId{};
+        std::uint16_t shndx = 0;
+        std::uint64_t value = 0;
+        std::uint64_t size  = 0;
+        std::uint8_t  type  = 0;   // STT_FUNC / STT_OBJECT
+    };
+    std::vector<AliasSite> aliasSites;
+
     // Emit one defined FUNCTION symbol (STT_FUNC, shndx=.text).
     //
     // NAME: both tiers read the ONE format-neutral `module.symbols` carrier
@@ -3729,10 +3885,15 @@ encode(AssembledModule const&    module,
         std::uint32_t const nameOff = strtab.add(symName);
         std::uint32_t const idx =
             static_cast<std::uint32_t>(symtab.size() / 24);
+        // st_value: a VA in an image, a `.text` offset in a `.o` — see
+        // `symtabValueBase`.
+        std::uint64_t const stValue = symtabValueBase + f.valueInText;
         appendSym(nameOff,
                   makeStInfo(stbForBinding(definedFuncBinding(f.symId)), STT_FUNC),
-                  0, /*shndx=.text*/ 1, f.valueInText, f.size);
+                  0, /*shndx=.text*/ 1, stValue, f.size);
         symIdxBySymbol.emplace(f.symId, idx);
+        aliasSites.push_back({f.symId, /*shndx=*/1, stValue, f.size,
+                              STT_FUNC});
     };
 
     // Emit the defined DATA symbols of ONE binding class (`wantLocal` selects
@@ -3777,6 +3938,9 @@ encode(AssembledModule const&    module,
                           0, sectionIdx, layout.itemOffsets[j],
                           di.sizeInSection());
                 symIdxBySymbol.emplace(di.symbol, idx);
+                aliasSites.push_back({di.symbol, sectionIdx,
+                                      layout.itemOffsets[j],
+                                      di.sizeInSection(), STT_OBJECT});
             }
         };
 
@@ -3808,6 +3972,34 @@ encode(AssembledModule const&    module,
         if (hasBss)    emitDataSyms(bssLayout,    IDX_BSS,    /*wantLocal=*/false);
     }
 
+    // Extra names bound to an already-emitted atom, at the SAME shndx /
+    // st_value / st_size, each with ITS OWN binding (ELF says this per SYMBOL
+    // through st_info, so a WEAK alias of a GLOBAL definition — the shape gcc
+    // emits for `__attribute__((weak, alias("strong_fn")))` — needs nothing
+    // special). NOT registered in `symIdxBySymbol`: aliases share a `SymbolId`
+    // by design and a relocation must resolve to exactly one index, so the map
+    // keeps naming the CANONICAL row. ⚠ That is also why this cannot be folded
+    // into `emitFuncSym`: its `emplace` is first-wins, and once ordering is
+    // binding-driven "first" stops meaning "canonical".
+    //
+    // ★ BOTH TIERS, ONE PASS — the ET_REL `.o` AND the ET_EXEC image. The image
+    // half is the same defect one level narrower: a final image's `.symtab` is
+    // what `nm`, `gdb` and every profiler read, and dropping the second name
+    // there loses exactly what `imageName` was added to preserve. It is NOT
+    // `isExec`-gated for the same reason `imageName` is not: nothing re-links an
+    // image, so a second name at one address costs nothing and answers the
+    // question a debugger is asking. (`aliasSites` for an image holds functions
+    // only — the exec arm emits no DATA symbols here at all,
+    // D-LINK-ELF-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB.)
+    for (auto const& site : aliasSites) {
+        for (ModuleSymbol const* alias : objNames.definedAliases(site.symId)) {
+            std::uint32_t const aliasNameOff = strtab.add(alias->name);
+            appendSym(aliasNameOff,
+                      makeStInfo(stbForBinding(alias->binding), site.type),
+                      0, site.shndx, site.value, site.size);
+        }
+    }
+
     // Undefined extern symbols referenced by any relocation but not
     // defined by any function. ET_EXEC has no extern symbols at this
     // point — the cycle-1 reloc-application pass above failed loud on
@@ -3837,6 +4029,22 @@ encode(AssembledModule const&    module,
             for (auto const& rel : fn.relocations) emitExternForReloc(rel);
         for (auto const& di : module.dataItems)
             for (auto const& rel : di.relocations) emitExternForReloc(rel);
+    }
+
+    // The finished partition, checked rather than assumed — see
+    // `elfSymtabPartitionBreach`. `firstNonLocalSymIdx` was snapshotted between the
+    // LOCAL and GLOBAL passes; the alias pass and the extern pass both append
+    // AFTER it, so this is the guard that keeps those two honest.
+    if (std::string const breach = link::format::elfSymtabPartitionBreach(
+            symtab, firstNonLocalSymIdx);
+        !breach.empty()) {
+        emit(reporter, DiagnosticCode::K_SymbolUndefined,
+             "elf::encode: the `.symtab` local/global partition is malformed — "
+                 + breach
+                 + ". ELF requires every STB_LOCAL symbol to precede sh_info; "
+                   "emitting this object would silently mis-partition in ld, "
+                   "readelf, nm and gdb.");
+        return {};
     }
 
     // ── Build .rela.text ───────────────────────────────────────

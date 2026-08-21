@@ -157,6 +157,15 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   is the task not being done.** Before writing ANY row, answer in one sentence: *is this the work I
   was sent to do?* If yes, the row is forbidden and the work is mandatory. That cycle's 22 committed
   rows over five commits are the same arithmetic at a slower rate.
+
+  ⓘ ANCHOR-GUARD-QUOTED-NOT-CITED: `D-PP-COMPILER-IDENTITY-INCOHERENT` `D-PP-IMPL-DETAIL-PREDEFINES-ABSENT` `D-PP-CODE-MODEL-PREDEFINES`
+  — the three ids in the paragraph above are **quoted, not cited**. They name rows that were correctly
+  DELETED, so they resolve to nothing **by design**, and the sentence only carries weight because they
+  are the real names. They must not be given rows, allowlisted, or blurred into placeholders to make a
+  tool green: the record is the authority, the guard is the instrument. The anchor guard exempts them
+  **in this file only**, and reds if any of them is ever cited elsewhere, acquires a plan row, or stops
+  appearing above — see the QUOTED-NOT-CITED block in
+  `scripts/check-anchor-registry/check-anchor-registry.sh`.
 - **★ FOUR ROWS THAT LOOK DIFFERENT AND ARE THE SAME ROW.** Before appending, grep the registry for
   the SYMPTOM, the ARTEFACT and the FILE NAMES in your evidence — not the title you have in mind
   (§C.-1 1b). Nine rows about one absent macro family is one row, or better, one fix.

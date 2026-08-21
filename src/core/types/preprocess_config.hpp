@@ -52,6 +52,11 @@ inline constexpr EnumNameTable<PredefinedMacroKind, 5> kPredefinedMacroKindTable
     { PredefinedMacroKind::Time,     "time"     },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kPredefinedMacroKindTable);
+
 [[nodiscard]] constexpr std::string_view
 predefinedMacroKindName(PredefinedMacroKind k) noexcept {
     return kPredefinedMacroKindTable.name(k);
@@ -212,6 +217,11 @@ inline constexpr EnumNameTable<ImpliedSurfaceKind, 3> kImpliedSurfaceKindTable{{
     { ImpliedSurfaceKind::NotExpressible, "not-expressible" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kImpliedSurfaceKindTable);
+
 [[nodiscard]] constexpr std::string_view
 impliedSurfaceKindName(ImpliedSurfaceKind k) noexcept {
     return kImpliedSurfaceKindTable.name(k);
@@ -248,6 +258,11 @@ inline constexpr EnumNameTable<ClaimsNothingReason, 3> kClaimsNothingReasonTable
     { ClaimsNothingReason::ArchProperty,    "arch-property"     },
     { ClaimsNothingReason::StandardDefined, "standard-defined"  },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kClaimsNothingReasonTable);
 
 [[nodiscard]] constexpr std::string_view
 claimsNothingReasonName(ClaimsNothingReason r) noexcept {

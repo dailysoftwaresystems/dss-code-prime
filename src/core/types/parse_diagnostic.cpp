@@ -522,6 +522,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_ProgramEntryAmbiguous";
         case DiagnosticCode::K_UnwindRuleUnrepresentable:
             return "K_UnwindRuleUnrepresentable";
+        case DiagnosticCode::K_FormatLacksWeakDefinitionDialect:
+            return "K_FormatLacksWeakDefinitionDialect";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

@@ -107,6 +107,11 @@ inline constexpr EnumNameTable<EntryParamShape, 4> kEntryParamShapeTable{{{
     { EntryParamShape::PtrPtrU16,  "ptr-ptr-u16"  },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kEntryParamShapeTable);
+
 [[nodiscard]] constexpr std::string_view
 entryParamShapeName(EntryParamShape p) noexcept {
     return kEntryParamShapeTable.name(p);
@@ -115,6 +120,19 @@ entryParamShapeName(EntryParamShape p) noexcept {
 entryParamShapeFromName(std::string_view s) noexcept {
     return kEntryParamShapeTable.fromName(s);
 }
+
+// The shapes a language file may actually DECLARE — the table minus the
+// sentinel, which `fromName("none")` resolves but every loader then refuses.
+// A loader's "accepted: …" half renders THIS, never a retyped list: the
+// retyped one advertises whatever the enum looked like on the day it was
+// typed (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET). The
+// `3` is checked by `namesWhere` at compile time.
+[[nodiscard]] constexpr bool
+isDeclarableEntryParamShape(EntryParamShape p) noexcept {
+    return p != EntryParamShape::None;
+}
+inline constexpr auto kDeclarableEntryParamShapeNames =
+    namesWhere<3>(kEntryParamShapeTable, isDeclarableEntryParamShape);
 
 // The entry's RETURN shape. Only `i32` is declared, and the omission of `void`
 // is the point: C23 5.1.2.2.1 says main's return type "shall be int", so
@@ -131,6 +149,11 @@ inline constexpr EnumNameTable<EntryReturnShape, 2> kEntryReturnShapeTable{{{
     { EntryReturnShape::None, "none" },
     { EntryReturnShape::I32,  "i32"  },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kEntryReturnShapeTable);
 
 [[nodiscard]] constexpr std::string_view
 entryReturnShapeName(EntryReturnShape r) noexcept {
@@ -184,6 +207,11 @@ kEntryMaterializationTable{{{
     { EntryMaterialization::ArgcArgv,  "argc-argv"  },
     { EntryMaterialization::ArgcWargv, "argc-wargv" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kEntryMaterializationTable);
 
 [[nodiscard]] constexpr std::string_view
 entryMaterializationName(EntryMaterialization m) noexcept {

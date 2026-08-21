@@ -71,7 +71,12 @@
 #      Darwin dylibs for the macho legs. A leg whose DECLARED inputs are not on
 #      this machine (or cannot be acquired) records `skipped-build-input-missing`
 #      — LOUDLY, naming every name and path it searched, or quoting the
-#      resolver's refusal — and the run continues with the other legs.
+#      resolver's refusal — and the run continues with the other legs. A leg
+#      declaring a provider NO DRIVER IMPLEMENTS is a different fact and gets a
+#      different verdict: `poisoned`, the closed vocabulary's FAILURE class, per
+#      leg, run continues, exit != 0 — because nothing about this machine could
+#      have changed it. Both drivers answer that condition identically; the
+#      decision itself is the mirrored `dss:unknown-library-provider` region.
 #   7. PER LEG, generate a `.dss-project.json` (language c-subset / profile cli /
 #      the leg's target spec / artifactName testfixture / the 185 TUs as absolute
 #      `sources` / the sqlite+tcl+zlib include dirs / the recipe defines / that
@@ -3150,12 +3155,59 @@ function Invoke-LegResolver([string[]]$callArgs) {
   }
 }
 
-# Resolve ONE leg's declared (tcl, z) pair. Returns @{ Ok; Tcl; Z; Detail } — plus,
-# for a provider that ACQUIRED its libraries, `Acquired` (the resolver's own
-# per-library records, which Step 7 stages beside the artefact).
-# Ok=$false is ALWAYS `skipped-build-input-missing` with a Detail that names the
-# provider, every candidate NAME and every candidate PATH — a reader must be able
-# to act on it without reading this script.
+# ── A PROVIDER NO DRIVER IMPLEMENTS — THE VERDICT, DECIDED IN ONE PLACE ──────
+# [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+#
+# ★★ THE TWO DRIVERS USED TO ANSWER THIS CONDITION DIFFERENTLY. Until 2026-08-20
+# build-and-test.sh's `*)` arm called `die` — `exit 1`, from a TOP-LEVEL loop, so
+# ONE leg declaring an unimplemented provider cost the whole run and the other
+# four legs never reached a verdict — while THIS driver returned a per-leg record
+# and carried on. Same condition, same tree, two exit codes.
+#
+# ★★★ AND `Ok = $false` WAS THE WRONG ANSWER HERE TOO, in the other direction.
+# The docblock below says (correctly) that Ok=$false is always
+# `skipped-build-input-missing`, which is an ENVIRONMENTAL skip: it only WARNS
+# unless DSS_STRICT_ARM_VERDICTS=1, so this driver filed a HARNESS/CATALOGUE bug
+# as a fact about the operator's machine and exited 0. A leg declaring a provider
+# NO DRIVER IMPLEMENTS is not a missing build input; nothing about that box could
+# have changed the outcome. `poisoned` is the closed vocabulary's FAILURE class
+# and both drivers ALREADY use it for the same shape one level down — see
+# Set-LegVerdict / Set-UnitNotRun, which record `poisoned` + "HARNESS DEFECT: …"
+# when this driver meets a member of a closed vocabulary it cannot classify. So
+# no new verdict is minted, the run still CONTINUES to every other leg, and the
+# run can no longer exit 0.
+#
+# WHY THIS IS A FUNCTION AND WHY IT IS IN A `dss:` REGION. The verdict TOKEN and
+# the message are now one pure function of their arguments, mirrored in the .sh,
+# so `harness_legs.py --check-regions` EXTRACTS BOTH COPIES FROM THE SHIPPED
+# DRIVERS, EXECUTES THEM ON IDENTICAL INPUT AND COMPARES THE ANSWERS. A pin that
+# only READ the two arms could not have caught the divergence that produced this
+# region — the tokens were both spelled correctly in their own file.
+#
+# ⚠ THE MESSAGE IS ASCII ON PURPOSE, for the reason MIRROR_CASES states for the
+# zero-progress sentinel: it is compared BYTE-FOR-BYTE between a PowerShell
+# string and a bash string that reach the battery through two different file
+# readers, and a non-ASCII character would put an encoding question inside the
+# one value the comparison rests on.
+# >>> dss:unknown-library-provider >>>  (region mirrored in build-and-test.sh)
+function Get-UnknownLibraryProviderVerdict($driver, $leg, $provider, $tclNames, $zNames, $known) {
+  return "poisoned`tHARNESS DEFECT: leg '$leg' declares library provider '$provider', which $driver has no dispatch arm for, so this driver cannot obtain that leg's DECLARED inputs (tcl: $tclNames / z: $zNames). ACQUISITION IS NOT DRIVER-LOCAL - pinned-archive is performed by harness_legs.py --acquire, on every host - so NO declared provider should reach this arm; reaching it means the catalogue or LIBRARY_PROVIDERS grew a provider and this driver was not extended in the same change. Add the arm to BOTH drivers: a capability in one driver and not the other is this project's canonical silent harness bug. Known providers: $known (printed by harness_legs.py --library-providers, never copied here)."
+}
+# <<< dss:unknown-library-provider <<<
+
+# Resolve ONE leg's declared (tcl, z) pair. Returns @{ Ok; Verdict; Tcl; Z; Detail }
+# — plus, for a provider that ACQUIRED its libraries, `Acquired` (the resolver's
+# own per-library records, which Step 7 stages beside the artefact).
+# ★ EVERY `Ok = $false` RETURN NAMES ITS OWN `Verdict`, and that is a contract,
+# not a convenience. It used to be a rule stated here instead — "Ok=$false is
+# ALWAYS skipped-build-input-missing" — and the rule was WRONG for one arm: the
+# unknown-provider `default` below is a HARNESS defect, not a missing input, and
+# reporting it as environmental made a bug read as an operator's problem and let
+# the run exit 0. A `Verdict` left off a false return arrives at Set-LegVerdict
+# as an EMPTY token, which that function already refuses loudly — so forgetting
+# one is a red, never a silent default.
+# The Detail must name the provider, every candidate NAME and every candidate
+# PATH — a reader must be able to act on it without reading this script.
 function Resolve-LegLibraries($leg) {
   $libs     = $leg.build.libraries
   $provider = "$($libs.provider)"
@@ -3184,7 +3236,7 @@ function Resolve-LegLibraries($leg) {
       if (-not $z)   { $z   = Find-DeclaredLib $zNames   $roots }
       if ($tcl -and $z) { return @{ Ok = $true; Tcl = $tcl; Z = $z; Detail = "provider 'search-paths'" } }
       $missing = @(); if (-not $tcl) { $missing += "tcl ($($tclNames -join ' | '))" }; if (-not $z) { $missing += "z ($($zNames -join ' | '))" }
-      return @{ Ok = $false; Tcl = $tcl; Z = $z; Detail = "provider 'search-paths' found no $($missing -join ' and no ') under any declared search path [$($roots -join ' ; ')] — install them, add a path via `$env:DSS_PE_LIBDIR, or point `$env:TCL_DLL/`$env:ZLIB_DLL straight at them" }
+      return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = $tcl; Z = $z; Detail = "provider 'search-paths' found no $($missing -join ' and no ') under any declared search path [$($roots -join ' ; ')] — install them, add a path via `$env:DSS_PE_LIBDIR, or point `$env:TCL_DLL/`$env:ZLIB_DLL straight at them" }
     }
     'host-system' {
       $roots = @(Get-HostSystemLibRoots)
@@ -3192,7 +3244,7 @@ function Resolve-LegLibraries($leg) {
       $z   = Find-DeclaredLib $zNames   $roots
       if ($tcl -and $z) { return @{ Ok = $true; Tcl = $tcl; Z = $z; Detail = "provider 'host-system'" } }
       $missing = @(); if (-not $tcl) { $missing += "tcl ($($tclNames -join ' | '))" }; if (-not $z) { $missing += "z ($($zNames -join ' | '))" }
-      return @{ Ok = $false; Tcl = $tcl; Z = $z; Detail = "provider 'host-system' found no $($missing -join ' and no ') under any candidate root [$($roots -join ' ; ')] — this machine has no copy of that target's tcl/zlib runtime; put one anywhere and name the directory in `$env:DSS_HOST_LIBDIR" }
+      return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = $tcl; Z = $z; Detail = "provider 'host-system' found no $($missing -join ' and no ') under any candidate root [$($roots -join ' ; ')] — this machine has no copy of that target's tcl/zlib runtime; put one anywhere and name the directory in `$env:DSS_HOST_LIBDIR" }
     }
     'pinned-archive' {
       # ★ THE LEG'S DECLARED ROUTE, PERFORMED BY THE RESOLVER — never by this
@@ -3214,14 +3266,14 @@ function Resolve-LegLibraries($leg) {
       Info "[$($leg.label)] provider 'pinned-archive' — acquiring this leg's DECLARED libraries via harness_legs.py --acquire (cached after the first run; a cold cache downloads)"
       $acqRun = Invoke-LegResolver @('--acquire', "$($leg.label)")
       if ($acqRun.Rc -ne 0) {
-        return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': harness_legs.py --acquire $($leg.label) FAILED (rc=$($acqRun.Rc)). The declared route could not be completed and nothing was improvised in its place:`n$(($acqRun.Text -split "`n" | ForEach-Object { "        $_" }) -join "`n")" }
+        return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': harness_legs.py --acquire $($leg.label) FAILED (rc=$($acqRun.Rc)). The declared route could not be completed and nothing was improvised in its place:`n$(($acqRun.Text -split "`n" | ForEach-Object { "        $_" }) -join "`n")" }
       }
       $acq = $null
       try { $acq = ($acqRun.Stdout -join "`n") | ConvertFrom-Json } catch {
-        return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': harness_legs.py --acquire $($leg.label) exited 0 but did not print the JSON report this driver reads ($($_.Exception.Message)). Output was:`n$(($acqRun.Text -split "`n" | Select-Object -First 20 | ForEach-Object { "        $_" }) -join "`n")" }
+        return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': harness_legs.py --acquire $($leg.label) exited 0 but did not print the JSON report this driver reads ($($_.Exception.Message)). Output was:`n$(($acqRun.Text -split "`n" | Select-Object -First 20 | ForEach-Object { "        $_" }) -join "`n")" }
       }
       $cdir = "$($acq.cacheDir)"
-      if (-not $cdir) { return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': the acquisition report for $($leg.label) carries no cacheDir, so there is no directory to resolve this leg's libraries out of." } }
+      if (-not $cdir) { return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': the acquisition report for $($leg.label) carries no cacheDir, so there is no directory to resolve this leg's libraries out of." } }
       # ★ THE SUBSTITUTION IS STATED, NEVER HIDDEN. An acquired library is a
       # STAND-IN: we read its export surface here, and the target machine loads
       # its OWN copy. Its embedded identity is the PACKAGER's (MEASURED: the
@@ -3289,7 +3341,7 @@ function Resolve-LegLibraries($leg) {
       # the artefact, and that copy is driven off this very field. Dropping it on
       # the failure path would produce a binary that links clean here and fails in
       # the target's loader — the one failure this host cannot observe.
-      return @{ Ok = $false; Tcl = $tcl; Z = $z; Acquired = @($acq.libraries | Where-Object { $_ })
+      return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = $tcl; Z = $z; Acquired = @($acq.libraries | Where-Object { $_ })
                 TclScriptDir = $tclScriptDir
                 Detail = "provider 'pinned-archive' acquired $(@($acq.libraries | Where-Object { $_ }).Count) file(s) into $cdir but none of them is a declared $($missing -join ' and none is a declared ') — the leg's acquire members and its tclNames/zNames disagree in legs.json (the 'as' name a member materialises under MUST be one this leg's own name list can resolve)." }
     }
@@ -3305,19 +3357,39 @@ function Resolve-LegLibraries($leg) {
       # (`harness_legs.py --acquire`) and is dispatched right here, on every host —
       # which is how a Windows box acquires Darwin dylibs for the macho legs.
       #
-      # ★ EXACTLY ONE DECLARED PROVIDER STILL REACHES THIS ARM, BY NAME:
-      # ubuntu-ports-arm64, the bespoke ancestor of `pinned-archive`.
-      # build-and-test.sh performs it inline with curl + dpkg-deb, and generalising
-      # it into the shared resolver needs a .deb reader — MEASURED 2026-08-04, not
-      # safely doable yet: a modern .deb's inner archive can be zstd, whose stdlib
-      # module arrived only in Python 3.14 (this Windows host has 3.14, the WSL leg
-      # has 3.12), so that route would be a capability that exists on one HOST and
-      # not another — the same defect one level down. It is therefore named here,
-      # with its anchor, instead of quietly passing, and
-      # tests/harness/test_sqlite_harness_legs.cpp carries the self-retiring
-      # exemption that reds the day it IS implemented in both drivers.
+      # ★ NO DECLARED PROVIDER REACHES THIS ARM ANY MORE, AND THE TEXT THAT SAID
+      # OTHERWISE WAS FALSE FOR NINE DAYS. It asserted "exactly one DECLARED
+      # provider still lands here: ubuntu-ports-arm64" and cited that anchor as
+      # live. Both halves had stopped being true: TF-C123 moved the elf64-arm64
+      # leg onto `pinned-archive`, the row CLOSED, `LIBRARY_PROVIDERS` in
+      # harness_legs.py dropped the name — so `--lint` now REFUSES a leg that
+      # declares it — and the self-retiring exemption in
+      # tests/harness/test_sqlite_harness_legs.cpp went to ZERO. A refusal that
+      # names a provider the resolver rejects sends its reader to write a
+      # declaration that cannot load.
+      # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
       # D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
-      return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "library provider `"$provider`" has no dispatch arm in build-and-test.ps1, so this driver cannot obtain this leg's declared inputs (tcl: $($tclNames -join ' | ') / z: $($zNames -join ' | ')). ACQUISITION ITSELF IS NOT DRIVER-LOCAL — pinned-archive is performed HERE, by harness_legs.py --acquire, on every host. Exactly one DECLARED provider still lands in this arm: ubuntu-ports-arm64, whose .deb route build-and-test.sh performs inline with curl + dpkg-deb and which is not generalised into the shared resolver yet (a .deb's inner archive can be zstd, whose stdlib module arrived only in Python 3.14 — a route that works on one HOST and not another is the same defect one level down). D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE. If the provider named above is a DIFFERENT one, the catalogue (or LIBRARY_PROVIDERS in harness_legs.py) grew a provider and this driver was not extended in the same change — add the arm to BOTH drivers, because a capability in one driver and not the other is this project's canonical silent harness bug." }
+      #
+      # ⇒ Reaching this arm now means exactly one thing: the vocabulary grew and
+      # this driver was not extended in the same change. The message says that,
+      # and prints the vocabulary from the set's OWNER rather than a copy that
+      # can drift the way the last one did.
+      # `.Stdout` and not `.Text`: Stdout is already the non-error lines, trimmed.
+      # A refusal that dies computing its own text tells nobody anything, so an
+      # empty result degrades to a pointer rather than to silence.
+      $knownProviders = @((Invoke-LegResolver @('--library-providers')).Stdout |
+                          Where-Object { $_ }) -join ' '
+      if ([string]::IsNullOrWhiteSpace($knownProviders)) {
+        $knownProviders = '<resolver did not print them - read LIBRARY_PROVIDERS in harness_legs.py>'
+      }
+      # ★ NOT A SKIP. The verdict and the message come from the mirrored
+      # `dss:unknown-library-provider` region above, so this driver and the .sh
+      # answer this condition with the SAME token and the SAME words - which is
+      # the whole point, and what they did not do until 2026-08-20.
+      # [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+      $uv = (Get-UnknownLibraryProviderVerdict 'build-and-test.ps1' "$($leg.label)" $provider `
+               ($tclNames -join ' ') ($zNames -join ' ') $knownProviders) -split "`t", 2
+      return @{ Ok = $false; Verdict = $uv[0]; Tcl = ''; Z = ''; Detail = $uv[1] }
     }
   }
 }
@@ -3720,8 +3792,20 @@ foreach ($lg in $Legs) {
     Info "[$($lg.label)] tcl : $($r.Tcl)"
     Info "[$($lg.label)] z   : $($r.Z)"
   } else {
-    Set-LegVerdict $lg.label 'skipped-build-input-missing' $r.Detail
-    Warn "[$($lg.label)] BUILD INPUT MISSING — the TESTFIXTURE will NOT be built for this leg on this machine."
+    # ★ THE VERDICT IS THE RESOLVER'S, NOT THIS LOOP'S. It was the literal
+    # 'skipped-build-input-missing' here, which made EVERY unresolved leg
+    # environmental — including the one whose provider no driver implements, a
+    # HARNESS defect that then only warned and let the run exit 0. Each false
+    # return now names its own class; an omitted one arrives EMPTY and
+    # Set-LegVerdict refuses it loudly.
+    # [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+    Set-LegVerdict $lg.label "$($r.Verdict)" $r.Detail
+    if ("$($r.Verdict)" -eq 'poisoned') {
+      Warn "[$($lg.label)] HARNESS DEFECT [poisoned] — the TESTFIXTURE will NOT be built for this leg, and the reason is OURS, not this machine's."
+      Warn "      The other legs are unaffected and the run CONTINUES — but it CANNOT exit 0."
+    } else {
+      Warn "[$($lg.label)] BUILD INPUT MISSING — the TESTFIXTURE will NOT be built for this leg on this machine."
+    }
     Warn "      $($r.Detail)"
     # Said out loud, because it changes what the next steps will do: the CLI is a
     # separate artefact with a separate precondition and Step 7b still tries it.
@@ -4681,6 +4765,20 @@ foreach ($leg in $Legs) {
   $legLibRes = $LegLibsAll[$lbl]
   if (-not "$($legLibRes.Z)") {
     $CliFails++
+    # ★ THE REASON IS THE LEG'S OWN, NOT AN ASSUMED ENVIRONMENT FACT. "No zlib"
+    # has two causes and they are not the same claim: this machine really has no
+    # copy of that target's zlib (environmental — the message below), or Step 6
+    # never got as far as looking because the leg's own resolution was a HARNESS
+    # DEFECT (a provider no driver implements). Printing the environmental
+    # sentence for the second one files our bug as a fact about the operator's
+    # box. The resolver already named the class, so it is READ, not re-derived —
+    # and the .sh twin makes the same distinction at the same place.
+    # [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+    if ("$($legLibRes.Verdict)" -eq 'poisoned') {
+      Set-DssArtifactVerdict $lbl 'sqlite3' 'poisoned' "$($legLibRes.Detail)  (the CLI links zlib too, so it is lost to the same defect.)"
+      Warn "[$lbl] CLI POISONED — $((Get-DssArtifactVerdict $lbl 'sqlite3').Detail)"
+      continue
+    }
     Set-DssArtifactVerdict $lbl 'sqlite3' 'skipped-build-input-missing' "no zlib could be resolved for this leg on this host, and the CLI links zlib (SQLITE_HAVE_ZLIB=1 reaches a live '#include <zlib.h>' in shell.c). Resolver said: $($legLibRes.Detail)"
     Warn "[$lbl] CLI build NOT ATTEMPTED [skipped-build-input-missing] — $((Get-DssArtifactVerdict $lbl 'sqlite3').Detail)"
     continue

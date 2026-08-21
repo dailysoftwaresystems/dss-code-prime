@@ -5,9 +5,11 @@
 #include "core/types/symbol_attrs.hpp"  // SymbolBinding, SymbolVisibility, isExternallyVisible
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 // Shared symbol-NAMING substrate for the object/image writers — the ONE owner of
 // the `AssembledModule::symbols` lookup, serving BOTH artifact tiers:
@@ -16,6 +18,11 @@
 //     D-LK-OBJECT-EXTERN-SYMBOL-NAMES;
 //   * FINAL IMAGES (ELF ET_EXEC + ET_DYN, Mach-O exec/dylib, PE image) via
 //     `imageName` — D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS.
+// `definedAliases` serves BOTH tiers unchanged — see its docblock for why the
+// extra names do NOT take `imageName`'s wider predicate. An anchor name is
+// never wrapped, because a split name is not greppable and the registry guard
+// then reads a DIFFERENT, shorter name and passes:
+// D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB
 // The two tiers differ in ONE predicate clause and that difference is documented
 // on `imageName`; everything else (the carrier, the lookup, the `<prefix><id>`
 // fallback shape) is shared, so a writer can never grow a private name table.
@@ -73,7 +80,30 @@ public:
     explicit ObjectSymbolNames(AssembledModule const& module) {
         definedBySym_.reserve(module.symbols.size());
         for (ModuleSymbol const& ms : module.symbols) {
-            definedBySym_.emplace(ms.symbol.v, &ms);
+            auto const [it, fresh] = definedBySym_.emplace(ms.symbol.v, &ms);
+            if (fresh) continue;
+            // A SECOND (third, …) row for one SymbolId is an ALIAS: one atom,
+            // several names. See `definedAliases` for what qualifies and why
+            // the canonical row is the first one.
+            if (ms.name.empty() || ms.name == it->second->name) continue;
+            if (!isExternallyVisible(ms.binding, ms.visibility)) continue;
+            // ...and against every alias ALREADY accepted for this id, not the
+            // canonical alone. `[A, B, B]` otherwise emits `B` twice, which is
+            // the duplicate-symbol error at the foreign linker that the
+            // "name DIFFERS" clause below exists to prevent -- the clause held
+            // the property against the canonical and not against itself.
+            // No shipped reader produces a repeated alias today (each folds one
+            // boundary symbol at a time), so this is a hole in a guard rather
+            // than a live defect; a guard that does not hold the property it
+            // claims is the defect. The scan is linear over a vector that is
+            // empty for almost every id and one or two entries otherwise.
+            auto& rows = aliasesBySym_[ms.symbol.v];
+            bool repeated = false;
+            for (ModuleSymbol const* seen : rows) {
+                if (seen->name == ms.name) { repeated = true; break; }
+            }
+            if (repeated) continue;
+            rows.push_back(&ms);
         }
         externBySym_.reserve(module.externImports.size());
         for (ExternImport const& e : module.externImports) {
@@ -183,6 +213,71 @@ public:
         return SymbolBinding::Local;
     }
 
+    // Every ADDITIONAL name bound to `id` beyond the canonical one, in
+    // `module.symbols` order, each carrying its OWN binding.
+    // D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB.
+    //
+    // ★ WHY THIS EXISTS. Since equal-offset defined symbols collapse to ONE
+    // atom with several names (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-
+    // ATOMS), `module.symbols` can carry several rows for one `SymbolId` --
+    // `strong_fn` GLOBAL and `weak_alias` WEAK at the same address is the shape
+    // gcc emits for `__attribute__((weak, alias("strong_fn")))`. `definedName`
+    // and `definedBinding` are FIRST-ROW-WINS by design (a symtab entry, an
+    // index map key and a relocation target all need exactly one answer), so
+    // every later row was silently dropped from a re-emitted object: DSS read
+    // an object carrying two names and wrote one back.
+    //
+    // WHAT QUALIFIES, and each clause is the same predicate `definedName` uses:
+    //   * a NAMED row (an empty name is "no name recorded", not a name);
+    //   * whose name DIFFERS from the canonical's AND from every alias already
+    //     accepted for this id (a byte-identical repeat is the same name, and
+    //     emitting it twice is a duplicate-symbol error at the foreign linker);
+    //   * that is EXTERNALLY VISIBLE. A non-externally-visible extra name stays
+    //     internal for exactly the reason the canonical's would -- `definedName`
+    //     carves such names to `<prefix><id>`, and an alias is not a licence to
+    //     bypass that. ⚠ BOUNDARY: a Local-only alias of a defined symbol is
+    //     therefore still absent from the re-emitted symtab. No shipped shape
+    //     produces one (an alias exists to be referred to by name from
+    //     elsewhere, which is what external visibility means), but it is a real
+    //     gap and is named here rather than left to be rediscovered.
+    //
+    // The canonical is the FIRST row, which keeps every existing id-to-row
+    // lookup byte-identical: this method only ADDS names a writer may emit
+    // after the canonical one, and never changes which row is canonical.
+    //
+    // ★★ ONE ACCESSOR SERVES BOTH TIERS, and unlike `definedName`/`imageName`
+    // that is a POSITIVE finding rather than an omission. `imageName` drops
+    // `definedName`'s visibility gate because a `static`'s real name is the
+    // frame a debugger prints and nothing re-links an image. Applying the same
+    // reasoning to the EXTRA names would admit compiler-private section labels:
+    // ✔MEASURED — INSTRUMENT: `tests/link/clang_macho_subsections_object.inc`,
+    // a real clang-produced arm64 MH_OBJECT checked into this tree byte-for-byte
+    // (Ubuntu clang 19.1.1, `-target arm64-apple-macos11 -c -O1`), whose header
+    // carries the nlist dump read back OUT of those bytes: `nlist_64[0]` is
+    // `ltmp0`, non-external, n_sect=1, n_value=0x00, and `nlist_64[4]` is the
+    // EXTERNAL `_outer` at the same n_value=0x00. One address, two names, one of
+    // them compiler-private. ⚠ Stated with its instrument because a bare
+    // `✔MEASURED` is a claim about an experiment nobody can re-run. So clang
+    // emits `ltmp0` at the exact `n_value` of the first function of an ordinary
+    // translation unit, and the readers correctly fold it in here as a
+    // non-externally-visible extra name
+    // (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS names that case).
+    // A module-private label denotes an address the real name already denotes,
+    // so emitting it into an image adds a second nlist/`.symtab` row that
+    // answers no question a debugger asks — and ld64/ld drop exactly these when
+    // they build an image. So the image tier legitimately wants the SAME
+    // externally-visible set: two names that are both real ABI, never a name
+    // plus its compiler-private shadow. The Local-only-alias boundary noted
+    // above therefore applies to both tiers, for two different reasons.
+    [[nodiscard]] std::span<ModuleSymbol const* const>
+    definedAliases(SymbolId id) const {
+        if (auto const it = aliasesBySym_.find(id.v);
+            it != aliasesBySym_.end()) {
+            return it->second;
+        }
+        return {};
+    }
+
     // The `.symtab` name for an UNDEFINED extern reference. Returns the import's
     // (already-mangled) on-binary name so a foreign linker resolves it;
     // otherwise the internal `<internalPrefix><id>` (a reloc target that is
@@ -202,6 +297,10 @@ private:
     // which outlives this helper (the writer builds it on the stack inside
     // `encode()`, before the symtab loop, and discards it after).
     std::unordered_map<std::uint32_t, ModuleSymbol const*> definedBySym_;
+    // Only the ids that HAVE aliases appear here, so the common case costs a
+    // failed hash lookup and no allocation.
+    std::unordered_map<std::uint32_t, std::vector<ModuleSymbol const*>>
+        aliasesBySym_;
     std::unordered_map<std::uint32_t, ExternImport const*> externBySym_;
 };
 

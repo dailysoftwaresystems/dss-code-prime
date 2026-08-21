@@ -4,6 +4,7 @@
 #include "core/types/config_path_walk.hpp"       // findShippedConfigDir — shared src/dss-config/<dir> resolver
 #include "core/types/data_model.hpp"             // dataModelFromName (signatureByDataModel keys)
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/enum_name_table.hpp"        // EnumNameTable/allNames (the descriptor-local closed sets)
 #include "core/types/include_path_resolve.hpp"   // resolveSystemDescriptor (the `includes` closure walk)
 #include "core/types/object_format_kind.hpp"     // objectFormatKindFromName (library-map key vocabulary)
 #include "core/types/parse_diagnostic.hpp"
@@ -140,15 +141,61 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
 
 // Closed-table enum resolution. A miss is a malformed descriptor (the JSON
 // named an enumerator outside the closed set) → reported by the caller.
+//
+// ★ TABLES, NOT IF-CHAINS (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-
+// CLOSED-SET). These were two hand-written if-chains, each with its accepted
+// set RETYPED into the refusal message beside its call site — the same fact
+// owned twice, drifting the moment a spelling is added or renamed. The rows are
+// now the only owner and the refusals render `allNames(…)` over them.
+//
+// ⓘ The TABLES live here rather than beside the enums in
+// `ffi/shipped_lib_descriptor.hpp` for the same reason `configName()` lives on
+// each backend: these spellings are the DESCRIPTOR FILE's vocabulary, and this
+// TU is the only thing that reads or writes one. (That header was owned by
+// another lane this cycle; if the enums ever gain a second reader, the tables
+// move next to them — the projection is unaffected either way.)
+inline constexpr EnumNameTable<ShippedSymbolKind, 2> kShippedSymbolKindTable{{{
+    { ShippedSymbolKind::Function, "function" },
+    { ShippedSymbolKind::Object,   "object"   },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kShippedSymbolKindTable);
+inline constexpr EnumNameTable<ShippedSymbolLinkage, 2>
+kShippedSymbolLinkageTable{{{
+    { ShippedSymbolLinkage::External, "external" },
+    { ShippedSymbolLinkage::Weak,     "weak"     },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kShippedSymbolLinkageTable);
+
 [[nodiscard]] std::optional<ShippedSymbolKind> kindFromName(std::string_view s) {
-    if (s == "function") return ShippedSymbolKind::Function;
-    if (s == "object")   return ShippedSymbolKind::Object;
-    return std::nullopt;
+    return kShippedSymbolKindTable.fromName(s);
 }
 [[nodiscard]] std::optional<ShippedSymbolLinkage> linkageFromName(std::string_view s) {
-    if (s == "external") return ShippedSymbolLinkage::External;
-    if (s == "weak")     return ShippedSymbolLinkage::Weak;
-    return std::nullopt;
+    return kShippedSymbolLinkageTable.fromName(s);
+}
+
+// The "expected …" half of every closed-set refusal in this file, projected
+// from the table the check consults. Never a literal: the descriptor corpus is
+// authored by hand, so the sentence IS the documentation an author reads, and a
+// sentence narrower than the check denies by name a spelling the loader takes.
+//
+// ✔THE CLASS HAD ALREADY FIRED HERE. MEASURED 2026-08-20 against
+// `kSelectableObjectFormatKindNames` (FIVE spellings — the enum table minus its
+// `unknown` sentinel, which is exactly what `objectFormatKindFromName` +
+// `isSelectableObjectFormatKind` accept below): FOUR object-format refusals in
+// this file advertised THREE (`"pe"/"elf"/"macho"`), omitting `wasm` and
+// `spirv`.
+template <typename Names>
+[[nodiscard]] std::string allowedList(Names const& names,
+                                      std::string_view sep = "/") {
+    return detail::renderAllowedList(names, sep);
 }
 
 // True for the core integer SCALAR kinds (signed + unsigned, I8..U128). A
@@ -348,8 +395,9 @@ matchVariantWhen(json const& when, WhenAxes axes, std::string const& whenCtx,
         if (!dataModelFromName(wantModel).has_value()) {
             emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
                                         + ": 'dataModel' has unknown data-model name '"
-                                        + wantModel
-                                        + "' (expected \"LP64\"/\"LLP64\"/\"ILP32\")");
+                                        + wantModel + "' (expected "
+                                        + allowedList(allNames(kDataModelTable))
+                                        + ")");
             return WhenMatch::Error;
         }
         if (archKeysParticipate && activeDataModelName != wantModel) matches = false;
@@ -381,8 +429,9 @@ matchVariantWhen(json const& when, WhenAxes axes, std::string const& whenCtx,
         if (!wantKind.has_value()) {
             emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
                                         + ": 'format' has unknown object-format name '"
-                                        + wantFormat
-                                        + "' (expected \"pe\"/\"elf\"/\"macho\")");
+                                        + wantFormat + "' (expected "
+                                        + allowedList(kSelectableObjectFormatKindNames)
+                                        + ")");
             return WhenMatch::Error;
         }
         // ...and the `unknown` SENTINEL has the identical consequence by the
@@ -737,7 +786,9 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
     if (!doc.at("availableObjectFormats").is_array()) {
         emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
                                     + "': 'availableObjectFormats' must be an array of "
-                                      "object-format names, e.g. [\"elf\",\"macho\"]");
+                                      "object-format names ("
+                                    + allowedList(kSelectableObjectFormatKindNames)
+                                    + ")");
         return;
     }
     for (auto const& v : doc.at("availableObjectFormats")) {
@@ -751,7 +802,9 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         if (!fmtKind.has_value()) {
             emitMalformed(reporter, "shipped-lib descriptor '" + pathStr
                                         + "': 'availableObjectFormats' has unknown object-format "
-                                          "name '" + fmt + "' (expected \"pe\"/\"elf\"/\"macho\")");
+                                          "name '" + fmt + "' (expected "
+                                        + allowedList(kSelectableObjectFormatKindNames)
+                                        + ")");
             continue;
         }
         // The `unknown` sentinel spells correctly, so it survives the lookup and
@@ -800,8 +853,8 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         if (!keyKind.has_value()) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
                 + "' has unknown object-format key '" + kv.key()
-                + "' (expected one of the object-format names, e.g. "
-                  "\"pe\"/\"elf\"/\"macho\")");
+                + "' (expected one of the object-format names: "
+                + allowedList(kSelectableObjectFormatKindNames) + ")");
             continue;
         }
         // The `unknown` sentinel spells correctly ("pee" does not), so only an
@@ -863,8 +916,8 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         if (!keyKind.has_value()) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
                 + "' has unknown object-format key '" + kv.key()
-                + "' (expected one of the object-format names, e.g. "
-                  "\"pe\"/\"elf\"/\"macho\")");
+                + "' (expected one of the object-format names: "
+                + allowedList(kSelectableObjectFormatKindNames) + ")");
             continue;
         }
         // Same reason as `decodeLibraryMap`: the `unknown` sentinel SPELLS
@@ -1842,7 +1895,9 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             if (!k) {
                 emitMalformed(reporter, "shipped-lib descriptor " + at
                     + ": unknown 'kind' '" + sym.at("kind").get<std::string>()
-                    + "' (expected \"function\" or \"object\")");
+                    + "' (expected "
+                    + allowedList(allNames(kShippedSymbolKindTable), " or ")
+                    + ")");
                 continue;
             }
             kind = *k;
@@ -1860,7 +1915,9 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             if (!l) {
                 emitMalformed(reporter, "shipped-lib descriptor " + at
                     + ": unknown 'linkage' '" + sym.at("linkage").get<std::string>()
-                    + "' (expected \"external\" or \"weak\")");
+                    + "' (expected "
+                    + allowedList(allNames(kShippedSymbolLinkageTable), " or ")
+                    + ")");
                 continue;
             }
             linkage = *l;
@@ -2037,7 +2094,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 if (!dm) {
                     emitMalformed(reporter, "shipped-lib descriptor " + at
                         + ": 'signatureByDataModel' has unknown data-model key '"
-                        + kv.key() + "' (expected one of \"LP64\"/\"LLP64\"/\"ILP32\")");
+                        + kv.key() + "' (expected one of "
+                        + allowedList(allNames(kDataModelTable)) + ")");
                     overridesOk = false;
                     continue;
                 }

@@ -1,6 +1,7 @@
 #include "link/object_format_schema.hpp"
 
 #include "core/substrate/relocation_table.hpp"
+#include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList — the ONE closed-set renderer
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -226,8 +227,10 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // for being unresolved, instead of being silently adjudicated as ELF.
     if (backend == nullptr) {
         fail("/format/kind",
-             "format kind 'unknown' is reserved as the invalid sentinel; "
-             "declare one of 'elf' / 'pe' / 'macho' / 'wasm' / 'spirv'");
+             std::format("format kind '{}' is reserved as the invalid "
+                         "sentinel; declare one of {}",
+                         kObjectFormatKindSentinelName,
+                         link::objectFormatBackendNameList()));
     }
 
     // FC3 c1: the data model is REQUIRED (the loader rejects a missing
@@ -236,10 +239,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // invalid sentinel, never a silent width choice).
     if (dataModelName(dataModel).empty()) {
         fail("/dataModel",
-             "missing required 'dataModel' — every object format must "
-             "declare its C-family width triple ('LP64', 'LLP64', or "
-             "'ILP32'); a silent default would bake wrong primitive "
-             "widths");
+             std::format("missing required 'dataModel' — every object format "
+                         "must declare its C-family width triple ({}); a "
+                         "silent default would bake wrong primitive widths",
+                         detail::renderAllowedList(allNames(kDataModelTable),
+                                                   ", ")));
     }
 
     // D-PP-HEADER-CASE-INSENSITIVE-PE: the header-name case rule is REQUIRED
@@ -248,13 +252,15 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // zero default is the invalid sentinel, never a silent case rule).
     if (headerNameMatchingName(headerNameMatching).empty()) {
         fail("/headerNameMatching",
-             "missing required 'headerNameMatching' — every object format "
-             "must declare how an `#include` header NAME is matched "
-             "('case-sensitive' or 'case-insensitive'); a silent default "
-             "would let the BUILD HOST's filesystem decide, which both "
-             "wrongly rejects `<Windows.h>` for a pe target on a "
-             "case-sensitive host and silently ACCEPTS `<Stdio.h>` for an "
-             "elf target on a case-insensitive one");
+             std::format("missing required 'headerNameMatching' — every "
+                         "object format must declare how an `#include` header "
+                         "NAME is matched ({}); a silent default would let the "
+                         "BUILD HOST's filesystem decide, which both wrongly "
+                         "rejects `<Windows.h>` for a pe target on a "
+                         "case-sensitive host and silently ACCEPTS `<Stdio.h>` "
+                         "for an elf target on a case-insensitive one",
+                         detail::renderAllowedList(
+                             allNames(kHeaderNameMatchingTable), " or ")));
     }
 
     // ── D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN: the C-symbol decoration
@@ -295,11 +301,43 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // constant, or the reason it is safe disappears with it.
     if (cSymbolDecorationSchemeName(cSymbolDecoration.scheme).empty()) {
         fail("/cSymbolDecoration",
-             "missing required 'cSymbolDecoration' — every object format must "
-             "declare how a canonical C identifier is decorated to obtain its "
-             "linker-visible name ('none' or 'leading-underscore'); a silent "
-             "default would re-hide the rule in the engine's C++ table, which "
-             "is the two-owner defect this key exists to remove");
+             std::format("missing required 'cSymbolDecoration' — every object "
+                         "format must declare how a canonical C identifier is "
+                         "decorated to obtain its linker-visible name ({}); a "
+                         "silent default would re-hide the rule in the engine's "
+                         "C++ table, which is the two-owner defect this key "
+                         "exists to remove",
+                         detail::renderAllowedList(
+                             allNames(kCSymbolDecorationSchemeTable), " or ")));
+    }
+
+    // ── D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: a PRESENT
+    //    `weakDefinition` block must name a real dialect ─────────────────
+    //
+    // Presence is the declaration, so ABSENCE is not an error here — the
+    // walker that needs the answer refuses when it needs it, and a format
+    // that never encodes a weak definition never has to answer. What is an
+    // error is a block that is PRESENT and says nothing: the sentinel has no
+    // spelling (it is deliberately absent from `kWeakDefinitionDialectTable`,
+    // so no JSON string can produce it), which means the only way to reach
+    // this state is a HAND-BUILT `ObjectFormatData` — the
+    // `ObjectFormatSchema{ObjectFormatData}` public constructor runs no
+    // validation, and every in-memory producer reaches the walkers through it.
+    // Without this arm such a schema would carry an engaged optional whose
+    // dialect matches no encoder, and the walker's refusal would name the
+    // empty string.
+    if (weakDefinition.has_value()
+     && weakDefinitionDialectName(weakDefinition->dialect).empty()) {
+        fail("/weakDefinition/dialect",
+             std::format("'weakDefinition' is present but names no dialect — a "
+                         "DECLARED block must state HOW this format spells a "
+                         "weak definition ({}). Omit the block entirely to "
+                         "leave the question unanswered; an engaged block with "
+                         "the invalid sentinel is neither an answer nor an "
+                         "omission. D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-"
+                         "DECLARED.",
+                         detail::renderAllowedList(
+                             allNames(kWeakDefinitionDialectTable), " or ")));
     }
 
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): container rules ──

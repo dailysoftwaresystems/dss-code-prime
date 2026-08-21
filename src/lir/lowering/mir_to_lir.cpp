@@ -28,6 +28,7 @@
 // on `lir_lowering`.
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "asm/asm_template_to_lir.hpp"
+#include "core/types/config_key_vocabulary.hpp"  // renderAllowedList — the ONE closed-set renderer
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "mir/mir_asm_descriptor.hpp"
@@ -1131,12 +1132,28 @@ struct Lowerer {
         // if the module declares extern imports but the active object
         // FORMAT cannot dispatch an extern call — before any lowering
         // work. The extern-call shape is a property of the FORMAT (its
-        // dynamic-import model), NOT the target: the SAME x86_64 target
-        // needs `call_indirect_via_extern` (FF 15, deref the IAT slot)
-        // under PE but the plain `call` (E8, direct branch to the PLT
-        // stub) under ELF — picking the wrong one miscompiles (FF 15
-        // through an ELF PLT stub dereferences code as a pointer →
-        // SIGSEGV). So the gate is keyed on `externCallDispatch_`:
+        // dynamic-import model), NOT the target — picking the wrong one
+        // miscompiles in both directions: `FF 15` through an ELF PLT stub
+        // dereferences code as a pointer → SIGSEGV, and `E8` to a raw
+        // `.idata` slot branches into data.
+        //
+        // ⚠ THIS COMMENT USED TO MOTIVATE THE GATE WITH PE, claiming the
+        // same x86_64 target "needs `call_indirect_via_extern` (FF 15,
+        // deref the IAT slot) under PE". ✔MEASURED 2026-08-20 (cycle P23):
+        // that is FALSE and the shipped config says so itself. All 22
+        // object-format documents declare `direct-plt` and NOT ONE declares
+        // `indirect-slot`, because PE resolves imports through IAT import
+        // THUNKS — the linker synthesizes one `jmp *[IAT slot]` per extern
+        // and points the symbol's VA at the THUNK, so the call site is a
+        // plain direct `call rel32` exactly as on ELF. `pe64-x86_64-windows-
+        // exec.format.json`'s own `$externCallDispatchComment` records that
+        // `indirect-slot` MISCOMPILES an address-taken import, which was the
+        // pe64 leg's last run-green blocker (sqlite `os_win.c aSyscall[]`).
+        // The gate is right; its example was inverted. `indirect-slot` stays
+        // in the vocabulary because a format MAY declare it — it is the
+        // shape, not a prediction about who uses it.
+        //
+        // So the gate is keyed on `externCallDispatch_`:
         //   * nullopt          → the format declared no dispatch model
         //                        (NO silent default to either shape).
         //   * indirect-slot    → requires `call_indirect_via_extern`.
@@ -1149,38 +1166,63 @@ struct Lowerer {
             auto const callMissing =
                 !cache_[static_cast<std::size_t>(MnemonicSlot::Call)]
                      .id.has_value();
+            // ★ EVERY DISPATCH SPELLING BELOW IS PROJECTED FROM
+            // `kExternCallDispatchTable`, never typed here. The nullopt arm
+            // advertised the whole closed set as a literal — a second owner of
+            // a fact `object_format_kind.hpp` already holds — and the two
+            // value arms each named their own spelling a third and fourth
+            // time, in a file that cannot see a rename
+            // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+            // ⓘ The value arms use `externCallDispatchName(*externCallDispatch_)`
+            // rather than naming the enumerator again: the branch condition has
+            // already established WHICH value fired, so re-stating it is the
+            // same duplication one scope smaller.
             if (!externCallDispatch_.has_value()) {
                 dss::report(reporter,
                     DiagnosticCode::L_RequiredLirOpcodeMissing,
                     DiagnosticSeverity::Error,
-                    "MIR→LIR: module declares extern imports but the active "
-                    "object format declares no `externCallDispatch` shape — "
-                    "extern calls have no defined call-site form. Declare "
-                    "`externCallDispatch` in the format's `.format.json` "
-                    "(\"indirect-slot\" for PE IAT / Mach-O __got, "
-                    "\"direct-plt\" for ELF PLT). (D-FFI-EXTERN-CALL-DISPATCH.)");
+                    std::format(
+                        // ⓘ NO POSSESSIVE APOSTROPHE. This sentence quotes a
+                        // vocabulary, and every reader of such a sentence in
+                        // this tree pairs `'` characters — an unmatched one
+                        // scrambles the whole token list. ✔MEASURED: written
+                        // as "the format's `.format.json`", the projection pin
+                        // could not find its own set in it.
+                        "MIR→LIR: module declares extern imports but the active "
+                        "object format declares no `externCallDispatch` shape — "
+                        "extern calls have no defined call-site form. Declare "
+                        "`externCallDispatch` in the `.format.json` document of "
+                        "that format — accepted: {}. "
+                        "(D-FFI-EXTERN-CALL-DISPATCH.)",
+                        detail::renderAllowedList(
+                            allNames(kExternCallDispatchTable), " / ")));
             } else if (*externCallDispatch_ == ExternCallDispatch::IndirectSlot
                        && callIndirectMissing) {
                 dss::report(reporter,
                     DiagnosticCode::L_RequiredLirOpcodeMissing,
                     DiagnosticSeverity::Error,
-                    "MIR→LIR: the active format uses `indirect-slot` extern "
-                    "dispatch but the target schema does not declare a "
-                    "`call_indirect_via_extern` opcode — IAT/__got-indirect "
-                    "extern calls cannot be lowered. Add the indirect-call "
-                    "encoding to the target's `.target.json` `opcodes[]` "
-                    "(x86_64 uses `FF 15 disp32`). (D-FFI-EXTERN-CALL-DISPATCH.)");
+                    std::format(
+                        "MIR→LIR: the active format uses `{}` extern "
+                        "dispatch but the target schema does not declare a "
+                        "`call_indirect_via_extern` opcode — IAT/__got-indirect "
+                        "extern calls cannot be lowered. Add the indirect-call "
+                        "encoding to the target's `.target.json` `opcodes[]` "
+                        "(x86_64 uses `FF 15 disp32`). "
+                        "(D-FFI-EXTERN-CALL-DISPATCH.)",
+                        externCallDispatchName(*externCallDispatch_)));
             } else if (*externCallDispatch_ == ExternCallDispatch::DirectPlt
                        && callMissing) {
                 dss::report(reporter,
                     DiagnosticCode::L_RequiredLirOpcodeMissing,
                     DiagnosticSeverity::Error,
-                    "MIR→LIR: the active format uses `direct-plt` extern "
-                    "dispatch but the target schema does not declare a "
-                    "`call` opcode — extern calls lower to a plain direct "
-                    "call to the linker-synthesized PLT stub, which needs "
-                    "the universal `call` encoding (x86_64 `E8 disp32`, "
-                    "ARM64 `BL imm26`). (D-FFI-EXTERN-CALL-DISPATCH.)");
+                    std::format(
+                        "MIR→LIR: the active format uses `{}` extern "
+                        "dispatch but the target schema does not declare a "
+                        "`call` opcode — extern calls lower to a plain direct "
+                        "call to the linker-synthesized PLT stub, which needs "
+                        "the universal `call` encoding (x86_64 `E8 disp32`, "
+                        "ARM64 `BL imm26`). (D-FFI-EXTERN-CALL-DISPATCH.)",
+                        externCallDispatchName(*externCallDispatch_)));
             }
         }
     }

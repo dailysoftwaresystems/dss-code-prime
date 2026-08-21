@@ -84,6 +84,66 @@ template <typename T, std::size_t N>
     return true;
 }
 
+// ── projecting a NAME→VALUE vocabulary onto its key half ──────────────────
+//
+// Several closed vocabularies are not `string_view` tables but ROW tables — a
+// name plus what the name selects (a member pointer, an enumerator, a prose
+// description). Their key check still has to answer the same question, and it
+// was answered by a hand-written inner loop per site, next to a hand-written
+// renderer for the "the closed set is …" half of the message.
+//
+// ★ THE POINT IS THAT THE PROJECTION IS COMPUTED, NOT RETYPED. A second literal
+// list of the same names is a second owner of one fact, and the two drift
+// silently — the rows keep working while the message (or the check) names a set
+// that no longer matches. Feed the ROW table in, get the key table out, and the
+// two cannot disagree because there is only one of them.
+//
+// `proj` takes a row and returns something convertible to `std::string_view`.
+template <typename Row, std::size_t N, typename Proj>
+[[nodiscard]] constexpr std::array<std::string_view, N>
+keysOf(std::array<Row, N> const& rows, Proj proj) {
+    std::array<std::string_view, N> out{};
+    for (std::size_t i = 0; i < N; ++i) out[i] = std::string_view{proj(rows[i])};
+    return out;
+}
+
+// ── RENDERING A CLOSED SET INTO A DIAGNOSTIC ──────────────────────────────
+//
+// `'a', 'b', 'c'` — the quoted, separated list that every "expected one of …"
+// half of every config diagnostic ends in.
+//
+// ★ THE POINT IS THAT NOBODY WRITES THIS LOOP AGAIN, and it is a smaller,
+// meaner version of the duplication `rejectUnknownKeys` below exists to end.
+// The loop itself had two copies (this file and a `closedKindSet` lambda in
+// the grammar loader) — but the DAMAGE was never the loop: it was that most
+// sites skipped the projection entirely and typed the SET into the sentence,
+// which is a second owner of a fact the enum table already owns
+// (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET). Every such
+// message stayed correct only for as long as nobody touched the vocabulary,
+// and a test asserting the sentence CONTAINS a name stays green while the
+// sentence becomes a lie.
+//
+// `sep` — the separator, because the two house shapes differ (`, ` in the
+// language/semantics diagnostics, ` / ` in the target loader) and a cycle
+// that unified them would rewrite dozens of pinned sentences for no
+// correctness gain. The QUOTING is not a parameter: an unquoted list is
+// ambiguous the moment a spelling contains a space or a slash.
+//
+// `known` — any range of string-convertible spellings. Feed it an
+// `EnumNameTable` projection (`allNames` / `namesWhere`), never a literal.
+template <typename KnownKeys>
+[[nodiscard]] inline std::string renderAllowedList(KnownKeys const& known,
+                                                   std::string_view sep = ", ") {
+    std::string out;
+    for (auto const& k : known) {
+        if (!out.empty()) out += sep;
+        out += '\'';
+        out += std::string_view{k};
+        out += '\'';
+    }
+    return out;
+}
+
 // ── THE TYPO DISCRIMINATOR ITSELF ─────────────────────────────────────────
 //
 // Reject every key of `obj` that is neither a `$`-documentation key nor a
@@ -158,13 +218,8 @@ void rejectUnknownKeys(JsonObject const& obj,
         }
         if (found) continue;
         if (!allowedRendered) {
-            for (auto const& k : known) {
-                if (!allowed.empty()) allowed += ", ";
-                allowed += '\'';
-                allowed += std::string_view{k};
-                allowed += '\'';
-            }
-            allowedRendered = true;
+            allowed          = renderAllowedList(known);
+            allowedRendered  = true;
         }
         std::string message = "unknown key '";
         message += std::string_view{it.key()};

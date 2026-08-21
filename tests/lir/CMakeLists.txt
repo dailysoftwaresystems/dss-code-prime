@@ -55,3 +55,11 @@ target_link_libraries(dss_lir_test_mir_to_lir PRIVATE nlohmann_json::nlohmann_js
 # the strip-foeq/strip-fogt capability red-on-disable levers.
 dss_add_test(NAME lir/test_fcmp_lowering SOURCES test_fcmp_lowering.cpp)
 target_link_libraries(dss_lir_test_fcmp_lowering PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LIR-RETURN-REG-REFUSAL-IS-UNREACHABLE-FROM-THE-TEST-TIER: the result-register
+# pool rows are the ONE owner of both the acceptance decision and the sentence
+# that advertises it. Reaches `returnRegisterForClass` directly, which is the
+# whole point — while it lived in an anonymous namespace no tier could observe
+# its refusal, and retyping the accepted set as a literal reddened nothing.
+dss_add_test(NAME lir/test_lir_return_pool_projection
+             SOURCES test_lir_return_pool_projection.cpp)

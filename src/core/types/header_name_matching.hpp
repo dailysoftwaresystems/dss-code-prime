@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> (leaf header — no target_schema cycle)
 
 #include <cstdint>
 #include <optional>
@@ -62,28 +63,51 @@ enum class HeaderNameMatching : std::uint8_t {
     CaseInsensitive = 2,
 };
 
-// Hand-rolled name pair rather than the house `EnumNameTable<E,N>`: that
-// template lives in `target_schema.hpp`, which this header must not pull (the
-// same include-cycle constraint `data_model.hpp` documents). Two spellable
-// values; the switch stays trivially in sync with the enum (a new member
-// without an arm fails the -Wswitch build).
+// ── THE ONE OWNER OF THE HEADER-MATCHING SPELLINGS ────────────────────────
+//
+// ⚠ WAS A SWITCH PLUS AN IF-CHAIN, on a stale premise. The comment here said
+// `EnumNameTable<E,N>` "lives in `target_schema.hpp`, which this header must
+// not pull" — it has lived in the dependency-free
+// `core/types/enum_name_table.hpp` since that extraction, whose own comment
+// names leaf enum headers like this one as the reason it exists. What the
+// stale premise actually bought was two owners of two spellings, and a
+// `…FromName` that could silently stop agreeing with `…Name`.
+//
+// ★ `Invalid` IS NOT A ROW. A spellable "invalid" would let a typo look
+// deliberate, and a row with the EMPTY name would make `fromName("")` resolve
+// to it. It is left out, and the name side asks `nameOrEmpty` — which is the
+// contract `ObjectFormatData::validate()` reads through
+// `headerNameMatchingName(x).empty()`. `name()` would answer
+// "case-sensitive" for an undeclared axis and validate() would accept it.
+inline constexpr EnumNameTable<HeaderNameMatching, 2> kHeaderNameMatchingTable{{{
+    { HeaderNameMatching::CaseSensitive,   "case-sensitive"   },
+    { HeaderNameMatching::CaseInsensitive, "case-insensitive" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kHeaderNameMatchingTable);
+
 [[nodiscard]] constexpr std::string_view
 headerNameMatchingName(HeaderNameMatching m) noexcept {
+    // The `-Werror=switch` backstop — it owns no spelling, and its only job is
+    // that a new enumerator with no `case` fails the BUILD, which is what the
+    // hand-written name switch guaranteed and a bare table lookup would drop.
+    // ✔MEASURED on the sibling `dataModelName`: adding an enumerator without a
+    // case produces `enumeration value 'X' not handled in switch [-Werror=switch]`.
     switch (m) {
-        case HeaderNameMatching::Invalid:         return {};
-        case HeaderNameMatching::CaseSensitive:   return "case-sensitive";
-        case HeaderNameMatching::CaseInsensitive: return "case-insensitive";
+        case HeaderNameMatching::Invalid:
+        case HeaderNameMatching::CaseSensitive:
+        case HeaderNameMatching::CaseInsensitive:
+            break;
     }
-    return {};
+    return kHeaderNameMatchingTable.nameOrEmpty(m);   // NOT .name()
 }
 
-// `Invalid` deliberately has NO JSON spelling — a spellable "invalid" would
-// let a typo look deliberate.
 [[nodiscard]] constexpr std::optional<HeaderNameMatching>
 headerNameMatchingFromName(std::string_view s) noexcept {
-    if (s == "case-sensitive")   return HeaderNameMatching::CaseSensitive;
-    if (s == "case-insensitive") return HeaderNameMatching::CaseInsensitive;
-    return std::nullopt;
+    return kHeaderNameMatchingTable.fromName(s);
 }
 
 // The policy every caller that has NO active object format must use: LSP,

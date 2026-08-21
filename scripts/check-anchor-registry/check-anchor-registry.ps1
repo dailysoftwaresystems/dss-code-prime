@@ -3,9 +3,14 @@
 # registry CI guard. Mirrors the bash variant; same contract.
 #
 # Contract: every `D-*` identifier cited in a SCANNED ROOT (`src/`, `examples/`,
-# `tests/`, `integrated_tests/`, `real-examples/` - see the roots table below)
+# `tests/`, `integrated_tests/`, `real-examples/`, `scripts/`, `.claude/` - see
+# the roots table below)
 # MUST resolve to a row in `.plans/_deferred-anchor-registry.md` OR a citation
 # in any `.plans/*.md` file.
+#
+# Exit codes, matching the `.sh` exactly: 0 clean · 1 an anchor resolves nowhere ·
+# 2 a scan collapsed · 3 a markdown table row drops content · 4 a citation names a
+# retired id · 5 a quotation declaration is stale or false · 6 the self-test failed.
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -38,10 +43,27 @@ Set-Location $RepoRoot
 # below requires two or more), while any three-segment spelling is not.
 # See D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS, which is the row
 # that predicted this and stays open for the `scripts/` + `tests/` half.
-$AnchorRegex = '\bD-[A-Z0-9_]+(-[A-Z0-9_]+){2,}'
+# ★ THE GRAMMAR IS SPELLED ONCE AND THE BOUNDARY IS BOLTED ON, mirroring the
+# `.sh`. The wrap-recovery pass needs the same grammar WITHOUT the boundary,
+# because it enforces the boundary itself by testing the preceding character; two
+# spellings of the THRESHOLD would be the duplicated-site shape this file keeps
+# closing, while two spellings of the BOUNDARY are unavoidable and so are made
+# explicit here rather than left to be rediscovered.
+$AnchorCore  = 'D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}'
+$AnchorRegex = '\b' + $AnchorCore
 
+# ⚠ `-Force` IS LOAD-BEARING NOW, AND IT WAS NOT BEFORE. The header further down
+# records `Get-ChildItem -Recurse` skipping hidden files and directories as a
+# divergence from `grep -r`, "harmless only while no source lives under a dotted
+# path". `.claude/` IS a dotted path, so adding it as a root retires that excuse.
+# ✔MEASURED on this host, both ways: 35 files with `-Force` and 35 without,
+# because a leading dot does not set the hidden ATTRIBUTE on Windows - so this is
+# a repair for the filesystem where it does, not for a difference visible here.
+# The cell-width half of this file already passes `-Force` for `.plans/`, and the
+# two halves disagreeing about how to walk a dotted root is exactly the kind of
+# drift `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` is open about.
 function Get-Anchors([string]$Path, [string[]]$Filters) {
-    $files = Get-ChildItem -Path $Path -Recurse -File -Include $Filters -ErrorAction SilentlyContinue
+    $files = Get-ChildItem -Path $Path -Recurse -File -Force -Include $Filters -ErrorAction SilentlyContinue
     $anchors = @{}
     foreach ($f in $files) {
         $content = Get-Content -Raw -LiteralPath $f.FullName -ErrorAction SilentlyContinue
@@ -51,6 +73,273 @@ function Get-Anchors([string]$Path, [string[]]$Filters) {
     }
     return $anchors.Keys | Sort-Object
 }
+
+# Repo-relative, forward-slashed - the shape the `.sh` twin prints. The cell-width
+# half already normalises this way; the anchor half did not, so every `cited in:`
+# line differed between the twins by its separators alone. The twins are verified
+# by DIFFING their output, and noise a real divergence could hide in is not free.
+function RelPath([string]$full) {
+    return $full.Substring($RepoRoot.Length + 1).Replace([IO.Path]::DirectorySeparatorChar, '/')
+}
+
+# ── WRAP RECOVERY ── twin of the block of that name in `check-anchor-registry.sh`,
+# which carries the full rationale and the measurements. Restated here in the one
+# sentence that matters, because a twin that only points at its sibling is how the
+# pair drifts: a line-wrapped anchor id does not FAIL, it DISAPPEARS - the
+# single-line regex sees at most a prefix, and 43 of the wrapped prefixes in this
+# tree fall below the three-segment threshold and so are never collected at all.
+# Recovery joins the continuation and lets the whole name face the ordinary
+# resolve. It is a RECOVERY and not a refusal: refusing would demand 298 reflows
+# of honest text across seven roots.
+# ⚠ THE UPPERCASE REQUIREMENT LIVES IN ONE PLACE, and it used to live in two. An
+# earlier cut tested `-cnotmatch '^[A-Z0-9_]'` before the anchored match below,
+# which is the same question asked twice. ✔MEASURED on the `.sh` twin by planting
+# a mutant on the first test and watching the self-test STAY GREEN - a redundant
+# guard makes the property untestable, because no single-point break exposes it.
+function WrapContinuation([string]$next) {
+    $c = $next -replace '^[^A-Za-z0-9_]+', ''
+    $m = [regex]::Match($c, '^[A-Z0-9_]+(-[A-Z0-9_]+)*')
+    if (-not $m.Success) { return '' }
+    return $m.Value
+}
+# The WORD-BOUNDARY test here is the .NET spelling of the `\b` in $AnchorRegex and
+# of the `\<` the `.sh` greps use: the character before the token must not be a
+# word character. ★ It LOOPS rather than testing the first match: the leftmost
+# `D-` on a line can be an inner fragment of a longer hyphenated word while a
+# genuine anchor sits later on the same line.
+function WrapPrefix([string]$line) {
+    $s = $line -replace '[ \t]+$', ''
+    if (-not $s.EndsWith('-')) { return '' }
+    $s = $s.Substring(0, $s.Length - 1)
+    $rx = [regex]::new('D-[A-Z0-9_]+(-[A-Z0-9_]+)*$')
+    $off = 0
+    while ($off -le $s.Length) {
+        $m = $rx.Match($s, $off)
+        if (-not $m.Success) { return '' }
+        if ($m.Index -eq 0 -or $s[$m.Index - 1] -notmatch '[A-Za-z0-9_]') { return $s.Substring($m.Index) }
+        $off = $m.Index + 1
+    }
+    return ''
+}
+function JoinWrappedInFile([string]$path, [string]$rel) {
+    $out = [System.Collections.ArrayList]::new()
+    $lines = ([IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)) -split "`n"
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $pre = WrapPrefix ($lines[$i].TrimEnd([char]13))
+        if ($pre -eq '') { continue }
+        $nxt = ''
+        if ($i + 1 -lt $lines.Count) { $nxt = $lines[$i + 1].TrimEnd([char]13) }
+        $cont = WrapContinuation $nxt
+        if ($cont -eq '') { continue }
+        [void]$out.Add("${rel}:${pre}-${cont}")
+    }
+    return $out.ToArray()
+}
+
+# ── QUOTED-NOT-CITED ── twin of the block of that name in the `.sh`, where the
+# design argument lives in full: a document that QUOTES a dead id as evidence is
+# not citing live work, and neither of this project's existing mechanisms fits.
+# Rewording it would edit a measured record to suit a tool; an Allowlist entry
+# silences a name repo-wide and forever and its own table is headed "code-internal
+# pins, NOT deferrals". A declaration is scoped to ONE file, is visible to a human
+# reader, and EXPIRES - three refusals below make sure of that.
+# ★★ RECOGNITION IS POSITIONAL: only DECORATION may precede the token, so writing
+# ABOUT the marker cannot trip it. That is the same lesson the retired-id matcher
+# learned from two production false positives.
+$QuoteDeclRx = '^[^A-Za-z0-9_]*ANCHOR-GUARD-QUOTED-NOT-CITED:'
+function DeclRecordsInFile([string]$path, [string]$rel) {
+    $out = [System.Collections.ArrayList]::new()
+    $lines = ([IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)) -split "`n"
+    $isDecl = New-Object bool[] $lines.Count
+    $ids = [System.Collections.ArrayList]::new()
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i].TrimEnd([char]13)
+        if ($line -cnotmatch $QuoteDeclRx) { continue }
+        $isDecl[$i] = $true
+        # ★ ONE MECHANISM PROTECTS THE ID LIST, AND IT IS THE WORD BOUNDARY. The
+        # marker itself ENDS IN AN ANCHOR-SHAPED TAIL (the `D` of GUARD plus
+        # `-QUOTED-NOT-CITED`), and the boundary test rejects it because a word
+        # character precedes it - ✔MEASURED, because the first cut of this
+        # extractor lacked the test, lifted that tail out of the marker, and
+        # reported the declaration as STALE. An earlier cut ALSO stripped the
+        # marker off the front first; that was the same question asked twice, and a
+        # mutant deleting it left the self-test GREEN, which is how a redundant
+        # guard rots. The strip is gone and the boundary test is pinned by two arms.
+        $rest = $line
+        foreach ($m in [regex]::Matches($rest, 'D-[A-Z0-9_]+(-[A-Z0-9_]+)*')) {
+            if ($m.Index -gt 0 -and $rest[$m.Index - 1] -match '[A-Za-z0-9_]') { continue }
+            if (-not $ids.Contains($m.Value)) { [void]$ids.Add($m.Value) }
+        }
+    }
+    foreach ($id in $ids) {
+        $cited = $false
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($isDecl[$i]) { continue }
+            if ($lines[$i].Contains($id)) { $cited = $true; break }
+        }
+        [void]$out.Add(($(if ($cited) { 'DECL:' } else { 'STALE:' }) + "${rel}:${id}"))
+    }
+    return $out.ToArray()
+}
+
+# ── The retired-id matcher, in the same POSITIONAL form as the `.sh` ──────────
+# ★★★ THIS CHECK DID NOT EXIST IN THIS TWIN AT ALL until 2026-08-21, and the
+# Windows ctest entry runs THIS file. ✔MEASURED: zero occurrences of the word
+# RETIRED anywhere in this script, against a `.sh` that has refused with exit 4
+# since 2026-08-17 - so on the Windows leg the retired-id refusal had never once
+# run. That is `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` in its purest form: the pair
+# existed, and one of them silently did less.
+# The matcher is positional because two SEARCHING forms produced false positives
+# in production - one on a row whose prose merely said "as a retired id", the next
+# on the row that DOCUMENTS the token. A marker that is merely PRESENT can always
+# be tripped by writing about it, so the status cell must OPEN with it.
+# ⚠ Field splitting is on EVERY `|`, escaped or not, exactly as the `.sh`'s
+# `awk -F'|'` does. Matching its imperfection is the point: the twins must agree.
+function RetiredIdsIn([string[]]$lines) {
+    $out = [System.Collections.ArrayList]::new()
+    foreach ($raw in $lines) {
+        $line = $raw.TrimEnd([char]13)
+        if ($line -cnotmatch '^\| `D-') { continue }
+        $cells = $line -split '\|'
+        if ($cells.Count -lt 3) { continue }
+        $key = $cells[1] -replace '[` ]', ''
+        if ($cells[2] -cmatch '^ *\**✅ \*\*CLOSED [0-9-]+ — RETIRED-ID') { [void]$out.Add($key) }
+    }
+    return $out.ToArray()
+}
+
+# ── Per-root scan, hoisted into a function so the self-test drives the SAME code
+# the live loop drives. A self-test that re-implements its subject proves only
+# that two copies of a mistake agree.
+function ScanOneRoot([string]$Root, [int]$Floor, [string[]]$Filters, [hashtable]$Into) {
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        Write-Host "anchor-registry: FAIL - scan root '$Root' does not exist. A missing root would silently shrink coverage; refusing to report a partial scan as a pass."
+        return $false
+    }
+    # @() forces an array even for the 0- and 1-anchor cases: under
+    # `Set-StrictMode -Version Latest` a `$null.Count` from an empty root is a
+    # terminating error, i.e. the collapse case would die with a PowerShell stack
+    # trace instead of the sentence that says what happened.
+    $rootAnchors = @(Get-Anchors $Root $Filters)
+    if ($rootAnchors.Count -lt $Floor) {
+        Write-Host "anchor-registry: FAIL - root '$Root' yielded only $($rootAnchors.Count) anchors, below its floor of $Floor."
+        Write-Host "  This does NOT mean that root is clean - it means ITS scan collapsed (unreadable files, a drifted -Include filter, or a moved subtree)."
+        Write-Host "  Refusing to report a pass. Fix the scan; do not lower the floor."
+        return $false
+    }
+    foreach ($a in $rootAnchors) { $Into[$a] = $true }
+    return $true
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# SELF-TEST - RUNS ON EVERY INVOCATION, like `check-orphan-tests`, and TWIN of the
+# battery of the same name in `check-anchor-registry.sh`: same 13 arms, same order.
+#
+# ★★ IT TAKES NO FLAG, DELIBERATELY. ctest invokes this guard with no arguments,
+# so a `-SelfTest` switch would be a self-test that CI never runs - the vacuous
+# pass this repository already has a row about. Running it unconditionally means
+# the ctest entry cannot go green without the guard first PROVING IT CAN FAIL.
+#
+# ★ EVERY ARM DRIVES THE PRODUCTION CODE - the same functions the live path calls,
+# never a copy. A self-test that re-implements its subject proves only that two
+# copies of a mistake agree.
+#
+# ⛔ THE FIXTURE NAMES ARE BELOW THE THREE-SEGMENT THRESHOLD, or are assembled from
+# two adjacent string literals so the whole name never appears in this file's
+# bytes. `scripts/` is now a SCANNED ROOT, so an anchor-shaped fixture written out
+# here would be a CITATION of a name with no row - which is exactly the defect this
+# cycle found in another script's parser fixtures.
+# ⛔ AND THE DECLARATION MARKER IS NEVER WRITTEN AT THE START OF A LINE HERE: a
+# line whose only prefix is decoration IS a declaration, so a fixture spelled
+# literally would be read as a real one. It is built by concatenation instead.
+$stFail = $false
+function St-Arm([string]$name, [string]$expected, [string]$actual) {
+    if ($expected -ceq $actual) { return }
+    Write-Host "anchor-registry: SELF-TEST arm '$name' FAILED - this guard cannot be trusted to fail."
+    Write-Host "    expected: $expected"
+    Write-Host "    actual  : $actual"
+    $script:stFail = $true
+}
+$stDir = Join-Path ([IO.Path]::GetTempPath()) ("anchor-registry-selftest-" + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $stDir)
+try {
+    # ── arms 1-4: wrap recovery, both directions ────────────────────────────
+    [IO.File]::WriteAllLines((Join-Path $stDir 'wrap.txt'), [string[]]@(
+        '// a one-line citation D-CTL-ONE needs no recovery',
+        '// wrapped, comment continuation D-WRAPA-',
+        '// TAILA is the rest of it',
+        '# wrapped, decoration continuation D-WRAPB-',
+        '# -- TAILB ends it',
+        '// wrapped into prose D-WRAPC-',
+        '// tailc is a word, not a name',
+        '// an inner fragment of a longer word FIXED-32-BIT-WORD-',
+        '// TAILD must not be reached'))
+    $stGot = ((@(JoinWrappedInFile (Join-Path $stDir 'wrap.txt') 'wrap.txt') |
+        ForEach-Object { $_.Substring($_.LastIndexOf(':') + 1) }) -join ' ') + ' '
+    St-Arm 'wrap-join-recovers-both-continuation-shapes' 'D-WRAPA-TAILA D-WRAPB-TAILB ' $stGot
+    St-Arm 'wrap-join-refuses-a-lower-case-continuation' '' (($stGot -split ' ' | Where-Object { $_ -clike 'D-WRAPC*' }) -join ' ')
+    St-Arm 'wrap-join-refuses-a-fragment-inside-a-longer-word' '' (($stGot -split ' ' | Where-Object { $_ -clike '*TAILD*' }) -join ' ')
+    St-Arm 'wrap-join-leaves-an-unwrapped-citation-alone' '' (($stGot -split ' ' | Where-Object { $_ -clike 'D-CTL*' }) -join ' ')
+
+    # ── arms 5-6: quotation declarations ────────────────────────────────────
+    $stMarker = 'ANCHOR-GUARD-QUOTED-NOT-CITED:'
+    [IO.File]::WriteAllLines((Join-Path $stDir 'decl.txt'), [string[]]@(
+        'prose that quotes D-QUO-HERE as evidence of a deleted row',
+        "  > $stMarker D-QUO-HERE D-QUO-GONE WORD-D-QUO-INNER"))
+    $stGot = ((@(DeclRecordsInFile (Join-Path $stDir 'decl.txt') 'decl.txt')) -join ' ') + ' '
+    St-Arm 'quotation-declaration-classifies-cited-and-absent-ids' `
+           'DECL:decl.txt:D-QUO-HERE STALE:decl.txt:D-QUO-GONE ' $stGot
+    # Two SEPARATE outcomes of the one boundary test, pinned separately: the
+    # anchor-shaped tail inside the marker, and an id sitting in the middle of a
+    # longer hyphenated word on the same line.
+    St-Arm 'quotation-marker-does-not-cite-its-own-anchor-shaped-tail' '' `
+           (($stGot -split ' ' | Where-Object { $_ -clike '*D-QUOTED*' }) -join ' ')
+    St-Arm 'quotation-ids-must-sit-on-a-word-boundary' '' `
+           (($stGot -split ' ' | Where-Object { $_ -clike '*D-QUO-INNER*' }) -join ' ')
+    # A line that merely MENTIONS the marker is prose, not a declaration. Two
+    # earlier markers in this guard were defeated by exactly that - one by a row
+    # whose prose said the words, the next by the row that documented the token.
+    [IO.File]::WriteAllLines((Join-Path $stDir 'mid.txt'), [string[]]@(
+        "see the $stMarker convention, which would exempt D-QUO-MID"))
+    St-Arm 'quotation-declaration-recognition-is-positional' '' `
+           ((@(DeclRecordsInFile (Join-Path $stDir 'mid.txt') 'mid.txt')) -join ' ')
+
+    # ── arms 7-9: root existence and per-root floor ─────────────────────────
+    # The fixture anchor is assembled from two literals; see the note above.
+    $stAnchor = 'D-SELFTEST' + '-FIXTURE-ANCHOR'
+    [void](New-Item -ItemType Directory -Path (Join-Path $stDir 'root'))
+    [IO.File]::WriteAllText((Join-Path $stDir 'root/a.md'), "cite $stAnchor here`n")
+    $stSink = @{}
+    $stGot = (& { ScanOneRoot (Join-Path $stDir 'no-such-root') 1 @('*.md') $stSink } 6>&1 | Out-String)
+    St-Arm 'missing-root-refuses-and-says-so' 'yes' `
+           $(if ($stGot -match 'does not exist' -and $stGot -match 'refusing to report a partial scan as a pass') { 'yes' } else { $stGot })
+    $stGot = (& { ScanOneRoot (Join-Path $stDir 'root') 99 @('*.md') $stSink } 6>&1 | Out-String)
+    St-Arm 'below-floor-root-refuses-and-names-the-floor' 'yes' `
+           $(if ($stGot -match 'yielded only 1 anchors, below its floor of 99' -and $stGot -match 'do not lower the floor') { 'yes' } else { $stGot })
+    $stSink = @{}
+    [void](ScanOneRoot (Join-Path $stDir 'root') 1 @('*.md') $stSink)
+    St-Arm 'at-floor-root-passes-and-collects' $stAnchor (($stSink.Keys | Sort-Object) -join ' ')
+
+    # ── arms 10-12: the retired-id matcher, against its two production false positives
+    $stR1 = 'D-RETA' + '-FIXTURE-ROW'; $stR2 = 'D-RETB' + '-FIXTURE-ROW'; $stR3 = 'D-RETC' + '-FIXTURE-ROW'
+    $stGot = ((@(RetiredIdsIn ([string[]]@(
+        "| ``$stR1`` | ✅ **CLOSED 2026-01-01 — RETIRED-ID, renamed** | t | c |",
+        "| ``$stR2`` | 🟠 **OPEN** — the prose here merely says ""as a retired id"" | t | c |",
+        "| ``$stR3`` | 🟠 **OPEN** — this row DOCUMENTS the RETIRED-ID token | t | c |")))) -join ' ') + ' '
+    St-Arm 'retired-matcher-extracts-a-positionally-marked-row' 'yes' `
+           $(if ($stGot -clike "*$stR1*") { 'yes' } else { $stGot })
+    St-Arm 'retired-matcher-ignores-prose-that-says-retired-id' '' `
+           (($stGot -split ' ' | Where-Object { $_ -ceq $stR2 }) -join ' ')
+    St-Arm 'retired-matcher-ignores-a-row-that-documents-the-token' '' `
+           (($stGot -split ' ' | Where-Object { $_ -ceq $stR3 }) -join ' ')
+} finally {
+    Remove-Item -Recurse -Force -LiteralPath $stDir -ErrorAction SilentlyContinue
+}
+if ($stFail) {
+    Write-Host "anchor-registry: FAIL - the self-test did not pass, so no verdict from this run means anything."
+    exit 6
+}
+Write-Host "anchor-registry: self-test OK - 15 arms (4 wrap recovery incl. 3 refusals to join, 4 quotation classification incl. the positional rule and the word boundary, 3 root existence/floor, 3 retired-id matcher incl. both production false positives, 1 green control); this guard is PROVEN able to fail."
 
 # The scanned set MUST match the .sh sibling EXACTLY (`src/ examples/` x
 # {cpp,hpp,json,c}). It did not: this script scanned `src` without `*.c` and
@@ -335,6 +624,20 @@ if (-not (Test-Path -LiteralPath $CellWidthRoot -PathType Container)) {
 $AnchorFileFilters     = @('*.cpp', '*.hpp', '*.json', '*.c',
                            '*.s', '*.inc', '*.probes', 'CMakeLists.txt', '*.md')
 $HarnessFileFilters    = @('*.sh', '*.ps1', '*.py')
+# `scripts/` is a driver root like `real-examples/`, plus its prose: ✔MEASURED per
+# extension, anchors live in `*.sh` (26), `*.ps1` (21) and `*.py` (38) and nowhere
+# else, and `scripts/README.md` is a citation site like any other prose file. The
+# rest of the tree there is test FIXTURE data - a C example project, a golden
+# `.expected`, two JSON data files - and scanning input data for citations is the
+# category error that this cycle found in another script's parser fixtures.
+$ScriptFileFilters     = @('*.sh', '*.ps1', '*.py', '*.md')
+# `.claude/` is where this project's RULES live, so a dangling citation there
+# misleads exactly the reader with the most authority to act on it. ✔MEASURED: 40
+# distinct anchors, 39 in `*.md` and 1 in `*.mjs`. `*.py` contributes zero today
+# and is included anyway because `.claude/` DOES contain a `.py` file - that is
+# coverage, not a no-op. `*.json` is deliberately out: the only JSON here is the
+# gitignored, machine-local `settings.local.json`.
+$SkillFileFilters      = @('*.md', '*.py', '*.mjs')
 
 # ── tests/ + integrated_tests/ ADDED 2026-08-14 (AP6),
 # D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS. Mirrors the `.sh`
@@ -369,12 +672,23 @@ $HarnessFileFilters    = @('*.sh', '*.ps1', '*.py')
 # locator below spelled the roots and filters a second time, so adding a root to
 # the scan alone would have left it unable to attribute a `cited in:` line for
 # that root. Derived from this array now, so a root cannot be half-added.
+# ── scripts/ + .claude/ ADDED 2026-08-21 (P23), completing
+# D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS. Mirrors the `.sh`
+# sibling in the same commit; that file carries the full rationale and the
+# per-extension measurements. The half of it that must not be delegated: the
+# `scripts/` widening does NOT close that row, because ✔MEASURED, the eleven
+# synthetic fixture names the row predicted as blockers resolve today through
+# exactly ONE piece of text - the registry row that reports them as unregistered -
+# and through nothing else. Green because the complaint exists is not green.
+# Floors below MUST stay identical to the `.sh` table.
 $RootSpecs = @(
     @{ Root = 'src';              Floor = 400; Filters = $AnchorFileFilters  }
     @{ Root = 'examples';         Floor = 150; Filters = $AnchorFileFilters  }
     @{ Root = 'tests';            Floor = 300; Filters = $AnchorFileFilters  }
     @{ Root = 'integrated_tests'; Floor = 8;   Filters = $AnchorFileFilters  }
     @{ Root = 'real-examples';    Floor = 10;  Filters = $HarnessFileFilters }
+    @{ Root = 'scripts';          Floor = 25;  Filters = $ScriptFileFilters  }
+    @{ Root = '.claude';          Floor = 15;  Filters = $SkillFileFilters   }
 )
 
 # ★★ FAIL-CLOSED. Every root must EXIST and must independently CLEAR ITS FLOOR.
@@ -388,27 +702,50 @@ $RootSpecs = @(
 $scanFailed = $false
 $srcAnchorSet = @{}
 foreach ($spec in $RootSpecs) {
-    if (-not (Test-Path -LiteralPath $spec.Root -PathType Container)) {
-        Write-Host "anchor-registry: FAIL - scan root '$($spec.Root)' does not exist. A missing root would silently shrink coverage; refusing to report a partial scan as a pass."
-        $scanFailed = $true
-        continue
-    }
-    # @() forces an array even for the 0- and 1-anchor cases: under
-    # `Set-StrictMode -Version Latest` a `$null.Count` from an empty root is a
-    # terminating error, i.e. the collapse case would die with a PowerShell
-    # stack trace instead of the sentence that says what happened.
-    $rootAnchors = @(Get-Anchors $spec.Root $spec.Filters)
-    if ($rootAnchors.Count -lt $spec.Floor) {
-        Write-Host "anchor-registry: FAIL - root '$($spec.Root)' yielded only $($rootAnchors.Count) anchors, below its floor of $($spec.Floor)."
-        Write-Host "  This does NOT mean that root is clean - it means ITS scan collapsed (unreadable files, a drifted -Include filter, or a moved subtree)."
-        Write-Host "  Refusing to report a pass. Fix the scan; do not lower the floor."
-        $scanFailed = $true
-        continue
-    }
-    foreach ($a in $rootAnchors) { $srcAnchorSet[$a] = $true }
+    if (-not (ScanOneRoot $spec.Root $spec.Floor $spec.Filters $srcAnchorSet)) { $scanFailed = $true }
 }
 if ($scanFailed) { exit 2 }
-$srcAnchors = @($srcAnchorSet.Keys | Sort-Object)
+
+# ── WRAP RECOVERY, one root at a time, AFTER the floors ──────────────────────
+# ★ The floors are computed on the RAW single-line scan and are deliberately
+# unaffected by recovery: a floor exists to catch a COLLAPSED scan, and folding
+# recovered names into it would let a burst of wrapped citations mask a root that
+# had stopped being read. Recovered names widen what must resolve; they must not
+# move what proves the scan ran.
+# The recovered records are `path:token` - the same shape the FAIL-path locator
+# index uses - so a recovered name that fails to resolve is reported WITH its
+# `cited in:` line, which matters most for exactly the citations that are hardest
+# to find by eye.
+$wrapRecords = [System.Collections.ArrayList]::new()
+foreach ($spec in $RootSpecs) {
+    if (-not (Test-Path -LiteralPath $spec.Root -PathType Container)) { continue }
+    foreach ($f in @(Get-ChildItem -Path $spec.Root -Recurse -File -Force `
+                                   -Include $spec.Filters -ErrorAction SilentlyContinue)) {
+        foreach ($r in (JoinWrappedInFile $f.FullName (RelPath $f.FullName))) { [void]$wrapRecords.Add($r) }
+    }
+}
+$wholeAnchorRx = [regex]::new('^' + $AnchorCore + '$')
+foreach ($r in $wrapRecords) {
+    $t = $r.Substring($r.LastIndexOf(':') + 1)
+    if ($wholeAnchorRx.IsMatch($t)) { $srcAnchorSet[$t] = $true }
+}
+
+# ── QUOTED-NOT-CITED declarations - see the block of that name above ─────────
+# Runs BEFORE the anchor set is frozen, because an exempted id must never reach
+# the resolve. ⓘ A RETIRED id can never be exempted: a retired row exists, so the
+# id RESOLVES, so the FALSE refusal below fires first. That is by construction
+# rather than by a special case.
+$declRecords = [System.Collections.ArrayList]::new()
+foreach ($spec in $RootSpecs) {
+    if (-not (Test-Path -LiteralPath $spec.Root -PathType Container)) { continue }
+    foreach ($f in @(Get-ChildItem -Path $spec.Root -Recurse -File -Force `
+                                   -Include $spec.Filters -ErrorAction SilentlyContinue)) {
+        $head = Get-Content -Raw -LiteralPath $f.FullName -ErrorAction SilentlyContinue
+        if (-not $head) { continue }
+        if ($head -cnotmatch "(?m)$QuoteDeclRx") { continue }
+        foreach ($r in (DeclRecordsInFile $f.FullName (RelPath $f.FullName))) { [void]$declRecords.Add($r) }
+    }
+}
 
 # ⚠ KNOWN PAIRING DIVERGENCES, extension-case half — documented 2026-08-03 (TF-C112),
 # adding to the three already listed above. `Get-ChildItem -Include '*.sh'` matches
@@ -472,21 +809,169 @@ $srcAnchors = @($srcAnchorSet.Keys | Sort-Object)
 $planFiles = Get-ChildItem -Path '.plans' -Recurse -File -Include '*.md'
 $allPlanText = ($planFiles | ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
 
+# ── ONE `path:token` CITATION INDEX, BUILT AT MOST ONCE, WITH TWO CONSUMERS ──
+# ★★ THE TREE IS WALKED ONCE - NOT ONCE PER QUESTION. This twin has paid for that
+# lesson before (the FAIL-path locator re-walked per missing anchor and took 82.9
+# s for eight of them), and the `.sh` paid for it a third time while this cycle's
+# quotation check was being written: asking the tree per declared id took that
+# guard from 8.1 s to 49.3 s for THREE ids. One pass answers both questions.
+# ⚠ Built LAZILY: a tree with no quotation declaration and no missing anchor never
+# pays for it, and a run that needs it for one consumer hands it to the other free.
+$script:LocIndexBuilt = $false
+$script:LocTokens = [System.Collections.ArrayList]::new()   # distinct tokens, first-seen order
+$script:LocPaths  = @{}                                     # token -> ordered path list
+$script:LocRank   = @{}                                     # path  -> enumeration position
+function Build-CitationIndex {
+    if ($script:LocIndexBuilt) { return }
+    $script:LocIndexBuilt = $true
+    $locFiles = @()
+    foreach ($spec in $RootSpecs) {
+        if (-not (Test-Path -LiteralPath $spec.Root -PathType Container)) { continue }
+        $locFiles += @(Get-ChildItem -Path $spec.Root -Recurse -File -Force `
+                                     -Include $spec.Filters -ErrorAction SilentlyContinue)
+    }
+    $locRx = [regex]::new($AnchorRegex, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    foreach ($f in $locFiles) {
+        $c = Get-Content -Raw -LiteralPath $f.FullName -ErrorAction SilentlyContinue
+        if (-not $c) { continue }
+        $rel = RelPath $f.FullName
+        $seenHere = @{}
+        foreach ($m in $locRx.Matches($c)) {
+            $t = $m.Value
+            if ($seenHere.ContainsKey($t)) { continue }
+            $seenHere[$t] = $true
+            if (-not $script:LocPaths.ContainsKey($t)) {
+                [void]$script:LocTokens.Add($t)
+                $script:LocPaths[$t] = [System.Collections.ArrayList]::new()
+            }
+            [void]$script:LocPaths[$t].Add($rel)
+        }
+    }
+    # The recovered wrapped names are part of the index, not just of the anchor set.
+    foreach ($r in $wrapRecords) {
+        $i = $r.LastIndexOf(':')
+        $p = $r.Substring(0, $i); $t = $r.Substring($i + 1)
+        if (-not $script:LocPaths.ContainsKey($t)) {
+            [void]$script:LocTokens.Add($t)
+            $script:LocPaths[$t] = [System.Collections.ArrayList]::new()
+        }
+        if (-not $script:LocPaths[$t].Contains($p)) { [void]$script:LocPaths[$t].Add($p) }
+    }
+    # ORDER: the old form walked FILES and printed the matching ones, so the report
+    # is ordered by enumeration position. Replay that by ranking each path.
+    $locOrder = 0
+    foreach ($f in $locFiles) {
+        $rel = RelPath $f.FullName
+        if (-not $script:LocRank.ContainsKey($rel)) { $script:LocRank[$rel] = $locOrder++ }
+    }
+}
+
+# ── The three quotation refusals. See the QUOTED-NOT-CITED block above ───────
+$quoteFailed = $false
+$exempt = @{}
+foreach ($rec in $declRecords) {
+    $kind = $rec.Substring(0, $rec.IndexOf(':'))
+    $tail = $rec.Substring($rec.IndexOf(':') + 1)
+    $i = $tail.LastIndexOf(':')
+    $dpath = $tail.Substring(0, $i); $did = $tail.Substring($i + 1)
+    if ($kind -eq 'STALE') {
+        Write-Host "anchor-registry: FAIL - a quotation declaration is STALE."
+        Write-Host "    $dpath declares $did as QUOTED-NOT-CITED, but that id appears nowhere else in that file."
+        Write-Host "    The quotation it exempted is gone. Delete the declaration; an exemption that outlives what it covered silences a future real citation."
+        $quoteFailed = $true
+        continue
+    }
+    if ($allPlanText.Contains($did)) {
+        Write-Host "anchor-registry: FAIL - a quotation declaration is FALSE."
+        Write-Host "    $dpath declares $did as QUOTED-NOT-CITED, but that id RESOLVES in .plans/."
+        Write-Host "    It names live work, so it is an ordinary citation. Remove it from the declaration and let the ordinary check own it."
+        $quoteFailed = $true
+        continue
+    }
+    # EQUALITY on the token, not substring: a LONGER name that happens to contain
+    # this id is a different anchor and is nobody else's citation of this one.
+    Build-CitationIndex
+    $elsewhere = ''
+    if ($script:LocPaths.ContainsKey($did)) {
+        foreach ($p in $script:LocPaths[$did]) { if ($p -ne $dpath) { $elsewhere += " $p" } }
+    }
+    if ($elsewhere -ne '') {
+        Write-Host "anchor-registry: FAIL - a quotation declaration LEAKED."
+        Write-Host "    $dpath declares $did as QUOTED-NOT-CITED, but that id is also cited in:$elsewhere"
+        Write-Host "    One document may not exempt a name on another document's behalf. Either those are live citations and the id needs a row, or they are quotations and each file declares its own."
+        $quoteFailed = $true
+        continue
+    }
+    $exempt[$did] = $true
+}
+if ($quoteFailed) {
+    Write-Host "  A quotation declaration says 'this document QUOTES a dead id as evidence, it does not cite live work'."
+    Write-Host "  It is scoped to ONE file and it EXPIRES: that is what makes it narrower than an Allowlist entry, which"
+    Write-Host "  silences a name repo-wide and forever. Repair the declaration; do not widen it."
+    exit 5
+}
+foreach ($e in $exempt.Keys) { $srcAnchorSet.Remove($e) }
+$srcAnchors = @($srcAnchorSet.Keys | Sort-Object)
+
+# ══ RETIRED IDS - a citation must not name an id that has been withdrawn ══════
+# See the note on `RetiredIdsIn` above: this half of the contract did not exist in
+# this twin at all until 2026-08-21, while the `.sh` had refused with exit 4 since
+# 2026-08-17 - and the Windows ctest entry runs THIS file.
+# ⚠ EQUALITY, NOT SUBSTRING, and deliberately so: a retired id may be a PREFIX of
+# a live one, and substring here would red the live citation too. The failure this
+# catches is a citation that still spells the dead name exactly.
+# ★★ FAIL-CLOSED on a collapsed extraction, like every other scan here. The
+# registry carries retired rows; zero means the marker drifted or the table shape
+# changed, never that the check has nothing to do.
+$retiredIds = @(RetiredIdsIn ([IO.File]::ReadAllLines(
+    (Join-Path $RepoRoot '.plans/_deferred-anchor-registry.md'), [Text.Encoding]::UTF8)))
+if ($retiredIds.Count -lt 1) {
+    Write-Host "anchor-registry: FAIL - the retired-id scan found 0 marked rows."
+    Write-Host "  This does NOT mean no id is retired - it means THIS scan collapsed (the ``RETIRED-ID`` token was renamed, or the registry's column layout moved)."
+    Write-Host "  Refusing to report a pass. Fix the scan; do not delete the check."
+    exit 2
+}
+$retiredCited = @($retiredIds | Where-Object { $srcAnchorSet.ContainsKey($_) })
+if ($retiredCited.Count -gt 0) {
+    Write-Host "anchor-registry: FAIL - $($retiredCited.Count) citation(s) name a RETIRED anchor id:"
+    Build-CitationIndex
+    foreach ($rid in $retiredCited) {
+        Write-Host "    $rid"
+        if ($script:LocPaths.ContainsKey($rid)) {
+            foreach ($p in $script:LocPaths[$rid]) { Write-Host "      $p" }
+        }
+    }
+    Write-Host "  A retired id resolves only because the plans still MENTION it. Repoint each"
+    Write-Host "  citation at the live row named in the retired row's own status cell."
+    exit 4
+}
+
 $missing = @()
 foreach ($a in $srcAnchors) {
     if (-not $allPlanText.Contains($a)) { $missing += $a }
 }
 
 if ($missing.Count -eq 0) {
-    Write-Host "anchor-registry: OK ($($srcAnchors.Count) src anchors all resolve to plans)"
+    # The retired-id count is part of the headline BECAUSE this twin now runs that
+    # check: a summary that omits a check nobody can see running is how a check
+    # gets deleted by accident. It also keeps the two twins byte-comparable, which
+    # is the only thing that makes the pairing contract checkable at all.
+    Write-Host "anchor-registry: OK ($($srcAnchors.Count) src anchors all resolve to plans, $($retiredIds.Count) retired id(s) uncited)"
     # ★ The cell-width verdict is NOT allowed to be swallowed by the anchor
     # check's success. Exit codes, matching the .sh: 1 = an anchor resolves
-    # nowhere, 2 = a scan collapsed, 3 = a markdown table row drops content.
+    # nowhere, 2 = a scan collapsed, 3 = a markdown table row drops content,
+    # 4 = a citation names a retired id, 5 = a quotation declaration is stale or
+    # false, 6 = the self-test failed.
     exit $(if ($cwCollapsed) { 2 } elseif ($cwViolated) { 3 } else { 0 })
 }
 
+# ★ THE ROOT LIST IN THE HEADLINE IS DERIVED, TOO. It was another hardcoded copy
+# and it had gone stale in the direction that misleads most: the sentence that
+# tells the reader WHERE the guard looked was the one place guaranteed to be
+# wrong about it.
+$rootNames = (($RootSpecs | ForEach-Object { "$($_.Root)/" }) -join ', ')
 Write-Host "anchor-registry: FAIL - the following anchors are cited in a SCANNED ROOT"
-Write-Host "(src/, examples/, tests/, integrated_tests/, real-examples/ - NOT src/ alone) but"
+Write-Host "($rootNames - NOT src/ alone) but"
 Write-Host "have no matching row/citation in any .plans/*.md file:"
 Write-Host ""
 # ★★ THE TREE IS WALKED ONCE — NOT ONCE PER MISSING ANCHOR.
@@ -514,38 +999,14 @@ Write-Host ""
 # Enumerated one root at a time (not one call over all roots) because the
 # filters differ per root, which is the same reason the collection loop is
 # per-root.
-$locFiles = @()
-foreach ($spec in $RootSpecs) {
-    $locFiles += @(Get-ChildItem -Path $spec.Root -Recurse -File `
-                                 -Include $spec.Filters -ErrorAction SilentlyContinue)
-}
-$locRx     = [regex]::new($AnchorRegex, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
-$locTokens = [System.Collections.ArrayList]::new()   # distinct tokens, first-seen order
-$locPaths  = @{}                                     # token -> ordered path list
-foreach ($f in $locFiles) {
-    $c = Get-Content -Raw -LiteralPath $f.FullName -ErrorAction SilentlyContinue
-    if (-not $c) { continue }
-    $rel = $f.FullName.Replace($RepoRoot + [IO.Path]::DirectorySeparatorChar, '')
-    $seenHere = @{}
-    foreach ($m in $locRx.Matches($c)) {
-        $t = $m.Value
-        if ($seenHere.ContainsKey($t)) { continue }
-        $seenHere[$t] = $true
-        if (-not $locPaths.ContainsKey($t)) {
-            [void]$locTokens.Add($t)
-            $locPaths[$t] = [System.Collections.ArrayList]::new()
-        }
-        [void]$locPaths[$t].Add($rel)
-    }
-}
-# ORDER: the old form walked FILES and printed the matching ones, so the report
-# is ordered by enumeration position. Replay that by ranking each path.
-$locRank = @{}
-$locOrder = 0
-foreach ($f in $locFiles) {
-    $rel = $f.FullName.Replace($RepoRoot + [IO.Path]::DirectorySeparatorChar, '')
-    if (-not $locRank.ContainsKey($rel)) { $locRank[$rel] = $locOrder++ }
-}
+# ★ The build now lives in `Build-CitationIndex` above and is SHARED with the
+# quotation check and the retired-id report, so whichever consumer needs it first
+# pays for it and the others get it free. It also carries the recovered wrapped
+# names, so a wrapped citation that fails to resolve is reported WITH its location.
+Build-CitationIndex
+$locTokens = $script:LocTokens
+$locPaths  = $script:LocPaths
+$locRank   = $script:LocRank
 # An index that came back EMPTY means the locator can attribute NOTHING, and the
 # report would then be a list of bare anchor names with no `cited in:` line -
 # precisely the guessing game the note above says this locator exists to prevent.
@@ -572,10 +1033,13 @@ Write-Host ""
 Write-Host "Fix: either"
 Write-Host "  (a) add a row in .plans/_deferred-anchor-registry.md naming the"
 Write-Host "      trigger + closing work, OR"
-Write-Host "  (b) cite the anchor in a per-plan section 3.1 row (preferred when"
-Write-Host "      the anchor maps to a specific plan's feature area), OR"
-Write-Host "  (c) if the string is a code-internal pin not deferred work, add"
-Write-Host "      it to the Allowlist section of the registry."
+# ⚠ THESE FOUR LINES WRAP EXACTLY AS THE `.sh`'s DO, and that is not fussiness:
+# the twins are verified by DIFFING their output, so a report that differs on four
+# lines for no reason is four lines of noise a real divergence could hide inside.
+Write-Host "  (b) cite the anchor in a per-plan section 3.1 row (preferred when the"
+Write-Host "      anchor maps to a specific plan's feature area), OR"
+Write-Host "  (c) if the string is a code-internal pin not deferred work, add it"
+Write-Host "      to the Allowlist section of the registry."
 Write-Host ""
 Write-Host "Discipline: this leak recurred TWICE before this guard landed."
 Write-Host "See .plans/_deferred-anchor-registry.md for the discipline rationale."

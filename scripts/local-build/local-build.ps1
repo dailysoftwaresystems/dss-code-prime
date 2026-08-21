@@ -32,11 +32,138 @@ param(
     [switch]$Test,
     [switch]$Configure,
     [switch]$Clean,
+    [switch]$SelfTest,
     [string]$Tree = 'dbg',
     [string]$BuildType = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+# -- TOOLCHAIN READ FAILURE - a distinct outcome from a build failure ---------
+# The twin of local_build_toolchain_read_failure in local-build.sh: same
+# condition, same exit code (9), same refusal to retry. Kept in step with it
+# BY REVIEW, not by a detector -- equivalence of two arbitrary programs is not
+# a property a script can decide, which is why the pairing rule is a review
+# obligation in the first place.
+#
+# MEASURED 2026-08-20 (cycle P23, D-BUILD-CONCURRENT-LANES-TRIP-A-TOOLCHAIN-
+# HEADER-READ-FAILURE): under several concurrent lane builds g++ failed to READ
+# a standard-library header and printed a bare path plus an errno string,
+# followed by ~6 CASCADED diagnostics that look exactly like source defects.
+#
+# * The discriminator is SHAPE: a compiler DIAGNOSTIC carries `file:line:col:`
+#   and a severity; an I/O failure carries a bare path, a colon and an errno
+#   string -- inside the TOOLCHAIN's own include tree, which this repo never
+#   edits. Path alone is NOT the signal; a genuine diagnostic about a toolchain
+#   header must stay classified as a diagnostic.
+# ! Deliberately does NOT retry. A retry that hides the event stops it being
+#   root-caused. The build still FAILS; it stops lying about whose fault it is.
+$script:LocalBuildIoFailureRe =
+    '(/(usr|opt)/[^ :]*|[A-Za-z]:[\\/][^ :]*)(include|lib[\\/]gcc)[^ :]*:\s+(Invalid argument|Input/output error|Permission denied|Resource temporarily unavailable|Bad file descriptor)\s*$|fatal error:\s+error\s+(writing\s+to|closing)\s+.+:\s+(Invalid argument|Input/output error|Permission denied|Resource temporarily unavailable|Bad file descriptor|No space left on device)\s*$'
+
+function Test-LocalBuildToolchainIoFailure([string]$LogPath) {
+    if (-not (Test-Path -LiteralPath $LogPath)) { return $false }
+    foreach ($line in Get-Content -LiteralPath $LogPath) {
+        if ($line -match $script:LocalBuildIoFailureRe) { return $true }
+    }
+    return $false
+}
+
+function Write-LocalBuildIoFailure([string]$LogPath) {
+    Write-Host "local-build.ps1: FAIL - TOOLCHAIN I/O FAILURE (READ or WRITE), not a source defect."
+    Write-Host "  The compiler could not READ a file inside its OWN include tree, or could"
+    Write-Host "  not WRITE its own temporary. Every diagnostic after that line is a CASCADE"
+    Write-Host "  and says nothing about this repository's source."
+    Write-Host "  ! The WRITE shape names a TEMP path, not an include path - it is the half"
+    Write-Host "    this detector was blind to until 2026-08-21."
+    Write-Host "  the line that classifies it:"
+    Get-Content -LiteralPath $LogPath |
+        Where-Object { $_ -match $script:LocalBuildIoFailureRe } |
+        Select-Object -First 3 |
+        ForEach-Object { Write-Host "    $_" }
+    Write-Host "  [!] DO NOT act on the errors above it and DO NOT 'fix' the standard library."
+    Write-Host "  [!] If this happened during a RED-ON-DISABLE arm, that arm measured NOTHING -"
+    Write-Host "      re-run it; a restore that fails this way is not evidence about your change."
+    Write-Host "  Root cause is UNKNOWN and is not guessed at here (see the anchor). Re-run the"
+    Write-Host "  build; if it recurs at the same file, say so in the row rather than retrying."
+    Write-Host "  full log: $LogPath"
+}
+
+if ($SelfTest) {
+    # The arm is EXERCISED, not read - the same four arms the .sh twin runs.
+    $stDir = Join-Path ([System.IO.Path]::GetTempPath()) ("lb-selftest-" + [System.Guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $stDir
+    $stFail = 0
+    try {
+        # The fixture paths are ASSEMBLED, not written literally - same reason as
+        # the .sh twin: a literal `path:line` here is indistinguishable from a
+        # CITATION to scripts/check-plan-citations, and these are compiler OUTPUT
+        # SAMPLES, not claims about any file in this repository.
+        $at = ':'
+        $read = Join-Path $stDir 'read.log'
+        Set-Content -LiteralPath $read -Value @(
+            'C:/Strawberry/c/include/c++/13.2.0/bits/locale_facets.tcc: Invalid argument',
+            "In file included from x.cpp${at}1:",
+            "error: '__use_cache' is not a class template")
+        $real = Join-Path $stDir 'real.log'
+        Set-Content -LiteralPath $real -Value @(
+            "src/link/linker.cpp${at}120:5: error: no member named q",
+            'ninja: build stopped: subcommand failed.')
+        $diag = Join-Path $stDir 'diag-in-toolchain.log'
+        Set-Content -LiteralPath $diag -Value @(
+            "/usr/include/c++/13/bits/basic_string.h${at}1:1: error: expected unqualified-id")
+
+        if (Test-LocalBuildToolchainIoFailure $read) {
+            Write-Host 'self-test arm 1 READ-FAILURE            classified as expected'
+        } else {
+            Write-Host 'self-test arm 1 READ-FAILURE            NOT classified - the guard is blind'; $stFail = 1
+        }
+        if (Test-LocalBuildToolchainIoFailure $real) {
+            Write-Host 'self-test arm 2 REAL-COMPILE-ERROR      misclassified - it would HIDE a real defect'; $stFail = 1
+        } else {
+            Write-Host 'self-test arm 2 REAL-COMPILE-ERROR      left alone as expected'
+        }
+        if (Test-LocalBuildToolchainIoFailure $diag) {
+            Write-Host 'self-test arm 3 DIAGNOSTIC-IN-TOOLCHAIN misclassified - path alone is not the signal'; $stFail = 1
+        } else {
+            Write-Host 'self-test arm 3 DIAGNOSTIC-IN-TOOLCHAIN left alone as expected'
+        }
+        # Arms 5 and 6 are the WRITE half - the shape every pattern here was
+        # blind to until 2026-08-21, because they all required an INCLUDE path.
+        $write = Join-Path $stDir 'write.log'
+        Set-Content -LiteralPath $write -Value @(
+            "cc1plus: fatal error: error writing to C:\Users\x\AppData\Local\Temp\ccigZdWt.s: Invalid argument",
+            'compilation terminated.')
+        $writeReal = Join-Path $stDir 'write-real.log'
+        Set-Content -LiteralPath $writeReal -Value @(
+            "src/hir/hir_verifier.cpp${at}42:7: error: no member named 'writing'",
+            'ninja: build stopped: subcommand failed.')
+        if (Test-LocalBuildToolchainIoFailure $write) {
+            Write-Host 'self-test arm 5 WRITE-FAILURE           classified as expected'
+        } else {
+            Write-Host 'self-test arm 5 WRITE-FAILURE           NOT classified - blind to the write half'; $stFail = 1
+        }
+        if (Test-LocalBuildToolchainIoFailure $writeReal) {
+            Write-Host 'self-test arm 6 REAL-ERROR-SAYS-WRITING misclassified - it would HIDE a real defect'; $stFail = 1
+        } else {
+            Write-Host 'self-test arm 6 REAL-ERROR-SAYS-WRITING left alone as expected'
+        }
+        # 6>&1 because Write-Host emits on the INFORMATION stream, not the output
+        # stream: a bare `| Out-String` captures NOTHING and the text goes to the
+        # console instead. The .sh twin captures with 2>&1 for the same reason, and
+        # this arm caught the asymmetry on its first run.
+        $msg = (Write-LocalBuildIoFailure $read 6>&1 | Out-String)
+        if ($msg -match 'TOOLCHAIN I/O FAILURE' -and $msg -match 'locale_facets\.tcc' -and $msg -match 'RED-ON-DISABLE') {
+            Write-Host 'self-test arm 4 MESSAGE                 names the shape, the file and the red-on-disable hazard'
+        } else {
+            Write-Host "self-test arm 4 MESSAGE                 incomplete: $msg"; $stFail = 1
+        }
+    } finally {
+        Remove-Item -LiteralPath $stDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($stFail -eq 0) { Write-Host 'local-build: self-test OK - 6 arms, both directions exercised.' }
+    exit $stFail
+}
 
 # Refresh PATH from the system + user env vars. PowerShell sessions
 # inherit their parent's PATH and don't pick up post-launch system
@@ -109,8 +236,16 @@ if ($Configure -or -not (Test-Path (Join-Path $buildDir 'build.ninja'))) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-cmake --build $buildDir
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# Tee so the console still streams while a copy stays scannable. $LASTEXITCODE
+# after a native command piped to Tee-Object is the NATIVE command's.
+$buildLog = Join-Path $buildDir '.local-build-last.log'
+cmake --build $buildDir 2>&1 | Tee-Object -FilePath $buildLog
+$buildRc = $LASTEXITCODE
+if ($buildRc -ne 0 -and (Test-LocalBuildToolchainIoFailure $buildLog)) {
+    Write-LocalBuildIoFailure $buildLog
+    exit 9
+}
+if ($buildRc -ne 0) { exit $buildRc }
 
 if ($Test) {
     Push-Location $buildDir

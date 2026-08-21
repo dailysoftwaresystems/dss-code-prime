@@ -82,10 +82,61 @@ constexpr std::uint8_t IMAGE_SYM_CLASS_EXTERNAL = 2;
 // an interior block address (silent wrong-control-flow) — the COFF
 // analog of ELF STB_LOCAL / Mach-O no-N_EXT (c147 fold, baked in).
 constexpr std::uint8_t IMAGE_SYM_CLASS_STATIC = 3;
+// WEAK_EXTERNAL(105 == 0x69): a name that DEFERS TO ANOTHER NAME. PE/COFF 5.5.3
+// gives the record's whole shape as a conjunction -- EXTERNAL-ish class 105,
+// UNDEF section number, Value zero -- plus an Auxiliary Format 3 record naming
+// the symbol to use instead. It DEFINES NOTHING, which is why it is the wrong
+// mechanism for a weak DEFINITION (that is COMDAT select-any, below) and the
+// right one for a weak ALIAS. ✔VERIFIED against this host's Windows SDK
+// `um/winnt.h` (10.0.26100.0), not quoted from memory.
+constexpr std::uint8_t IMAGE_SYM_CLASS_WEAK_EXTERNAL = 105;
 // IMAGE_SECTION_NUMBER specials
 constexpr std::int16_t IMAGE_SYM_UNDEFINED = 0;
 // IMAGE_SYM_TYPE_*
 constexpr std::uint16_t IMAGE_SYM_DTYPE_FUNCTION = 0x20;
+
+// ── COMDAT: how COFF spells a WEAK DEFINITION ──────────────────
+// D-LK-OBJECT-WEAK-DEF-RELOCATABLE. IMAGE_SCN_LNK_COMDAT marks a section as
+// one several objects may each define; the Selection byte of that section's
+// section-definition auxiliary record (Auxiliary Format 5, offset 14 of the
+// 18-byte record) says what the linker does about duplicates.
+// IMAGE_COMDAT_SELECT_ANY is "Any section that defines the same COMDAT symbol
+// can be linked; the rest are removed" -- the coalescing rule
+// `SymbolBinding::Weak` means. The reader's mirror of these two values lives
+// in coff_object_reader.cpp (`kScnLnkComdat` / `kComdatSelAny`), which lifts
+// ANY back to `SymbolBinding::Weak`; the pair is what makes the round trip
+// hold. ✔VERIFIED against the published PE/COFF format ("COMDAT Sections
+// (Object Only)" + "Auxiliary Format 5: Section Definitions").
+constexpr std::uint32_t kScnLnkComdat          = 0x00001000u;
+constexpr std::uint8_t  IMAGE_COMDAT_SELECT_ANY = 2;
+// Auxiliary Format 5 is 18 bytes like every symbol record: Length[4],
+// NumberOfRelocations[2], NumberOfLinenumbers[2], CheckSum[4], Number[2],
+// Selection[1], Unused[3].
+constexpr std::size_t   kAuxSectionDefUnusedTail = 3;
+
+// ── Auxiliary Format 3 (Weak Externals): TagIndex[4], Characteristics[4],
+// Unused[10] -- 18 bytes, like every symbol record. ✔VERIFIED by CROSS-CHECK
+// rather than by trusting one source: the SDK's `IMAGE_AUX_SYMBOL_EX::Sym`
+// declares the same two fields in the same order at the same offsets
+// (`WeakDefaultSymIndex` DWORD @0, `WeakSearchType` DWORD @4), confirming both
+// the ORDER and the 32-bit WIDTH independently of the prose.
+// ★★ THE VALUE IS SEARCH_ALIAS(3), AND IT WAS CHOSEN BY MEASUREMENT AFTER THE
+// SEMANTIC ARGUMENT GAVE THE WRONG ANSWER. 5.5.3 reads as though NOLIBRARY(1)
+// were the conditional "if sym1 is not present, use sym2" form a weak alias
+// wants, and ALIAS(3) the unconditional one -- so 1 was written here first.
+// ✔MEASURED, one object per value, same `main` referencing the alias from
+// ANOTHER translation unit:
+//   Characteristics 1 -> link.exe REFUSES (LNK2019 unresolved `alias_fn`)
+//   Characteristics 2 -> link.exe REFUSES (LNK2019)
+//   Characteristics 3 -> link.exe LINKS, and the binary RUNS returning 42
+// ⇒ 3 is the only value under which a cross-object weak alias RESOLVES, and by
+// bar §A.3b one working reference makes the behaviour required. gcc emits 1 for
+// its own `weak, alias(...)`, but gcc has already bound its INTERNAL reference
+// to the renamed `.weak.<n>.<n>` body, so its value never has to make the alias
+// reachable from outside; DSS re-emits objects whose alias must be. See
+// `appendAliasEntries` for the ld-vs-link.exe divergence this uncovered.
+constexpr std::uint32_t IMAGE_WEAK_EXTERN_SEARCH_ALIAS = 3;
+constexpr std::size_t   kAuxWeakExternUnusedTail = 10;
 
 constexpr std::uint16_t kFileHeaderSize    = 20;
 constexpr std::uint16_t kSectionHeaderSize = 40;
@@ -787,6 +838,139 @@ encode(AssembledModule const&    module,
         return {};
     }
 
+    // ── D-LK-OBJECT-WEAK-DEF-RELOCATABLE: A WEAK DEFINITION IS A COMDAT ──
+    //
+    // COFF HAS NO PER-SYMBOL "WEAK" STORAGE CLASS FOR A DEFINITION, and the
+    // one construct that looks like it is not one. IMAGE_SYM_CLASS_WEAK_
+    // EXTERNAL + its Auxiliary Format 3 record is a weak *REFERENCE* with a
+    // fallback: the PE/COFF specification requires such a symbol to carry
+    // "EXTERNAL storage class, UNDEF section number, and a value of zero", and
+    // its aux record's TagIndex names the `sym2` to use when `sym1` is not
+    // linked. It DEFINES NOTHING -- it is the `/ALTERNATENAME` shape.
+    // ✔VERIFIED against the published PE/COFF format, sections "Auxiliary
+    // Format 3: Weak Externals" and "COMDAT Sections (Object Only)".
+    //
+    // A weak DEFINITION in COFF is a section flagged IMAGE_SCN_LNK_COMDAT
+    // whose Selection byte is IMAGE_COMDAT_SELECT_ANY: "Any section that
+    // defines the same COMDAT symbol can be linked; the rest are removed" --
+    // which is exactly "several translation units may define this; keep one",
+    // the semantics `SymbolBinding::Weak` carries.
+    //
+    // ★ THE CHOICE IS FIXED BY DSS'S OWN READER, NOT BY TASTE. The COFF
+    // reader's COMDAT gate (coff_object_reader.cpp, "GATE 3: COMDAT selection
+    // -> the section's external-symbol binding") lifts ANY / SAME_SIZE /
+    // EXACT_MATCH to `SymbolBinding::Weak` and NODUPLICATES to Global.
+    // Emitting WEAK_EXTERNAL here would produce objects DSS READS BACK WITH
+    // THE WRONG SEMANTICS -- the writer/reader round trip is this arm's
+    // acceptance test, and before this change the two disagreed about what a
+    // COFF weak definition even is (the reader had an answer; the writer
+    // emitted no COMDAT at all and refused the symbol).
+    //
+    // ✔MEASURED 2026-08-20, the reference encodings, each probed separately:
+    //   * cl.exe 14.51.36231 and clang 17 (--target=x86_64-pc-windows-msvc)
+    //     BOTH encode `__declspec(selectany) int gv` as its own `.data`
+    //     section, COMDAT, `selection 2 (pick any)`, section-definition
+    //     symbol first and the EXTERNAL `gv` second -- the shape emitted here.
+    //   * mingw gcc 13.2.0 and that same clang BOTH encode GNU
+    //     `__attribute__((weak))` as UNDEF WEAK_EXTERNAL plus a STRONG
+    //     definition under a synthetic `.weak.<name>...` name. That shape is
+    //     a weak reference to a renamed strong body: DSS's reader would see
+    //     the real name undefined and the body under a name nothing refers
+    //     to, so it is NOT the encoding for a symbol DSS models as a weak
+    //     DEFINITION.
+    //
+    // MECHANICS: the duplicate-resolution policy is a property of the
+    // SECTION, so each weak body needs a section OF ITS OWN -- two weak
+    // bodies sharing one section would be kept or discarded as a unit. Weak
+    // functions are therefore held out of the shared `.text` and weak data
+    // items out of their shared data section (`excludedItemIndices`), and each
+    // gets a single-body COMDAT section appended after the ordinary ones.
+    link::format::ObjectSymbolNames const objNames{module};
+    auto const isWeakDefinition = [&](SymbolId id) {
+        return objNames.definedBinding(id) == SymbolBinding::Weak;
+    };
+
+    // ── D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: ASK THE CONFIG ──
+    //
+    // WHICH spelling a weak definition takes is a per-FORMAT fact, so this
+    // walker does not decide it — the schema declares it and the walker
+    // CONSULTS the declaration. That is the whole point of the row: a key the
+    // writer does not READ is worse than no key, because it drifts silently
+    // while reading as authoritative. The COMDAT select-any encoding below is
+    // unchanged; what changed is that emitting it is now conditional on the
+    // format having SAID so.
+    //
+    // ★ GATED ON THE MODULE, NOT ON THE FORMAT. The question is only asked when
+    // a weak definition is actually present, so a pe `.obj` schema that never
+    // meets one is never required to answer — this must not become a back-door
+    // "every format must declare `weakDefinition`" rule, which would be the
+    // required-key shape the row's own reasoning rejects.
+    //
+    // ★ TWO REFUSALS, NOT ONE, because their remediations differ: an
+    // UNANSWERED schema needs the block added, while a schema that answered
+    // with a dialect this walker has no encoder for needs the DECLARATION
+    // fixed (or that walker built). Both are loud: re-spelling a weak
+    // definition under whatever encoder happens to be at hand publishes it as
+    // a STRONG definition, which changes what the final link does with a
+    // duplicate — a silent semantic change, not a cosmetic one.
+    bool moduleHasWeakDefinition = false;
+    for (auto const& fn : module.functions) {
+        if (isWeakDefinition(fn.symbol)) { moduleHasWeakDefinition = true; break; }
+    }
+    if (!moduleHasWeakDefinition) {
+        for (auto const& d : module.dataItems) {
+            // Anonymous items carry no ModuleSymbol row and so can never be
+            // weak — the same reason the index walk below skips them.
+            if (d.symbol == SymbolId{}) continue;
+            if (isWeakDefinition(d.symbol)) { moduleHasWeakDefinition = true; break; }
+        }
+    }
+    if (moduleHasWeakDefinition) {
+        auto const declaredWeak = fmt.weakDefinition();
+        if (!declaredWeak.has_value()) {
+            emit(reporter, DiagnosticCode::K_FormatLacksWeakDefinitionDialect,
+                 std::format(
+                     "pe::encode (Obj): this module defines a WEAK symbol, but "
+                     "format '{}' declares no 'weakDefinition' block, so it has "
+                     "not said HOW a weak definition is spelled. Declare "
+                     "'weakDefinition': {{ \"dialect\": \"{}\" }} — emitting "
+                     "the body under an assumed spelling would publish it as a "
+                     "STRONG definition on any format whose dialect differs. "
+                     "D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED.",
+                     fmt.name(),
+                     weakDefinitionDialectName(WeakDefinitionDialect::Comdat)));
+            return {};
+        }
+        if (declaredWeak->dialect != WeakDefinitionDialect::Comdat) {
+            emit(reporter, DiagnosticCode::K_FormatLacksWeakDefinitionDialect,
+                 std::format(
+                     "pe::encode (Obj): format '{}' declares weakDefinition "
+                     "dialect '{}', but this walker spells a weak definition "
+                     "only as '{}' (a per-body IMAGE_SCN_LNK_COMDAT section "
+                     "with Selection = IMAGE_COMDAT_SELECT_ANY). The "
+                     "definition is refused rather than re-spelled: a weak "
+                     "body written under the wrong dialect is published as a "
+                     "STRONG definition. Fix the declaration, or land the "
+                     "encoder for '{}'. "
+                     "D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED.",
+                     fmt.name(),
+                     weakDefinitionDialectName(declaredWeak->dialect),
+                     weakDefinitionDialectName(WeakDefinitionDialect::Comdat),
+                     weakDefinitionDialectName(declaredWeak->dialect)));
+            return {};
+        }
+    }
+
+    // `dataItems` indices whose symbol is a weak definition, ascending.
+    // Anonymous items (SymbolId{}) carry no ModuleSymbol row and so can never
+    // be weak -- they are section-offset-referenced, never named.
+    std::vector<std::size_t> weakDataItemIndices;
+    for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+        AssembledData const& d = module.dataItems[i];
+        if (d.symbol == SymbolId{}) continue;
+        if (isWeakDefinition(d.symbol)) weakDataItemIndices.push_back(i);
+    }
+
     // Lay out each data-section kind via the shared kind-parameterized
     // substrate (`exec_data_section.hpp`) — the SAME helper the ELF /
     // Mach-O / PE-exec arms use. The alignment floor is 1 for every PE
@@ -801,18 +985,20 @@ encode(AssembledModule const&    module,
     // carry no bytes to relocate.
     auto const rodataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Rodata,
-        /*alignFloor=*/1, "pe::encode (Obj)", reporter);
+        /*alignFloor=*/1, "pe::encode (Obj)", reporter,
+        /*allowItemRelocations=*/false, weakDataItemIndices);
     if (!rodataLayoutOpt.has_value()) return {};
     auto const& rodataLayout = *rodataLayoutOpt;
     auto dataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Data,
         /*alignFloor=*/1, "pe::encode (Obj)", reporter,
-        /*allowItemRelocations=*/true);
+        /*allowItemRelocations=*/true, weakDataItemIndices);
     if (!dataLayoutOpt.has_value()) return {};
     auto& dataLayout = *dataLayoutOpt;
     auto const bssLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Bss,
-        /*alignFloor=*/1, "pe::encode (Obj)", reporter);
+        /*alignFloor=*/1, "pe::encode (Obj)", reporter,
+        /*allowItemRelocations=*/false, weakDataItemIndices);
     if (!bssLayoutOpt.has_value()) return {};
     auto const& bssLayout = *bssLayoutOpt;
     // Unlike the PE-exec arm (which FOLDS relro into `.rdata` bytes), the
@@ -823,7 +1009,7 @@ encode(AssembledModule const&    module,
     auto relroLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::RelRoConst,
         /*alignFloor=*/1, "pe::encode (Obj)", reporter,
-        /*allowItemRelocations=*/true);
+        /*allowItemRelocations=*/true, weakDataItemIndices);
     if (!relroLayoutOpt.has_value()) return {};
     auto& relroLayout = *relroLayoutOpt;
 
@@ -950,7 +1136,21 @@ encode(AssembledModule const&    module,
     std::vector<std::uint64_t> funcTextStart;
     funcTextStart.reserve(module.functions.size());
 
-    for (auto const& fn : module.functions) {
+    // `module.functions` indices whose symbol is a WEAK definition, ascending.
+    // Their bytes are held OUT of the shared `.text` and placed in a COMDAT
+    // section of their own (see the weak-definition block above); the parallel
+    // `funcTextStart` entry then records the offset within THAT section, which
+    // is 0 because a COMDAT section holds exactly one body. Keeping the vector
+    // parallel to `module.functions` is what lets the single relocation walk
+    // below stay one loop over every function, weak or not.
+    std::vector<std::size_t> weakFuncIndices;
+    for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+        auto const& fn = module.functions[fi];
+        if (isWeakDefinition(fn.symbol)) {
+            weakFuncIndices.push_back(fi);
+            funcTextStart.push_back(0);
+            continue;
+        }
         std::uint64_t const start = text.size();
         funcTextStart.push_back(start);
         text.insert(text.end(), fn.bytes.begin(), fn.bytes.end());
@@ -968,37 +1168,332 @@ encode(AssembledModule const&    module,
     std::int16_t const IDX_DATA  = hasData ? ++sectOrdinalCursor : 0;
     std::int16_t const IDX_RELRO = hasRelRo ? ++sectOrdinalCursor : 0;
     std::int16_t const IDX_BSS   = hasBss ? ++sectOrdinalCursor : 0;
+
+    // ── COMDAT sections: one per WEAK DEFINITION ───────────────
+    //
+    // D-LK-OBJECT-WEAK-DEF-RELOCATABLE (see the block near the top of this
+    // arm for WHY a weak definition is a COMDAT and not a WEAK_EXTERNAL).
+    // Each record owns ONE body -- a whole weak function, or a single weak
+    // data item -- because IMAGE_COMDAT_SELECT_ANY is a per-SECTION policy.
+    // Ordinals follow every ordinary section so the existing `.text` /
+    // rodata / data / relro / bss ordinal arithmetic is untouched; COFF puts
+    // no ordering requirement on sections.
+    struct ComdatSectionRecord {
+        SymbolId      symId{};
+        std::string   sectionName;
+        std::uint32_t characteristics = 0;
+        std::uint16_t symType = 0;        // DTYPE_FUNCTION for a function
+        bool          zeroFill = false;
+        std::uint64_t spanSize = 0;
+        // Exactly one of these is engaged. A function record serialises
+        // `module.functions[fnIndex].bytes`; a data record serialises its own
+        // single-item layout (which also carries the item's in-slot addends).
+        std::optional<std::size_t> fnIndex;
+        std::optional<link::format::ExecDataSectionLayout> dataLayout;
+        std::int16_t  sectionNumber = 0;
+        // Filled once the symbol table is minted / the reloc tables are built.
+        std::size_t   sectionDefEntry = 0;  // index into the symbol entry list
+        std::vector<std::uint8_t> relocs;
+        std::uint32_t relocCount   = 0;
+        std::uint32_t rawPointer   = 0;
+        std::uint32_t relocPointer = 0;
+    };
+    std::vector<ComdatSectionRecord> comdats;
+    comdats.reserve(weakFuncIndices.size() + weakDataItemIndices.size());
+
+    // A weak FUNCTION's COMDAT carries the `.text` row's Characteristics
+    // verbatim (that row declares its own align class -- see the
+    // `alignBitsFor` note about not OR-ing onto preexisting align bits) plus
+    // IMAGE_SCN_LNK_COMDAT.
+    for (std::size_t const fi : weakFuncIndices) {
+        ComdatSectionRecord rec;
+        rec.symId           = module.functions[fi].symbol;
+        rec.sectionName     = secText->name;
+        rec.characteristics = secText->type | kScnLnkComdat;
+        rec.symType         = IMAGE_SYM_DTYPE_FUNCTION;
+        rec.spanSize =
+            static_cast<std::uint64_t>(module.functions[fi].bytes.size());
+        rec.fnIndex = fi;
+        comdats.push_back(std::move(rec));
+    }
+    // A weak DATA item's COMDAT is laid out by the SAME shared substrate the
+    // ordinary sections use, called with every OTHER item excluded. That is
+    // deliberate rather than a hand-rolled one-item layout: it inherits the
+    // zero-fill rule, the reloc-bearing-rodata refusal and the alignment
+    // arithmetic, so a weak item can never be validated by a weaker standard
+    // than its strong sibling one line away.
+    for (std::size_t const wi : weakDataItemIndices) {
+        AssembledData const& di = module.dataItems[wi];
+        std::vector<std::size_t> allButThis;
+        allButThis.reserve(module.dataItems.size());
+        for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+            if (i != wi) allButThis.push_back(i);   // ascending by construction
+        }
+        // Item relocations are allowed exactly where the shared section of the
+        // same kind allows them (`data` + `relro`), so a reloc-bearing weak
+        // `rodata` item still fails loud.
+        bool const allowRelocs = di.section == DataSectionKind::Data
+                                 || di.section == DataSectionKind::RelRoConst;
+        auto layoutOpt = link::format::buildExecDataSection(
+            module.dataItems, di.section, /*alignFloor=*/1,
+            "pe::encode (Obj, COMDAT)", reporter, allowRelocs, allButThis);
+        if (!layoutOpt.has_value()) return {};
+        ObjectFormatSectionInfo const* row = requireSection(
+            fmt, toSectionKind(di.section), "PE writer (Obj)", reporter);
+        if (row == nullptr) return {};
+        std::uint32_t alignBits = 0;
+        if (!alignBitsFor(layoutOpt->maxAlign, *row,
+                          dataSectionKindName(di.section), alignBits)) {
+            return {};
+        }
+        ComdatSectionRecord rec;
+        rec.symId           = di.symbol;
+        rec.sectionName     = row->name;
+        rec.characteristics = row->type | alignBits | kScnLnkComdat;
+        rec.symType         = 0;   // COFF data symbols are `notype`
+        rec.zeroFill        = isZeroFill(di.section);
+        rec.spanSize        = layoutOpt->spanSize;
+        rec.dataLayout      = std::move(*layoutOpt);
+        comdats.push_back(std::move(rec));
+    }
+    // COFF's IMAGE_SYMBOL.SectionNumber is a SIGNED 16-bit field whose negative
+    // values are reserved specials (UNDEF is 0, ABSOLUTE is -1, DEBUG is -2),
+    // so an object cannot carry more than 32767 sections. Every weak definition
+    // adds one, so this bound is reachable in a way it never was when the
+    // section count was capped at five. Fail loud rather than let the ordinal
+    // cursor wrap into a reserved value and bind every later symbol to a
+    // section that does not exist.
+    constexpr std::size_t kMaxCoffSections = 0x7FFF;
+    if (static_cast<std::size_t>(sectOrdinalCursor) + comdats.size()
+        > kMaxCoffSections) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encode (Obj): {} ordinary sections plus {} weak "
+                         "definitions (each of which needs a COMDAT section of "
+                         "its own) exceed COFF's {} section limit - "
+                         "IMAGE_SYMBOL.SectionNumber is a signed 16-bit field "
+                         "whose negative values are reserved specials.",
+                         static_cast<std::size_t>(sectOrdinalCursor),
+                         comdats.size(), kMaxCoffSections));
+        return {};
+    }
+    for (auto& rec : comdats) rec.sectionNumber = ++sectOrdinalCursor;
+    // `module.functions` index -> its COMDAT record, for the two walks that
+    // must follow a weak function's body into its own section: the block
+    // symbols interior to it, and its relocation table.
+    std::unordered_map<std::size_t, std::size_t> comdatByFuncIndex;
+    for (std::size_t ci = 0; ci < comdats.size(); ++ci) {
+        if (comdats[ci].fnIndex.has_value()) {
+            comdatByFuncIndex.emplace(*comdats[ci].fnIndex, ci);
+        }
+    }
+
     std::size_t const numSections =
         static_cast<std::size_t>(sectOrdinalCursor);
 
-    // ── Build symbol-table indices ─────────────────────────────
+    // ── Build the symbol table as ONE ORDERED ENTRY LIST ───────
     //
-    // Order: defined FUNCTION symbols → synthetic per-BLOCK locals
-    // (computed-goto / jump-table targets at interior .text offsets) →
-    // defined DATA symbols (SectionNumber = the data section's ordinal,
-    // Value = the item's SECTION-RELATIVE offset) → undefined externs
-    // (SectionNumber = 0). The IMAGE_RELOCATION SymbolTableIndex values
-    // below must match this exact order.
+    // ★★ ONE LIST, ONE WALK, AND THAT IS THE POINT. Every record this object
+    // will carry is appended here, in emission order, and every
+    // IMAGE_RELOCATION SymbolTableIndex is minted by the SAME append. This
+    // replaced a REGISTRATION pass that minted indices and a separate EMISSION
+    // pass that wrote records over the same four collections, coupled only by
+    // a comment saying they had to agree. A record added to one walk and not
+    // the other shifts every following record while the index map keeps the
+    // old values -- so every relocation past the divergence points at the
+    // WRONG symbol, in a perfectly well-formed file, with no diagnostic. The
+    // list makes that unrepresentable; the `slotsMinted == numberOfSymbols`
+    // belt after the emit loop catches any future attempt to append symtab
+    // bytes from outside it.
     //
-    // AUX-ENTRY ACCOUNTING: COFF SymbolTableIndex counts auxiliary
-    // records as index slots. This writer emits ZERO aux records (every
-    // appendSym call below passes numAuxSymbols = 0 — no section-
-    // definition, file, or function-definition aux), so a symbol's index
-    // equals its record ordinal with no adjustment. If aux records are
-    // ever added, every index minted here must skip them.
+    // Order: defined FUNCTION symbols -> one group per WEAK DEFINITION (its
+    // COMDAT section's own symbol + that symbol's auxiliary record + the COMDAT
+    // symbol) -> synthetic per-BLOCK locals (computed-goto / jump-table targets
+    // at interior offsets) -> defined DATA symbols (SectionNumber = the data
+    // section's ordinal, Value = the item's SECTION-RELATIVE offset) ->
+    // undefined externs (SectionNumber = 0).
     //
-    // Symbol indices are minted strictly with `emplace.second` —
-    // duplicates do not advance the index counter (silent-failure
-    // H3 fix: prior version `nextSymIdx++` ran unconditionally,
-    // desynchronizing the index map from the appended symtab).
+    // ★ THE WEAK GROUPS SIT SECOND FOR A REASON THE OTHER ROWS DO NOT HAVE:
+    // PE/COFF requires a COMDAT section's own symbol to be the FIRST record
+    // bearing that section's number, and a weak function's block locals bear it
+    // too. The tripwire after the extern scan holds that order to the artifact.
+    //
+    // AUX-ENTRY ACCOUNTING: COFF SymbolTableIndex counts auxiliary records as
+    // index slots, so a record carrying one advances the counter by TWO.
+    // `appendEntry` is the only place a slot is minted, so the accounting
+    // cannot drift from what is written.
+    constexpr std::int16_t kTextSectionNumber = 1;
+
+    struct CoffSymEntry {
+        std::string   name;
+        std::uint32_t value         = 0;
+        std::int16_t  sectionNumber = 0;
+        std::uint16_t type          = 0;
+        std::uint8_t  storageClass  = 0;
+        // Auxiliary Format 5 (section definition) -- engaged ONLY for a COMDAT
+        // section's own STATIC section symbol, which is where COFF keeps the
+        // duplicate-resolution policy.
+        bool          hasSectionDefAux = false;
+        std::uint32_t auxLength        = 0;
+        std::uint16_t auxNumRelocs     = 0;  // patched once relocs are built
+        std::uint8_t  auxSelection     = 0;
+        // Auxiliary Format 3 (Weak Externals) -- engaged ONLY for an
+        // IMAGE_SYM_CLASS_WEAK_EXTERNAL record, which is UNDEF by construction.
+        // Mutually exclusive with `hasSectionDefAux`: one record carries one
+        // auxiliary, and the two formats occupy the same 18 bytes.
+        bool          hasWeakExternAux     = false;
+        std::uint32_t auxWeakTagIndex      = 0;  // symtab index of the DEFAULT
+        std::uint32_t auxWeakCharacteristics = 0;
+    };
+    std::vector<CoffSymEntry> symEntries;
+    std::uint32_t slotsMinted = 0;
+    // The ONLY slot-minting site. Returns the appended record's
+    // SymbolTableIndex (relocations bind to this, never to a vector position).
+    // A record with EITHER auxiliary format costs TWO slots -- the aux occupies
+    // a symbol-table index of its own, which is precisely why the reader has to
+    // skip aux slots and why a miscount here rebinds every later relocation.
+    auto appendEntry = [&](CoffSymEntry e) -> std::uint32_t {
+        std::uint32_t const idx = slotsMinted;
+        slotsMinted += (e.hasSectionDefAux || e.hasWeakExternAux) ? 2u : 1u;
+        symEntries.push_back(std::move(e));
+        return idx;
+    };
+
+    // ── ALIAS ROWS — D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB ──
+    //
+    // An atom can carry several names (`strong_fn` plus a `weak_alias` at the
+    // same address). Each extra name gets its own IMAGE_SYMBOL at the SAME
+    // Value / SectionNumber / Type as the canonical, and is DELIBERATELY NOT
+    // registered in `symIdxBySymbol`: aliases share a `SymbolId` by design, so
+    // routing them through the duplicate-symbol guards would fail on day one,
+    // and a relocation must bind to exactly ONE index. The counter still
+    // advances per EMITTED record, which is the whole hazard this writer's
+    // single entry list exists to remove.
+    //
+    // ⚠ COFF CANNOT GIVE TWO NAMES ON ONE BODY DIFFERENT COALESCING POLICIES
+    // *THROUGH THE COMDAT MECHANISM*. The weakness of a COFF definition is a
+    // property of its SECTION (a COMDAT Selection byte), and an alias shares
+    // the canonical's section by definition -- that is what "same address"
+    // means. An EQUAL-binding alias therefore rides the canonical's section
+    // symbol and needs nothing further; that is the loop's first arm.
+    //
+    // ★★ A WEAK ALIAS OF A STRONG DEFINITION USES THE OTHER MECHANISM, AND IT
+    // IS A DIFFERENT MECHANISM FOR A DIFFERENT FACT -- not a re-litigation of
+    // the weak-DEFINITION ruling. COMDAT select-any answers "several TUs may
+    // define this -- keep one", a property of a SECTION, and is correct for a
+    // weak definition ([[D-LK-OBJECT-WEAK-DEF-RELOCATABLE]], unchanged).
+    // IMAGE_SYM_CLASS_WEAK_EXTERNAL answers "this NAME defers to that NAME", a
+    // relation between SYMBOLS, which is exactly what a weak alias is: PE/COFF
+    // 5.5.3 gives it as an UNDEF record with a value of zero plus an auxiliary
+    // record naming the symbol to use instead.
+    //
+    // ⓘ CHARACTERISTICS = SEARCH_ALIAS(3) -- SEE THE MEASUREMENT AT THE
+    // CONSTANT. It is the only value under which a foreign linker resolves the
+    // alias from ANOTHER object; 1 and 2 both produce LNK2019.
+    //
+    // ⚠⚠ AND THE FOREIGN-LINKER CEILING IS NOT WHERE ANYONE WOULD GUESS -- read
+    // this before "fixing" a test that seems to be missing. ✔MEASURED, with
+    // gcc's OWN object as the control, which is what makes it attributable:
+    //   * MSVC link.exe (VS 18) resolves the cross-object weak alias at
+    //     Characteristics 3 and RUNS the binary -- for a DSS-written object and
+    //     for a gcc-written one patched to 3 alike.
+    //   * mingw GNU ld 13.2.0 refuses it at EVERY Characteristics value,
+    //     INCLUDING for gcc's own unmodified object, in every link order and
+    //     from an archive. Its PE backend does not export a weak-external name
+    //     across objects at all.
+    // ⇒ the ld refusal is a NON-DSS CONFOUND (bar §A.3b: the test is the
+    // DISJUNCTION, and link.exe is a reference that works), NOT a defect in
+    // what this writer emits. gcc's own `weak, alias(...)` links only when the
+    // reference is in the SAME translation unit, where gcc has already bound it
+    // to the renamed `.weak.<n>.<n>` body and the weak external is never
+    // consulted.
+    //
+    // WHAT STILL FAILS LOUD, and it is a real remaining shape rather than a
+    // vestigial arm: an alias that is STRONGER than its canonical (Global alias
+    // of a Weak definition) has no encoding at all. A weak external is by
+    // construction the name that YIELDS, so it cannot express a name that must
+    // NOT yield, and the COMDAT policy on the shared section would drag the
+    // strong name into the canonical's coalescing. Refusing beats guessing.
+    auto appendAliasEntries = [&](SymbolId id, CoffSymEntry const& canonical,
+                                  SymbolBinding canonicalBinding,
+                                  std::uint32_t canonicalIndex) -> bool {
+        for (ModuleSymbol const* alias : objNames.definedAliases(id)) {
+            if (alias->binding == canonicalBinding) {
+                // A second NAME on the canonical's wire record: the same Value,
+                // SectionNumber, Type and StorageClass, and NO auxiliary of
+                // either format. Built field by field rather than copied and
+                // then cleared. An alias must never carry a second copy of a
+                // section-definition aux -- the COMDAT Selection policy rides
+                // the SECTION symbol, which is a different record, and an alias
+                // of a weak definition inherits that policy by sharing the
+                // section rather than by copying a byte. A record that starts
+                // blank cannot inherit one at all, which is what makes that
+                // true for every future caller instead of for today's three;
+                // the weak-external arm below constructs the same way.
+                CoffSymEntry e;
+                e.name          = alias->name;
+                e.value         = canonical.value;
+                e.sectionNumber = canonical.sectionNumber;
+                e.type          = canonical.type;
+                e.storageClass  = canonical.storageClass;
+                appendEntry(std::move(e));
+                continue;
+            }
+            if (alias->binding == SymbolBinding::Weak
+                && canonicalBinding == SymbolBinding::Global) {
+                // The weak-external form. UNDEF section, Value 0, class 105,
+                // and an Auxiliary Format 3 record whose TagIndex names the
+                // canonical's ALREADY-MINTED symbol-table index -- which is why
+                // this runs after the canonical's own `appendEntry`.
+                CoffSymEntry e;
+                e.name                   = alias->name;
+                e.value                  = 0;
+                e.sectionNumber          = IMAGE_SYM_UNDEFINED;
+                e.type                   = canonical.type;
+                e.storageClass           = IMAGE_SYM_CLASS_WEAK_EXTERNAL;
+                e.hasWeakExternAux       = true;
+                e.auxWeakTagIndex        = canonicalIndex;
+                e.auxWeakCharacteristics = IMAGE_WEAK_EXTERN_SEARCH_ALIAS;
+                appendEntry(std::move(e));
+                continue;
+            }
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format(
+                     "pe::encode (Obj): '{}' is an alias of '{}' at the same "
+                     "address but binds {} where '{}' binds {}. COFF expresses "
+                     "a definition's coalescing policy on its SECTION (the "
+                     "COMDAT Selection byte), and an alias shares its "
+                     "canonical's section, so that mechanism cannot give them "
+                     "different policies. The weak-external mechanism "
+                     "(IMAGE_SYM_CLASS_WEAK_EXTERNAL + Auxiliary Format 3) "
+                     "expresses a name that DEFERS to another, so it covers a "
+                     "WEAK alias of a GLOBAL definition -- but it cannot "
+                     "express an alias that must NOT yield. Emitting this one "
+                     "under the canonical's policy would silently change its "
+                     "semantics. D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-"
+                     "OBJECT-SYMTAB.",
+                     alias->name, canonical.name,
+                     symbolBindingName(alias->binding), canonical.name,
+                     symbolBindingName(canonicalBinding)));
+            return false;
+        }
+        return true;
+    };
+
     std::unordered_map<SymbolId, std::uint32_t> symIdxBySymbol;
     symIdxBySymbol.reserve(module.functions.size()
                            + module.dataItems.size());
-    std::uint32_t nextSymIdx = 0;
+
+    // Defined function symbols (type=FUNCTION, SectionNumber=1 for `.text`).
+    // Storage class is coupled to the NAME (D-LK-INTERNAL-LINKAGE-FN-EMITTED-
+    // GLOBAL-FOREIGN-COLLISION, TF-C54): a static/synthesized `sym_<id>` def is
+    // Local -> IMAGE_SYM_CLASS_STATIC (3), so a sibling `.obj`'s unrelated
+    // `sym_<id>` can never collide with it at a FOREIGN multi-TU link; an
+    // externally-visible def keeps EXTERNAL (2). COFF has NO local-first
+    // ordering rule (unlike ELF), so only the storage class flips.
+    // `funcSyms` holds the NON-weak functions; a weak definition's body lives
+    // in a COMDAT section and is emitted with that group below.
     for (auto const& f : funcSyms) {
-        auto const [it, fresh] =
-            symIdxBySymbol.emplace(f.symId, nextSymIdx);
-        if (!fresh) {
+        if (symIdxBySymbol.contains(f.symId)) {
             emit(reporter, DiagnosticCode::K_SymbolUndefined,
                  std::string{"PE writer: duplicate defined symbol #"}
                      + std::to_string(f.symId.v)
@@ -1006,32 +1501,126 @@ encode(AssembledModule const&    module,
                        "for distinct AssembledFunctions)");
             return {};
         }
-        ++nextSymIdx;
+        SymbolBinding const binding = objNames.definedBinding(f.symId);
+        CoffSymEntry e;
+        e.name          = objNames.definedName(f.symId, "sym_");
+        e.value         = static_cast<std::uint32_t>(f.valueInText);
+        e.sectionNumber = kTextSectionNumber;
+        e.type          = IMAGE_SYM_DTYPE_FUNCTION;
+        e.storageClass  = (binding == SymbolBinding::Local)
+                              ? IMAGE_SYM_CLASS_STATIC
+                              : IMAGE_SYM_CLASS_EXTERNAL;
+        CoffSymEntry const canonical = e;
+        std::uint32_t const canonicalIdx = appendEntry(std::move(e));
+        symIdxBySymbol.emplace(f.symId, canonicalIdx);
+        if (!appendAliasEntries(f.symId, canonical, binding, canonicalIdx)) {
+            return {};
+        }
+    }
+
+    // ── One group per WEAK DEFINITION ──────────────────────────
+    //
+    // D-LK-OBJECT-WEAK-DEF-RELOCATABLE. The PE/COFF specification fixes the
+    // shape and the ORDER: "The first symbol that has the section value of the
+    // COMDAT section must be the section symbol... The second symbol is called
+    // 'the COMDAT symbol' and is used by the linker in conjunction with the
+    // Selection field." So the pair is appended together, never separately.
+    // ✔MEASURED 2026-08-20 — cl.exe 14.51.36231 and clang both emit exactly
+    // this pair for `__declspec(selectany)`: `.data` STATIC + aux
+    // "selection 2 (pick any)", then the EXTERNAL name at value 0.
+    //
+    // ★★ "FIRST" IS A PROPERTY OF THE WHOLE TABLE, NOT OF THIS LOOP — WHICH IS
+    // WHY THE GROUP IS APPENDED HERE, AHEAD OF EVERY OTHER APPEND THAT CAN NAME
+    // A COMDAT ORDINAL. The only other one is the block-symbol walk below: a
+    // weak FUNCTION's interior labels belong to ITS COMDAT section. With that
+    // walk running first, the first symbol bearing the ordinal was a `sym_<id>`
+    // with NO auxiliary record at all, and the object was NOT LINKABLE.
+    // ✔MEASURED 2026-08-21 over an object this writer produced that way:
+    //   * dumpbin 14.51.36252 reads the section header as `COMDAT; sym= sym_77`
+    //     — the COMDAT key had become a per-module interior block label instead
+    //     of the function name;
+    //   * link.exe 14.51.36252 REFUSES it outright, one object on the command
+    //     line and nothing else: `fatal error LNK1162: expected aux symbol for
+    //     COMDAT section 0x2`. No image is produced.
+    // The same two objects with this loop in its present position dumpbin as
+    // `COMDAT; sym= weakfn` and link clean.
+    //
+    // ⚠ AND NOTHING INSIDE DSS SAW IT. `coff_object_reader` recognises the
+    // section-definition symbol by NAME plus a following aux record and scans
+    // the WHOLE table for it, so the round-trip oracle read the Selection
+    // correctly and stayed green over an object the reference linker rejects.
+    // That is why the ordering gets a tripwire of its own once the entry list
+    // is complete, rather than only a comment here.
+    //
+    // Appended BEFORE the extern scan so a relocation against a weak
+    // definition resolves to it rather than fabricating an undefined symbol.
+    for (auto& rec : comdats) {
+        if (symIdxBySymbol.contains(rec.symId)) {
+            emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                 std::format("pe::encode (Obj): weak definition "
+                             "SymbolId={{ {} }} collides with an "
+                             "already-emitted symbol - a defined symbol's "
+                             "SymbolId must be unique.",
+                             rec.symId.v));
+            return {};
+        }
+        CoffSymEntry secDef;
+        secDef.name             = rec.sectionName;
+        secDef.sectionNumber    = rec.sectionNumber;
+        secDef.storageClass     = IMAGE_SYM_CLASS_STATIC;
+        secDef.hasSectionDefAux = true;
+        secDef.auxLength        = static_cast<std::uint32_t>(rec.spanSize);
+        secDef.auxSelection     = IMAGE_COMDAT_SELECT_ANY;
+        rec.sectionDefEntry     = symEntries.size();
+        appendEntry(std::move(secDef));
+
+        CoffSymEntry sym;
+        sym.name          = objNames.definedName(rec.symId, "sym_");
+        sym.value         = 0;   // a COMDAT section holds exactly one body
+        sym.sectionNumber = rec.sectionNumber;
+        sym.type          = rec.symType;
+        sym.storageClass  = IMAGE_SYM_CLASS_EXTERNAL;
+        CoffSymEntry const canonical = sym;
+        std::uint32_t const canonicalIdx = appendEntry(std::move(sym));
+        symIdxBySymbol.emplace(rec.symId, canonicalIdx);
+        // An alias of a WEAK definition rides the same COMDAT section, so it
+        // inherits the same select-any policy -- which is exactly right, and
+        // is why this site needs no special case beyond the shared guard.
+        if (!appendAliasEntries(rec.symId, canonical, SymbolBinding::Weak,
+                                canonicalIdx)) {
+            return {};
+        }
     }
 
     // D-CSUBSET-COMPUTED-GOTO / jump tables: synthetic per-block symbols
     // (the `&&label` / dense-switch jump-table relocation targets) are
-    // intra-module DEFINED LOCAL symbols pointing at an interior `.text`
-    // offset. Register + emit them as IMAGE_SYM_CLASS_STATIC (LOCAL — a
+    // intra-module DEFINED LOCAL symbols pointing at an interior offset of
+    // the function that contains them. IMAGE_SYM_CLASS_STATIC (LOCAL — a
     // sibling object's unrelated `sym_<id>` must never bind to or be
     // bound by an interior block address; the ELF STB_LOCAL / Mach-O
-    // no-N_EXT mirror), SectionNumber = 1 (.text), Value =
-    // funcTextStart + blockByteOffset (SECTION-relative — for .text that
-    // equals the flat offset). Registering them BEFORE the undefined-
+    // no-N_EXT mirror), Value = funcTextStart + blockByteOffset
+    // (SECTION-relative). Appending them BEFORE the undefined-
     // extern scan makes a jump-table slot's abs64 reloc resolve to this
     // defined local rather than the extern fallback fabricating a bogus
     // undefined `sym_<id>` nothing can ever define (the c147 Mach-O
     // CRITICAL fold, baked into the PE arm from the start).
-    struct BlockSymRecord {
-        SymbolId      symId{};
-        std::uint64_t textOffset = 0;
-    };
-    std::vector<BlockSymRecord> blockSyms;
+    // ★ A block symbol inside a WEAK function belongs to that function's
+    // COMDAT section, not to `.text` — naming section 1 would point the
+    // label at whatever bytes happen to sit at that offset of a section its
+    // body is not in, which is a silent wrong-control-flow bug of exactly the
+    // shape IMAGE_SYM_CLASS_STATIC exists to prevent.
+    // ⇒ AND THAT IS WHY THIS WALK RUNS AFTER THE WEAK-DEFINITION GROUPS ABOVE.
+    // A record naming a COMDAT ordinal may not precede that section's own
+    // section symbol; a label that did became the COMDAT key (see the measured
+    // dumpbin reading at the group loop).
     for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+        auto const cit = comdatByFuncIndex.find(fi);
+        std::int16_t const blockSection =
+            (cit != comdatByFuncIndex.end())
+                ? comdats[cit->second].sectionNumber
+                : kTextSectionNumber;
         for (auto const& bs : module.functions[fi].blockSymbols) {
-            auto const [it, fresh] =
-                symIdxBySymbol.emplace(bs.symbol, nextSymIdx);
-            if (!fresh) {
+            if (symIdxBySymbol.contains(bs.symbol)) {
                 emit(reporter, DiagnosticCode::K_SymbolUndefined,
                      std::string{"PE writer: synthetic block symbol #"}
                          + std::to_string(bs.symbol.v)
@@ -1039,33 +1628,41 @@ encode(AssembledModule const&    module,
                            " - block SymbolIds must be unique.");
                 return {};
             }
-            ++nextSymIdx;
-            blockSyms.push_back(
-                {bs.symbol, funcTextStart[fi] + bs.blockByteOffset});
+            CoffSymEntry e;
+            e.name = std::string{"sym_"} + std::to_string(bs.symbol.v);
+            e.value = static_cast<std::uint32_t>(funcTextStart[fi]
+                                                 + bs.blockByteOffset);
+            e.sectionNumber = blockSection;
+            e.storageClass  = IMAGE_SYM_CLASS_STATIC;
+            symIdxBySymbol.emplace(bs.symbol, appendEntry(std::move(e)));
         }
     }
 
-    // Defined DATA symbols — one IMAGE_SYMBOL per NAMED item (anonymous
-    // SymbolId{} items are section-offset-referenced, never reloc
-    // targets — M1 skip). A SymbolId colliding with an already-
-    // registered (function / block / data) symbol is a producer-contract
+    // Defined DATA symbols (D-LK-OBJECT-DATA-SECTION-RELOCATABLE, PE arm) —
+    // one IMAGE_SYMBOL per NAMED item (anonymous SymbolId{} items are
+    // section-offset-referenced, never reloc targets — M1 skip).
+    // SectionNumber = the item's 1-based section ordinal, Value = the item's
+    // SECTION-RELATIVE offset (the COFF convention — dumpbin shows e.g.
+    // `table` as `00000000 SECT4 External`; NOT Mach-O's flat-address
+    // n_value), type = 0 (COFF data symbols are `notype`; DTYPE_FUNCTION is
+    // functions-only). Externally-visible items carry their real
+    // (identity-mangled) name + EXTERNAL; static/synthesized ones keep
+    // `sym_<id>` + Local → IMAGE_SYM_CLASS_STATIC (the same name+binding
+    // coupling the function loop above uses — TF-C54; the design-audit caught
+    // this DATA site as the omitted twin). A SymbolId colliding with an
+    // already-appended (function / block / data) symbol is a producer-contract
     // breach — fail loud (the ELF ET_REL / Mach-O K_DuplicateDataSymbol
     // mirror), never a silent skip that would bind a reloc to the WRONG
-    // symbol.
-    struct DataSymRecord {
-        SymbolId      symId{};
-        std::int16_t  sectionNumber = 0;      // 1-based ordinal
-        std::uint64_t sectionRelOffset = 0;   // COFF Value convention
-    };
-    std::vector<DataSymRecord> dataSyms;
-    auto registerDataSyms =
+    // symbol. Weak items are absent from these layouts (their bodies are
+    // COMDAT sections, emitted with their group below).
+    auto appendDataSyms =
         [&](link::format::ExecDataSectionLayout const& layout,
             std::int16_t sectionNumber) -> bool {
         for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
             AssembledData const& di =
                 module.dataItems[layout.itemIndices[j]];
             if (di.symbol == SymbolId{}) continue;   // anonymous item (M1)
-            if (!symIdxBySymbol.emplace(di.symbol, nextSymIdx).second) {
+            if (symIdxBySymbol.contains(di.symbol)) {
                 emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
                      std::format(
                          "pe::encode (Obj): data SymbolId={{ {} }} "
@@ -1074,25 +1671,50 @@ encode(AssembledModule const&    module,
                          di.symbol.v));
                 return false;
             }
-            ++nextSymIdx;
-            dataSyms.push_back({di.symbol, sectionNumber,
-                                layout.itemOffsets[j]});
+            SymbolBinding const binding =
+                objNames.definedBinding(di.symbol);
+            CoffSymEntry e;
+            e.name          = objNames.definedName(di.symbol, "sym_");
+            e.value         =
+                static_cast<std::uint32_t>(layout.itemOffsets[j]);
+            e.sectionNumber = sectionNumber;
+            e.storageClass  = (binding == SymbolBinding::Local)
+                                  ? IMAGE_SYM_CLASS_STATIC
+                                  : IMAGE_SYM_CLASS_EXTERNAL;
+            CoffSymEntry const canonical = e;
+            std::uint32_t const canonicalIdx = appendEntry(std::move(e));
+            symIdxBySymbol.emplace(di.symbol, canonicalIdx);
+            if (!appendAliasEntries(di.symbol, canonical, binding,
+                                    canonicalIdx)) {
+                return false;
+            }
         }
         return true;
     };
-    if (hasRodata && !registerDataSyms(rodataLayout, IDX_RODATA)) {
-        return {};
-    }
-    if (hasData && !registerDataSyms(dataLayout, IDX_DATA)) return {};
-    if (hasRelRo && !registerDataSyms(relroLayout, IDX_RELRO)) return {};
-    if (hasBss && !registerDataSyms(bssLayout, IDX_BSS)) return {};
+    if (hasRodata && !appendDataSyms(rodataLayout, IDX_RODATA)) return {};
+    if (hasData && !appendDataSyms(dataLayout, IDX_DATA)) return {};
+    if (hasRelRo && !appendDataSyms(relroLayout, IDX_RELRO)) return {};
+    if (hasBss && !appendDataSyms(bssLayout, IDX_BSS)) return {};
 
     // Undefined externs: any reloc target that is neither a defined
-    // function / block / data symbol. Scans DATA-ITEM relocations too
+    // function / block / data / weak symbol. Scans DATA-ITEM relocations too
     // (the ELF c145 / Mach-O c147 mirror) — a relro const table of libc
     // function pointers whose targets appear in NO function reloc still
     // needs its IMAGE_SYM_UNDEFINED entries so the data IMAGE_RELOCATION
     // records below resolve their SymbolTableIndex.
+    //
+    // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE (PE arm, c148): the undefined extern
+    // carries its REAL import name (`externName` — the pipeline-mangled
+    // `mangledName`; PE x64 C mangling is IDENTITY, so `puts` is emitted
+    // verbatim with no leading underscore) so the FINAL linker (link.exe /
+    // lld-link) resolves it against a sibling object or an import library.
+    // A FUNCTION extern (isData==false) carries IMAGE_SYM_DTYPE_FUNCTION —
+    // mirroring the defined-function path above — so the c170 COFF object
+    // reader reconstructs the function/data class FAITHFULLY (without the hint
+    // a reconstructed function extern defaults to DATA, which would route a
+    // `call rel32 -> extern` through the data IAT slot). An extern with no
+    // ExternImport row (a reloc target the source never declared) stays
+    // type=0; cl.exe / link.exe treat a type-0 undefined symbol as either.
     std::vector<SymbolId> externSyms;
     std::unordered_set<SymbolId> externSeen;
     auto noteExternTarget = [&](SymbolId target) {
@@ -1103,8 +1725,76 @@ encode(AssembledModule const&    module,
         for (auto const& rel : fn.relocations) noteExternTarget(rel.target);
     for (auto const& di : module.dataItems)
         for (auto const& rel : di.relocations) noteExternTarget(rel.target);
+    std::unordered_map<SymbolId, bool> externIsData;
+    for (auto const& imp : module.externImports)
+        externIsData.emplace(imp.symbol, imp.isData);
     for (auto const& e : externSyms) {
-        if (symIdxBySymbol.emplace(e, nextSymIdx).second) ++nextSymIdx;
+        auto const it = externIsData.find(e);
+        bool const isFunction = (it != externIsData.end()) && !it->second;
+        CoffSymEntry ent;
+        ent.name          = objNames.externName(e, "sym_");
+        ent.sectionNumber = IMAGE_SYM_UNDEFINED;
+        ent.type          = isFunction
+                                ? static_cast<std::uint16_t>(
+                                      IMAGE_SYM_DTYPE_FUNCTION)
+                                : std::uint16_t{0};
+        ent.storageClass  = IMAGE_SYM_CLASS_EXTERNAL;
+        symIdxBySymbol.emplace(e, appendEntry(std::move(ent)));
+    }
+
+    // ── THE COMDAT-ORDERING TRIPWIRE ───────────────────────────
+    //
+    // The entry list is complete here, and this is the last chance to check the
+    // one property of it that no later step and no reader of DSS's own can see.
+    // PE/COFF: "The first symbol that has the section value of the COMDAT
+    // section must be the section symbol... The second symbol is called 'the
+    // COMDAT symbol'." Both are appended together by the weak-definition group
+    // above, which is placed ahead of every other append that can name a COMDAT
+    // ordinal -- so for well-formed input this loop finds nothing.
+    //
+    // ⚠ IT IS HERE BECAUSE NOTHING INSIDE DSS CAN WITNESS THE BREAK. ✔MEASURED
+    // 2026-08-21 over an object emitted with the block walk ahead of the group:
+    // link.exe 14.51.36252 refuses it -- `fatal error LNK1162: expected aux
+    // symbol for COMDAT section 0x2` -- while `coff_object_reader` reads it back
+    // perfectly, because it recognises the section-definition symbol by NAME
+    // plus a following aux record and scans the whole table for it. The
+    // round-trip oracle therefore stays GREEN over an object the reference
+    // linker will not accept, and a comment coupling the two walks would be the
+    // only thing holding the invariant. This is the same belt, and the same
+    // reasoning, as the `slotsMinted == numberOfSymbols` tripwire further down.
+    std::int32_t const firstComdatOrdinal =
+        static_cast<std::int32_t>(numSections)
+        - static_cast<std::int32_t>(comdats.size()) + 1;
+    std::vector<std::size_t> namingComdat(comdats.size(), 0);
+    for (std::size_t i = 0; i < symEntries.size(); ++i) {
+        std::int32_t const sn =
+            static_cast<std::int32_t>(symEntries[i].sectionNumber);
+        if (sn < firstComdatOrdinal) continue;   // not a COMDAT ordinal
+        std::size_t const ci =
+            static_cast<std::size_t>(sn - firstComdatOrdinal);
+        std::size_t const rank = namingComdat[ci]++;
+        if (rank > 1) continue;   // ordinary members of the section
+        // The group appends the section symbol at `sectionDefEntry` and the
+        // COMDAT symbol immediately after it, so those two positions ARE the
+        // required first and second.
+        if (i == comdats[ci].sectionDefEntry + rank) continue;
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format(
+                 "pe::encode (Obj): '{}' is the {} symbol naming COMDAT section "
+                 "{} ('{}'), but PE/COFF requires that section's own "
+                 "section-definition symbol first and the COMDAT symbol '{}' "
+                 "second. A consumer reads the FIRST record bearing the ordinal "
+                 "to find the Selection byte, so any other order makes some "
+                 "other symbol the COMDAT key - link.exe rejects such an object "
+                 "outright (LNK1162, 'expected aux symbol for COMDAT section'), "
+                 "and DSS's own reader cannot see it because it finds the "
+                 "section symbol by name rather than by position. "
+                 "Substrate-invariant violation, "
+                 "D-LK-OBJECT-WEAK-DEF-RELOCATABLE.",
+                 symEntries[i].name, rank == 0 ? "first" : "second",
+                 comdats[ci].sectionNumber, comdats[ci].sectionName,
+                 objNames.definedName(comdats[ci].symId, "sym_")));
+        return {};
     }
 
     // ── Build .text relocation table ───────────────────────────
@@ -1124,11 +1814,23 @@ encode(AssembledModule const&    module,
     // patch bytes). DATA-item relocations differ: their slot bytes ARE
     // the addend carrier, so the data-reloc pass below WRITES the
     // addend in-slot instead (see its block comment).
+    //
+    // ★ A WEAK function's relocations belong to ITS OWN COMDAT section's
+    // table, not to `.text`'s — a section's relocation table is a property of
+    // the section, and its VirtualAddress column is an offset WITHIN that
+    // section. `funcTextStart[fi]` is already 0 for such a function, so the
+    // arithmetic is shared; only the destination table differs.
     std::vector<std::uint8_t> textRelocs;
     std::uint32_t textRelocCount = 0;
     for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
         auto const& fn = module.functions[fi];
         std::uint64_t const fnStart = funcTextStart[fi];
+        auto const cit = comdatByFuncIndex.find(fi);
+        bool const inComdat = cit != comdatByFuncIndex.end();
+        std::vector<std::uint8_t>& relocsOut =
+            inComdat ? comdats[cit->second].relocs : textRelocs;
+        std::uint32_t& relocCountOut =
+            inComdat ? comdats[cit->second].relocCount : textRelocCount;
         for (auto const& rel : fn.relocations) {
             if (rel.addend != 0) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
@@ -1150,11 +1852,11 @@ encode(AssembledModule const&    module,
             if (it == symIdxBySymbol.end()) continue;  // ditto
             std::uint32_t const va =
                 static_cast<std::uint32_t>(fnStart + rel.offset);
-            appendU32LE(textRelocs, va);
-            appendU32LE(textRelocs, it->second);
-            appendU16LE(textRelocs,
+            appendU32LE(relocsOut, va);
+            appendU32LE(relocsOut, it->second);
+            appendU16LE(relocsOut,
                 static_cast<std::uint16_t>(fmtReloc->nativeId));
-            ++textRelocCount;
+            ++relocCountOut;
         }
     }
 
@@ -1287,6 +1989,25 @@ encode(AssembledModule const&    module,
                                 relroRelocCount)) {
         return {};
     }
+    // A weak DATA definition's COMDAT section owns its item's relocations, in
+    // its own table, through the SAME walker (offsets are section-relative and
+    // its single item sits at 0, so nothing about the arithmetic is special).
+    for (auto& rec : comdats) {
+        if (!rec.dataLayout.has_value()) continue;
+        if (!buildDataRelocTable(*rec.dataLayout, rec.sectionName,
+                                 rec.relocs, rec.relocCount)) {
+            return {};
+        }
+    }
+    // The COMDAT section's auxiliary record duplicates its section header's
+    // NumberOfRelocations (PE/COFF "Auxiliary Format 5: Section Definitions").
+    // Filled here rather than at mint time because the count is not known
+    // until the table exists — and a stale duplicate of a header field is the
+    // kind of disagreement a linker reads as corruption.
+    for (auto const& rec : comdats) {
+        symEntries[rec.sectionDefEntry].auxNumRelocs =
+            static_cast<std::uint16_t>(rec.relocCount);
+    }
 
     // Silent-failure C1 guard: PE/COFF spec §4 says when a section's
     // relocation count > 65534, the writer must set
@@ -1312,6 +2033,9 @@ encode(AssembledModule const&    module,
         || !checkRelocCountFits(".data", dataRelocCount)
         || !checkRelocCountFits("relro", relroRelocCount)) {
         return {};
+    }
+    for (auto const& rec : comdats) {
+        if (!checkRelocCountFits("COMDAT", rec.relocCount)) return {};
     }
 
     // ── Build string table + symbol table records ─────────────
@@ -1339,158 +2063,70 @@ encode(AssembledModule const&    module,
     auto emitSymWithName = [&](std::string_view name, std::uint32_t value,
                                 std::int16_t sectionNumber,
                                 std::uint16_t type,
-                                std::uint8_t storageClass) {
+                                std::uint8_t storageClass,
+                                std::uint8_t numAuxSymbols) {
         std::uint32_t offset = 0;
         if (name.size() > 8) offset = strtab.add(name);
         appendSym(name.size() <= 8
                       ? encodeSymbolName(name, 0)
                       : encodeSymbolName(name, offset),
-                  value, sectionNumber, type, storageClass, /*aux=*/0);
+                  value, sectionNumber, type, storageClass, numAuxSymbols);
     };
 
-    constexpr std::int16_t kTextSectionNumber = 1;
-
-    // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real source-level C names for the
-    // externally-visible defined functions; `sym_<id>` fallback for
-    // static/local/synthesized symbols.
-    link::format::ObjectSymbolNames const objNames{module};
-
-    // D-LK-OBJECT-WEAK-DEF-RELOCATABLE (fail-loud interim): a WEAK DEFINED
-    // symbol cannot round-trip a PE/COFF RELOCATABLE (.obj) object today.
-    // `definedBinding` (the shared, format-neutral decision) returns Weak for an
-    // externally-visible `__attribute__((weak))` def; a faithful COFF weak def
-    // needs an IMAGE_SYM_CLASS_WEAK_EXTERNAL record + its weak-external aux
-    // (tagging the default resolution) that is NOT wired. Emitting it strong
-    // (EXTERNAL) would SILENTLY drop the weak-override semantics, so fail loud
-    // instead — the same posture the Mach-O MH_DYLIB export arm takes on this
-    // case (D-LK3-DYLIB-WEAK-EXPORT). Each writer owns its own fail-loud +
-    // vocabulary; the Weak decision is the one shared `definedBinding`.
-    auto emitWeakDefinedRelocatableError =
-        [&](std::string_view symName, char const* symKind) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::string{"pe::encode (Obj): defined "} + symKind
-                     + " symbol '" + std::string{symName}
-                     + "' has WEAK binding -- a weak DEFINED symbol cannot be "
-                       "emitted to a PE/COFF RELOCATABLE object until COFF weak-"
-                       "external (IMAGE_SYM_CLASS_WEAK_EXTERNAL + its weak-"
-                       "external aux record) machinery ships "
-                       "(D-LK-OBJECT-WEAK-DEF-RELOCATABLE); emitting it strong "
-                       "(IMAGE_SYM_CLASS_EXTERNAL) would silently lose weak-"
-                       "override semantics.");
-        };
-
-    // Defined function symbols (type=FUNCTION, SectionNumber=1 for `.text`).
-    // Storage class is coupled to the NAME (D-LK-INTERNAL-LINKAGE-FN-EMITTED-
-    // GLOBAL-FOREIGN-COLLISION, TF-C54): a static/synthesized `sym_<id>` def is
-    // Local → IMAGE_SYM_CLASS_STATIC (3), so a sibling `.obj`'s unrelated
-    // `sym_<id>` can never collide with it at a FOREIGN multi-TU link; an
-    // externally-visible def keeps EXTERNAL (2). COFF has NO local-first
-    // ordering rule (unlike ELF), so the emission order is unchanged — only the
-    // storage class flips. A WEAK def FAILS LOUD (D-LK-OBJECT-WEAK-DEF-
-    // RELOCATABLE): the c-subset DOES produce weak defined symbols
-    // (`__attribute__((weak))` → SymbolBinding::Weak, per `c-subset.lang.json` +
-    // examples/c-subset/attributes_syntax's `weak_helper` and
-    // weak_inline_crosscu), but they reach a PE binary ONLY via the EXEC/DLL arm
-    // (encodeExec — `encode` dispatches to it above when objectType != Obj),
-    // where a weak def is merge-resolved strong-over-weak / forced Global before
-    // the writer. A weak def routed to THIS relocatable path cannot round-trip
-    // until the COFF weak-external machinery ships, so the writer fails loud
-    // rather than silently degrade it to EXTERNAL.
-    for (auto const& f : funcSyms) {
-        std::string const symName = objNames.definedName(f.symId, "sym_");
-        SymbolBinding const binding = objNames.definedBinding(f.symId);
-        if (binding == SymbolBinding::Weak) {
-            emitWeakDefinedRelocatableError(symName, "function");
-            return {};
+    // ── Emit the symbol table from the ONE entry list ─────────
+    //
+    // Every record — defined functions, block locals, data symbols, the
+    // per-weak-definition COMDAT groups and the undefined externs — was
+    // appended in `symEntries` in this exact order, and every relocation's
+    // SymbolTableIndex was minted from that same append. There is nothing to
+    // keep in step here: this loop cannot emit a record the index map does not
+    // know about, or skip one it does.
+    for (auto const& e : symEntries) {
+        emitSymWithName(e.name, e.value, e.sectionNumber, e.type,
+                        e.storageClass,
+                        (e.hasSectionDefAux || e.hasWeakExternAux)
+                            ? std::uint8_t{1}
+                            : std::uint8_t{0});
+        if (e.hasWeakExternAux) {
+            // Auxiliary Format 3 (Weak Externals), 18 bytes:
+            //   TagIndex[4] Characteristics[4] Unused[10]
+            // TagIndex is the symbol-table INDEX of the default -- the same
+            // coordinate a relocation's SymbolTableIndex uses, minted by the
+            // one `appendEntry` site, so it cannot drift from what the file
+            // carries (the `slotsMinted == numberOfSymbols` tripwire below
+            // covers the whole table, this record's own slot included).
+            appendU32LE(symtab, e.auxWeakTagIndex);
+            appendU32LE(symtab, e.auxWeakCharacteristics);
+            for (std::size_t k = 0; k < kAuxWeakExternUnusedTail; ++k) {
+                appendU8(symtab, 0);
+            }
+            continue;
         }
-        std::uint8_t const storageClass =
-            (binding == SymbolBinding::Local)
-                ? IMAGE_SYM_CLASS_STATIC
-                : IMAGE_SYM_CLASS_EXTERNAL;
-        emitSymWithName(symName,
-                        static_cast<std::uint32_t>(f.valueInText),
-                        kTextSectionNumber,
-                        IMAGE_SYM_DTYPE_FUNCTION,
-                        storageClass);
-    }
-    // Synthetic per-block symbols (computed-goto labels / dense-switch
-    // jump-table targets): IMAGE_SYM_CLASS_STATIC — deliberately LOCAL,
-    // so a sibling object's unrelated `sym_<id>` can never bind to (or
-    // be bound by) an interior block address — SectionNumber = 1
-    // (.text), Value = the section-relative text offset. Emission order
-    // matches the symIdxBySymbol registration above (functions → blocks
-    // → data → externs) so relocation SymbolTableIndex values line up.
-    // The ELF STB_LOCAL / Mach-O no-N_EXT block-symbol legs are the
-    // mirrors (c147 fold, baked in).
-    for (auto const& b : blockSyms) {
-        std::string const symName =
-            std::string{"sym_"} + std::to_string(b.symId.v);
-        emitSymWithName(symName,
-                        static_cast<std::uint32_t>(b.textOffset),
-                        kTextSectionNumber,
-                        /*type=*/0,
-                        IMAGE_SYM_CLASS_STATIC);
-    }
-    // Defined DATA symbols (D-LK-OBJECT-DATA-SECTION-RELOCATABLE, PE
-    // arm): EXTERNAL, SectionNumber = the item's 1-based section
-    // ordinal, Value = the item's SECTION-RELATIVE offset (the COFF
-    // convention — dumpbin shows e.g. `table` as `00000000 SECT4
-    // External`; NOT Mach-O's flat-address n_value), type = 0 (COFF
-    // data symbols are `notype`; DTYPE_FUNCTION is functions-only).
-    // Externally-visible items carry their real (identity-mangled)
-    // name + EXTERNAL; static/synthesized ones keep `sym_<id>` + Local →
-    // IMAGE_SYM_CLASS_STATIC (the same name+binding coupling the function loop
-    // above uses — D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION,
-    // TF-C54; the design-audit caught this DATA site as the omitted twin).
-    // A WEAK data def FAILS LOUD, same D-LK-OBJECT-WEAK-DEF-RELOCATABLE reason
-    // as the function loop above (COFF weak-external is not wired; degrading it
-    // to EXTERNAL would silently drop the weak-override semantics).
-    for (auto const& d : dataSyms) {
-        std::string const symName = objNames.definedName(d.symId, "sym_");
-        SymbolBinding const binding = objNames.definedBinding(d.symId);
-        if (binding == SymbolBinding::Weak) {
-            emitWeakDefinedRelocatableError(symName, "data");
-            return {};
+        if (!e.hasSectionDefAux) continue;
+        // Auxiliary Format 5 (Section Definitions), 18 bytes:
+        //   Length[4] NumberOfRelocations[2] NumberOfLinenumbers[2]
+        //   CheckSum[4] Number[2] Selection[1] Unused[3]
+        // CheckSum is deliberately 0. The spec calls it "the checksum for
+        // communal data", and link.exe only COMPARES it for SAME_SIZE(3) /
+        // EXACT_MATCH(4); SELECT_ANY(2) — the only selection this writer
+        // emits — never consults it. Its algorithm is a link.exe-private one
+        // the published format does not define (✔MEASURED: it is not CRC-32 —
+        // cl.exe and clang both stamp 0x37DEF032 for the 4 bytes `05 00 00 00`
+        // where zlib's CRC-32 is 0x169A2F2E), so a fabricated non-zero value
+        // would be a wrong number dressed as a real one. Zero is what a
+        // producer that has no checksum to offer emits, and both toolchains
+        // emit zero for their non-COMDAT section symbols.
+        // Number is 0: it names the ASSOCIATED section and is read only for
+        // selection 5 (ASSOCIATIVE), which this writer never emits.
+        appendU32LE(symtab, e.auxLength);
+        appendU16LE(symtab, e.auxNumRelocs);
+        appendU16LE(symtab, 0);            // NumberOfLinenumbers
+        appendU32LE(symtab, 0);            // CheckSum
+        appendU16LE(symtab, 0);            // Number (ASSOCIATIVE only)
+        appendU8(symtab, e.auxSelection);
+        for (std::size_t k = 0; k < kAuxSectionDefUnusedTail; ++k) {
+            appendU8(symtab, 0);
         }
-        std::uint8_t const storageClass =
-            (binding == SymbolBinding::Local)
-                ? IMAGE_SYM_CLASS_STATIC
-                : IMAGE_SYM_CLASS_EXTERNAL;
-        emitSymWithName(symName,
-                        static_cast<std::uint32_t>(d.sectionRelOffset),
-                        d.sectionNumber,
-                        /*type=*/0,
-                        storageClass);
-    }
-    // Undefined extern symbols (SectionNumber=0=UNDEF, type=0,
-    // value=0). D-LK-OBJECT-EXTERN-CALL-RELOCATABLE (PE arm, c148): the
-    // undefined extern carries its REAL import name (`externName` — the
-    // pipeline-mangled `mangledName`; PE x64 C mangling is IDENTITY, so
-    // `puts` is emitted verbatim with no leading underscore) so the
-    // FINAL linker (link.exe / lld-link) resolves it against a sibling
-    // object or an import library — the PE analog of the ELF c141 /
-    // Mach-O c146 fix. `sym_<id>` remains the fallback for a reloc
-    // target that is neither defined nor a known import.
-    // Map each extern SymbolId to its isData class (from the module's extern
-    // imports). A FUNCTION extern (isData==false) carries
-    // IMAGE_SYM_DTYPE_FUNCTION -- mirroring the defined-function path above --
-    // so the c170 COFF object reader reconstructs the function/data class
-    // FAITHFULLY (c170 silent-failure-review fold: without the hint a
-    // reconstructed function extern defaults to DATA, which would route a
-    // `call rel32 -> extern` through the data IAT slot). An extern with no
-    // ExternImport row (a reloc target the source never declared) stays
-    // type=0; cl.exe / link.exe treat a type-0 undefined symbol as either.
-    std::unordered_map<SymbolId, bool> externIsData;
-    for (auto const& imp : module.externImports)
-        externIsData.emplace(imp.symbol, imp.isData);
-    for (auto const& e : externSyms) {
-        std::string const symName = objNames.externName(e, "sym_");
-        auto const it = externIsData.find(e);
-        bool const isFunction = (it != externIsData.end()) && !it->second;
-        std::uint16_t const symType =
-            isFunction ? static_cast<std::uint16_t>(IMAGE_SYM_DTYPE_FUNCTION) : 0u;
-        emitSymWithName(symName, /*value=*/0, IMAGE_SYM_UNDEFINED,
-                        symType, IMAGE_SYM_CLASS_EXTERNAL);
     }
 
     // ── Layout the file: header → section headers → section data
@@ -1530,6 +2166,13 @@ encode(AssembledModule const&    module,
     if (hasRelRo) {
         rawCursor += static_cast<std::uint32_t>(relroLayout.spanSize);
     }
+    // Each COMDAT section's bytes follow, in the ordinal order assigned above
+    // — a zero-fill one (a weak `bss` item) stores none, exactly like `.bss`.
+    for (auto& rec : comdats) {
+        if (rec.zeroFill) { rec.rawPointer = 0; continue; }
+        rec.rawPointer = rawCursor;
+        rawCursor += static_cast<std::uint32_t>(rec.spanSize);
+    }
     // Relocation tables follow ALL file-backed section bytes (.text's
     // first, then each reloc-bearing data section's — the same order the
     // section headers are emitted). A no-reloc table keeps pointer = 0.
@@ -1543,6 +2186,10 @@ encode(AssembledModule const&    module,
     std::uint32_t const relroRelocPointer =
         relroRelocCount > 0 ? relocCursor : 0u;
     relocCursor += static_cast<std::uint32_t>(relroRelocs.size());
+    for (auto& rec : comdats) {
+        rec.relocPointer = rec.relocCount > 0 ? relocCursor : 0u;
+        relocCursor += static_cast<std::uint32_t>(rec.relocs.size());
+    }
 
     std::uint32_t const symtabPointer = relocCursor;
     std::uint32_t const symtabSizeBytes =
@@ -1563,6 +2210,25 @@ encode(AssembledModule const&    module,
     }
     std::uint32_t const numberOfSymbols =
         static_cast<std::uint32_t>(symtab.size() / kSymbolRecordSize);
+    // ★★ THE INDEX-vs-RECORD TRIPWIRE. `slotsMinted` is what every
+    // IMAGE_RELOCATION SymbolTableIndex was minted against; `numberOfSymbols`
+    // is what the file actually carries and what link.exe will walk. If they
+    // ever disagree, the emitted object is WELL-FORMED and WRONG: every
+    // relocation past the divergence names a different symbol than the one it
+    // was computed for, and nothing downstream can detect it. Cheap to check,
+    // impossible to notice without. (The Mach-O writer carries the same belt
+    // for the same reason.)
+    if (slotsMinted != numberOfSymbols) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encode (Obj): minted {} symbol-table index "
+                         "slots but emitted {} IMAGE_SYMBOL records - every "
+                         "relocation's SymbolTableIndex is computed from the "
+                         "former and resolved against the latter, so a "
+                         "mismatch silently binds relocations to the wrong "
+                         "symbols. Substrate-invariant violation.",
+                         slotsMinted, numberOfSymbols));
+        return {};
+    }
 
     // ── Emit ──
     std::vector<std::uint8_t> bytes;
@@ -1587,6 +2253,18 @@ encode(AssembledModule const&    module,
         || (hasData && !checkSectionNameFits(*secData))
         || (hasRelRo && !checkSectionNameFits(*secRelRo))
         || (hasBss && !checkSectionNameFits(*secBss))) {
+        return {};
+    }
+    // A COMDAT section's name comes from the SAME schema rows, but a weak item
+    // can be the ONLY item of its kind — in which case that row was never
+    // reached by the checks above, so it is checked here rather than trusted.
+    for (auto const& rec : comdats) {
+        if (rec.sectionName.size() <= 8) continue;
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encode (Obj): COMDAT section name '{}' exceeds "
+                         "8 chars; the .obj writer does not emit the COFF "
+                         "long-name (/N string-table) form.",
+                         rec.sectionName));
         return {};
     }
 
@@ -1657,6 +2335,26 @@ encode(AssembledModule const&    module,
                               /*rawPointer=*/0, /*relocPointer=*/0,
                               /*relocCount=*/0, bssAlignBits);
     }
+    // COMDAT section headers, in the ordinal order assigned above. The name is
+    // the ordinary section's name (a COMDAT does NOT need a distinct one —
+    // ✔MEASURED: cl.exe and clang both emit a second plain `.data` for a
+    // `selectany` global); Characteristics already carry
+    // IMAGE_SCN_LNK_COMDAT plus the row's own class + align bits.
+    for (auto const& rec : comdats) {
+        PeSectionHeader h{};
+        h.name                 = encodeSectionName(rec.sectionName, 0);
+        h.virtualSize          = 0;
+        h.virtualAddress       = 0;
+        h.sizeOfRawData        = static_cast<std::uint32_t>(rec.spanSize);
+        h.pointerToRawData     = rec.rawPointer;
+        h.pointerToRelocations = rec.relocPointer;
+        h.pointerToLinenumbers = 0;
+        h.numberOfRelocations  =
+            static_cast<std::uint16_t>(rec.relocCount);
+        h.numberOfLinenumbers  = 0;
+        h.characteristics      = rec.characteristics;
+        sectionHeaders.push_back(h);
+    }
     // Belt: the header vector must match the ordinal cursor the symbol
     // SectionNumbers were minted from — a drift here would bind every
     // data symbol to the WRONG section at final link.
@@ -1701,9 +2399,23 @@ encode(AssembledModule const&    module,
         bytes.insert(bytes.end(), relroLayout.bytes.begin(),
                      relroLayout.bytes.end());
     }
+    // Each COMDAT section's single body, in the ordinal order assigned above.
+    for (auto const& rec : comdats) {
+        if (rec.zeroFill) continue;   // reserves span, stores no bytes
+        if (rec.fnIndex.has_value()) {
+            auto const& fnBytes = module.functions[*rec.fnIndex].bytes;
+            bytes.insert(bytes.end(), fnBytes.begin(), fnBytes.end());
+        } else {
+            bytes.insert(bytes.end(), rec.dataLayout->bytes.begin(),
+                         rec.dataLayout->bytes.end());
+        }
+    }
     bytes.insert(bytes.end(), textRelocs.begin(), textRelocs.end());
     bytes.insert(bytes.end(), dataRelocs.begin(), dataRelocs.end());
     bytes.insert(bytes.end(), relroRelocs.begin(), relroRelocs.end());
+    for (auto const& rec : comdats) {
+        bytes.insert(bytes.end(), rec.relocs.begin(), rec.relocs.end());
+    }
 
     // The emitted byte cursor must equal the symtab pointer stamped into
     // the file header — a file-backed layout whose bytes diverge from

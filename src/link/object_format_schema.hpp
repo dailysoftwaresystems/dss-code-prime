@@ -309,6 +309,11 @@ inline constexpr EnumNameTable<ElfObjectType, 3> kElfObjectTypeTable{{{
     { ElfObjectType::Dyn,  "dyn"  },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kElfObjectTypeTable);
+
 [[nodiscard]] constexpr std::string_view
 elfObjectTypeName(ElfObjectType t) noexcept {
     return kElfObjectTypeTable.name(t);
@@ -413,6 +418,11 @@ inline constexpr EnumNameTable<PeObjectType, 3> kPeObjectTypeTable{{{
     { PeObjectType::Dll,  "dll"  },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kPeObjectTypeTable);
+
 [[nodiscard]] constexpr std::string_view
 peObjectTypeName(PeObjectType t) noexcept {
     return kPeObjectTypeTable.name(t);
@@ -503,6 +513,11 @@ inline constexpr EnumNameTable<MachOObjectType, 3> kMachOObjectTypeTable{{{
     { MachOObjectType::Execute, "execute" },
     { MachOObjectType::Dylib,   "dylib"   },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMachOObjectTypeTable);
 
 [[nodiscard]] constexpr std::string_view
 machoObjectTypeName(MachOObjectType t) noexcept {
@@ -619,10 +634,20 @@ kMachOCodeSignatureKindTable{{{
     { MachOCodeSignature::Kind::AdHoc, "adhoc" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMachOCodeSignatureKindTable);
+
 inline constexpr EnumNameTable<MachOCodeSignature::HashAlgo, 1>
 kMachOCodeSignatureHashAlgoTable{{{
     { MachOCodeSignature::HashAlgo::Sha256, "sha256" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMachOCodeSignatureHashAlgoTable);
 
 [[nodiscard]] constexpr std::optional<MachOCodeSignature::Kind>
 machoCodeSignatureKindFromName(std::string_view s) noexcept {
@@ -767,6 +792,11 @@ kMachOBuildVersionPlatformTable{{{
     { MachOBuildVersion::Platform::VisionOsExclaveCore, "visionos-exclavecore"  },
     { MachOBuildVersion::Platform::VisionOsExclaveKit,  "visionos-exclavekit"   },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMachOBuildVersionPlatformTable);
 
 // The table's row count IS the vocabulary's size, so it must equal Apple's
 // contiguous 1..24 range. Without this an enumerator added without its row
@@ -966,6 +996,11 @@ inline constexpr EnumNameTable<ObjectFormatContainer, 2> kObjectFormatContainerT
     { ObjectFormatContainer::Single,  "single"  },
     { ObjectFormatContainer::Archive, "archive" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kObjectFormatContainerTable);
 
 [[nodiscard]] constexpr std::string_view
 objectFormatContainerName(ObjectFormatContainer c) noexcept {
@@ -1457,6 +1492,31 @@ struct DSS_EXPORT ObjectFormatData {
     // `StackReserveUnsupportedReason` (core/types/object_format_kind.hpp) for
     // why each of the four verbs exists and what it tells the user to do.
     std::optional<StackReserveUnsupportedReason> stackReserveUnsupportedReason;
+
+    // ── D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the weak-DEFINITION
+    //    spelling this format uses (`"weakDefinition"` in the JSON) ────────
+    //
+    // WHICH dialect a weak definition is written in — a SEMANTIC fact about the
+    // format, never a capability flag. See `WeakDefinition` /
+    // `WeakDefinitionDialect` (core/types/object_format_kind.hpp) for the
+    // dialects, and for why this row may not grow a capability sibling.
+    //
+    // `std::nullopt` = this format has not ANSWERED the question. It is NOT the
+    // assertion "this format cannot express a weak definition" — that is the
+    // capability shape [[D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE]] is the
+    // record of, where an implementation gap got recorded as a property of the
+    // format and did not reverse cleanly. A walker that must encode a weak
+    // definition under a nullopt schema fails loud
+    // (`K_FormatLacksWeakDefinitionDialect`); a walker that never meets one
+    // never asks, so the key is not a back-door requirement on every schema.
+    //
+    // Declared today by the pe **object** and **staticlib** formats — the two
+    // whose walker arm (the COFF `.obj` writer) consults it. Deliberately NOT
+    // declared by ELF or Mach-O yet: their writers encode `STB_WEAK` /
+    // `N_WEAK_DEF` without asking, and a key nobody reads drifts silently while
+    // reading as authoritative, which is worse than no key at all
+    // ([[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]]).
+    std::optional<WeakDefinition> weakDefinition;
 
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
     //
@@ -2014,6 +2074,18 @@ public:
     [[nodiscard]] std::optional<StackReserveUnsupportedReason>
     stackReserveUnsupportedReason() const noexcept {
         return d_.stackReserveUnsupportedReason;
+    }
+
+    // D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the dialect this format
+    // spells a WEAK DEFINITION in, or `std::nullopt` if it has not answered.
+    // THE query a walker asks before encoding a weak body — a declared
+    // spelling, never a format identity — so a walker that has no encoder for
+    // the declared dialect refuses instead of re-spelling it as something
+    // whose meaning differs. Nullopt is the ABSENCE OF AN ANSWER, not the
+    // claim that this format cannot express one.
+    [[nodiscard]] std::optional<WeakDefinition>
+    weakDefinition() const noexcept {
+        return d_.weakDefinition;
     }
 
     // ── D-LK2-RODATA producer-data-section capability gate ─────

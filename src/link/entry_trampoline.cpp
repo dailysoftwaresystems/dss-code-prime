@@ -1,6 +1,8 @@
 #include "link/entry_trampoline.hpp"
 
+#include "core/types/config_key_vocabulary.hpp"  // renderAllowedList — the ONE closed-set renderer
 #include "core/types/extern_import.hpp"
+#include "core/types/object_format_kind.hpp"     // kExternCallDispatchTable
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir.hpp"
 #include "lir/lir_callconv.hpp"
@@ -621,14 +623,20 @@ bool injectEntryTrampoline(AssembledModule&          module,
         auto const dispatch = format.externCallDispatch();
         if (!dispatch.has_value()) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 // The accepted set is PROJECTED from the vocabulary's own
+                 // table, never retyped beside the check — the same fact had
+                 // three owners across this file, the MIR→LIR gate and the
+                 // format loader
+                 // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
                  std::format("entry-trampoline: format '{}' uses a "
                              "by-name-import exit but declares no "
                              "`externCallDispatch` — the exit call "
                              "has no defined call-site shape. Declare "
-                             "`externCallDispatch` (\"direct-plt\" or "
-                             "\"indirect-slot\") in the format JSON "
+                             "`externCallDispatch` ({}) in the format JSON "
                              "(D-FFI-EXTERN-CALL-DISPATCH).",
-                             std::string{format.name()}));
+                             std::string{format.name()},
+                             detail::renderAllowedList(
+                                 allNames(kExternCallDispatchTable), " or ")));
             return false;
         }
         bool const useIndirect = externCallUsesIndirectShape(*dispatch);

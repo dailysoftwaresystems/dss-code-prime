@@ -296,3 +296,88 @@ target_link_libraries(dss_link_test_runtime_library_roles
 # differ, the no-CFI control that must emit NO section, and the __got early/late
 # VA congruence a __TEXT-appended section would otherwise slide.
 dss_add_test(NAME link/test_macho_eh_frame       SOURCES test_macho_eh_frame.cpp)
+
+# D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW — the LK11b cross-CU merge vs a
+# definition carrying SEVERAL NAMES (`__attribute__((weak, alias(...)))`, and what
+# all three relocatable-object readers emit). The merge answered every question
+# through the CANONICAL row: it deduped `combined.symbols` on the merged SymbolId
+# alone (dropping every alias name from `.symtab` / `.dynsym` / the export tables),
+# minted one merged id per NAME rather than per KEY (leaving `nameToId` pointing at
+# ids no definition carries, so a losing sibling's relocations retargeted onto
+# nothing), and decided whether BYTES survive from the canonical name's fate (so an
+# atom that lost its canonical name while WINNING an alias name was deleted).
+# Every pin runs a REAL multi-module link through a shipped format and reads the
+# property back out of the EMITTED BYTES — three tiers (ET_EXEC `.symtab`, ET_DYN
+# `.dynsym`, ET_REL `.symtab`), because the merge feeding the carrier and a writer
+# reading it are separable and a pin on one alone goes green while the other loses
+# the name.
+dss_add_test(NAME link/test_cross_cu_alias_merge
+             SOURCES test_cross_cu_alias_merge.cpp)
+
+# D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET — the linker tier's
+# one site of the class: `linker::link`'s exec-flavored refusal
+# (K_FormatLacksProcessExit) ended in a REMEDY that typed the `processExit`
+# mechanism vocabulary into the sentence while `kExitMechanismTable` decides what
+# is accepted. The pin walks that TABLE and requires the message to name every
+# declarable row and no refused sentinel — never today's sentence, which would be
+# the same retyping one level up.
+dss_add_test(NAME link/test_linker_diagnostic_vocabulary
+             SOURCES test_linker_diagnostic_vocabulary.cpp)
+
+# D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET — the OBJECT-FORMAT
+# tier: the JSON loader, its JSON-free `validate()` twin, and the five backends.
+# Every "expected one of ..." half now renders `dss::detail::renderAllowedList`
+# over the table the check consults, and these pins assert the two name the SAME
+# set in BOTH directions (completeness + honesty), driven from the table so
+# adding a row without touching the message reds the test.
+# ✔The class had ALREADY FIRED here, twice: `/sections/{}/kind` advertised 11 of
+# `kSectionKindTable`'s 16 rows while the shipped corpus DECLARES five of the
+# missing ones (shstrtab 10 rows, relro 10, tdata 5, tbss 4, tvars 2), and
+# `/elf/osabi` accepted seven spellings while advertising six (`linux`, an
+# ELFOSABI_GNU alias, was accepted and denied at once).
+# It also closes a second-owner gap nothing pinned: `format.kind` is resolved by
+# the BACKEND REGISTRY, not by `kObjectFormatKindTable`, and no test tied the two
+# together — `FormatKindRefusalNamesEveryRegisteredBackend` drives the assertion
+# from `objectFormatBackendTable()`.
+# The fixtures are the SHIPPED `.format.json` files mutated in memory, so they
+# cannot drift from what we ship — hence the json link.
+# ⚠ MUST run through ctest, never a bare .exe: the shipped-config resolver walks
+# the cwd unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME link/test_object_format_vocabulary_projection
+             SOURCES test_object_format_vocabulary_projection.cpp)
+target_link_libraries(dss_link_test_object_format_vocabulary_projection
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET, the two halves
+# that meet in the link tier: a BLOCK-SHAPE sentence (which advertises a KEY set
+# and drifts exactly as a value refusal does -- `tlsAccess` advertised 3 of its
+# 4 keys, `librarySynthesis` advertised a key that is not one at all), and
+# `externCallDispatch`, whose accepted set was retyped in THREE tiers: the format
+# loader that owns it, entry_trampoline.cpp and mir_to_lir.cpp. The two lowering
+# messages END IN AN INSTRUCTION to declare it in the format JSON, so a stale
+# one tells an author to write a value the loader refuses -- which is why the
+# honesty arm here loads EVERY advertised spelling through the real loader.
+# Mutations edit the SHIPPED format documents in memory (nlohmann consumer),
+# never a hand-written format-like fixture that could rot against the real file.
+# MUST run through ctest, never a bare .exe: the shipped-config resolver walks
+# the cwd unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME link/test_extern_dispatch_and_block_shape_projection
+             SOURCES test_extern_dispatch_and_block_shape_projection.cpp)
+target_link_libraries(dss_link_test_extern_dispatch_and_block_shape_projection
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the CONFIG half of the
+# weak-DEFINITION dialect row -- the closed vocabulary, its loader, the
+# JSON-free validate() twin, and the corpus pin that keeps the key declared
+# ONLY where a walker consults it (a key the writer does not READ is worse
+# than no key: it drifts silently and reads as authoritative). The WRITER half
+# -- the pins proving the COFF .obj arm actually reads it -- lives in
+# test_pe_writer.cpp, beside the encoder.
+# Mutations edit the SHIPPED pe object document in memory (nlohmann consumer),
+# never a hand-written format-like fixture that could rot against the real file.
+# MUST run through ctest, never a bare .exe: the shipped-config resolver walks
+# the cwd unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME link/test_weak_definition_dialect
+             SOURCES test_weak_definition_dialect.cpp)
+target_link_libraries(dss_link_test_weak_definition_dialect
+                      PRIVATE nlohmann_json::nlohmann_json)

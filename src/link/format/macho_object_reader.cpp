@@ -91,6 +91,20 @@ constexpr std::uint8_t kNTypeSect = 0x0Eu;  // N_SECT (defined in a section)
 // label and its bytes dropped.
 constexpr std::uint16_t kNDescAltEntry    = 0x0200u;  // N_ALT_ENTRY
 constexpr std::uint16_t kNDescNoDeadStrip = 0x0020u;  // N_NO_DEAD_STRIP (NOT alt-entry)
+// N_WEAK_DEF -- "coalesed symbol is a weak definition" in Apple's own header.
+// The READ half of D-LK-OBJECT-WEAK-DEF-RELOCATABLE: it is the whole of
+// Mach-O's weak-definition machinery at this tier, and lifting it is what
+// makes a weak definition survive a DSS write/read round trip instead of
+// coming back Global. Without this the writer's N_WEAK_DEF would be a bit
+// nobody reads, which is indistinguishable from not emitting it.
+// ✔MEASURED 2026-08-20 against the installed MacOSX.sdk `<mach-o/nlist.h>`
+// (`#define N_WEAK_DEF 0x0080`) AND against a `/usr/bin/clang -c` object, whose
+// `__attribute__((weak))` function reads n_type=0x0f n_desc=0x0080.
+constexpr std::uint16_t kNDescWeakDef     = 0x0080u;  // N_WEAK_DEF
+static_assert(kNDescWeakDef != kNDescNoDeadStrip
+              && kNDescWeakDef != kNDescAltEntry,
+              "N_WEAK_DEF (0x0080) is a distinct n_desc bit from "
+              "N_NO_DEAD_STRIP (0x0020) and N_ALT_ENTRY (0x0200)");
 static_assert(kNDescAltEntry != kNDescNoDeadStrip,
               "N_ALT_ENTRY (0x0200) and N_NO_DEAD_STRIP (0x0020) are different "
               "bits -- confusing them silently drops a `used` static function's "
@@ -693,9 +707,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // Its own CU still resolves it: `buildCompoundIndex` declares every
             // `AssembledFunction` / `AssembledData` by SymbolId regardless of
             // binding.
+            // N_WEAK_DEF lifts an EXTERNAL definition to Weak -- the READ half
+            // of D-LK-OBJECT-WEAK-DEF-RELOCATABLE, the inverse of the writer's
+            // `definedNDesc`. It is honoured only for an EXTERNAL symbol: the
+            // Local arm above is a deliberate, load-bearing choice (a file-
+            // local body must stay module-private), and a coalescible
+            // file-local symbol is not a shape any producer emits.
+            SymbolBinding const defBinding =
+                !isExt                            ? SymbolBinding::Local
+                : (s.desc & kNDescWeakDef) != 0u  ? SymbolBinding::Weak
+                                                  : SymbolBinding::Global;
             defsBySection[s.sect].push_back(
-                DefSym{i, secRelOff, s.name,
-                       isExt ? SymbolBinding::Global : SymbolBinding::Local,
+                DefSym{i, secRelOff, s.name, defBinding,
                        machoVisibility(s.type)});
         } else if (!s.name.empty()) {
             // NOT an atom boundary -- an interior label. Either the object

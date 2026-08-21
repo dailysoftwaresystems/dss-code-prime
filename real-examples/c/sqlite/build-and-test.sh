@@ -58,10 +58,18 @@
 #      headers — whatever version it has — + zlib, NO descriptor — D-FFI-SHIPPED-
 #      LIBS-OS-ONLY; portable C, shared by EVERY leg) and resolve EACH LEG'S OWN
 #      (tcl, z) library pair from the provider its catalogue entry declares
-#      (`host-system` | `ubuntu-ports-arm64` | `search-paths` | `pinned-archive`).
+#      (the closed set `harness_legs.py --library-providers` prints — this header
+#      does NOT re-type it, and the resolution loop's refusal does not either;
+#      which provider each leg declares is read from $LEG_CATALOGUE, not from
+#      here. A list copied into a comment is a list that drifts, and this one
+#      already had: it advertised `ubuntu-ports-arm64` for ten days after the
+#      resolver stopped accepting the name).
 #      A leg whose pair cannot be resolved on this machine records
 #      `skipped-build-input-missing` NAMING what was searched — the run continues,
-#      and the other legs are unaffected. `pinned-archive` is the GENERAL form:
+#      and the other legs are unaffected. A leg declaring a provider NO driver
+#      implements is a different fact and gets a different verdict: `poisoned`,
+#      the closed vocabulary's FAILURE class, per leg, run continues, exit != 0.
+#      `pinned-archive` is the GENERAL form:
 #      the leg declares digest-pinned third-party archives and the members to take,
 #      harness_legs.py `--acquire` fetches/verifies/extracts/slices them once for
 #      both drivers, and Step 7 stages the result BESIDE the artefact because such
@@ -108,7 +116,7 @@
 # Overridable via env: DSS_REPO_URL SQLITE_REPO_URL SRC_DIR SQLITE_DIR OUT_DIR
 #                      JOBS  DSS_TIER  DSS_LEGS  DSS_CONFOUNDS  DSS_TIER_EXCLUDES
 #                      DSS_MAX_RESUMES  DSS_SEGMENT_STALL  DSS_SEGMENT_TIMEOUT
-#                      ARM64_LIBDIR  DSS_TCL_VERSION  DSS_STRICT_ARM_VERDICTS
+#                      DSS_TCL_VERSION  DSS_STRICT_ARM_VERDICTS
 #                      DSS_BRANCH  DSS_COMMIT  DSS_ALLOW_FRESH_CLONE
 #                      DSS_ALLOW_NONRELEASE_COMPILER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3288,59 +3296,29 @@ host_system_tcl_names() {       # host_system_tcl_names <leg>  -> one candidate 
   } | LC_ALL=C awk 'NF && !seen[$0]++'
 }
 
-# arm64 libraries for the `ubuntu-ports-arm64` provider — Ubuntu ports .deb
-# extract, NO apt-source surgery: resolve the exact .deb from the ports Packages
-# index, then dpkg-deb -x and harvest the runtime .so. qemu resolves libc/libm from
-# the sysroot.
-# ★ NOT FATAL TO THE RUN. It used to `die`, which meant a host that cannot reach
-# ports.ubuntu.com (or has no dpkg-deb) lost EVERY leg over one leg's input. It is
-# now called in a SUBSHELL so a `die`/ERR inside it exits only that subshell: the
-# caller sees rc != 0, records `skipped-build-input-missing` for THAT leg, and the
-# other four carry on. The diagnostics still print — loudly — they just stop being
-# the whole run's obituary.
-ARM64_LIBDIR="${ARM64_LIBDIR:-$HOME/.cache/dss-code-prime/arm64libs}"
-ensure_arm64_libs() {
-  if [[ -e "$ARM64_LIBDIR/libtcl8.6.so.0" && -e "$ARM64_LIBDIR/libz.so.1" ]]; then
-    info "arm64 libs cached: $ARM64_LIBDIR ($(ls "$ARM64_LIBDIR" | tr '\n' ' '))"; return
-  fi
-  ensure_cmd curl curl; ensure_cmd dpkg-deb dpkg; ensure_cmd gzip gzip
-  mkdir -p "$ARM64_LIBDIR"
-  local work; work="$(mktemp -d)"
-  local codename; codename="$( . /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-noble}" )"
-  local baseurl="http://ports.ubuntu.com/ubuntu-ports"
-  local idx="$work/Packages"
-  info "arm64 libs: fetching ports index ($codename/main)"
-  curl -fsSL "$baseurl/dists/$codename/main/binary-arm64/Packages.gz" | gzip -d > "$idx" || die "cannot fetch ports arm64 Packages index for '$codename'."
-  local pkg rel
-  for pkg in libtcl8.6 zlib1g libtommath1; do
-    rel="$(awk -v p="$pkg" '$1=="Package:"{c=$2} $1=="Filename:"&&c==p{print $2; exit}' "$idx")"
-    [[ -n "$rel" ]] || { warn "arm64 $pkg not in ports index (skipping — may be optional)"; continue; }
-    info "  downloading $pkg:arm64"
-    curl -fsSL "$baseurl/$rel" -o "$work/$pkg.deb" || die "download failed: $pkg ($baseurl/$rel)"
-    dpkg-deb -x "$work/$pkg.deb" "$work/root"
-  done
-  find "$work/root" \( -name 'libtcl8.6.so*' -o -name 'libz.so*' -o -name 'libtommath.so*' \) \
-    -exec cp -Pa {} "$ARM64_LIBDIR/" \; 2>/dev/null || true
-  # ensure the DT_NEEDED soname link exists (tcl bakes libtcl8.6.so.0)
-  if [[ ! -e "$ARM64_LIBDIR/libtcl8.6.so.0" ]]; then
-    local rt; rt="$(find "$ARM64_LIBDIR" -name 'libtcl8.6.so*' | head -1)"
-    [[ -n "$rt" ]] && ln -sf "$(basename "$rt")" "$ARM64_LIBDIR/libtcl8.6.so.0"
-  fi
-  # a plain `.so` alias for --resolve-library introspection
-  [[ -e "$ARM64_LIBDIR/libtcl8.6.so" ]] || ln -sf "$(basename "$(find "$ARM64_LIBDIR" -name 'libtcl8.6.so.0' | head -1)")" "$ARM64_LIBDIR/libtcl8.6.so" 2>/dev/null || true
-  rm -rf "$work"
-  [[ -e "$ARM64_LIBDIR/libtcl8.6.so.0" ]] || die "arm64 libtcl8.6 not obtained under $ARM64_LIBDIR."
-  [[ -e "$ARM64_LIBDIR/libz.so.1"      ]] || die "arm64 libz not obtained under $ARM64_LIBDIR."
-  info "arm64 libs staged: $(ls "$ARM64_LIBDIR" | tr '\n' ' ')"
-}
+# ★ THE BESPOKE `ubuntu-ports-arm64` ACQUISITION USED TO LIVE HERE, AND IS GONE.
+# ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+# D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
+# It was ~45 lines of `curl` + `dpkg-deb` + soname-symlink repair, staged under
+# `$ARM64_LIBDIR`, serving ONE leg from THIS driver only — the .ps1 had no such
+# arm, which is the capability-pair gap that row was named for. TF-C123 moved the
+# elf64-arm64 leg onto the shared `pinned-archive` route below and the provider
+# stopped being declared; `LIBRARY_PROVIDERS` in $LEG_RESOLVER dropped the name,
+# so `--lint` now REFUSES any leg that declares it. The code, its `case` arm and
+# the `ARM64_LIBDIR` override outlived all of that from `3e86a187` (2026-08-10)
+# to 2026-08-20, and this file's
+# own refusal message went on advertising the name as KNOWN — pointing a reader
+# at a declaration the resolver rejects. Removed here, with the vocabulary below
+# now READ FROM the resolver so the two cannot drift again.
 
 # ── `pinned-archive` — the GENERAL, DECLARED library-acquisition route ───────
 # [D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER]
-# `ensure_arm64_libs` above is a whole acquisition mechanism — fetch, extract,
-# stage — that exists for ONE leg, in ONE driver, with the archive layout welded
-# into this file. `pinned-archive` is the same idea DECLARED: the archives, their
-# PINNED sha256, the members to take and the runtime identity to record all live
-# in $LEG_CATALOGUE, and the fetch/verify/extract/slice is implemented ONCE in
+# The retired mechanism described above was a whole acquisition route — fetch,
+# extract, stage — that existed for ONE leg, in ONE driver, with the archive
+# layout welded into this file. `pinned-archive` is the same idea DECLARED: the
+# archives, their PINNED sha256, the members to take and the runtime identity to
+# record all live in $LEG_CATALOGUE, and the fetch/verify/extract/slice is
+# implemented ONCE in
 # $LEG_RESOLVER (`--acquire`) so this driver and the .ps1 acquire identically
 # instead of each growing its own. That is what makes "any leg builds on any
 # host" true rather than aspirational: the macho legs used to declare
@@ -3352,8 +3330,8 @@ ensure_arm64_libs() {
 # acquire_leg_libs <leg> — the resolver's acquisition report, as JSON, on stdout.
 # Diagnostics go to STDERR (the caller redirects them to a log), so stdout is the
 # report and nothing else. Called from a COMMAND SUBSTITUTION, which is a
-# subshell — the same isolation `ensure_arm64_libs` gets from `( … )` and for the
-# same reason: a leg whose archive cannot be fetched, whose digest does not
+# subshell — deliberate isolation, for the same reason the retired bespoke route
+# had it: a leg whose archive cannot be fetched, whose digest does not
 # match, or whose declared member is absent costs THAT LEG a
 # `skipped-build-input-missing`, never the other four. rc is taken DIRECTLY off
 # the substitution, never through a pipe.
@@ -3400,6 +3378,50 @@ else:
     sys.stdout.write("%s\n" % report[what])' "$2" <<< "$1"
 }
 
+# ── A PROVIDER NO DRIVER IMPLEMENTS — THE VERDICT, DECIDED IN ONE PLACE ──────
+# [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+#
+# ★★ THE TWO DRIVERS USED TO ANSWER THIS CONDITION DIFFERENTLY, AND THE ARGUMENT
+# AGAINST THIS DRIVER'S ANSWER WAS DELETED WHILE THE ANSWER STAYED. Until 2026-08-20
+# the `*)` arm below called `die` — `exit 1`, from a TOP-LEVEL loop, so ONE leg
+# declaring an unimplemented provider cost the whole run and the other four legs
+# never reached a verdict. The .ps1's `default` arm returned a per-leg record and
+# carried on. The retired `ensure_arm64_libs` docblock had made exactly this
+# argument in its own words — "a host that cannot reach ports.ubuntu.com lost
+# EVERY leg over one leg's input" — and that paragraph was removed with the
+# function while the `die` two hundred lines below it survived.
+#
+# ★★★ AND THE FIX IS *NOT* `leg_marks_missing`. A leg declaring a provider NO
+# DRIVER IMPLEMENTS is a HARNESS/CATALOGUE defect, not an absent build input:
+# `skipped-build-input-missing` is an ENVIRONMENTAL skip, which only WARNS unless
+# DSS_STRICT_ARM_VERDICTS=1, so a bug would have been filed as a fact about the
+# machine and the run would have exited 0. `poisoned` is the closed vocabulary's
+# FAILURE class and it already means precisely this — "no artifact was exercised
+# and the reason is OURS". Both drivers ALREADY use it for the same shape one
+# level down: `unit_not_run` here, and `Set-LegVerdict`/`Set-UnitNotRun` in the
+# .ps1, record `poisoned` + "HARNESS DEFECT: …" when a driver meets a member of a
+# closed vocabulary it cannot classify. So no new verdict is minted; the existing
+# one is used where it already belongs, per leg, and the run CONTINUES to every
+# other leg — the harness must survive its own defects, not hide them.
+#
+# WHY THIS IS A FUNCTION AND WHY IT IS IN A `dss:` REGION. The verdict TOKEN and
+# the message are now one pure function of their arguments, mirrored in the .ps1,
+# so `harness_legs.py --check-regions` EXTRACTS BOTH COPIES FROM THE SHIPPED
+# DRIVERS, EXECUTES THEM ON IDENTICAL INPUT AND COMPARES THE ANSWERS. A pin that
+# only READ the two arms could not have caught the divergence that produced this
+# region — the tokens were both spelled correctly in their own file.
+#
+# ⚠ THE MESSAGE IS ASCII ON PURPOSE, for the reason MIRROR_CASES states for the
+# zero-progress sentinel: it is compared BYTE-FOR-BYTE between a bash string and
+# a PowerShell string that reach the battery through two different file readers,
+# and a non-ASCII character would put an encoding question inside the one value
+# the comparison rests on.
+# >>> dss:unknown-library-provider >>>  (region mirrored in build-and-test.ps1)
+unknown_library_provider_verdict() {   # <driver> <leg> <provider> <tcl-names> <z-names> <known> -> "<verdict>\t<detail>"
+  printf 'poisoned\t%s\n' "HARNESS DEFECT: leg '$2' declares library provider '$3', which $1 has no dispatch arm for, so this driver cannot obtain that leg's DECLARED inputs (tcl: $4 / z: $5). ACQUISITION IS NOT DRIVER-LOCAL - pinned-archive is performed by harness_legs.py --acquire, on every host - so NO declared provider should reach this arm; reaching it means the catalogue or LIBRARY_PROVIDERS grew a provider and this driver was not extended in the same change. Add the arm to BOTH drivers: a capability in one driver and not the other is this project's canonical silent harness bug. Known providers: $6 (printed by harness_legs.py --library-providers, never copied here)."
+}
+# <<< dss:unknown-library-provider <<<
+
 # ── resolve EVERY declared leg's build inputs ────────────────────────────────
 # ★ ONE VERDICT PER LEG, AND THE RUN CONTINUES. A leg whose DECLARED inputs are
 # absent from this machine is recorded `skipped-build-input-missing` — an
@@ -3423,6 +3445,21 @@ leg_marks_missing() {           # leg_marks_missing <leg> <what-is-lost> <why>
   LEG_VERDICT_DETAIL["$1"]="$3$extra"
   warn "[$1] BUILD INPUT MISSING — $2: $3"
 }
+# ★ THE SIBLING FOR THE OTHER KIND OF LOSS, AND THE DISTINCTION IS THE WHOLE
+# POINT. `leg_marks_missing` says "this machine could not supply a DECLARED
+# input" — environmental, warns by default. This one says "the harness itself
+# cannot do what the catalogue declares" — a FAILURE, reported under the closed
+# vocabulary's `poisoned`, which reds the run wherever it is recorded. Same
+# per-leg shape, same "the run continues" rule, deliberately different class:
+# filing a harness bug as an environment fact is how a bug ships green.
+# [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+leg_marks_harness_defect() {    # leg_marks_harness_defect <leg> <verdict> <detail>
+  LEG_VERDICT["$1"]="$2"
+  LEG_VERDICT_DETAIL["$1"]="$3"
+  warn "[$1] HARNESS DEFECT [$2] — $3"
+  warn "      This leg is NOT built and NOT run here. The other legs are unaffected and the run"
+  warn "      CONTINUES — but it CANNOT exit 0, because what failed is ours, not this machine's."
+}
 for leg in "${LEG_ORDER[@]}"; do
   provider="${LEG_LIB_PROVIDER[$leg]}"
   tcl_lib=""; z_lib=""; searched=""
@@ -3434,18 +3471,6 @@ for leg in "${LEG_ORDER[@]}"; do
       tcl_lib="$(find_first ${_tnames[@]+"${_tnames[@]}"})"
       z_lib="$(find_first ${_znames[@]+"${_znames[@]}"})"
       searched="provider 'host-system'; tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; roots: ${LIB_ROOTS[*]}"
-      ;;
-    ubuntu-ports-arm64)
-      # SUBSHELL on purpose — see ensure_arm64_libs. rc is taken DIRECTLY off the
-      # subshell, never through a pipe.
-      if ( ensure_arm64_libs ); then _ports_rc=0; else _ports_rc=$?; fi
-      declare -a _tnames=(); read -r -a _tnames <<< "${LEG_LIB_TCL_NAMES[$leg]}"
-      declare -a _znames=(); read -r -a _znames <<< "${LEG_LIB_Z_NAMES[$leg]}"
-      if [[ "$_ports_rc" -eq 0 ]]; then
-        tcl_lib="$(find_first_in "$ARM64_LIBDIR" -- ${_tnames[@]+"${_tnames[@]}"})"
-        z_lib="$(find_first_in "$ARM64_LIBDIR" -- ${_znames[@]+"${_znames[@]}"})"
-      fi
-      searched="provider 'ubuntu-ports-arm64' (rc=$_ports_rc); tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; staged under: $ARM64_LIBDIR"
       ;;
     search-paths)
       # Declared candidate DIRECTORIES, tried on EVERY host: a hit is used, a miss
@@ -3528,10 +3553,59 @@ for leg in "${LEG_ORDER[@]}"; do
       searched="provider 'pinned-archive' ($_acq_stage rc=$_acq_rc); tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; acquired under: ${_acq_dir:-<nothing acquired — see $_acq_log>}"
       ;;
     *)
-      die "[$leg] declares library provider '$provider', which this driver does not implement.
-      Known: host-system | ubuntu-ports-arm64 | search-paths | pinned-archive (see $LEG_CATALOGUE and
-      LIBRARY_PROVIDERS in $LEG_RESOLVER). A provider the driver silently ignored would
-      resolve to an empty library pair and read as a missing input — so it fails loud here."
+      # ★ THE KNOWN SET IS READ, NOT RE-TYPED. This message used to carry its own
+      # hard-coded copy of the vocabulary and DRIFTED: it advertised
+      # `ubuntu-ports-arm64` as known from 2026-08-10 to 2026-08-20, after LIBRARY_PROVIDERS
+      # dropped the name, so the one message whose whole job is to tell a reader
+      # what IS accepted was naming something `--lint` refuses. A list printed by
+      # the set's owner cannot disagree with the set.
+      # ★ WHAT ACTUALLY CARRIES THE DEGRADATION HERE, stated correctly because the
+      # previous wording named the wrong half — it credited the `|| echo`.
+      # ✔MEASURED 2026-08-20, both failure modes × pipefail on/off, by running the
+      # exact expression below in a subshell with each setting:
+      #                                          pipefail=on   pipefail=off
+      #   resolver CANNOT RUN (pipeline != 0)  -> `|| echo`    `${_known:-…}`
+      #   resolver exits 0 and prints NOTHING  -> `${_known:-…}` `${_known:-…}`
+      # ⇒ `${_known:-<…>}` is the load-bearing one: it covers three of the four
+      # cells and EVERY case where the resolver exits 0, whatever the shell's
+      # pipeline settings are. The `|| echo` covers exactly one cell and is live
+      # ONLY because this file runs under `set -Eeuo pipefail` — without it the
+      # pipeline's status is `tr`'s (0), the `||` never fires, and `_known` is
+      # empty. Keep both: they degrade different failures, and a diagnostic that
+      # dies computing its own text tells nobody anything.
+      _known="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" --library-providers 2>/dev/null | tr '\n' ' ' || echo '<resolver unavailable - read LIBRARY_PROVIDERS in it>')"
+      # ⚠ THE TRAILING SPACE IS STRIPPED, AND THAT IS A PARITY FIX RATHER THAN
+      # TIDINESS. `tr` turns the resolver's FINAL newline into a space too, so the
+      # sentence rendered `…search-paths  (printed by…` here and
+      # `…search-paths (printed by…` in the .ps1, whose `-join ' '` adds none.
+      # ✔MEASURED: with it stripped the two SHIPPED drivers now produce a
+      # BYTE-IDENTICAL detail for the same leg. The differential battery could
+      # NOT have caught this — there the list is an ARGUMENT, identical to both
+      # arms by construction — so the two drivers would have gone on saying
+      # subtly different things about the same defect.
+      # Parameter expansion, not a second tool: exactly one trailing space exists
+      # (one final newline), and this needs nothing that could differ on a BSD
+      # host — the portability rule D-HARNESS-SELFTEST-BSD-SED-PORTABILITY set.
+      _known="${_known% }"
+      # ONE LEG, NOT THE RUN. See the `dss:unknown-library-provider` region above
+      # for why this is `poisoned` and not `skipped-build-input-missing`, and why
+      # it is no longer a `die`.
+      #
+      # ⚠ A PLAIN ASSIGNMENT AND TWO EXPANSIONS, NEVER `read`. This file installs
+      # `trap 'die …' ERR` with `set -E`, so `read a b < <(…)` returning non-zero
+      # — which it does on any line without a trailing newline — would fire that
+      # trap and `die`, ending the whole run from inside the ONE arm whose entire
+      # purpose is not to. Parameter expansion cannot fail, so this shape has no
+      # such edge. A malformed (TAB-less) decision line would leave `_uv` holding
+      # the whole sentence, which the Step-9 ledger then reports as a verdict
+      # OUTSIDE the closed vocabulary — loud, named, and still only this leg.
+      _uvline="$(unknown_library_provider_verdict \
+        "$(basename "${BASH_SOURCE[0]}")" "$leg" "$provider" \
+        "${LEG_LIB_TCL_NAMES[$leg]}" "${LEG_LIB_Z_NAMES[$leg]}" \
+        "${_known:-<resolver printed nothing - read LIBRARY_PROVIDERS in it>}")"
+      _uv="${_uvline%%$'\t'*}"; _ud="${_uvline#*$'\t'}"
+      leg_marks_harness_defect "$leg" "$_uv" "$_ud"
+      continue
       ;;
   esac
   [[ -z "$tcl_lib" ]] || LEG_TCL_LIB_ANY["$leg"]="$tcl_lib"
@@ -4312,8 +4386,8 @@ run_leg() {                    # run_leg <leg> <bin> <args...>  — REPLACES thi
   eval "envs=(${LEG_LAUNCH_ENV[$leg]})"
   [[ ${#envs[@]} -eq 0 ]] || export "${envs[@]}"
   # The leg's OWN library directories, for the runtime loader. Only for a leg whose
-  # libraries the harness STAGED (`ubuntu-ports-arm64`, `search-paths`,
-  # `pinned-archive`): a `host-system` leg's libraries are, by definition, already
+  # libraries the harness STAGED (`search-paths`, `pinned-archive`): a
+  # `host-system` leg's libraries are, by definition, already
   # where this machine's loader looks, and prepending a system dir would be a
   # change with no purpose. Keyed on the leg's DECLARED provider, so a future
   # staged-library leg inherits it.
@@ -5118,6 +5192,21 @@ for leg in "${LEG_ORDER[@]}"; do
   # named verdict — not an inference from what kind of box this is.
   if [[ -z "${LEG_Z_LIB[$leg]:-}" ]]; then
     CLI_FAILS=$((CLI_FAILS + 1))
+    # ★ THE REASON IS THE LEG'S OWN, NOT AN ASSUMED ENVIRONMENT FACT. "No zlib"
+    # has two causes and they are not the same claim: this machine really has no
+    # copy of that target's zlib (environmental — the message below), or Step 6
+    # never got as far as looking because the leg's own resolution was a HARNESS
+    # DEFECT (a provider no driver implements). Printing the environmental
+    # sentence for the second one files our bug as a fact about the operator's
+    # box. The fixture verdict Step 6 recorded already distinguishes them, so it
+    # is READ rather than re-derived.
+    # [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+    if [[ "${LEG_VERDICT[$leg]:-}" == "poisoned" ]]; then
+      dss_bh_set_verdict "$leg" sqlite3 'poisoned' \
+        "${LEG_VERDICT_DETAIL[$leg]:-<no reason recorded>}  (the CLI links zlib too, so it is lost to the same defect.)"
+      warn "[$leg] CLI POISONED — $(dss_bh_get_detail "$leg" sqlite3)"
+      continue
+    fi
     dss_bh_set_verdict "$leg" sqlite3 'skipped-build-input-missing' \
       "no zlib could be resolved for this leg on this host, and the CLI links zlib (SQLITE_HAVE_ZLIB=1 reaches a live '#include <zlib.h>' in shell.c) — see Step 6."
     warn "[$leg] CLI build NOT ATTEMPTED [skipped-build-input-missing] — $(dss_bh_get_detail "$leg" sqlite3)"
@@ -7057,7 +7146,21 @@ for leg in "${LEG_DECLARED[@]}"; do
     # line can never be read as "the whole corpus ran".
     printf '   %-14s (%s): %scompiled%s   units: %s%s\n' "$leg" "$spec" "$C_GRN" "$C_RST" "${UNIT_VERDICT[$leg]:--}" "$EXCL_NOTE"
   elif [[ "${LEG_VERDICT[$leg]:-}" == "poisoned" ]]; then
-    printf '   %-14s (%s): %sCOMPILE FAILED%s   see %s/%s/compile.log\n' "$leg" "$spec" "$C_RED" "$C_RST" "$OUT_DIR" "$leg"
+    # ★ IT SAYS WHAT ACTUALLY HAPPENED, AND IT NAMES A LOG ONLY WHEN THERE IS ONE.
+    # This line used to read "COMPILE FAILED   see <out>/<leg>/compile.log" for
+    # EVERY poisoned leg — true for the leg whose compile really failed, and a
+    # double lie for a leg poisoned BEFORE any compile was attempted (a provider
+    # no driver implements, a missing include list): no compile was tried, and the
+    # log it sends the reader to does not exist. The .ps1 twin never had this
+    # shape; it prints the recorded verdict and detail, which is what this does
+    # now. [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+    _plog="$OUT_DIR/$leg/compile.log"
+    if [[ -f "$_plog" ]]; then
+      printf '   %-14s (%s): %sCOMPILE FAILED%s   see %s\n' "$leg" "$spec" "$C_RED" "$C_RST" "$_plog"
+    else
+      printf '   %-14s (%s): %sPOISONED%s [no compile was attempted] — %s\n' \
+        "$leg" "$spec" "$C_RED" "$C_RST" "${LEG_VERDICT_DETAIL[$leg]:-<no reason recorded>}"
+    fi
   else
     # ★ NOT BUILT — and it says WHY, by name. This line is the difference between
     # the old driver and this one: a leg that this host could not build or run used
@@ -7292,6 +7395,29 @@ if [[ "$UNIT_FAILS" -gt 0 ]]; then
   printf '\n%s%d leg(s) had genuine unit failures (non-confound) — the corpus is not green.%s\n' "$C_RED" "$UNIT_FAILS" "$C_RST"
   exit 1
 fi
+# ★★ A POISONED LEG REDS THE RUN, AND IT DOES SO FROM THE LEDGER — the .ps1's
+# `if ($vPoisoned -gt 0)` in one statement, which this driver did not have.
+# ✔MEASURED 2026-08-20: `LEDGER_FAILED` was computed and PRINTED and then read by
+# nothing, so every `poisoned` verdict in this file reddened the run only via a
+# SEPARATE counter its own site happened to bump (COMPILE_FAILS, STAGE_FAILS,
+# CLI_FAILS, …). This file's own comment beside LEDGER_FAILED already named that
+# as a correctness "that lived in another function and could be broken by adding
+# one verdict site" — and the very next cycle to add one would have shipped a
+# driver that printed `1 poisoned` and exited 0 while its twin exited 1 on the
+# same tree. The specific counters above stay: they come FIRST because each names
+# WHICH half broke, and this is the backstop that cannot be forgotten.
+# [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+if [[ "$LEDGER_FAILED" -gt 0 ]]; then
+  declare -a _poisoned_legs=()
+  for leg in "${LEG_DECLARED[@]}"; do
+    [[ "${LEG_VERDICT[$leg]:-}" != "poisoned" ]] || _poisoned_legs+=("$leg")
+  done
+  printf '\n%s%d leg(s) POISONED: %s%s\n' "$C_RED" "$LEDGER_FAILED" "${_poisoned_legs[*]}" "$C_RST"
+  printf 'Each one is named above with its reason. `poisoned` is the closed vocabulary'\''s FAILURE\n'
+  printf 'class — "no artifact was exercised and the reason is OURS" — so this run proved nothing\n'
+  printf 'about those targets and must not exit 0.\n'
+  exit 1
+fi
 if [[ ${#ENV_SKIPS[@]} -gt 0 && "$STRICT_VERDICTS" -eq 1 ]]; then exit 1; fi
 # ★ THE CLOSING CLAIM IS BOUNDED BY THE LEDGER. It used to read "every leg
 # compiled ... GREEN", which on the old driver meant "every leg this host happened
@@ -7303,6 +7429,10 @@ if [[ ${#ENV_SKIPS[@]} -gt 0 && "$STRICT_VERDICTS" -eq 1 ]]; then exit 1; fi
 # another function and could be broken by adding one verdict site (this cycle added
 # one). A closing line that hardcodes its own denominator is the same defect class
 # as the ledger accounting hole it sits next to.
+# ⓘ THAT FRAGILITY IS GONE AS OF 2026-08-20: `LEDGER_FAILED` now has its own
+# `exit 1` above, so a new `poisoned` site reds the run whether or not it
+# remembers to bump a counter. The sentence above is kept because it is the
+# reasoning that found it, not because the hazard is still live.
 # ★ A CAPABILITY GAP FAILS THE RUN, and it fails it HERE rather than mid-leg so
 #   the other legs still produce their verdicts — one stage defect must not cost
 #   us four legs' results. It is a HARNESS failure, never a DSS one: the compiler

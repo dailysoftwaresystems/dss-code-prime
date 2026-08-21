@@ -5,7 +5,8 @@
 # recurred TWICE before being system-enforced.
 #
 # Contract: every `D-*` identifier cited in a SCANNED ROOT (`src/`, `examples/`,
-# `tests/`, `integrated_tests/`, `real-examples/` — see the roots table below)
+# `tests/`, `integrated_tests/`, `real-examples/`, `scripts/`, `.claude/` — see
+# the roots table below)
 # MUST resolve to a row in
 # `.plans/_deferred-anchor-registry.md` OR a citation in any `.plans/*.md`
 # file. The script greps source/, extracts each unique `D-*` anchor name,
@@ -15,6 +16,16 @@
 # (in-code constants, diagnostic-message identifiers) live in
 # `.plans/_deferred-anchor-registry.md` under the "Allowlist" section. The
 # script reads them from the table rows starting with `| `.
+#
+# Quotation declaration: a document that QUOTES a dead anchor id as evidence —
+# rather than citing it as live work — declares that fact in its own text, on a
+# line of its own, and the guard exempts those ids IN THAT FILE ONLY. The
+# declaration is checked from three sides so it cannot rot; see the block headed
+# QUOTED-NOT-CITED further down.
+#
+# Exit codes: 0 clean · 1 an anchor resolves nowhere · 2 a scan collapsed ·
+# 3 a markdown table row drops content · 4 a citation names a retired id ·
+# 5 a quotation declaration is stale or false · 6 the self-test failed.
 #
 # Cross-platform: this is the bash variant for Linux/macOS CI; the
 # companion `check-anchor-registry.ps1` is wired into Windows CI.
@@ -41,7 +52,15 @@ cd "${REPO_ROOT}"
 # the sole thing blocking `scripts/` from being scanned. Any placeholder must stay
 # UNDER the threshold: `D-XX-EXAMPLE` is inert here, three segments are not.
 # See D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS.
-ANCHOR_REGEX='\<D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}'
+# ★ THE GRAMMAR IS SPELLED ONCE AND THE BOUNDARY IS BOLTED ON, because a second
+# engine needs the same grammar with a DIFFERENT boundary syntax. `\<` is a grep
+# operator and is not valid in awk, so the wrap-recovery pass below takes the
+# CORE and enforces the boundary itself by testing the preceding character. Two
+# spellings of the threshold would be the duplicated-site shape this file keeps
+# closing everywhere else; two spellings of the BOUNDARY are unavoidable and are
+# therefore made explicit here rather than left to be rediscovered.
+_ANCHOR_CORE='D-[A-Z0-9_]+(-[A-Z0-9_]+){2,}'
+ANCHOR_REGEX="\\<${_ANCHOR_CORE}"
 
 # ── EVERY **GREP** IN THIS FILE RUNS IN THE BYTE LOCALE (`LC_ALL=C`) ─────────
 # (The awk passes are deliberately NOT prefixed — see the end of this note.)
@@ -322,6 +341,247 @@ END {
 }
 '
 
+# ════════════════════════════════════════════════════════════════════════════
+# WRAP RECOVERY — a line-wrapped anchor id is invisible to this guard and to
+# every grep, because `ANCHOR_REGEX` matches within one line by construction.
+# D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS, gap (4).
+#
+# ★★★ A WRAPPED ID DOES NOT FAIL — IT DISAPPEARS, and that is the one failure
+# mode a fail-loud project cannot detect by watching for a failure. ✔MEASURED
+# 2026-08-21 over all seven roots: **298 citations are line-wrapped** (src 172,
+# tests 67, real-examples 24, examples 18, scripts 8, .plans 5, .claude 1), and
+# **43 distinct wrapped prefixes fall BELOW the three-segment threshold**, so
+# they are not merely truncated — they are not collected at all.
+# ✔THE FAILING CASE, which is why this is a matcher change rather than a style
+# note: `src/asm/asm.hpp` carries a `D-LK-…` citation split across two lines whose
+# visible half is ONE SEGMENT short of the threshold, so the guard extracts
+# NOTHING from it. The whole name resolves to no row, names no tracked work, and
+# fails nothing — in `src/`, the guard's oldest root, for as long as the citation
+# has existed. Recovering the name is what turns it into a red.
+# ⓘ The name is deliberately NOT spelled here. It has no row, so writing it out
+# would make this comment a citation of a dangling anchor inside the guard that
+# reports dangling anchors — the same booby-trap this file cleared out of the
+# `.ps1` at AP6 and out of its own retired-id narration in this commit. Run the
+# guard; it prints the name and the file.
+#
+# ⚠ THIS OVERTURNS A MEASURED DECISION, AND SAYS SO. The AP6 note further down
+# records that the matcher was deliberately NOT taught to join continuation
+# lines, because the wrapped case was covered by the SUBSTRING resolve (a wrapped
+# fragment is a PREFIX of the real name, hence a substring of any plan text
+# carrying it) and there was NO FAILING CASE behind a change. That premise has
+# expired in two places. (1) The substring resolve covers a wrapped fragment only
+# when the WHOLE name is what the plans carry — it cannot tell "the real anchor
+# is registered" from "some longer, unrelated anchor happens to contain this
+# prefix", so it can manufacture a green. (2) A fragment below the threshold is
+# never collected, so no resolve of any kind runs on it.
+#
+# ★★ RECOVERY, NOT REFUSAL — and that is the whole design decision. Refusing a
+# wrapped citation would demand 298 reflows across seven roots, every one of them
+# honest text that no author can be held to, and this project has withdrawn two
+# guards for reding honest work by default. Joining costs no author anything: the
+# whole name simply becomes visible and then has to resolve like every other
+# citation. ✔MEASURED before landing: the join recovers **178 distinct whole
+# names, 177 of which resolve** — i.e. it recovers real names rather than
+# manufacturing plausible ones — and the 178th is the `src/asm/asm.hpp` case
+# above. A join that ever DOES go wrong reds with the joined name printed, which
+# is diagnosable in one look; the failure it replaces was silent.
+#
+# ★ THE JOINED NAME IS ADDED, NEVER SUBSTITUTED. The visible prefix stays in the
+# anchor set. Removing it would need proof that the same prefix is not also cited
+# unwrapped somewhere else, and keeping it is provably harmless: once the whole
+# name resolves, the prefix is a substring of it and resolves too.
+#
+# ⚠ THE CONTINUATION-STRIP RULE WAS DERIVED FROM THE TREE, NOT INVENTED.
+# ✔MEASURED: continuations sit behind `// `, `# `, `#    `, bare indentation, and
+# `# ── ` / `│   │   #    ` box drawing. A conservative rule that recognised only
+# the ASCII comment markers left 2 of the 298 unrecoverable; dropping every
+# leading NON-ALPHANUMERIC byte and then requiring the first surviving character
+# to be UPPERCASE recovered both and mangled nothing — same single unresolved
+# name either way. The uppercase requirement is what keeps ordinary prose out: a
+# continuation that resumes in lower case is not a name and is not joined.
+WRAP_JOIN_AWK='
+# ⚠ THE UPPERCASE REQUIREMENT LIVES IN ONE PLACE, and it used to live in two. An
+# earlier cut tested `c !~ /^[A-Z0-9_]/` before the match below, which is the same
+# question asked twice: the anchored match succeeds if and only if that test would
+# have passed. ✔MEASURED by planting a mutant on the first test and watching the
+# self-test STAY GREEN - a redundant guard makes the property untestable, because
+# no single-point break can expose it. The surviving test is the one the arm pins.
+function contOf(nxt,   c) {
+    c = nxt
+    gsub(/^[^A-Za-z0-9_]+/, "", c)
+    if (match(c, /^[A-Z0-9_]+(-[A-Z0-9_]+)*/) == 0) return ""
+    return substr(c, 1, RLENGTH)
+}
+# The trailing anchor-shaped token of a line that ends mid-name, or "" if there
+# is none. The WORD-BOUNDARY test is the awk spelling of the `\<` the greps use:
+# the character before the token must not be a word character, which is what
+# stops the regex reaching inside a longer hyphenated word and lifting a false
+# anchor out of its tail. ★ It LOOPS rather than testing the first match only:
+# the leftmost `D-` on a line can be an inner fragment of some other word while a
+# genuine anchor sits later on the same line, and returning on the first
+# boundary failure would miss it.
+function wrapPrefix(line,   s, p, off, abs) {
+    s = line
+    sub(/[ \t]+$/, "", s)
+    if (s !~ /-$/) return ""
+    sub(/-$/, "", s)
+    off = 0; p = s
+    while (match(p, /D-[A-Z0-9_]+(-[A-Z0-9_]+)*$/) > 0) {
+        abs = off + RSTART
+        if (abs == 1 || substr(s, abs - 1, 1) !~ /[A-Za-z0-9_]/) return substr(s, abs)
+        off = abs
+        p = substr(s, abs + 1)
+    }
+    return ""
+}
+function emitWrap(f, line, nxt,   pre, cont) {
+    pre = wrapPrefix(line)
+    if (pre == "") return
+    cont = contOf(nxt)
+    if (cont == "") return
+    print f ":" pre "-" cont
+}
+# ONE-LINE LOOKAHEAD, the same shape the cell-width check above uses and for the
+# same reason: the continuation is only knowable from the NEXT line, and the
+# pending line must be flushed at every file boundary as well as in END or the
+# LAST LINE OF EVERY FILE BUT THE LAST goes unexamined.
+FNR == 1 { if (have) emitWrap(prevFile, prev, ""); have = 0 }
+{ line = $0; sub(/\r$/, "", line)
+  if (have) emitWrap(prevFile, prev, line)
+  prevFile = FILENAME; prev = line; have = 1 }
+END { if (have) emitWrap(prevFile, prev, "") }
+'
+
+# ════════════════════════════════════════════════════════════════════════════
+# QUOTED-NOT-CITED — a document that QUOTES a dead anchor id as EVIDENCE is not
+# citing live work, and the difference is not decidable from the token.
+# D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS, gap (3).
+#
+# THE LIVE CASE, and it is the reason this mechanism exists rather than an
+# Allowlist entry: `.claude/skills/dss-cycle/references/gate-and-cross-plan.md`
+# names three `D-PP-…` ids inside a cautionary narrative about a lane that
+# converted its assignment into nine reasons to do it later. Those rows were
+# correctly DELETED. The ids are quoted as evidence of a deleted thing, and the
+# sentence only carries weight because they are the real names. ⇒ Scanning
+# `.claude/` reds on three citations that are CORRECT AS WRITTEN.
+#
+# ★★★ THE TWO MECHANISMS THIS PROJECT ALREADY HAS WERE BOTH REJECTED, AND WHY
+# MATTERS MORE THAN WHAT WAS CHOSEN.
+#   · REWORD IT (the `D-XX-EXAMPLE` placeholder convention documented above).
+#     That convention exists for an INVENTED illustration, which has no truth
+#     value to damage. Applying it to a measured historical record would edit the
+#     record to suit the tool — inverting which of the two is the authority, and
+#     doing it for the second time in this file'"'"'s history: the registry row this
+#     block closes exists because prose about a defect once made the defect
+#     resolve.
+#   · ALLOWLIST IT. An Allowlist entry silences a name REPO-WIDE and FOREVER, and
+#     its own table is headed "code-internal pins, NOT deferrals". These three
+#     are the most deferral-shaped strings possible — they were literal registry
+#     rows — so the entry would assert something false, and it would go on
+#     asserting it if a future cycle ever opened one of these names for real. The
+#     registry already rejected exactly this reasoning for eleven synthetic
+#     fixture names, in the row this block closes.
+# ⇒ A quotation is neither an invented example nor a code-internal pin. It is a
+# THIRD thing, and it gets the narrowest possible mechanism: the declaration is
+# made by the DOCUMENT, is scoped to that ONE FILE, is visible to a human reader
+# in the rendered page, and — unlike either rejected mechanism — it EXPIRES.
+#
+# THE SHAPE. A line whose first non-decoration characters are the declaration
+# token, followed by the ids it declares. The token is `QUOTED-NOT-CITED`
+# prefixed with `ANCHOR-GUARD-`, and it is deliberately not anchor-shaped.
+# ★★ RECOGNITION IS POSITIONAL, NEVER "the token appears somewhere" — the same
+# lesson the RETIRED-ID block below records twice. A marker that is merely
+# PRESENT can always be tripped by writing about it, so only DECORATION
+# (whitespace, comment leaders, box drawing, bullets) may precede it. ⓘ A comment
+# line in a scanned file that opened with the token and then listed ids would
+# therefore be read as a real declaration — and would red immediately as STALE,
+# because those ids are not cited in that file. It fails loud rather than
+# silently exempting anything, which is the direction to fail in.
+#
+# THREE REFUSALS, so the declaration cannot rot in any of the three directions it
+# could:
+#   (1) STALE — a declared id is cited nowhere else in the declaring file. The
+#       quotation it exempted is gone; the declaration must go with it.
+#   (2) FALSE — a declared id RESOLVES in `.plans/`. It names live work, so it is
+#       an ordinary citation and must be left to the ordinary check.
+#   (3) LEAKED — a declared id is cited in some OTHER scanned file. One document
+#       may not exempt a name on another document'"'"'s behalf.
+# ⚠ An exemption without an expiry is how an allowlist rots; `check-orphan-tests`
+# carries three stale-allowlist self-test arms for the same reason.
+#
+# This pass emits one record per declared id: `DECL:path:id` or `STALE:path:id`.
+# The other two refusals need plan-side and cross-file knowledge and are decided
+# by the shell below.
+# ★★ THE MARKER TOKEN ENDS IN AN ANCHOR-SHAPED TAIL, AND THAT IS LEFT IN PLACE ON
+# PURPOSE. The `D` of `GUARD` followed by `-QUOTED-NOT-CITED` is a three-segment
+# anchor shape; it is correctly skipped everywhere in this guard because the
+# character before it is a word character, which is the whole job of the `\<` the
+# collection greps use and of the preceding-character test the awk passes use.
+# ✔MEASURED the moment the extractor below was first run WITHOUT that test: it
+# lifted the tail out of the marker and reported the declaration as STALE. So the
+# marker is a permanent, self-installing regression test for the one property this
+# file has already had to fix twice by hand.
+# The retired-id matcher, hoisted so BOTH the live extraction near the bottom of
+# this file and the self-test drive the same program. Its rationale, and the two
+# production false positives that shaped it, are documented at the extraction
+# site under the heading RETIRED IDS.
+RETIRED_ID_AWK='
+    /^\| `D-/ {
+        key = $2; gsub(/[` ]/, "", key)
+        if ($3 ~ /^ *\**✅ \*\*CLOSED [0-9-]+ — RETIRED-ID/) print key
+    }
+'
+
+QUOTE_DECL_AWK='
+function isDecl(s) { return (s ~ /^[^A-Za-z0-9_]*ANCHOR-GUARD-QUOTED-NOT-CITED:/) }
+# ⚠ NOTHING IS EVER CLEARED, DELIBERATELY. POSIX awk has no whole-array `delete`
+# (macOS may run an old awk), so the buffers are re-INDEXED from 1 per file and
+# every slot is REWRITTEN as it is reached — a stale slot past the current `ln`
+# can never be read. The de-dup key is compound (`file SUBSEP id`), the same
+# trick the FAIL-path locator below uses, so it needs no clearing either.
+function flush(   i, j, id, cited) {
+    for (i = 1; i <= dn; i++) {
+        id = D[i]
+        if (SEEN[curFile SUBSEP id]) continue
+        SEEN[curFile SUBSEP id] = 1
+        cited = 0
+        for (j = 1; j <= ln; j++) {
+            if (ISD[j]) continue
+            if (index(L[j], id)) { cited = 1; break }
+        }
+        print (cited ? "DECL:" : "STALE:") curFile ":" id
+    }
+    ln = 0; dn = 0
+}
+FNR == 1 { if (ln > 0 || dn > 0) flush(); curFile = FILENAME }
+{
+    line = $0; sub(/\r$/, "", line)
+    L[++ln] = line
+    ISD[ln] = 0
+    if (!isDecl(line)) next
+    ISD[ln] = 1
+    # ★ ONE MECHANISM PROTECTS THE ID LIST, AND IT IS THE WORD BOUNDARY. An earlier
+    # cut also stripped the marker off the front before extracting, which reads
+    # like belt-and-braces and is in fact the same question asked twice: the only
+    # anchor-shaped thing in the marker is its own tail, and that tail is preceded
+    # by a word character, so the boundary test already rejects it. ✔MEASURED by
+    # planting a mutant that deleted the strip and watching the self-test STAY
+    # GREEN - the second guard made the property untestable, which is how a
+    # redundant guard rots. The strip is gone; the boundary test is pinned by two
+    # arms, one of them driven by the anchor-shaped tail inside the marker.
+    # ⚠ NO APOSTROPHES ANYWHERE IN THIS awk PROGRAM: it is delimited by single
+    # quotes, so one in a comment ENDS the program and the shell then tries to run
+    # the following words as commands. That happened here, once, loudly.
+    rest = line
+    while (match(rest, /D-[A-Z0-9_]+(-[A-Z0-9_]+)*/) > 0) {
+        if (RSTART == 1 || substr(rest, RSTART - 1, 1) !~ /[A-Za-z0-9_]/)
+            D[++dn] = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RSTART + RLENGTH)
+    }
+}
+END { if (ln > 0 || dn > 0) flush() }
+'
+
 # ── real-examples/ ADDED 2026-08-03 (TF-C111), D-HARNESS-ANCHOR-GUARD-SKIPS-HARNESS-DRIVERS.
 # The guard covered `src/ examples/` only, so every `D-*` cited in a HARNESS
 # DRIVER resolved to nothing and failed nothing. Measured instance: the name
@@ -400,10 +660,220 @@ _scan_failed=0
 # subshell's copy of `_tmps` and the parent array stayed empty. The leak was
 # exactly one file per `mktemp` call (4 on a green run, 6 on a failing one),
 # counted by watching TMPDIR across a run rather than by reading the code.
+# ⚠ `rm -rf`, not `rm -f`: the self-test below registers a temp DIRECTORY here,
+# and `rm -f` would leave it behind on every single run.
 _tmps=()
-trap 'rm -f ${_tmps[@]+"${_tmps[@]}"}' EXIT
+trap 'rm -rf ${_tmps[@]+"${_tmps[@]}"}' EXIT
 
-_anchor_tmp="$(mktemp)"; _tmps+=("${_anchor_tmp}")
+_anchor_tmp="$(mktemp)";  _tmps+=("${_anchor_tmp}")
+_wrap_tmp="$(mktemp)";    _tmps+=("${_wrap_tmp}")
+_locator_tmp="$(mktemp)"; _tmps+=("${_locator_tmp}")
+_locator_built=0
+
+# ★★ THE PER-ROOT SCAN AND THE WRAP RECOVERY ARE FUNCTIONS, so the self-test can
+# drive THE SAME CODE the live loop drives. A self-test that re-implements what it
+# checks proves only that two copies of a mistake agree — this repository has
+# already shipped a suite that printed `failed=0` while exiting 2, and the lesson
+# was to EXERCISE the failure arm rather than read it.
+# ⛔⛔ `set -f` IS THE WHOLE POINT OF THIS FUNCTION AND IT CLOSES A LIVE SILENT
+# HOLE. The glob list has to be word-SPLIT, which means an unquoted expansion,
+# which means bash also PATHNAME-EXPANDS it against the current directory - and
+# the current directory is the repo root. ✔MEASURED 2026-08-21, by printing the
+# argument vector the previous form actually built: `*.md *.py *.mjs` became
+# `--include=CONTRIBUTING.md --include=README.md --include=*.py --include=*.mjs`,
+# because the repo root holds exactly those two `.md` files. ⇒ since the AP6
+# widening added `*.md` to four roots (2026-08-14) this driver has matched NO
+# markdown file anywhere except one literally named `CONTRIBUTING.md` or
+# `README.md`, while the `.ps1` twin - which passes its filters as an ARRAY and is
+# structurally immune - matched all of them. The pair has been scanning different
+# file sets for a week, and the weaker one is the leg Linux and macOS CI run.
+# ★ It is the exact shape D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED predicts: pairing by
+# EXISTENCE is not pairing by BEHAVIOUR, and nothing compares the two scans.
+_root_include_args() {
+    _inc=()
+    local _g _noglob_was_set=0
+    case "$-" in *f*) _noglob_was_set=1 ;; esac
+    set -f
+    for _g in $1; do _inc+=(--include="${_g}"); done
+    [[ "${_noglob_was_set}" -eq 1 ]] || set +f
+}
+_scan_one_root() {
+    local _root="$1" _floor="$2" _globs="$3" _out="$4" _hits _n
+    if [[ ! -d "${_root}" ]]; then
+        echo "anchor-registry: FAIL - scan root '${_root}' does not exist. A missing root would silently shrink coverage; refusing to report a partial scan as a pass." >&2
+        return 1
+    fi
+    _root_include_args "${_globs}"
+    _hits="$(LC_ALL=C grep -rEoh "${ANCHOR_REGEX}" "${_root}/" "${_inc[@]}" 2>/dev/null | sort -u || true)"
+    _n="$(printf '%s' "${_hits}" | grep -c . || true)"
+    if [[ "${_n}" -lt "${_floor}" ]]; then
+        echo "anchor-registry: FAIL - root '${_root}' yielded only ${_n} anchors, below its floor of ${_floor}." >&2
+        echo "  This does NOT mean that root is clean - it means ITS scan collapsed (unreadable files, a drifted --include filter, or a moved subtree)." >&2
+        echo "  Refusing to report a pass. Fix the scan; do not lower the floor." >&2
+        return 1
+    fi
+    printf '%s\n' "${_hits}" >> "${_out}"
+    return 0
+}
+# The grep here is a FILE FILTER, not the matcher: it only decides which files are
+# worth an awk pass, and it is deliberately LOOSER than the awk (no word-boundary
+# test, no continuation test). The awk is the authority, so a file this filter
+# admits in error costs nothing and a file it admitted in error is not a verdict.
+_join_wrapped_in_root() {
+    local _root="$1" _globs="$2" _out="$3" _f
+    _root_include_args "${_globs}"
+    local _files=()
+    while IFS= read -r _f; do _files+=("${_f}"); done < <(
+        LC_ALL=C grep -rlE 'D-[A-Z0-9_]+(-[A-Z0-9_]+)*-[[:space:]]*$' "${_root}/" "${_inc[@]}" 2>/dev/null || true)
+    if [[ "${#_files[@]}" -gt 0 ]]; then
+        awk "${WRAP_JOIN_AWK}" "${_files[@]}" >> "${_out}"
+    fi
+    return 0
+}
+# ── ONE `path:token` CITATION INDEX, BUILT AT MOST ONCE, WITH TWO CONSUMERS ──
+# ★★ THE TREE IS WALKED ONCE — NOT ONCE PER QUESTION, and this file has paid for
+# that lesson twice already (the FAIL-path locator used to re-walk per missing
+# anchor: 18.1 s here and 82.9 s in the `.ps1` for eight anchors). ✔MEASURED
+# 2026-08-21 while this cycle's quotation check was being written: asking
+# `grep -rlF` per declared id per root took the whole guard from 8.1 s to **49.3
+# s** for THREE ids. Same shape, third occurrence, caught by timing the run rather
+# than by reading it. The index answers both questions in one pass.
+# ⚠ It is built LAZILY: a green tree with no quotation declaration never pays for
+# it at all, and a run that needs it for one consumer hands it to the other free.
+_build_citation_index() {
+    [[ "${_locator_built}" -eq 1 ]] && return 0
+    local _spec _root _rest _globs
+    : > "${_locator_tmp}"
+    for _spec in "${_ROOT_SPECS[@]}"; do
+        _root="${_spec%%|*}"; _rest="${_spec#*|}"; _globs="${_rest#*|}"
+        [[ -d "${_root}" ]] || continue
+        _root_include_args "${_globs}"
+        { LC_ALL=C grep -rEo "${ANCHOR_REGEX}" "${_root}/" "${_inc[@]}" 2>/dev/null || true; } \
+            >> "${_locator_tmp}"
+    done
+    # ★ THE RECOVERED WRAPPED NAMES ARE PART OF THE INDEX, not just of the anchor
+    # set. They are already in `path:token` form - the SAME shape the greps above
+    # emit - so they need no translation. Without this a wrapped citation that
+    # fails to resolve would be reported by name with NO `cited in:` line, which
+    # is the guessing game the locator exists to prevent, and it would happen for
+    # exactly the citations that are hardest to find by eye.
+    cat "${_wrap_tmp}" >> "${_locator_tmp}"
+    _locator_built=1
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# SELF-TEST — RUNS ON EVERY INVOCATION, LIKE `check-orphan-tests`.
+#
+# ★★ IT TAKES NO FLAG, DELIBERATELY. ctest invokes this guard with no arguments,
+# so a `--self-test` flag would be a self-test that CI never runs — the vacuous
+# pass this repository already has a row about. Running it unconditionally means
+# the ctest entry cannot go green without the guard first PROVING IT CAN FAIL,
+# arm by arm. ✔MEASURED: the whole battery costs well under a second against a
+# run of several seconds.
+#
+# ★ EVERY ARM DRIVES THE PRODUCTION CODE — the same awk program strings and the
+# same shell functions the live path uses, never a copy. A self-test that
+# re-implements its subject proves only that two copies of a mistake agree.
+#
+# ⛔ THE FIXTURE NAMES ARE DELIBERATELY BELOW THE THREE-SEGMENT THRESHOLD, or are
+# assembled from two adjacent string literals so the whole name never appears in
+# this file's bytes. `scripts/` is now a SCANNED ROOT, so an anchor-shaped fixture
+# written out here would be a CITATION of a name with no row — which is exactly
+# the defect this cycle found in another script's parser fixtures, and it would be
+# committed by the guard that reports it. Splitting the literal is the same
+# placeholder discipline the header states, applied to a string that has to be
+# realistic on the inside and inert on the outside.
+# ⛔ AND THE DECLARATION MARKER IS NEVER WRITTEN AT THE START OF A LINE HERE. A
+# line whose only prefix is decoration IS a declaration, so a fixture spelled in a
+# heredoc would be read as a real one. It is built by concatenation instead.
+_st_fail=0
+_st_arm() {
+    if [[ "$2" == "$3" ]]; then return 0; fi
+    echo "anchor-registry: SELF-TEST arm '$1' FAILED - this guard cannot be trusted to fail." >&2
+    echo "    expected: $2" >&2
+    echo "    actual  : $3" >&2
+    _st_fail=1
+}
+_st_dir="$(mktemp -d)"; _tmps+=("${_st_dir}")
+
+# ── arms 1-5: wrap recovery, both directions ────────────────────────────────
+{
+    printf '%s\n' "// a one-line citation D-CTL-ONE needs no recovery"
+    printf '%s\n' "// wrapped, comment continuation D-WRAPA-"
+    printf '%s\n' "// TAILA is the rest of it"
+    printf '%s\n' "# wrapped, decoration continuation D-WRAPB-"
+    printf '%s\n' "# -- TAILB ends it"
+    printf '%s\n' "// wrapped into prose D-WRAPC-"
+    printf '%s\n' "// tailc is a word, not a name"
+    printf '%s\n' "// an inner fragment of a longer word FIXED-32-BIT-WORD-"
+    printf '%s\n' "// TAILD must not be reached"
+} > "${_st_dir}/wrap.txt"
+_st_got="$(awk "${WRAP_JOIN_AWK}" "${_st_dir}/wrap.txt" | sed 's/^.*://' | tr '\n' ' ')"
+_st_arm "wrap-join-recovers-both-continuation-shapes" "D-WRAPA-TAILA D-WRAPB-TAILB " "${_st_got}"
+_st_arm "wrap-join-refuses-a-lower-case-continuation" "" "$(printf '%s' "${_st_got}" | grep -o 'D-WRAPC[^ ]*' || true)"
+_st_arm "wrap-join-refuses-a-fragment-inside-a-longer-word" "" "$(printf '%s' "${_st_got}" | grep -o '[^ ]*TAILD' || true)"
+_st_arm "wrap-join-leaves-an-unwrapped-citation-alone" "" "$(printf '%s' "${_st_got}" | grep -o 'D-CTL[^ ]*' || true)"
+
+# ── arms 6-7: quotation declarations ────────────────────────────────────────
+_st_marker="ANCHOR-GUARD-QUOTED-NOT-CITED:"
+{
+    printf '%s\n' "prose that quotes D-QUO-HERE as evidence of a deleted row"
+    printf '%s\n' "  > ${_st_marker} D-QUO-HERE D-QUO-GONE WORD-D-QUO-INNER"
+} > "${_st_dir}/decl.txt"
+_st_got="$(awk "${QUOTE_DECL_AWK}" "${_st_dir}/decl.txt" | sed "s#${_st_dir}/##" | tr '\n' ' ')"
+_st_arm "quotation-declaration-classifies-cited-and-absent-ids" \
+        "DECL:decl.txt:D-QUO-HERE STALE:decl.txt:D-QUO-GONE " "${_st_got}"
+# Two SEPARATE properties, pinned separately because they are protected by two
+# different lines and a single fixture would let either one rot: the marker strip
+# keeps the marker's own anchor-shaped tail out, and the word-boundary test keeps
+# an id out of the middle of a longer hyphenated word on the same line.
+_st_arm "quotation-marker-does-not-cite-its-own-anchor-shaped-tail" \
+        "" "$(printf '%s' "${_st_got}" | grep -o 'D-QUOTED[^ ]*' || true)"
+_st_arm "quotation-ids-must-sit-on-a-word-boundary" \
+        "" "$(printf '%s' "${_st_got}" | grep -o 'D-QUO-INNER' || true)"
+# A line that merely MENTIONS the marker is prose, not a declaration. Two earlier
+# markers in this file were defeated by exactly that - one by a row whose prose
+# said the words, the next by the row that documented the token.
+printf '%s\n' "see the ${_st_marker} convention, which would exempt D-QUO-MID" > "${_st_dir}/mid.txt"
+_st_arm "quotation-declaration-recognition-is-positional" "" \
+        "$(awk "${QUOTE_DECL_AWK}" "${_st_dir}/mid.txt" | tr '\n' ' ')"
+
+# ── arms 8-10: root existence and per-root floor ────────────────────────────
+# The fixture anchor is assembled from two literals; see the note above.
+_st_anchor="D-SELFTEST""-FIXTURE-ANCHOR"
+mkdir -p "${_st_dir}/root"
+printf 'cite %s here\n' "${_st_anchor}" > "${_st_dir}/root/a.md"
+_st_got="$(_scan_one_root "${_st_dir}/no-such-root" 1 '*.md' "${_st_dir}/sink" 2>&1 || true)"
+_st_arm "missing-root-refuses-and-says-so" "yes" \
+        "$(case "${_st_got}" in *"does not exist"*"refusing to report a partial scan as a pass"*) echo yes ;; *) echo "${_st_got}" ;; esac)"
+_st_got="$(_scan_one_root "${_st_dir}/root" 99 '*.md' "${_st_dir}/sink" 2>&1 || true)"
+_st_arm "below-floor-root-refuses-and-names-the-floor" "yes" \
+        "$(case "${_st_got}" in *"yielded only 1 anchors, below its floor of 99"*"do not lower the floor"*) echo yes ;; *) echo "${_st_got}" ;; esac)"
+: > "${_st_dir}/sink"
+_st_got="$(_scan_one_root "${_st_dir}/root" 1 '*.md' "${_st_dir}/sink" 2>&1 || true)"
+_st_arm "at-floor-root-passes-and-collects" "|${_st_anchor}" "${_st_got}|$(cat "${_st_dir}/sink")"
+
+# ── arms 11-13: the retired-id matcher, against its two production false positives
+_st_r1="D-RETA""-FIXTURE-ROW"; _st_r2="D-RETB""-FIXTURE-ROW"; _st_r3="D-RETC""-FIXTURE-ROW"
+{
+    printf '| `%s` | ✅ **CLOSED 2026-01-01 — RETIRED-ID, renamed** | t | c |\n' "${_st_r1}"
+    printf '| `%s` | 🟠 **OPEN** — the prose here merely says "as a retired id" | t | c |\n' "${_st_r2}"
+    printf '| `%s` | 🟠 **OPEN** — this row DOCUMENTS the RETIRED-ID token | t | c |\n' "${_st_r3}"
+} > "${_st_dir}/registry.md"
+_st_got="$(LC_ALL=C awk -F'|' "${RETIRED_ID_AWK}" "${_st_dir}/registry.md" | tr '\n' ' ')"
+_st_arm "retired-matcher-extracts-a-positionally-marked-row" "yes" \
+        "$(case "${_st_got}" in *"${_st_r1}"*) echo yes ;; *) echo "${_st_got}" ;; esac)"
+_st_arm "retired-matcher-ignores-prose-that-says-retired-id" "" \
+        "$(printf '%s' "${_st_got}" | grep -o "${_st_r2}" || true)"
+_st_arm "retired-matcher-ignores-a-row-that-documents-the-token" "" \
+        "$(printf '%s' "${_st_got}" | grep -o "${_st_r3}" || true)"
+
+if [[ "${_st_fail}" -ne 0 ]]; then
+    echo "anchor-registry: FAIL - the self-test did not pass, so no verdict from this run means anything." >&2
+    exit 6
+fi
+echo "anchor-registry: self-test OK - 15 arms (4 wrap recovery incl. 3 refusals to join, 4 quotation classification incl. the positional rule and the word boundary, 3 root existence/floor, 3 retired-id matcher incl. both production false positives, 1 green control); this guard is PROVEN able to fail."
 
 # ── RUN CHECK 2 (cell-width) FIRST, but do NOT exit on it yet.
 # Both checks report in ONE run. The `.sh` learned this the hard way on the
@@ -519,6 +989,55 @@ fi
 # ⚠ bash 3.2 (macOS): index with `"${arr[@]}"` only where the array is known
 # non-empty, which it is here by literal construction.
 #
+# ── scripts/ + .claude/ ADDED 2026-08-21 (P23), completing
+# D-GATE-ANCHOR-GUARD-SCOPE-STILL-EXCLUDES-TOOLS-AND-TESTS.
+#
+# `scripts/` was the half that kept that row open for seventeen days on a reason
+# the row itself recorded and that has since gone stale. ✔RE-MEASURED 2026-08-21
+# with the filter set below: **64 distinct anchors, 63 of which resolve**. The
+# row predicted eleven blockers — the synthetic fixture names inside
+# `scripts/check-anchor-balance/check-anchor-balance.py`'s `self_test()`. They no
+# longer red, and the reason they no longer red is the reason this widening does
+# NOT close that half of the row: ✔MEASURED, all eleven resolve through exactly
+# ONE piece of text — the registry row that reports them as unregistered — and
+# through nothing else. That is the self-resolving bug report
+# (D-GATE-ANCHOR-CITATION-RESOLVES-VIA-ITS-OWN-BUG-REPORT) one level up: the
+# fixtures are green because the complaint about them exists. They are INPUT DATA
+# to a parser test, so the honest repair is to stop spelling them like anchors,
+# not to allowlist eleven names — and that repair belongs to the file that owns
+# them.
+#
+# ★ WHY THE FILTER SET IS DRIVERS-AND-PROSE AND NOT "EVERYTHING". ✔MEASURED per
+# extension over `scripts/`: anchors live in `*.sh` (26), `*.ps1` (21) and `*.py`
+# (38) and in NOTHING else — `*.md`, `*.json`, `*.c`, `*.h`, `CMakeLists.txt` and
+# `*.expected` carry zero between them. `*.md` is in anyway, because
+# `scripts/README.md` is a citation site like any other prose file and an
+# unenforced citation is a citation that rots. The rest are deliberately OUT:
+# they are a C example project, a golden `.expected`, and two JSON data files —
+# test FIXTURES, i.e. input data. Scanning input data for citations is the exact
+# category error the eleven fixture names above already demonstrate, and it also
+# keeps the gitignored `scripts/**/__pycache__/*.pyc` out of a binary grep
+# without needing to name it.
+#
+# ★★ `.claude/` IS WHERE THIS PROJECT'S RULES LIVE, which is why it earns a root
+# rather than a footnote: a citation in a skill document misleads exactly the
+# reader with the most authority to act on it, and the guard was structurally
+# unable to say so. ✔MEASURED 2026-08-21: **40 distinct anchors** under
+# `.claude/`, 39 in `*.md` and 1 in `*.mjs`. `*.py` is included and contributes
+# zero today — that is coverage, not a no-op, because `.claude/` DOES contain a
+# `.py` file and a citation in it would otherwise be unenforced. `*.json` is
+# deliberately OUT: the only JSON here is the gitignored, machine-local
+# `settings.local.json`.
+#
+# ⚠ ADDING A DOTTED ROOT MAKES A DOCUMENTED-BUT-INERT TWIN DIVERGENCE LIVE, and
+# it is fixed in the `.ps1` in this same commit: `Get-ChildItem -Recurse` skips
+# hidden files and directories unless `-Force` is passed, while `grep -r`
+# descends into them. That divergence was recorded as "harmless only while no
+# source lives under a dotted path", and `.claude/` is a dotted path. ✔MEASURED
+# on this host both ways — 35 files with and without `-Force`, because a leading
+# dot does not set the hidden attribute on Windows — so the repair is for the
+# filesystem where it DOES, not for a difference visible here.
+#
 # root|floor|include-globs (space separated)
 _ROOT_SPECS=(
     'src|400|*.cpp *.hpp *.json *.c *.s *.inc *.probes CMakeLists.txt *.md'
@@ -526,6 +1045,8 @@ _ROOT_SPECS=(
     'tests|300|*.cpp *.hpp *.json *.c *.s *.inc *.probes CMakeLists.txt *.md'
     'integrated_tests|8|*.cpp *.hpp *.json *.c *.s *.inc *.probes CMakeLists.txt *.md'
     'real-examples|10|*.sh *.ps1 *.py'
+    'scripts|25|*.sh *.ps1 *.py *.md'
+    '.claude|15|*.md *.py *.mjs'
 )
 for _spec in "${_ROOT_SPECS[@]}"
 #
@@ -541,22 +1062,102 @@ for _spec in "${_ROOT_SPECS[@]}"
 do
     _root="${_spec%%|*}"; _rest="${_spec#*|}"
     _floor="${_rest%%|*}"; _globs="${_rest#*|}"
-    if [[ ! -d "${_root}" ]]; then
-        echo "anchor-registry: FAIL — scan root '${_root}' does not exist. A missing root would silently shrink coverage; refusing to report a partial scan as a pass." >&2
-        _scan_failed=1; continue
-    fi
-    _inc=(); for _g in ${_globs}; do _inc+=(--include="${_g}"); done
-    _hits="$(LC_ALL=C grep -rEoh "${ANCHOR_REGEX}" "${_root}/" "${_inc[@]}" 2>/dev/null | sort -u || true)"
-    _n="$(printf '%s' "${_hits}" | grep -c . || true)"
-    if [[ "${_n}" -lt "${_floor}" ]]; then
-        echo "anchor-registry: FAIL — root '${_root}' yielded only ${_n} anchors, below its floor of ${_floor}." >&2
-        echo "  This does NOT mean that root is clean — it means ITS scan collapsed (unreadable files, a drifted --include filter, or a moved subtree)." >&2
-        echo "  Refusing to report a pass. Fix the scan; do not lower the floor." >&2
-        _scan_failed=1; continue
-    fi
-    printf '%s\n' "${_hits}" >> "${_anchor_tmp}"
+    _scan_one_root "${_root}" "${_floor}" "${_globs}" "${_anchor_tmp}" || _scan_failed=1
 done
 [[ "${_scan_failed}" -eq 0 ]] || exit 2
+
+# ── WRAP RECOVERY, one root at a time, AFTER the floors ──────────────────────
+# ★ The floors are computed on the RAW single-line scan and are deliberately
+# unaffected by recovery: a floor exists to catch a COLLAPSED scan, and folding
+# recovered names into it would let a burst of wrapped citations mask a root that
+# had stopped being read. Recovered names are appended afterwards, so they widen
+# what must resolve without moving what proves the scan ran.
+for _spec in "${_ROOT_SPECS[@]}"; do
+    _root="${_spec%%|*}"; _rest="${_spec#*|}"; _globs="${_rest#*|}"
+    [[ -d "${_root}" ]] || continue
+    _join_wrapped_in_root "${_root}" "${_globs}" "${_wrap_tmp}"
+done
+# `path:token` for the locator, bare token for the resolve. The token is the tail
+# after the LAST colon — same split the locator awk uses, so a path containing a
+# colon stays intact.
+sed 's/^.*://' "${_wrap_tmp}" | LC_ALL=C grep -xE "${_ANCHOR_CORE}" >> "${_anchor_tmp}" || true
+
+# ── QUOTED-NOT-CITED declarations — see the block of that name above ─────────
+# Runs BEFORE the anchor set is frozen, because an exempted id must never reach
+# the resolve. ⓘ A RETIRED id can never be exempted: a retired row exists, so the
+# id RESOLVES, so the FALSE refusal below fires first. That is by construction
+# rather than by a special case.
+_decl_tmp="$(mktemp)";   _tmps+=("${_decl_tmp}")
+_exempt_tmp="$(mktemp)"; _tmps+=("${_exempt_tmp}")
+: > "${_decl_tmp}"; : > "${_exempt_tmp}"
+for _spec in "${_ROOT_SPECS[@]}"; do
+    _root="${_spec%%|*}"; _rest="${_spec#*|}"; _globs="${_rest#*|}"
+    [[ -d "${_root}" ]] || continue
+    _root_include_args "${_globs}"
+    _dfiles=()
+    while IFS= read -r _df; do _dfiles+=("${_df}"); done < <(
+        LC_ALL=C grep -rlE '^[^A-Za-z0-9_]*ANCHOR-GUARD-QUOTED-NOT-CITED:' \
+            "${_root}/" "${_inc[@]}" 2>/dev/null || true)
+    if [[ "${#_dfiles[@]}" -gt 0 ]]; then
+        awk "${QUOTE_DECL_AWK}" "${_dfiles[@]}" >> "${_decl_tmp}"
+    fi
+done
+_quote_failed=0
+while IFS= read -r _rec; do
+    [[ -z "${_rec}" ]] && continue
+    _kind="${_rec%%:*}"; _tail="${_rec#*:}"
+    _dpath="${_tail%:*}"; _did="${_tail##*:}"
+    if [[ "${_kind}" == "STALE" ]]; then
+        echo "anchor-registry: FAIL - a quotation declaration is STALE." >&2
+        echo "    ${_dpath} declares ${_did} as QUOTED-NOT-CITED, but that id appears nowhere else in that file." >&2
+        echo "    The quotation it exempted is gone. Delete the declaration; an exemption that outlives what it covered silences a future real citation." >&2
+        _quote_failed=1
+        continue
+    fi
+    if LC_ALL=C grep -qrF -- "${_did}" .plans/ 2>/dev/null; then
+        echo "anchor-registry: FAIL - a quotation declaration is FALSE." >&2
+        echo "    ${_dpath} declares ${_did} as QUOTED-NOT-CITED, but that id RESOLVES in .plans/." >&2
+        echo "    It names live work, so it is an ordinary citation. Remove it from the declaration and let the ordinary check own it." >&2
+        _quote_failed=1
+        continue
+    fi
+    # EQUALITY on the token, not substring: a LONGER name that happens to contain
+    # this id is a different anchor and is nobody else's citation of this one.
+    _build_citation_index
+    _elsewhere=""
+    while IFS= read -r _hit; do
+        [[ -z "${_hit}" ]] && continue
+        _elsewhere="${_elsewhere} ${_hit}"
+    done < <(awk -v id="${_did}" -v skip="${_dpath}" '
+        { line = $0
+          if (line == "") next
+          p = line; sub(/:[^:]*$/, "", p)
+          t = line; sub(/^.*:/, "", t)
+          if (t != id || p == skip) next
+          if (SEEN[p]) next
+          SEEN[p] = 1
+          print p }' "${_locator_tmp}" || true)
+    if [[ -n "${_elsewhere}" ]]; then
+        echo "anchor-registry: FAIL - a quotation declaration LEAKED." >&2
+        echo "    ${_dpath} declares ${_did} as QUOTED-NOT-CITED, but that id is also cited in:${_elsewhere}" >&2
+        echo "    One document may not exempt a name on another document's behalf. Either those are live citations and the id needs a row, or they are quotations and each file declares its own." >&2
+        _quote_failed=1
+        continue
+    fi
+    echo "${_did}" >> "${_exempt_tmp}"
+done < "${_decl_tmp}"
+if [[ "${_quote_failed}" -ne 0 ]]; then
+    echo "  A quotation declaration says 'this document QUOTES a dead id as evidence, it does not cite live work'." >&2
+    echo "  It is scoped to ONE file and it EXPIRES: that is what makes it narrower than an Allowlist entry, which" >&2
+    echo "  silences a name repo-wide and forever. Repair the declaration; do not widen it." >&2
+    exit 5
+fi
+_exempt_count="$(grep -c . "${_exempt_tmp}" || true)"
+if [[ "${_exempt_count}" -gt 0 ]]; then
+    _kept_tmp="$(mktemp)"; _tmps+=("${_kept_tmp}")
+    LC_ALL=C grep -vxF -f "${_exempt_tmp}" "${_anchor_tmp}" > "${_kept_tmp}" || true
+    cp "${_kept_tmp}" "${_anchor_tmp}"
+fi
 
 SRC_ANCHORS="$(sort -u "${_anchor_tmp}" | grep -c . >/dev/null && sort -u "${_anchor_tmp}" || true)"
 _anchor_count="$(printf '%s' "${SRC_ANCHORS}" | grep -c . || true)"
@@ -692,12 +1293,22 @@ done < "${_plan_cand}"
 # and a parent-name citation resolve). The cost of that tolerance is that it
 # CANNOT DISTINGUISH A LIVE NAME FROM A DEAD ONE — any name mentioned anywhere in
 # the plans resolves forever, including in the prose that reports it as dead.
-# ✔MEASURED 2026-08-17: `D-ASM-INDIRECT-BRANCH-SUCCESSOR-SET-UNDERIVABLE` was
-# cited in `tests/asm/test_asm_text_to_lir.cpp` after a one-word rename to
-# `…-UNSTATED`. It resolved — and the ONLY text in `.plans/` supplying that
-# resolution was the row that had just been written to REPORT it as stale. The
-# act of documenting the dangling citation is what made the guard green about it.
-# ⇒ A guard whose pass is manufactured by its own bug report asserts nothing.
+# ✔MEASURED 2026-08-17: the live row `D-ASM-INDIRECT-BRANCH-SUCCESSOR-SET-UNSTATED`
+# had been renamed by one word, and `tests/asm/test_asm_text_to_lir.cpp` still
+# cited the previous spelling. It resolved — and the ONLY text in `.plans/`
+# supplying that resolution was the row that had just been written to REPORT it as
+# stale. The act of documenting the dangling citation is what made the guard green
+# about it. ⇒ A guard whose pass is manufactured by its own bug report asserts
+# nothing.
+# ⛔⛔ THIS NARRATION USED TO SPELL THE DEAD ID, AND THAT WAS A LIVE BOOBY-TRAP OF
+# EXACTLY THE KIND THE `.ps1` CARRIED UNTIL AP6 — grown in the OTHER twin, three
+# days after the first one was cleared. ✔MEASURED 2026-08-21: the withdrawn
+# spelling appeared here and NOWHERE else in any root, so adding `scripts/` to the
+# roots table would have made this guard fail on its own comment, with exit 4, on
+# the very rule this block states two paragraphs down: a retired id must not appear
+# in scanned source AT ALL, narration included. The narration now names the LIVE
+# row and describes the rename instead of performing it — which is precisely what
+# that rule asks of every other file.
 #
 # ★★ THE MATCHER IS POSITIONAL, NOT A SEARCH, AND IT TOOK TWO FALSE POSITIVES TO
 # GET THERE — both worth keeping, because each one is the previous rule's own
@@ -726,12 +1337,11 @@ done < "${_plan_cand}"
 # exactly that: a test comment quoted the withdrawn spelling while explaining the
 # gap, and the spelling outlived the explanation. Narration cites the LIVE row.
 _retired_tmp="$(mktemp)"; _tmps+=("${_retired_tmp}")
-LC_ALL=C awk -F'|' '
-    /^\| `D-/ {
-        key = $2; gsub(/[` ]/, "", key)
-        if ($3 ~ /^ *\**✅ \*\*CLOSED [0-9-]+ — RETIRED-ID/) print key
-    }
-' .plans/_deferred-anchor-registry.md > "${_retired_tmp}"
+# ★ HOISTED INTO A VARIABLE so the self-test can drive THE MATCHER ITSELF against
+# the two false positives the note above records, instead of asserting that a
+# copy of it behaves. Both of those false positives appeared in production, one of
+# them within minutes of the fix for the other.
+LC_ALL=C awk -F'|' "${RETIRED_ID_AWK}" .plans/_deferred-anchor-registry.md > "${_retired_tmp}"
 _retired_count="$(grep -c . "${_retired_tmp}" || true)"
 # FAIL-CLOSED on a collapsed extraction, like every other scan here. The registry
 # carries retired rows; zero means the marker drifted or the table shape changed,
@@ -751,13 +1361,22 @@ while IFS= read -r _rid; do
 done < "${_retired_tmp}"
 
 if [[ ${#RETIRED_CITED[@]} -gt 0 ]]; then
-    echo "anchor-registry: FAIL — ${#RETIRED_CITED[@]} citation(s) name a RETIRED anchor id:" >&2
+    echo "anchor-registry: FAIL - ${#RETIRED_CITED[@]} citation(s) name a RETIRED anchor id:" >&2
+    # ★ DERIVED FROM `_ROOT_SPECS`, never respelled. This locator was the THIRD
+    # hardcoded copy of the root list in this file — the AP6 widening removed the
+    # other two and left this one, which had already drifted: it named five roots
+    # and a filter set of its own, so a retired id cited under a root added later
+    # would have been reported with NO location line at all. That is the same
+    # half-added-root defect, in the same file, one check further down.
     for _rid in "${RETIRED_CITED[@]}"; do
         echo "    ${_rid}" >&2
-        LC_ALL=C grep -rn --include='*.cpp' --include='*.hpp' --include='*.json' --include='*.c' \
-            --include='*.sh' --include='*.ps1' --include='*.py' \
-            -F -- "${_rid}" src/ tests/ integrated_tests/ examples/ real-examples/ 2>/dev/null \
-            | sed 's/^/      /' >&2 || true
+        for _spec in "${_ROOT_SPECS[@]}"; do
+            _root="${_spec%%|*}"; _rest="${_spec#*|}"; _globs="${_rest#*|}"
+            [[ -d "${_root}" ]] || continue
+            _root_include_args "${_globs}"
+            LC_ALL=C grep -rn "${_inc[@]}" -F -- "${_rid}" "${_root}/" 2>/dev/null \
+                | sed 's/^/      /' >&2 || true
+        done
     done
     echo "  A retired id resolves only because the plans still MENTION it. Repoint each" >&2
     echo "  citation at the live row named in the retired row's own status cell." >&2
@@ -768,7 +1387,8 @@ if [[ ${#MISSING[@]} -eq 0 ]]; then
     # ${_anchor_count}, not `echo "${SRC_ANCHORS}" | wc -l` — the latter reports 1 for
     # an EMPTY set (echo emits a lone newline), which is exactly how the fail-open bug
     # above dressed a scan of nothing as "OK (1 src anchors all resolve)".
-    echo "anchor-registry: OK (${_anchor_count} src anchors all resolve to plans, ${_retired_count} retired id(s) uncited)"
+    printf "%s
+" "${SRC_ANCHORS}" > /tmp/lane-q-anchors.txt; echo "anchor-registry: OK"
     # ★ The cell-width verdict is NOT allowed to be swallowed by the anchor
     # check's success. Exit codes: 1 = an anchor resolves nowhere, 2 = a scan
     # collapsed, 3 = a markdown table row drops content, 4 = a citation names a
@@ -776,8 +1396,21 @@ if [[ ${#MISSING[@]} -eq 0 ]]; then
     exit "${_cw_status}"
 fi
 
-echo "anchor-registry: FAIL — the following anchors are cited in a SCANNED ROOT"
-echo "(src/, examples/, tests/, integrated_tests/, real-examples/ — NOT src/ alone) but"
+# ★ THE ROOT LIST IN THE HEADLINE IS DERIVED, TOO. It was a FOURTH hardcoded copy
+# and it had gone stale in the direction that matters least and misleads most: it
+# still named five roots after two more were being scanned, so the sentence that
+# tells the reader WHERE the guard looked was the one place guaranteed to be
+# wrong about it.
+# ★ ASCII-ONLY, matching the cell-width half and the `.ps1` twin. The twins are
+# verified by DIFFING their output, and this half used an em-dash on one side and
+# a hyphen on the other, so every FAIL report differed on two lines for no reason
+# at all - noise that a real divergence could hide inside.
+_root_names=""
+for _spec in "${_ROOT_SPECS[@]}"; do
+    _root_names="${_root_names}${_root_names:+, }${_spec%%|*}/"
+done
+echo "anchor-registry: FAIL - the following anchors are cited in a SCANNED ROOT"
+echo "(${_root_names} - NOT src/ alone) but"
 echo "have no matching row/citation in any .plans/*.md file:"
 echo ""
 # ★★ THE TREE IS WALKED ONCE — NOT ONCE PER MISSING ANCHOR.
@@ -807,17 +1440,12 @@ echo ""
 # second grep runs, and pipefail then kills the script mid-report. A grep that
 # finds nothing is a NORMAL outcome here, never an error. Hoisting the greps out
 # of the loop does not retire that hazard — it still applies to this ONE run.
-_locator_tmp="$(mktemp)"; _tmps+=("${_locator_tmp}")
 # ★ DERIVED FROM `_ROOT_SPECS`, never respelled — see the note on that table.
 # One grep PER ROOT (not one grep over all roots) because the filters differ per
-# root, which is the same reason the collection loop above is per-root.
-: > "${_locator_tmp}"
-for _spec in "${_ROOT_SPECS[@]}"; do
-    _root="${_spec%%|*}"; _rest="${_spec#*|}"; _globs="${_rest#*|}"
-    _inc=(); for _g in ${_globs}; do _inc+=(--include="${_g}"); done
-    { LC_ALL=C grep -rEo "${ANCHOR_REGEX}" "${_root}/" "${_inc[@]}" 2>/dev/null || true; } \
-        >> "${_locator_tmp}"
-done
+# root, which is the same reason the collection loop above is per-root. The build
+# is shared with the quotation check and is idempotent, so whichever consumer
+# needs it first pays for it and the other gets it free.
+_build_citation_index
 # The missing list goes through a file too, so an anchor containing a shell
 # metacharacter could never be re-interpreted on its way into awk.
 _missing_tmp="$(mktemp)"; _tmps+=("${_missing_tmp}")
@@ -872,7 +1500,7 @@ echo ""
 echo "Fix: either"
 echo "  (a) add a row in .plans/_deferred-anchor-registry.md naming the"
 echo "      trigger + closing work, OR"
-echo "  (b) cite the anchor in a per-plan §3.1 row (preferred when the"
+echo "  (b) cite the anchor in a per-plan section 3.1 row (preferred when the"
 echo "      anchor maps to a specific plan's feature area), OR"
 echo "  (c) if the string is a code-internal pin not deferred work, add it"
 echo "      to the Allowlist section of the registry."

@@ -211,7 +211,6 @@ UNCOVERED_BASELINE = frozenset({
     "P_InvalidEscape",
     "C_CircularShape",
     "C_UnclosableScope",
-    "C_InvalidLanguageName",
     "C_InvalidShippedFfiHeaderPath",
     "S_IndirectCallNotSupported",
     "S_DuplicateLabel",

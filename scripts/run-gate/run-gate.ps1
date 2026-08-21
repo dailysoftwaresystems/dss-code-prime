@@ -63,11 +63,67 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
+# ── WHICH SHELL IS ACTUALLY RUNNING THIS, NAMED IN EVERY REFUSAL ────────────
+#
+# ★★ A GATE THAT REFUSES MUST SAY WHICH REFUSAL IT IS -- the mirror of the same
+# block in run-gate.sh, added in the same commit for the same reason.
+#
+# ✔MEASURED 2026-08-20, and the .ps1 half was the WORSE of the two: given a
+# command it cannot resolve, `& $Command` raises a TERMINATING error, so this
+# script died before its own footer, left a ZERO-BYTE log, printed a raw
+# PowerShell "is not recognized as a name of a cmdlet" on the caller's console
+# instead of into the log, and exited **1** -- the exit code this wrapper
+# reserves for "ran, but produced no witness". The .sh twin reports the same
+# condition as **127**. Same input, two different exit codes and one of them
+# actively misleading: that is precisely the divergence class this project keeps
+# paying for, inside the tool written to make gates trustworthy.
+#
+# ⇒ The command is RESOLVED FIRST, the refusal is written into the LOG as well
+# as to the console, and it exits 127 -- the .sh's number for "not found".
+#
+# ⓘ THIS NAMES, IT DOES NOT TRANSLATE. Rewriting a path into the other shell's
+# spelling would make this file a second path canonicaliser; see
+# scripts/check-path-identity. The refusal stands, it just stops being anonymous.
+# ⚠ THE POWERSHELL IDENTITY LEADS, THE HOST PROCESS TRAILS, and that order is a
+# measurement rather than a preference: ✔MEASURED 2026-08-20, the running
+# process path for pwsh 7.5.2 on this box is `C:\Program Files\dotnet\dotnet.exe`
+# (pwsh is a dotnet-hosted app), so a refusal that led with the process path
+# named something that is not a shell at all. `$PSHOME` is the one value that
+# always points at the PowerShell that is actually executing this file.
+function Get-RunGateShellIdentity {
+    $exe = try { [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
+           catch { '<unknown host process>' }
+    $plat = if ($PSVersionTable.Platform) { $PSVersionTable.Platform } else { 'Win32NT (Windows PowerShell)' }
+    return "PowerShell $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition) on $plat (PSHOME: $PSHOME; host process: $exe)"
+}
+# A path handed to this shell that begins with a POSIX root or a WSL mount --
+# reported, not repaired. Windows PowerShell cannot open '/mnt/c/...' any more
+# than a WSL bash can open 'C:\...'; it is the same defect seen from the other
+# side, which is why the twins carry the same check with the shapes swapped.
+function Test-RunGateForeignPath([string]$p) {
+    return ($p -match '^/')
+}
+
 # Truncate up front (see LogPath above).
 try {
     Set-Content -LiteralPath $LogPath -Value $null -NoNewline -ErrorAction Stop
 } catch {
-    Write-Error "run-gate.ps1: cannot write log '$LogPath'"
+    Write-Host "run-gate.ps1: FAIL - cannot create the log '$LogPath', so nothing was run."
+    Write-Host "  This refusal is about the LOG PATH, not about the gate command."
+    Write-Host "  shell   : $(Get-RunGateShellIdentity)"
+    Write-Host "  script  : $PSCommandPath"
+    Write-Host "  cwd     : $((Get-Location).Path)"
+    if (Test-RunGateForeignPath $LogPath) {
+        Write-Host "  [!] that log path is POSIX-ROOTED ('/...'), and the shell named above is the one"
+        Write-Host "      that has to open it. A Windows PowerShell has no '/mnt/c' and no '/tmp'; that"
+        Write-Host "      spelling belongs to a WSL/Linux shell. Hand this script a path THIS shell can"
+        Write-Host "      see; a repo-relative path works from either side."
+        Write-Host "      This script deliberately does NOT rewrite the path for you: one canonicaliser,"
+        Write-Host "      see scripts/check-path-identity."
+    } else {
+        Write-Host "  Check that the parent directory exists and is writable by this shell."
+    }
+    Write-Host "  reason  : $($_.Exception.Message)"
     exit 2
 }
 
@@ -105,6 +161,31 @@ function Restore-CplDefault {
 }
 trap { Restore-CplDefault; break }
 
+# ★ RESOLVE argv[0] BEFORE RUNNING IT, so "not found" is its own named refusal
+# with the .sh's exit code and not a raw PowerShell error over an empty log.
+# See Get-RunGateShellIdentity above for the measurement. `Get-Command` resolves
+# an application, a cmdlet, a function and an explicit path alike, so this
+# rejects nothing the `&` below would have accepted.
+$resolved = Get-Command -Name $Command -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+if (-not $resolved) {
+    $notFound = @(
+        "run-gate.ps1: FAIL - the gate command was NOT FOUND, so it never ran (rc=127).",
+        "  command : $Command $($CommandArgs -join ' ')",
+        "  shell   : $(Get-RunGateShellIdentity)",
+        "  This is NOT 'the gate failed' and NOT 'the witness was missing' - the shell named",
+        "  above could not resolve argv[0] on ITS OWN PATH. 127 is the number run-gate.sh",
+        "  reports for the same condition; the twins must not disagree about an exit code.",
+        "  (log: $LogPath)"
+    )
+    # INTO THE LOG TOO. An empty log is the one artefact a reader cannot learn
+    # anything from, and it is what this arm used to leave behind.
+    Add-Content -LiteralPath $LogPath -Value ($notFound -join [Environment]::NewLine)
+    Restore-CplDefault
+    foreach ($l in $notFound) { Write-Host $l }
+    exit 127
+}
+
 # Redirect ALL streams to the log with `*>` so the native command stays last
 # and $LASTEXITCODE is its own, not a pipeline's.
 try {
@@ -129,6 +210,20 @@ function Show-Tail {
     if (Test-Path -LiteralPath $LogPath) {
         Get-Content -LiteralPath $LogPath -Tail 20 | ForEach-Object { Write-Host $_ }
     }
+}
+
+if ($rc -eq 127) {
+    # The command WAS resolved above, so this 127 is the child's own -- which is
+    # the one thing the .sh twin cannot tell you, because a POSIX shell reserves
+    # 127 for "not found". Saying which it is here is not a divergence from the
+    # twin; it is the extra fact this side actually has.
+    Write-Host "run-gate.ps1: FAIL - the gate command exited 127 (log: $LogPath)."
+    Write-Host "  command : $Command $($CommandArgs -join ' ')"
+    Write-Host "  resolved: $(if ($resolved.Source) { $resolved.Source } else { $resolved.Name })"
+    Write-Host "  It was FOUND and it RAN - 127 is its own exit code here, not 'command not found'"
+    Write-Host "  (which this wrapper reports before starting anything, with the same 127)."
+    Show-Tail
+    exit $rc
 }
 
 if ($rc -ne 0) {

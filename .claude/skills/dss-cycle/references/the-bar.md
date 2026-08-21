@@ -128,11 +128,24 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      still worthless. **Add a fourth check: assert the witness is absent from the mutant BY THE
      SAME MATCHER THE PIN USES**, not by eye and not by a different reader. Describe a mutation in
      the harness's output, never inside the mutated file.
+     ★★ **AND AN EMPTY MUTATION ANCHOR MATCHES EVERYWHERE — SO A FAIL-CLOSED CHECK WRITTEN
+     AROUND ONE FIRES *AFTER* THE DAMAGE.** ⚠ ✔MEASURED 2026-08-20 (cycle P23,
+     `D-GATE-RED-ON-DISABLE-EMPTY-RESTORE-ANCHOR-MATCHES-EVERYWHERE`): a mutation whose replacement
+     text was the empty string made the RESTORE anchor `""`, and `str.count("")` returns **`len + 1`**
+     — 8,181 on the subject file. The uniqueness clause therefore tripped on the restore, *after*
+     the forward half had already run, and the source was left mutated with a totality
+     `static_assert` silently gone. It was caught only because the lane re-read the file.
+     ⇒ **Forbid an empty anchor** — delete by replacing with a marker, never with nothing — **and
+     run the restore from a `finally` whose success is itself asserted.**
+     ★★ The generalization is worth more than the fix: **a fail-closed check placed after an
+     irreversible step is not fail-closed, it is a post-mortem.** Every clause above guards the
+     VERDICT; this is the one that corrupts the TREE, and the next cycle would have inherited a
+     source file that silently disagreed with its own pin.
    - **★★★ A GREEN RED-ON-DISABLE IS UNPROVEN UNTIL THE MUTANT IS SHOWN TO HAVE BEEN *READ*.**
-     ✔MEASURED 2026-08-13 — **two independent mechanisms in ONE cycle** each produced a green pin over
-     a live mutant, and in both the four fail-closed clauses above were fully satisfied. They are not
-     variants of one bug; they fail at different layers, which is why the rule has to be about the
-     *read*, not about any one layer:
+     ✔MEASURED — **three independent mechanisms**, two in one cycle (2026-08-13) and a third in
+     P23 (2026-08-20), each produced a green pin over a live mutant with the four fail-closed clauses
+     above fully satisfied. They are not variants of one bug; they fail at different layers, which is
+     why the rule has to be about the *read*, not about any one layer:
      - **The mutant was never COMPILED IN.** `ninja -t deps <obj>` reported **`#deps 0`** — ninja had
        recorded zero header dependencies, so a header-only change did not rebuild its consumer.
        **10 of 403 objects** in `build-dbg` were in that state
@@ -145,6 +158,19 @@ bar **stops and reports** — it never pushes a partial or a workaround.
        in, so a worktree binary run from the shared tree's cwd read the *shared* config and never saw
        the mutant (`D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE`). ⇒ **a config-level
        red-on-disable MUST run through `ctest`, never a bare `.exe`.**
+     - **The mutant was COMPILED IN — TO THE WRONG BINARY.** ✔MEASURED 2026-08-20 (cycle P23,
+       `D-TEST-RED-ON-DISABLE-MTIME-WITNESS-MUST-BE-THE-ARTIFACT-THAT-RUNS-THE-ASSERTION`): the
+       mutated predicate was a **header inline**. A narrow build rebuilt the shared library and its
+       mtime advanced — the instrument the clause above prescribes, behaving exactly as written
+       — and the pin stayed **GREEN**, because the assertion under test calls the copy of the
+       inline compiled into the **TEST EXECUTABLE**, which was never relinked. ⇒ **The witness must
+       be the artifact that *RUNS* the assertion, not merely one that CONTAINS the mutated bytes.**
+       For a `.cpp` in the shared library those are the same file, which is why the shorter wording
+       survived this long; for a header inline, a `constexpr`, a template, or anything else the test
+       TU compiles for itself, they are different files. ★ The tell was in the output and is worth
+       keeping: the run reported *"1 failed"* and that one failure was an unrelated `(Not Run)` from
+       another lane — **a mutant that reds the WRONG test is the same signal as one that reds
+       nothing.** Read *which* test went red, never the count.
      ⇒ **The fifth check, and it subsumes the others: prove the mutated bytes reached the process that
      ran the pin.** A changed file on disk is not a changed input. Show the artifact rebuilt (mtime),
      or the config tree that was read (`DSS_CONFIG_ROOT`), or both — and if you cannot show it, the

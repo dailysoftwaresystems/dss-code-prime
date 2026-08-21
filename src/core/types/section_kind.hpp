@@ -1,7 +1,16 @@
 #pragma once
 
 #include "core/export.hpp"
-#include "core/types/target_schema.hpp"   // EnumNameTable<E,N>
+// ⚠ THIS USED TO PULL THE WHOLE `core/types/target_schema.hpp`, FOR ONE
+// TEMPLATE. `EnumNameTable<E,N>` moved to its own dependency-free header when it
+// was extracted, and `enum_name_table.hpp`'s own docblock names THIS file's
+// neighbours as the motivating cases — so the heavy include was a stale premise,
+// not a requirement. `target_schema.hpp` reaches `grammar_schema.hpp`
+// (ConfigDiagnostic) and the whole target substrate; every TU that includes a
+// section kind was paying for it, and a leaf enum header reached early in
+// `grammar_schema.hpp`'s own include list is exactly the cycle the extraction
+// exists to prevent.
+#include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> + namesWhere (leaf header — no target_schema cycle)
 
 #include <cstdint>
 #include <optional>
@@ -98,6 +107,11 @@ inline constexpr EnumNameTable<SectionKind, 16> kSectionKindTable{{{
     { SectionKind::ThreadVars, "tvars"      },
     { SectionKind::RelRoConst, "relro"      },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kSectionKindTable);
 
 [[nodiscard]] constexpr std::string_view
 sectionKindName(SectionKind k) noexcept {
@@ -217,15 +231,35 @@ dataSectionKindName(DataSectionKind d) noexcept {
     return sectionKindName(toSectionKind(d));
 }
 
+// Is this section kind one a DATA declaration may name? The membership
+// predicate, expressed as the existence of the narrowing — never as a second
+// list of kinds.
+[[nodiscard]] constexpr bool isDataSectionKind(SectionKind k) noexcept {
+    return dataSectionKindOf(k).has_value();
+}
+
+// The spellings a data-section declaration may use — `kSectionKindTable`
+// narrowed to the data subrange. What a loader's "the closed set is …" half
+// must render.
+//
+// ⚠ THE COUNT IS NOT DECORATION. `namesWhere` refuses a `M` that disagrees with
+// the number of accepted rows, at COMPILE TIME, so adding a seventh data kind
+// (or renaming one) cannot leave this list — or any diagnostic rendered from
+// it — advertising the old set.
+inline constexpr auto kDataSectionKindNames =
+    namesWhere<6>(kSectionKindTable, isDataSectionKind);
+
+// ⚠ DERIVED, NOT A SECOND IF-CHAIN. This used to spell all six names again,
+// beside `kSectionKindTable` which already owned them and beside
+// `dataSectionKindName` which already read them from it — three owners of one
+// fact, of which only the round-trip `static_assert`s above happened to keep
+// two honest (they pin the ENUM VALUES, never the SPELLINGS, so a renamed
+// section would have passed every one of them while
+// `dataSectionKindFromName` silently stopped resolving it).
 [[nodiscard]] constexpr std::optional<DataSectionKind>
 dataSectionKindFromName(std::string_view s) noexcept {
-    if (s == "rodata") return DataSectionKind::Rodata;
-    if (s == "data")   return DataSectionKind::Data;
-    if (s == "bss")    return DataSectionKind::Bss;
-    if (s == "tdata")  return DataSectionKind::Tdata;
-    if (s == "tbss")   return DataSectionKind::Tbss;
-    if (s == "relro")  return DataSectionKind::RelRoConst;
-    return std::nullopt;
+    auto const k = sectionKindFromName(s);
+    return k.has_value() ? dataSectionKindOf(*k) : std::nullopt;
 }
 
 // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): the ONE chokepoint for the section a

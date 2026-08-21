@@ -435,9 +435,17 @@ TEST(ObjectFormatMutationProbe, RejectedRootFieldStillFires) {
     // Both bytecode formats must have been probed across their WHOLE list.
     ASSERT_EQ(perFormat.size(), 2u) << "expected exactly wasm + spirv";
     for (auto const& [name, n] : perFormat) {
-        EXPECT_EQ(n, 14u)
+        // ⚠ WRITTEN OUT ON PURPOSE — do NOT replace it with
+        // `backend->rejectedRootFields().size()`. Deriving the expectation from
+        // the very list under test makes the assertion self-satisfying: a key
+        // deleted from the array would take the expected count down with it and
+        // nothing would go red. The constant is the teeth. Bump it in the SAME
+        // change that adds or removes an entry, and only then.
+        // 14 → 15 with `weakDefinition`
+        // (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED).
+        EXPECT_EQ(n, 15u)
             << name << " probed " << n << " rejected root fields; the declared "
-               "list is 14 long. A shrinking list means keys stopped being "
+               "list is 15 long. A shrinking list means keys stopped being "
                "rejected AND stopped being probed at the same time.";
     }
 }

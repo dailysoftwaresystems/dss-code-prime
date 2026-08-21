@@ -8,8 +8,12 @@
 #include "lir/lir.hpp"
 #include "lir/lir_regalloc.hpp"
 
+#include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 // LIR calling-convention lowering pass (ML7). Consumes a post-
@@ -153,6 +157,99 @@ alignedSizeWithBias(std::uint32_t rawBytes,
         (entryBias + stackAlignment - remainder) % stackAlignment;
     return rawBytes + delta;
 }
+
+// ── WHICH CLASSES HAVE A RESULT-REGISTER POOL, AS ROWS ───────────────────────
+//
+// D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET, and
+// D-LIR-RETURN-REG-REFUSAL-IS-UNREACHABLE-FROM-THE-TEST-TIER.
+//
+// One row per register class that can hold a returned value, naming the cc pool
+// it reads. `returnRegisterForClass` walks these to DECIDE, and its refusal
+// renders the same rows to ADVERTISE — so the two cannot disagree.
+//
+// ★★ WHY THE ROWS AND THE LOOKUP LIVE IN THE HEADER RATHER THAN IN AN ANONYMOUS
+// NAMESPACE, WHICH IS WHERE THEY WERE BORN. The conversion that made ACCEPTANCE
+// and ADVERTISEMENT one walk is only worth what a test can hold it to, and in an
+// anonymous namespace it was worth NOTHING: ✔MEASURED — retyping the accepted
+// set back into a hand-written literal (`"only gpr/fpr results can be returned
+// in registers"`, the pre-VR sentence) left `ctest` at rc=0 with 16 of 16 LIR
+// tests GREEN, because no caller in this tree reaches a `None`/`Flags` result
+// and no tier could observe the refusal at all. A guard that cannot fire asserts
+// nothing. The lookup is a pure query over `(schema, cc, class, ordinal)` —
+// exactly the shape `lir_pass_util::incomingArgRegister` already publishes for
+// the ARG side — so publishing the RETURN side is the symmetric position, not a
+// hole opened for a test.
+//
+// ⚠ THE SPELLINGS ARE NOT MINTED HERE: `lirRegClassName` delegates to
+// `kTargetRegClassTable`, the one owner of a register class's name across the
+// `.target.json` and `.dsslir` surfaces.
+struct ReturnPoolRow {
+    LirRegClass                                        cls;
+    std::vector<std::string> TargetCallingConvention::* pool;
+};
+inline constexpr std::array<ReturnPoolRow, 3> kReturnPoolRows{{
+    {LirRegClass::GPR, &TargetCallingConvention::returnGprs},
+    {LirRegClass::FPR, &TargetCallingConvention::returnFprs},
+    {LirRegClass::VR,  &TargetCallingConvention::returnVrs},
+}};
+
+// ⚠ AND THE COUNT CANNOT SILENTLY OUTRUN THE ROWS. `std::array<Row, N>` with
+// fewer than N initializers is legal C++ and VALUE-INITIALIZES the remainder —
+// a row whose `pool` is a NULL pointer-to-member and whose class is `None`.
+// `returnRegisterPool` would then match `None` against that padding row and
+// dereference the null member, which is undefined behaviour reached through a
+// hand-edit that compiles clean. ✔MEASURED while planting the row-deletion
+// mutant for this file's pins: deleting one row without adjusting the count
+// built without a single warning. Same guarantee `DSS_CHECK_ENUM_NAME_TABLE`
+// gives the spelling tables, by the same means — the BUILD stops.
+static_assert([] {
+    for (auto const& row : kReturnPoolRows) {
+        if (row.pool == nullptr) return false;
+        if (row.cls == LirRegClass::None) return false;
+    }
+    return true;
+}(), "kReturnPoolRows has a padding row — the array's declared size outruns its "
+     "initializers, and a row with a null pointer-to-member would be matched "
+     "against LirRegClass::None and dereferenced");
+
+// The rendered accepted set, built ONCE off those rows. Not a literal, and not a
+// second array of names either — it is the rows' own spellings.
+inline constexpr auto kReturnPoolClassNames = [] {
+    std::array<std::string_view, kReturnPoolRows.size()> out{};
+    for (std::size_t i = 0; i < kReturnPoolRows.size(); ++i) {
+        out[i] = lirRegClassName(kReturnPoolRows[i].cls);
+    }
+    return out;
+}();
+
+// The cc pool a result of class `cls` is returned in, or `nullptr` when this
+// class has no row — which is the SAME question the refusal below answers, asked
+// once. A class with no row owns no pool and is not silently filed into
+// somebody else's.
+[[nodiscard]] constexpr std::vector<std::string> const*
+returnRegisterPool(TargetCallingConvention const& cc, LirRegClass cls) noexcept {
+    for (auto const& row : kReturnPoolRows) {
+        if (row.cls == cls) return &(cc.*row.pool);
+    }
+    return nullptr;
+}
+
+// Lookup the `ordinal`-th return register of the given class. Slot 0 is the
+// primary return register (the scalar / first-eightbyte result); higher slots
+// are the additional eightbyte pieces of an in-register struct return (SysV's
+// rax+rdx / xmm0+xmm1 — FC7 C1c, D-FC7-SYSV-STRUCT-RETURN-IN-REGS). `ordinal`
+// is the PER-CLASS index (GPR and FPR pieces counted separately).
+//
+// Returns `nullopt` + a loud diagnostic when the class has no row
+// (`returnRegisterPool` is nullptr), when `ordinal` is past that pool, or when
+// the cc names a register the target schema does not declare.
+[[nodiscard]] DSS_EXPORT std::optional<LirReg>
+returnRegisterForClass(TargetSchema const&            schema,
+                       TargetCallingConvention const& cc,
+                       LirRegClass                    cls,
+                       std::uint32_t                  ordinal,
+                       std::string_view               contextLabel,
+                       DiagnosticReporter&            reporter);
 
 // Per-function frame layout computed before emission. Stored so
 // downstream passes (AS1 unwind info, debug-info DWARF .debug_frame

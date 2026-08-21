@@ -82,6 +82,11 @@ inline constexpr EnumNameTable<TargetAbiModel, 3> kTargetAbiModelTable{{{
     { TargetAbiModel::ResultId,        "result-id"        },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetAbiModelTable);
+
 [[nodiscard]] constexpr std::string_view targetAbiModelName(TargetAbiModel m) noexcept {
     return kTargetAbiModelTable.name(m);
 }
@@ -110,6 +115,11 @@ inline constexpr EnumNameTable<CallConv, 9> kCallConvTable{{{
     { CallConv::CcWasm,       "wasm"       },
     { CallConv::CcSpirv,      "spirv"      },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kCallConvTable);
 
 [[nodiscard]] constexpr std::string_view callConvName(CallConv cc) noexcept {
     return kCallConvTable.name(cc);
@@ -213,6 +223,11 @@ kTargetCondCodeTable{{{
     { TargetCondCode::Ford, "ford" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetCondCodeTable);
+
 [[nodiscard]] constexpr std::string_view targetCondCodeName(TargetCondCode c) noexcept {
     return kTargetCondCodeTable.name(c);
 }
@@ -232,8 +247,24 @@ inline constexpr EnumNameTable<TargetResultRule, 3> kTargetResultRuleTable{{{
     { TargetResultRule::Optional, "optional" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetResultRuleTable);
+
 [[nodiscard]] constexpr std::string_view targetResultRuleName(TargetResultRule r) noexcept {
     return kTargetResultRuleTable.name(r);
+}
+// ⚠ THE `…FromName` HALF WAS MISSING, AND THE LOADER FILLED THE GAP ITSELF.
+// `target_schema_json.cpp` carried a private `parseResultRule` if-chain
+// spelling all three names a second time, beside the table that already owned
+// them — the only opcode vocabulary in this header with a name side and no
+// parse side, and the only one whose loader had to invent one. Every sibling
+// enum here exposes BOTH halves off its table; this one now does too, so the
+// loader has nothing left to duplicate.
+[[nodiscard]] constexpr std::optional<TargetResultRule>
+targetResultRuleFromName(std::string_view s) noexcept {
+    return kTargetResultRuleTable.fromName(s);
 }
 
 // Register-class envelope (universal — every target maps its concrete
@@ -262,6 +293,11 @@ inline constexpr EnumNameTable<TargetRegClass, 5> kTargetRegClassTable{{{
     { TargetRegClass::Flags, "flags" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetRegClassTable);
+
 [[nodiscard]] constexpr std::string_view targetRegClassName(TargetRegClass c) noexcept {
     return kTargetRegClassTable.name(c);
 }
@@ -269,6 +305,28 @@ inline constexpr EnumNameTable<TargetRegClass, 5> kTargetRegClassTable{{{
 targetRegClassFromName(std::string_view s) noexcept {
     return kTargetRegClassTable.fromName(s);
 }
+
+// ── the class set a `registerClassOps[]` ROW may name ─────────────────────
+//
+// `None` is a legitimate value of this enum — a register (or an operand) can
+// genuinely have no class — so it is a table row and `targetRegClassFromName`
+// resolves it. It is NOT a legitimate SUBJECT for a per-class operation row:
+// `registerClassOps` declares the move/load/store mnemonics for a class, and
+// the no-class sentinel has no registers to move.
+//
+// ⚠ THE LOADER'S DIAGNOSTIC ALREADY SAID SO AND THE CHECK DID NOT.
+// `/registerClassOps/{}/class` refused nothing beyond a name lookup, so
+// `"class": "none"` LOADED and took row 0, while the sentence beside it read
+// "expected 'gpr' / 'fpr' / 'vr' / 'flags'". A message narrower than its check
+// is the same defect class as a message wider than it — the sentence and the
+// gate disagreed, and the sentence was the one telling the truth about intent.
+// The gate now matches, and both come off this predicate.
+[[nodiscard]] constexpr bool
+isOperableTargetRegClass(TargetRegClass c) noexcept {
+    return c != TargetRegClass::None;
+}
+inline constexpr auto kOperableTargetRegClassNames =
+    namesWhere<4>(kTargetRegClassTable, isOperableTargetRegClass);
 
 // Map a substrate-tier `TypeKind` to its `TargetRegClass`. Universal
 // across all register-machine targets — floats use the FPR envelope,
@@ -404,6 +462,11 @@ inline constexpr EnumNameTable<WideFloatOp, 6> kWideFloatOpTable{{{
     { WideFloatOp::Mul, "mul" }, { WideFloatOp::Div, "div" },
     { WideFloatOp::ToInt32, "to_i32" }, { WideFloatOp::FromFloat64, "from_f64" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kWideFloatOpTable);
 [[nodiscard]] constexpr std::string_view wideFloatOpName(WideFloatOp op) noexcept {
     return kWideFloatOpTable.name(op);
 }
@@ -852,6 +915,11 @@ inline constexpr EnumNameTable<TargetEncodingShape, 3> kTargetEncodingShapeTable
     { TargetEncodingShape::Fixed32,     "fixed32"      },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetEncodingShapeTable);
+
 [[nodiscard]] constexpr std::string_view
 targetEncodingShapeName(TargetEncodingShape s) noexcept {
     return kTargetEncodingShapeTable.name(s);
@@ -929,6 +997,11 @@ inline constexpr EnumNameTable<OperandKindFilter, 7> kOperandKindFilterTable{{{
     { OperandKindFilter::LiteralIndex, "imm64" },  // JSON-side width label
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kOperandKindFilterTable);
+
 [[nodiscard]] constexpr std::string_view
 operandKindFilterName(OperandKindFilter f) noexcept {
     return kOperandKindFilterTable.name(f);
@@ -998,6 +1071,11 @@ inline constexpr EnumNameTable<AsmConstraintBinding, 3>
         { AsmConstraintBinding::Register,      "register"      },
         { AsmConstraintBinding::OperandKind,   "operandKind"   },
     }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kAsmConstraintBindingTable);
 
 [[nodiscard]] constexpr std::string_view
 asmConstraintBindingName(AsmConstraintBinding b) noexcept {
@@ -1463,6 +1541,11 @@ inline constexpr EnumNameTable<EncodingSlotKind, 32> kEncodingSlotKindTable{{{
     { EncodingSlotKind::MemRelocDisp32,    "memreloc.disp32" },
     { EncodingSlotKind::Imm16Inverted, "imm16.inverted" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kEncodingSlotKindTable);
 
 // Centralised count — promoted from per-translation-unit local
 // constexpr per simplifier review. Used as the size of
@@ -2112,6 +2195,11 @@ inline constexpr EnumNameTable<RelocFormulaKind, 7> kRelocFormulaTable{{{
     { RelocFormulaKind::Aarch64Ld64GotLo12,   "aarch64_ld64_got_lo12" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kRelocFormulaTable);
+
 [[nodiscard]] DSS_EXPORT std::string_view
     relocFormulaName(RelocFormulaKind k) noexcept;
 
@@ -2156,6 +2244,11 @@ inline constexpr EnumNameTable<ExitMechanism, 3> kExitMechanismTable{{{
     { ExitMechanism::Syscall,      "syscall"        },
     { ExitMechanism::ByNameImport, "by-name-import" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kExitMechanismTable);
 
 [[nodiscard]] constexpr std::string_view exitMechanismName(ExitMechanism m) noexcept {
     return kExitMechanismTable.name(m);
@@ -2309,6 +2402,11 @@ inline constexpr EnumNameTable<ArgsMechanism, 3> kArgsMechanismTable{{{
     { ArgsMechanism::CrtArgvAccessors, "crt-argv-accessors"  },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kArgsMechanismTable);
+
 [[nodiscard]] constexpr std::string_view argsMechanismName(ArgsMechanism m) noexcept {
     return kArgsMechanismTable.name(m);
 }
@@ -2446,6 +2544,11 @@ inline constexpr EnumNameTable<TlsVariant, 2> kTlsVariantTable{{{
     { TlsVariant::Variant2, "variant2" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTlsVariantTable);
+
 [[nodiscard]] constexpr std::string_view tlsVariantName(TlsVariant v) noexcept {
     return kTlsVariantTable.name(v);
 }
@@ -2550,6 +2653,11 @@ inline constexpr EnumNameTable<TargetTerminatorKind, 7> kTargetTerminatorKindTab
     { TargetTerminatorKind::Unreachable, "unreachable" },
     { TargetTerminatorKind::IndirectBr,  "indirect-br" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetTerminatorKindTable);
 
 [[nodiscard]] constexpr std::string_view
 targetTerminatorKindName(TargetTerminatorKind k) noexcept {

@@ -221,3 +221,28 @@ dss_add_test(NAME program/test_runtime_object_cache
 # restates the other's assertions.
 dss_add_test(NAME program/test_shipped_runtime_compiles
              SOURCES test_shipped_runtime_compiles.cpp)
+
+# THE DRIVER'S **SUPPLYING** OF THE PIPELINE KERNEL'S DRIVER-DERIVED ARGUMENTS
+# (D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP). The
+# classification these pins witness lives in a block comment in
+# `src/program/compile_pipeline.hpp`, beside the exports it classifies.
+#
+# ★★★ DRIVER TIER BY DEFINITION, NOT BY PREFERENCE — the tier IS the subject.
+# Every entry point pinned here already has thorough unit coverage, and that
+# coverage is exactly what cannot help: a unit case CONSTRUCTS the argument the
+# driver is supposed to derive, so it tests the callee while assuming the
+# caller. Cycle P22 measured the consequence — dropping a newly-threaded
+# parameter at ONE driver call site reproduced the original CLI failure while
+# the whole in-process suite stayed green at 32/32.
+#
+# ★★ AND THE PINS ARE PER **ROUTE**. `program.cpp` reaches
+# `linkAndWriteWithStaticArchives` by three routes and `optimizeModule` by
+# three; a pin on one says nothing about the others, which is how a parameter
+# ends up threaded to two call sites out of three.
+#
+# ⓘ NOT tests/examples/: two of the three parameters have no corpus surface at
+# all. `--stack-reserve` is a DRIVER flag (a manifest declares sources and
+# targets, not image knobs), and the optimizer STAGE count is invisible to an
+# exit code — a build optimized at the unit schedule only still exits 42.
+dss_add_test(NAME program/test_driver_argument_supply
+             SOURCES test_driver_argument_supply.cpp)

@@ -139,6 +139,82 @@ hand-typing every edit or reading every subsystem.
    red-on-disable observation.
    ⇒ Name the lane's build tree in its brief (`build/<lane>`), and clear it once green (the
    one-root rule). `scripts/local-build/local-build.{sh,ps1} --tree <name>` takes one.
+   ★★ **AND A LANE THAT WRITES SCRATCH FILES GETS ITS OWN SCRATCH DIRECTORY.** The per-lane
+   BUILD tree isolates artifacts; it isolates neither the scratchpad nor the working tree.
+   ⚠ ✔MEASURED 2026-08-20 (cycle P23,
+   `D-CYCLE-LANE-SCRATCHPADS-ARE-SHARED-AND-LANES-CLOBBER-EACH-OTHER`):
+   four lanes were given one `scratchpad/<cycle>/` directory, one lane's
+   mutation harness was OVERWRITTEN by another lane's file of the same name mid-run, and the
+   next three red-on-disable cycles executed the WRONG SCRIPT with the first lane's arguments.
+   Nothing was corrupted only because that harness restored its subject from a `finally` and
+   verified the hash. ⇒ Name `scratchpad/<cycle>/<lane>/` in the brief.
+   ★★ **AN ANCHOR ID IS NEVER LINE-WRAPPED, AND THIS CLAUSE IS THE PROOF OF WHY.** The row
+   above was cited here for hours WITHOUT EXISTING, and the step-10 audit was the first thing
+   to notice — because the id was split across two lines, so neither the registry guard nor a
+   human's grep could match it. ✔MEASURED 2026-08-20: **17 of the 78** distinct `D-*` ids cited
+   on that cycle's added lines were wrapped; 16 were harmless only because the same id appears
+   unwrapped nearby. ★ **A wrapped id does not fail — it becomes INVISIBLE**, which is the one
+   failure mode a fail-loud project cannot detect by watching for a failure. Break the line
+   BEFORE the id or AFTER it, never inside it — the convention the harness scripts already
+   spell as `ANCHOR, ONE LINE, DO NOT WRAP`.
+   ⚠ **The same measurement carries a second, larger consequence: a WHOLE-TREE gate number
+   taken by any lane is not attributable to that lane**, because the source tree still holds
+   every other lane's uncommitted edits. A lane scopes its gate with `-R` to its own subjects
+   and treats a failure outside them as somebody else's until proven otherwise; the ONLY
+   attributable whole-tree number is the orchestrator's, after the fold.
+   ★★ **A BRIEF MAY STATE AN INTERFACE ONLY IF ITS AUTHOR HAS RUN IT** — the same standard as
+   §5's "a measurement is stated only with the instrument that produced it", one level up: an
+   invocation is a claim about the world, and writing one from memory is writing an
+   unmeasured fact into the place a lane trusts most. ⚠ ✔MEASURED 2026-08-20 (cycle P23): the
+   orchestrator's own common brief spelled `run-gate.sh -- ctest …`; the real interface is
+   `<log-path> <success-regex> <command> [args...]`. TWO lanes hit it, it refused
+   (fail-closed, correctly), and one left a file literally named `--` in the repo root. The
+   fix is one command: run the invocation once before pasting it into a brief.
+   ★★ **AND THE SAME STANDARD BINDS A MECHANISM, NOT ONLY AN INTERFACE: A BRIEF THAT NAMES THE
+   FIELD A DECISION READS, OR THE ROLE A VALUE CARRIES, IS MAKING A MEASUREMENT AND OWES AN
+   INSTRUMENT.** ⚠ ✔MEASURED 2026-08-20 (cycle P23,
+   `D-CYCLE-BRIEF-ROUTED-A-DECISION-ONTO-A-FIELD-THAT-DOES-NOT-DISCRIMINATE`): a brief told a lane
+   to route the COFF weak-external decision on the auxiliary record's `Characteristics` field. gcc
+   emits `Characteristics = 1` for **all four** weak shapes, so routing on it would have classified
+   every gcc weak DEFINITION as unresolvable — *precisely the defect the lane existed to fix*. The
+   field that discriminates is the record's own `TagIndex`. ★ **This is the same trap as
+   `D-LK-MACHO-ISDATA-NO-CALL-SIGNAL` (a relocation's arithmetic substituted for its role) and as
+   `D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE`'s revisit condition (a front-end feature substituted
+   for the existence of a caller). The trap is not any particular field — it is reaching for
+   whichever field sits nearest the decision and assuming it carries it.** Where a brief cannot
+   supply an instrument, it says *"unmeasured, verify first"* rather than stating the fact flat.
+   ★★ **AND THE LANE THAT REFUTES ITS BRIEF IS THE CONTROL LOOP WORKING, NOT A LANE GOING
+   OFF-BRIEF** — say so in the brief, so the lane knows a refutation is a deliverable.
+   ⚠ **AND THE FIRST WRITE-UP OF THIS RULE MISSTATED ITS OWN MEASUREMENT** — it said
+   that invocation exits 127 with an empty log. ✔RE-MEASURED: it exits **2**, with a named
+   refusal. The 127-and-empty-log shape is the DIFFERENT invocation `bash <C:/.../run-gate.sh>`,
+   where bash cannot open the SCRIPT (see below). Two failures that look alike were being
+   described as one, inside the rule that exists to stop exactly that.
+   ★★ **A BRIEF THAT ASSIGNS `tests/<dir>/` GRANTS THAT DIRECTORY'S `CMakeLists.txt` AS
+   APPEND-ONLY — AND SAYS SO.** A new `test_*.cpp` cannot RUN without a `dss_add_test` block, and
+   that file belongs to the directory rather than to any lane, so a brief that lists the test file
+   and not its registration leaves the lane a choice between not landing the test and editing an
+   unowned file. ⚠ ✔MEASURED 2026-08-20 (cycle P23,
+   `D-CYCLE-BRIEF-ASSIGNS-A-TEST-FILE-WITHOUT-ITS-BUILD-REGISTRATION`): four lanes added tests and
+   three shared `CMakeLists.txt` files were each edited by lanes that had not been given them.
+   Append-only edits merged cleanly; the damage came from ONE lane rewriting a whole file in CRLF,
+   reddening `line_endings_guard` for three other lanes' work and leaving a diff nobody could claim.
+   ⇒ **Append a block; never reorder, reformat, or rewrite the file whole.** Append-only is what
+   makes a shared file safe under concurrency, and it is also what makes a violation visible.
+   ★★ **A MESSAGE TO A LIVE LANE RE-STATES THAT LANE'S SUBJECT AND OWNED PATHS, IN ITS
+   OPENING LINES.** A lane handle is an opaque id; several lanes run at once; and a message from
+   the orchestrator carries the orchestrator's authority. ⚠ ✔MEASURED 2026-08-20 (cycle
+   P23, `D-CYCLE-A-LANE-MESSAGE-DELIVERED-TO-THE-WRONG-LANE`): an ownership-NARROWING message
+   — reassigning a file set and asserting *"your scope was always X"* — was delivered to
+   the wrong lane. Had it been obeyed, two lanes would have edited one file set and BOTH reports
+   would have become unattributable, which is the same damage class as editing a lane's config
+   underneath it. **It did no damage for exactly one reason: the recipient's BRIEF named its own
+   subject and listed those paths as FORBIDDEN**, so the instruction contradicted a written
+   boundary instead of arriving into a vacuum — and the lane refused it and answered with a
+   measurement (`git status --short` + `stat -c %y`) rather than a denial.
+   ★ The reusable half: **an instruction that names the recipient's scope can be REFUTED by the
+   recipient; one that only names the work cannot.** Redundancy in the addressing is what makes
+   mis-delivery detectable at the destination, which is the only place it can still be caught.
 6. **Review and fold** — `/pr-review-toolkit:review-pr`, plus the agnosticism pass and the CI-hazard
    screen. ★★ **If this cycle created or modified a `.sh`/`.ps1` pair, TWIN PARITY IS PART OF THIS
    STEP** — same inputs, same properties, same flags, same exit codes, both siblings changed in this
@@ -232,6 +308,19 @@ workaround an own tool. reusable tools exists to avoid bunch of problems like ma
 - **A defect in one of them is FIXED in the cycle that hits it.** A workaround at the call site leaves
   the defect for the next caller and forks the behaviour silently. This is a FIX, so by the 2026-08-15
   ruling **no hard stop gates it**, whatever subsystem it lands in.
+- ⚠⚠ **AND `bash <script>` FROM A WINDOWS-NATIVE PARENT IS NOT THE BASH YOU MEAN.**
+  ✔MEASURED 2026-08-20 (cycle P23): from a Windows-native process, `bash` resolves to
+  `C:\WINDOWS\system32\bash.exe` — **WSL's** — which cannot open a `C:/...` path. Two
+  distinct failures follow and they look alike:
+  * `bash scripts/run-gate/run-gate.sh <C:/...log>` — the script RUNS and cannot write its
+    log; it now exits **2** with a named refusal that identifies the shell.
+  * `bash <C:/.../run-gate.sh>` — bash cannot open the SCRIPT, so **it never executes**.
+    Exit **127**, empty log, and **no edit inside any script can ever improve this shape**.
+    The only fix is at the CALL SITE: invoke it as a relative path from Git Bash, or run the
+    `.ps1` twin.
+  ★ Worth stating because the second shape reads as *"the gate refused"* when what happened
+  is *"the wrong bash ran"* — an instrument that misattributes is the failure this project
+  cares most about.
 - ⚠ **The reason is measured, not aesthetic.** These scripts hold this project's accumulated edge
   cases: a `wsl.exe bash -c` with a variable that once became `rsync -a --delete / /` and reported
   exit 0; quoted heredocs eating backslashes; unanchored rsync excludes that silently skipped a

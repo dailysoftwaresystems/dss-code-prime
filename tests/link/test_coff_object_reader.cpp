@@ -854,6 +854,15 @@ struct BSec {
     // any reservation assertion vacuous.
     std::optional<std::uint32_t> rawSizeOverride;
 };
+// Auxiliary Format 3 (PE/COFF 5.5.3) on a WEAK_EXTERNAL record. `defaultName`
+// resolves to the FINAL symtab index the same way a relocation target does, so a
+// fixture never hand-computes an index that aux slots shift; `rawTagIndex`
+// overrides it for the corruption pins that must name an index ON PURPOSE.
+struct BWeakAux {
+    std::string                  defaultName;
+    std::uint32_t                characteristics = 1;  // SEARCH_NOLIBRARY
+    std::optional<std::uint32_t> rawTagIndex;
+};
 struct BSym {
     std::string   name;                 // <= 8 bytes (inline)
     std::uint32_t value   = 0;
@@ -861,6 +870,7 @@ struct BSym {
     std::uint16_t type    = 0;
     std::uint8_t  storage = kClassExternal;
     std::optional<std::uint8_t> auxSelection;   // set -> emit a section-def aux
+    std::optional<BWeakAux>     auxWeakExtern;  // set -> emit a format-3 aux
 };
 
 void emitU16(std::vector<std::uint8_t>& b, std::uint16_t v) {
@@ -882,11 +892,15 @@ void emitName8(std::vector<std::uint8_t>& b, std::string const& n) {
 // 4-byte size prefix only.
 [[nodiscard]] std::vector<std::uint8_t>
 buildCoff(std::vector<BSec> const& secs, std::vector<BSym> const& syms) {
+    auto auxCount = [](BSym const& s) -> std::uint32_t {
+        return (s.auxSelection.has_value() ? 1u : 0u)
+             + (s.auxWeakExtern.has_value() ? 1u : 0u);
+    };
     std::unordered_map<std::string, std::uint32_t> symIndex;
     std::uint32_t slot = 0;
     for (auto const& s : syms) {
         if (!s.name.empty()) symIndex.emplace(s.name, slot);
-        slot += 1u + (s.auxSelection.has_value() ? 1u : 0u);
+        slot += 1u + auxCount(s);
     }
     std::uint32_t const numSymbols  = slot;
     std::uint16_t const numSections = static_cast<std::uint16_t>(secs.size());
@@ -939,10 +953,27 @@ buildCoff(std::vector<BSec> const& secs, std::vector<BSym> const& syms) {
         emitU16(out, s.sectNum);
         emitU16(out, s.type);
         out.push_back(s.storage);
-        out.push_back(s.auxSelection.has_value() ? 1u : 0u);
+        out.push_back(static_cast<std::uint8_t>(auxCount(s)));
         if (s.auxSelection.has_value()) {
             std::array<std::uint8_t, 18> aux{};
             aux[14] = *s.auxSelection;   // Selection byte (section-def aux, format 5)
+            out.insert(out.end(), aux.begin(), aux.end());
+        }
+        if (s.auxWeakExtern.has_value()) {
+            // Auxiliary Format 3: [0] u32 TagIndex, [4] u32 Characteristics,
+            // [8] 10 unused bytes.
+            auto const& w = *s.auxWeakExtern;
+            std::uint32_t tag = 0;
+            if (w.rawTagIndex.has_value()) {
+                tag = *w.rawTagIndex;
+            } else {
+                auto const it = symIndex.find(w.defaultName);
+                tag = (it == symIndex.end()) ? 0u : it->second;
+            }
+            std::vector<std::uint8_t> aux;
+            emitU32(aux, tag);
+            emitU32(aux, w.characteristics);
+            aux.resize(18u, 0u);
             out.insert(out.end(), aux.begin(), aux.end());
         }
     }
@@ -1529,6 +1560,21 @@ TEST(CoffLocalFunctionInArchive, DssBuiltLibMemberCallingAStaticHelperExitsForty
     auto const exe = dir / "main.exe";
     ASSERT_TRUE(std::filesystem::exists(exe));
 
+    // ★★ THE RUN IS `_WIN32`-GATED; THE BUILD ABOVE IS NOT, AND THE SPLIT IS THE
+    // POINT. DSS cross-compiles a pe64 image from any host, so everything above
+    // this line is a HOST-NEUTRAL assertion about the reader and belongs on every
+    // leg. EXECUTING that image is a host CAPABILITY, and only Windows has it --
+    // the same split `tests/program/test_static_link.cpp` already spells for its
+    // pe / elf / Mach-O run arms.
+    // ⚠ D-TEST-COFF-ARCHIVE-RUN-ARM-NOT-HOST-GATED: this arm shipped ungated and
+    // TWO of the three legs then in use hid it. Windows runs a PE natively; WSL
+    // runs one through the interop binfmt handler, so `posix_spawn` succeeds
+    // there and the arm reads as portable. ✔MEASURED 2026-08-21 on the native
+    // aarch64 VPS, which has neither: `posix_spawn(main.exe) failed: rc=8`
+    // (ENOEXEC) -- a red that says nothing about the reader this file tests.
+    // ★ The general shape: A CROSS-COMPILE TEST THAT SPAWNS ITS OUTPUT IS TWO
+    // TESTS, and only the second one is about the host.
+#if defined(_WIN32)
     auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
@@ -1536,6 +1582,7 @@ TEST(CoffLocalFunctionInArchive, DssBuiltLibMemberCallingAStaticHelperExitsForty
         << "THE witness: (14 + 7) * 2 = 42, and the +7 exists only inside the "
            "file-local helper -- so 42 is reachable only if the helper's BYTES "
            "reached the image and the call landed on them";
+#endif  // _WIN32
 }
 
 // The REAL-TOOLCHAIN variant: the same shape compiled by cl.exe and wrapped by
@@ -2196,4 +2243,728 @@ TEST(CoffForeignObject, EqualOffsetLocalLabelSharesTheFunctionsAtomAndRelocation
     EXPECT_EQ(next->relocations[0].target, fn->symbol)
         << "a target naming `Lfn` must bind to the atom `Lfn` names";
     EXPECT_EQ(nameOf(*got, next->relocations[0].target), "fn");
+}
+
+// ══ WEAK EXTERNALS — PE/COFF 5.5.3, Auxiliary Format 3 ══════════════════════
+//
+// D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB, the COFF weak half.
+//
+// Before these, the reader's ENTIRE storage-class vocabulary was EXTERNAL(2) and
+// STATIC(3); class 105 fell through an open-ended fallback and -- being UNDEF by
+// construction -- was read as a plain STRONG extern, with the auxiliary record
+// (the TagIndex naming the default AND the Characteristics) discarded by the
+// symbol loop's aux-slot skip before anything looked at it.
+//
+// ⚠ THE FIXTURES BELOW ARE MEASURED SHAPES, NOT INVENTED ONES. Every field value
+// comes from a raw 18-byte aux dump of a REAL mingw gcc 13.2.0 object (objdump
+// renders a format-3 aux as though it were a function aux and never prints
+// Characteristics at all, which is why the shape had to be read from bytes).
+
+namespace {
+
+// The symtab-index a reconstructed name resolves to; nullopt if the name has no
+// ModuleSymbol row. Two names that share one id are two names for ONE atom.
+[[nodiscard]] std::optional<SymbolId>
+symIdOfName(AssembledModule const& m, std::string const& name) {
+    for (auto const& s : m.symbols) if (s.name == name) return s.symbol;
+    return std::nullopt;
+}
+[[nodiscard]] bool hasExternNamed(AssembledModule const& m, std::string const& n) {
+    for (auto const& e : m.externImports) if (e.mangledName == n) return true;
+    return false;
+}
+
+constexpr std::uint8_t  kClassWeakExternal  = 105u;
+constexpr std::uint32_t kWeakSearchNoLibrary = 1u;
+constexpr std::uint32_t kWeakSearchLibrary   = 2u;
+constexpr std::uint32_t kWeakSearchAlias     = 3u;
+
+}  // namespace
+
+// -- (a) A SECTION-BACKED default: the weak name IS that body ----------------
+//
+// The shape mingw gcc emits for a weak function DEFINITION: the body is renamed
+// to a `.weak.`-prefixed symbol and kept EXTERNAL/STRONG, and the real name
+// becomes an UNDEF class-105 record whose aux TagIndex names the renamed body.
+// The reconstruction must put the body back under its REAL name, WEAK.
+TEST(CoffWeakExternal, SectionBackedDefaultBindsTheWeakNameToThatBody) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    std::vector<std::uint8_t> text(0x20, 0x90u);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, text, {}}},
+        {// the renamed strong body at `.text`+0 ...
+         BSym{"Wbody", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         // ... and `caller` after it, so the body has a real extent
+         BSym{"caller", 0x10, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         // the weak external deferring to it
+         BSym{"wfn", 0, 0, kDtypeFunction, kClassWeakExternal, std::nullopt,
+              BWeakAux{"Wbody", kWeakSearchNoLibrary, std::nullopt}}});
+
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // THE CLAIM, and it is the defect this arm removes: the weak name is DEFINED
+    // here. It used to come back as an extern import, so the linker reported
+    // "undefined symbol" about a symbol defined in the object it had just read.
+    EXPECT_FALSE(hasExternNamed(*got, "wfn"))
+        << "a weak external whose default is defined HERE is not an import";
+    auto const* body = funcNamed(*got, "wfn");
+    ASSERT_NE(body, nullptr) << "the body must be reachable under its REAL name";
+    EXPECT_EQ(body->bytes.size(), 0x10u)
+        << "and it must be the BODY, sliced to the next boundary -- not an "
+           "empty row that merely carries the name";
+
+    // The binding is the record's own statement: a weak external is the name
+    // that YIELDS. Asserting it is the point -- a Global here would make an
+    // overridable name collide with the definition meant to override it.
+    EXPECT_EQ(bindingOf(*got, "wfn"), SymbolBinding::Weak);
+    EXPECT_EQ(bindingOf(*got, "Wbody"), SymbolBinding::Global)
+        << "the renamed body keeps the STRONG linkage the object gave it";
+
+    // One atom, two names -- the equal-offset alias rule, not two twin atoms.
+    auto const wfnId  = symIdOfName(*got, "wfn");
+    auto const bodyId = symIdOfName(*got, "Wbody");
+    ASSERT_TRUE(wfnId.has_value() && bodyId.has_value());
+    EXPECT_EQ(*wfnId, *bodyId)
+        << "the weak name and the default name address ONE body";
+    EXPECT_EQ(got->functions.size(), 2u)
+        << "two functions -- the shared body and `caller` -- never three";
+}
+
+// -- (b) A NON-section-backed default: fail loud, and name the missing fact ---
+//
+// gcc's encoding of a weak UNDEFINED reference: the default is an ABSOLUTE
+// symbol of value 0, so an unresolved reference tests as 0. DSS's link tier
+// cannot carry that -- ExternImport declares no binding on ANY format -- so the
+// reader REFUSES rather than silently promoting the name to a strong extern.
+TEST(CoffWeakExternal, AbsoluteDefaultIsAWeakUndefinedReferenceAndFailsLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"probe", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         // the ABSOLUTE(-1) zero fallback gcc emits
+         BSym{"Wabs", 0, 0xFFFFu, 0, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"maybe", 0, 0, kDtypeFunction, kClassWeakExternal, std::nullopt,
+              BWeakAux{"Wabs", kWeakSearchNoLibrary, std::nullopt}}});
+
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
+    EXPECT_TRUE(sawDetail(rep, "WEAK UNDEFINED REFERENCE"))
+        << "the diagnostic must name the construct, not just refuse";
+    EXPECT_TRUE(sawDetail(rep, "D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE"))
+        << "and it must point at the row that owns the missing carrier";
+}
+
+// -- (c) THE PIN THAT KEEPS THE DISPATCH TOTAL -------------------------------
+//
+// An unmodeled storage class must FAIL LOUD, not land in the block-label
+// bucket. Without this, the next class someone's toolchain emits is silently
+// reclassified -- which is exactly how class 105 became a strong extern.
+// IMAGE_SYM_CLASS_FAR_EXTERNAL (0x44) is a real spec class this reader does not
+// model, so the fixture asks a genuine question rather than a made-up one.
+TEST(CoffWeakExternal, UnmodeledStorageClassFailsLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"odd", 8, 1, 0, 0x44u /* FAR_EXTERNAL */, std::nullopt, std::nullopt}});
+
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
+    EXPECT_TRUE(sawDetail(rep, "storage class 68"));
+    EXPECT_TRUE(sawDetail(rep, "does not model"));
+}
+
+// A class the dispatch DOES model as bodiless keeps reading green -- the
+// enumeration must not have turned a working shape into a refusal. LABEL(6) is
+// what cl.exe stamps on its switch-case targets.
+TEST(CoffWeakExternal, ModeledBodilessStorageClassStillReadsGreen) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"LN4", 8, 1, 0, 6u /* IMAGE_SYM_CLASS_LABEL */, std::nullopt, std::nullopt}});
+
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    EXPECT_EQ(got->functions.size(), 1u)
+        << "an interior LABEL stays interior -- it must not split the function";
+}
+
+// -- (d) An unmodeled Characteristics value fails loud -----------------------
+//
+// ANTI_DEPENDENCY(4) means sym1 must NOT force sym2 to be pulled from an
+// archive. Reading it as a plain weak external would change which members a
+// static link pulls, so it is refused rather than defaulted.
+TEST(CoffWeakExternal, UnmodeledWeakExternCharacteristicsFailsLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x20, 0x90u), {}}},
+        {BSym{"Wbody", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"caller", 0x10, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"wfn", 0, 0, kDtypeFunction, kClassWeakExternal, std::nullopt,
+              BWeakAux{"Wbody", 4u /* ANTI_DEPENDENCY */, std::nullopt}}});
+
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawDetail(rep, "Characteristics 4"));
+    EXPECT_TRUE(sawDetail(rep, "ANTI_DEPENDENCY"));
+}
+
+// SEARCH_LIBRARY(2) and SEARCH_ALIAS(3) are modeled and reconstruct identically
+// to NOLIBRARY(1) -- they differ only in how hard a LINKER should look for sym1,
+// which is not a question DSS's object tier asks. Asserted so the vocabulary's
+// ACCEPTED half is pinned too, not only its refusal.
+TEST(CoffWeakExternal, EverySearchCharacteristicReconstructsTheSameRelation) {
+    for (std::uint32_t chars : {kWeakSearchNoLibrary, kWeakSearchLibrary,
+                                kWeakSearchAlias}) {
+        auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+        ASSERT_TRUE(loaded.target && loaded.format);
+        auto const obj = buildCoff(
+            {BSec{".text", kScnText, std::vector<std::uint8_t>(0x20, 0x90u), {}}},
+            {BSym{"Wbody", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+             BSym{"caller", 0x10, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+             BSym{"wfn", 0, 0, kDtypeFunction, kClassWeakExternal, std::nullopt,
+                  BWeakAux{"Wbody", chars, std::nullopt}}});
+        DiagnosticReporter rep;
+        auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+        ASSERT_TRUE(got.has_value()) << "characteristics=" << chars
+                                     << " errs=" << rep.errorCount();
+        EXPECT_EQ(bindingOf(*got, "wfn"), SymbolBinding::Weak)
+            << "characteristics=" << chars;
+        EXPECT_EQ(symIdOfName(*got, "wfn"), symIdOfName(*got, "Wbody"))
+            << "characteristics=" << chars;
+    }
+}
+
+// -- (e) Structural refusals on the record's own shape -----------------------
+
+TEST(CoffWeakExternal, WeakExternalWithNoAuxiliaryRecordFailsLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"wfn", 0, 0, kDtypeFunction, kClassWeakExternal, std::nullopt,
+              std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawDetail(rep, "carries no auxiliary record"));
+}
+
+TEST(CoffWeakExternal, WeakExternalTagIndexPastTheTableFailsLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"wfn", 0, 0, kDtypeFunction, kClassWeakExternal, std::nullopt,
+              BWeakAux{"", kWeakSearchNoLibrary, std::uint32_t{9999u}}}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawDetail(rep, "names default symbol index 9999"));
+}
+
+TEST(CoffWeakExternal, WeakExternalThatIsNotUndefFailsLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // 5.5.3 states UNDEF + value zero as part of the record's identity; a
+    // section-backed class-105 record is not a weak external, and decoding its
+    // aux as format 3 would read arbitrary bytes as a symbol index.
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x20, 0x90u), {}}},
+        {BSym{"Wbody", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"wfn", 0x10, 1, kDtypeFunction, kClassWeakExternal, std::nullopt,
+              BWeakAux{"Wbody", kWeakSearchNoLibrary, std::nullopt}}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawDetail(rep, "requires UNDEF"));
+}
+
+// PE/COFF 5.5.3 states the record's identity as a CONJUNCTION -- SectionNumber
+// UNDEF **and** Value zero -- and the reader spends one refusal arm on each.
+// The arm above is reached by a fixture carrying sectNum 1, which means the
+// UNDEF arm fires FIRST and its assertion ("requires UNDEF") is the only thing
+// that test has ever read. The Value arm had NO input that reached it: a
+// refusal nothing reaches is a refusal nobody has run, and it would have gone
+// on reading as covered forever. This cell supplies UNDEF **with** a non-zero
+// Value, so the second conjunct is the only one that can fire -- and asserts
+// the FIRST arm's sentence is ABSENT, because a fixture that trips both proves
+// nothing about which one is live.
+TEST(CoffWeakExternal, WeakExternalWithNonZeroValueFailsLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x20, 0x90u), {}}},
+        {BSym{"Wbody", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"wfn", 0x10 /* Value != 0 */, 0 /* UNDEF, so the first arm passes */,
+              kDtypeFunction, kClassWeakExternal, std::nullopt,
+              BWeakAux{"Wbody", kWeakSearchNoLibrary, std::nullopt}}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawDetail(rep, "requires zero"))
+        << "a class-105 record with a non-zero Value is not a weak external, "
+           "and reading its aux as Auxiliary Format 3 would decode arbitrary "
+           "bytes as a symbol index";
+    EXPECT_FALSE(sawDetail(rep, "requires UNDEF"))
+        << "this fixture must reach the VALUE arm and only it -- if the "
+           "SectionNumber arm also fired, the cell says nothing about which "
+           "refusal is live";
+}
+
+// The `auxSlot[tagIndex]` arm, which is NOT the past-the-table arm above it.
+// The only fixture that named a raw TagIndex used `9999u`, which is past the
+// table -- so the earlier bound check fired and this arm, the one that catches a
+// TagIndex landing INSIDE the table but on a slot that is not a symbol, had
+// never executed. The distinction is the whole reason both exist: `syms[tag]`
+// for an aux slot reads a default-constructed `Sym` (sectNum 0, empty name) and
+// would route the weak external down the UNDEFINED-default path, silently
+// turning a name that defers into a name that imports.
+//
+// The shape: an aux-BEARING static symbol occupies slot 0, so slot 1 is an
+// auxiliary record; the weak external names slot 1 as its default. `.text` is
+// deliberately NOT COMDAT, so Gate 3 never runs and the aux exists only to make
+// slot 1 an aux slot.
+TEST(CoffWeakExternal, WeakExternalTagIndexNamingAnAuxSlotFailsLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x20, 0x90u), {}}},
+        {BSym{"mystery", 0, 1, 0, kClassStatic, kSelAny, std::nullopt},
+         BSym{"Wbody", 0x10, 1, kDtypeFunction, kClassExternal, std::nullopt,
+              std::nullopt},
+         BSym{"wfn", 0, 0, kDtypeFunction, kClassWeakExternal, std::nullopt,
+              BWeakAux{"", kWeakSearchNoLibrary, std::uint32_t{1u}}}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawDetail(rep, "AUXILIARY slot"))
+        << "TagIndex 1 is inside the table but names `mystery`'s auxiliary "
+           "record, not a symbol";
+    EXPECT_FALSE(sawDetail(rep, "past the symbol table"))
+        << "this cell must reach the aux-slot arm, not the bound arm the "
+           "existing 9999u fixture already covers";
+}
+
+// A NAMELESS weak external. This arm used to be `if (s.name.empty()) continue;`
+// -- a silent DROP -- and nothing exercised it either way, so the behaviour was
+// whatever the line happened to say. It is now a refusal, and the reason is the
+// index: the record still occupies a slot in NumberOfSymbols, so a relocation
+// can name it, and a dropped record leaves that relocation retargeted to a
+// SymbolId the reader never produced. That surfaces as an unresolved symbol
+// against whoever merged the object, arbitrarily far from the malformed record
+// that caused it. Every other structural violation of 5.5.3 in this decoder
+// fails loud; this one now does too.
+TEST(CoffWeakExternal, NamelessWeakExternalFailsLoudRatherThanBeingDropped) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"Wbody", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"", 0, 0, kDtypeFunction, kClassWeakExternal, std::nullopt,
+              BWeakAux{"Wbody", kWeakSearchNoLibrary, std::nullopt}}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value())
+        << "a nameless WEAK_EXTERNAL must be refused, not skipped";
+    EXPECT_TRUE(sawDetail(rep, "EMPTY name"));
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
+}
+
+// -- (f) COMMON symbols: a DEFINITION, never an import -----------------------
+//
+// Found while making the storage-class dispatch total, and it is a silent wrong
+// answer in the worst direction. PE/COFF 5.4.2: an EXTERNAL record with UNDEF
+// section number and a NON-ZERO Value is a COMMON symbol whose Value is its
+// SIZE. The reader read it as an extern import -- so an object that DEFINES
+// storage was reconstructed as one that DEMANDS it, and the definition vanished
+// on re-emission. ✔MEASURED, mingw gcc 13.2.0 with -fcommon: a tentative
+// definition emits (sec 0)(ty 0)(scl 2) with Value 4.
+TEST(CoffWeakExternal, CommonSymbolFailsLoudRatherThanReadingAsAnImport) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"cvar", 4 /* SIZE, not an offset */, 0, 0, kClassExternal,
+              std::nullopt, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawDetail(rep, "COMMON symbol"));
+    // A zero-Value UNDEF external is an ordinary import and must stay one --
+    // the guard has to discriminate, not merely refuse UNDEF externals.
+    auto const ok = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"imp", 0, 0, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt}});
+    DiagnosticReporter rep2;
+    auto got2 = pe::readRelocatableObject(ok, *loaded.target, *loaded.format, rep2);
+    ASSERT_TRUE(got2.has_value()) << "errs=" << rep2.errorCount();
+    EXPECT_TRUE(hasExternNamed(*got2, "imp"));
+}
+
+// ══ THE SAME CLAIM AGAINST THE REAL PRODUCER ════════════════════════════════
+//
+// The fixtures above are hand-built from a MEASURED shape. These compile the
+// shape with the actual toolchain, so the reader is asked about bytes nobody in
+// this repo typed -- which name the aux TagIndex really points at, what
+// Characteristics gcc really writes, and what it really does to the body's name.
+// A transcription error in the fixtures above survives them and dies here.
+
+namespace {
+
+#if defined(_WIN32)
+// A mingw gcc on PATH, or nothing. LOCATE, then PROVE IT BUILDS -- the same
+// skip-vs-fail discipline as `native_probe::locateMsvcToolchain`
+// (D-TEST-NATIVE-ORACLE-INERT-ON-POSIX): a tool that is ABSENT is a skip, a tool
+// that is PRESENT and fails is a RED. Gating on `where gcc` alone would call a
+// broken install "absent" and quietly retire the witness.
+struct MingwGcc {
+    bool        usable = false;
+    std::string detail;
+    std::filesystem::path work;
+
+    // Compile `src` to `obj` with gcc. Returns false on any non-zero exit.
+    [[nodiscard]] bool compile(std::string const& source,
+                               std::string const& stem,
+                               std::filesystem::path& objOut) const {
+        auto const src = work / (stem + ".c");
+        { std::ofstream s{src}; s << source; }
+        objOut = work / (stem + ".o");
+        std::error_code ec;
+        std::filesystem::remove(objOut, ec);   // a stale .o must not vouch
+        std::string const cmd = "gcc -c -O0 -o \"" + objOut.string() + "\" \""
+                              + src.string() + "\" >nul 2>&1";
+        return std::system(cmd.c_str()) == 0
+            && std::filesystem::exists(objOut);
+    }
+};
+
+[[nodiscard]] MingwGcc locateMingwGcc(std::filesystem::path const& work) {
+    MingwGcc g;
+    g.work = work;
+    if (std::system("where gcc >nul 2>&1") != 0) {
+        g.detail = "no gcc on PATH -- the mingw witness is inert on this host";
+        return g;
+    }
+    // PRESENT: prove it can build before promising a red on failure.
+    std::filesystem::path probe;
+    MingwGcc probeGcc; probeGcc.work = work;
+    if (!probeGcc.compile("int p(void){return 0;}\n", "gcc_toolchain_check", probe)) {
+        g.detail = "gcc is on PATH but could not compile "
+                   "`int p(void){return 0;}` -- a shim with no toolchain behind "
+                   "it counts as ABSENT, not broken";
+        return g;
+    }
+    g.usable = true;
+    return g;
+}
+#endif  // _WIN32
+
+}  // namespace
+
+// A REAL mingw weak DEFINITION reads back with the body under its REAL name and
+// binding Weak -- not as "undefined symbol", which is what this reader produced
+// for every gcc weak definition before the WEAK_EXTERNAL arm existed.
+TEST(CoffWeakExternalNative, RealMingwWeakDefinitionBindsTheBodyToItsRealName) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "compiles a mingw-gcc COFF object; Windows only";
+#else
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-weak"};
+    auto const gcc = locateMingwGcc(scratch.path());
+    if (!gcc.usable) GTEST_SKIP() << gcc.detail;
+
+    std::filesystem::path obj;
+    ASSERT_TRUE(gcc.compile(
+        "__attribute__((weak)) int wfn(int x) { return x + 1; }\n"
+        "int caller(int x) { return wfn(x); }\n",
+        "weakdef", obj)) << "gcc is usable, so a failure here is a RED";
+
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const bytes = readFile(obj);
+    ASSERT_FALSE(bytes.empty());
+
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(bytes, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value())
+        << "a gcc weak definition must READ; errs=" << rep.errorCount();
+
+    // `wfn` is DEFINED by this object. Assert the resolved NAME and BINDING --
+    // "the read returned success" would have been satisfied by the old
+    // behaviour too, which read `wfn` as an undefined strong extern.
+    EXPECT_FALSE(hasExternNamed(*got, "wfn"))
+        << "`wfn` is defined in the very object being read";
+    auto const* body = funcNamed(*got, "wfn");
+    ASSERT_NE(body, nullptr) << "the body must carry its real name";
+    EXPECT_GT(body->bytes.size(), 0u);
+    EXPECT_EQ(bindingOf(*got, "wfn"), SymbolBinding::Weak)
+        << "a weak definition that reads back Global is one that can no longer "
+           "be overridden -- the whole content of the attribute";
+
+    // gcc's renamed body symbol is `.weak.<name>.<referrer>`; the reader must
+    // land BOTH names on ONE atom. Found by prefix, because the suffix is
+    // gcc's choice of referring function, not a stable contract.
+    ModuleSymbol const* renamed = nullptr;
+    for (auto const& s : got->symbols) {
+        if (s.name.rfind(".weak.wfn.", 0) == 0) { renamed = &s; break; }
+    }
+    ASSERT_NE(renamed, nullptr)
+        << "gcc renames the weak body; if this vanished, the shape changed";
+    EXPECT_EQ(renamed->symbol, *symIdOfName(*got, "wfn"))
+        << "the renamed body and the real name address ONE atom";
+    EXPECT_EQ(renamed->binding, SymbolBinding::Global);
+
+    // And `caller`'s call must reach that atom rather than a dangling id.
+    auto const* caller = funcNamed(*got, "caller");
+    ASSERT_NE(caller, nullptr);
+    ASSERT_EQ(caller->relocations.size(), 1u);
+    EXPECT_EQ(caller->relocations[0].target, *symIdOfName(*got, "wfn"))
+        << "the call to `wfn` binds to the atom `wfn` names";
+#endif
+}
+
+// A REAL mingw `__attribute__((weak, alias("target")))` -- the shape the WRITER
+// half emits -- reads back as the alias name on the target's body, weak.
+TEST(CoffWeakExternalNative, RealMingwWeakAliasBindsBothNamesToOneBody) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "compiles a mingw-gcc COFF object; Windows only";
+#else
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-weak"};
+    auto const gcc = locateMingwGcc(scratch.path());
+    if (!gcc.usable) GTEST_SKIP() << gcc.detail;
+
+    std::filesystem::path obj;
+    ASSERT_TRUE(gcc.compile(
+        "int real_fn(int x) { return x * 2; }\n"
+        "__attribute__((weak, alias(\"real_fn\"))) int alias_fn(int x);\n"
+        "int use(int x) { return alias_fn(x); }\n",
+        "weakalias", obj)) << "gcc is usable, so a failure here is a RED";
+
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(readFile(obj), *loaded.target,
+                                         *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+
+    EXPECT_FALSE(hasExternNamed(*got, "alias_fn"));
+    EXPECT_EQ(bindingOf(*got, "alias_fn"), SymbolBinding::Weak);
+    EXPECT_EQ(bindingOf(*got, "real_fn"), SymbolBinding::Global);
+    auto const aliasId = symIdOfName(*got, "alias_fn");
+    auto const realId  = symIdOfName(*got, "real_fn");
+    ASSERT_TRUE(aliasId.has_value() && realId.has_value());
+    EXPECT_EQ(*aliasId, *realId)
+        << "an alias and its target are two names for ONE body";
+#endif
+}
+
+// A REAL mingw weak UNDEFINED REFERENCE -- the half DSS's symbol model cannot
+// yet carry. It must be REFUSED with a diagnostic naming the missing fact, not
+// read as a strong extern. ⚠ THIS TEST RECORDS A GAP, NOT A CAPABILITY: gcc and
+// clang both LINK this construct and let the reference test as zero. When the
+// carrier lands, this pin flips to asserting the link succeeds.
+TEST(CoffWeakExternalNative, RealMingwWeakUndefinedReferenceIsRefusedNotDowngraded) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "compiles a mingw-gcc COFF object; Windows only";
+#else
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-weak"};
+    auto const gcc = locateMingwGcc(scratch.path());
+    if (!gcc.usable) GTEST_SKIP() << gcc.detail;
+
+    std::filesystem::path obj;
+    ASSERT_TRUE(gcc.compile(
+        "extern __attribute__((weak)) int maybe(void);\n"
+        "int probe(void) { return maybe ? maybe() : 42; }\n",
+        "weakundef", obj)) << "gcc is usable, so a failure here is a RED";
+
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(readFile(obj), *loaded.target,
+                                         *loaded.format, rep);
+    EXPECT_FALSE(got.has_value())
+        << "reading it green would mean the weak flag was silently dropped";
+    EXPECT_TRUE(sawDetail(rep, "WEAK UNDEFINED REFERENCE"));
+    EXPECT_TRUE(sawDetail(rep, "D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE"));
+#endif
+}
+
+// ★★★ THE END-TO-END WITNESS, AND IT EXERCISES THE EXACT CONSUMER THE OPERATOR
+// RULING NAMES: RE-EMISSION OF AN OBJECT DSS READ.
+//
+// [[D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE]] declined to build this writer on
+// 2026-08-05, on a measured premise: zero consumers, plus a named front-end
+// blocker ([[D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE]] -- the c-subset
+// cannot express `__attribute__((alias(...)))`, so a writer would be a path
+// nothing could invoke). That premise CHANGED, and this test is the proof: the
+// consumer is not a front end at all. gcc writes the alias, DSS READS it, DSS
+// RE-EMITS it, and a FOREIGN LINKER links the re-emitted object and RUNS it.
+//
+// Structural inspection is deliberately NOT this test. A foreign linker
+// resolving both names and a binary returning 42 is a claim no byte pin makes:
+// a symbol table can be perfectly shaped and still name the wrong index.
+//
+// ⚠⚠ WHY link.exe AND NOT gcc's OWN LINKER -- do NOT "fix" this to use gcc.
+// ✔MEASURED, with gcc's own object as the CONTROL, which is what makes the
+// attribution sound (a control that does not match the target is how two cycles
+// were lost once before):
+//   * mingw GNU ld 13.2.0 REFUSES a cross-object weak alias at every
+//     Characteristics value -- and refuses GCC'S OWN UNMODIFIED OBJECT
+//     identically, in both link orders and from an archive
+//     (`undefined reference to 'alias_fn'`). Its PE backend does not export a
+//     weak-external name across objects.
+//   * MSVC link.exe resolves it and the binary runs, for a DSS-written object
+//     and for a gcc-written one alike.
+// ⇒ the ld refusal is a NON-DSS CONFOUND, not a DSS defect: bar §A.3b makes the
+// test the DISJUNCTION, and link.exe is a reference that works. gcc's own
+// `weak, alias(...)` links only when the reference sits in the SAME translation
+// unit, where gcc has already bound it to the renamed `.weak.<n>.<n>` body and
+// the weak external is never consulted at all.
+TEST(CoffWeakExternalNative, ForeignLinkerConsumesADssReEmittedWeakAlias) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "links with MSVC link.exe; Windows only";
+#else
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-weak"};
+    auto const dir = scratch.path();
+    auto const gcc = locateMingwGcc(dir);
+    if (!gcc.usable) GTEST_SKIP() << gcc.detail;
+    auto const msvc = native_probe::locateMsvcToolchain(dir);
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    MsvcEnv const env{msvc.vcvars, dir};
+
+    // 1. gcc writes a weak alias of a strong definition.
+    std::filesystem::path src;
+    ASSERT_TRUE(gcc.compile(
+        "int real_fn(int x) { return x * 2; }\n"
+        "__attribute__((weak, alias(\"real_fn\"))) int alias_fn(int x);\n",
+        "aliassrc", src)) << "gcc is usable, so a failure here is a RED";
+
+    // 2. DSS reads it.
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    DiagnosticReporter rrep;
+    auto mod = pe::readRelocatableObject(readFile(src), *loaded.target,
+                                         *loaded.format, rrep);
+    ASSERT_TRUE(mod.has_value()) << "errs=" << rrep.errorCount();
+
+    // 3. DSS re-emits it. This is the arm that used to FAIL LOUD: the alias
+    //    binds Weak where its canonical binds Global.
+    DiagnosticReporter wrep;
+    auto const reemitted = pe::encode(*mod, *loaded.target, *loaded.format, wrep);
+    ASSERT_FALSE(reemitted.empty())
+        << "re-emitting a weak alias must now succeed; errs=" << wrep.errorCount();
+    EXPECT_EQ(wrep.errorCount(), 0u);
+    auto const objPath = dir / "dss_reemitted.obj";
+    {
+        std::ofstream o{objPath, std::ios::binary};
+        o.write(reinterpret_cast<char const*>(reemitted.data()),
+                static_cast<std::streamsize>(reemitted.size()));
+    }
+
+    // 4. A FOREIGN LINKER resolves BOTH names out of the DSS-written object.
+    //    `main` lives in a DIFFERENT translation unit, which is the whole
+    //    point: an alias only reachable from inside its own object would be
+    //    satisfied by gcc's internal renaming and would prove nothing about the
+    //    weak-external record.
+    auto const mainSrc = dir / "wmain.c";
+    {
+        std::ofstream m{mainSrc};
+        m << "int real_fn(int);\n"
+             "int alias_fn(int);\n"
+             "int main(void) { return real_fn(10) + alias_fn(11); }\n";
+    }
+    ASSERT_TRUE(env.run("cl /c /nologo wmain.c /Fowmain.obj"))
+        << "the reference C compiler must build the referencing TU";
+    ASSERT_TRUE(env.run("link /nologo /OUT:wmain.exe wmain.obj dss_reemitted.obj"))
+        << "link.exe must resolve BOTH `real_fn` and `alias_fn` out of the "
+           "DSS-written object -- a weak external whose aux TagIndex named the "
+           "wrong record, or whose Characteristics is not SEARCH_ALIAS, fails "
+           "here with LNK2019";
+    auto const exe = dir / "wmain.exe";
+    ASSERT_TRUE(std::filesystem::exists(exe));
+
+    // 5. ...and it RUNS. 10*2 + 11*2 = 42, which is only reachable if BOTH
+    //    names reached the SAME body.
+    auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE witness: a gcc weak alias, read by DSS, re-emitted by DSS as an "
+           "IMAGE_SYM_CLASS_WEAK_EXTERNAL + Auxiliary Format 3 record, linked by "
+           "a foreign linker and executed";
+    // ⓘ WHAT THIS WITNESS DOES **NOT** CATCH, stated because an earlier draft of
+    // this comment claimed it did and a mutant proved otherwise. Advancing the
+    // aux TagIndex by one still links and still exits 42: in this object the
+    // next symbol is `.weak.alias_fn.real_fn`, gcc's renamed body, which sits at
+    // the SAME address. An execution witness cannot separate two names for one
+    // address -- that is what `PeWriter.WeakAliasOfAStrongDefinitionEmitsA
+    // WeakExternalRecord` (TagIndex asserted by value) and
+    // `PeWriter.WeakAliasRoundTripsThroughDssOwnReader` are for, and both DO red
+    // on that mutant. Keep all three: this one proves a foreign toolchain
+    // accepts the record at all, which no byte pin can.
+#endif
+}
+
+// A weak DATA definition takes the same arm -- the weak-external route stages
+// its name in whatever section the default lives in, with no code/data gate.
+// Pinned separately because "no gate" is a property that a future edit can
+// remove without any function-shaped test noticing: `.data` and `.text` reach
+// the slicing loop through different predicates everywhere else in this reader.
+TEST(CoffWeakExternalNative, RealMingwWeakDataDefinitionBindsToItsRealName) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "compiles a mingw-gcc COFF object; Windows only";
+#else
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-weak"};
+    auto const gcc = locateMingwGcc(scratch.path());
+    if (!gcc.usable) GTEST_SKIP() << gcc.detail;
+
+    std::filesystem::path obj;
+    ASSERT_TRUE(gcc.compile(
+        "__attribute__((weak)) int wdata = 7;\n"
+        "int *get(void) { return &wdata; }\n",
+        "weakdata", obj)) << "gcc is usable, so a failure here is a RED";
+
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(readFile(obj), *loaded.target,
+                                         *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+
+    EXPECT_FALSE(hasExternNamed(*got, "wdata"))
+        << "the object DEFINES `wdata`; an import row here is the same defect "
+           "the function case had";
+    EXPECT_EQ(bindingOf(*got, "wdata"), SymbolBinding::Weak);
+    auto const* d = dataNamed(*got, "wdata");
+    ASSERT_NE(d, nullptr) << "the datum must be reachable under its real name";
+    // The initialiser is the strongest available property: a row that carries
+    // the name but not the bytes would satisfy every assertion above.
+    ASSERT_GE(d->bytes.size(), 4u);
+    EXPECT_EQ(d->bytes[0], 7u) << "the weak datum's initialiser, little-endian";
+#endif
 }

@@ -128,6 +128,24 @@ if ! printf '%s' "$DSS_MACOS_HOST" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; t
           echo "ssh-macos: cannot resolve '$DSS_MACOS_HOST' from this host."
           echo "  Most likely: the Mac is OFF or asleep — personal machine, not CI. Ask before waking it."
           echo "  Or:          no mDNS responder here (usual under WSL). Put a literal IP in DSS_MACOS_HOST."
+          # ★★ AND THE THIRD CAUSE IS THE ONE THAT DEFEATS THE ADVICE ON THE LINE
+          # ABOVE, WHICH IS WHY IT IS PRINTED RATHER THAN LEFT TO BE REDISCOVERED.
+          # D-SCRIPT-MACOS-HOST-OVERRIDE-DOES-NOT-CROSS-THE-WSLENV-BOUNDARY:
+          # Windows→WSL forwards ONLY the variables `WSLENV` names, so
+          # `$env:DSS_MACOS_HOST=...; wsl.exe -e bash ...` arrives here UNSET and
+          # this script falls back to the `.local` name from `.secrets/macos.env`.
+          # ✔MEASURED 2026-08-21: `DSS_MACOS_HOST=[<UNSET>] WSLENV=[<UNSET>]`
+          # inside WSL after setting it in PowerShell — and mDNS then answered for
+          # the rsync and failed for the build minutes later, so the run got FAR
+          # enough to look like the override had worked.
+          # ⓘ `run-gate.sh` already solves exactly this for CTEST_PARALLEL_LEVEL by
+          # APPENDING to WSLENV; the same one-liner is the fix at any call site.
+          if [ -n "${WSL_DISTRO_NAME:-}${WSL_INTEROP:-}" ]; then
+            echo "  Or:          you are under WSL and set DSS_MACOS_HOST in the WINDOWS parent."
+            echo "               Windows→WSL forwards only what WSLENV names. Prepend it:"
+            echo '                 $env:DSS_MACOS_HOST="<ip>"; $env:WSLENV="DSS_MACOS_HOST"; wsl.exe -e bash ...'
+            echo "               (or export it inside the WSL shell instead)."
+          fi
         } >&2
         exit 3
     fi

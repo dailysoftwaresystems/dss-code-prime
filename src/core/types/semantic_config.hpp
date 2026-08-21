@@ -86,6 +86,11 @@ inline constexpr EnumNameTable<DeclarationKind, 4> kDeclarationKindTable{{{
     { DeclarationKind::Type,     "type"     },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kDeclarationKindTable);
+
 [[nodiscard]] constexpr std::string_view
 declarationKindName(DeclarationKind k) noexcept {
     return kDeclarationKindTable.name(k);
@@ -198,6 +203,48 @@ struct DSS_EXPORT EnumUnderlyingTypeSpec {
 // The loader rejects a `fieldChildren` whose declaration rule is not also in
 // `scopes` via `C_InvalidSemantics`.
 enum class CompositeKind : std::uint8_t { Struct, Union, Enum };
+
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-
+//    THEIR-CLOSED-SET) ──────────────────────────────────────────────────────
+//
+// ★★ WHAT THIS REPLACED. Until this table existed, `CompositeKind` had NO name
+// table and NO `fromName` — the config-facing spellings lived in two separate
+// inline `k == "struct" / "union" / "enum"` chains in `grammar_schema_json.cpp`
+// (one on `declarations[].fieldChildren.compositeKind`, one on the tag-reference
+// row's `compositeKind`), with FIVE sentences beside them restating the set.
+// Seven owners of three spellings.
+//
+// ★★★ AND ONE OF THE SEVEN HAD ALREADY DRIFTED, WHICH IS WHY THIS IS A DEFECT
+// AND NOT A TIDINESS PREFERENCE. ✔MEASURED 2026-08-21: the `fieldChildren`
+// type-error arm read *"'compositeKind' must be a string 'struct' or 'union'"*
+// while the chain three lines below it accepted `enum` as well. A schema author
+// who wrote a non-string there — `compositeKind: 5` — was told BY NAME that
+// `enum` is not allowed, by the same loader that takes it. Its two sibling arms
+// named all three, so the file disagreed with itself and nothing could see it:
+// the census that swept this class harvests `EnumNameTable`s, `…FromName`
+// if-chains and `std::array` key tables, and an INLINE chain is none of those.
+//
+// ⚠ THE ROW ORDER FIXES `name()`'s FALL-BACK, and `Struct` is row 0 — matching
+// `FieldChildrenDescriptor::compositeKind`'s own default, so an unnamed value
+// renders as the value it would actually behave as. Every enumerator IS listed
+// (there is no sentinel), so `name()` is the right helper here and `nameOrEmpty`
+// would answer a question this enum cannot ask.
+inline constexpr EnumNameTable<CompositeKind, 3> kCompositeKindTable{{{
+    { CompositeKind::Struct, "struct" },
+    { CompositeKind::Union,  "union"  },
+    { CompositeKind::Enum,   "enum"   },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kCompositeKindTable);
+
+[[nodiscard]] constexpr std::string_view
+compositeKindName(CompositeKind k) noexcept {
+    return kCompositeKindTable.name(k);
+}
+[[nodiscard]] constexpr std::optional<CompositeKind>
+compositeKindFromName(std::string_view s) noexcept {
+    return kCompositeKindTable.fromName(s);
+}
+
 struct DSS_EXPORT FieldChildrenDescriptor {
     RuleId        rule{};                          // the field-declaration rule
     std::string   ruleName;                        // source spelling, for diagnostics
@@ -1044,54 +1091,103 @@ enum class BuiltinLowering : std::uint16_t {
     Bswap,
 };
 
+// ── THE ONE OWNER OF THE `lowering` SPELLINGS ────────────────────────────
+//
+// ★★★ D-TEXT-TIER-READERS-KEEP-HAND-WRITTEN-FROMNAME-IF-CHAINS. This was a
+// 30-arm `if (name == "…")` chain and it was the ONLY place the spellings
+// existed, which made it look like a single owner and hid the real defect one
+// level up: the grammar loader's refusal for an unrecognized `lowering`
+// (`unknown builtin lowering '<x>'`) NAMED NO ACCEPTED SET AT ALL. A config
+// author who wrote `popcnt` was told their name was wrong and never told what
+// the loader would have taken — for a closed set of THIRTY verbs, most of them
+// `stdc_*` names that differ by one word. Nothing could render the set, because
+// an if-chain is not enumerable.
+//
+// The table makes it enumerable, so the refusal renders from the same rows the
+// lookup walks and cannot narrow or go stale.
+//
+// ⚠ `None` IS DELIBERATELY NOT A ROW. It is the "absent" sentinel (an ordinary
+// builtin carries no `lowering` key at all), and listing it would make
+// `fromName("none")` RESOLVE — handing a document a spelling that means "this
+// knob does nothing" while reading as a declaration. That is exactly the hole
+// `enum_name_table.hpp`'s `nameOrEmpty` note describes, so the projection below
+// uses `nameOrEmpty`: an unlisted value renders EMPTY rather than wearing row
+// 0's spelling (`"umulh"`), which is what `name()` would have done.
+inline constexpr EnumNameTable<BuiltinLowering, 30> kBuiltinLoweringTable{{{
+    { BuiltinLowering::UMulHigh,              "umulh"                    },
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS)
+    { BuiltinLowering::AtomicCas,             "atomic_cas"               },
+    // FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): the explicit-order accessors.
+    { BuiltinLowering::AtomicLoad,            "atomic_load"              },
+    { BuiltinLowering::AtomicStore,           "atomic_store"             },
+    // D-CSUBSET-ATOMIC-FENCE: __sync_synchronize — the standalone seq_cst fence.
+    { BuiltinLowering::AtomicFence,           "atomic_fence"             },
+    // C99 _Complex (D-CSUBSET-COMPLEX §7.3): the complex-builtin lowerings.
+    { BuiltinLowering::ComplexMake,           "complex_make"             },
+    { BuiltinLowering::ComplexReal,           "complex_real"             },
+    { BuiltinLowering::ComplexImag,           "complex_imag"             },
+    { BuiltinLowering::ComplexConj,           "complex_conj"             },
+    { BuiltinLowering::Barrier,               "barrier"                  },
+    { BuiltinLowering::SehExceptionCode,      "seh_exception_code"       },
+    { BuiltinLowering::SehExceptionInfo,      "seh_exception_info"       },
+    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 width-blind bit-count
+    // verbs shared by the 6 __builtin_{popcount,clz,ctz}{,ll} rows — the width
+    // lives in the param core (U32/U64), read by the hir_to_mir arm.
+    { BuiltinLowering::Popcount,              "popcount"                 },
+    { BuiltinLowering::Clz,                   "clz"                      },
+    { BuiltinLowering::Ctz,                   "ctz"                      },
+    // D-CSUBSET-INTRINSIC-BSWAP: the byte-reverse verb shared by the 3
+    // `_byteswap_*` rows (width-blind, like popcount/clz/ctz).
+    { BuiltinLowering::Bswap,                 "bswap"                    },
+    // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 `stdc_*` op lowerings,
+    // each shared by that op's 4 width rows.
+    { BuiltinLowering::StdcLeadingZeros,      "stdc_leading_zeros"       },
+    { BuiltinLowering::StdcLeadingOnes,       "stdc_leading_ones"        },
+    { BuiltinLowering::StdcTrailingZeros,     "stdc_trailing_zeros"      },
+    { BuiltinLowering::StdcTrailingOnes,      "stdc_trailing_ones"       },
+    { BuiltinLowering::StdcFirstLeadingZero,  "stdc_first_leading_zero"  },
+    { BuiltinLowering::StdcFirstLeadingOne,   "stdc_first_leading_one"   },
+    { BuiltinLowering::StdcFirstTrailingZero, "stdc_first_trailing_zero" },
+    { BuiltinLowering::StdcFirstTrailingOne,  "stdc_first_trailing_one"  },
+    { BuiltinLowering::StdcCountZeros,        "stdc_count_zeros"         },
+    { BuiltinLowering::StdcCountOnes,         "stdc_count_ones"          },
+    { BuiltinLowering::StdcHasSingleBit,      "stdc_has_single_bit"      },
+    { BuiltinLowering::StdcBitWidth,          "stdc_bit_width"           },
+    { BuiltinLowering::StdcBitFloor,          "stdc_bit_floor"           },
+    { BuiltinLowering::StdcBitCeil,           "stdc_bit_ceil"            },
+}}};
+// ★ THE UNDER-FILL GUARD, and for a 30-row hand-written table it is not
+// ceremony: `EnumNameTable<BuiltinLowering, 30>` with 29 initializers is legal
+// C++ — it value-initializes the tail, so row 29 becomes
+// `{ BuiltinLowering(0), "" }` and `builtinLoweringFromName("")` starts
+// RESOLVING, to `None`, which is the sentinel meaning "this knob does nothing".
+// A dropped row would therefore not break the build; it would make an empty
+// `"lowering": ""` load clean and silently disable the intrinsic.
+//
+// ⓘ This check WAS written out inline here, because the only macro that could
+// express it lived in `config_key_vocabulary.hpp`, whose own header states it
+// must never be included by a public type header — and this is one. It now
+// routes through `DSS_CHECK_ENUM_NAME_TABLE`, which lives in the
+// dependency-free `enum_name_table.hpp` beside the template it checks
+// (D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE). ★ The predicate
+// also catches a case the inline version could not: two rows sharing an
+// ENUMERATOR, where the second is unreachable through `findName` and nothing
+// says so.
+DSS_CHECK_ENUM_NAME_TABLE(kBuiltinLoweringTable);
+
 // Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
 // name (rejected with a diagnostic at the decode site) -- distinct from "absent"
 // (an ordinary builtin, which never carries a `lowering` key).
 [[nodiscard]] inline std::optional<BuiltinLowering>
 builtinLoweringFromName(std::string_view name) noexcept {
-    if (name == "umulh")      { return BuiltinLowering::UMulHigh;  }
-    if (name == "atomic_cas") { return BuiltinLowering::AtomicCas; }
-    // FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): the explicit-order scalar accessors.
-    if (name == "atomic_load")  { return BuiltinLowering::AtomicLoad;  }
-    if (name == "atomic_store") { return BuiltinLowering::AtomicStore; }
-    // D-CSUBSET-ATOMIC-FENCE: __sync_synchronize — the standalone seq_cst fence.
-    if (name == "atomic_fence") { return BuiltinLowering::AtomicFence; }
-    // C99 _Complex (D-CSUBSET-COMPLEX §7.3): the complex-builtin lowerings.
-    if (name == "complex_make") { return BuiltinLowering::ComplexMake; }
-    if (name == "complex_real") { return BuiltinLowering::ComplexReal; }
-    if (name == "complex_imag") { return BuiltinLowering::ComplexImag; }
-    if (name == "complex_conj") { return BuiltinLowering::ComplexConj; }
-    if (name == "barrier")    { return BuiltinLowering::Barrier;   }
-    if (name == "seh_exception_code") { return BuiltinLowering::SehExceptionCode; }
-    if (name == "seh_exception_info") { return BuiltinLowering::SehExceptionInfo; }
-    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 bit-count verbs shared by
-    // the 6 __builtin_{popcount,clz,ctz}{,ll} rows (the width lives in the param
-    // core U32/U64, read by the hir_to_mir arm — the lowering tag is width-blind).
-    if (name == "popcount") { return BuiltinLowering::Popcount; }
-    if (name == "clz")      { return BuiltinLowering::Clz;      }
-    if (name == "ctz")      { return BuiltinLowering::Ctz;      }
-    // D-CSUBSET-INTRINSIC-BSWAP: the byte-reverse verb shared by the 3
-    // `_byteswap_*` rows (the width lives in the param core U16/U32/U64, read by
-    // the hir_to_mir arm — the lowering tag is width-blind, like popcount/clz/ctz).
-    if (name == "bswap")    { return BuiltinLowering::Bswap;    }
-    // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 `stdc_*` op lowerings
-    // (shared by each op's 4 width rows — the width lives in the param core, read
-    // by the hir_to_mir arm; the lowering tag is width-blind, like popcount/clz/ctz).
-    if (name == "stdc_leading_zeros")       { return BuiltinLowering::StdcLeadingZeros; }
-    if (name == "stdc_leading_ones")        { return BuiltinLowering::StdcLeadingOnes; }
-    if (name == "stdc_trailing_zeros")      { return BuiltinLowering::StdcTrailingZeros; }
-    if (name == "stdc_trailing_ones")       { return BuiltinLowering::StdcTrailingOnes; }
-    if (name == "stdc_first_leading_zero")  { return BuiltinLowering::StdcFirstLeadingZero; }
-    if (name == "stdc_first_leading_one")   { return BuiltinLowering::StdcFirstLeadingOne; }
-    if (name == "stdc_first_trailing_zero") { return BuiltinLowering::StdcFirstTrailingZero; }
-    if (name == "stdc_first_trailing_one")  { return BuiltinLowering::StdcFirstTrailingOne; }
-    if (name == "stdc_count_zeros")         { return BuiltinLowering::StdcCountZeros; }
-    if (name == "stdc_count_ones")          { return BuiltinLowering::StdcCountOnes; }
-    if (name == "stdc_has_single_bit")      { return BuiltinLowering::StdcHasSingleBit; }
-    if (name == "stdc_bit_width")           { return BuiltinLowering::StdcBitWidth; }
-    if (name == "stdc_bit_floor")           { return BuiltinLowering::StdcBitFloor; }
-    if (name == "stdc_bit_ceil")            { return BuiltinLowering::StdcBitCeil; }
-    return std::nullopt;
+    return kBuiltinLoweringTable.fromName(name);
+}
+
+// The write direction, which did not exist and is what a diagnostic naming the
+// verb it FOUND needs. `nameOrEmpty`, never `name()` — see the table's note.
+[[nodiscard]] inline constexpr std::string_view
+builtinLoweringName(BuiltinLowering lowering) noexcept {
+    return kBuiltinLoweringTable.nameOrEmpty(lowering);
 }
 
 // SE6: a built-in function the engine binds into a CU-wide "builtins"

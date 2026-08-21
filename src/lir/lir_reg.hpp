@@ -30,15 +30,48 @@ enum class LirRegClass : std::uint8_t {
     Flags   = 4,  // condition flags (single per arch)
 };
 
+// ── THE SPELLINGS HAVE ONE OWNER, AND IT IS `kTargetRegClassTable` ────────
+// D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET.
+//
+// ★★ WHAT THIS REPLACED, AND WHY THE EXISTING PIN DID NOT COVER IT. These two
+// helpers were a hand-written `switch` and a hand-written if-chain over exactly
+// the five spellings `kTargetRegClassTable` already owns — three owners of one
+// vocabulary. The `static_assert`s below have pinned the two enums since ML5,
+// and they pin **VALUES ONLY**: rename the vector class's spelling in the target
+// table and every one of them still passes, while `.target.json` starts
+// declaring a class
+// the `.dsslir` text parser refuses and the `.dsslir` writer emits a name the
+// target loader refuses. Two file formats silently disagreeing, with a green
+// suite — the exact failure mode this class describes.
+//
+// ★ WHY DELEGATE RATHER THAN GIVE `LirRegClass` ITS OWN TABLE + AN EQUALITY
+// ASSERT. The tiers ARE separate and stay separate: two ENUMS, two tiers, and
+// the include direction is unchanged (this header already included
+// `target_schema.hpp` for the synchrony pin, and `core/` still does not know
+// LIR exists). But the SPELLING SET is not two facts — the header comment on
+// `TargetRegClass` has always said so in words ("both enums declare the same
+// set"), and the whole point of `%v.3:gpr` matching `"class": "gpr"` is that a
+// register class has ONE name across the pipeline. A second table plus an
+// assert that the two agree is still two owners with a gate bolted on; the bar's
+// ruling is that a fact with an owner does not get a second owner. So the enum
+// stays LIR-tier and the names come from the one table that has them.
+//
+// ⚠ The `unknown` fall-back is UNCHANGED. `kTargetRegClassTable`'s row 0 is
+// `{None, "none"}`, so `EnumNameTable::name`'s row-0 fall-back renders exactly
+// the `"none"` this switch used to return for an out-of-range value.
 [[nodiscard]] constexpr std::string_view lirRegClassName(LirRegClass c) noexcept {
+    // The `-Werror=switch` backstop, and it owns no spelling: a new LIR class
+    // with no `case` fails the BUILD rather than becoming a value whose name
+    // silently comes back as `none`.
     switch (c) {
-        case LirRegClass::None:  return "none";
-        case LirRegClass::GPR:   return "gpr";
-        case LirRegClass::FPR:   return "fpr";
-        case LirRegClass::VR:    return "vr";
-        case LirRegClass::Flags: return "flags";
+        case LirRegClass::None:
+        case LirRegClass::GPR:
+        case LirRegClass::FPR:
+        case LirRegClass::VR:
+        case LirRegClass::Flags:
+            break;
     }
-    return "none";
+    return targetRegClassName(static_cast<TargetRegClass>(c));
 }
 
 // Inverse of `lirRegClassName` — consumed by the `.dsslir` text
@@ -46,12 +79,9 @@ enum class LirRegClass : std::uint8_t {
 // Returns `std::nullopt` on an unrecognized name (parser-side fatal).
 [[nodiscard]] constexpr std::optional<LirRegClass>
 lirRegClassFromName(std::string_view s) noexcept {
-    if (s == "none")  return LirRegClass::None;
-    if (s == "gpr")   return LirRegClass::GPR;
-    if (s == "fpr")   return LirRegClass::FPR;
-    if (s == "vr")    return LirRegClass::VR;
-    if (s == "flags") return LirRegClass::Flags;
-    return std::nullopt;
+    auto const t = targetRegClassFromName(s);
+    if (!t.has_value()) return std::nullopt;
+    return static_cast<LirRegClass>(*t);
 }
 
 // A register operand. Pre-regalloc: `isPhysical == false`, `id` is
@@ -98,6 +128,31 @@ static_assert(static_cast<int>(LirRegClass::GPR)   == static_cast<int>(TargetReg
 static_assert(static_cast<int>(LirRegClass::FPR)   == static_cast<int>(TargetRegClass::FPR));
 static_assert(static_cast<int>(LirRegClass::VR)    == static_cast<int>(TargetRegClass::VR));
 static_assert(static_cast<int>(LirRegClass::Flags) == static_cast<int>(TargetRegClass::Flags));
+
+// ★★ AND THE TOTALITY OF THE MAPPING, WHICH THE FIVE ABOVE DO NOT COVER.
+// Each of them names ONE pair, so they say nothing about a SIXTH row appearing
+// in `kTargetRegClassTable`: `targetRegClassFromName` would resolve it, this
+// header's `lirRegClassFromName` would hand the caller a `static_cast` of a
+// value no `LirRegClass` enumerator has, and `LirReg::classKind` would carry a
+// number the LIR tier cannot name. The `-Werror=switch` backstop in
+// `lirRegClassName` catches the reverse direction (a new LIR class), and this
+// catches the forward one — so neither table can grow alone.
+//
+// It walks the ROWS, so it needs no maintenance when a class is added: the new
+// row either has a numerically-equal `LirRegClass` (and its spelling round-trips
+// through both helpers) or this build stops.
+static_assert([] {
+    for (auto const& row : kTargetRegClassTable.rows) {
+        auto const back = lirRegClassFromName(row.second);
+        if (!back.has_value()) return false;                 // spelling lost
+        if (static_cast<int>(*back) != static_cast<int>(row.first)) return false;
+        if (lirRegClassName(*back) != row.second) return false;  // round trip
+    }
+    return true;
+}(), "every kTargetRegClassTable row must map to a numerically-equal "
+     "LirRegClass whose name round-trips — the LIR tier and the target tier "
+     "share ONE spelling set, and a row present in only one of them makes the "
+     ".dsslir text format and .target.json disagree in silence");
 
 // Factory helpers. The substrate emits virtual regs only; physical-
 // reg creation will be gated behind a passkey when the ML6 regalloc

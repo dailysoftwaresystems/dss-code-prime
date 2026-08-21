@@ -512,6 +512,25 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/scripts/check-scripts-index/check-scripts-index.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    # Closed-vocabulary well-formedness gate (2026-08-21 -
+    # D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE).
+    # An `EnumNameTable<E, N>` written with N-1 initializers COMPILES: the missing
+    # row value-initializes to `{E(0), ""}`, so `fromName("")` starts resolving --
+    # and for a vocabulary whose enumerator 0 is a sentinel, an empty string then
+    # silently selects "this knob does nothing". The predicate that refuses that
+    # shape lives beside the template; this entry refuses a DECLARATION that never
+    # invokes it, which is the hazard the predicate alone cannot cover.
+    # * It reads the declarations, never a hand-maintained list -- the correction
+    #   `check-diagnostic-codes.py` already records: a hand-kept pin can only check
+    #   rows somebody remembered to add to it.
+    # * It self-tests on every run (7 arms, each asserting the MESSAGE of the
+    #   refusal it names), so this entry cannot pass without proving it can fail.
+    add_test(
+        NAME enum_name_table_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-enum-name-table-guards/check-enum-name-table-guards.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     # Citation-stability guard (2026-08-19 — D-PLANS-CITATION-LINE-NUMBERS-SILENTLY-INVALIDATED).
     # A `path:line` citation is a claim about a file that nothing rechecks: insert
     # one line above it and it silently points at unrelated prose while still
