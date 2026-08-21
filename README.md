@@ -42,6 +42,21 @@ DSS Code Prime already compiles and runs **real, unmodified, production software
   | `--config=release` | **38.0 s** | 16.6 s | 6,904,848 B |
 
   The figure is the compiler's own `--time` report, not a wrapper's stopwatch. The release build turns **4m08s of attributed CPU into 31.1 s of phase wall — 8.0× parallel** (the front-half CU stage runs 103 jobs at 30.2× concurrency). ⚠ **Quote both rows or neither:** the optimizer is the difference between them, and a debug-pipeline number presented as "SQLite compiles in 23 seconds" would be the release-only omission this project has been bitten by before. ⚠ The staged upstream tree these figures ran against carries **no recorded revision id**, so they are a this-host, this-day measurement and not a benchmark you can reproduce against a different checkout.
+- **Benchmarked head-to-head against GCC and MSVC, on SQLite's own benchmark, and we are behind.** The subject is `test/speedtest1.c` — SQLite's own performance program — linked against the same **103 full-source translation units**, *not* the amalgamation. (Upstream ships no full-source recipe for it: both `main.mk` and `Makefile.msc` build `speedtest1` from `sqlite3.c`. So the TU list is derived from the full-source `sqlite3d` recipe and has its one artifact TU substituted.) Native Windows 11 host, 32 logical CPUs, all three compilers on the same machine against the same source tree, cold builds (fresh object directory per repeat), median of 3; run times median of 5 after an uncounted warm-up, monotonic clock:
+
+  | compiler | optimization | build −j1 | build −j4 | `speedtest1 --size 25` | parallelism |
+  |---|---|---|---|---|---|
+  | **DSS Code Prime** | `--config=release` | 66.56 s | **34.81 s** | 3.473 s | in-process CU thread pool (`--jobs N`) |
+  | gcc 13.2.0 (MinGW-W64) | `-O2` | 26.41 s | **7.12 s** | 2.473 s | 4 × `gcc -c` processes + link |
+  | MSVC `cl.exe` (VS 2026) | `/O2` | 13.26 s | **4.31 s** | 2.976 s | 4 × `cl /c` processes + link |
+
+  **Read this as the gap it is.** At `-j4` DSS takes **4.9× gcc's** and **8.1× MSVC's** compile time, and its output runs **1.40× slower than gcc's** and **1.17× slower than MSVC's**. We publish it because a compiler that only reports the axes it wins is not a measurement, it is marketing.
+
+  ⚠ **The parallel mechanism is deliberately not equalized, and the sharpest number is the one that exposes.** DSS compiles every CU inside *one* process on a worker-thread pool; the references are four separate processes. Going 1 → 4 workers, DSS scales **1.91×** where gcc scales **3.71×** and MSVC **3.08×** — by Amdahl that puts roughly **a third of a full-source release build on a serial path**, which is a specific, addressable target rather than a vague "it is slower" (`D-PERF-CU-POOL-SCALES-HALF-AS-WELL-AS-SEPARATE-PROCESSES`).
+
+  ✅ **What the benchmark also proves is correctness.** It runs `speedtest1 --verify`, whose hash upstream describes as being there "to verify that compilation is not miscompiled" — and **all three binaries produced the same hash**. Arms whose output disagrees are refused outright rather than reported side by side, because three programs computing different things do not have comparable times.
+
+  Reproduce it: [`real-examples/c/sqlite/benchmark-speedtest1.ps1`](real-examples/c/sqlite/benchmark-speedtest1.sh) (`.sh` twin for POSIX hosts; both share one derivation and one measurement core). ⚠ These figures are this-host and this-day, against upstream SQLite `6f1110c` — a compile-time number quoted without its host, its TU count and its upstream revision is not comparable to anything.
 - **The whole pipeline is in-tree and complete**: tokenizer → parser → semantic analysis → three-tier IR (HIR → MIR → LIR) → register allocation → **its own assembler** (x86_64 + arm64 byte encoding with a round-trip oracle) → **its own linker** (ELF / PE / Mach-O, static and dynamic).
 
 | Capability | Status |

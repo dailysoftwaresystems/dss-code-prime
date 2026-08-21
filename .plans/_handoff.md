@@ -365,6 +365,77 @@ second pattern beside the one P23 built and pinned.**
 
 ---
 
+## 0.0000000000000000000000000000 ★★★ THE speedtest1 BENCHMARK — DSS BESIDE gcc AND MSVC, ON ONE MACHINE, AND WE ARE BEHIND
+
+**Operator request 2026-08-21:** *"can you run a benchmark against gcc and msvc over test/speedtest1.c …
+we put the comparison in our readme"*, then *"full source please"*. Delivered: `real-examples/c/sqlite/benchmark-speedtest1.{sh,ps1}`
++ the shared measurement core `speedtest1_bench.py`, and the README section they feed.
+
+### The subject, and why it had to be derived
+
+`test/speedtest1.c` **is** SQLite's own performance program. ⚠ **Upstream ships NO full-source recipe for
+it** — `main.mk`'s `speedtest1` target and `Makefile.msc`'s `speedtest1.exe` BOTH link the amalgamation
+(`sqlite3.c` / `$(SQLITE3C)`). ✔MEASURED by reading both files. So the TU list is derived from the
+full-source CLI target `sqlite3d` (`shell.c` + `$(LIBOBJS0)`) through `base-harness.sh`'s
+`dss_bh_emit_recipe` — the derivation this repository already proves daily — and then has its ONE
+artifact TU substituted: `shell.c` out, `speedtest1.c` in. **103 TUs.** The substitution is asserted,
+never assumed (`--selftest`, and R3 in the core refuses a surviving `shell.c`, two `speedtest1.c`, or a
+`sqlite3.c` anywhere in the set).
+
+### The numbers — native Windows 11, 32 logical CPUs, one machine, one source tree
+
+Cold builds (fresh object dir per repeat), median of 3; runs median of 5 after an uncounted warm-up;
+`time.monotonic()` only. Upstream SQLite `6f1110c`.
+
+| compiler | optimization | build `-j1` | build `-j4` | `speedtest1 --size 25` |
+| --- | --- | --- | --- | --- |
+| DSS Code Prime | `--config=release` | 66.56 s | **34.81 s** | 3.473 s |
+| gcc 13.2.0 MinGW-W64 | `-O2` | 26.41 s | **7.12 s** | 2.473 s |
+| MSVC `cl.exe` | `/O2` | 13.26 s | **4.31 s** | 2.976 s |
+
+At `-j4` DSS is **4.9× gcc** and **8.1× MSVC** to compile, and its output runs **1.40× slower than
+gcc's**, **1.17× slower than MSVC's**. ★ That is published as-is. A compiler that reports only the axes
+it wins is not measuring.
+
+### ★★ THE FINDING THE TABLE ALONE DOES NOT CARRY
+
+1 → 4 workers: DSS **1.91×**, gcc **3.71×**, MSVC **3.08×**. Inverting Amdahl on 1.91× at 4 gives a
+parallel fraction of **~0.64** ⇒ **~36% of a full-source release build is on a SERIAL path**. That is a
+place to look rather than an adjective, and it is why this is a registry row:
+`D-PERF-CU-POOL-SCALES-HALF-AS-WELL-AS-SEPARATE-PROCESSES` (🔵 DISCLOSED — the defect pre-dates the
+commit; nothing in it touches `src/`). ⚠ **Do not let it absorb the throughput gap** — "why the pool
+stops scaling" and "why one CU is slow" are two questions and one row each.
+
+### ✅ AND IT IS A CORRECTNESS CHECK, USING UPSTREAM'S OWN INSTRUMENT
+
+The run passes `--verify`, which upstream's own comment describes as the *"Hash algorithm used to verify
+that compilation is not miscompiled"*. **All three binaries produced the same hash.** Arms whose
+normalized output disagrees are REFUSED outright (R6) rather than tabulated — three programs computing
+different things do not have comparable times.
+
+### ⚠ SIX DEFECTS THE PROVING RUN FOUND, EACH FIXED, TWO WORTH CARRYING
+
+* **`libsqlite3.a` built without `USE_AMALGAMATION=0` holds ONE member, `sqlite3.o`** — the amalgamation,
+  under exactly the right filename. The TU floor caught it only because 1 ≪ 100. ★ A count can never say
+  WHICH thing is in the archive, so the driver now asserts the amalgamation object's ABSENCE **by name**.
+  This is the one that would have silently inverted the whole subject.
+* **`wslpath -w` is NOT idempotent and fails SILENTLY.** Applied to an already-Windows path it returns
+  `CSourcesqlitex.c` — every separator gone, exit 0. Caught only because R1 checks the TUs exist.
+* Also: the include list needed the generated-header dir (`-I.` in the recipe is relative to `$BLD` and is
+  correctly dropped); `--output D` places the artifact at `D/<object-format>/name`, so the path is now READ
+  from the build's own `dss-code-prime: artifact <spec> <path>` line instead of guessed; `cl.exe` must be
+  resolved to an ABSOLUTE path out of the harvested vcvars PATH, because `CreateProcess` resolves the
+  executable against the PARENT's PATH and the symptom reads as "MSVC is not installed"; and an arm that
+  RAISES must be a named arm failure, not a dead run — one unresolvable compiler took down a run whose
+  other two arms had already succeeded.
+
+### Twin parity
+
+The `.ps1` does not re-derive anything: it calls `benchmark-speedtest1.sh --derive-only --path-style
+windows` through WSL (SQLite's build is autosetup + make + tclsh, so derivation has always been POSIX)
+and then measures natively. One derivation, one measurement core, two callers. The MSVC arm is the only
+asymmetry and even it is resolved by the SHARED core, so the `.sh` picks it up when run on Windows.
+
 ## 0.000000000000000000000000000 ★★★ CYCLE P25 — THE ARG CURSOR IS ONE OBJECT INSTEAD OF SIX, AND THE POOL TABLE ALONE FIXED NOTHING
 
 **Priority:** `D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR` — the branch's only
