@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-22 — cycles **P14 … P26**. ★★★ **P26 FIXED THREE RED CI LEGS, AND THE macOS ONE WAS A GUARD THAT HAD NEVER RUN.** `anchor_registry_guard` died inside its OWN self-test on `macos-latest`: bash 3.2 does not recursively parse a command substitution, so the `)` closing a `case` PATTERN ends the `$( … )` early and the arm expands to LITERAL TEXT — the anchor registry had therefore never been checked on that host. ★★★ The portable finding is that **`bash -n` IS BLIND TO IT** (✔the probe parses clean on 3.2 and fails only when the substitution is EXPANDED), so the obvious instrument cannot see the class at all; a static guard can, and `shell_portability_guard` (34 arms) reds on the tree exactly as it stood at `3ce4e336`. ✔**16 of 17 bash-4 constructs are unsupported on 3.2 and SIX leave the exit status at ZERO** — `declare -A` fails and the name then behaves as an INDEXED array, so every key subscripts to 0. ⚠ It also caught a defect P25 shipped (`benchmark-speedtest1.sh` sourcing an ungated `base-harness.sh`) and one nobody had: `enum_name_table_guard`'s ctest form **never self-tested** while its comment said it did. The other two legs were ONE defect — two GLOBAL budgets (45/50) set from the legs they happened to fit; they are per-leg matrix fields now, and the Test step warns above 80% so the next breach is announced while the run is still GREEN. Balance **1034 → 1036** — nine rows written, **seven BORN CLOSED** and two 🔵 DISCLOSED pre-existing, so the gate counts *opened 2 (created 0, disclosed 2)* and both are exempt; both are flagged for operator veto. ⚠ **Two of the seven were found AFTER the first push, by things no local check could see:** the macOS leg caught the new guard scanning the git INDEX instead of the tree, and GitHub REFUSED THE WORKFLOW OUTRIGHT over an arithmetic `timeout-minutes` expression that YAML, the official schema and every local check called valid. Earlier: ★★★ **P25 CLOSED THE BRANCH'S ONLY 🔴 HIGH — A LIVE SILENT MISCOMPILE IN ARGUMENT PLACEMENT.** A two-way pool rule over a three-member register-class vocabulary filed every `VR` argument into the INTEGER pool; ✔MEASURED at the disassembly, the mutant emits `ldur q0` **over an already-placed argument** at rc=0 with no diagnostic, the fix emits `ldur q2` (AAPCS64 NSRN 2), and gcc agrees. ★★★ The portable finding is that **the pool TABLE alone fixed nothing — the reproduction recompiled byte-identical** — because the decision lives in a CURSOR WALK that existed in **six** hand-kept copies, two of them carrying comments promising to stay in step by hand. One object owns it now. ⚠ **Two claims I wrote were refuted by reading the thing they were about**, both recorded in §0.000000000000000000000000000 rather than dropped: the `"w"` view-selection premise (the config's own measurement was right and the whole schema migration was reverted) and a row I had opened hours earlier in the same cycle. Balance **1033 → 1033, net ±0**. Earlier: ★★★ **P24 SPLIT `integrated_tests` INTO 616 ctest ENTRIES — 677.97 s in ONE entry became 83.81 s over many, 8.1×, and every example now reports its own pass/fail.** Operator-instructed, and the ruling that shaped it is the portable part: **a UNIVERSAL claim is per-example; an EXISTENCE claim is about the corpus and stays one.** Balance **1034 → 1033, net −1** — the burn-down after P23. Earlier: ★★★ **P23 SHIPPED WEAK DEFINITIONS *AND* WEAK ALIASES ON PE/COFF AND MACH-O, FINISHED THE RETYPED-CLOSED-SET CLASS, AND CLOSED THE pe64 ACQUISITION ROW ON A MEASUREMENT NOBODY HAD EVER TAKEN.** All four queued rows closed plus three more. ⚠ **The BALANCE went the other way and the number is said plainly: OPEN 1018 → 1033, closed 7, opened 22 (21 created + 1 disclosed pre-existing), net +14 created-over-closed, and 55 further rows BORN CLOSED** — because a step-10 independent audit, six fold lanes and a four-leg gate found twenty-nine further defects, and an operator ruling authorized shipping the positive balance with every one of them queued as the next cycle's first work. Two operator rulings, neither to be re-litigated: a weak DEFINITION in COFF is **COMDAT select-any**, not `WEAK_EXTERNAL` (*"an implementation gap and a format incapability are different facts"*); and `WEAK_EXTERNAL` IS right for a weak **alias**, built reader-first. ⚠ The brief that ordered the second routed the decision onto `Characteristics`, and ✔gcc emits **1 for all four weak shapes** — the discriminator is the aux record’s `TagIndex`. Earlier: ★★★ **P22 MADE A `static` HELPER LINK OUT OF AN ARCHIVE ON EVERY LEG** — pe64 and macho64 readers were classifying a non-external defined symbol as a bodyless block label, so its bytes never entered the image. Earlier: ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
+**Last updated:** 2026-08-22 — cycles **P14 … P27**. ★★★ **P27: THE P26 BUDGETS WORKED, AND WHAT THEY UNCOVERED WAS TWO TESTS THAT HAD NEVER RUN HERE.** macOS is GREEN in CI (the bash 3.2 repair holds) and both remaining legs now REACH AND FINISH ctest — asan at **68%** of its budget, Windows at **10%**, its first completed ctest ever (**665.70 s**, which CLOSES [[D-CI-WINDOWS-CTEST-COST-IS-UNMEASURED]] and re-derives that budget to 50/60). What remained was one test each. ★★ **Both are an instrument that was CORRECT about its subject and WRONG about its environment:** a hard-coded **2-second** LSP wait sized on an idle machine (✔622 ms idle, ✔**1912 ms** under 3x contention on a faithfully rebuilt sanitizer binary — 88 ms from the deadline), and `shutil.which("bash")` on `windows-latest` answering **WSL's** bash on a runner with no distribution, reddening 26 differential assertions where nothing was wrong. Neither was findable on the machine that wrote it. Balance **1036 → 1036, net ±0** (two born closed, one closed, one opened and sized). Earlier: ★★★ **P26 FIXED THREE RED CI LEGS, AND THE macOS ONE WAS A GUARD THAT HAD NEVER RUN.** `anchor_registry_guard` died inside its OWN self-test on `macos-latest`: bash 3.2 does not recursively parse a command substitution, so the `)` closing a `case` PATTERN ends the `$( … )` early and the arm expands to LITERAL TEXT — the anchor registry had therefore never been checked on that host. ★★★ The portable finding is that **`bash -n` IS BLIND TO IT** (✔the probe parses clean on 3.2 and fails only when the substitution is EXPANDED), so the obvious instrument cannot see the class at all; a static guard can, and `shell_portability_guard` (34 arms) reds on the tree exactly as it stood at `3ce4e336`. ✔**16 of 17 bash-4 constructs are unsupported on 3.2 and SIX leave the exit status at ZERO** — `declare -A` fails and the name then behaves as an INDEXED array, so every key subscripts to 0. ⚠ It also caught a defect P25 shipped (`benchmark-speedtest1.sh` sourcing an ungated `base-harness.sh`) and one nobody had: `enum_name_table_guard`'s ctest form **never self-tested** while its comment said it did. The other two legs were ONE defect — two GLOBAL budgets (45/50) set from the legs they happened to fit; they are per-leg matrix fields now, and the Test step warns above 80% so the next breach is announced while the run is still GREEN. Balance **1034 → 1036** — nine rows written, **seven BORN CLOSED** and two 🔵 DISCLOSED pre-existing, so the gate counts *opened 2 (created 0, disclosed 2)* and both are exempt; both are flagged for operator veto. ⚠ **Two of the seven were found AFTER the first push, by things no local check could see:** the macOS leg caught the new guard scanning the git INDEX instead of the tree, and GitHub REFUSED THE WORKFLOW OUTRIGHT over an arithmetic `timeout-minutes` expression that YAML, the official schema and every local check called valid. Earlier: ★★★ **P25 CLOSED THE BRANCH'S ONLY 🔴 HIGH — A LIVE SILENT MISCOMPILE IN ARGUMENT PLACEMENT.** A two-way pool rule over a three-member register-class vocabulary filed every `VR` argument into the INTEGER pool; ✔MEASURED at the disassembly, the mutant emits `ldur q0` **over an already-placed argument** at rc=0 with no diagnostic, the fix emits `ldur q2` (AAPCS64 NSRN 2), and gcc agrees. ★★★ The portable finding is that **the pool TABLE alone fixed nothing — the reproduction recompiled byte-identical** — because the decision lives in a CURSOR WALK that existed in **six** hand-kept copies, two of them carrying comments promising to stay in step by hand. One object owns it now. ⚠ **Two claims I wrote were refuted by reading the thing they were about**, both recorded in §0.000000000000000000000000000 rather than dropped: the `"w"` view-selection premise (the config's own measurement was right and the whole schema migration was reverted) and a row I had opened hours earlier in the same cycle. Balance **1033 → 1033, net ±0**. Earlier: ★★★ **P24 SPLIT `integrated_tests` INTO 616 ctest ENTRIES — 677.97 s in ONE entry became 83.81 s over many, 8.1×, and every example now reports its own pass/fail.** Operator-instructed, and the ruling that shaped it is the portable part: **a UNIVERSAL claim is per-example; an EXISTENCE claim is about the corpus and stays one.** Balance **1034 → 1033, net −1** — the burn-down after P23. Earlier: ★★★ **P23 SHIPPED WEAK DEFINITIONS *AND* WEAK ALIASES ON PE/COFF AND MACH-O, FINISHED THE RETYPED-CLOSED-SET CLASS, AND CLOSED THE pe64 ACQUISITION ROW ON A MEASUREMENT NOBODY HAD EVER TAKEN.** All four queued rows closed plus three more. ⚠ **The BALANCE went the other way and the number is said plainly: OPEN 1018 → 1033, closed 7, opened 22 (21 created + 1 disclosed pre-existing), net +14 created-over-closed, and 55 further rows BORN CLOSED** — because a step-10 independent audit, six fold lanes and a four-leg gate found twenty-nine further defects, and an operator ruling authorized shipping the positive balance with every one of them queued as the next cycle's first work. Two operator rulings, neither to be re-litigated: a weak DEFINITION in COFF is **COMDAT select-any**, not `WEAK_EXTERNAL` (*"an implementation gap and a format incapability are different facts"*); and `WEAK_EXTERNAL` IS right for a weak **alias**, built reader-first. ⚠ The brief that ordered the second routed the decision onto `Characteristics`, and ✔gcc emits **1 for all four weak shapes** — the discriminator is the aux record’s `TagIndex`. Earlier: ★★★ **P22 MADE A `static` HELPER LINK OUT OF AN ARCHIVE ON EVERY LEG** — pe64 and macho64 readers were classifying a non-external defined symbol as a bodyless block label, so its bytes never entered the image. Earlier: ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
 **Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P21). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
@@ -261,7 +261,12 @@ commit that lands it, and never delete a ticked row.
       (both checkable in `3ce4e336`), net +0 after the exemption. ⚠ The two disclosed rows are the
       only judgement call in the cycle and are flagged for operator veto — if either reads as debt this
       cycle CREATED, it becomes P27's first work.
-- [ ] **P27+ — THE REST OF WHAT P21 AND P22 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
+- [x] **P27 — OPERATOR-INSERTED: the two CI legs still red after P26. ✅ DONE 2026-08-22.**
+      Detail in §0.000000000000000000000000000000. Two rows BORN CLOSED, one CLOSED
+      ([[D-CI-WINDOWS-CTEST-COST-IS-UNMEASURED]], answered by the first Windows ctest run that ever
+      happened) and one OPENED and sized rather than absorbed, net ±0. Both defects were instruments that were correct about their subject and
+      wrong about their environment.
+- [ ] **P28+ — THE REST OF WHAT P21 AND P22 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
       /loop using /dss-cycle each iteration to address ALL anchors found in _handoff §0."* Re-derive each pick
       from the REGISTRY, never from this list.
 - [x] **OPERATOR CALL — ✅ FILED 2026-08-19: <https://sqlite.org/bugs/forumpost/97cd29ca44624113c73b30f5d2504729e6ffc5c5ebcba137078ea1a868cd97c9>.**
@@ -368,6 +373,114 @@ second pattern beside the one P23 built and pinned.**
   `examples/*/*/expected.json` (**613** examples, hoisted to the root `CMakeLists.txt` in P24); a
   `"[=+]?w"` constraint search over `.c/.h/.s/.S/.json` under `examples/` returns **0 files**, and the
   same search over the sqlite real-example tree returns **0**. No corpus example exercises `"w"`.
+
+---
+
+## 0.000000000000000000000000000000 ★★★ CYCLE P27 — THE BUDGETS WORKED, AND WHAT THEY UNCOVERED WAS TWO TESTS THAT HAD NEVER RUN HERE
+
+**Operator argument 2026-08-22:** two still-failing jobs on CI run 32585879580. ★★ **The P26 fix did its
+job and that is the first thing to read from this run:** `macos-clang-release` is **GREEN** — the bash 3.2
+repair holds in CI — and both remaining legs now **REACH AND FINISH** ctest inside their budgets:
+
+| leg | ctest | budget used | what remained |
+| --- | --- | --- | --- |
+| linux-clang-asan | 4528 s | **68%** of 6600 s | 1538/1539 — `lsp/test_workspace_project` |
+| windows-msvc-release | **665.70 s** | **10%** of 6600 s | 1538/1539 — `harness/test_sqlite_harness_legs` |
+
+★ That Windows figure is the one [[D-CI-WINDOWS-CTEST-COST-IS-UNMEASURED]] was opened for — the leg had
+never completed a Build step, so its budget was 🧠INFERRED. It is measured now, the row is **CLOSED**, and
+the budget is re-derived to **50/60** like the other release legs. ⚠ Its BUILD budget stays **120**: that
+run had a **98.72%-hit** ccache and built in **1m48s**, while the run killed at 45 minutes had a 100% MISS.
+**The cold Windows build has still never been seen to completion** — said, not assumed away.
+
+### ★★★ THE asan FAILURE IS A TWO-SECOND DEADLINE, AND THE PROOF IS A REPRODUCTION, NOT AN ARGUMENT
+
+`WorkspaceProjectE2E.ASaveThatChangesNoManifestRepublishesNothing` failed with `Which is: -1` — which
+reads as a wrong exit status and is not one. `-1` is `runUntilExit`'s TIMEOUT sentinel, against a
+hard-coded `std::chrono::seconds(2)`.
+
+✔**MEASURED by rebuilding the CI leg exactly** (`clang-19`, Debug, `-fsanitize=address,undefined`, ✔665
+`__asan` symbols in the linked binary):
+* idle host: the test passes in **622 ms**;
+* same binary, CPU oversubscribed 3x: **1912 ms** — 3.1x, and within **88 ms** of the deadline;
+* CI is a harsher version of that experiment — 4 vCPUs running `ctest --parallel 4` of sanitized
+  binaries — and it crossed, at 2204 ms.
+
+★★ **The deadline was sized on an idle developer machine and had no margin for the slowest host that runs
+it.** That is [[D-CI-BUILD-AND-CTEST-BUDGETS-WERE-ONE-NUMBER-FOR-FIVE-LEGS]] one level down, failing in the
+same direction: a red on a leg where nothing is wrong. One shared `kWaitBudget` (60 s) now carries the
+derivation once and the four hand-written deadlines under `tests/lsp/` point at it. ✔With it, the whole
+12-test `WorkspaceProjectE2E` suite passes under that same 3x contention.
+⚠ **And the message named the wrong event.** All ✔27 call sites compare the return against an expected
+EXIT CODE, so expiry now adds a failure that says TIMEOUT and names the budget.
+`D-TEST-LSP-WAIT-DEADLINE-IS-SIZED-FOR-AN-IDLE-HOST`
+
+### ★★★ THE WINDOWS FAILURE IS `bash` MEANING WSL — THE REPOSITORY'S OWN LESSON, REACHING AN INSTRUMENT
+
+`harness_legs.py --check-regions` is the only instrument that compares the two sqlite drivers BY
+EXECUTION. It resolved its `.sh` arm with `shutil.which("bash")`. ✔On `windows-latest` that answers
+`C:/Windows/System32/bash.exe` — **WSL's** — on a runner with **no distribution installed**, so every
+`.sh` arm exited 1 with `Windows Subsystem for Linux has no installed distributions.` and **26
+differential assertions** reddened on a host where nothing was wrong.
+
+★★ **THE BATTERY'S RULE WAS RIGHT AND ITS PRESENCE ANSWER WAS WRONG.** *"A PRESENT interpreter that could
+not run its arm is a FAILURE, never a skip"* is exactly what stops a host quietly dropping coverage. Fed a
+`which` result it convicted the host — its diagnostic even reads *"this host HAS bash"*. It does; it is the
+wrong one. ✔On this repository's Windows workstation `which("bash")` answers Git Bash (`$OSTYPE` **msys**)
+and `System32\bash.exe` answers **linux-gnu**; the runner's PATH orders them the other way round, which is
+the entire difference between green here and red there.
+
+**FIXED:** the resolver PROVES its answer by running the candidate; on Windows a Git Bash is tried before
+the PATH answer; and no usable bash makes the language ABSENT with a reason, which the existing
+host-independent inventory already skips correctly instead of convicting.
+`D-HARNESS-MIRROR-BASH-RESOLVES-TO-WSL-ON-A-WINDOWS-RUNNER`
+
+### ★★★ AND THE FIX BROKE THE OTHER LANGUAGE — CAUGHT BY ASKING A THIRD HOST BEFORE COMMITTING
+
+The bash repair replaced `have[lang] = which(interp[lang])` with `have[lang] = mirror_interpreter(lang)
+is not None`. Right for `sh`; **wrong for `ps1`**, whose branch returns an argv unconditionally — so a host
+with no PowerShell became "present". ✔MEASURED on the macOS host, same machine, pre-change against
+post-change: **`passed=356 failed=0 skipped=15` → `passed=356 failed=25 skipped=0`**. Fifteen honest skips
+became twenty-five failures on a host whose only fault is having no pwsh.
+
+★★ **It is the same defect class as the one being fixed, pointing the other way** — and Windows and WSL
+both have pwsh, so **both were green and neither could ever have shown it**. The fix restores `which`
+for `ps1` (bash earned the stronger run-probe by being measured wrong; nothing has measured pwsh wrong,
+and changing behaviour without a measurement is exactly what produced this), and presence is now pinned
+in BOTH directions for EVERY language rather than for the one that broke.
+`D-HARNESS-MIRROR-PS1-PRESENCE-BECAME-UNCONDITIONAL`
+
+★ The carryable rule: **when a fix changes how a capability is DETECTED, the hosts that lack that
+capability are the only ones that can review it.** A green two-host gate said nothing about this.
+
+### THE GATE
+
+| leg / check | result |
+| --- | --- |
+| Windows ctest, `build/dbg` (`-j 8`) | ✅ **1539/1539, 517.17 s** |
+| Windows harness + guards subset | ✅ **13/13, 122.31 s** |
+| WSL x86_64, `wsl-leg` clean build through `run-gate` | ✅ **1539/1539, 298.86 s** |
+| WSL guards under a real POSIX shell | ✅ **7/7** |
+| qemu arm64, `DSS_STRICT_ARM_VERDICTS=ON`, scoped | ✅ **636/636, 93.27 s** |
+| asan LSP — all 5 binaries, 3x CPU contention | ✅ **65/65, rc=0** |
+| `harness_legs --self-test` | ✅ **1985/0 on Windows, WSL AND macOS** |
+| `harness_legs --check-regions` | ✅ **371/0/0** (Windows, WSL) · **356/0/15** (macOS, byte-identical to the pre-change baseline) |
+
+★ The last two rows are the ones that matter for this cycle: the same totals on three hosts is what
+says the presence fix did not quietly change what any of them checks.
+
+### WHAT THIS CYCLE LEFT OPEN, STATED RATHER THAN ABSORBED
+
+`D-TEST-A-NEW-WALL-CLOCK-LITERAL-IN-A-TEST-IS-UNGUARDED` — the wait-budget fix unified the FOUR deadlines
+that existed and ✔left none behind under `tests/lsp/`, but **nothing refuses a FIFTH**. The next one fails
+exactly as this one did: green where it was written, red on the slowest leg, naming the wrong event.
+Deliberately NOT built this cycle — the subject was two named CI jobs and a third guard is its own arc —
+so it is sized in the row instead of rediscovered later. Balance therefore **1036 → 1036, net ±0**: two
+born closed, one closed, one opened.
+
+★ **THE SHAPE BOTH FAILURES SHARE, AND IT IS THE ONE WORTH CARRYING:** each is an instrument that was
+CORRECT about its subject and WRONG about its environment — a deadline that assumed an idle host, a
+presence check that assumed a name meant a program. Neither was findable on the machine that wrote it.
 
 ---
 

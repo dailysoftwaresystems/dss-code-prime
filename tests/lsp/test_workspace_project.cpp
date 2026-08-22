@@ -617,7 +617,7 @@ using dss::lsp::testing::lspShutdown;
 void awaitPublishes(LspTestHarness& h, std::string const& uri,
                     std::size_t want, std::vector<std::string>& sink) {
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        std::chrono::steady_clock::now() + dss::test_support::kWaitBudget;
     while (countPublishes(sink, uri) < want) {
         for (auto& m : h.takeServerMessages()) sink.push_back(std::move(m));
         if (countPublishes(sink, uri) >= want) return;

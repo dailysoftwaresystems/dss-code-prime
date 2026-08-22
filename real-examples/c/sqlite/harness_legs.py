@@ -9672,22 +9672,173 @@ def mirror_case_inventory(case):
     return inv
 
 
+_MIRROR_BASH = []          # memo: [] unprobed, [None, why] unusable, [path] usable
+
+
+def mirror_bash_candidates():
+    """Every bash worth trying, in the order they are tried.
+
+    ★★★ THE ORDER IS THE WHOLE CONTENT OF THIS FUNCTION, AND IT IS MEASURED.
+    ✔On this repository's Windows workstation `shutil.which("bash")` answers
+    `C:/Program Files/Git/usr/bin/bash.EXE`, whose `$OSTYPE` is **msys** — Git
+    Bash, the shell that actually runs this repository's `.sh` files there. ✔On
+    the SAME machine `C:/Windows/System32/bash.exe` also exists and answers
+    **linux-gnu**: it is WSL's, a different operating system reached through a
+    Windows path, and it cannot see the Windows fixture directory this battery
+    writes.
+    ⚠ On the GitHub `windows-latest` runner `which` finds the System32 one FIRST,
+    and that runner has no WSL distribution installed — so the arm exited 1 with
+    `Windows Subsystem for Linux has no installed distributions.` (UTF-16LE, which
+    is why the CI log shows it interleaved with NULs) and the whole differential
+    reddened on a host where nothing was wrong. CI run 32585879580.
+    ★ `$BASH` still wins outright: on macOS a bare `bash` is /bin/bash 3.2, not the
+    bash 4+ the drivers re-exec themselves into — the same rule
+    D-HARNESS-SELFTEST-BSD-SED-PORTABILITY made for the self-tests.
+    """
+    out, seen = [], set()
+
+    def add(path):
+        # An absolute candidate that does not exist is not a candidate: it would
+        # reach the probe, raise FileNotFoundError, and land in the "everything was
+        # tried" diagnostic as noise. A bare NAME still goes through, because only
+        # the probe can resolve it.
+        if not path or path in seen:
+            return
+        if os.path.isabs(path) and not os.path.isfile(path):
+            return
+        seen.add(path)
+        out.append(path)
+
+    add(os.environ.get("BASH"))
+    if os.name == "nt":
+        # BEFORE the PATH lookup, deliberately: the PATH answer is the one that
+        # was measured wrong, and a Git Bash found here is the shell the rest of
+        # this file's comments are written about.
+        for root in (os.environ.get("ProgramFiles"),
+                     os.environ.get("ProgramW6432"),
+                     os.environ.get("ProgramFiles(x86)"),
+                     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+            if root:
+                for sub in ("bin", os.path.join("usr", "bin")):
+                    add(os.path.join(root, "Git", sub, "bash.exe"))
+    # EVERY bash on PATH, not just the first. `shutil.which` returns one answer,
+    # and ✔the one it returned on the CI runner was the unusable one — so a Git
+    # Bash sitting later on the same PATH would have been invisible. Guessing the
+    # install location (above) and enumerating the PATH (here) are two independent
+    # ways to reach it; the probe decides which one works.
+    for entry in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not entry:
+            continue
+        for name in ("bash.exe", "bash") if os.name == "nt" else ("bash",):
+            cand = os.path.join(entry, name)
+            if os.path.isfile(cand):
+                add(cand)
+    return out
+
+
+def mirror_bash_probe(cand):
+    """(ok, detail) — does THIS bash run a one-line script and say so?
+
+    ★★ THE PROBE IS A RUN. `shutil.which` answers "is there a file by this name",
+    and ✔that is exactly the question that was wrong on CI: the file existed, was
+    executable, and could not run anything. Kept separate from the SELECTION below
+    so the selection can be driven by --self-test without spawning.
+    """
+    import subprocess  # local, matching the rest of this module's spawn sites
+    if not os.path.isabs(cand) and not shutil.which(cand):
+        return False, "not on PATH"
+    try:
+        proc = subprocess.Popen([cand, "-c", "printf usable"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(timeout=60)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    answer = out.decode("utf-8", "replace").strip()
+    if proc.returncode == 0 and answer == "usable":
+        return True, ""
+    # ★ THE NULs ARE STRIPPED ON PURPOSE. ✔WSL's refusal arrives as UTF-16LE, so
+    # the CI log rendered it as `W\0i\0n\0d\0o\0w\0s\0 ...` — a diagnostic nobody
+    # can read is most of the way to no diagnostic at all.
+    detail = (err.decode("utf-8", "replace").replace("\x00", "").strip()
+              or answer or "no output")
+    return False, "exited %s (%s)" % (proc.returncode, detail[:160])
+
+
+def mirror_pick_bash(candidates, probe):
+    """(path, why-not) — the first candidate the probe PROVES can run a script.
+
+    Pure: every spawn is the caller's `probe`. That is what lets --self-test pin
+    both directions, including the exact refusal the GitHub Windows runner gave.
+    """
+    tried = []
+    for cand in candidates:
+        ok, detail = probe(cand)
+        if ok:
+            return cand, ""
+        tried.append("%s: %s" % (cand, detail))
+    return None, ("no usable bash on this host — every candidate was tried and "
+                  "each refused to run a one-line script: " + "; ".join(tried))
+
+
+def mirror_bash():
+    """The memoised answer for THIS host."""
+    if not _MIRROR_BASH:
+        path, why = mirror_pick_bash(mirror_bash_candidates(), mirror_bash_probe)
+        _MIRROR_BASH[:] = [path] if path else [None, why]
+    return (_MIRROR_BASH[0], _MIRROR_BASH[1] if _MIRROR_BASH[0] is None else "")
+
+
 def mirror_interpreter(lang):
-    """The interpreter argv PREFIX one arm is executed with.
+    """The interpreter argv PREFIX one arm is executed with, or None.
 
     ★ NAMED ONCE, because the AVAILABILITY PROBE and the SPAWN must be talking
-    about the same program. They were two literals — `_sh.which("pwsh")` in the
+    about the same program. They were two literals — `shutil.which("pwsh")` in the
     verifier and `["pwsh", …]` in the runner — and a pair like that fails in
     both directions: probe a spelling the spawn does not use and a "present"
     interpreter OSErrors into a FAIL; probe a spelling the spawn does not use
-    the other way and an available interpreter is skipped as absent. The probe
-    below takes argv[0] of THIS list, so neither can happen."""
+    the other way and an available interpreter is skipped as absent.
+    ★★ `sh` now resolves through `mirror_bash`, which PROVES its answer by running
+    it. Returning None is how this function says "this host has no such
+    interpreter" — the caller then SKIPS the arm with a reason instead of running
+    a program that cannot work and calling the failure a defect.
+    """
     if lang == "sh":
-        # `$BASH` first: on macOS a bare `bash` is /bin/bash 3.2, not the bash 4+
-        # the drivers re-exec themselves into — the same rule
-        # D-HARNESS-SELFTEST-BSD-SED-PORTABILITY made for the self-tests.
-        return [os.environ.get("BASH", "bash")]
-    return ["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+        path, _why = mirror_bash()
+        return [path] if path else None
+    # ⚠⚠ `ps1` KEEPS THE `which` TEST, AND RETURNING None WHEN IT FAILS IS THE
+    # WHOLE POINT. ✔MEASURED 2026-08-22 on the macOS host, and it is a defect THIS
+    # CYCLE'S OWN FIX INTRODUCED: the first draft made `have[lang]` mean "the
+    # resolver returned something", and this branch returns an argv
+    # UNCONDITIONALLY — so a host with no pwsh was suddenly "present". The Mac went
+    # from `passed=356 failed=0 skipped=15` to `passed=356 failed=25 skipped=0`:
+    # fifteen honestly-skipped assertions became twenty-five failures on a host that
+    # simply has no PowerShell.
+    # ★ That is the SAME defect class as the bash one being fixed here — a presence
+    # answer that is wrong — pointing the other way, and the only reason it was
+    # caught is that a THIRD host was asked before this was committed.
+    # ★ `which` and not a run-probe, deliberately: bash earned the stronger probe by
+    # being MEASURED wrong (a found binary that could not run a script). Nothing has
+    # measured pwsh wrong, and inventing a behaviour change without a measurement is
+    # exactly how the paragraph above happened.
+    return (["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+            if shutil.which("pwsh") else None)
+
+
+def mirror_interpreter_display(lang):
+    """What to CALL the interpreter in a report, present or not."""
+    argv = mirror_interpreter(lang)
+    if argv:
+        return argv[0]
+    return "bash" if lang == "sh" else "pwsh"
+
+
+def mirror_interpreter_absence(lang):
+    """Why this host cannot execute `lang`, or "" when it can."""
+    if lang == "sh":
+        _path, why = mirror_bash()
+        return why
+    return ("" if mirror_interpreter(lang)
+            else "pwsh is not on PATH, so this host cannot execute a .ps1 arm")
 
 
 def _mirror_run(lang, region, case, work, env):
@@ -9716,7 +9867,10 @@ def _mirror_run(lang, region, case, work, env):
         head = "".join("$%s = %s\n" % (k, _ps1_single_quote(v))
                        for k, v in sorted(env.items()))
         text = MIRROR_PRELUDE_PS1 + head + region + "\n" + body + "\n"
-    argv = mirror_interpreter(lang) + [rel]
+    prefix = mirror_interpreter(lang)
+    if prefix is None:
+        return False, [], mirror_interpreter_absence(lang), ""
+    argv = prefix + [rel]
     script = os.path.join(work, rel)
     with open(script, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
@@ -9974,13 +10128,20 @@ def check_dss_regions(harness_dir, out=None):
         # reduction in the same breath as the count. See mirror_case_inventory,
         # which is what makes that claim checkable rather than asserted.
         region_text = {"sh": sh_text, "ps1": ps_text}
-        interp = dict((lang, mirror_interpreter(lang)[0]) for lang in MIRROR_LANGS)
-        have = dict((lang, _sh.which(interp[lang])) for lang in MIRROR_LANGS)
+        # ★★ PRESENCE IS A RUN, NOT A `which`. See mirror_bash: the defect this
+        # replaces was a `which` that found `C:/Windows/System32/bash.exe` — WSL's,
+        # on a runner with no distribution installed — and this battery's own rule
+        # ("a PRESENT interpreter that could not run its arm is a FAILURE, never a
+        # skip") then correctly turned that into a red. The rule is right; the
+        # presence answer was wrong.
+        interp = dict((lang, mirror_interpreter_display(lang)) for lang in MIRROR_LANGS)
+        have = dict((lang, mirror_interpreter(lang) is not None)
+                    for lang in MIRROR_LANGS)
         absent = [lang for lang in MIRROR_LANGS if not have[lang]]
-        why_absent = ("%s is not on PATH, so this host cannot execute the .%s "
-                      "copy of a mirrored region"
-                      % (" and ".join(interp[l] for l in absent),
-                         "/.".join(absent)) if absent else "")
+        why_absent = ("; ".join(mirror_interpreter_absence(l) for l in absent)
+                      + (" — so this host cannot execute the .%s copy of a "
+                         "mirrored region" % "/.".join(absent))
+                      if absent else "")
         if absent:
             reduced.append((name, list(absent),
                             [interp[l] for l in absent], list(cases)))
@@ -10505,6 +10666,68 @@ def self_test(path=CATALOGUE, out=sys.stdout):
 
     findings = lint(path)
     check("the leg catalogue lints clean", not findings, "\n      ".join(findings))
+
+    # ── the mirrored-region interpreter, and the CI failure that produced it ──
+    # D-HARNESS-MIRROR-BASH-RESOLVES-TO-WSL-ON-A-WINDOWS-RUNNER.
+    # ✔MEASURED on CI run 32585879580: `which("bash")` on `windows-latest` answers
+    # `C:/Windows/System32/bash.exe` — WSL's — on a runner with no distribution
+    # installed, so the .sh arm exited 1 and this battery's own rule ("a PRESENT
+    # interpreter that could not run its arm is a FAILURE, never a skip") turned a
+    # host difference into a red. The rule is right; the presence answer was wrong.
+    WSL_REFUSAL = ("exited 1 (Windows Subsystem for Linux has no installed "
+                   "distributions.)")
+    picked, why = mirror_pick_bash(
+        ["C:/Windows/System32/bash.exe", "C:/Program Files/Git/bin/bash.exe"],
+        lambda c: (False, WSL_REFUSAL) if "System32" in c else (True, ""))
+    check("a bash that cannot run a script is passed over for one that can",
+          picked == "C:/Program Files/Git/bin/bash.exe" and why == "",
+          "picked=%r why=%r" % (picked, why))
+
+    picked, why = mirror_pick_bash(
+        ["C:/Windows/System32/bash.exe"], lambda c: (False, WSL_REFUSAL))
+    check("when no bash runs, the answer is ABSENT and not a false present",
+          picked is None, "picked=%r" % (picked,))
+    check("...and the reason names every candidate and what it answered",
+          "System32" in why and "no installed distributions" in why, "why=%r" % (why,))
+
+    check("an absent .sh interpreter is reported as absent, never as a defect",
+          mirror_pick_bash([], lambda c: (True, ""))[0] is None)
+
+    # The ORDER is the fix: a Git Bash must be reached before the PATH answer,
+    # because the PATH answer is the one measured wrong.
+    # ★ UNCONDITIONAL, so passed+failed is the SAME TOTAL on every host — the rule
+    # this battery already holds its mirrored-region inventory to. The System32
+    # clause simply has nothing to bite on where no such bash exists.
+    cands = mirror_bash_candidates()
+    gits = [i for i, c in enumerate(cands) if "Git" in c]
+    sys32 = [i for i, c in enumerate(cands)
+             if "system32" in c.replace("\\", "/").lower()]
+    check("no System32 bash is tried before a Git Bash, and the list is non-empty",
+          bool(cands) and (not sys32 or (gits and min(gits) < min(sys32))),
+          "candidates=%r" % (cands,))
+
+    # ⚠ PRESENCE MUST STILL BE A QUESTION FOR EVERY LANGUAGE, and this arm exists
+    # because the first draft of the fix above broke exactly that: `ps1` returned an
+    # argv unconditionally, so a host with no pwsh became "present" and ✔the macOS
+    # host went from `passed=356 failed=0 skipped=15` to `356/25/0`. An interpreter
+    # this host does not have must resolve to None so the arms SKIP with a reason.
+    for _lang in MIRROR_LANGS:
+        _argv = mirror_interpreter(_lang)
+        _exe = mirror_interpreter_display(_lang)
+        check("%s presence is a real question, not an unconditional yes" % _lang,
+              (_argv is not None) == bool(shutil.which(_exe) or
+                                          (_argv and os.path.isfile(_argv[0]))),
+              "argv=%r display=%r which=%r" % (_argv, _exe, shutil.which(_exe)))
+        check("an absent %s names its own reason" % _lang,
+              bool(mirror_interpreter_absence(_lang)) == (_argv is None),
+              "argv=%r reason=%r" % (_argv, mirror_interpreter_absence(_lang)))
+
+    # And the host's OWN answer must be usable, because every mirrored region
+    # depends on it. A host with no bash is a real state; a host whose bash is
+    # unusable while `which` says otherwise is the defect above.
+    _bash, _why = mirror_bash()
+    check("this host resolves a bash that actually runs a script",
+          _bash is not None, _why)
 
     # ── the stage build configuration ────────────────────────────────────────
     # Asserted on CONTENT, not on shape. "four keys are present" was satisfied
