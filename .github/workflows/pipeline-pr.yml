@@ -138,19 +138,19 @@ jobs:
         run: |
           legs='[]'
           if [ "${{ true }}" = "true" ]; then
-            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-gcc-release","os":"ubuntu-latest","cc":"gcc-13","cxx":"g++-13","build_type":"Release","sanitizers":"","build_timeout_min":45,"ctest_budget_min":50}]')
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-gcc-release","os":"ubuntu-latest","cc":"gcc-13","cxx":"g++-13","build_type":"Release","sanitizers":"","build_timeout_min":45,"ctest_budget_min":50,"ctest_step_timeout_min":60}]')
           fi
           if [ "${{ true }}" = "true" ]; then
-            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-clang-asan","os":"ubuntu-latest","cc":"clang-19","cxx":"clang++-19","build_type":"Debug","sanitizers":"address,undefined","build_timeout_min":45,"ctest_budget_min":110}]')
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-clang-asan","os":"ubuntu-latest","cc":"clang-19","cxx":"clang++-19","build_type":"Debug","sanitizers":"address,undefined","build_timeout_min":45,"ctest_budget_min":110,"ctest_step_timeout_min":120}]')
           fi
           if [ "${{ true }}" = "true" ]; then
-            legs=$(echo "$legs" | jq -c '. + [{"name":"windows-msvc-release","os":"windows-latest","cc":"","cxx":"","build_type":"Release","sanitizers":"","build_timeout_min":120,"ctest_budget_min":110}]')
+            legs=$(echo "$legs" | jq -c '. + [{"name":"windows-msvc-release","os":"windows-latest","cc":"","cxx":"","build_type":"Release","sanitizers":"","build_timeout_min":120,"ctest_budget_min":110,"ctest_step_timeout_min":120}]')
           fi
           if [ "${{ true }}" = "true" ]; then
-            legs=$(echo "$legs" | jq -c '. + [{"name":"macos-clang-release","os":"macos-latest","cc":"","cxx":"","build_type":"Release","sanitizers":"","build_timeout_min":45,"ctest_budget_min":50}]')
+            legs=$(echo "$legs" | jq -c '. + [{"name":"macos-clang-release","os":"macos-latest","cc":"","cxx":"","build_type":"Release","sanitizers":"","build_timeout_min":45,"ctest_budget_min":50,"ctest_step_timeout_min":60}]')
           fi
           if [ "${{ true }}" = "true" ]; then
-            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-arm64-gcc-release","os":"ubuntu-24.04-arm","cc":"gcc-13","cxx":"g++-13","build_type":"Release","sanitizers":"","build_timeout_min":45,"ctest_budget_min":50}]')
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-arm64-gcc-release","os":"ubuntu-24.04-arm","cc":"gcc-13","cxx":"g++-13","build_type":"Release","sanitizers":"","build_timeout_min":45,"ctest_budget_min":50,"ctest_step_timeout_min":60}]')
           fi
           echo "matrix={\"include\":$legs}" >> "$GITHUB_OUTPUT"
           if [ "$legs" = "[]" ]; then
@@ -513,7 +513,17 @@ jobs:
         # Ten minutes above ctest's own budget: --stop-time stops ctest STARTING new
         # tests, so one already running continues past it. The longest single test on
         # the asan leg measured 513.57s, which fits inside that margin.
-        timeout-minutes: ${{ matrix.ctest_budget_min + 10 }}
+        #
+        # ⚠⚠ THE +10 IS DONE IN THE MATRIX BUILDER, NOT HERE, AND THAT IS NOT STYLE:
+        # ✔MEASURED 2026-08-22 against GitHub's own validator, two minimal
+        # `workflow_dispatch` files pushed side by side — `timeout-minutes:
+        # ${{ matrix.t }}` is ACCEPTED and produces no run, while `timeout-minutes:
+        # ${{ matrix.t + 10 }}` is REJECTED: the workflow is refused as a whole, with a
+        # zero-job run whose name is the FILE PATH. That is how this file shipped broken
+        # for one commit (D-CI-STEP-TIMEOUT-MINUTES-REJECTS-AN-ARITHMETIC-EXPRESSION).
+        # ★ A plain field reference is the only expression form to use here; arithmetic
+        # belongs in the shell that builds the matrix, where it is ordinary code.
+        timeout-minutes: ${{ matrix.ctest_step_timeout_min }}
 
       - name: Upload test logs on failure
         if: ${{ failure() }}

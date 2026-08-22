@@ -494,6 +494,28 @@ Fixed to match its siblings (`check-scripts-index` and `check-orphan-tests` both
 made the odd one out visible), and the CMake comment now records that it was false rather than being quietly
 corrected.
 
+### ⚠⚠ AND THE FIRST PUSH SHIPPED A WORKFLOW GitHub REFUSES TO LOAD — WITH EVERY LOCAL INSTRUMENT GREEN
+
+Commit `78f9a607` produced a CI run with **ZERO jobs**, `conclusion: failure`, and the FILE PATH where a
+workflow name belongs. ✔The file parses as YAML, has no duplicate keys, no tabs, no CR, and validates
+CLEAN against the official SchemaStore workflow schema — all four checked before the cause was found.
+
+★★ **A WORKFLOW-LEVEL REJECTION LOOKS NOTHING LIKE A FAILING JOB**: no job, no log, no annotation
+reachable through the API, and `gh run list` still prints the workflow's declared `name:`. The tell is
+the EVENT — this workflow is `pull_request`-only, so a `push`-event run for it can only mean the file
+was refused and reported against the push that changed it.
+
+✔**MEASURED against GitHub's own validator**, two minimal `workflow_dispatch` files pushed side by side
+on a throwaway branch (deleted once read): `timeout-minutes: ${{ matrix.t }}` is **ACCEPTED**;
+`timeout-minutes: ${{ matrix.t + 10 }}` is **REJECTED**. The step timeout is a matrix FIELD now
+(`ctest_step_timeout_min`), computed in the shell that builds the matrix.
+`D-CI-STEP-TIMEOUT-MINUTES-REJECTS-AN-ARITHMETIC-EXPRESSION`
+
+⚠ Worth carrying forward beyond this row: **a local YAML check and even the official JSON schema do not
+tell you a workflow will load.** The only instrument that answers that question is a push, so a workflow
+edit is not verified until a run appears with the jobs you expect — and "a run appeared and failed" is
+not the same fact as "the jobs ran and failed".
+
 ### THE GATE — AND EVERY FIGURE SAYS WHICH TREE IT WAS TAKEN ON
 
 ★★ The guard was still being corrected while the long legs ran, so a full-suite number and a
