@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-21 — cycles **P14 … P25**. ★★★ **P25 CLOSED THE BRANCH'S ONLY 🔴 HIGH — A LIVE SILENT MISCOMPILE IN ARGUMENT PLACEMENT.** A two-way pool rule over a three-member register-class vocabulary filed every `VR` argument into the INTEGER pool; ✔MEASURED at the disassembly, the mutant emits `ldur q0` **over an already-placed argument** at rc=0 with no diagnostic, the fix emits `ldur q2` (AAPCS64 NSRN 2), and gcc agrees. ★★★ The portable finding is that **the pool TABLE alone fixed nothing — the reproduction recompiled byte-identical** — because the decision lives in a CURSOR WALK that existed in **six** hand-kept copies, two of them carrying comments promising to stay in step by hand. One object owns it now. ⚠ **Two claims I wrote were refuted by reading the thing they were about**, both recorded in §0.000000000000000000000000000 rather than dropped: the `"w"` view-selection premise (the config's own measurement was right and the whole schema migration was reverted) and a row I had opened hours earlier in the same cycle. Balance **1033 → 1033, net ±0**. Earlier: ★★★ **P24 SPLIT `integrated_tests` INTO 616 ctest ENTRIES — 677.97 s in ONE entry became 83.81 s over many, 8.1×, and every example now reports its own pass/fail.** Operator-instructed, and the ruling that shaped it is the portable part: **a UNIVERSAL claim is per-example; an EXISTENCE claim is about the corpus and stays one.** Balance **1034 → 1033, net −1** — the burn-down after P23. Earlier: ★★★ **P23 SHIPPED WEAK DEFINITIONS *AND* WEAK ALIASES ON PE/COFF AND MACH-O, FINISHED THE RETYPED-CLOSED-SET CLASS, AND CLOSED THE pe64 ACQUISITION ROW ON A MEASUREMENT NOBODY HAD EVER TAKEN.** All four queued rows closed plus three more. ⚠ **The BALANCE went the other way and the number is said plainly: OPEN 1018 → 1033, closed 7, opened 22 (21 created + 1 disclosed pre-existing), net +14 created-over-closed, and 55 further rows BORN CLOSED** — because a step-10 independent audit, six fold lanes and a four-leg gate found twenty-nine further defects, and an operator ruling authorized shipping the positive balance with every one of them queued as the next cycle's first work. Two operator rulings, neither to be re-litigated: a weak DEFINITION in COFF is **COMDAT select-any**, not `WEAK_EXTERNAL` (*"an implementation gap and a format incapability are different facts"*); and `WEAK_EXTERNAL` IS right for a weak **alias**, built reader-first. ⚠ The brief that ordered the second routed the decision onto `Characteristics`, and ✔gcc emits **1 for all four weak shapes** — the discriminator is the aux record’s `TagIndex`. Earlier: ★★★ **P22 MADE A `static` HELPER LINK OUT OF AN ARCHIVE ON EVERY LEG** — pe64 and macho64 readers were classifying a non-external defined symbol as a bodyless block label, so its bytes never entered the image. Earlier: ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
+**Last updated:** 2026-08-22 — cycles **P14 … P26**. ★★★ **P26 FIXED THREE RED CI LEGS, AND THE macOS ONE WAS A GUARD THAT HAD NEVER RUN.** `anchor_registry_guard` died inside its OWN self-test on `macos-latest`: bash 3.2 does not recursively parse a command substitution, so the `)` closing a `case` PATTERN ends the `$( … )` early and the arm expands to LITERAL TEXT — the anchor registry had therefore never been checked on that host. ★★★ The portable finding is that **`bash -n` IS BLIND TO IT** (✔the probe parses clean on 3.2 and fails only when the substitution is EXPANDED), so the obvious instrument cannot see the class at all; a static guard can, and `shell_portability_guard` (34 arms) reds on the tree exactly as it stood at `3ce4e336`. ✔**16 of 17 bash-4 constructs are unsupported on 3.2 and SIX leave the exit status at ZERO** — `declare -A` fails and the name then behaves as an INDEXED array, so every key subscripts to 0. ⚠ It also caught a defect P25 shipped (`benchmark-speedtest1.sh` sourcing an ungated `base-harness.sh`) and one nobody had: `enum_name_table_guard`'s ctest form **never self-tested** while its comment said it did. The other two legs were ONE defect — two GLOBAL budgets (45/50) set from the legs they happened to fit; they are per-leg matrix fields now, and the Test step warns above 80% so the next breach is announced while the run is still GREEN. Balance **1034 → 1036, opened 2 (created 0, disclosed 2)**, both exempt and both flagged for veto. Earlier: ★★★ **P25 CLOSED THE BRANCH'S ONLY 🔴 HIGH — A LIVE SILENT MISCOMPILE IN ARGUMENT PLACEMENT.** A two-way pool rule over a three-member register-class vocabulary filed every `VR` argument into the INTEGER pool; ✔MEASURED at the disassembly, the mutant emits `ldur q0` **over an already-placed argument** at rc=0 with no diagnostic, the fix emits `ldur q2` (AAPCS64 NSRN 2), and gcc agrees. ★★★ The portable finding is that **the pool TABLE alone fixed nothing — the reproduction recompiled byte-identical** — because the decision lives in a CURSOR WALK that existed in **six** hand-kept copies, two of them carrying comments promising to stay in step by hand. One object owns it now. ⚠ **Two claims I wrote were refuted by reading the thing they were about**, both recorded in §0.000000000000000000000000000 rather than dropped: the `"w"` view-selection premise (the config's own measurement was right and the whole schema migration was reverted) and a row I had opened hours earlier in the same cycle. Balance **1033 → 1033, net ±0**. Earlier: ★★★ **P24 SPLIT `integrated_tests` INTO 616 ctest ENTRIES — 677.97 s in ONE entry became 83.81 s over many, 8.1×, and every example now reports its own pass/fail.** Operator-instructed, and the ruling that shaped it is the portable part: **a UNIVERSAL claim is per-example; an EXISTENCE claim is about the corpus and stays one.** Balance **1034 → 1033, net −1** — the burn-down after P23. Earlier: ★★★ **P23 SHIPPED WEAK DEFINITIONS *AND* WEAK ALIASES ON PE/COFF AND MACH-O, FINISHED THE RETYPED-CLOSED-SET CLASS, AND CLOSED THE pe64 ACQUISITION ROW ON A MEASUREMENT NOBODY HAD EVER TAKEN.** All four queued rows closed plus three more. ⚠ **The BALANCE went the other way and the number is said plainly: OPEN 1018 → 1033, closed 7, opened 22 (21 created + 1 disclosed pre-existing), net +14 created-over-closed, and 55 further rows BORN CLOSED** — because a step-10 independent audit, six fold lanes and a four-leg gate found twenty-nine further defects, and an operator ruling authorized shipping the positive balance with every one of them queued as the next cycle's first work. Two operator rulings, neither to be re-litigated: a weak DEFINITION in COFF is **COMDAT select-any**, not `WEAK_EXTERNAL` (*"an implementation gap and a format incapability are different facts"*); and `WEAK_EXTERNAL` IS right for a weak **alias**, built reader-first. ⚠ The brief that ordered the second routed the decision onto `Characteristics`, and ✔gcc emits **1 for all four weak shapes** — the discriminator is the aux record’s `TagIndex`. Earlier: ★★★ **P22 MADE A `static` HELPER LINK OUT OF AN ARCHIVE ON EVERY LEG** — pe64 and macho64 readers were classifying a non-external defined symbol as a bodyless block label, so its bytes never entered the image. Earlier: ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
 **Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P21). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
 
 ---
@@ -255,7 +255,13 @@ commit that lands it, and never delete a ticked row.
       `D-CONFIG-GRAMMAR-ISA-AND-IDENTIFIERCLASS-BELONG-IN-THE-LANGUAGE-BLOCK` is **TRIGGER-GATED**.
       ⚠ **AND ONE IS NOT THIS CYCLE'S DEBT AT ALL:** `D-HARNESS-VPS-SSH-PS1-DOES-NOT-EXPAND-HOME` is
       🔵 **DISCLOSED PRE-EXISTING** — surfaced by lane Q, exempt from the net, and real regardless.
-- [ ] **P26+ — THE REST OF WHAT P21 AND P22 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
+- [x] **P26 — OPERATOR-INSERTED, not from this list: the three red CI legs. ✅ DONE 2026-08-22.**
+      Argument: *"CI failed for linux-clang-asan, macos and windows"*. Three legs, three different
+      causes; detail in §0.00000000000000000000000000000. Five rows BORN CLOSED, two 🔵 DISCLOSED
+      (both checkable in `3ce4e336`), net +0 after the exemption. ⚠ The two disclosed rows are the
+      only judgement call in the cycle and are flagged for operator veto — if either reads as debt this
+      cycle CREATED, it becomes P27's first work.
+- [ ] **P27+ — THE REST OF WHAT P21 AND P22 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
       /loop using /dss-cycle each iteration to address ALL anchors found in _handoff §0."* Re-derive each pick
       from the REGISTRY, never from this list.
 - [x] **OPERATOR CALL — ✅ FILED 2026-08-19: <https://sqlite.org/bugs/forumpost/97cd29ca44624113c73b30f5d2504729e6ffc5c5ebcba137078ea1a868cd97c9>.**
@@ -362,6 +368,176 @@ second pattern beside the one P23 built and pinned.**
   `examples/*/*/expected.json` (**613** examples, hoisted to the root `CMakeLists.txt` in P24); a
   `"[=+]?w"` constraint search over `.c/.h/.s/.S/.json` under `examples/` returns **0 files**, and the
   same search over the sqlite real-example tree returns **0**. No corpus example exercises `"w"`.
+
+---
+
+## 0.00000000000000000000000000000 ★★★ CYCLE P26 — THREE RED CI LEGS, AND THE macOS ONE WAS A GUARD THAT HAD NEVER RUN
+
+**Operator argument 2026-08-22:** *"CI failed for linux-clang-asan, macos and windows"*. Three legs, and
+not three defects: the macOS one is a shell dialect, and the other two are ONE budget defect
+wearing two faces.
+
+✔**MEASURED, CI run 32533052057 (2026-08-21) — and the first fact is about the RUN, not the legs:** this was
+the **first run on this branch where the matrix actually executed**. Every earlier Pipeline run stopped at
+`label-check` ("Missing 'Run Pipes' label"), so every leg came up with a **100%-MISS ccache**, and nothing
+these three legs report had ever been observed here before.
+
+| leg | cold build | ctest | verdict |
+| --- | --- | --- | --- |
+| linux-gcc-release | 19m22s | 274.19s | green |
+| linux-clang-asan | 13m04s | **2999.79s of a 3000s cap** | RED — `conformance/test_reference_conformance` (Timeout) |
+| windows-msvc-release | **>45m, killed at 453 of 786 edges** | never reached | RED — `The action 'Build' has timed out after 45 minutes` |
+| macos-clang-release | 12m53s | 286.37s | RED — `anchor_registry_guard` |
+| linux-arm64-gcc-release | 13m07s | 178.58s | green |
+
+### ★★★ THE macOS LEG IS THE ONE WORTH READING — A `case` INSIDE `$( … )` IS UNRUNNABLE ON bash 3.2
+
+`anchor_registry_guard` did not fail on the registry. It died **inside its own self-test**, in
+`SELF-TEST arm 'missing-root-refuses-and-says-so'`, with `command substitution: syntax error near
+unexpected token`. **So the anchor registry had never actually been checked on macOS.**
+
+bash 3.2 — which is what `/bin/bash` is on **every** macOS host, including `macos-latest`, and always will be
+— does not recursively parse a command substitution. It scans forward for the matching `)`, counting parens.
+The `)` that closes a **`case` PATTERN** therefore ends the `$( … )` early, and the arm expands to LITERAL
+TEXT. ✔MEASURED on macOS 26.5.2 (`/bin/bash` 3.2.57) against bash 5.2.21 in WSL, one `bash -c` per construct,
+verdict taken from the **OUTPUT** and not the exit status — **16 of 17 constructs unsupported on 3.2, 17 of 17
+on 5.2**, the single survivor being the `(`-prefixed pattern form. The POSIX-optional leading `(` balances
+the count and is the whole fix.
+
+★★★ **AND `bash -n` IS BLIND TO IT.** ✔The probe file parses clean under 3.2 (exit 0) and fails only when the
+substitution is **EXPANDED**, because that is when 3.2 parses the text it extracted. **The obvious instrument
+— syntax-check every script under the old shell — cannot see this class at all.** That is why the fix is a
+static guard and not a pre-check, and it is the reusable half of this cycle: *when an instrument is blind by
+construction, adding more of it is not the answer.*
+
+⚠ **SIX OF THE TWELVE bash-4 CONSTRUCTS THIS REPOSITORY USES LEAVE THE EXIT STATUS AT ZERO** — `mapfile`
+prints `command not found` and the script continues; **`declare -A` fails and the name then behaves as an
+INDEXED array, so every key subscripts to 0 and the table silently holds one entry**; `local -n` and `wait -n`
+the same. Five of those six produce a **wrong answer** rather than a failure, on the one host that cannot be
+checked from any other host.
+
+**Shipped:** `scripts/check-shell-portability/check-shell-portability.py` (ctest entry
+`shell_portability_guard`, **34 self-test arms**, every red arm asserting the MESSAGE). Two rules:
+* **rule 1** — for every `$(`, the span bash 3.2 would extract must contain BALANCED `case`/`esac`. Stated as
+  the property, not as a source pattern; a `case` that is **not** inside a substitution is perfectly safe on
+  3.2 and this repository has dozens, so nothing is churned to prevent nothing.
+* **rule 2** — a bash-4 construct requires a `BASH_VERSINFO` gate **above** its first use. The states each
+  construct counts in are part of the measured table: an EXPANSION is a use inside double quotes, a COMMAND
+  is not.
+
+✔**RED-ON-DISABLE, AT THE LEVEL THAT MATTERS:** run against the tree exactly as it stood at `3ce4e336`, the
+guard reports **five** violations — the three arms that killed the macOS leg, `test-driver-contracts.sh`'s
+call-site arm, and `base-harness.sh`. On the fixed tree it is green.
+
+⚠ **AND IT FOUND A DEFECT I SHIPPED LAST CYCLE.** `base-harness.sh` is `declare -A` and had **no** version
+gate; the three entry scripts that source it each carried their own copy — and P25's `benchmark-speedtest1.sh`
+became a fourth sourcer **without one**. On macOS it would have died at `declare: -A: invalid option`, an error
+naming a shell builtin, raised by a file the caller never mentions. **A precondition checked once per CALLER is
+a precondition a new caller can forget**, so the refusal now lives in the sourced file, where it cannot be.
+
+### ★★★ AND THE GATE LEG CAUGHT THE NEW GUARD'S OWN FIRST DEFECT — ON THE HOST IT WAS WRITTEN FOR
+
+The macOS leg run for THIS cycle reported `anchor_registry_guard` **PASSED (4.91 s)** — the fix works
+under bash 3.2, which is the whole point — and in the same run `shell_portability_guard` **FAILED**,
+with **seven violations against files that do not exist**.
+
+✔MEASURED: the first version answered *"which scripts are ours?"* with `git ls-files`. The macOS
+carriage's checkout sits at **`b52784a` (P5c)** with the working tree rsynced over it, so the INDEX
+still named `tools/check-anchor-registry.sh`, `tools/run-gate.sh`, `scripts/build/local-build.sh` and
+four more — every one deleted by the P17 `tools/` consolidation.
+
+★ **THE INDEX DESCRIBES A COMMIT; THE GUARD IS ABOUT THE TREE.** Every carriage here has that shape,
+so a guard keyed on the index reds on a HOST DIFFERENCE rather than a defect — and the next person to
+see it red would be right to ignore it. ⚠ The earlier walk-based draft had the OPPOSITE defect (six
+violations inside the gitignored `scratchpad/`, which holds verbatim lane backups of the very scripts
+this cycle repaired), so **neither obvious answer was correct on its own**. The tree is walked and git
+is asked only which of those files are IGNORED. `D-GATE-SHELL-PORTABILITY-SCANNED-THE-INDEX-NOT-THE-TREE`
+
+★★ Worth stating plainly because it is the cycle's own control loop working: **a guard written to stop
+a host-specific defect was itself host-specific, and the only thing that could have found that is the
+leg on that host.** A local green would have shipped it.
+
+### ★★ THE OTHER TWO LEGS WERE ONE DEFECT: TWO GLOBAL BUDGETS SET FROM THE LEGS THEY HAPPENED TO FIT
+
+Neither leg is broken. The asan leg is Debug + ASan + UBSan — ✔**11,314 CPU-seconds against gcc-release's
+935 (12x)**, which at `--parallel 4` is **47 minutes of PERFECT packing against a 50-minute budget**; the
+slowdown is uniform (~27x per compute-bound test), so there is no pathological test to find. Windows compiled
+**453 of 786** ninja edges in 45 minutes from a cold cache. **Neither number was ever wrong about its own leg.
+One number for five legs was.**
+
+`build_timeout_min` and `ctest_budget_min` are now **per-leg matrix fields** (windows build 120; asan and
+windows ctest 110; the rest 45/50), the Test step's `timeout-minutes` is `ctest_budget_min + 10`, and the
+measurement table sits above the matrix builder so the next reader meets the derivation rather than the
+constants. ★ A budget is a **CAP, not a reservation** — a leg that finishes early costs nothing, and what a
+cap prevents is a `timeout-minutes` SIGNAL kill that uploads no test log at all
+([[D-CI-STEP-TIMEOUT-YIELDS-NO-TEST-LOG]]).
+
+★★ **RAISING THE NUMBER WOULD HAVE DEFERRED THE SAME RED, NOT CLOSED IT.** ✔The asan leg reached **99.99% of
+its budget with nothing having said it was close**, and **62%** of its cost is the **1,231-entry** corpus,
+which grows every cycle. The Test step now times `ctest` with `$SECONDS`, prints
+`ctest wall clock: Ns of a Ms budget (P%)`, and emits a `::warning::` naming the leg above 80% — so the next
+breach is announced **while the run is still green**. ✔`$SECONDS` and no pipe, deliberately: `ctest` piped to
+`tee` hands `$?` to `tee` under `bash -e {0}` (no `pipefail`), so a failing suite would report success.
+
+✔**THE WORKFLOW BLOCK WAS EXERCISED, NOT READ**: the `Test` step was extracted verbatim, its GitHub
+expressions substituted, and driven under `bash -e` against a stub `ctest` — green under budget (no warning),
+**rc=8 preserved** on a failing suite, and exactly one `::warning::` at 55s of a 60s budget. The matrix builder
+was likewise run through `jq` and emits the five rows with the intended numbers.
+
+### ⚠ A THIRD DEFECT, FOUND BY WRITING THE FIRST FIX AGAINST THE HOUSE CONVENTION
+
+`enum_name_table_guard`'s ctest entry **verified the tree and proved nothing**, while the CMake comment beside
+it said *"It self-tests on every run (7 arms…)"*. ✔`main()` ran the self-test only under `--self-test`, and the
+entry passes no flag — so it would have passed identically with every assertion inside `check()` deleted.
+**The comment recorded the full fact while the code used half of it**, the shape this project keeps paying for.
+Fixed to match its siblings (`check-scripts-index` and `check-orphan-tests` both had it right, which is what
+made the odd one out visible), and the CMake comment now records that it was false rather than being quietly
+corrected.
+
+### THE GATE — AND EVERY FIGURE SAYS WHICH TREE IT WAS TAKEN ON
+
+★★ The guard was still being corrected while the long legs ran, so a full-suite number and a
+final-tree number are NOT the same claim. Both are given, and which is which is said, rather than
+quoting the convenient one. The rule is the cycle skill's own: a whole-tree gate number is not
+attributable once the tree has moved under it — here applied to the orchestrator's numbers rather
+than to a lane's.
+
+| leg | result | tree |
+| --- | --- | --- |
+| Windows ctest, `build/dbg`, **serial** (no `-j`) | ✅ **1539/1539, 2470.00 s** | FINAL |
+| Windows ctest, `local-build.ps1 -Test` (`-j 8`) | ✅ **1539/1539, 515.23 s** | mid-cycle |
+| Windows guards subset (`-R` the seven guards) | ✅ **7/7, 68.01 s** | FINAL |
+| WSL x86_64, `wsl-leg` clean build through `run-gate` | ✅ **1539/1539, 316.20 s** | mid-cycle |
+| WSL guards under a real POSIX shell, `--mode guards` | ✅ **7/7** | FINAL |
+| qemu arm64, `DSS_STRICT_ARM_VERDICTS=ON`, scoped `-R 'examples/.*\|lir/.*\|core/test_target.*'` | ✅ **636/636, 93.86 s** | mid-cycle |
+| macOS arm64, `remote-leg` clean build through `run-gate` | ⚠ **1538/1539, 3601.49 s** | mid-cycle |
+| macOS guards subset (`-R 'guard\|portab'`) | ✅ **12/12, 27.47 s** | FINAL |
+
+⚠ **THE ONE RED IS THE ONE WORTH READING, AND IT IS NOT A PRODUCT FAILURE.** The macOS full suite's
+single failure is `shell_portability_guard` — the copy synced BEFORE the index→tree correction, i.e.
+the defect described two sections above, caught by the leg it was written for. In the same run
+`anchor_registry_guard` **PASSED (4.91 s)**, which is the fix this cycle exists for. The corrected guard
+was then re-synced and re-run on that host: **12/12**. Every other macOS entry was green in both runs.
+
+★ The serial Windows figure (2470.00 s against 515.23 s) is not a regression: a bare `ctest` runs one
+test at a time, while `local-build.ps1` and `run-gate` default `CTEST_PARALLEL_LEVEL=8`. Said here
+because a number quoted without its `-j` is the shape this project has been misled by before.
+
+### WHAT THIS CYCLE LEFT OPEN, AND WHY — both 🔵 DISCLOSED, both checkable in `3ce4e336`
+
+* `D-CI-WINDOWS-CTEST-COST-IS-UNMEASURED` — the one budget in the new table **not measured on its own leg**,
+  because that leg has never reached ctest. 110 is 🧠**INFERRED** from the operator's workstation figure
+  (✔501.82s at 32 logical CPUs, P25) and said so rather than presented as measured. It closes by reading the
+  budget-usage line off the first completed Windows run.
+* `D-CI-PR-PIPELINE-IS-VENDORED-AND-ITS-SYNC-IS-UNCHECKED` — `pipeline-pr.yml` is a hand-copied fork of
+  DSS.DevOps's `cpp-app-pr.yml@v2` (a PUBLIC repo cannot call a reusable in a private one), its sync obligation
+  is stated in a comment and enforced by nothing, and this cycle made the divergence concrete. **An operator
+  decision: that repository is outside this tree.**
+
+⚠ **THE 🔵 CLASSIFICATION IS A JUDGEMENT AND IT IS FLAGGED FOR VETO.** Both rows describe conditions that
+pre-date this cycle — the Windows leg had never reached ctest, and nothing has ever checked the vendored copy
+against its upstream — so `DISCLOSED, not created` is the honest mark under the 2026-08-14 ruling. If the
+operator reads either as created debt, they become P27's first work.
 
 ---
 

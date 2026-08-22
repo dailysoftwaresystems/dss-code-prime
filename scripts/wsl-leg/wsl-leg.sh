@@ -87,7 +87,11 @@ if [[ "$MODE" == "guards" ]]; then
         bash "scripts/$g/$g.sh" 2>&1 | tail -2
         s=${PIPESTATUS[0]}; [[ $s -eq 0 ]] || { rc=$s; echo "    RED rc=$s"; }
     done
-    for g in check-scripts-index check-plan-citations check-anchor-balance; do
+    # ⚠ THIS LIST IS HAND-KEPT, AND A GUARD MISSING FROM IT IS A GUARD THIS MODE
+    # CANNOT RUN. `check-shell-portability` was added 2026-08-22 and belongs here
+    # more than most: its whole subject is what a POSIX shell does differently, and
+    # this mode is the one that runs the guards under a real POSIX shell.
+    for g in check-scripts-index check-plan-citations check-anchor-balance check-shell-portability; do
         printf -- '--- %s\n' "$g"
         python3 "scripts/$g/$g.py" 2>&1 | tail -2
         s=${PIPESTATUS[0]}; [[ $s -eq 0 ]] || { rc=$s; echo "    RED rc=$s"; }

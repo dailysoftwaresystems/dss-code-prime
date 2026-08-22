@@ -78,6 +78,21 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   (`scripts/README.md`, `references/scripts.md`) disagree, or when a script's own `PURPOSE:`
   line differs from its index row. Regenerate both with `--write`; never hand-edit the block
   between the generated-index markers.
+- shell-portability guard OK: `python scripts/check-shell-portability/check-shell-portability.py`.
+  Rides ctest as `shell_portability_guard`, so it runs anyway — run it directly when this cycle
+  touched a `.sh`. It refuses two shapes that are fatal on **macOS bash 3.2** and invisible
+  everywhere else: a `case` inside `$( … )` whose patterns are not `(`-prefixed, and a bash-4+
+  construct in a file with no `BASH_VERSINFO` gate above it.
+  ★★ ⚠ **`bash -n` CANNOT FIND THE FIRST ONE** — ✔MEASURED 2026-08-22: the probe file parses clean
+  under 3.2 (exit 0) and fails only when the substitution is EXPANDED. Do not "check it with the old
+  shell" instead; that instrument is blind by construction. The cost of not having this guard was
+  `anchor_registry_guard` dying inside its OWN self-test on `macos-latest`, so the anchor registry
+  had never been checked on that host (`D-SCRIPT-CASE-IN-COMMAND-SUBSTITUTION-BREAKS-BASH-3-2`).
+  ⓘ It walks the TREE and asks git only what is IGNORED — never `git ls-files`. ✔MEASURED on the
+  macOS leg the same day: a carriage's checkout sits at an old commit with the working tree rsynced
+  over it, so the INDEX named seven deleted `tools/*.sh` paths and the guard reported seven
+  violations on a host where nothing was wrong. Every carriage has that shape, so the distinction is
+  operational, not academic (`D-GATE-SHELL-PORTABILITY-SCANNED-THE-INDEX-NOT-THE-TREE`).
 - agnosticism scan clean (no hardcoded language/CPU/format in shared substrate).
 - CI-hazard screen clean (from Step 5): no GCC-vs-MSVC portability traps. Local green ≠ CI green.
 - review folded clean.

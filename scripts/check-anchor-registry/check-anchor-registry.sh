@@ -840,16 +840,41 @@ _st_arm "quotation-declaration-recognition-is-positional" "" \
         "$(awk "${QUOTE_DECL_AWK}" "${_st_dir}/mid.txt" | tr '\n' ' ')"
 
 # ── arms 8-10: root existence and per-root floor ────────────────────────────
+# ★★★ EVERY `case` ARM BELOW CARRIES A LEADING `(` ON ITS PATTERN, AND THAT PAREN IS
+# LOAD-BEARING — IT IS NOT STYLE.
+#
+# ✔MEASURED 2026-08-22 on macOS 26.5.2 (`/bin/bash` 3.2.57, the shell every macOS host
+# and the `macos-latest` CI runner give you): bash 3.2 does not recursively parse a
+# command substitution. It scans forward for the matching `)` counting parens, so the
+# `)` that CLOSES A `case` PATTERN terminates the `$( … )` early. The arm
+#     "$(case "$g" in *"hello"*) echo yes ;; *) echo no ;; esac)"
+# expands to the LITERAL TEXT ` echo yes ;; *) echo no ;; esac)` and bash prints
+#     command substitution: syntax error near unexpected token `newline'
+# The POSIX-optional leading `(` balances the parens, and the same line then yields
+# `yes` on 3.2, 4.x and 5.x alike.
+#
+# ⚠ AND `bash -n` IS BLIND TO IT — ✔MEASURED in the same run: the probe file parses
+# clean (`bash -n` exit 0) and fails only when the substitution is EXPANDED, because
+# that is when 3.2 parses the extracted text. So a syntax pre-check cannot find this
+# class. The guard that does is `check-shell-portability`, and its row is
+# D-SCRIPT-CASE-IN-COMMAND-SUBSTITUTION-BREAKS-BASH-3-2
+# -- on a line of its own, because an id broken across a line break is invisible
+# to every grep, which is the one failure mode a fail-loud project cannot detect
+# by watching for a failure.
+#
+# ⚠ THE DAMAGE HERE WAS NOT AN ERROR MESSAGE, IT WAS A GUARD THAT NEVER RAN. This is
+# the self-test that proves `anchor_registry_guard` can FAIL; on macOS it died inside
+# its own arms, so the guard's verdict on the real tree was never reached at all.
 # The fixture anchor is assembled from two literals; see the note above.
 _st_anchor="D-SELFTEST""-FIXTURE-ANCHOR"
 mkdir -p "${_st_dir}/root"
 printf 'cite %s here\n' "${_st_anchor}" > "${_st_dir}/root/a.md"
 _st_got="$(_scan_one_root "${_st_dir}/no-such-root" 1 '*.md' "${_st_dir}/sink" 2>&1 || true)"
 _st_arm "missing-root-refuses-and-says-so" "yes" \
-        "$(case "${_st_got}" in *"does not exist"*"refusing to report a partial scan as a pass"*) echo yes ;; *) echo "${_st_got}" ;; esac)"
+        "$(case "${_st_got}" in (*"does not exist"*"refusing to report a partial scan as a pass"*) echo yes ;; (*) echo "${_st_got}" ;; esac)"
 _st_got="$(_scan_one_root "${_st_dir}/root" 99 '*.md' "${_st_dir}/sink" 2>&1 || true)"
 _st_arm "below-floor-root-refuses-and-names-the-floor" "yes" \
-        "$(case "${_st_got}" in *"yielded only 1 anchors, below its floor of 99"*"do not lower the floor"*) echo yes ;; *) echo "${_st_got}" ;; esac)"
+        "$(case "${_st_got}" in (*"yielded only 1 anchors, below its floor of 99"*"do not lower the floor"*) echo yes ;; (*) echo "${_st_got}" ;; esac)"
 : > "${_st_dir}/sink"
 _st_got="$(_scan_one_root "${_st_dir}/root" 1 '*.md' "${_st_dir}/sink" 2>&1 || true)"
 _st_arm "at-floor-root-passes-and-collects" "|${_st_anchor}" "${_st_got}|$(cat "${_st_dir}/sink")"
@@ -863,7 +888,7 @@ _st_r1="D-RETA""-FIXTURE-ROW"; _st_r2="D-RETB""-FIXTURE-ROW"; _st_r3="D-RETC""-F
 } > "${_st_dir}/registry.md"
 _st_got="$(LC_ALL=C awk -F'|' "${RETIRED_ID_AWK}" "${_st_dir}/registry.md" | tr '\n' ' ')"
 _st_arm "retired-matcher-extracts-a-positionally-marked-row" "yes" \
-        "$(case "${_st_got}" in *"${_st_r1}"*) echo yes ;; *) echo "${_st_got}" ;; esac)"
+        "$(case "${_st_got}" in (*"${_st_r1}"*) echo yes ;; (*) echo "${_st_got}" ;; esac)"
 _st_arm "retired-matcher-ignores-prose-that-says-retired-id" "" \
         "$(printf '%s' "${_st_got}" | grep -o "${_st_r2}" || true)"
 _st_arm "retired-matcher-ignores-a-row-that-documents-the-token" "" \

@@ -549,10 +549,46 @@ if(DSS_BUILD_TESTS)
     #   rows somebody remembered to add to it.
     # * It self-tests on every run (7 arms, each asserting the MESSAGE of the
     #   refusal it names), so this entry cannot pass without proving it can fail.
+    #   ⚠ THIS SENTENCE WAS FALSE FOR A DAY, AND THE FIX IS IN THE SCRIPT, NOT HERE.
+    #   ✔MEASURED 2026-08-22: `main()` ran the self-test only under `--self-test`,
+    #   and this entry passes no flag — so the ctest form verified the tree and
+    #   proved nothing. `check-shell-portability` found it while being written
+    #   against the same convention (D-GATE-ENUM-NAME-TABLE-CTEST-FORM-NEVER-SELF-TESTED).
     add_test(
         NAME enum_name_table_guard
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/scripts/check-enum-name-table-guards/check-enum-name-table-guards.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Shell-portability guard (2026-08-22 —
+    # D-SCRIPT-CASE-IN-COMMAND-SUBSTITUTION-BREAKS-BASH-3-2).
+    # macOS is a supported host and its `/bin/bash` is 3.2.57 — there is no newer
+    # one, and this repository drives its guards through `bash <script>` on every
+    # non-Windows leg. Two shapes are fatal there and invisible everywhere else:
+    #   · a `case` inside `$( … )` whose patterns are not `(`-prefixed. bash 3.2
+    #     scans for the matching `)` instead of parsing, so the pattern's own `)`
+    #     ends the substitution and the arm expands to LITERAL TEXT.
+    #   · a bash-4+ construct (`mapfile`, `declare -A`, `${v^^}`, …) in a file that
+    #     never says it needs bash 4 — six of the twelve leave the exit status at
+    #     ZERO, so the script runs on with a wrong answer.
+    #
+    # ★★ THE COST OF NOT HAVING THIS WAS MEASURED, NOT IMAGINED. On 2026-08-22 the
+    # `macos-clang-release` leg failed with `anchor_registry_guard` dying inside its
+    # OWN self-test — so the anchor registry had never actually been checked on that
+    # host. ⚠ And `bash -n` cannot see the first shape at all (✔the probe file
+    # parses clean under 3.2 and fails only when the substitution is EXPANDED), which
+    # is why this is a static guard and not a syntax pre-check.
+    #
+    # ★ RIDES CTEST rather than being a CI step, for the reason the guards above
+    # give: every leg then runs it, on the host it is about.
+    # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies the
+    # tree and then drives 34 arms against synthetic fixtures, each red arm asserting
+    # the MESSAGE of the refusal it names, so this entry cannot pass without proving
+    # the guard can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    add_test(
+        NAME shell_portability_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-shell-portability/check-shell-portability.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     # Citation-stability guard (2026-08-19 — D-PLANS-CITATION-LINE-NUMBERS-SILENTLY-INVALIDATED).

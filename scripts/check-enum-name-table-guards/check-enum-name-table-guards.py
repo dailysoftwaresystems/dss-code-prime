@@ -207,7 +207,18 @@ def main():
     args = ap.parse_args()
     if args.self_test:
         return self_test()
-    return check(repo_root())
+    # star star THE NO-ARGUMENT FORM -- the one ctest uses -- VERIFIES THE REAL TREE
+    # AND THEN PROVES IT CAN FAIL, in that order.
+    # ⚠ IT DID NOT, AND THE COMMENT IN CMakeLists.txt SAID IT DID. Measured
+    # 2026-08-22: this returned `check(...)` alone, so the ctest entry would have
+    # passed identically with every assertion inside `check` deleted -- the vacuous
+    # pass the sibling guards were built to refuse, in the guard that refuses it for
+    # enum tables. Found while writing `check-shell-portability` against the same
+    # convention. D-GATE-ENUM-NAME-TABLE-CTEST-FORM-NEVER-SELF-TESTED.
+    rc = check(repo_root())
+    if rc != 0:
+        return rc
+    return self_test()
 
 
 if __name__ == '__main__':

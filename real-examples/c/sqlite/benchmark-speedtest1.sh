@@ -56,6 +56,27 @@
 # Exit codes: 0 measured · 1 a refusal · 2 usage · 3 no arm produced a binary.
 set -Eeuo pipefail
 
+# ── bash 4+ required, and this script gets the RE-EXEC arm its siblings have ──
+# It sources base-harness.sh, whose tables are `declare -A`. ✔MEASURED 2026-08-22:
+# every macOS host answers `bash` with 3.2.57, so without this the benchmark died
+# inside a file it never named. The floor is base-harness.sh's own refusal; this is
+# the arm that makes the floor unnecessary on a host where a newer bash IS present,
+# and it is here rather than there because only an entry script owns `$0` and `"$@"`.
+# Kept byte-for-byte in step with build-and-test.sh, test-confound-scope.sh and
+# test-driver-contracts.sh — four copies of one predicate is itself a drift risk, and
+# `check-shell-portability` is what refuses a fifth that forgets.
+# TWIN PARITY: `benchmark-speedtest1.ps1` needs no analogue — it reaches this file
+# through `wsl.exe -e`, where bash is 5.x, and does its own work in PowerShell.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  for _newer_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null || true)"; do
+    if [ -n "$_newer_bash" ] && [ -x "$_newer_bash" ] && "$_newer_bash" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null; then
+      exec "$_newer_bash" "$0" "$@"
+    fi
+  done
+  echo "ERROR: this benchmark needs bash 4+ (found ${BASH_VERSION:-unknown}); on macOS run: brew install bash" >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 C_RST=$'\033[0m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'
