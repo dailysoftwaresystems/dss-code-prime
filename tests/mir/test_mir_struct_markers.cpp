@@ -16,12 +16,15 @@
 
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
+#include "mir/mir_cfg.hpp"
 #include "mir/mir_dom.hpp"
 #include "mir/mir_struct_markers.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -644,4 +647,494 @@ TEST(StructCfDerivation, ModuleWideRederiveCoversEveryFunction) {
     rederiveStructCfMarkers(m);
     EXPECT_EQ(m.blockMarker(m.funcEntry(f1)), StructCfMarker::EntryBlock);
     EXPECT_EQ(m.blockMarker(m.funcEntry(f2)), StructCfMarker::EntryBlock);
+}
+
+// ── the two REUSED substrates behind the derivation ─────────────────────────
+//
+// `deriveStructCfMarkers` costs O(function), not O(module), because two of its
+// inputs stopped being recomputed from scratch per function:
+//   - the natural-loop forest, whose back-edge sweep is now SCOPED to the
+//     function's own candidate set (mir_dom.hpp `mirNaturalLoops` overload);
+//   - the post-dominator tree, now built through a reusable `MirPostDomScratch`
+//     (D-OPT-POSTDOM-SCRATCH-REUSE).
+// Both are PERFORMANCE changes over a compiler's output, so each one is pinned
+// DIFFERENTIALLY against the fresh/whole-module computation it replaced, over
+// an adversarial module, after EVERY call. A performance change that alters a
+// marker is a miscompile of the verifier's contract, not a slow build.
+
+namespace {
+
+// Adversarial module. The shapes are chosen so that consecutive per-function
+// walks have DIFFERENT and SHRINKING write sets (a big loop nest followed by a
+// one-block function is the case a partial-reset bug survives), and so that
+// every ipdom arm is exercised: a real join, the virtual exit, and INVALID
+// (reverse-unreachable, from the infinite loop). Two functions own SELF-LOOPING
+// blocks — the shape that makes a back-edge sweep reach across function
+// boundaries (see ForeignSelfLoopPseudoLoopClaimIsPreserved).
+struct AdversarialModule {
+    Mir                    m;
+    std::vector<MirFuncId> funcs;
+    MirFuncId              selfLoopFunc{};   // owns gSelf/gTail
+    MirBlockId             gSelf{};
+    MirBlockId             gTail{};
+    MirFuncId              trivialFunc{};    // one block, derived FIRST
+};
+
+AdversarialModule buildAdversarialModule(TypeInterner& interner) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    AdversarialModule out;
+
+    // f0 — TRIVIAL: one block. Derived FIRST, so the module-wide sweep's
+    // reach into LATER functions is observable in its own derived vector.
+    MirFuncId const f0 = mb.addFunction(fnSig, SymbolId{1});
+    {
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e); mb.addReturn(mb.addConst(i32Lit(0), i32));
+    }
+
+    // f1 — BIG: a loop whose body carries a diamond, plus a switch after it.
+    MirFuncId const f1 = mb.addFunction(fnSig, SymbolId{2});
+    {
+        MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const header = mb.createBlock();
+        MirBlockId const body   = mb.createBlock();
+        MirBlockId const innerT = mb.createBlock();
+        MirBlockId const innerJ = mb.createBlock();
+        MirBlockId const exit   = mb.createBlock();
+        MirBlockId const c1     = mb.createBlock();
+        MirBlockId const c2     = mb.createBlock();
+        MirBlockId const sjoin  = mb.createBlock();
+        mb.beginBlock(entry);
+        MirInstId const cond = mb.addArg(0, boolT);
+        mb.addBr(header);
+        mb.beginBlock(header); mb.addCondBr(cond, body, exit);
+        mb.beginBlock(body);   mb.addCondBr(cond, innerT, innerJ);
+        mb.beginBlock(innerT); mb.addBr(innerJ);
+        mb.beginBlock(innerJ); mb.addBr(header);
+        mb.beginBlock(exit);
+        MirInstId const disc = mb.addConst(i32Lit(1), i32);
+        MirInstId const k1   = mb.addConst(i32Lit(1), i32);
+        MirInstId const k2   = mb.addConst(i32Lit(2), i32);
+        std::pair<MirInstId, MirBlockId> const cases[] = {{k1, c1}, {k2, c2}};
+        mb.addSwitch(disc, cases, sjoin);
+        mb.beginBlock(c1);    mb.addBr(sjoin);
+        mb.beginBlock(c2);    mb.addBr(sjoin);
+        mb.beginBlock(sjoin); mb.addReturn(mb.addConst(i32Lit(3), i32));
+    }
+
+    // f2 — INFINITE: reverse-unreachable blocks (ipdom INVALID) and a
+    // REACHABLE self-loop.
+    MirFuncId const f2 = mb.addFunction(fnSig, SymbolId{3});
+    {
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const spin  = mb.createBlock();
+        mb.beginBlock(entry); mb.addBr(spin);
+        mb.beginBlock(spin);  mb.addBr(spin);   // self-loop, never exits
+    }
+
+    // f3 — DIAMOND: both arms return (ipdom == the VIRTUAL exit).
+    MirFuncId const f3 = mb.addFunction(fnSig, SymbolId{4});
+    {
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const tArm  = mb.createBlock();
+        MirBlockId const fArm  = mb.createBlock();
+        mb.beginBlock(entry);
+        mb.addCondBr(mb.addArg(0, boolT), tArm, fArm);
+        mb.beginBlock(tArm); mb.addReturn(mb.addConst(i32Lit(7), i32));
+        mb.beginBlock(fArm); mb.addReturn(mb.addConst(i32Lit(9), i32));
+    }
+
+    // f4 — an UNREACHABLE self-looping block whose OTHER successor is a
+    // further unreachable block. This is the shape the whole-module back-edge
+    // sweep turns into a single-block pseudo-loop in EVERY function's
+    // derivation, claiming LoopExit on `gTail` across function boundaries.
+    MirFuncId const f4 = mb.addFunction(fnSig, SymbolId{5});
+    MirBlockId gSelf{}, gTail{};
+    {
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        gSelf = mb.createBlock();
+        gTail = mb.createBlock();
+        mb.beginBlock(entry);
+        MirInstId const c = mb.addArg(0, boolT);
+        mb.addReturn(mb.addConst(i32Lit(1), i32));
+        mb.beginBlock(gSelf); mb.addCondBr(c, gSelf, gTail);
+        mb.beginBlock(gTail); mb.addReturn(mb.addConst(i32Lit(2), i32));
+    }
+
+    // f5 — LATCH-LAST: a reachable do-while whose back-edge SOURCE is the
+    // function's FINAL block in the arena. The production candidate builder
+    // enumerates the function's contiguous range [first, first+nb); an
+    // off-by-one at the range END silently drops exactly this latch, the
+    // whole-module sweep still finds its loop, and every scoped-vs-whole
+    // differential in this file goes red. Until this function existed the
+    // clause was UNEXERCISED: f1's latch is mid-function, and f2's last
+    // block is a self-loop the module index covers regardless of the range.
+    MirFuncId const f5 = mb.addFunction(fnSig, SymbolId{6});
+    {
+        MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const header = mb.createBlock();
+        MirBlockId const body   = mb.createBlock();
+        MirBlockId const exit   = mb.createBlock();
+        MirBlockId const latch  = mb.createBlock();   // arena-LAST on purpose
+        mb.beginBlock(entry);  mb.addBr(header);
+        mb.beginBlock(header); mb.addCondBr(mb.addArg(0, boolT), body, exit);
+        mb.beginBlock(body);   mb.addBr(latch);
+        mb.beginBlock(latch);  mb.addBr(header);      // back edge from the LAST block
+        mb.beginBlock(exit);   mb.addReturn(mb.addConst(i32Lit(5), i32));
+    }
+
+    out.m = std::move(mb).finish();
+    out.funcs = {f0, f1, f2, f3, f4, f5};
+    out.trivialFunc  = f0;
+    out.selfLoopFunc = f4;
+    out.gSelf = gSelf;
+    out.gTail = gTail;
+    return out;
+}
+
+// FULL-array equality over the module-sized post-dominator arrays, comparing
+// `v` AND `arenaTag` — MirBlockId's `operator==` compares `.v` only, so a
+// provenance divergence would slip past a plain `EXPECT_EQ`.
+::testing::AssertionResult postDomEqual(MirPostDomTree const& fresh,
+                                        MirPostDomTree const& reused) {
+    if (fresh.virtualExit != reused.virtualExit) {
+        return ::testing::AssertionFailure()
+            << "virtualExit " << fresh.virtualExit << " != " << reused.virtualExit;
+    }
+    if (fresh.ipdom.size() != reused.ipdom.size()) {
+        return ::testing::AssertionFailure()
+            << "ipdom size " << fresh.ipdom.size() << " != " << reused.ipdom.size();
+    }
+    if (fresh.gaveUp.size() != reused.gaveUp.size()) {
+        return ::testing::AssertionFailure()
+            << "gaveUp size " << fresh.gaveUp.size() << " != " << reused.gaveUp.size();
+    }
+    for (std::size_t i = 0; i < fresh.ipdom.size(); ++i) {
+        if (fresh.ipdom[i].v != reused.ipdom[i].v
+         || fresh.ipdom[i].arenaTag != reused.ipdom[i].arenaTag) {
+            return ::testing::AssertionFailure()
+                << "ipdom[" << i << "] fresh {v=" << fresh.ipdom[i].v
+                << ", tag=" << fresh.ipdom[i].arenaTag << "} != reused {v="
+                << reused.ipdom[i].v << ", tag=" << reused.ipdom[i].arenaTag << "}";
+        }
+        if (fresh.gaveUp[i] != reused.gaveUp[i]) {
+            return ::testing::AssertionFailure()
+                << "gaveUp[" << i << "] " << int{fresh.gaveUp[i]} << " != "
+                << int{reused.gaveUp[i]};
+        }
+    }
+    return ::testing::AssertionSuccess();
+}
+
+::testing::AssertionResult loopForestEqual(std::vector<MirNaturalLoop> const& a,
+                                           std::vector<MirNaturalLoop> const& b) {
+    if (a.size() != b.size()) {
+        return ::testing::AssertionFailure()
+            << "loop count " << a.size() << " != " << b.size();
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].header.v != b[i].header.v
+         || a[i].header.arenaTag != b[i].header.arenaTag) {
+            return ::testing::AssertionFailure()
+                << "loop[" << i << "] header " << a[i].header.v << " != " << b[i].header.v;
+        }
+        auto ids = [](std::vector<MirBlockId> const& v) {
+            std::vector<std::uint32_t> o;
+            for (MirBlockId const x : v) { o.push_back(x.v); o.push_back(x.arenaTag); }
+            return o;
+        };
+        if (ids(a[i].body) != ids(b[i].body)) {
+            return ::testing::AssertionFailure()
+                << "loop[" << i << "] (header " << a[i].header.v << ") body differs";
+        }
+        if (ids(a[i].backEdgeSources) != ids(b[i].backEdgeSources)) {
+            return ::testing::AssertionFailure()
+                << "loop[" << i << "] (header " << a[i].header.v
+                << ") backEdgeSources differ";
+        }
+    }
+    return ::testing::AssertionSuccess();
+}
+
+// The candidate set a caller must supply for the scoped sweep to answer what
+// the whole-module sweep answers. Recomputed HERE independently of the
+// production builder (mir_struct_markers.cpp) — a shared helper would make the
+// differential tautological.
+std::vector<std::uint32_t> candidateSetFor(Mir const& m, MirFuncId f,
+                                           std::vector<MirBlockId> const& rpo) {
+    std::vector<std::uint32_t> out;
+    std::uint32_t const bc = static_cast<std::uint32_t>(m.blockCount());
+    std::uint32_t const nb = m.funcBlockCount(f);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) out.push_back(m.funcBlockAt(f, bi).v);
+    for (MirBlockId const b : rpo) out.push_back(b.v);
+    for (std::uint32_t i = 1; i < bc; ++i) {          // the module self-loop index
+        MirBlockId const b{i, m.id().v};
+        for (MirBlockId const s : m.blockSuccessors(b)) {
+            if (s.valid() && s.v == i) { out.push_back(i); break; }
+        }
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+} // namespace
+
+// D-OPT-POSTDOM-SCRATCH-REUSE. One scratch, an adversarial SEQUENCE of
+// functions (big → tiny → infinite → …, then reversed, then a repeat), and a
+// FULL module-sized array comparison against the fresh tree after EVERY call.
+// A partial reset that misses a slot leaves the PREVIOUS function's ipdom
+// there; the big-then-tiny order is what makes that stale slot survive.
+TEST(MirPostDomScratchReuse, MatchesFreshOverAdversarialSequence) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule a = buildAdversarialModule(interner);
+
+    std::vector<MirFuncId> sequence = a.funcs;
+    for (auto it = a.funcs.rbegin(); it != a.funcs.rend(); ++it) {
+        sequence.push_back(*it);
+    }
+    sequence.push_back(a.funcs.front());   // repeat: idempotence on one scratch
+    sequence.push_back(a.funcs.front());
+
+    MirPostDomScratch scratch;
+    for (std::size_t step = 0; step < sequence.size(); ++step) {
+        MirFuncId const f = sequence[step];
+        MirPostDomTree const  fresh  = computeMirPostDomTree(a.m, f);
+        MirPostDomTree const& reused = computeMirPostDomTree(a.m, f, scratch);
+        EXPECT_TRUE(postDomEqual(fresh, reused))
+            << "step " << step << ", func #" << f.v;
+    }
+}
+
+// The OTHER half of the scratch contract, and the half a value-differential
+// CANNOT see: each call must see ONLY its own function. A reset that misses
+// the reverse-ADJACENCY leaves the previous function's exit blocks hanging off
+// the shared virtual-exit node, so the next call's reverse-RPO walks them too.
+// Their idom still resolves to "unset" (their own reverse-preds WERE cleared),
+// so every ipdom value stays correct and the differential above passes — while
+// the traversal quietly grows by every exit block in the module and the whole
+// O(function) property, which is the only reason the scratch exists, is gone.
+//
+// So this pins the SHAPE of the scratch after each call: nothing outside the
+// function's own block range (plus the virtual exit) may be dirty.
+TEST(MirPostDomScratchReuse, EachCallSeesOnlyItsOwnFunction) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule a = buildAdversarialModule(interner);
+    std::uint32_t const virtualSlot = static_cast<std::uint32_t>(a.m.blockCount());
+
+    std::vector<MirFuncId> sequence = a.funcs;
+    for (auto it = a.funcs.rbegin(); it != a.funcs.rend(); ++it) {
+        sequence.push_back(*it);
+    }
+
+    MirPostDomScratch scratch;
+    for (std::size_t step = 0; step < sequence.size(); ++step) {
+        MirFuncId const f = sequence[step];
+        (void)computeMirPostDomTree(a.m, f, scratch);
+
+        std::uint32_t const nb    = a.m.funcBlockCount(f);
+        std::uint32_t const first = a.m.funcBlockAt(f, 0).v;
+        std::uint32_t const lastEx = first + nb;
+        for (std::uint32_t s = 0; s <= virtualSlot; ++s) {
+            if (s >= first && s < lastEx) continue;   // this function's own
+            if (s == virtualSlot) continue;           // checked exactly below
+            EXPECT_TRUE(scratch.revPreds[s].empty())
+                << "step " << step << ", func #" << f.v << ": revPreds[" << s
+                << "] carries " << scratch.revPreds[s].size()
+                << " stale edge(s) from an earlier function";
+            EXPECT_TRUE(scratch.revSuccs[s].empty())
+                << "step " << step << ", func #" << f.v << ": revSuccs[" << s
+                << "] carries " << scratch.revSuccs[s].size()
+                << " stale edge(s) from an earlier function";
+            EXPECT_EQ(scratch.visited[s], 0)
+                << "step " << step << ", func #" << f.v << ": visited[" << s
+                << "] still set from an earlier function";
+        }
+        // The virtual exit is the ONE shared node: its reverse-successors are
+        // exactly THIS function's reachable Return/Unreachable blocks.
+        // Recomputed here from the Mir, independently of the production walk.
+        std::unordered_set<std::uint32_t> reachable;
+        for (MirBlockId const b : mirReversePostOrder(a.m, a.m.funcEntry(f))) {
+            reachable.insert(b.v);
+        }
+        std::size_t exits = 0;
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = a.m.funcBlockAt(f, bi);
+            if (!reachable.contains(b.v)) continue;
+            std::uint32_t const ni = a.m.blockInstCount(b);
+            if (ni == 0) continue;
+            MirOpcode const term = a.m.instOpcode(a.m.blockInstAt(b, ni - 1));
+            if (term == MirOpcode::Return || term == MirOpcode::Unreachable) ++exits;
+        }
+        EXPECT_EQ(scratch.revSuccs[virtualSlot].size(), exits)
+            << "step " << step << ", func #" << f.v
+            << ": the virtual exit accumulated other functions' exit blocks";
+        EXPECT_EQ(scratch.order.size(), scratch.touchedNodes.size())
+            << "step " << step << ": the recorded write set must BE the order";
+    }
+}
+
+// The scratch is bound to ONE module — a stale scratch carried across a
+// rebuild must fail LOUD, never silently mix two modules' slots.
+TEST(MirPostDomScratchReuseDeathTest, StaleScratchAcrossModulesAborts) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule a = buildAdversarialModule(interner);
+    AdversarialModule b = buildAdversarialModule(interner);
+    MirPostDomScratch scratch;
+    (void)computeMirPostDomTree(a.m, a.funcs.front(), scratch);
+    EXPECT_DEATH((void)computeMirPostDomTree(b.m, b.funcs.front(), scratch),
+                 "stale scratch across a rebuild");
+}
+
+// D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN. The scoped back-edge sweep must answer
+// EXACTLY what the whole-module sweep answers — same loops, same bodies, same
+// back-edge-source ORDER — for every function of the adversarial module.
+TEST(MirNaturalLoopsScopedSweep, MatchesWholeModuleSweepForEveryFunction) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule a = buildAdversarialModule(interner);
+    auto const preds = mirBuildPredecessors(a.m);
+    for (MirFuncId const f : a.funcs) {
+        MirBlockId const entry = a.m.funcEntry(f);
+        auto const rpo = mirReversePostOrder(a.m, entry);
+        MirDomTree const dom = computeMirDomTree(a.m, entry, rpo, preds);
+        auto const cands = candidateSetFor(a.m, f, rpo);
+        auto const wholeModule = mirNaturalLoops(a.m, dom, preds);
+        auto const scoped = mirNaturalLoops(
+            a.m, dom, preds, std::span<std::uint32_t const>(cands.data(), cands.size()));
+        EXPECT_TRUE(loopForestEqual(wholeModule, scoped)) << "func #" << f.v;
+    }
+}
+
+// The scoped overload's ascending-unique-in-range contract is what fixes
+// `backEdgeSources` order; a violation is a caller bug and fails LOUD.
+TEST(MirNaturalLoopsScopedSweepDeathTest, UnsortedCandidatesAbort) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule a = buildAdversarialModule(interner);
+    auto const preds = mirBuildPredecessors(a.m);
+    MirFuncId const f = a.funcs[1];
+    MirBlockId const entry = a.m.funcEntry(f);
+    auto const rpo = mirReversePostOrder(a.m, entry);
+    MirDomTree const dom = computeMirDomTree(a.m, entry, rpo, preds);
+    std::vector<std::uint32_t> const descending = {3u, 2u};
+    EXPECT_DEATH((void)mirNaturalLoops(a.m, dom, preds,
+                     std::span<std::uint32_t const>(descending.data(), descending.size())),
+                 "not strictly ascending");
+    std::vector<std::uint32_t> const outOfRange = {
+        static_cast<std::uint32_t>(a.m.blockCount())};
+    EXPECT_DEATH((void)mirNaturalLoops(a.m, dom, preds,
+                     std::span<std::uint32_t const>(outOfRange.data(), outOfRange.size())),
+                 "outside \\[1, blockCount");
+}
+
+// ── the derivation's CROSS-FUNCTION reach (behaviour, not aspiration) ───────
+
+// The production candidate builder (collectBackEdgeCandidates) had NO
+// differential of its own: every scoped-vs-whole comparison in this file
+// feeds the TEST's independent candidate set, and both appliers share the
+// production builder, so a range-enumeration bug agreed with itself
+// everywhere. ✔PROVEN: with the range end mutated to `s < lastEx - 1` the
+// whole differential suite stayed GREEN. This pin closes that gap with a
+// VALUE pin through the public per-function overload (the production
+// path): f5's do-while derives LoopHeader on the header via the back edge
+// from the arena-LAST block — drop that block from the candidate range and
+// the loop vanishes from the scoped sweep, the header falls through to the
+// if/switch rules, and exactly this assertion goes red.
+TEST(StructCfDerivation, LatchLastBlocksBackEdgeIsInTheCandidateRange) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule a = buildAdversarialModule(interner);
+
+    // f5 is the module's LAST function; its latch is the module's LAST block.
+    ASSERT_EQ(a.funcs.back().v, a.m.funcCount() - 1u);
+    auto const& f5   = a.funcs.back();
+    auto const  last = a.m.funcBlockAt(f5, a.m.funcBlockCount(f5) - 1u);
+    // entry, header, body, exit, latch — creation order; latch is arena-last.
+    MirBlockId const entry  = a.m.funcBlockAt(f5, 0);
+    MirBlockId const header = a.m.funcBlockAt(f5, 1);
+    MirBlockId const body   = a.m.funcBlockAt(f5, 2);
+    MirBlockId const exit   = a.m.funcBlockAt(f5, 3);
+    MirBlockId const latch  = a.m.funcBlockAt(f5, 4);
+    EXPECT_GT(latch.v, exit.v);
+    EXPECT_EQ(latch.v, last.v);
+    // latch → header is the back edge; the natural loop is {header, body,
+    // latch}; exit is the only way out.
+    auto const derived = deriveStructCfMarkers(a.m, f5);
+    EXPECT_EQ(derived[entry.v],  StructCfMarker::EntryBlock);
+    EXPECT_EQ(derived[header.v], StructCfMarker::LoopHeader)
+        << "the back edge from the arena-LAST block must reach the sweep — "
+           "an off-by-one at the candidate range END drops exactly it";
+    EXPECT_EQ(derived[body.v],   StructCfMarker::Linear);
+    EXPECT_EQ(derived[latch.v],  StructCfMarker::Linear)
+        << "the latch is IN the loop body (its successor is the header, not "
+           "an exit)";
+    // Rule 3: `exit` is the target of the loop-EXITING edge (header→exit,
+    // a body block to a non-body block) — the same rule that claims gTail in
+    // ForeignSelfLoopPseudoLoopClaimIsPreserved. Under the range-end mutant
+    // the natural loop vanishes, so BOTH this and the LoopHeader claim above
+    // fall through to the if/linear vocabulary.
+    EXPECT_EQ(derived[exit.v],   StructCfMarker::LoopExit);
+}
+
+// `mirDominatesBlock(s, u, dom)` short-circuits to Dominates when s.v == u.v,
+// BEFORE consulting the tree — so a SELF-LOOPING block registers as a
+// back-edge source even in a function whose dominator tree knows nothing about
+// it. The whole-module sweep therefore manufactures a single-block pseudo-loop
+// for every self-looping block in the MODULE, in EVERY function's derivation,
+// and rule 3 claims LoopExit on its non-self successors.
+//
+// This pins that behaviour EXACTLY, because the scoped sweep must reproduce
+// it: RED if the module self-loop index is dropped from the candidate set.
+//
+// It is also the pin for a documented-spec divergence: mir_struct_markers.hpp
+// says unreachable blocks stay Linear, and `gTail` here is unreachable and
+// derives LoopExit. The behaviour is canon until the derivation rules change
+// deliberately — this test is what makes that change a DECISION rather than an
+// accident (D-MIR-STRUCTCF-UNREACHABLE-BLOCK-CLAIMED).
+TEST(StructCfDerivation, ForeignSelfLoopPseudoLoopClaimIsPreserved) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule a = buildAdversarialModule(interner);
+
+    // Deriving the TRIVIAL one-block function claims a slot that belongs to a
+    // DIFFERENT function, five functions later.
+    auto const derivedForTrivial = deriveStructCfMarkers(a.m, a.trivialFunc);
+    ASSERT_LT(a.gTail.v, derivedForTrivial.size());
+    EXPECT_EQ(derivedForTrivial[a.gTail.v], StructCfMarker::LoopExit)
+        << "the module-wide back-edge sweep reaches out of the function being "
+           "derived; the scoped sweep must reproduce it";
+    EXPECT_EQ(derivedForTrivial[a.gSelf.v], StructCfMarker::Linear)
+        << "the pseudo-loop's own block is IN its body, so it is not an exit";
+
+    // And the owning function derives the same thing for those slots.
+    auto const derivedForOwner = deriveStructCfMarkers(a.m, a.selfLoopFunc);
+    EXPECT_EQ(derivedForOwner[a.gTail.v], StructCfMarker::LoopExit);
+    EXPECT_EQ(derivedForOwner[a.gSelf.v], StructCfMarker::Linear);
+
+    // …so the module-wide applier STAMPS an unreachable block LoopExit.
+    rederiveStructCfMarkers(a.m);
+    EXPECT_EQ(a.m.blockMarker(a.gTail), StructCfMarker::LoopExit);
+    EXPECT_EQ(a.m.blockMarker(a.gSelf), StructCfMarker::Linear);
+}
+
+// The module-wide applier and the one-function applier must agree block for
+// block. They share a derivation core but reach it differently — the module
+// path hoists the self-loop index and REUSES one post-dominator scratch across
+// every function, the per-function path builds both fresh. This is the
+// end-to-end differential over both.
+TEST(StructCfDerivation, ModuleWideAndPerFunctionAppliersAgree) {
+    TypeInterner interner{CompilationUnitId{1}};
+    AdversarialModule wide = buildAdversarialModule(interner);
+    AdversarialModule one  = buildAdversarialModule(interner);
+
+    rederiveStructCfMarkers(wide.m);
+    for (MirFuncId const f : one.funcs) rederiveStructCfMarkers(one.m, f);
+
+    ASSERT_EQ(wide.funcs.size(), one.funcs.size());
+    for (std::size_t i = 0; i < wide.funcs.size(); ++i) {
+        EXPECT_EQ(storedVectorOf(wide.m, wide.funcs[i]),
+                  storedVectorOf(one.m, one.funcs[i]))
+            << "func index " << i;
+    }
 }

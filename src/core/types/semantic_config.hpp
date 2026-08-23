@@ -86,6 +86,11 @@ inline constexpr EnumNameTable<DeclarationKind, 4> kDeclarationKindTable{{{
     { DeclarationKind::Type,     "type"     },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kDeclarationKindTable);
+
 [[nodiscard]] constexpr std::string_view
 declarationKindName(DeclarationKind k) noexcept {
     return kDeclarationKindTable.name(k);
@@ -198,6 +203,48 @@ struct DSS_EXPORT EnumUnderlyingTypeSpec {
 // The loader rejects a `fieldChildren` whose declaration rule is not also in
 // `scopes` via `C_InvalidSemantics`.
 enum class CompositeKind : std::uint8_t { Struct, Union, Enum };
+
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-
+//    THEIR-CLOSED-SET) ──────────────────────────────────────────────────────
+//
+// ★★ WHAT THIS REPLACED. Until this table existed, `CompositeKind` had NO name
+// table and NO `fromName` — the config-facing spellings lived in two separate
+// inline `k == "struct" / "union" / "enum"` chains in `grammar_schema_json.cpp`
+// (one on `declarations[].fieldChildren.compositeKind`, one on the tag-reference
+// row's `compositeKind`), with FIVE sentences beside them restating the set.
+// Seven owners of three spellings.
+//
+// ★★★ AND ONE OF THE SEVEN HAD ALREADY DRIFTED, WHICH IS WHY THIS IS A DEFECT
+// AND NOT A TIDINESS PREFERENCE. ✔MEASURED 2026-08-21: the `fieldChildren`
+// type-error arm read *"'compositeKind' must be a string 'struct' or 'union'"*
+// while the chain three lines below it accepted `enum` as well. A schema author
+// who wrote a non-string there — `compositeKind: 5` — was told BY NAME that
+// `enum` is not allowed, by the same loader that takes it. Its two sibling arms
+// named all three, so the file disagreed with itself and nothing could see it:
+// the census that swept this class harvests `EnumNameTable`s, `…FromName`
+// if-chains and `std::array` key tables, and an INLINE chain is none of those.
+//
+// ⚠ THE ROW ORDER FIXES `name()`'s FALL-BACK, and `Struct` is row 0 — matching
+// `FieldChildrenDescriptor::compositeKind`'s own default, so an unnamed value
+// renders as the value it would actually behave as. Every enumerator IS listed
+// (there is no sentinel), so `name()` is the right helper here and `nameOrEmpty`
+// would answer a question this enum cannot ask.
+inline constexpr EnumNameTable<CompositeKind, 3> kCompositeKindTable{{{
+    { CompositeKind::Struct, "struct" },
+    { CompositeKind::Union,  "union"  },
+    { CompositeKind::Enum,   "enum"   },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kCompositeKindTable);
+
+[[nodiscard]] constexpr std::string_view
+compositeKindName(CompositeKind k) noexcept {
+    return kCompositeKindTable.name(k);
+}
+[[nodiscard]] constexpr std::optional<CompositeKind>
+compositeKindFromName(std::string_view s) noexcept {
+    return kCompositeKindTable.fromName(s);
+}
+
 struct DSS_EXPORT FieldChildrenDescriptor {
     RuleId        rule{};                          // the field-declaration rule
     std::string   ruleName;                        // source spelling, for diagnostics
@@ -1044,54 +1091,103 @@ enum class BuiltinLowering : std::uint16_t {
     Bswap,
 };
 
+// ── THE ONE OWNER OF THE `lowering` SPELLINGS ────────────────────────────
+//
+// ★★★ D-TEXT-TIER-READERS-KEEP-HAND-WRITTEN-FROMNAME-IF-CHAINS. This was a
+// 30-arm `if (name == "…")` chain and it was the ONLY place the spellings
+// existed, which made it look like a single owner and hid the real defect one
+// level up: the grammar loader's refusal for an unrecognized `lowering`
+// (`unknown builtin lowering '<x>'`) NAMED NO ACCEPTED SET AT ALL. A config
+// author who wrote `popcnt` was told their name was wrong and never told what
+// the loader would have taken — for a closed set of THIRTY verbs, most of them
+// `stdc_*` names that differ by one word. Nothing could render the set, because
+// an if-chain is not enumerable.
+//
+// The table makes it enumerable, so the refusal renders from the same rows the
+// lookup walks and cannot narrow or go stale.
+//
+// ⚠ `None` IS DELIBERATELY NOT A ROW. It is the "absent" sentinel (an ordinary
+// builtin carries no `lowering` key at all), and listing it would make
+// `fromName("none")` RESOLVE — handing a document a spelling that means "this
+// knob does nothing" while reading as a declaration. That is exactly the hole
+// `enum_name_table.hpp`'s `nameOrEmpty` note describes, so the projection below
+// uses `nameOrEmpty`: an unlisted value renders EMPTY rather than wearing row
+// 0's spelling (`"umulh"`), which is what `name()` would have done.
+inline constexpr EnumNameTable<BuiltinLowering, 30> kBuiltinLoweringTable{{{
+    { BuiltinLowering::UMulHigh,              "umulh"                    },
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS)
+    { BuiltinLowering::AtomicCas,             "atomic_cas"               },
+    // FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): the explicit-order accessors.
+    { BuiltinLowering::AtomicLoad,            "atomic_load"              },
+    { BuiltinLowering::AtomicStore,           "atomic_store"             },
+    // D-CSUBSET-ATOMIC-FENCE: __sync_synchronize — the standalone seq_cst fence.
+    { BuiltinLowering::AtomicFence,           "atomic_fence"             },
+    // C99 _Complex (D-CSUBSET-COMPLEX §7.3): the complex-builtin lowerings.
+    { BuiltinLowering::ComplexMake,           "complex_make"             },
+    { BuiltinLowering::ComplexReal,           "complex_real"             },
+    { BuiltinLowering::ComplexImag,           "complex_imag"             },
+    { BuiltinLowering::ComplexConj,           "complex_conj"             },
+    { BuiltinLowering::Barrier,               "barrier"                  },
+    { BuiltinLowering::SehExceptionCode,      "seh_exception_code"       },
+    { BuiltinLowering::SehExceptionInfo,      "seh_exception_info"       },
+    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 width-blind bit-count
+    // verbs shared by the 6 __builtin_{popcount,clz,ctz}{,ll} rows — the width
+    // lives in the param core (U32/U64), read by the hir_to_mir arm.
+    { BuiltinLowering::Popcount,              "popcount"                 },
+    { BuiltinLowering::Clz,                   "clz"                      },
+    { BuiltinLowering::Ctz,                   "ctz"                      },
+    // D-CSUBSET-INTRINSIC-BSWAP: the byte-reverse verb shared by the 3
+    // `_byteswap_*` rows (width-blind, like popcount/clz/ctz).
+    { BuiltinLowering::Bswap,                 "bswap"                    },
+    // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 `stdc_*` op lowerings,
+    // each shared by that op's 4 width rows.
+    { BuiltinLowering::StdcLeadingZeros,      "stdc_leading_zeros"       },
+    { BuiltinLowering::StdcLeadingOnes,       "stdc_leading_ones"        },
+    { BuiltinLowering::StdcTrailingZeros,     "stdc_trailing_zeros"      },
+    { BuiltinLowering::StdcTrailingOnes,      "stdc_trailing_ones"       },
+    { BuiltinLowering::StdcFirstLeadingZero,  "stdc_first_leading_zero"  },
+    { BuiltinLowering::StdcFirstLeadingOne,   "stdc_first_leading_one"   },
+    { BuiltinLowering::StdcFirstTrailingZero, "stdc_first_trailing_zero" },
+    { BuiltinLowering::StdcFirstTrailingOne,  "stdc_first_trailing_one"  },
+    { BuiltinLowering::StdcCountZeros,        "stdc_count_zeros"         },
+    { BuiltinLowering::StdcCountOnes,         "stdc_count_ones"          },
+    { BuiltinLowering::StdcHasSingleBit,      "stdc_has_single_bit"      },
+    { BuiltinLowering::StdcBitWidth,          "stdc_bit_width"           },
+    { BuiltinLowering::StdcBitFloor,          "stdc_bit_floor"           },
+    { BuiltinLowering::StdcBitCeil,           "stdc_bit_ceil"            },
+}}};
+// ★ THE UNDER-FILL GUARD, and for a 30-row hand-written table it is not
+// ceremony: `EnumNameTable<BuiltinLowering, 30>` with 29 initializers is legal
+// C++ — it value-initializes the tail, so row 29 becomes
+// `{ BuiltinLowering(0), "" }` and `builtinLoweringFromName("")` starts
+// RESOLVING, to `None`, which is the sentinel meaning "this knob does nothing".
+// A dropped row would therefore not break the build; it would make an empty
+// `"lowering": ""` load clean and silently disable the intrinsic.
+//
+// ⓘ This check WAS written out inline here, because the only macro that could
+// express it lived in `config_key_vocabulary.hpp`, whose own header states it
+// must never be included by a public type header — and this is one. It now
+// routes through `DSS_CHECK_ENUM_NAME_TABLE`, which lives in the
+// dependency-free `enum_name_table.hpp` beside the template it checks
+// (D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE). ★ The predicate
+// also catches a case the inline version could not: two rows sharing an
+// ENUMERATOR, where the second is unreachable through `findName` and nothing
+// says so.
+DSS_CHECK_ENUM_NAME_TABLE(kBuiltinLoweringTable);
+
 // Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
 // name (rejected with a diagnostic at the decode site) -- distinct from "absent"
 // (an ordinary builtin, which never carries a `lowering` key).
 [[nodiscard]] inline std::optional<BuiltinLowering>
 builtinLoweringFromName(std::string_view name) noexcept {
-    if (name == "umulh")      { return BuiltinLowering::UMulHigh;  }
-    if (name == "atomic_cas") { return BuiltinLowering::AtomicCas; }
-    // FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): the explicit-order scalar accessors.
-    if (name == "atomic_load")  { return BuiltinLowering::AtomicLoad;  }
-    if (name == "atomic_store") { return BuiltinLowering::AtomicStore; }
-    // D-CSUBSET-ATOMIC-FENCE: __sync_synchronize — the standalone seq_cst fence.
-    if (name == "atomic_fence") { return BuiltinLowering::AtomicFence; }
-    // C99 _Complex (D-CSUBSET-COMPLEX §7.3): the complex-builtin lowerings.
-    if (name == "complex_make") { return BuiltinLowering::ComplexMake; }
-    if (name == "complex_real") { return BuiltinLowering::ComplexReal; }
-    if (name == "complex_imag") { return BuiltinLowering::ComplexImag; }
-    if (name == "complex_conj") { return BuiltinLowering::ComplexConj; }
-    if (name == "barrier")    { return BuiltinLowering::Barrier;   }
-    if (name == "seh_exception_code") { return BuiltinLowering::SehExceptionCode; }
-    if (name == "seh_exception_info") { return BuiltinLowering::SehExceptionInfo; }
-    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 bit-count verbs shared by
-    // the 6 __builtin_{popcount,clz,ctz}{,ll} rows (the width lives in the param
-    // core U32/U64, read by the hir_to_mir arm — the lowering tag is width-blind).
-    if (name == "popcount") { return BuiltinLowering::Popcount; }
-    if (name == "clz")      { return BuiltinLowering::Clz;      }
-    if (name == "ctz")      { return BuiltinLowering::Ctz;      }
-    // D-CSUBSET-INTRINSIC-BSWAP: the byte-reverse verb shared by the 3
-    // `_byteswap_*` rows (the width lives in the param core U16/U32/U64, read by
-    // the hir_to_mir arm — the lowering tag is width-blind, like popcount/clz/ctz).
-    if (name == "bswap")    { return BuiltinLowering::Bswap;    }
-    // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 `stdc_*` op lowerings
-    // (shared by each op's 4 width rows — the width lives in the param core, read
-    // by the hir_to_mir arm; the lowering tag is width-blind, like popcount/clz/ctz).
-    if (name == "stdc_leading_zeros")       { return BuiltinLowering::StdcLeadingZeros; }
-    if (name == "stdc_leading_ones")        { return BuiltinLowering::StdcLeadingOnes; }
-    if (name == "stdc_trailing_zeros")      { return BuiltinLowering::StdcTrailingZeros; }
-    if (name == "stdc_trailing_ones")       { return BuiltinLowering::StdcTrailingOnes; }
-    if (name == "stdc_first_leading_zero")  { return BuiltinLowering::StdcFirstLeadingZero; }
-    if (name == "stdc_first_leading_one")   { return BuiltinLowering::StdcFirstLeadingOne; }
-    if (name == "stdc_first_trailing_zero") { return BuiltinLowering::StdcFirstTrailingZero; }
-    if (name == "stdc_first_trailing_one")  { return BuiltinLowering::StdcFirstTrailingOne; }
-    if (name == "stdc_count_zeros")         { return BuiltinLowering::StdcCountZeros; }
-    if (name == "stdc_count_ones")          { return BuiltinLowering::StdcCountOnes; }
-    if (name == "stdc_has_single_bit")      { return BuiltinLowering::StdcHasSingleBit; }
-    if (name == "stdc_bit_width")           { return BuiltinLowering::StdcBitWidth; }
-    if (name == "stdc_bit_floor")           { return BuiltinLowering::StdcBitFloor; }
-    if (name == "stdc_bit_ceil")            { return BuiltinLowering::StdcBitCeil; }
-    return std::nullopt;
+    return kBuiltinLoweringTable.fromName(name);
+}
+
+// The write direction, which did not exist and is what a diagnostic naming the
+// verb it FOUND needs. `nameOrEmpty`, never `name()` — see the table's note.
+[[nodiscard]] inline constexpr std::string_view
+builtinLoweringName(BuiltinLowering lowering) noexcept {
+    return kBuiltinLoweringTable.nameOrEmpty(lowering);
 }
 
 // SE6: a built-in function the engine binds into a CU-wide "builtins"
@@ -1900,6 +1996,54 @@ struct DSS_EXPORT InlineAsmConfig {
     RuleId operandListRule{};       std::string operandListRuleName;
     RuleId clobberListRule{};       std::string clobberListRuleName;
     RuleId gotoLabelListRule{};     std::string gotoLabelListRuleName;
+    // ONE operand inside `operandListRule` — `[name] "constraint" (expr)`.
+    //
+    // ★ THE LIST RULE IS NOT ENOUGH AND THE DIFFERENCE IS NOT COSMETIC. Every
+    // question above is "is this section present / non-empty", which a list node
+    // answers by existing. Binding an operand is the first question about ONE
+    // operand: which constraint string goes with which host expression, and
+    // WHICH INDEX it carries (`%0` names the first operand of the outputs+inputs
+    // concatenation — GCC 6.47.2.3). A walker that had only the list rule would
+    // have to recover operand boundaries by counting separator TOKENS, which is
+    // the token archaeology this whole facet exists to avoid — and it would get
+    // it wrong on the very form `asmOperand`'s own $comment measures, because the
+    // comma OPERATOR is legal inside an operand's parens (`"r"(a, b)` is accepted
+    // by gcc 13.3.0 and clang 18.1.3), so separator commas and operator commas
+    // are indistinguishable at the token.
+    RuleId operandRule{};           std::string operandRuleName;
+
+    // ── the two NON-REGISTER clobber spellings (GCC 6.47.2.5) ──
+    //
+    // ★★★ THEY ARE SPELLINGS, NOT ROLES, AND THAT IS WHY THEY ARE STRINGS RATHER
+    // THAN RuleIds. A clobber list holds string literals; `"memory"` and `"cc"`
+    // are the two entries that name NO register — `"memory"` says the asm reads
+    // or writes memory the compiler cannot see, `"cc"` says it clobbers the
+    // condition flags. Everything else in the list is a per-TARGET register name,
+    // which this facet must never enumerate (that is `.target.json`'s vocabulary
+    // and the reason `asmClobberList` declares none).
+    //
+    // ★★ WHY THEY LIVE IN THE ASM LANGUAGE DOCUMENT AND NOT IN C++ STRING
+    // LITERALS. They are GNU-ASM vocabulary — a property of the assembly surface
+    // being embedded, not of the host language embedding it — exactly like
+    // `gotoQualifierToken` beside them. Hard-coded in `semantic_analyzer.cpp`
+    // they would be an `if (spelling == "memory")` in shared substrate: the
+    // analyzer would be asserting a fact about ONE embeddable language while
+    // claiming to be language-agnostic, and a second embedded language with a
+    // different barrier spelling could not be expressed at all.
+    //
+    // ⚠ THEY ARE NOT DERIVABLE FROM THE TARGET, which is the test this project
+    // applies before adding any config knob. `.target.json` owns REGISTER names;
+    // neither of these is a register on any target (that is precisely what
+    // distinguishes them), so there is nothing for a dialect knob to disagree
+    // with and no second source of truth is created.
+    //
+    // Both are REQUIRED whenever the object is present, on the same
+    // all-or-nothing grounds as every field above: a missing `memoryClobber`
+    // would make `__asm__("" ::: "memory")` look like a REGISTER clobber, and
+    // the analyzer would then try to resolve `memory` against the target's
+    // register file and refuse a barrier every reference compiler accepts.
+    std::string memoryClobber;
+    std::string conditionCodeClobber;
     // The `goto` QUALIFIER token kind. A token, not a rule: it is the same
     // keyword the `goto` statement uses, and the check is "does this kind occur
     // among the statement's pre-template tokens".
@@ -1913,6 +2057,122 @@ struct DSS_EXPORT InlineAsmConfig {
             || r.v == inputsTailFusedRule.v   || r.v == clobbersTailRule.v
             || r.v == clobbersTailFusedRule.v || r.v == labelsTailRule.v
             || r.v == labelsTailFusedRule.v;
+    }
+};
+
+// ── inline-asm P5c (`semantics.inlineAsmTemplateLexemes`) ──
+//    D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER, closed.
+//
+// ★★★ THE TEMPLATE SIGILS ARE **ONE** FACT WITH **ONE** OWNER, AND THIS IS IT.
+// Until 2026-08-17 they had two: `scanInlineAsmTemplate` compared against the
+// C++ literals `'%'`, `'l'`, `'['`, `']'` while every assembly DIALECT declared
+// the same spellings in its `asm-template` lexer mode — and nothing in the
+// shipped build could notice them disagreeing, because the semantic tier has no
+// dialect in scope when it scans. The dialect now declares only the CAPABILITY
+// (`assembly.templateLexerMode` + `templateOperandRule`); this block declares
+// the VOCABULARY; and the loader INTERSECTS them, synthesizing the dialect's
+// per-mode token rows from these bytes. A dialect that declares template
+// lexemes of its own is a LOAD ERROR naming both sites.
+//
+// ★★ WHY IT IS A **LANGUAGE** FACT AND NOT A DIALECT ONE — the measurement that
+// decides where this lives. `%0`, `%%`, `%l[label]` and `[name]` are GNU
+// **C-extension** syntax: gcc SUBSTITUTES them before the assembler ever sees
+// the text, so gas never receives a `%0` — it receives the substituted register
+// name. The dialect's job begins AFTER substitution. The sigils therefore belong
+// to the HOST language's inline-asm surface, which is precisely where
+// `memoryClobber` / `conditionCodeClobber` already live (see the block above for
+// the same argument made about the two non-register clobber spellings). It is
+// also why this structurally solves the null-target case rather than happening
+// to: the semantic analyzer ALWAYS has the language config — it cannot analyze
+// without one — and legitimately has no target (the LSP, the FFI header parser
+// and every direct-API caller all scan templates with `target == nullptr`).
+//
+// ★★ ROLES, NOT BYTES. A flat byte list could not say which byte is which, and
+// every reader would re-derive it. This is a fixed set of named ROLES modelled
+// exactly as `assembly.operandForms` is: EVERY role is REQUIRED whenever the
+// object is present, with an EXPLICIT `null` permitted for a role a language
+// genuinely lacks — so a partial block can never silently mean "this form is
+// unrecognized". An unknown role key is a LOAD ERROR naming it.
+//
+// ★★★ AND `null` MEANS THE FORM DOES NOT EXIST, WHICH IS A CLAIM A DOCUMENT CAN
+// CONTRADICT — THE FOUR CASES, CLOSED (2026-08-17):
+//     role declared + role bound   ⇒ the row is synthesized
+//     role declared + NOT bound    ⇒ LOAD ERROR (nothing can carry the sigil)
+//     role NULL     + role bound   ⇒ LOAD ERROR (this grammar still needs it)
+//     role NULL     + NOT bound    ⇒ HONOURED — no row, and the scan stops
+//                                    recognizing the form
+// ⚠ THE THIRD ROW IS NOT PEDANTRY; IT CLOSES A MEASURED PLATFORM SPLIT. Without
+// it, `symbolicNameClose: null` meant TWO different things: on `asm-x86_64-att`
+// the bound kind (`PlaceholderNameClose`) had no other declaration, so the load
+// failed two tiers away with an unresolvable shape reference; on
+// `asm-arm64-gas` the same role binds `BracketClose`, which its GLOBAL table
+// declares for the memory form, so the template went on accepting the form the
+// language had just declared ABSENT. ⇒ the outcome turned on whether an
+// UNRELATED lexeme happened to mint the same kind, and a pin that loaded "the
+// first discovered dialect" was therefore decided by `directory_iterator` order
+// — green on NTFS (sorted), red on ext4 (hash order). The split was the symptom;
+// two meanings for one declaration was the defect, and the silent-accept side
+// was the one that looked green.
+// ★ The rule is decidable from the two documents alone — a binding exists only
+// because the imported closure SPELLS the role — so it can never depend on what
+// else is interned, in what order, on which filesystem.
+//
+// ⓘ WHERE `null` IS ACTUALLY HONOURED, AND IT IS THE CASE THE CLAUSE IS FOR: a
+// HOST that declares the role set and NO `assembly.templateLexerMode` — it
+// SCANS templates and never lexes one. There the null costs it a recognized
+// form and nothing else, which is a language genuinely lacking a form. (It is
+// also why the check is gated on the capability: `symbolicNameOpen`/`Close` are
+// the same roles a host binds for its OWN operand spelling
+// `[name] "constraint" (expr)`, which has nothing to do with the template.)
+//
+// ⚠ THE ROLE NAMES ARE THE `bindTokens` HOLE NAMES ON PURPOSE. That is the
+// intersection seam: the language says which BYTES play each role, the dialect
+// says which of ITS token kinds plays the same role (it already had to, because
+// the shared template shapes spell those holes), and the loader joins them by
+// name. One name space, no second table to keep in step.
+//
+// ⓘ WHAT IS **NOT** HERE, AND WHY THAT IS NOT AN OMISSION: the operand INDEX
+// digits and the modifier LETTER. `%0`'s `0` is bound to the shared
+// `templateOperandIndex` role (an `IntLiteral`), and a modifier letter is a
+// per-TARGET width-view vocabulary no shipped `.target.json` declares — the scan
+// REFUSES it rather than lowering it. Neither is a sigil, so neither is a role
+// of this set.
+struct DSS_EXPORT InlineAsmTemplateLexemes {
+    // `templatePlaceholder` — GNU `%`. Introduces an operand reference.
+    std::string placeholder;
+    // `templateEscape` — GNU `%%`. The literal percent. MUST be longer than
+    // `placeholder` wherever both are declared, or maximal munch cannot separate
+    // them; the loader refuses the pairing that cannot be lexed.
+    std::string escape;
+    // `templateLabelPlaceholder` — GNU `%l`. An `asm goto` label reference.
+    std::string labelPlaceholder;
+    // `symbolicNameOpen` / `symbolicNameClose` — GNU `[` / `]`. The brackets of
+    // `%[name]` and of an operand's own `[name] "constraint" (expr)` spelling.
+    std::string symbolicNameOpen;
+    std::string symbolicNameClose;
+    // The object was PRESENT. Distinguishes "declared, and this role is null"
+    // from "no template surface at all" — every emptiness test below has to be
+    // able to tell those apart.
+    bool declared = false;
+
+    // ── the DERIVED spellings the diagnostics quote ──
+    // Every `%0` / `%%` / `%[name]` / `%l[name]` that used to be a C++ string
+    // literal in `scanInlineAsmTemplate` is built HERE, from the declared bytes.
+    // A message that quotes a hard-coded `%` at a language that spells it `$` is
+    // the same defect as a scan that looks for one.
+    [[nodiscard]] std::string operandRef(std::string_view index) const {
+        return placeholder + std::string{index};
+    }
+    [[nodiscard]] std::string namedOperandRef(std::string_view name) const {
+        return placeholder + symbolicNameOpen + std::string{name}
+             + symbolicNameClose;
+    }
+    [[nodiscard]] std::string labelRef(std::string_view index) const {
+        return labelPlaceholder + std::string{index};
+    }
+    [[nodiscard]] std::string namedLabelRef(std::string_view name) const {
+        return labelPlaceholder + symbolicNameOpen + std::string{name}
+             + symbolicNameClose;
     }
 };
 
@@ -2236,6 +2496,19 @@ struct DSS_EXPORT SemanticConfig {
     // `inlineAsm.rule` invalid ⇒ the language has no inline-asm surface
     // (toy/tsql — none of the checks run).
     InlineAsmConfig inlineAsm;
+    // The inline-asm TEMPLATE's lexical role set — the ONE owner of the sigils
+    // (D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER). See
+    // `InlineAsmTemplateLexemes` above. `declared == false` ⇒ this language
+    // declares no template surface, and `scanInlineAsmTemplate` scans nothing
+    // rather than falling back on a guessed sigil.
+    // ⚠ IT IS A SIBLING OF `inlineAsm` RATHER THAN A MEMBER, AND THE REASON IS
+    // MEASURED, NOT stylistic: `semantics.inlineAsm` names twelve rules of the
+    // EMBEDDED `__asm__` surface, so the reference merge scopes it to hosts that
+    // import that surface and it never reaches a DIALECT document (which imports
+    // the `.s` line surface only). The lexeme role set names NO rule, so it is
+    // surface-neutral and travels to BOTH — which is exactly what a single owner
+    // consumed by the semantic tier AND by the dialect's lexer requires.
+    InlineAsmTemplateLexemes inlineAsmTemplateLexemes;
     // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): `_Generic` generic
     // selection. `genericRule` = the `genericExpr` shape; `genericControlChild` =
     // the visible-child index of the controlling `assignmentExpr`. When Pass 2

@@ -12,6 +12,16 @@ dss_add_test(NAME ffi/test_shipped_lib_descriptor SOURCES test_shipped_lib_descr
 # enumerates the shipped object-format configs to derive the target matrix, so
 # it parses their JSON directly.
 dss_add_test(NAME ffi/test_shipped_type_consistency SOURCES test_shipped_type_consistency.cpp)
+# D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the SHIPPED-SOURCE REALIZATION axis
+# — the four refusals (R1 a realization naming a source that is not there; R2 a
+# source file no descriptor names; R3 an image AND a source for one format; R4 no
+# headers in the runtime tree, folded into R2) plus the tree-shape and
+# two-readers-agree invariants. Reads the shipped descriptors' JSON directly, like
+# its siblings above, hence the same json link.
+dss_add_test(NAME ffi/test_shipped_source_realization
+             SOURCES test_shipped_source_realization.cpp)
+target_link_libraries(dss_ffi_test_shipped_source_realization
+                      PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(dss_ffi_test_shipped_type_consistency
                       PRIVATE nlohmann_json::nlohmann_json)
 # D-FFI-PE-CRT-UCRT-MIGRATION: the co-state-group binding invariant — the pe C

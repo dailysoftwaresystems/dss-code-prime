@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "hir/hir.hpp"
+#include "hir/hir_inline_asm.hpp"   // HirInlineAsmPool (checkInlineAsm)
 #include "hir/hir_attrs.hpp"   // HirSourceMap
 
 #include <vector>
@@ -178,8 +179,15 @@ template <typename Source>
 class DSS_EXPORT HirVerifier {
 public:
     explicit HirVerifier(Hir const& hir, HirSourceMap const* sourceMap = nullptr,
-                         TypeInterner const* interner = nullptr) noexcept
-        : hir_(hir), sourceMap_(sourceMap), interner_(interner) {}
+                         TypeInterner const* interner = nullptr,
+                         // Inline-asm P5: the pool an `InlineAsm` node's payload
+                         // HANDLE names. nullptr => `checkInlineAsm` verifies only
+                         // what needs no pool (see its docblock), which is the
+                         // honest posture for a caller that has no pool to hand it
+                         // -- never a licence to call the handle good.
+                         HirInlineAsmPool const* inlineAsmPool = nullptr) noexcept
+        : hir_(hir), sourceMap_(sourceMap), interner_(interner),
+          inlineAsmPool_(inlineAsmPool) {}
 
     // The verifier stores a reference and must not outlive the module it
     // inspects — forbid binding to a temporary `Hir` outright. Every arity is
@@ -188,6 +196,8 @@ public:
     HirVerifier(Hir&&)                                           = delete;
     HirVerifier(Hir&&, HirSourceMap const*)                      = delete;
     HirVerifier(Hir&&, HirSourceMap const*, TypeInterner const*) = delete;
+    HirVerifier(Hir&&, HirSourceMap const*, TypeInterner const*,
+                HirInlineAsmPool const*)                         = delete;
 
     // Run every rule, reporting each violation into `reporter`. Returns true
     // iff THIS run emitted no Error-severity diagnostic (computed by delta on the
@@ -290,9 +300,31 @@ private:
     // `H_ShaderViolation`. (Dynamic allocation is not yet expressible in HIR.)
     void checkShaderRestrictions(DiagnosticReporter& reporter) const;
 
+    // Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): the `InlineAsm` node's two
+    // structural invariants, which no other rule can see.
+    //
+    //   (a) POOL-FREE, always checked: a node with `payload ==
+    //       kNoInlineAsmDescriptor` is the bare barrier and must have ZERO
+    //       children. That pairing is the whole reason the barrier form is still
+    //       byte-identical downstream -- a leaf with children would reach MIR's
+    //       CompilerBarrier arm and have its operands DROPPED silently.
+    //   (b) POOL-DEPENDENT: the handle must RESOLVE, `operands.size()` must equal
+    //       the child count, and `outputCount` must not exceed it.
+    //
+    // * WHY (b) IS A VERIFIER RULE AND NOT AN ASSERT AT THE BUILDER. `hir_text`
+    // and the lowering are two independent producers of this pairing, and the
+    // text parser can be handed hand-written `.dsshir`. A mismatch there is a
+    // diagnosable malformed module, not a caller bug -- and if it were left
+    // unchecked the descriptor and the child list would disagree about which
+    // expression operand k binds, which is a silent miscompile with a clean log.
+    void checkInlineAsm(DiagnosticReporter& reporter) const;
+
     Hir const&          hir_;
     HirSourceMap const* sourceMap_;   // optional; nullptr = no source provenance
     TypeInterner const* interner_;    // optional; nullptr = skip type-decoding rules
+    // Inline-asm P5: optional; nullptr = the handle cannot be resolved, so
+    // `checkInlineAsm` runs only its pool-free half and says so.
+    HirInlineAsmPool const* inlineAsmPool_;
 };
 
 } // namespace dss

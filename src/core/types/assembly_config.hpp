@@ -1,7 +1,16 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/ascii_case.hpp"   // asciiToLower — the ONE folding helper
+// `CfiOpKind` — the closed unwind-rule vocabulary a `frameRule` directive row
+// NAMES. Included rather than re-spelled: the alternative (a private rule enum
+// here, or the rule stored as a bare string) is the "one fact, two owners"
+// shape the bar vetoes, and `cfi.hpp` is dependency-free by construction (it
+// includes `core/export.hpp` and the standard library only), so there is no
+// cycle to route around the way `sectionName` has to.
+#include "core/types/cfi.hpp"
 #include "core/types/rule_id.hpp"
+#include "core/types/strong_ids.hpp"   // LexerModeId — the template surface's mode
 
 #include <array>
 #include <cstdint>
@@ -58,6 +67,74 @@ static_assert(kAsmOperandOrderNames.size()
                   == static_cast<std::size_t>(AsmOperandOrder::DestinationFirst)
                          + 1,
               "every AsmOperandOrder enumerator needs a config spelling");
+
+// ★★★ DOES A WRITTEN SPELLING HAVE TO MATCH THE DECLARED ONE BYTE FOR BYTE?
+// (D-ASM-DIALECT-MNEMONIC-MATCH-IS-CASE-SENSITIVE.)
+//
+// ★★ IT IS A DIALECT FACT, NOT A TARGET FACT, FOR THE SAME REASON THE OPERAND
+// ORDER IS. One CPU can be written in two dialects with different case rules —
+// masm folds, and a hypothetical dialect need not — so storing it per-CPU would
+// be the per-(X,Y)-fact-stored-per-X shape the header comment above already
+// rejects. ⇒ THE DIALECT FOLDS THE SPELLING AND THEN ASKS THE TARGET;
+// `TargetSchema::registerByName` stays an EXACT match on target vocabulary, so
+// nothing about the CPU description changes when a dialect's case rule does.
+//
+// ★★★ WHAT IT GOVERNS, STATED AS A RULE RATHER THAN AS A LIST OF FOUR SEAMS:
+// matching a written spelling against **DECLARED VOCABULARY** — this dialect's
+// own instruction/directive/selector tables, and the target's register table.
+// It NEVER governs a name the PROGRAM introduces. That boundary is not a taste
+// call, it is the measurement:
+//
+//   ✔MEASURED 2026-08-15, `as` 2.42 (x86_64) and `aarch64-linux-gnu-as` 2.42,
+//   rc + the encoded words read back with `objdump -d`:
+//     * mnemonic  — FOLDS. `movq`/`MOVQ`/`MoVq %rax,%rcx` → `48 89 c1`;
+//                   `mov`/`MOV`/`MoV x0,x1` → `aa0103e0`.
+//     * register  — FOLDS. `%RAX,%RCX` → `48 89 c1`; `%EAX,%ECX` → `89 c1`;
+//                   `MOV W0,W1` → `2a0103e0`.
+//     * selector  — FOLDS. `MRS X0, CNTVCT_EL0` → `d53be040` (and
+//                   `CntVct_El0` likewise); `CSET X0, EQ` → `9a9f17e0`.
+//     * directive — FOLDS. `.TEXT`, `.GLOBL`, `.TYPE`, `.SECTION`, `.QUAD`,
+//                   `.DATA`, `.BSS`, `.ZERO`, arm64 `.XWORD` — all rc=0.
+//   ⇒ fold all four TOGETHER or none: folding only the mnemonic still fails
+//   `MOV X0, X1` at the register and `.GLOBL main` at the directive, which
+//   hides the gap behind a half-fix.
+//
+// ⛔ AND THE THREE SURFACES THAT DO **NOT** FOLD, EACH REFUSED BY THE SAME
+// MEASUREMENT. Folding any of them would not be a conformance fix, it would be
+// a silent miscompile, because in every case the two spellings denote two
+// DIFFERENT THINGS to the reference assembler:
+//     * SYMBOL / LABEL names — `foo:` and `FOO:` are two defined symbols in one
+//       object (`nm`: both present), and `b FOO` against `foo:` leaves `FOO`
+//       `*UND*`. Folding merges two real definitions.
+//     * THE `.type` MARKER — `.type main, @FUNCTION` and `@Function` are BOTH
+//       rc=1, *"unrecognized symbol type"*, on BOTH assemblers, while `.TYPE`
+//       itself is accepted. So the directive SPELLING folds and its marker
+//       operand does not, in the same line.
+//     * THE `.section` NAME OPERAND — `.section .RODATA` is rc=0 and produces a
+//       section literally named `.RODATA`: a source writing both `.rodata` and
+//       `.RODATA` yields TWO sections of 8 bytes each (`objdump -h`). Folding
+//       it would route `.RODATA` data into `.rodata`, which is not what the
+//       reference does with the same input.
+//   ⚠ THE FIRST TWO OF THOSE ARE COMPARED IN `asm_text_to_lir.cpp` AND THE
+//   THIRD IN `sectionRowByName` BELOW, all three with a plain `==`, and every
+//   one of them must STAY that way. There is a note at each site.
+enum class AsmSpellingCase : std::uint8_t {
+    // An exact byte match — what every dialect got before this key existed.
+    Sensitive,
+    // ASCII case-insensitive, via `dss::asciiToLower`. ⚠ ASCII ONLY, and that
+    // is the reference behaviour rather than a shortcut: gas folds `A`-`Z` and
+    // has no opinion about any other code point.
+    AsciiFolded,
+};
+
+inline constexpr std::array<std::pair<std::string_view, AsmSpellingCase>, 2>
+    kAsmSpellingCaseNames{{
+        {"sensitive", AsmSpellingCase::Sensitive},
+        {"asciiFolded", AsmSpellingCase::AsciiFolded},
+    }};
+static_assert(kAsmSpellingCaseNames.size()
+                  == static_cast<std::size_t>(AsmSpellingCase::AsciiFolded) + 1,
+              "every AsmSpellingCase enumerator needs a config spelling");
 
 // What an assembler DIRECTIVE means. ★ A CLOSED VERB SET, NOT A STRING MATCH:
 // gas's `.globl` and `.global` are two spellings of one verb, and a dialect
@@ -165,9 +242,66 @@ enum class AsmDirectiveVerb : std::uint8_t {
     // REFUSED, naming the operand it will not interpret; it is never silently
     // ignored and never half-applied.
     SectionByName,
+
+    // ★★★ THE CALL-FRAME-INFORMATION FAMILY.
+    // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED.
+    // Until these existed the 18 `.cfi_*` spellings the AT&T dialect
+    // declares were `IgnoredAnnotation` — parsed, accepted, and DROPPED — so a
+    // `.s` assembled, ran correctly, and could not be unwound: no debugger
+    // backtrace, no profiler stack, and an exception thrown through the frame
+    // terminating instead of propagating. That is an accept-and-ignore with a
+    // silent RUNTIME consequence, which is the one shape this project's bar
+    // refuses outright.
+    //
+    // ★★★ THEY MINT NO UNWIND VOCABULARY, AND THAT WAS THE DESIGN RULE.
+    // `core/types/cfi.hpp` already declares `CfiOpKind` — the closed set of
+    // rule changes a producer can STATE — and its own docblock records that
+    // every enumerator was written from a `.cfi_*` spelling a real assembler
+    // emits. So a `FrameRule` row names one of THOSE (see
+    // `AsmDirectiveSpelling::frameRule`) and nothing else, exactly as
+    // `SectionData` names a `DataSectionKind` rather than inventing a section
+    // taxonomy. The dialect owns the SPELLING; the shared core owns the MEANING.
+    //
+    // `.cfi_startproc` — everything until the matching `FrameEnd` describes the
+    // frame of the function that is open. ⚠ NOT derivable from the function
+    // boundary: gas lets a `.s` describe SOME functions and not others, and a
+    // producer that assumed every function had CFI would emit a table covering
+    // frames nobody described.
+    FrameStart,
+    // `.cfi_endproc` — closes the description opened by `FrameStart`. An
+    // unmatched one either way is a refusal: a stream that never closes has no
+    // extent, and one that closes twice has no owner.
+    FrameEnd,
+    // `.cfi_def_cfa` / `.cfi_offset` / `.cfi_restore` / … — ONE rule change, at
+    // the PC reached by the instruction this directive follows. The row's
+    // `frameRule` names the `CfiOpKind`.
+    FrameRule,
+    // `.cfi_return_column N` — the CIE's return-address column. DSS DERIVES it
+    // from the target's `dwarfReturnAddressColumn`, so this row exists to
+    // CHECK the file's claim against it: a `.s` naming a different column is
+    // refused (one shared CIE cannot carry two), and one naming the same column
+    // is the no-op gcc emits. ⚠ Accepting it as an annotation would let a file
+    // silently redefine where the return address lives.
+    FrameReturnColumn,
+    // ★★★ DECLARED BY THE REFERENCE ASSEMBLER, AND DELIBERATELY REFUSED — the
+    // EXACT COMPLEMENT of `IgnoredAnnotation`, and the reason it is a verb
+    // rather than an absent row. `IgnoredAnnotation` says "this carries
+    // information DSS derives elsewhere"; this says "this carries information
+    // DSS cannot carry AT ALL, so it is refused by name". Leaving the spelling
+    // undeclared would produce the generic *unknown directive* refusal — loud,
+    // but it tells the reader the dialect does not know the spelling, which is
+    // false, and the obvious repair for a future reader is to add it as an
+    // `ignoredAnnotation`. That repair is precisely
+    // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED being re-created inside its own
+    // fix, and the row's closing note names it as the thing that must not
+    // happen. A declared refusal makes the decision visible in the config and
+    // carries its `$comment` to whoever reads it next.
+    // ⚠ WHAT IT IS *NOT*: a fallback bucket. Every row carrying it must state,
+    // in its own `$comment`, the fact this build cannot represent.
+    Unrepresentable,
 };
 
-inline constexpr std::array<std::pair<std::string_view, AsmDirectiveVerb>, 8>
+inline constexpr std::array<std::pair<std::string_view, AsmDirectiveVerb>, 13>
     kAsmDirectiveVerbNames{{
         {"sectionText", AsmDirectiveVerb::SectionText},
         {"globalSymbol", AsmDirectiveVerb::GlobalSymbol},
@@ -177,12 +311,43 @@ inline constexpr std::array<std::pair<std::string_view, AsmDirectiveVerb>, 8>
         {"emitData", AsmDirectiveVerb::EmitData},
         {"reserveFillBytes", AsmDirectiveVerb::ReserveFillBytes},
         {"sectionByName", AsmDirectiveVerb::SectionByName},
+        {"frameStart", AsmDirectiveVerb::FrameStart},
+        {"frameEnd", AsmDirectiveVerb::FrameEnd},
+        {"frameRule", AsmDirectiveVerb::FrameRule},
+        {"frameReturnColumn", AsmDirectiveVerb::FrameReturnColumn},
+        {"unrepresentable", AsmDirectiveVerb::Unrepresentable},
     }};
 static_assert(kAsmDirectiveVerbNames.size()
                   == static_cast<std::size_t>(
-                         AsmDirectiveVerb::SectionByName)
+                         AsmDirectiveVerb::Unrepresentable)
                          + 1,
               "every AsmDirectiveVerb enumerator needs a config spelling");
+
+// ★★★ THE `frameRule` NAME → `CfiOpKind`, RESOLVED AGAINST THE ONE OWNER OF
+// THOSE NAMES. Deliberately a LOOP over `cfiOpKindName` rather than a second
+// `{name, kind}` table beside it: a parallel table is a second home for a fact
+// `core/types/cfi.hpp` already states, and the two drift the first time a rule
+// is added (the `hasDwarfNumber` bit-mask that `DwarfRegisterMapping` deleted
+// for exactly this reason). Define the lookup as the complement of the
+// existing names, never as an enumeration of them.
+[[nodiscard]] constexpr std::optional<CfiOpKind>
+asmFrameRuleFromName(std::string_view name) noexcept {
+    for (std::size_t i = 0; i < kCfiOpKindCount; ++i) {
+        auto const k = static_cast<CfiOpKind>(i);
+        if (cfiOpKindName(k) == name) return k;
+    }
+    return std::nullopt;
+}
+
+// Does this verb belong to the call-frame family — i.e. is it meaningful only
+// between a `FrameStart` and its `FrameEnd`? ONE predicate, so the walker's
+// "are we inside a frame description?" gate and any future loader check cannot
+// disagree about the membership of the set.
+[[nodiscard]] constexpr bool
+asmVerbIsFrameBody(AsmDirectiveVerb v) noexcept {
+    return v == AsmDirectiveVerb::FrameRule
+        || v == AsmDirectiveVerb::FrameReturnColumn;
+}
 
 // Does this verb OPEN A SECTION — i.e. can a `SectionByName` operand resolve
 // to a row carrying it? ★ ONE PREDICATE, SO THE LOADER'S "which rows may be
@@ -226,6 +391,55 @@ static_assert(kAsmOperandRoleCount
               "every AsmOperandRole enumerator needs a config spelling — a role "
               "with no name is unbindable, and the loader's REQUIRE-ALL check "
               "would silently stop covering it");
+
+// ★★★ ONE POSITIONAL OPERAND SELECTOR — an operand that SELECTS THE OPCODE
+// instead of being one (operator ruling, plan 29 §4.7, 2026-08-14).
+//
+// gas writes `mrs <Xd>, cntvct_el0` and `cset <Xd>, eq`; the target opcodes are
+// `cntvct` (zero-operand, the counter baked into the fixed word) and `setcc`
+// (the condition carried as a `TargetCondCode`). A plain spelling row hands the
+// lowering a leftover operand against `maxOperands: 0`, so EVERY line using it
+// fails loud — which is why both spellings were absent from this dialect and
+// both were anchored (D-ASM-ARM64-SYSTEM-REGISTER-AS-OPERAND-UNMODELLED,
+// D-ASM-ARM64-CONDITION-AS-OPERAND-UNMODELLED). A selector says "this written
+// operand is part of the mnemonic": it is consumed BY THE MATCH, never becomes
+// an operand, and never reaches the target.
+//
+// ⛔ THE REJECTED ALTERNATIVE, RECORDED BECAUSE IT IS THE OBVIOUS ONE: model
+// system registers as a real operand KIND with a sysreg table. ✔MEASURED both
+// shipped targets — x86_64 `rdtsc` is `min/maxOperands 0` with
+// `implicitRegisters.outputs [rax,rdx]`, arm64 `cntvct` is `min/maxOperands 0`
+// with `result value` and `fixedWord 0xD53BE040`. They differ in RESULT MODEL,
+// which is real and fine, but BOTH are zero-operand with WHICH COUNTER baked
+// into the opcode. "Read the hardware counter" is therefore ONE VERB across
+// ISAs, and `cntvct_el0` is an AArch64 spelling detail exactly as `edx:eax` is
+// an x86 one. A generic `mrs` + sysreg operand would give the arm64 read a
+// DIFFERENT SHAPE from the x86 read, so every shared consumer would acquire a
+// per-arch shape distinction — the `if (arch == …)` the bar hard-vetoes,
+// arriving through CONFIG rather than C++, which is the slower and worse way
+// for it to arrive.
+//
+// ★★★ WHY THE KEY IS POSITIONAL AND NOT "THE LITERAL OPERAND". That simpler
+// key is already FALSE about this instruction's mirror image: gas writes
+// `msr tpidr_el0, x0` — selector FIRST (✔MEASURED 2026-08-14,
+// `aarch64-linux-gnu-as` 2.42, `d51bd040`) — and this dialect declares
+// `operandOrder: destinationFirst`, so a position-blind rule would read the
+// SELECTOR as the destination. Declaring the INDEX is what keeps the key from
+// being wrong about a form nothing ships yet.
+// ⚠ A SELECTOR AT INDEX 0 SUPPRESSES `destinationFirst` FOR THAT POSITION, and
+// it does so BY CONSTRUCTION rather than by a second rule: the selector is
+// excluded from the operand list before the destination is read, so position 0
+// is simply no longer a candidate. No `msr` row ships (nothing needs one, and
+// §A.2 cuts both ways) — the point is only that the KEY is not wrong about it.
+struct AsmOperandSelector {
+    // Position in the operand list AS WRITTEN, counting selectors.
+    std::uint32_t index = 0;
+    // The exact operand text that selects this row. ⚠ COMPARED, NEVER
+    // INTERPRETED: the engine holds no opinion about what a system register or
+    // a condition spelling MEANS, which is what keeps `sysreg` out of the
+    // shared substrate's vocabulary.
+    std::string   name;
+};
 
 // One `assembly.instructions[]` row: an assembly SPELLING and the target
 // opcodes it may name. `width` is the operand width the spelling's suffix
@@ -276,6 +490,16 @@ struct AsmInstructionSpelling {
     // WHICH condition a variant that declares `condCodeFromPayload` should
     // read out of the instruction payload.
     //
+    // ⚠⚠ ON A SELECTOR ROW, `cond` BESIDE `operandSelectors` IS **NOT ONE FACT
+    // WRITTEN TWICE**, and "simplifying" it is a silent miscompile.
+    // `{"spelling":"cset","operandSelectors":[{"index":1,"name":"lo"}],
+    //   "cond":"ult"}` maps the gas SPELLING to the `TargetCondCode` — the same
+    // non-identity the shipped `b.lo`/`ult` row already carries. DERIVING
+    // `cond` from the selector string is precisely the letter-pattern-matching
+    // the `b.<cc>` comment warns about: gas's `lt/le/gt/ge` are SIGNED and its
+    // unsigned peers are `lo/ls/hi/hs`, so a derivation would map `ls` to `sle`
+    // and miscompile every unsigned comparison with a clean build log.
+    //
     // ★★★ REQUIRED ⟺ THE OPCODE'S ENCODING READS ONE, IN BOTH DIRECTIONS. The
     // cross-check runs in `asm_text_to_lir.cpp`'s `resolveRows` — once per
     // dialect row, before any statement is walked, so a broken row is reported
@@ -295,7 +519,52 @@ struct AsmInstructionSpelling {
     // condition; a `cbz`-shaped conditional branch is the other direction of
     // the same point (a cond-br that correctly carries no condition code).
     std::string              condName;
+
+    // OPTIONAL; EMPTY on every ordinary row. See `AsmOperandSelector`.
+    std::vector<AsmOperandSelector> operandSelectors;
+
+    // The selector declared at `index`, or nullptr.
+    [[nodiscard]] AsmOperandSelector const*
+    selectorAt(std::uint32_t index) const noexcept {
+        for (auto const& s : operandSelectors) {
+            if (s.index == index) return &s;
+        }
+        return nullptr;
+    }
 };
+
+// ★★★ CAN TWO ROWS SHARING A SPELLING BOTH MATCH THE SAME LINE?
+//
+// ★★ THE ANSWER IS A LOAD-TIME REFUSAL, AND IT IS THE PRICE OF ADMISSION FOR
+// THE SELECTOR KEY (plan 29 §4.7.1). Without it, selectors buy the `cntvct` row
+// by planting the `ldr`/`ldur` bug one level up: that pair was split into
+// separate rows precisely because guard election *"would take the first and
+// silently encode LDR where the programmer wrote LDUR"*. So NEVER first-match
+// and NEVER most-specific-silently-wins — two rows that could both take a line
+// are refused when the DOCUMENT loads, naming both.
+//
+// ★ THE PREDICATE IS DELIBERATELY CONSERVATIVE — provably disjoint, or refused.
+// Two rows are distinguishable ⟺ some index carries a selector in BOTH rows
+// with DIFFERENT names, because that index alone then decides every line. A
+// selector row against a bare row (no common index) is NOT separable that way:
+// the bare row matches everything the selector row matches, so it is refused —
+// which is exactly the §4.7.1 case. Erring toward refusal costs a config author
+// one diagnostic; erring the other way costs a reader a wrong instruction with
+// no diagnostic at all.
+//
+// ★ AND IT IS WHY SELECTORS FORECLOSE NOTHING. If a target ever needs a real
+// system-register operand KIND, a selector row and a generic row COEXIST — the
+// selector row is a SPECIALIZATION, the same relation `nop` has to a generic
+// form — *provided this refusal is in place*. That is the second reason it is
+// not optional.
+//
+// ⚠⚠ THE PREDICATE MOVED ONTO `AssemblyConfig` WHEN `spellingCase` LANDED, AND
+// THAT IS NOT COSMETIC. "Different names" is a question about SPELLINGS, so it
+// is answered under the document's own case policy: in a folding dialect,
+// selectors `eq` and `EQ` at one index name the SAME condition, so two rows
+// carrying them are NOT disjoint and one line would match both. A free function
+// could not see the policy, and a caller that forgot to pass it would silently
+// re-open exactly the §4.7.1 ambiguity this refusal exists to close.
 
 struct AsmDirectiveSpelling {
     std::string      spelling;   // as written after the introducer, WITHOUT it
@@ -358,6 +627,32 @@ struct AsmDirectiveSpelling {
     // in either case nothing could ever reach the row, and a row nothing can
     // reach is config that silently does nothing.
     bool             operandOnly = false;
+
+    // ★★★ `FrameRule` ONLY (required there, refused on every other verb): WHICH
+    // rule change this spelling states. The value is a `CfiOpKind` — the shared
+    // core's unwind vocabulary — resolved AT LOAD from the name
+    // `cfiOpKindName()` publishes, so an unknown rule is a load error naming
+    // the closed set rather than a directive that silently carries nothing.
+    //
+    // ★ WHY THE NAMES LINE UP 1:1 WITH gas's SPELLINGS AND THAT IS NOT A
+    // COINCIDENCE: `core/types/cfi.hpp` states outright that every enumerator
+    // was written from a `.cfi_*` spelling a real assembler emits. So the AT&T
+    // row for `.cfi_def_cfa_register` names `"def_cfa_register"` and the
+    // mapping reads as an identity — but it is DECLARED, because a dialect
+    // whose spelling is `.frame_cfa_reg` binds the same rule with no engine
+    // change, which is the whole reason the spelling and the meaning are two
+    // fields.
+    std::optional<CfiOpKind> frameRule;
+    // `FrameRule` ONLY. TRUE on `.cfi_rel_offset`, whose stated offset is
+    // measured from the CURRENT CFA rather than from the canonical frame
+    // address — gas defines it as `.cfi_offset reg, off − <current CFA
+    // offset>` and resolves it against its own running state. There is no
+    // `CfiOpKind` for it and there must not be: it is the SAME rule
+    // (`RegAtCfaOffset`) stated in a different coordinate system, so a second
+    // enumerator would put one fact in two places and every consumer would
+    // carry both arms forever. The producer folds it; the representation never
+    // sees it.
+    bool                     frameOffsetFromCfa = false;
 };
 
 struct DSS_EXPORT AssemblyConfig {
@@ -381,12 +676,86 @@ struct DSS_EXPORT AssemblyConfig {
     RuleId labelTailRule{};
     RuleId operandSeqRule{};
 
+    // ★★★ THE TEMPLATE SURFACE — how an EMBEDDED `__asm__` template differs
+    // from a standalone `.s`, declared as two names rather than built into the
+    // engine (D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER, 2026-08-15).
+    //
+    // ★★ WHY A LEXER MODE AND NOT A GRAMMAR ALTERNATIVE. ✔MEASURED, and
+    // EXERCISED rather than read: `%` is ALREADY the register sigil in the AT&T
+    // dialect and the type sigil in the arm64 one, and
+    // `detectAmbiguousAlternatives` REFUSES two sibling alts sharing a FIRST
+    // token — two in-process tests watch the loader refuse the naive arm. So a
+    // placeholder needs `%` to carry a SECOND kind in template context, which
+    // is precisely what a per-mode `tokens` override is for. The mode is named
+    // here so the template parse entry selects it from CONFIG rather than from
+    // a hard-coded string.
+    // ★ AND THE MODE BUYS A CORRECTNESS PROPERTY, NOT ONLY AN EXPRESSIVENESS
+    // ONE: a placeholder token is minted ONLY inside the template mode, so
+    // every placeholder-headed shape is unreachable from a `.s` BY
+    // CONSTRUCTION. gas rejects `%0` in a `.s`; so does DSS, without a check
+    // that could be forgotten.
+    //
+    // `templateOperandRule` names the SHARED grammar's placeholder rule
+    // (`asm.lang.json`'s `asmTemplateOperand`). The lowering engine asks the
+    // dialect which rule that is, exactly as it asks which rule is
+    // `labelTailRule` — so the engine holds no opinion about how a placeholder
+    // is spelled and never names a rule of another document in C++.
+    //
+    // ⚠ OPTIONAL AS A SET, REQUIRED OF EACH OTHER — the loader refuses any
+    // proper subset. A mode with no rule mints tokens no shape accepts; a
+    // rule with no mode declares a shape whose FIRST token nothing ever
+    // produces; and see `templateLabelRule` below for the third. Every one of
+    // them is a silent no-op, which is the one outcome this config surface is
+    // shaped to make impossible. A dialect that hosts no embedded templates
+    // declares none of them, and all stay invalid.
+    LexerModeId templateLexerMode{};
+    RuleId      templateOperandRule{};
+
+    // ★★★ WHICH PLACEHOLDER RULE IS THE `asm goto` **LABEL** REFERENCE —
+    // `asm.lang.json`'s `asmTemplateLabelRef`, naming `%l[done]` and `%l2`.
+    //
+    // ★★ IT EXISTS SO THE ENGINE CAN TELL THE TWO PLACEHOLDER FAMILIES APART
+    // WITHOUT EVER LOOKING AT A BYTE. An operand placeholder denotes a
+    // REGISTER and is asked for through `AsmLoweringHost::resolveRegister`; a
+    // label placeholder denotes a BLOCK and is asked for through
+    // `resolveBranchTarget`. Two questions, two virtuals — and the only
+    // dialect-neutral way to know which one a matched node is asking is the
+    // rule it was produced by. Testing the `%l` bytes in C++ would put a
+    // second owner beside `semantics.inlineAsmTemplateLexemes`, which is the
+    // defect `D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER`
+    // closed; this key is what keeps it closed.
+    //
+    // ⚠⚠ MANDATORY FOR EVERY DIALECT DOCUMENT, PRESENT AND FUTURE, AND THAT IS
+    // A LOAD-BREAKING CHANGE FOR ANY OUT-OF-TREE DIALECT — stated plainly
+    // rather than discovered. `asm.lang.json`'s `asmLine` closure SPELLS the
+    // template holes, so a dialect that imports the shared standalone surface
+    // imports the placeholder shapes whether or not it wants them, and the
+    // capability was therefore never really optional for such a document. That
+    // is not a new policy: it is the consequence recorded in the closed row
+    // `D-CONFIG-ASM-TEMPLATE-CAPABILITY-NO-LONGER-OPTIONAL-FOR-A-SHARED-SURFACE-IMPORTER`,
+    // now extended to a third key by the same argument. A dialect importing a
+    // NARROWER entry — one whose closure does not reach the template shapes —
+    // may still declare none of the three.
+    RuleId      templateLabelRule{};
+
     // Indexed by `static_cast<std::size_t>(AsmOperandRole)`. Every role is
     // REQUIRED when the block is present — a partial `operandForms` is a load
     // error, never a silently-unrecognized operand shape.
     std::array<RuleId, kAsmOperandRoleCount> operandFormRules{};
 
     AsmOperandOrder operandOrder = AsmOperandOrder::DestinationLast;
+
+    // How a WRITTEN spelling is matched against DECLARED VOCABULARY. See
+    // `AsmSpellingCase` for the measurement that fixes which surfaces this
+    // reaches and which three it must never reach.
+    // ⚠ THE MEMBER DEFAULT IS THE STRICT ARM AND THE KEY IS STILL REQUIRED.
+    // Defaulting to `AsciiFolded` would make a dialect that forgot the key
+    // silently accept spellings it never declared; defaulting to `Sensitive`
+    // and leaving the key optional would make it silently refuse what its
+    // reference assembler takes — the defect this field closed. So the loader
+    // demands the key exactly as it demands `operandOrder`, and this
+    // initializer only fixes the value of a default-constructed config.
+    AsmSpellingCase spellingCase = AsmSpellingCase::Sensitive;
 
     std::vector<AsmInstructionSpelling> instructions;
     std::vector<AsmDirectiveSpelling>   directives;
@@ -402,6 +771,62 @@ struct DSS_EXPORT AssemblyConfig {
     // Empty is legal and means "this dialect starts no program by itself" — a
     // pure object/relocatable build, where the entry is somebody else's.
     std::vector<std::string> entryLabels;
+
+    // ★★★ THE ONE SPELLING COMPARISON. Every match against declared vocabulary
+    // — mnemonic, directive, operand selector, register name — goes through
+    // this function and nothing else re-implements it. Four independent `==`s
+    // honouring a policy is four chances for one of them to be forgotten, and a
+    // forgotten one is not a compile error: it is a dialect that folds its
+    // mnemonics and refuses its registers.
+    //
+    // ★ THE FOLD IS `dss::asciiToLower`, THE ONE FOLDING HELPER — never a
+    // hand-rolled loop (`ascii_case.hpp` exists because the second loop is how
+    // two comparisons drift apart).
+    //
+    // ⚠ THE TWO EARLY-OUTS ARE CORRECTNESS-NEUTRAL AND NOT AN OPTIMIZATION
+    // GAMBLE. An ASCII fold is a per-code-unit map, so it can never change a
+    // string's LENGTH; and two byte-identical strings fold identically under
+    // any policy. So the allocating path is reached only by a same-length
+    // non-identical pair — which, in a dialect whose tables are lowercase and a
+    // source that is too, is never.
+    [[nodiscard]] bool spellingMatches(std::string_view declared,
+                                       std::string_view written) const {
+        if (declared.size() != written.size()) return false;
+        if (declared == written) return true;
+        if (spellingCase == AsmSpellingCase::Sensitive) return false;
+        return asciiToLower(declared) == asciiToLower(written);
+    }
+
+    // The canonical form of `s` under this document's policy — the key a
+    // DUPLICATE-DETECTING container must be keyed on.
+    //
+    // ★★ IT IS THE SAME FOLD, SO IT CANNOT DISAGREE WITH `spellingMatches`:
+    // `spellingMatches(a, b)` ⟺ `spellingKey(a) == spellingKey(b)`, by
+    // construction, since both route through `asciiToLower` and the size/equal
+    // early-outs above are implied by string equality. That equivalence is what
+    // makes the LOAD-TIME refusal and the RUN-TIME match one rule: a loader that
+    // deduplicated on raw spellings while the engine matched on folded ones
+    // would let `mov` and `MOV` both load clean and both take the same line —
+    // the §4.7.1 ambiguity, arriving through the back door.
+    [[nodiscard]] std::string spellingKey(std::string_view s) const {
+        return spellingCase == AsmSpellingCase::AsciiFolded
+                   ? asciiToLower(s)
+                   : std::string{s};
+    }
+
+    // See the block comment above `AsmDirectiveSpelling` for why this is a
+    // member rather than a free predicate.
+    [[nodiscard]] bool
+    rowsAreSelectorDisjoint(AsmInstructionSpelling const& a,
+                            AsmInstructionSpelling const& b) const {
+        for (auto const& sa : a.operandSelectors) {
+            auto const* sb = b.selectorAt(sa.index);
+            if (sb != nullptr && !spellingMatches(sb->name, sa.name)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // The rule realizing `role`, or an INVALID RuleId when the dialect declared
     // the role ABSENT (JSON `null`). ⚠ "Absent" is a DECLARED answer, not an
@@ -495,6 +920,20 @@ struct DSS_EXPORT AssemblyConfig {
     // ⚠ LOOKUP IS OVER SECTION-OPENING ROWS ONLY, so `.section text` reaches
     // the `sectionText` row and `.section globl` reaches nothing rather than
     // silently reaching a directive that has no section to open.
+    //
+    // ⛔⛔ THE `==` HERE IS EXACT ON PURPOSE AND `spellingCase` MUST NOT REACH
+    // IT — THIS ARGUMENT IS A SECTION *NAME*, NOT A DECLARED SPELLING. It is
+    // the one seam in this header where the folding rule looks like it applies
+    // and measurably does not: ✔MEASURED 2026-08-15, x86_64 `as` 2.42 —
+    // `.section .RODATA` is rc=0 and opens a section literally named
+    // `.RODATA`, and a source writing BOTH `.rodata` and `.RODATA` gets TWO
+    // sections of 8 bytes each (`objdump -h`). A fold here would put `.RODATA`
+    // data in `.rodata`; the reference puts it somewhere else. That is a silent
+    // divergence, not a conformance fix — the same reason symbol names and the
+    // `.type` marker stay exact. The DIRECTIVE that carries this operand is a
+    // different question and does fold: `.SECTION .rodata` reaches this row
+    // through `directiveBySpelling` and lands in `.rodata` (✔MEASURED, rc=0,
+    // one section).
     [[nodiscard]] AsmDirectiveSpelling const*
     sectionRowByName(std::string_view s) const noexcept {
         for (auto const& row : directives) {
@@ -513,18 +952,32 @@ struct DSS_EXPORT AssemblyConfig {
         return false;
     }
 
+    // The FIRST row spelled `s`. ⚠ A SPELLING MAY NOW HAVE MORE THAN ONE ROW —
+    // a selector-carrying mnemonic has one per selector value (`cset` × 12), and
+    // the loader has already proved they are pairwise disjoint. This accessor
+    // therefore answers "is this spelling declared at all"; the row that
+    // actually applies to a LINE is chosen by the selectors, which need the
+    // operands. Use `instructionRowCount` when the count is the question.
     [[nodiscard]] AsmInstructionSpelling const*
-    instructionBySpelling(std::string_view s) const noexcept {
+    instructionBySpelling(std::string_view s) const {
         for (auto const& row : instructions) {
-            if (row.spelling == s) return &row;
+            if (spellingMatches(row.spelling, s)) return &row;
         }
         return nullptr;
     }
 
+    [[nodiscard]] std::size_t instructionRowCount(std::string_view s) const {
+        std::size_t n = 0;
+        for (auto const& row : instructions) {
+            if (spellingMatches(row.spelling, s)) ++n;
+        }
+        return n;
+    }
+
     [[nodiscard]] AsmDirectiveSpelling const*
-    directiveBySpelling(std::string_view s) const noexcept {
+    directiveBySpelling(std::string_view s) const {
         for (auto const& row : directives) {
-            if (row.spelling == s) return &row;
+            if (spellingMatches(row.spelling, s)) return &row;
         }
         return nullptr;
     }
@@ -536,6 +989,24 @@ asmOperandOrderFromName(std::string_view name) {
         if (text == name) return v;
     }
     return std::nullopt;
+}
+
+[[nodiscard]] inline std::optional<AsmSpellingCase>
+asmSpellingCaseFromName(std::string_view name) {
+    for (auto const& [text, v] : kAsmSpellingCaseNames) {
+        if (text == name) return v;
+    }
+    return std::nullopt;
+}
+
+// The config spelling of a policy — read out of the SAME table `fromName`
+// validates against, so the two can never name it differently.
+[[nodiscard]] inline std::string_view
+asmSpellingCaseName(AsmSpellingCase v) noexcept {
+    for (auto const& [text, candidate] : kAsmSpellingCaseNames) {
+        if (candidate == v) return text;
+    }
+    return "<unnamed>";
 }
 
 [[nodiscard]] inline std::optional<AsmDirectiveVerb>

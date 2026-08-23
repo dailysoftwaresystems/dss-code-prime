@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_attrs.hpp"                 // HirSourceMap
+#include "hir/hir_inline_asm.hpp"      // HirInlineAsmPool (inline-asm descriptors)
 #include "hir/hir_literal_pool.hpp"
 
 #include <memory>
@@ -160,6 +161,14 @@ struct DSS_EXPORT CstToHirResult {
                                   // `mir_text` surfaces as `nosanitizethread`. Its
                                   // sink is STORAGE, not a pass — DSS ships no
                                   // sanitizer (see NoSanitizeThreadAttr)
+    HirInlineDefinitionMap inlineDefinitionMap; // bound to `hir` — native-FUNCTION
+                                  // C99 6.7.4p7 INLINE DEFINITION
+                                  // (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-
+                                  // DEFINITION-EMITTED). Keyed on the FUNCTION node
+                                  // (not the declaration node the five maps above
+                                  // use); read at HIR→MIR to sanction the one legal
+                                  // function-and-extern SymbolId pair, and NOT
+                                  // stamped onto MirFunc — see InlineDefinitionAttr
     HirMutabilityMap mutabilityMap; // bound to `hir` — native-global const-ness
                                   // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL); read at
                                   // HIR→MIR to pick `.rodata` vs writable `.data`
@@ -217,6 +226,18 @@ struct DSS_EXPORT CstToHirResult {
     // Empty for every non-threads (and every elf/macho) translation unit.
     std::unordered_map<std::uint32_t, std::string> synthRecipeBySymbol;
     HirLiteralPool literalPool;   // decoded literal values, indexed by literalIndex
+    // Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): the decoded `__asm__`
+    // payloads — template text, per-operand constraint records, clobbers, label
+    // ordinals — indexed by an `InlineAsm` node's `payload` HANDLE (1-based;
+    // `kNoInlineAsmDescriptor` == 0 is the bare-barrier form). Beside
+    // `literalPool` and for its reason: `detail::HirNode` is budgeted at 32
+    // bytes with one `uint32_t` payload, so a descriptor cannot live on a node.
+    // ⚠ LIKE `literalPool`, IT IS A SEPARATE HANDOFF ARGUMENT AT EVERY SEAM. HIR
+    // itself has no rebuild passes (✔MEASURED: exactly two `HirBuilder` sites in
+    // `src/`), so nothing can drop it mid-module; what CAN drop it is a new
+    // consumer that takes `Hir const&` alone. `HirVerifier` therefore asserts
+    // every handle resolves against the pool it is handed.
+    HirInlineAsmPool inlineAsmPool;
     // True iff neither lowering nor the verify-on-load pass emitted an
     // Error-severity diagnostic (delta-computed, so prior diagnostics on the
     // shared reporter don't taint the verdict).
@@ -230,11 +251,13 @@ struct DSS_EXPORT CstToHirResult {
     std::vector<HirExternRecord> externDecls;
 
     // `hir` is declared first so the maps bind to the constructed module.
-    CstToHirResult(Hir h, HirLiteralPool lp)
+    CstToHirResult(Hir h, HirLiteralPool lp, HirInlineAsmPool ap)
         : hir(std::move(h)), sourceMap(hir), linkageMap(hir), noInlineMap(hir),
           alwaysInlineMap(hir), noOptimizeMap(hir), noSanitizeThreadMap(hir),
+          inlineDefinitionMap(hir),
           mutabilityMap(hir), threadLocalMap(hir), volatileMap(hir),
-          returnsTwiceMap(hir), alignmentMap(hir), literalPool(std::move(lp)) {}
+          returnsTwiceMap(hir), alignmentMap(hir), literalPool(std::move(lp)),
+          inlineAsmPool(std::move(ap)) {}
 
     CstToHirResult(CstToHirResult const&)            = delete;
     CstToHirResult& operator=(CstToHirResult const&) = delete;

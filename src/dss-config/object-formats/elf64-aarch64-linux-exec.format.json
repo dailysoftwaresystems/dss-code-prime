@@ -21,8 +21,8 @@
   "cSymbolDecoration": { "scheme": "none" },
   "$predefinedMacrosComment": "TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the C-visible face of this file's `dataModel` above, DERIVED FROM THAT VALUE AND NEVER FROM THIS FILE'S NAME -- the loader synthesizes no macro name and the engine performs no format-identity branch; it merges whatever rows are declared here with the language's `preprocess.predefinedMacros` and the target's `predefinedMacros`, applying `availableObjectFormats` exactly once. DECLARED ON THE FORMAT because the data model is per-(OS x format), not per-CPU: the same x86_64 target is LP64 here and LLP64 under pe64-x86_64-windows-*, so a target-side row would be wrong on one of its own formats -- which is exactly what both .target.json files say when they record `__LP64__`/`_LP64` as DELIBERATELY NOT SHIPPED and defer to the format. BOTH spellings, each value 1: MEASURED 2026-07-30 with `/usr/bin/clang -dM -E -x c /dev/null -target <triple>` (Apple clang 21.0.0), __LP64__ and _LP64 are BOTH defined as 1 on arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu and x86_64-unknown-linux-gnu, and NEITHER is defined on x86_64-pc-windows-msvc. COLLISION POLICY: a name declared by this file AND the language or target config is FATAL (C_ConflictingPredefinedMacro) -- no side silently wins. WHAT IT UNBLOCKS, MEASURED: the macOS SDK gates 234 occurrences across 91 headers on __LP64__, so without these rows DSS compiled the SDK's ILP32 arms while its own widths were LP64 (sizeof(long)==8), and $SDK/usr/include/mach/port.h:113-114 then asserted the user32 struct size 12 instead of user64's 16 -- sqlite mem1.c's three error[S0029]. RED-ON-DISABLE: delete this key and examples/c-subset/predefined_lp64_macho stops exiting 42.",
   "predefinedMacros": [
-    { "name": "__LP64__", "kind": "constant", "value": "1" },
-    { "name": "_LP64",    "kind": "constant", "value": "1" }
+    { "name": "__LP64__", "kind": "constant", "value": "1", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "_LP64",    "kind": "constant", "value": "1", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } }
   ],
 
 
@@ -186,9 +186,11 @@
 
   "relocations": [
     {
+      "$comment": "26-bit PC-relative branch with link / branch (BL / B target). ELF type R_AARCH64_CALL26 = 283. `kind` = 1 matches arm64.target.json's `call26` row. ★ `isCall` (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL, 2026-08-20): this wire relocation can ONLY target executable code, so an object reader that meets an undefined extern through it has PROVEN the extern is a function rather than a data object -- the only classification signal a symbol-name-only reference offers. It is declared HERE, on the format row, and not derived from the target's formula, because a formula describes ARITHMETIC and not ROLE: `S + A - P` is the identical arithmetic for a call and for a PC-relative data reference, so the x86_64 target's `linear` is honest and simply carries no role, while aarch64's `aarch64_call26` looked like a role only because that CPU's branch has its own instruction encoding. ✔MEASURED 2026-08-20: every macho64-x86_64 archive member calling any library function was unreadable for exactly this reason while the arm64 sibling read the same source cleanly. The target document cannot carry it -- it is PER-CPU and shared with ELF, where the same `rel32` genuinely serves data references too.",
       "name": "R_AARCH64_CALL26",
       "kind": 1,
-      "nativeId": 283
+      "nativeId": 283,
+      "isCall": true
     },
     {
       "name": "R_AARCH64_ADR_PREL_PG_HI21",

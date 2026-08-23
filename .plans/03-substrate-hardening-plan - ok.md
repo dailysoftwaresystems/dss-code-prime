@@ -17,8 +17,8 @@
 |---|---|---|
 | SH2 | ✅ done | Multi-OS matrix already shipped by `DSS.DevOps@v2` (`cpp-app-pr.yml`): Linux/GCC-13/Release, Linux/Clang-19/Debug+ASan+UBSan, Windows/MSVC/Release, all default-enabled and green on recent PRs. This PR opts the consumer wiring into the `run-macos` leg (AppleClang on Homebrew LLVM). `ab0800e` (squash-merged into `d0d6119` via PR #3). |
 | SH3 | ✅ done | `NodeId` grew an 8-byte `treeTag` field; `TreeBuilder` mints `TreeId` eagerly at ctor and stamps every emitted id; `NodeAttribute<T>::validateId_` + `Tree::node_` abort on tag mismatch with both ids in the message. 14 new death tests added. `ac76408` (squash-merged into `d0d6119` via PR #3). |
-| SH1 | ✅ done | `tools/refresh_landing_log.py` regenerates hash anchors in landing-log tables from `git log`, gated by paired `<!-- LANDING-LOG-HASHES: <PR> -->...<!-- /LANDING-LOG-HASHES -->` markers and a `### PR landing log` section gate so prose references to the marker format aren't mistaken for live anchors. `tools/landing-log-config.json` maps each plan to a commit-subject regex. `--check` is the CI gate (exits non-zero on drift); `--write` applies the rewrite. 20 stdlib-only unittests cover render shapes, idempotency, section gating, missing-close-marker insertion, cross-line containment. `05d5c80` (squash-merged into `d0d6119` via PR #3). |
-| SH4 | ✅ done | v2 follow-ups: (a) `landing-log-check` CI job in `pipeline-pr.yml` runs `python tools/refresh_landing_log.py --check` (SH1's "out of scope" follow-up); (b) c-subset gains `switch`/`case`/`default`/`break` via shape-based positioning — design call deviates from the catalog's `scopeRequire` guess (`Block`-not-`Switch` is innermost in a switch body); v2-gap-catalog row 11 updated; (c) 7 new tests in `test_schema_cursor.cpp` pin `routeToRuleLeaf` through 3-level and 4-level nested AltChoice (`alt → optional → alt [→ optional] → RuleLeaf`). 1 new c-subset test (`SwitchStmtParsesAllArmKinds`) pins the case+default+break tree shape via full pretty-print equality. `e22a728` (SH4a) + `ded11d3` (SH4c) + `130d5b1` (SH4b), squash-merged into `d0d6119` via PR #3. |
+| SH1 | ✅ done | `scripts/refresh_landing_log/refresh_landing_log.py` regenerates hash anchors in landing-log tables from `git log`, gated by paired `<!-- LANDING-LOG-HASHES: <PR> -->...<!-- /LANDING-LOG-HASHES -->` markers and a `### PR landing log` section gate so prose references to the marker format aren't mistaken for live anchors. `scripts/refresh_landing_log/landing-log-config.json` maps each plan to a commit-subject regex. `--check` is the CI gate (exits non-zero on drift); `--write` applies the rewrite. 20 stdlib-only unittests cover render shapes, idempotency, section gating, missing-close-marker insertion, cross-line containment. `05d5c80` (squash-merged into `d0d6119` via PR #3). |
+| SH4 | ✅ done | v2 follow-ups: (a) `landing-log-check` CI job in `pipeline-pr.yml` runs `python scripts/refresh_landing_log/refresh_landing_log.py --check` (SH1's "out of scope" follow-up); (b) c-subset gains `switch`/`case`/`default`/`break` via shape-based positioning — design call deviates from the catalog's `scopeRequire` guess (`Block`-not-`Switch` is innermost in a switch body); v2-gap-catalog row 11 updated; (c) 7 new tests in `test_schema_cursor.cpp` pin `routeToRuleLeaf` through 3-level and 4-level nested AltChoice (`alt → optional → alt [→ optional] → RuleLeaf`). 1 new c-subset test (`SwitchStmtParsesAllArmKinds`) pins the case+default+break tree shape via full pretty-print equality. `e22a728` (SH4a) + `ded11d3` (SH4c) + `130d5b1` (SH4b), squash-merged into `d0d6119` via PR #3. |
 
 ---
 
@@ -42,12 +42,12 @@ None of these block forward progress today. All three become substantially more 
 
 **Goal.** Eliminate the entire class of "missing commit hash in landing log" bugs by generating the landing-log tables from `git log` instead of hand-editing them.
 
-**Outcome — Python-only, stdlib-only.** Originally scoped as "PowerShell first, Python if SH2 lands Linux CI." With SH2 already done (Linux + macOS CI active), the PowerShell variant gives no extra value over Python, so it's deferred. `py tools/refresh_landing_log.py --check` runs on every host the CI matrix covers.
+**Outcome — Python-only, stdlib-only.** Originally scoped as "PowerShell first, Python if SH2 lands Linux CI." With SH2 already done (Linux + macOS CI active), the PowerShell variant gives no extra value over Python, so it's deferred. `py scripts/refresh_landing_log/refresh_landing_log.py --check` runs on every host the CI matrix covers.
 
 **Surface — final.**
-- `tools/refresh_landing_log.py`: single-file Python 3 script (no external deps; works on the Strawberry-Python that ships with the dev env and on the ubuntu/macos runners that already have system Python).
-- `tools/landing-log-config.json`: lists each plan + a commit-subject regex whose first capture group is the PR identifier and optional second/third groups identify review-followup / round-N commits.
-- `tools/test_refresh_landing_log.py`: 20 unittest cases (stdlib `unittest`, no pytest), runs in <1 s.
+- `scripts/refresh_landing_log/refresh_landing_log.py`: single-file Python 3 script (no external deps; works on the Strawberry-Python that ships with the dev env and on the ubuntu/macos runners that already have system Python).
+- `scripts/refresh_landing_log/landing-log-config.json`: lists each plan + a commit-subject regex whose first capture group is the PR identifier and optional second/third groups identify review-followup / round-N commits.
+- `scripts/refresh_landing_log/test_refresh_landing_log.py`: 20 unittest cases (stdlib `unittest`, no pytest), runs in <1 s.
 
 **Marker design — paired markers within a section gate.**
 - Opening marker (hand-placed): `<!-- LANDING-LOG-HASHES: SH3 -->`. Closing marker (script-managed): `<!-- /LANDING-LOG-HASHES -->`. Content between the pair is the hash block.
@@ -150,10 +150,10 @@ Why `NodeId` carries the tag rather than just the `Node` (as the plan's Option A
 SH1's named "out of scope" follow-up. SH1 shipped the tool; SH4a runs it in CI.
 
 **Surface.**
-- `.github/workflows/pipeline-pr.yml`: add a `landing-log-check` job alongside the existing `pipeline-pr` reusable-workflow call. Runs on `ubuntu-latest`, checks out with `fetch-depth: 0` (the script needs full git history for `git log`), sets up Python 3, runs `python tools/refresh_landing_log.py --check`. Exits non-zero on drift, surfacing the diff in the Actions log.
+- `.github/workflows/pipeline-pr.yml`: add a `landing-log-check` job alongside the existing `pipeline-pr` reusable-workflow call. Runs on `ubuntu-latest`, checks out with `fetch-depth: 0` (the script needs full git history for `git log`), sets up Python 3, runs `python scripts/refresh_landing_log/refresh_landing_log.py --check`. Exits non-zero on drift, surfacing the diff in the Actions log.
 - No gate on the `Run Pipes` label — plan-doc hygiene matters even for label-less PRs.
 
-**Acceptance.** Pushing a PR with a stale landing-log hash fails the new check; running `python tools/refresh_landing_log.py --write` locally + pushing the diff makes it pass.
+**Acceptance.** Pushing a PR with a stale landing-log hash fails the new check; running `python scripts/refresh_landing_log/refresh_landing_log.py --write` locally + pushing the diff makes it pass.
 
 **Out of scope.** Wiring `--check` into the DSS.DevOps reusable workflow itself (cross-repo; the consumer wiring is the cleanest seam).
 

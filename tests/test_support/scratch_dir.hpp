@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/substrate/path_identity.hpp"
+
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -58,24 +60,30 @@ enum class Location : std::uint8_t {
     InsideRepo  = 1,  // `<cwd>/test-scratch/<group>/...` — for cwd-walk tests
 };
 
-// The SAME resolution the product applies to any path it reports or keys on —
-// `fs::weakly_canonical`, falling back to `lexically_normal` when the filesystem
-// refuses to answer. Mirrors `canonicalize` in
-// `src/program/dependency_resolver.cpp`; see the ctor for the measured failure
-// that made this necessary.
+// THE SAME resolution the product applies to any path it keys on — by CALLING
+// it, not by mirroring it.
 //
-// ⚠ IT IS DELIBERATELY A COPY, NOT A CALL. Tests must not link the resolver to
-// build a directory path, and the shared alternative — exporting a canonicalizer
-// from `src/` for tests to import — would let a product-side change silently
-// retune every fixture in the tree, which is the opposite of what a fixture is
-// for. The coupling that matters is asserted rather than assumed: the pin
-// `MatchesTheProductsOwnCanonicalizer` in `test_scratch_dir.cpp` fails if these
-// two ever disagree on the same input.
+// ⚠ THIS WAS A DELIBERATE COPY UNTIL 2026-08-18, and the reasons it stopped being
+// one are worth keeping. The copy existed so a test would not link the RESOLVER
+// merely to build a directory path, and so a product-side change could not
+// silently retune every fixture in the tree. The first no longer applies: the
+// canonicalizer is now a leaf host-substrate function
+// (`core/substrate/path_identity`), beside `process_spawn`, not the resolver.
+// The second INVERTS on inspection — a fixture that resolves paths DIFFERENTLY
+// from the product is exactly the 2026-08-17 CI failure (fixture spelled the
+// 8.3 short form, product reported the long one, `find()` returned npos), so
+// agreeing BY CONSTRUCTION is the property actually wanted here.
+//
+// The pin that guarded the copy is replaced, not dropped, by
+// `FixtureHasNotGrownItsOwnCanonicalizer` — see `test_scratch_dir.cpp` for why
+// "the two agree" became a test that passes both ways.
 [[nodiscard]] inline std::filesystem::path
 canonicalizeLikeTheProduct(std::filesystem::path const& p) {
-    std::error_code ec;
-    std::filesystem::path const c = std::filesystem::weakly_canonical(p, ec);
-    return ec ? p.lexically_normal() : c;
+    // `make_preferred` for the same reason `PathIdentity::path()` does it:
+    // this value becomes a DIRECTORY that tests hand to `cmd.exe`, and a
+    // forward-slashed Windows path is fine for every API except the shell.
+    return std::filesystem::path{dss::core::canonicalIdentityKey(p)}
+        .make_preferred();
 }
 
 class ScratchDir {

@@ -134,6 +134,22 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
                         idx, mir_.literalPool().size()));
             }
         }
+        // ★ THE SAME RULE FOR THE ASM POOL, AND IT WAS MISSING. Both asm opcodes
+        // carry a `MirAsmDescriptorPool` index in their payload, and
+        // `Mir::asmDescriptor` ABORTS on an out-of-range one — so a directly
+        // constructed module (the merge output, a deserializer, a hand-built
+        // fixture) with a stale index killed the process inside the verifier
+        // instead of being reported by it. A refusal that crashes is not a
+        // refusal; report it here, exactly as the literal pool's index is.
+        if (op == MirOpcode::InlineAsm || op == MirOpcode::InlineAsmGoto) {
+            std::uint32_t const idx = mir_.instPayload(id);
+            if (idx >= mir_.asmDescriptorPool().size()) {
+                reportInst(reporter, DiagnosticCode::I_VerifierFailure, id,
+                    std::format("{} payload {} out of inline-asm descriptor-pool "
+                                "range [0, {})",
+                        info.mnemonic, idx, mir_.asmDescriptorPool().size()));
+            }
+        }
         if (op == MirOpcode::Alloca) {
             // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: the Alloca's secondary payload
             // is the local's EFFECTIVE alignment in bytes (0 = no over-alignment
@@ -214,6 +230,63 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
                                 "out of range (blockCount = {})",
                                 from.v, to.v, blockCount));
             }
+        }
+        checkTerminatorSuccessorArity(reporter, from);
+    }
+}
+
+// ★★★ THE SUCCESSOR-ARITY BACKSTOP, AND IT WAS CLAIMED TO EXIST BEFORE IT DID.
+// `MirBuilder::recordSuccessors_`'s comment justified itself by saying "ML3's
+// verifier re-runs the same descriptor check on any frozen module — including the
+// direct-Mir-ctor path this builder doesn't own". ✔MEASURED: this file validated
+// OPERAND arity against `opcodeInfo` and range-checked edge TARGETS, and carried
+// no successor-count check of any kind — so a `Mir` built through the direct
+// constructor (the merge output, a deserializer, a hand-built fixture) could hold
+// a terminator with the wrong number of edges and reach the backend with no
+// diagnostic. This is that check, and it is the frozen-module half of the defence
+// behind `cloneInlineAsmGoto`'s descriptor-vs-successor rule: the builder guards
+// the paths it owns, the verifier guards the ones it does not.
+void MirVerifier::checkTerminatorSuccessorArity(DiagnosticReporter& reporter,
+                                                MirBlockId block) const {
+    // An empty block or a block whose last instruction is not a terminator is
+    // `checkBlockTermination`'s report to make — one defect, one diagnostic.
+    if (mir_.blockInstCount(block) == 0) return;
+    MirInstId const term = mir_.blockTerminator(block);
+    MirOpcode const op   = mir_.instOpcode(term);
+    if (!isTerminator(op)) return;
+
+    MirOpcodeInfo const& info = opcodeInfo(op);
+    auto const n = mir_.blockSuccessors(block).size();
+    bool const overMax = info.maxSuccessors != kMirUnboundedSuccessors
+                         && n > info.maxSuccessors;
+    if (n < info.minSuccessors || overMax) {
+        reportBlock(reporter, DiagnosticCode::I_VerifierFailure, block,
+            std::format("terminator {} carries {} CFG successor(s), outside [{}, {}]",
+                        info.mnemonic, n, info.minSuccessors,
+                        info.maxSuccessors == kMirUnboundedSuccessors
+                            ? std::string{"inf"}
+                            : std::format("{}", info.maxSuccessors)));
+        return;
+    }
+    // ⚠ THE RANGE IS NOT ENOUGH FOR `asm goto`, WHICH IS THE WHOLE REASON THE
+    // DESCRIPTOR CARRIES ITS LABELS. Its successors are [label…, fall-through] and
+    // the range is `[2, ∞)`, so a two-label goto that LOST its fall-through edge is
+    // still inside the range — and losing it deletes the code after the statement
+    // (the unreachable prune drops a block nothing reaches). The descriptor's
+    // per-label spellings are the carried fact that makes the loss visible.
+    // ⓘ Guarded on the pool range because reading a stale index ABORTS: the
+    // per-instruction sweep above has already REPORTED that case, so skipping it
+    // here costs no diagnostic and keeps this rule from crashing on a module the
+    // verifier is meant to describe.
+    if (op == MirOpcode::InlineAsmGoto
+        && mir_.instPayload(term) < mir_.asmDescriptorPool().size()) {
+        std::size_t const labels = mir_.asmDescriptor(term).labelSpellings.size();
+        if (labels + 1 != n) {
+            reportBlock(reporter, DiagnosticCode::I_VerifierFailure, block,
+                std::format("inlineasmgoto declares {} label(s) but carries {} CFG "
+                            "successor(s) — the successors are the labels plus the "
+                            "fall-through edge, so they must differ by exactly one",
+                            labels, n));
         }
     }
 }

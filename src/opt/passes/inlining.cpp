@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <format>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -614,6 +615,16 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
     for (MirInstId const o : cops) {
         newOps.push_back(mapCalleeOperand(src, o, local, callee));
     }
+    // Inline-asm P5: the descriptor must be RE-ADDED to the destination module's
+    // pool -- forwarding the payload would index the caller module's pool, where
+    // that slot holds a different asm block's template and clobber list (or does
+    // not exist). `MirBuilder::addInst` REFUSES the opcode, so deleting this arm
+    // aborts rather than dropping the clobbers silently.
+    if (cop == MirOpcode::InlineAsm) {
+        local.emplace(cid.v, dst.addInlineAsm(src.asmDescriptor(cid), newOps,
+                                              src.instType(cid), src.instFlags(cid)));
+        return;
+    }
     local.emplace(cid.v, dst.addInst(cop, newOps, src.instType(cid),
                                      src.instPayload(cid), src.instFlags(cid),
                                      // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: carry
@@ -623,6 +634,12 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
                                      // (else its slot silently under-aligns).
                                      src.instPayload2(cid)));
 }
+
+// ONE spelling of this pass's name for EVERY diagnostic it can emit — the
+// carve-out Info and every `MirFunctionRebuilder` fatal
+// (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS). Pipeline spelling
+// (`kPassNameTable`, opt/optimizer.hpp).
+constexpr std::string_view kPassName = "Inlining";
 
 // The single-block-leaf inlining rebuild policy (OPT7 cycle 1). Per-
 // function `analyze` decides which Call ids in THIS function are
@@ -637,6 +654,10 @@ public:
     InliningPolicy(Mir const& src, ModuleAnalysis const& analysis,
                    std::uint32_t inlineThreshold) noexcept
         : src_(src), analysis_(analysis), inlineThreshold_(inlineThreshold) {}
+
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return kPassName;
+    }
 
     [[nodiscard]] std::size_t callsInlined() const noexcept {
         return callsInlined_;
@@ -1038,6 +1059,14 @@ private:
         std::vector<MirInstId> newOps;
         newOps.reserve(ops.size());
         for (MirInstId const o : ops) newOps.push_back(mapCallerValue(o, id));
+        // Inline-asm P5 (third of the three verbatim-copy sites): re-add the
+        // descriptor to the destination pool. See emitCalleeInst's arm.
+        if (op == MirOpcode::InlineAsm) {
+            rewrite_.emplace(id.v, dst_.addInlineAsm(src_.asmDescriptor(id), newOps,
+                                                     src_.instType(id),
+                                                     src_.instFlags(id)));
+            return;
+        }
         rewrite_.emplace(id.v, dst_.addInst(op, newOps, src_.instType(id),
                                             src_.instPayload(id),
                                             src_.instFlags(id),
@@ -1065,13 +1094,21 @@ private:
             }
             return it->second;
         };
+        // ★★★ EVERY EMITTED CALLER TERMINATOR IS RECORDED, for the same reason
+        // `MirFunctionRebuilder::emitTerminator` records unconditionally
+        // (D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER): a `ReturnPiece`
+        // ANCHORS to its producer through its one operand, and an `asm goto` with
+        // outputs makes that producer a TERMINATOR. Whether an old id is
+        // referenced is spelled out in the MIR's operand lists — it is not
+        // something a clone site can decide — so this cloner does not decide it.
+        auto remember = [&](MirInstId newId) { rewrite_.emplace(id.v, newId); };
         switch (op) {
             case MirOpcode::Br:
-                dst_.addBr(mapSucc(oldSucc[0]));
+                remember(dst_.addBr(mapSucc(oldSucc[0])));
                 return;
             case MirOpcode::CondBr:
-                dst_.addCondBr(mapCallerValue(oldOps[0], id),
-                               mapSucc(oldSucc[0]), mapSucc(oldSucc[1]));
+                remember(dst_.addCondBr(mapCallerValue(oldOps[0], id),
+                                        mapSucc(oldSucc[0]), mapSucc(oldSucc[1])));
                 return;
             case MirOpcode::Switch: {
                 std::vector<std::pair<MirInstId, MirBlockId>> cases;
@@ -1081,8 +1118,8 @@ private:
                     cases.emplace_back(mapCallerValue(oldOps[1 + i], id),
                                        mapSucc(oldSucc[i]));
                 }
-                dst_.addSwitch(mapCallerValue(oldOps[0], id), cases,
-                               mapSucc(oldSucc[ncases]));
+                remember(dst_.addSwitch(mapCallerValue(oldOps[0], id), cases,
+                                        mapSucc(oldSucc[ncases])));
                 return;
             }
             case MirOpcode::Return: {
@@ -1092,11 +1129,30 @@ private:
                 std::vector<MirInstId> rvs;
                 rvs.reserve(oldOps.size());
                 for (MirInstId const o : oldOps) rvs.push_back(mapCallerValue(o, id));
-                dst_.addReturnMulti(rvs);
+                remember(dst_.addReturnMulti(rvs));
+                return;
+            }
+            case MirOpcode::InlineAsmGoto: {
+                // Inline-asm P5: successors (including any result-piece landing
+                // blocks, which are ordinary blocks here) map through mapSucc;
+                // the descriptor is re-added. `cloneInlineAsmGoto`, never
+                // `addInlineAsmGoto` -- the placement rule already ran.
+                // ⚠ EVERY successor, the trailing FALL-THROUGH edge included:
+                // dropping it leaves the code after the asm with no predecessor
+                // and the unreachable prune deletes it. `cloneInlineAsmGoto`
+                // re-checks the count against the descriptor's label list.
+                std::vector<MirInstId> newOps;
+                newOps.reserve(oldOps.size());
+                for (MirInstId const o : oldOps) newOps.push_back(mapCallerValue(o, id));
+                std::vector<MirBlockId> succs;
+                succs.reserve(oldSucc.size());
+                for (MirBlockId const sB : oldSucc) succs.push_back(mapSucc(sB));
+                remember(dst_.cloneInlineAsmGoto(src_.asmDescriptor(id), newOps,
+                                                 succs, src_.instFlags(id)));
                 return;
             }
             case MirOpcode::Unreachable:
-                dst_.addUnreachable();
+                remember(dst_.addUnreachable());
                 return;
             default:
                 std::fprintf(stderr,
@@ -1321,15 +1377,24 @@ private:
     // continuation (recording the (value, this-cloned-block) incoming for
     // the merge Phi); Br/CondBr/Switch re-emit with targets remapped
     // through calleeBlockMap; Unreachable re-emits verbatim.
+    // `local` is taken by MUTABLE reference (it was `const&`) so this emit can
+    // record the terminator it produced — see the `remember` note below.
     void emitCalleeTerminator(
         MirOpcode cop, MirInstId cid, MirFuncId callee,
         std::unordered_map<std::uint32_t, MirBlockId> const& calleeBlockMap,
-        std::unordered_map<std::uint32_t, MirInstId> const& local,
+        std::unordered_map<std::uint32_t, MirInstId>& local,
         MirBlockId contBlock, MirBlockId clonedPred,
         std::vector<MirPhiIncoming>& returnEdges) {
         auto const cops    = src_.instOperands(cid);
         auto const cBlk    = src_.instBlock(cid);
         auto const cSucc   = src_.blockSuccessors(cBlk);
+        // ★★★ EVERY EMITTED CALLEE TERMINATOR IS RECORDED IN `local`, the same
+        // rule the caller arm and `MirFunctionRebuilder::emitTerminator` follow
+        // (D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER). A `ReturnPiece`
+        // anchors to its PRODUCER, and for an `asm goto` with outputs the
+        // producer is a terminator — so "no instruction references a terminator"
+        // is a claim about the MIR that a clone site is in no position to make.
+        auto remember = [&](MirInstId newId) { local.emplace(cid.v, newId); };
         auto mapCalleeSucc = [&](MirBlockId fs) -> MirBlockId {
             auto const it = calleeBlockMap.find(fs.v);
             if (it == calleeBlockMap.end()) {
@@ -1361,7 +1426,7 @@ private:
                 if (!cops.empty()) {
                     rv = mapCalleeOperand(src_, cops[0], local, callee);
                 }
-                dst_.addBr(contBlock);
+                remember(dst_.addBr(contBlock));
                 // A void callee's Return contributes no merge value (rv
                 // invalid). For a value-returning callee, rv is the value
                 // flowing into the merge Phi along this cloned block.
@@ -1369,11 +1434,12 @@ private:
                 return;
             }
             case MirOpcode::Br:
-                dst_.addBr(mapCalleeSucc(cSucc[0]));
+                remember(dst_.addBr(mapCalleeSucc(cSucc[0])));
                 return;
             case MirOpcode::CondBr:
-                dst_.addCondBr(mapCalleeOperand(src_, cops[0], local, callee),
-                               mapCalleeSucc(cSucc[0]), mapCalleeSucc(cSucc[1]));
+                remember(dst_.addCondBr(
+                    mapCalleeOperand(src_, cops[0], local, callee),
+                    mapCalleeSucc(cSucc[0]), mapCalleeSucc(cSucc[1])));
                 return;
             case MirOpcode::Switch: {
                 std::vector<std::pair<MirInstId, MirBlockId>> cases;
@@ -1384,12 +1450,38 @@ private:
                         mapCalleeOperand(src_, cops[1 + i], local, callee),
                         mapCalleeSucc(cSucc[i]));
                 }
-                dst_.addSwitch(mapCalleeOperand(src_, cops[0], local, callee),
-                               cases, mapCalleeSucc(cSucc[ncases]));
+                remember(dst_.addSwitch(
+                    mapCalleeOperand(src_, cops[0], local, callee),
+                    cases, mapCalleeSucc(cSucc[ncases])));
+                return;
+            }
+            case MirOpcode::InlineAsmGoto: {
+                // Inline-asm P5, callee-body clone. Same rule as the host arm —
+                // INCLUDING the `remember`. ✔MEASURED 2026-08-17 at the CLI:
+                // without it, inlining a callee that contains an `asm goto` with
+                // outputs killed the process with `callee operand v=4 … has no
+                // local mapping during splice`, because the callee's own
+                // `ReturnPiece` (at its landing block's head) anchors to THIS
+                // terminator. Same defect, second cloner — the shared
+                // `MirFunctionRebuilder` fix does not reach here, since this
+                // splice path is Inlining's own
+                // (D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER).
+                // ⚠ EVERY successor, the trailing FALL-THROUGH edge included --
+                // see the caller-host arm above for what dropping it deletes.
+                std::vector<MirInstId> newOps;
+                newOps.reserve(cops.size());
+                for (MirInstId const o : cops) {
+                    newOps.push_back(mapCalleeOperand(src_, o, local, callee));
+                }
+                std::vector<MirBlockId> succs;
+                succs.reserve(cSucc.size());
+                for (MirBlockId const sB : cSucc) succs.push_back(mapCalleeSucc(sB));
+                remember(dst_.cloneInlineAsmGoto(src_.asmDescriptor(cid), newOps,
+                                                 succs, src_.instFlags(cid)));
                 return;
             }
             case MirOpcode::Unreachable:
-                dst_.addUnreachable();
+                remember(dst_.addUnreachable());
                 return;
             default:
                 std::fprintf(stderr,
@@ -1499,7 +1591,7 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
     InliningResult result{};
     MirBuilder builder;
 
-    if (cloneGlobalsOrCarveOut(mir, builder, reporter, "Inlining")
+    if (cloneGlobalsOrCarveOut(mir, builder, reporter, kPassName)
         == GlobalClonePrelude::CarvedOut) {
         result.ok = true;
         return result;
@@ -1561,6 +1653,14 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
     }
 
     result.callsInlined = callsInlined;
+    // A/B instrument (P10 D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE): the per-stage
+    // inlining count the split decision pre-registers on. Same env gate as
+    // the engine's per-pass trace so the two compose in one log.
+    if (std::getenv("DSS_OPT_TRACE") != nullptr) {
+        std::fprintf(stderr, "opt: pass=Inlining callsInlined=%u\n",
+                     static_cast<unsigned>(callsInlined));
+        std::fflush(stderr);
+    }
     mir = std::move(builder).finish();
     // Canonical-marker stamping (D-OPT4-1): the splice changed the
     // caller's CFG (split blocks, cloned callee bodies). Markers are

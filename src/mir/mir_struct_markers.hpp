@@ -7,16 +7,18 @@
 // THE SPEC — priority order, FIRST CLAIM WINS, deterministic (rules run
 // in order; within a rule, candidate blocks iterate in FUNCTION BLOCK
 // order). `deriveStructCfMarkers` returns a module-blockCount()-sized
-// vector; only the function's REACHABLE blocks get derived values —
-// everything else (unreachable blocks, other functions' blocks, the
-// slot-0 sentinel) stays `Linear`.
+// vector; the INTENT is that only the function's REACHABLE blocks get
+// derived values and everything else (unreachable blocks, other
+// functions' blocks, the slot-0 sentinel) stays `Linear` — but the
+// implementation is WIDER than that intent; see ⚠ below.
 //
 //   1. `funcBlockAt(f, 0)`                                → EntryBlock
 //   2. back-edge target (∃ REACHABLE pred P that the
 //      block dominates)                                   → LoopHeader
 //   3. target of a loop-EXITING edge (an edge from a
 //      natural-loop body block to a non-body block,
-//      per `mirNaturalLoops`)                             → LoopExit
+//      per `mirNaturalLoops` — see ⚠ for which loops
+//      that actually reports)                             → LoopExit
 //   4. for each reachable CondBr-terminated block H that
 //      is NOT a derived LoopHeader (a loop-condition
 //      CondBr is loop vocabulary, not if vocabulary):
@@ -39,6 +41,29 @@
 //      (the discriminant block itself falls to lower
 //      rules — SwitchHead is NOT derived; see below)
 //   6. otherwise                                          → Linear
+//
+// ⚠ THE DERIVATION REACHES PAST THE FUNCTION BEING DERIVED, and the
+// difference is OBSERVABLE. `mirDominatesBlock(s, u, dom)` answers
+// `Dominates` whenever `s.v == u.v`, BEFORE it consults the tree — so a
+// SELF-LOOPING block is its own back-edge source even in a function
+// whose dominator tree never saw it. Rule 3 therefore sees a
+// single-block pseudo-loop for EVERY self-looping block in the MODULE,
+// in EVERY function's derivation, and claims `LoopExit` on that block's
+// non-self successors. Two consequences:
+//   - an UNREACHABLE block CAN come back non-`Linear` (its function's
+//     applier stamps it, and mir_text round-trips it), which is exactly
+//     what the intent above says cannot happen;
+//   - deriving function F can write non-`Linear` markers into slots
+//     owned by function G. Nothing in-tree consumes those: `applyDerived`
+//     reads only F's own slots and the verifier reads only F's REACHABLE
+//     blocks — but the returned vector carries them.
+// This is BEHAVIOUR, not aspiration: it predates the O(function)
+// rework, it is pinned by `ForeignSelfLoopPseudoLoopClaimIsPreserved` in
+// tests/mir/test_mir_struct_markers.cpp, and the scoped back-edge sweep
+// reproduces it bit-for-bit ON PURPOSE. Narrowing it is a derivation-rule
+// change — a decision to take deliberately, with the verifier and every
+// producer moving together, never a silent tidy-up
+// (D-MIR-STRUCTCF-DERIVATION-REACHES-PAST-THE-FUNCTION).
 //
 // DELIBERATELY NOT DERIVED (dormant enum values — round-trip vocabulary
 // for `mir_text` only after this cycle):
@@ -90,6 +115,15 @@ deriveStructCfMarkers(Mir const& mir, MirFuncId f);
 // The verifier reuses its per-function dominance computation here so
 // one verify costs ONE preds/RPO/dom per function (the post-dominator
 // tree is the only addition, computed internally).
+//
+// COST: O(function) for the derivation itself, plus ONE O(module) scan
+// for the self-loop index the cross-function rule above needs, plus the
+// returned module-SIZED `out` vector this call fills (a fresh allocation
+// per call — measured 0.15% of a whole-module rederive and deliberately
+// NOT reused; see mir_struct_markers.cpp before changing that). A caller
+// that derives EVERY function should use the module-wide applier below,
+// which hoists that scan (and the post-dominator scratch) out of its
+// per-function loop instead of paying them per call.
 [[nodiscard]] DSS_EXPORT std::vector<StructCfMarker>
 deriveStructCfMarkers(Mir const& mir, MirFuncId f,
                       std::vector<std::vector<MirBlockId>> const& preds,
@@ -101,7 +135,19 @@ deriveStructCfMarkers(Mir const& mir, MirFuncId f,
 // for them). Producers call this after `MirBuilder::finish()`.
 DSS_EXPORT void rederiveStructCfMarkers(Mir& mir, MirFuncId f);
 
-// Module-wide applier — every function, one predecessor build.
+// Module-wide applier — every function, and every whole-module substrate
+// established exactly ONCE: the predecessor map, the dominator scratch,
+// the post-dominator scratch, and the self-loop index. Total cost is
+// O(module) + Σ O(function), NOT functions × O(module).
+//
+// That distinction is the whole point: this is the marker path every
+// producer runs (HIR→MIR lowering, SimplifyCfg, the inliner, the cross-CU
+// merge, prune-unreachable), and on a merged whole-program module it used
+// to be quadratic in module size. Measured on the SQLite CLI (103 TUs,
+// --config=release, 86,411 blocks / 4,030 functions in the merged module):
+// 5.3-6.6s per whole-module call and 29.0s across the 320 calls of one
+// compile, against 0.19-0.22s per call and 1.2s across the same 320 after.
+// Anything added here that is O(module) per FUNCTION puts that back.
 DSS_EXPORT void rederiveStructCfMarkers(Mir& mir);
 
 } // namespace dss

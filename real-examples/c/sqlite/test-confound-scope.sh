@@ -125,13 +125,21 @@ fails='writecrash-1.1.1 walsetlk-2.1.3 zipfile-25.0 sometest-9.9'
 # a pass over work it did not do.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN,
 # by design. One line to update, against an instrument that would otherwise lie.
-TOTAL_ASSERTIONS=138     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+TOTAL_ASSERTIONS=152     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
                          # + 28 loadext staging + 6 staged sqlite_cfg.h (this driver)
                          # + 4 launcher argv form (this driver, 2 of them behavioural)
-                         # + 40 driver-pairing (.ps1-gated): 12 original + 28 for
+                         # + 46 driver-pairing (.ps1-gated): 12 original + 28 for
                          #   the launcher-prerequisite gate, the MEASURED smoke
                          #   targets, the catalogue-resolved reference launcher
-                         #   and the rc table
+                         #   and the rc table, + 3 for the BUILD-ATTRIBUTION region
+                         #   [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION]
+                         # + 3 run-fidelity selector (region marker, the
+                         #   DSS_RUN_FIDELITY switch, and the --run-fidelities
+                         #   vocabulary it validates against) x2 drivers = 6
+                         #   [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+                         # + 3 build-attribution, this driver (region marker, the
+                         #   --attribute-build call, and the --oracle-status it
+                         #   must hand over so a stale log cannot buy an amnesty)
                          # + 8 THE SUPPLY (leg_confound_patterns) — the half that
                          #   was never tested, and where the defect actually was
 pass=0; fail=0; skip=0
@@ -778,6 +786,36 @@ check "...while the \`=\` form consumes BOTH tokens and reaches the required-arg
 # rather than decorative.
 check "the .sh marks the launcher-prerequisite region" "dss:launcher-prereq" "$SHTXT"
 check "the .sh marks the smoke-target-identity region" "dss:smoke-targets"   "$SHTXT"
+# [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] Same discipline, third
+# region: DSS_REGIONS names this file a verifier of `build-attribution`, and the
+# claim is only true if this file reads the sentinel BY NAME.
+check "the .sh marks the build-attribution region" "dss:build-attribution" "$SHTXT"
+check "the .sh ASKS whose build failure it is"     "--attribute-build"     "$SHCODE"
+# [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+check "the .sh marks the run-fidelity selector region" "dss:run-fidelity-select" "$SHTXT"
+check "the .sh honours DSS_RUN_FIDELITY"               "DSS_RUN_FIDELITY"        "$SHCODE"
+# ★ VALIDATED AGAINST THE RESOLVER'S OWN VOCABULARY, never a list re-typed in the
+# driver: a second copy is a second thing to keep in step, and the failure is
+# silent (a value the driver has never heard of selects zero legs).
+check "...validating the value against the RESOLVER's vocabulary" "--run-fidelities" "$SHCODE"
+# ★ AND IT HANDS OVER THE ORACLE'S STATUS, not just its log. A call that passed
+# only the log would let a log left behind by a PREVIOUS run buy an amnesty this
+# run never earned — the resolver refuses to default the flag for that reason,
+# and this asserts the driver actually supplies it.
+check "...and supplies the oracle STATUS, so a stale log cannot buy an amnesty" \
+      "--oracle-status" "$SHCODE"
+# ── THE VERDICT LINE MUST CARRY THE STATUS TOO ──────────────────────────
+# [D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE] The assertion
+# above only proves the ATTRIBUTION path is handed the status. The oracle
+# REPORT is a SECOND reader of the same fact and it is the one a human reads:
+# for two cycles it printed "NO ORACLE - no reference binary was produced or
+# preserved" over a control that had RUN AND FAILED with its log on disk.
+# ★ THE NEEDLE IS THE WHOLE ARGUMENT AS THE REPORT CALL SPELLS IT, never the
+# bare option name: the bare name is ALREADY satisfied by the attribution call
+# a few thousand lines up, so it would stay green over a report call that was
+# never wired -- a pin whose witness is not unique in its own subject.
+check "the .sh hands the oracle STATUS to the oracle REPORT, not only to the attributor" \
+      '--oracle-status "${LEG_ORACLE_STATUS[$leg]:-}" 2>&1)' "$SHCODE"
 
 # ── BOTH DRIVERS, OR THE CAPABILITY IS A SILENT HARNESS BUG ──────────────────
 # D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED existed because
@@ -786,14 +824,35 @@ check "the .sh marks the smoke-target-identity region" "dss:smoke-targets"   "$S
 # and not the other, and THIS is the assertion that keeps it that way.
 PS1="$(dirname "$SH")/build-and-test.ps1"
 if [ ! -f "$PS1" ]; then
-  echo "  SKIP build-and-test.ps1 not found beside the .sh — 42 pairing assertions not run"
-  skip=$((skip+42))
+  echo "  SKIP build-and-test.ps1 not found beside the .sh — 49 pairing assertions not run"
+  skip=$((skip+49))
 else
   PS1TXT="$(cat "$PS1")"
   # Same comment-stripped view as $SHCODE above, and for the same measured reason.
   PS1CODE="$(grep -v '^[[:space:]]*#' "$PS1")"
   check "the .ps1 marks the launcher-prerequisite region too" "dss:launcher-prereq" "$PS1TXT"
   check "the .ps1 marks the smoke-target-identity region too" "dss:smoke-targets"   "$PS1TXT"
+  # ★★ THE PAIRING THAT MATTERS MOST HERE: a driver that never asks "whose failure
+  # is this?" charges an upstream defect to dss on its side alone, so the two
+  # drivers render DIFFERENT verdicts on the same tree — and the missing side is
+  # invisible, because a leg that is poisoned for the wrong reason still looks
+  # poisoned. [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION]
+  check "the .ps1 marks the build-attribution region too" "dss:build-attribution" "$PS1TXT"
+  check "the .ps1 ASKS whose build failure it is too"     "--attribute-build"     "$PS1CODE"
+  check "...and supplies the oracle STATUS too"           "--oracle-status"       "$PS1CODE"
+  # The SAME second reader, on the .ps1 side. Its call spells the value as a
+  # subexpression rather than a brace-expansion, so the needle differs in FORM
+  # while asserting the identical property -- which is exactly why it has to be
+  # written out per driver instead of shared.
+  check "...and hands it to the .ps1's oracle REPORT too" \
+        "--oracle-status', \"\$(if (\$lr) { \$lr.OracleStatus })\")" "$PS1CODE"
+  # ★★ AN OPERATOR SWITCH HONOURED BY ONE DRIVER AND IGNORED BY THE OTHER is the
+  # worst shape available: the ignoring side runs legs the operator excluded and
+  # reports them as covered — a FALSE claim of coverage, not a missing one.
+  # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+  check "the .ps1 marks the run-fidelity selector region too" "dss:run-fidelity-select" "$PS1TXT"
+  check "the .ps1 honours DSS_RUN_FIDELITY too"              "DSS_RUN_FIDELITY"        "$PS1CODE"
+  check "...validating against the RESOLVER's vocabulary too" "--run-fidelities"       "$PS1CODE"
   check "the .ps1 stages a helper too"                "--build-loadext-helper" "$PS1TXT"
   check "...through the SAME shared resolver"         "Resolve-LoadextHelper"  "$PS1TXT"
   check "...and honours the same operator switch"     "--loadext-builder"      "$PS1TXT"

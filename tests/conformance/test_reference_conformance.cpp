@@ -1192,6 +1192,20 @@ constexpr std::size_t kMinDirectionBProbes = 15;
         // spelling. Named the day it was found so it cannot be trimmed before it
         // is fixed.
         "a_alignof_expression_operand_gnu",
+        // ★ D-CSUBSET-INLINE-ASM-SPELLING (closed 2026-08-17) — the BARE `asm`
+        // spelling, listed as THREE names because they guard three different
+        // things and any one of them alone can go green over the other two
+        // being broken. The statement and the label are separate GRAMMAR SLOTS
+        // reached through one token kind, so a keyword row landing in only one
+        // leaves the other red; and the third is the CONVERSE direction —
+        // making `asm` a keyword stops it being an identifier, which no probe
+        // in this corpus had ever oracled. Before the fix DSS accepted
+        // `int asm = 7;` at rc=0 while every gnu oracle rejects it in GNU mode,
+        // so the omission was a live divergence rather than a neutral absence.
+        // These are FEATURE guards from birth, not gap records: deleting any of
+        // them retires the only cross-compiler evidence for its half.
+        "a_inline_asm_bare_spelling", "a_asm_label_bare_spelling",
+        "a_asm_bare_is_reserved_in_gnu_mode",
         // ★ REGISTRATION GAP, FOUND AND FIXED 2026-08-12. The comment directly
         // above has claimed since 2026-08-11 that "deleting EITHER now would
         // retire the only cross-compiler evidence that the alias still

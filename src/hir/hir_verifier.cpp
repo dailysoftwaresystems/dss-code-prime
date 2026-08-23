@@ -75,6 +75,7 @@ bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     checkMemberAccess(reporter);
     checkConstructAggregate(reporter);
     checkShaderRestrictions(reporter);
+    checkInlineAsm(reporter);
     //
     // A capped reporter (the global maxDiagnostics ceiling hit — here or in a
     // prior phase sharing this reporter) silently drops further report() calls,
@@ -437,6 +438,83 @@ void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
 // the HIR→MIR block-scope teardown is sound: banning entry-past-a-decl makes every
 // LEGAL goto's restore-target StackSave dominate the goto in the CFG. Mirrors the
 // SEH ancestor-walk (checkSehContext). Interner-gated + zero-cost when VLA-free.
+// Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): see the declaration for why
+// each half exists.
+void HirVerifier::checkInlineAsm(DiagnosticReporter& reporter) const {
+    std::uint32_t const moduleTag = hir_.id().v;
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        if (hir_.kind(id) != HirKind::InlineAsm) continue;
+        if (hasError(hir_.flags(id))) continue;
+        std::uint32_t const handle = hir_.payload(id);
+        auto const          kids   = hir_.children(id);
+
+        // (a) the BARE BARRIER pairing - checked with or without a pool.
+        if (handle == kNoInlineAsmDescriptor) {
+            if (!kids.empty()) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("InlineAsm node carries {} child expression(s) "
+                                     "but no descriptor handle (payload 0 is the "
+                                     "bare-barrier form): the operands would reach "
+                                     "the CompilerBarrier lowering and be DROPPED "
+                                     "with no diagnostic",
+                                     kids.size()),
+                         sourceMap_);
+            }
+            continue;
+        }
+        // (b) the handle must resolve, and the two lists must agree.
+        if (inlineAsmPool_ == nullptr) continue;   // unasked, never assumed good
+        if (!inlineAsmPool_->contains(handle)) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("InlineAsm descriptor handle {} does not resolve "
+                                 "against the module's inline-asm pool (size {}) - "
+                                 "the statement's template, operands and clobbers "
+                                 "are unreachable",
+                                 handle, inlineAsmPool_->size()),
+                     sourceMap_);
+            continue;
+        }
+        auto const& d = inlineAsmPool_->at(handle);
+        if (d.operands.size() != kids.size()) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("InlineAsm descriptor declares {} operand(s) but "
+                                 "the node has {} child expression(s) - the two are "
+                                 "index-aligned by contract, so a mismatch means "
+                                 "some operand's constraint would be applied to the "
+                                 "wrong value",
+                                 d.operands.size(), kids.size()),
+                     sourceMap_);
+        }
+        if (d.outputCount > d.operands.size()) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("InlineAsm descriptor says {} of its operands are "
+                                 "outputs but declares only {} operand(s); "
+                                 "outputCount splits the outputs-then-inputs "
+                                 "concatenation and cannot exceed it",
+                                 d.outputCount, d.operands.size()),
+                     sourceMap_);
+        }
+        // The `asm goto` label ORDINAL and what the template CALLS that label
+        // are two halves of one fact, pushed together by the lowering and
+        // index-aligned by contract. Nothing downstream can notice them
+        // disagreeing: a dropped spelling leaves the edge intact and the
+        // template's reference to it unresolvable, which surfaces (if at all) as
+        // an unbound-label refusal blaming the assembly text for a fact this
+        // tier lost. Assert the sizes so the loss is reported where it happened.
+        if (d.labelSpellings.size() != d.labelOrdinals.size()) {
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("InlineAsm descriptor carries {} `asm goto` label "
+                                 "ordinal(s) but {} spelling group(s); the two are "
+                                 "index-aligned by contract, so a mismatch means a "
+                                 "label reference the template can write has no "
+                                 "edge behind it (or an edge nothing can name)",
+                                 d.labelOrdinals.size(), d.labelSpellings.size()),
+                     sourceMap_);
+        }
+    }
+}
+
 void HirVerifier::checkVlaJumpScoping(DiagnosticReporter& reporter) const {
     if (interner_ == nullptr) return;   // the VLA-ness of a type can't be read
     std::uint32_t const moduleTag = hir_.id().v;

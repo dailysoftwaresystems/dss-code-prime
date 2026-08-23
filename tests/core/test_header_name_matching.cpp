@@ -147,6 +147,14 @@ constexpr std::u8string_view kNihon = u8"\u65E5\u672C.json";    // ...from this 
 // actually matters — "can this repo be CLONED onto a case-insensitive host" —
 // and does not spend minutes walking `build-dbg/`. Recursion is pruned AT the
 // directory, so their contents are never even enumerated.
+//
+// ⚠ THIS LIST MATCHES A BARE NAME AT EVERY DEPTH, so only names nobody would
+// give to CONTENT may join it. `.git`, `node_modules`, `test-scratch` qualify;
+// an ordinary word like `dist` does not. This repo has already paid for that
+// distinction once — an UNANCHORED rsync exclude `build*` also matched
+// `src/program/build_scripts.cpp`, and a gate leg was configured against a tree
+// missing a changed `.cpp`. Generated trees whose name is ordinary are pruned by
+// ABSOLUTE PATH instead; see `prunedSubtrees` on `caseCollisionsUnder` below.
 [[nodiscard]] bool isGeneratedDirName(std::string const& name) {
     return name == ".git" || name == "test-scratch" || name == "node_modules"
         || name == ".claude" || name == "target"
@@ -173,9 +181,32 @@ struct CaseCollisionScan {
     std::error_code walkError;   // non-empty ⇒ TRUNCATED walk, never a pass
 };
 
-CaseCollisionScan caseCollisionsUnder(fs::path const& root) {
+// `prunedSubtrees` names ABSOLUTE subtrees to skip — the path-anchored half of
+// the prune, for generated trees whose bare NAME is too ordinary to hand to
+// `isGeneratedDirName`. Today that is
+// `src/dss-config/runtime/platform/dist/`: compiled object artifacts living
+// INSIDE the config tree (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF). Nothing
+// generated is ever CLONED, so enumerating it would make this guard answer a
+// different question than the one it states. Default empty, so a caller that
+// has no generated subtree writes nothing.
+CaseCollisionScan caseCollisionsUnder(fs::path const&              root,
+                                      std::vector<fs::path> const& prunedSubtrees = {}) {
     CaseCollisionScan scan;
     std::map<std::string, std::vector<std::string>> byFolded;
+
+    // ⚠ NORMALIZE BOTH SIDES, AND `.` IS EXACTLY WHY. The repo-wide guard walks
+    // `*root / "."` as one of its four roots, and `.` is a REAL element of
+    // `fs::path` iteration — not a spelling the library folds away — so every
+    // entry that walk yields reads `<root>/./src/...`. An as-written compare
+    // against `<root>/src/...` therefore NEVER matches, and the prune would be
+    // live for the `src/dss-config` root while silently absent for the
+    // whole-repo one, which is the only root that reaches the generated tree at
+    // all. `lexically_normal()` also settles `/` vs `\` on Windows, so the
+    // compare is about the SUBTREE and never about how it was spelled.
+    std::vector<fs::path> pruned;
+    pruned.reserve(prunedSubtrees.size());
+    for (auto const& p : prunedSubtrees) pruned.push_back(p.lexically_normal());
+
     std::error_code ec;
     fs::recursive_directory_iterator it{root, ec};
     if (ec) { scan.walkError = ec; return scan; }
@@ -183,8 +214,11 @@ CaseCollisionScan caseCollisionsUnder(fs::path const& root) {
         if (ec) { scan.walkError = ec; return scan; }   // truncated — NOT a pass
         std::error_code dirEc;
         if (it->is_directory(dirEc)) {
-            if (isGeneratedDirName(it->path().filename().string()))
-                it.disable_recursion_pending();
+            bool const prunedHere =
+                isGeneratedDirName(it->path().filename().string())
+                || std::find(pruned.begin(), pruned.end(),
+                             it->path().lexically_normal()) != pruned.end();
+            if (prunedHere) it.disable_recursion_pending();
             continue;
         }
         std::error_code relEc;
@@ -478,6 +512,15 @@ TEST(HeaderNameMatching, ShippedConfigTreeHasNoCaseCollidingPaths) {
     // the wrong half of the system.
     auto const root = dss::test::findRepoRoot();
     ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
+    // The ONE generated tree that `isGeneratedDirName` cannot claim, because
+    // `dist` is an ordinary word and a bare-name entry would prune EVERY
+    // directory so named anywhere in the repo (see the note there). Named by
+    // ABSOLUTE path, once, for every root below: it is simply unreachable from
+    // the two narrow roots, so listing it there costs one path compare that
+    // never fires and keeps a single source of truth for what is generated.
+    std::vector<fs::path> const generatedSubtrees{
+        *root / "src/dss-config/runtime/platform/dist"};
+
     // `src/dss-config/**` first (the descriptors this axis resolves), then the
     // WHOLE checked-out tree — the invariant is about CLONING the repo, not
     // just about headers, so the sweep must cover everything a clone
@@ -490,7 +533,7 @@ TEST(HeaderNameMatching, ShippedConfigTreeHasNoCaseCollidingPaths) {
         ASSERT_TRUE(fs::is_directory(dir))
             << sub << " must exist — a guard that silently skips its own "
                       "subject is the vacuous-pass class";
-        auto const scan = caseCollisionsUnder(dir);
+        auto const scan = caseCollisionsUnder(dir, generatedSubtrees);
         // Prove the instrument did work before believing its verdict.
         EXPECT_FALSE(scan.walkError)
             << sub << ": the walk was TRUNCATED (" << scan.walkError.message()
@@ -536,6 +579,76 @@ TEST(HeaderNameMatching, CaseCollisionGuardActuallyDetectsACollision) {
     EXPECT_EQ(scan.groups[0].size(), 2u);
     EXPECT_EQ(scan.groups[0][0], "nested/Windows.json");
     EXPECT_EQ(scan.groups[0][1], "nested/windows.json");
+}
+
+// CONTROL for the PATH-ANCHORED prune the repo-wide guard passes.
+//
+// ★ WHY THIS CANNOT BE LEFT TO THE REAL TREE. `src/dss-config/runtime/platform/
+// dist/` is GENERATED, so it is ABSENT from a fresh clone and absent on any host
+// that has not built the runtime — which means a prune that silently matched
+// nothing would look EXACTLY like a prune that worked, in every log this project
+// keeps. That is the vacuous-fix class, one step removed from the vacuous-pass
+// class `CaseCollisionScan` already carries a denominator for. So the mechanism
+// is exercised over a tree this test builds, in BOTH directions, on EXACT
+// counts — emptiness cannot tell "pruned" apart from "scanned nothing".
+//
+// It needs no case-colliding pair and therefore no host capability: the claim is
+// about WHAT WAS ENUMERATED, which every filesystem can answer.
+TEST(HeaderNameMatching, CaseCollisionScanPrunesOnlyTheSubtreesItIsGiven) {
+    ScratchDir scratch{Location::Temp, "header_case_prune"};
+    fs::path const dir = scratch.path();
+    writeFile(dir / "kept.json");
+    writeFile(dir / "kept-nested" / "also-kept.json");
+    writeFile(dir / "generated" / "one.o");
+    writeFile(dir / "generated" / "deeper" / "two.o");
+    // ★ A SECOND DIRECTORY OF THE SAME BARE NAME, at a different path — the
+    // whole reason this prune is anchored. A bare-name `dist`/`generated` entry
+    // in `isGeneratedDirName` would take this one out too, deleting coverage of
+    // a tree that IS cloned, and the guard would still report a clean pass.
+    writeFile(dir / "kept-nested" / "generated" / "three.o");
+
+    auto const all = caseCollisionsUnder(dir);
+    EXPECT_FALSE(all.walkError);
+    EXPECT_EQ(all.filesScanned, 5u)
+        << "UNPRUNED direction: the walk must see all five files, including the "
+           "two under `<dir>/generated/`. Without this the count below could be "
+           "explained by the files never existing";
+    EXPECT_TRUE(all.groups.empty());
+
+    auto const pruned = caseCollisionsUnder(dir, {dir / "generated"});
+    EXPECT_FALSE(pruned.walkError);
+    EXPECT_EQ(pruned.filesScanned, 3u)
+        << "PRUNED direction: exactly `<dir>/generated/one.o` and "
+           "`<dir>/generated/deeper/two.o` drop out. `kept.json`, "
+           "`kept-nested/also-kept.json` and `kept-nested/generated/three.o` "
+           "remain — the last one is the anchoring proof";
+    EXPECT_TRUE(pruned.groups.empty());
+}
+
+// ...and the prune must survive the root spelling the repo-wide guard actually
+// uses. `*root / "."` is one of that guard's four roots, and `.` is a REAL
+// element of `fs::path` iteration, so every entry it yields carries a `./` the
+// pruned path does not. An as-written compare fails HERE AND NOWHERE ELSE: the
+// three narrow roots would keep pruning correctly while the whole-repo root —
+// the only one that reaches the generated tree — silently walked it. The
+// unpruned scan is the control that attributes the count to the prune rather
+// than to the dot-spelled root breaking the walk.
+TEST(HeaderNameMatching, CaseCollisionScanPrunesThroughADotSpelledRoot) {
+    ScratchDir scratch{Location::Temp, "header_case_prune_dot"};
+    fs::path const dir = scratch.path();
+    writeFile(dir / "kept.json");
+    writeFile(dir / "generated" / "one.o");
+
+    auto const all = caseCollisionsUnder(dir / ".");
+    EXPECT_FALSE(all.walkError);
+    EXPECT_EQ(all.filesScanned, 2u)
+        << "a `.` component must not disturb the walk itself";
+
+    auto const pruned = caseCollisionsUnder(dir / ".", {dir / "generated"});
+    EXPECT_FALSE(pruned.walkError);
+    EXPECT_EQ(pruned.filesScanned, 1u)
+        << "with an as-written compare this reads 2, and the repo-wide guard "
+           "walks the generated tree it was told to skip";
 }
 
 // `.` and `..` are NAVIGATION components, not filenames — no directory listing

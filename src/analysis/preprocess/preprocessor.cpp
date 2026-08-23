@@ -1,5 +1,7 @@
 #include "analysis/preprocess/preprocessor.hpp"
 
+#include "core/substrate/path_identity.hpp"
+
 #include "analysis/preprocess/pp_if_eval.hpp"
 #include "core/types/header_case_diagnostic.hpp"   // reportHeaderCaseAmbiguity (the ONE fold-collision emit)
 #include "core/types/include_path_resolve.hpp"
@@ -702,7 +704,7 @@ struct SynthBuilder {
     HeaderNameMatching                   headerNameMatching;
     DiagnosticReporter&                  rep;
     int                                  depth;
-    std::vector<fs::path>&               includeStack;
+    std::vector<core::PathIdentity>&     includeStack;
     // Set TRUE when the include-nesting backstop fires (truncating the
     // splice). Shared by reference across the recursive child builders so
     // a deep-nest truncation at any level reaches `preprocess()`.
@@ -1025,15 +1027,27 @@ struct SynthBuilder {
         // exercised for correctness on the other formats.
         bool parentMacrosMalformed = false;
         bool sawParent = false;
-        std::unordered_set<std::string> visited;   // per-call (a splice is one root)
+        // D-DIAG-P0016-MALFORMED-DESCRIPTOR-DETAIL-IS-BUILT-THEN-NEVER-RENDERED: the
+        // loader already builds the message that says WHICH key is wrong and WHY, into
+        // the throwaway reporter below. Keeping it there told the reader only that a
+        // FILE is bad, leaving them to bisect the descriptor by hand — which is the
+        // exact cost a fail-loud diagnostic exists to remove. This carries the detail
+        // out so the P0016 text can name the offending key.
+        std::string parentMacrosDetail;
+        std::unordered_set<core::PathIdentity> visited;  // per-call (a splice is one root)
         ffi::forEachDescriptorInClosure(
-            *descPath, systemDirs, headerNameMatching, visited,
+            *descPath, systemDirs, headerNameMatching, activeFormat, visited,
             [&](fs::path const& p) {
                 bool const isParent = !sawParent;
                 sawParent = true;
-                // Per-descriptor availability (the parent already passed; a sibling
-                // absent on this format contributes no macros — mirrors today's
-                // single-descriptor behavior applied to each closure member).
+                // Per-descriptor availability. AFTER the edge gate this can only
+                // ever fire for the PARENT — the walker no longer visits a sibling
+                // that is unavailable on this format (it fires `onUnavailableChild`
+                // instead) and no longer descends out of an unavailable root. The
+                // test is kept rather than deleted because the PARENT case is real:
+                // a `#include <sys/time.h>` on pe reaches here before the semantic
+                // tier refuses it, and splicing its macros in the meantime would
+                // define names for a header this target does not have.
                 if (activeFormat.has_value()
                     && !ffi::shippedHeaderAvailableForFormat(p, *activeFormat)) {
                     return;
@@ -1042,13 +1056,34 @@ struct SynthBuilder {
                 // Pass the active object-format so a per-FORMAT macro variant selects
                 // the right replacement; nullopt ⇒ a variants-only macro is not injected.
                 auto macros = ffi::readShippedLibMacros(p, macroRep, activeFormat);
-                if (!macros) { if (isParent) parentMacrosMalformed = true; return; }
+                if (!macros) {
+                    if (isParent) {
+                        parentMacrosMalformed = true;
+                        // FIRST diagnostic only: the loader reports the offending key
+                        // once and any follow-ons are cascade. Empty stays empty, so a
+                        // failure that genuinely carried no detail reads exactly as it
+                        // did before rather than gaining an empty separator.
+                        for (auto const& d : macroRep.all()) {
+                            if (!d.actual.empty()) { parentMacrosDetail = d.actual; break; }
+                        }
+                    }
+                    return;
+                }
                 for (auto const& macro : *macros) spliceMacro(macro);
             },
             [&](std::string const&, HeaderSearchResult const&) {
                 /* import resolver owns F_ShippedHeaderNotFound AND
                    F_HeaderNameCaseAmbiguous — both positioned on the
-                   `#include` line, both re-derived from the same closure. */ });
+                   `#include` line, both re-derived from the same closure. */ },
+            [&](std::string const&, fs::path const&) {
+                /* An ACTIVE edge whose child is unavailable on this format: the
+                   import resolver owns the loud F_ShippedHeaderUnavailableForTarget,
+                   positioned on the `#include` line and re-derived from the SAME
+                   closure walk with the SAME active format. Silent HERE for the
+                   reason every other verdict in this callback is silent — this tier
+                   has no `#include` span and would double-report. NOT a dropped
+                   fact: the resolver reports it, and invariant (i) refuses the
+                   config that produces it. */ });
 
         if (parentMacrosMalformed) {
             // Malformed PARENT descriptor: report ONLY on a confidently-live include
@@ -1059,7 +1094,10 @@ struct SynthBuilder {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
                        SourceSpan::empty(0),
                        std::string{"shipped-header descriptor malformed (macros): "}
-                           + descPath->generic_string());
+                           + descPath->generic_string()
+                           + (parentMacrosDetail.empty()
+                                  ? std::string{}
+                                  : std::string{" — "} + parentMacrosDetail));
             }
             return SystemMacroSplice::Malformed;
         }
@@ -1963,9 +2001,7 @@ struct SynthBuilder {
                     // the output. Mirrors the quote arm below.
                     const ByteOffset dirEnd =
                         literalEndPastCloser(*schema, toks, aBody);
-                    std::error_code ec;
-                    fs::path canon = fs::weakly_canonical(angleRes.path, ec);
-                    if (ec) canon = angleRes.path;
+                    auto const canon = core::PathIdentity::of(angleRes.path);
                     // TF-C87: the buffer is loaded BEFORE the stack test now,
                     // because the re-entry decision reads the header's own text.
                     // Order-independent in practice: a header already ON the stack
@@ -2150,9 +2186,7 @@ struct SynthBuilder {
                 copiedUpTo = dirEnd;
                 continue;
             }
-            std::error_code ec;
-            fs::path canon = fs::weakly_canonical(*resolved, ec);
-            if (ec) canon = *resolved;
+            auto const canon = core::PathIdentity::of(*resolved);
             // TF-C87: loaded BEFORE the stack test (the re-entry decision reads
             // the header's own text) — see the angle arm's note.
             auto headerBuf = SourceBuffer::fromFile(*resolved);
@@ -2355,6 +2389,20 @@ inline HideSet hideIntersect(HideSet const& a, HideSet const& b) {
 struct MacroDef {
     std::vector<Token>       replacement;
     std::string              text;
+    // D-PP-REDEFINITION-IGNORES-WHITESPACE-PRESENCE: C 6.10.3p2 makes two
+    // replacement lists identical only when their white-space separation agrees
+    // in PRESENCE -- the AMOUNT is immaterial ("4 + 38" vs "4  +  38" is the
+    // SAME list; "40+2" vs "40 + 2" is NOT). `text` joins tokens with a single
+    // space UNCONDITIONALLY, which keeps token boundaries unambiguous but erases
+    // exactly that distinction, so this parallel bitmap carries it: one '0'/'1'
+    // per token, '1' iff white space (or a comment, which C counts as white
+    // space) separated it from the PREVIOUS token in the source. Kept as a
+    // SEPARATE field rather than encoded into `text` with a sentinel byte
+    // because no byte is safe -- a string-literal token's text is its source
+    // SPELLING, and a source file may legally contain any byte inside one.
+    // ✔MEASURED: without this, `#define M 40+2` then `#define M 40 + 2` passed
+    // SILENTLY here while both reference compilers diagnose it.
+    std::string              spacing;
     // FC13 cycle 2 (D-PP-FUNCTION-LIKE-MACRO): function-like macros. An
     // object-like macro keeps isFunctionLike=false + an empty params; a
     // function-like one records its parameter NAMES in declared order (used to
@@ -4054,14 +4102,27 @@ private:
         }
 
         std::string repText;
+        std::string repSpacing;
+        // The source END offset of the previous replacement token, so the gap to
+        // the next one answers "was there white space between them" WITHOUT
+        // re-scanning trivia (`skipTrivia` has already stepped over it, and a
+        // COMMENT is white space for this purpose exactly as C 6.10.3p2 says).
+        ByteOffset prevEnd = 0;
         for (std::size_t q = skipTrivia(in, p); q < end;
              q = skipTrivia(in, q + 1)) {
             if (isNewline(in[q])) break;
-            def.replacement.push_back(in[q]);
             if (!repText.empty()) repText.push_back(space);
+            // First token: no PREVIOUS token to be separated from, so '0' by
+            // construction -- the leading white space between `#define NAME` and
+            // the replacement list is not part of the list (C 6.10.3p2).
+            repSpacing.push_back(
+                (!def.replacement.empty() && in[q].span.start() != prevEnd) ? '1' : '0');
+            def.replacement.push_back(in[q]);
             repText.append(text(in[q]));
+            prevEnd = in[q].span.end();
         }
-        def.text = std::move(repText);
+        def.text    = std::move(repText);
+        def.spacing = std::move(repSpacing);
 
         // The variadic catch-all identifier (`__VA_ARGS__`) is valid ONLY inside
         // a VARIADIC macro's replacement (C 6.10.3p5 / 6.10.3.1p2 constraint:
@@ -4090,12 +4151,48 @@ private:
         // possibly-absent invocation. `validateVaOpt` emits its own diagnostic.
         if (!validateVaOpt(def, name)) return;
 
+        // D-PP-INCOMPATIBLE-REDEFINITION-IS-FATAL: an incompatible redefinition is
+        // a C 6.10.3p2 CONSTRAINT VIOLATION, so a diagnostic is REQUIRED -- but it
+        // is a WARNING and translation CONTINUES with the NEW definition, because
+        // that is what the compilers this language declares itself to be actually
+        // do. ✔MEASURED across every divergence shape `sameDefinition` can report,
+        // one TU each, `-std=c2x -pedantic` (and cross-checked with `cl /Zs`):
+        //
+        //   shape                | reference        | definition in effect after
+        //   parameter spelling   | warning, rc=0    | the SECOND (new) one
+        //   replacement text     | warning, rc=0    | the SECOND (new) one
+        //   arity                | warning, rc=0    | the SECOND (new) one
+        //   object vs fn-like    | warning, rc=0    | the SECOND (new) one
+        //   variadic vs not      | warning, rc=0    | the SECOND (new) one
+        //
+        // Uniform: every shape warns, none is fatal, and the new definition always
+        // wins. Only `-Werror` makes any of them stop a build, which is the user's
+        // choice about warnings, not a property of the construct. ★ The shapes were
+        // measured INDIVIDUALLY on purpose -- generalizing from the one that bit us
+        // (parameter spelling) would have been a guess wearing a measurement's
+        // clothes, and the sweep is also what caught the OPPOSITE defect recorded
+        // on `MacroDef::spacing`, where DSS was silently accepting a divergence the
+        // references diagnose.
+        //
+        // ⚠ WHY THIS IS A CONFORMANCE FIX AND NOT A RELAXATION: the standing rule is
+        // that the reference compilers are the spec, BIDIRECTIONALLY -- DSS may not
+        // reject what they accept, and may not silently accept what they diagnose.
+        // Being stricter than every reference is not rigor; it is a divergence that
+        // makes real code unbuildable. ✔The live consumer: sqlite's `shell.c.in`
+        // defines `S_ISLNK(mode) (0)` BEFORE it includes <sys/stat.h>, so the
+        // shipped descriptor's own macro lands on top of it -- fatal here, fine on
+        // gcc/clang/MSVC. Matching a descriptor's parameter SPELLING to whichever
+        // consumer is in front of us today is a lottery, not a fix.
         auto it = table_.find(name);
         if (it != table_.end() && !sameDefinition(it->second, def)) {
             emitPP(rep_, DiagnosticCode::P_PreprocessorMacroRedefinition,
                    synth_->id(), in[nameIdx].span,
-                   std::string{"incompatible redefinition of macro: "} + name);
-            return;
+                   std::string{"incompatible redefinition of macro: "} + name,
+                   DiagnosticSeverity::Warning);
+            // NO `return` -- falling through is the load-bearing half. The old code
+            // both errored AND kept the OLD definition; the references keep the NEW
+            // one, so an early return here would leave DSS wrong about the VALUE
+            // even once the severity matched.
         }
         table_[name] = std::move(def);
     }
@@ -4197,7 +4294,11 @@ private:
         return a.isFunctionLike == b.isFunctionLike
             && a.isVariadic == b.isVariadic
             && a.params == b.params
-            && a.text == b.text;
+            && a.text == b.text
+            // C 6.10.3p2's white-space clause -- see `MacroDef::spacing`. Without
+            // this term the space-joined `text` reports `40+2` and `40 + 2` as one
+            // definition, and DSS accepts SILENTLY what both references diagnose.
+            && a.spacing == b.spacing;
     }
 
     // Parse a function-like macro's parameter list, starting at `open` (the
@@ -5988,7 +6089,8 @@ MergedPredefinedMacros mergePredefinedMacros(
     std::span<PredefinedMacroDef const> languageMacros,
     std::span<PredefinedMacroDef const> targetMacros,
     std::span<PredefinedMacroDef const> formatMacros,
-    std::optional<ObjectFormatKind>     activeFormat) {
+    std::optional<ObjectFormatKind>     activeFormat,
+    std::span<PredefinedMacroExclusionGroup const> exclusiveGroups) {
     MergedPredefinedMacros out;
 
     // The per-format availability predicate, in its ONE surviving location.
@@ -6012,13 +6114,14 @@ MergedPredefinedMacros mergePredefinedMacros(
         std::string_view                    label;
         std::string_view                    path;
     };
+    // The PATHS come from the SHARED `kPredefinedMacroFamilyPaths` table (see
+    // preprocessor.hpp): the `requires` satisfaction check names the same files
+    // in its own diagnostics, and a second copy of these strings is a copy that
+    // can disagree about which config file the author must open.
     std::array<Family, 3> const families{
-        Family{languageMacros, "language",
-               "<lang>.lang.json /preprocess/predefinedMacros"},
-        Family{targetMacros, "target",
-               "<arch>.target.json /predefinedMacros"},
-        Family{formatMacros, "format",
-               "<name>.format.json /predefinedMacros"}};
+        Family{languageMacros, "language", kPredefinedMacroFamilyPaths[0]},
+        Family{targetMacros,   "target",   kPredefinedMacroFamilyPaths[1]},
+        Family{formatMacros,   "format",   kPredefinedMacroFamilyPaths[2]}};
 
     // (a) COLLISION SCAN — pre-filter, so gating cannot hide a conflict, over
     // every unordered pair of families (i < j).
@@ -6053,6 +6156,48 @@ MergedPredefinedMacros mergePredefinedMacros(
             if (availableHere(pm)) out.effective.push_back(pm);
         }
     }
+    // (e) D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC — THE MUTUAL-EXCLUSION PIN.
+    //
+    // Runs on the FILTERED list on purpose (see the header's property (e)): the
+    // defect is a pair that is individually legitimate and only contradictory
+    // once a format makes both effective, so before the filter there is no
+    // offending format to name.
+    //
+    // AGNOSTIC: not one macro name, language, architecture or object format is
+    // written here. The groups are whatever the language config declared, and
+    // the format is printed through the shared `objectFormatKindName`.
+    for (PredefinedMacroExclusionGroup const& grp : exclusiveGroups) {
+        std::vector<std::string> present;
+        for (std::string const& want : grp.macros) {
+            auto const hit = std::ranges::find(out.effective, want,
+                                               &PredefinedMacroDef::name);
+            if (hit != out.effective.end()) present.push_back(want);
+        }
+        if (present.size() < 2) continue;
+        std::string names;
+        for (std::string const& n : present) {
+            if (!names.empty()) names += "' and '";
+            names += n;
+        }
+        out.conflicts.push_back(std::format(
+            "predefined macros '{}' are ALL effective for object format {} — "
+            "they are declared mutually exclusive and at most one may be "
+            "defined for any one target. {}. Gate or remove all but one "
+            "(`availableObjectFormats` on the offending entry), or drop the "
+            "group from `preprocess.mutuallyExclusivePredefinedMacros` if the "
+            "rule itself is wrong",
+            names,
+            activeFormat.has_value() ? objectFormatKindName(*activeFormat)
+                                     : std::string_view{"<none>"},
+            grp.reason));
+    }
+    // A group violation makes `effective` unusable for exactly the reason the
+    // name-collision arm above does — a TU would be preprocessed under an
+    // identity no reference compiler can present — so the SAME contract holds:
+    // non-empty `conflicts` means the caller must abort, and there is no
+    // "merge anyway" mode.
+    if (!out.conflicts.empty()) out.effective.clear();
+
     // (d) empty `targetMacros` + empty `formatMacros` leaves exactly the
     // format-filtered language-only list the pre-TF-C74 engine built at each
     // seed site.
@@ -6098,7 +6243,24 @@ UserDefineSplit splitUserDefine(std::string_view entry) noexcept {
 TranslationTimestamp translationTimestamp() {
     TranslationTimestamp out;
     const std::time_t now = std::time(nullptr);
-    const std::tm*    lt  = std::localtime(&now);
+    // ★★ THREAD-SAFE BY CONSTRUCTION — `std::localtime` IS NOT, AND THIS IS NOW
+    // CALLED CONCURRENTLY. `std::localtime` returns a pointer into a SHARED
+    // process-wide `std::tm`, so two translation units expanding `__DATE__` /
+    // `__TIME__` at the same instant read a buffer the other is overwriting —
+    // a silent wrong-spelling race, not a crash. Since D-PERF-4 the driver
+    // builds the front half of every TU on a thread pool, so that is a real
+    // interleaving rather than a theoretical one, and c-subset declares BOTH
+    // macros (`c-subset.lang.json`), so the path is live for every C compile.
+    // The reentrant spelling fills a CALLER-OWNED `tm`; the `_WIN32` / POSIX
+    // split is pure host portability (which name the host libc gives the
+    // reentrant function), never a target or format identity.
+    std::tm       tmBuf{};
+    const std::tm* lt = nullptr;
+#ifdef _WIN32
+    if (::localtime_s(&tmBuf, &now) == 0) lt = &tmBuf;
+#else
+    lt = ::localtime_r(&now, &tmBuf);
+#endif
     // Defensive: a null `localtime` leaves BOTH strings empty -> a synth `""`
     // literal and a dump that says the value is empty, never a fabricated date.
     if (lt == nullptr) return out;
@@ -6184,11 +6346,16 @@ PreprocessResult preprocessRun(
     // structural rather than a convention four sites have to keep.
     MergedPredefinedMacros const merged = mergePredefinedMacros(
         schema->preprocess().predefinedMacros, targetPredefinedMacros,
-        formatPredefinedMacros, activeFormat);
+        formatPredefinedMacros, activeFormat,
+        schema->preprocess().mutuallyExclusivePredefinedMacros);
     if (!merged.conflicts.empty()) {
-        // A name owned by more than one config. None may silently win, so the
-        // pass does not run at all: `fatal` stops the caller from treating the
-        // token stream as a successful preprocess.
+        // EITHER a name owned by more than one config, OR (D-LANG-PE64-DEFINES-
+        // BOTH-MSC-VER-AND-GNUC) a mutually exclusive group with more than one
+        // member effective on this format. Both are the same failure in the
+        // end — the TU would be preprocessed under an identity that is not a
+        // real one — so neither may silently win and the pass does not run at
+        // all: `fatal` stops the caller from treating the token stream as a
+        // successful preprocess.
         //
         // This return produces NO tokens and NO synth buffer. That is fine
         // HERE and only here: the single exit in `preprocess()` turns it into
@@ -6266,12 +6433,9 @@ PreprocessResult preprocessRun(
         }
     }
 
-    std::vector<fs::path> includeStack;
-    {
-        std::error_code ec;
-        fs::path canon = fs::weakly_canonical(fs::path{mainSource->name()}, ec);
-        includeStack.push_back(ec ? fs::path{mainSource->name()} : canon);
-    }
+    std::vector<core::PathIdentity> includeStack;
+    includeStack.push_back(
+        core::PathIdentity::of(fs::path{mainSource->name()}));
     // C21 (D-PP-PRESCAN-PREDEFINED-VALUE-INCLUDE-GATE, Option 2): the `#define NAME
     // VALUE\n` VALUE prefix for the include-gating pre-scan. So a `#if
     // <cmdline/predefined>` VALUE guard (`#if SQLITE_TEST >= 1`,
@@ -6517,17 +6681,23 @@ PreprocessResult preprocessRun(
     //     the `#include`); silent here to avoid a double-report.
     // EMIT-ONLY -- populates a new output field, changes no preprocess behavior.
     {
-        std::unordered_set<std::string> visited;
+        std::unordered_set<core::PathIdentity> visited;
         for (auto const& [parent, off] : resolvedParents) {
             if (byteInDeadRegion(off)) continue;   // authoritatively-dead -> not seeded
             ffi::forEachDescriptorInClosure(
-                parent, systemDirs, headerNameMatching, visited,
+                parent, systemDirs, headerNameMatching, activeFormat, visited,
                 [&](fs::path const& p) {
                     result.resolvedShippedDescriptors.push_back(p);
                 },
                 [](std::string const&, HeaderSearchResult const&) {
                     /* import resolver owns the loud miss AND the loud
-                       fold-collision — both on the `#include` line */ });
+                       fold-collision — both on the `#include` line */ },
+                [](std::string const&, fs::path const&) {
+                    /* import resolver owns the loud unavailable-child too. This
+                       set feeds the typedef-name SEED, and the seed must never be
+                       a SUPERSET of what `finish()` will resolve — passing the
+                       same `activeFormat` the resolver uses is what keeps the two
+                       sets identical rather than merely similar. */ });
         }
     }
 

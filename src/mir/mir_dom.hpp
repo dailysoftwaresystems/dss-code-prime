@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <span>
 #include <unordered_set>
 #include <vector>
 
@@ -193,6 +194,67 @@ mirDominatesBlock(MirBlockId a, MirBlockId b, MirDomTree const& dom);
 [[nodiscard]] DSS_EXPORT MirPostDomTree
 computeMirPostDomTree(Mir const& mir, MirFuncId f);
 
+// Reusable post-dominator scratch (D-OPT-POSTDOM-SCRATCH-REUSE) — the
+// reverse-graph sibling of `MirDomScratch`, and the same bargain. The
+// fresh-allocation `computeMirPostDomTree` above allocates EIGHT whole-module-
+// sized buffers per call for ONE function's reverse CHK walk — including two
+// `vector<vector<uint32_t>>` adjacency maps, which alone are ~48 bytes PER
+// MODULE BLOCK per call. A whole-module marker re-derivation calls it once per
+// function, so that allocation storm is ~59% of `rederiveStructCfMarkers`'s
+// cost on a merged SQLite module (measured: 3.04s of a 5.16s call, 86,411
+// blocks / 4,030 functions).
+//
+// The scratch owns those buffers ONCE and resets, at the ENTRY of each call,
+// ONLY the slots the PREVIOUS call wrote (two self-recorded touched lists —
+// the adjacency write set and the reverse-RPO order — which are the
+// proven-complete write sets), restoring exactly the fresh-allocation
+// defaults. Same inputs → byte-identical trees (the differential pins in
+// test_mir_struct_markers.cpp — `MirPostDomScratchReuse.*`, beside the
+// derivation rules that consume this tree — compare ipdom v AND arenaTag plus
+// gaveUp over the FULL module-sized arrays after every call in adversarial
+// sequences).
+//
+// Contract: identical to `MirDomScratch` — one scratch per (pass call ×
+// module), bound on first use to {module id, blockCount} with a fail-loud
+// stale guard, and the returned reference is valid ONLY until the next call
+// with the same scratch. Bind results as `auto const&`.
+//
+// Arrays are sized `blockCount + 1` (the extra slot IS the virtual exit), and
+// are module-sized ON PURPOSE for the same reason `MirDomScratch`'s are: the
+// CHK intersect step-cap derives from the idom array SIZE, so compressing to
+// function-local sizing would change when pathological chains give up. Do not
+// compress.
+struct MirPostDomScratch {
+    std::uint32_t moduleIdV  = 0;
+    std::uint32_t blockCount = 0;   // 0 = not yet bound to a module
+    // Reverse-graph adjacency (revPreds[b] = forward successors of b, plus the
+    // virtual exit for exit blocks; revSuccs is its transpose).
+    std::vector<std::vector<std::uint32_t>> revPreds;
+    std::vector<std::vector<std::uint32_t>> revSuccs;
+    // Reverse-RPO traversal state.
+    std::vector<std::uint8_t>  visited;
+    std::vector<std::uint32_t> order;
+    // CHK core buffers (kUnsetSlot / 0 outside touched slots).
+    std::vector<std::uint32_t> coreIdom;
+    std::vector<std::uint8_t>  coreGaveUp;
+    std::vector<std::uint32_t> rpoIndex;
+    // Result buffer (MirBlockId{} / 0 outside touched slots).
+    MirPostDomTree tree;
+    // The previous call's write sets, reset at the next call's entry:
+    // `touchedRev` = every slot whose revPreds/revSuccs list was appended to;
+    // `touchedNodes` = the reverse-RPO order (== the visited set == the CHK
+    // core's and the result conversion's write set).
+    std::vector<std::uint32_t> touchedRev;
+    std::vector<std::uint32_t> touchedNodes;
+};
+
+// Scratch-backed post-dominator computation — byte-identical results to the
+// fresh-allocation overload above (same core, same values, same virtualExit),
+// O(function) per call instead of O(module). The returned reference lives in
+// `scratch` and is invalidated by the next call with that scratch.
+[[nodiscard]] DSS_EXPORT MirPostDomTree const&
+computeMirPostDomTree(Mir const& mir, MirFuncId f, MirPostDomScratch& scratch);
+
 // Does `a` post-dominate `b`? Tri-state sibling of `mirDominatesBlock`.
 // `a` may be the virtual-exit id (`MirBlockId{postdom.virtualExitSlot(),
 // tag}`) — it post-dominates every reverse-reachable block.
@@ -235,11 +297,40 @@ mirDomTreeChildren(Mir const& mir, MirDomTree const& dom);
 mirDomTreeChildren(Mir const& mir, MirDomTree const& dom,
                    MirDomScratch& scratch);
 
-// Natural-loop forest computation. See `MirNaturalLoop` for shape.
+// Natural-loop forest computation. See `MirNaturalLoop` for shape. The
+// back-edge scan sweeps EVERY block of the module — `dom` is a ONE-FUNCTION
+// tree, so this is O(module) work per function for a per-function answer.
 [[nodiscard]] DSS_EXPORT std::vector<MirNaturalLoop>
 mirNaturalLoops(Mir const& mir,
                 MirDomTree const& dom,
                 std::vector<std::vector<MirBlockId>> const& preds);
+
+// Candidate-scoped natural-loop forest (D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN)
+// — the SAME computation as the whole-module overload above with the back-edge
+// SOURCE sweep restricted to `candidateSources`. Loop BODIES are unaffected:
+// they are a backward closure over `preds` from the back-edge sources, so a
+// scoped scan still discovers every body block.
+//
+// `candidateSources` MUST be ascending, unique, and every element in
+// [1, blockCount) — a violation is a caller bug and fails loud. Ascending is
+// not cosmetic: it is what makes `MirNaturalLoop::backEdgeSources` come out in
+// the same order the whole-module sweep produces.
+//
+// COMPLETENESS (what a caller must supply to get the whole-module answer for a
+// tree computed over ONE function's `order`): a block `u` outside `order` has
+// an INVALID idom, so `mirDominatesBlock(s, u, dom)` can only answer
+// `Dominates` when `s.v == u.v`. Therefore the only back-edge sources outside
+// `order` are SELF-LOOPING blocks, and
+//     candidateSources ⊇ order ∪ {self-looping blocks of the module}
+// yields byte-identical output to the whole-module sweep. Callers that hold a
+// function's block range typically pass that range ∪ order ∪ the module's
+// self-loop index (which is a module property, so it is computed ONCE per
+// module rather than once per function).
+[[nodiscard]] DSS_EXPORT std::vector<MirNaturalLoop>
+mirNaturalLoops(Mir const& mir,
+                MirDomTree const& dom,
+                std::vector<std::vector<MirBlockId>> const& preds,
+                std::span<std::uint32_t const> candidateSources);
 
 // Iterated dominance frontier (IDF) of a set of "def blocks". For
 // Cytron-Ferrante SSA construction (Mem2Reg): a Phi for variable V

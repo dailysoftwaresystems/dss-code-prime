@@ -17,11 +17,30 @@
  * whose guard it sits behind. Do not add speculative pragmas: a fixture that
  * enumerates what someone imagined is a census of imagination.
  *
- * ★ KEEP THE MSVC ARM BEHIND `#if defined(_MSC_VER)`. The point is that the pe
- * leg REACHES it and the others ELIDE it (C 6.10p1). The non-vacuity twin test
+ * ★ KEEP THE MSVC ARM BEHIND A pe-ONLY PREDEFINE. The point is that the pe leg
+ * REACHES it and the others ELIDE it (C 6.10p1). The non-vacuity twin test
  * asserts both halves, so flattening the guard here would silently convert this
  * from a profile census into a single-profile one — the very defect it exists
  * to prevent.
+ *
+ * ★★ THE GUARD MOVED FROM `_MSC_VER` TO `_WIN32`, AND THE ASSERTION DID NOT
+ * WEAKEN (D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC). DSS used to predefine
+ * `_MSC_VER` for `pe` alongside the un-gated `__GNUC__`/`__clang__` — an
+ * identity ✔MEASURED to exist in no reference compiler (clang suppresses
+ * `__GNUC__` in MS-compatibility mode; mingw never defines `_MSC_VER`), and the
+ * reason pe64 alone died on sqlite's `src/hwtime.h`. `_MSC_VER` is gone, so a
+ * guard spelled on it is now dead on EVERY leg and this census would have
+ * quietly become the single-profile one it exists to prevent.
+ * What this arm needs is A PREDEFINE THAT IS LIVE ON pe AND DEAD ELSEWHERE, and
+ * `_WIN32` is exactly that — and is the HONEST one, because it names the OS
+ * rather than a toolchain DSS is not. Same two legs, same two assertions, same
+ * stamping witness; only the spelling of the pe-ness changed. The pragmas below
+ * are still the MSVC vocabulary and are still reached only on the Windows leg,
+ * which is the property the census actually measures. (In sqlite these lines sit
+ * behind `_MSC_VER` and are therefore no longer reached by the real corpus at
+ * all — that is a CONSEQUENCE of the identity fix, not a gap here: this fixture
+ * exists to prove the REGISTRY answers under every predefine class, and a row
+ * whose pragma the corpus stops reaching must still answer if it is ever met.)
  */
 
 /* ── Universal: reached on every leg. ─────────────────────────────────────── */
@@ -53,7 +72,7 @@ CENSUS_NN_POP
 
 /* ── MSVC-gated: LIVE on the `pe` leg, an elided dead branch everywhere else.
  *    These are the three prefixes TF-C82's macOS-only census could not see. ─ */
-#if defined(_MSC_VER)
+#if defined(_WIN32)
 
 /* sqlite `src/msvc.h:19-33` — MEASURED 15 lines x 112 TUs = 1680 hits. */
 #pragma warning(disable : 4054)
@@ -83,6 +102,6 @@ CENSUS_NN_POP
 int msvc_no_optimize_marker(void);
 #pragma optimize("", on)
 
-#endif /* _MSC_VER */
+#endif /* _WIN32 */
 
 int census_anchor = 1;

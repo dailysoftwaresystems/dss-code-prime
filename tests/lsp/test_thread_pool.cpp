@@ -2,6 +2,7 @@
 // and exception isolation (a throwing job must not kill the worker).
 
 #include "core/substrate/thread_pool.hpp"
+#include "test_wait_budget.hpp"
 
 #include <gtest/gtest.h>
 
@@ -45,7 +46,8 @@ TEST(ThreadPool, WorkerSurvivesThrowingJob) {
         hits.fetch_add(1, std::memory_order_relaxed);
         p.set_value();
     });
-    ASSERT_EQ(fut.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    ASSERT_EQ(fut.wait_for(dss::test_support::kWaitBudget),
+              std::future_status::ready);
     EXPECT_EQ(hits.load(), 1);
     pool.shutdown();
 }

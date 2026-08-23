@@ -285,7 +285,51 @@ TEST(Program_CompileFiles, PhaseTimersRecordEveryPipelinePhase) {
     }
 
     // (c) plausible nonzero attributed total.
-    EXPECT_GT(PhaseTimers::attributedNanoseconds(), 0u);
+    EXPECT_GT(PhaseTimers::attributedCpuNanoseconds(), 0u);
+
+    // (d) THE TWO-CLOCK INVARIANTS, on a real single-TU compile. This is a
+    // 1-CU build, so every phase ran on one thread at a time: `peak` must be
+    // 1 and the two time columns must AGREE for every phase that ran. That
+    // equality is what makes the parallel build's divergence between them
+    // meaningful rather than noise.
+    //
+    // RED-on-disable: make `wallNanoseconds` an ENVELOPE (first-start to
+    // last-end) instead of a UNION of self-intervals and (d3) fails — an
+    // envelope charges `preprocess` for the whole span between its first and
+    // last burst, which on any multi-phase compile exceeds its own cpu.
+    std::uint64_t sumWall = 0;
+    for (std::size_t i = 0; i < kCompilePhaseCount; ++i) {
+        auto const p   = static_cast<CompilePhase>(i);
+        auto const row = PhaseTimers::read(p);
+        sumWall += row.wallNanoseconds;
+        // (d1) a phase's timeline occupancy can never exceed its own thread-time.
+        EXPECT_LE(row.wallNanoseconds, row.cpuNanoseconds)
+            << "phase '" << compilePhaseName(p) << "' reports more wall than cpu";
+        // (d2) a phase that never ran contributes nothing to either column.
+        if (row.runs == 0) {
+            EXPECT_EQ(row.cpuNanoseconds, 0u);
+            EXPECT_EQ(row.wallNanoseconds, 0u);
+            EXPECT_EQ(row.peakConcurrency, 0u);
+        } else {
+            EXPECT_EQ(row.peakConcurrency, 1u)
+                << "phase '" << compilePhaseName(p)
+                << "': a single-TU compile has no concurrency to report";
+        }
+    }
+    // (d3) with peak==1 everywhere, cpu and wall must be the SAME total.
+    EXPECT_EQ(sumWall, PhaseTimers::attributedCpuNanoseconds())
+        << "on a serial compile the two columns must agree exactly";
+
+    // (e) THE REMAINDER CANNOT UNDERFLOW. The all-phase union is a subset of
+    // the process's lifetime, so it is bounded by the sum of the per-phase
+    // unions and is nonzero after a real compile. This is the property that
+    // lets the driver subtract it from the process wall without clamping.
+    auto const busy = PhaseTimers::busyWallNanoseconds();
+    EXPECT_GT(busy, 0u);
+    EXPECT_LE(busy, sumWall)
+        << "a union over every phase cannot exceed the sum of the per-phase unions";
+    // (f) no scope may outlive the compile — otherwise `busy` is incomplete.
+    EXPECT_EQ(PhaseTimers::liveScopeCount(), 0u);
 }
 
 TEST(Program_CompileFiles, MultiTargetWiresDistinctArtifactDirs) {
@@ -1275,6 +1319,271 @@ TEST(Program_CompileFiles, BufferlessDriverDiagnosticStaysCodeOnly) {
            "got:\n" << err;
 }
 
+// ── D-ASM-TEMPLATE-DIAGNOSTICS-RENDER-WITHOUT-SOURCE-CONTEXT ────────
+//
+// ★★★ A DIAGNOSTIC ABOUT AN EMBEDDED ASSEMBLY TEMPLATE MUST RENDER THE
+// OFFENDING TEMPLATE LINE — not a buffer id nothing resolves.
+//
+// ⚠ ✔MEASURED 2026-08-17 through the CLI, before the fix, on BOTH shipped
+// x86_64 formats and at both surfaces:
+//     error[P0001]: expected 'LineEnd' — got '@'
+//       --> <unknown-buffer:6>:offset 13
+// The template's `SourceBuffer` is minted at the LIR tier inside
+// `parseAsmTemplateText`, out of a C string literal. The driver builds its
+// `BufferRegistry` from `cu.trees()` + `cu.auxiliaryBuffers()`, which reaches
+// every buffer that exists BEFORE the compile and none minted during it — so
+// the id resolved to nothing and the source line was unreachable. On the
+// parse-FAILURE path it was worse: the `Tree` was destroyed and the buffer
+// died with it, leaving the caller holding diagnostics whose source was
+// already gone, which is precisely what forwarding them was for.
+//
+// ★★ THE PIN ASSERTS THE ECHOED SOURCE LINE, NEVER MERELY THE CODE, AND THAT
+// DISTINCTION IS THE WHOLE POINT. A test asserting `A_AsmTextUnsupported` was
+// emitted passes happily over `<unknown-buffer>` and proves nothing about the
+// thing that was broken. Each arm therefore matches the renderer's own gutter
+// (`{:>2} | <line>`), which the diagnostic PROSE cannot satisfy: arm 1's prose
+// carries only `'@'`, never `movl $42, %0 @@@`; arm 2's carries `'frobnicate'`
+// followed by a quote, never `frobnicate %0`.
+//
+// ★★ AND IT CARRIES **BOTH** FORMS, BECAUSE THE DEFECT HAD TWO AND THE ANCHOR
+// NAMED ONE. The forwarded lex/parse diagnostics are only half the population:
+// `AsmDiagnosticSink::fail` stamps `tree_.source().id()` — the SAME fragment
+// buffer — so every `A_AsmTextUnsupported` refusal the LOWERING raises on a
+// template that parsed cleanly was equally unrenderable, and that is the
+// commoner half (every "this dialect/target cannot encode that"). A green over
+// the parse-failure arm alone would leave the success-path arm latent.
+TEST(Program_CompileFiles, MalformedAsmTemplateRendersTheOffendingTemplateLine) {
+    // ⚠ ONE `ScratchDir` FOR BOTH ARMS. A second one constructed after
+    // `useAsCwd()` captures the FIRST scratch dir as its `originalCwd_` and
+    // roots itself INSIDE it (`Location::InsideRepo` is cwd-relative) — it
+    // happens to work, and it makes the schema loader's upward walk depend on
+    // a nesting nobody wrote down.
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // ARM 1 — the FAILURE path: the template does not PARSE, so there is no
+    // `Tree` and the buffer only survives because it is registered at its mint.
+    // `@` is not in the dialect's vocabulary; column 14 is its first byte.
+    auto const src = writeCSubsetSource(
+        scratch.path(), "bad_template.c",
+        "int main(void) {\n"
+        "    int r = 0;\n"
+        "    __asm__(\"movl $42, %0 @@@\" : \"=r\"(r));\n"
+        "    return r;\n"
+        "}\n");
+    auto const src2 = writeCSubsetSource(
+        scratch.path(), "unlowerable_template.c",
+        "int main(void) {\n"
+        "    int r = 0;\n"
+        "    __asm__(\"frobnicate %0\" : \"=r\"(r));\n"
+        "    return r;\n"
+        "}\n");
+    scratch.useAsCwd();
+    Program prog;
+    testing::internal::CaptureStderr();
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc, 0) << "a template that does not parse must fail the build";
+    EXPECT_EQ(err.find("<unknown-buffer"), std::string::npos)
+        << "the template's buffer did not reach the renderer; got:\n" << err;
+    EXPECT_NE(err.find(" 1 | movl $42, %0 @@@"), std::string::npos)
+        << "expected the OFFENDING TEMPLATE LINE echoed in the renderer's "
+           "gutter — asserting the code alone would pass over "
+           "'<unknown-buffer>'; got:\n" << err;
+    EXPECT_NE(err.find("--> <inline asm>:1:14"), std::string::npos)
+        << "expected the positioned header at the first '@' (line 1, col 14); "
+           "got:\n" << err;
+    EXPECT_NE(err.find('^'), std::string::npos)
+        << "expected a '^' caret underline; got:\n" << err;
+
+    // ARM 2 — the SUCCESS path: the template PARSES and the LOWERING refuses
+    // it. Same buffer, different diagnostic family (`A_AsmTextUnsupported`
+    // from `AsmDiagnosticSink::fail`), and it was equally unrenderable.
+    Program prog2;
+    testing::internal::CaptureStderr();
+    int const rc2 = prog2.compileFiles(
+        {src2.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err2 = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc2, 0) << "an unlowerable template must fail the build";
+    EXPECT_EQ(err2.find("<unknown-buffer"), std::string::npos)
+        << "a LOWERING refusal names the same fragment buffer and must render "
+           "it too; got:\n" << err2;
+    EXPECT_NE(err2.find(" 1 | frobnicate %0"), std::string::npos)
+        << "expected the offending template line echoed; the prose says "
+           "\"'frobnicate'\" and can never satisfy this; got:\n" << err2;
+    EXPECT_NE(err2.find("--> <inline asm>:1:1"), std::string::npos)
+        << "expected the positioned header at the mnemonic; got:\n" << err2;
+    EXPECT_NE(err2.find("^^^^^^^^^^"), std::string::npos)
+        << "expected the caret to underline all ten bytes of the mnemonic; "
+           "got:\n" << err2;
+}
+
+// ★★★ D-ASM-TEMPLATE-DIAGNOSTIC-DOES-NOT-NAME-THE-C-STATEMENT close. The
+// parent test above pinned that the OFFENDING TEMPLATE LINE renders; this one
+// pins the OTHER half the row was opened for: the diagnostic also names the C
+// STATEMENT that embedded the template — and names it as the PRIMARY locus.
+//
+// ✔MEASURED, both references, before the form was chosen (the row demanded it):
+//   gcc 13.3   `gt.c:3: Error: no such instruction: 'frobnicate %eax'`
+//   clang 18   `gt.c:3:13: error: invalid instruction mnemonic 'frobnicate'` with
+//              `<inline asm>:1:2: note: instantiated into assembly here`
+// BOTH make the C statement primary and NEITHER has template-primary, so the
+// reference-conforming shape is: C statement primary, template locus DEMOTED to
+// a related note (never dropped — the parent test's assertions stay green, the
+// `<inline asm>` header now renders under the note). The text-only wrapper
+// refusals this tier raises itself (`L_UnsupportedLoweringForOpcode`, no locus
+// at all before) gain the C primary.
+//
+// ★★ THE ASSERTIONS ARE EXACT, MEASURED STRINGS, not substrings-of-convenience:
+// the primary header `--> <file>.c:3:5` (col 5 = the statement start the HIR
+// span carries), the C line in the renderer's gutter, the note text that glues
+// the two loci into ONE diagnostic, and the template header/line in their
+// gutter. Asserting "the file name appears" alone would pass over a diagnostic
+// that named the file in prose and rendered no location — the exact vacuity
+// species the parent row shipped with.
+//
+// ⚠ RED-ON-DISABLE, demonstrated at authoring time: deleting the
+// `AsmStatementLocusGuard` instantiation in `expandInlineAsm` (or emptying
+// `reanchorFrom`) leaves every assertion on `bad_template.c:3:5` unsatisfied
+// while the parent test above stays green — the two tests pin orthogonal
+// halves of one render, which is why neither subsumes the other.
+TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // ARM 1 — template does not PARSE: the forwarded dialect diagnostic must
+    // carry the C statement as primary and the template as a related note.
+    auto const src = writeCSubsetSource(
+        scratch.path(), "bad_template.c",
+        "int main(void) {\n"
+        "    int r = 0;\n"
+        "    __asm__(\"movl $42, %0 @@@\" : \"=r\"(r));\n"
+        "    return r;\n"
+        "}\n");
+    // ARM 2 — template PARSES, the LOWERING refuses it (`frobnicate` is not in
+    // the instruction table): the engine's own refusal must render the same
+    // two-locus shape.
+    auto const src2 = writeCSubsetSource(
+        scratch.path(), "unlowerable_template.c",
+        "int main(void) {\n"
+        "    int r = 0;\n"
+        "    __asm__(\"frobnicate %0\" : \"=r\"(r));\n"
+        "    return r;\n"
+        "}\n");
+    scratch.useAsCwd();
+    Program prog;
+    testing::internal::CaptureStderr();
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc, 0) << "a template that does not parse must fail the build";
+    EXPECT_NE(err.find("bad_template.c:3:5"), std::string::npos)
+        << "expected the C statement as the PRIMARY locus (both reference "
+           "compilers lead with it); got:\n" << err;
+    EXPECT_NE(err.find(" 3 |     __asm__(\"movl $42, %0 @@@\" : \"=r\"(r));"),
+              std::string::npos)
+        << "expected the C statement line echoed in the renderer's gutter; "
+           "got:\n" << err;
+    EXPECT_NE(err.find("note: the assembly template this statement embedded"),
+              std::string::npos)
+        << "expected the related-note text that binds the two loci into one "
+           "diagnostic; got:\n" << err;
+    EXPECT_NE(err.find("--> <inline asm>:1:14"), std::string::npos)
+        << "expected the template locus, DEMOTED to a related note, still "
+           "rendering its header; got:\n" << err;
+    EXPECT_NE(err.find(" 1 | movl $42, %0 @@@"), std::string::npos)
+        << "expected the template line still echoed under the note; got:\n"
+        << err;
+
+    Program prog2;
+    testing::internal::CaptureStderr();
+    int const rc2 = prog2.compileFiles(
+        {src2.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err2 = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc2, 0) << "an unlowerable template must fail the build";
+    EXPECT_NE(err2.find("unlowerable_template.c:3:5"), std::string::npos)
+        << "expected the C statement as primary on the LOWERING refusal too; "
+           "got:\n" << err2;
+    EXPECT_NE(err2.find(" 3 |     __asm__(\"frobnicate %0\" : \"=r\"(r));"),
+              std::string::npos)
+        << "expected the C statement line echoed; got:\n" << err2;
+    EXPECT_NE(err2.find("--> <inline asm>:1:1"), std::string::npos)
+        << "expected the template locus as a related note at the mnemonic; "
+           "got:\n" << err2;
+    EXPECT_NE(err2.find(" 1 | frobnicate %0"), std::string::npos)
+        << "expected the template line echoed under the note — the caret run "
+           "alone is a substring of the C-primary statement's ~43-caret "
+           "underline and pins nothing by itself; got:\n" << err2;
+
+    // ARM 3 — the same two-locus render on the `asm goto` path, which is a
+    // SEPARATE code path from ARM 2's and needs its own witness.
+    //
+    // ★★ THIS ARM USED TO PIN A REFUSAL THAT NO LONGER EXISTS, AND WHAT IT
+    // PROTECTED IS WHAT IT STILL PINS. It compiled `__asm__ goto ("jmp
+    // %l[done]" …)` and asserted `rc != 0`, because `lowerInlineAsmGoto` was a
+    // bare refusal; P20 replaced that refusal with a lowering, so asserting the
+    // failure would now pin the ABSENCE of the feature. The property the arm was
+    // written for is untouched: a refusal raised while expanding an `asm goto`
+    // must make the C STATEMENT the primary locus. So the program keeps its
+    // shape and gains ONE unlowerable mnemonic — the same lever ARM 2 uses —
+    // and the positive half (the very program this arm used to reject) is
+    // asserted directly below as ARM 4.
+    auto const src3 = writeCSubsetSource(
+        scratch.path(), "goto_template.c",
+        "int main(void) {\n"
+        "    int x = 1;\n"
+        "    __asm__ goto (\"frobnicate %l[done]\" : : \"r\"(x) : : done);\n"
+        "    x = 2;\n"
+        "done:\n"
+        "    return x;\n"
+        "}\n");
+    Program prog3;
+    testing::internal::CaptureStderr();
+    int const rc3 = prog3.compileFiles(
+        {src3.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err3 = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(rc3, 0) << "an `asm goto` whose template names no instruction the "
+                         "target declares must fail the build";
+    EXPECT_NE(err3.find("goto_template.c:3:5"), std::string::npos)
+        << "expected the C statement as primary on the asm-goto refusal too; "
+           "got:\n" << err3;
+    EXPECT_NE(err3.find(
+                  " 3 |     __asm__ goto (\"frobnicate %l[done]\" : : \"r\"(x) : : done);"),
+              std::string::npos)
+        << "expected the C statement line echoed; got:\n" << err3;
+    EXPECT_NE(err3.find("--> <inline asm>:1:1"), std::string::npos)
+        << "expected the template locus as a related note at the mnemonic, "
+           "DEMOTED but not dropped, on the goto path too; got:\n" << err3;
+
+    // ARM 4 — ★ THE POSITIVE HALF: the `asm goto` this test used to require to
+    // FAIL must now BUILD. An unconditional-branch template is the shape that
+    // seals the block inside the template itself, which is the one of the three
+    // builder states `sealAsmGotoEdges` answers by emitting NOTHING — get it
+    // wrong in either direction and `LirBuilder` aborts the process rather than
+    // reporting, so a green `rc == 0` here is load-bearing beyond "it compiled".
+    // (The RUNTIME witness is `examples/c-subset/asm_goto_labels`; this arm is
+    // the one that pins the CLI path and the abort-free build.)
+    auto const src4 = writeCSubsetSource(
+        scratch.path(), "goto_lowers.c",
+        "int main(void) {\n"
+        "    int x = 1;\n"
+        "    __asm__ goto (\"jmp %l[done]\" : : \"r\"(x) : : done);\n"
+        "    x = 2;\n"
+        "done:\n"
+        "    return x;\n"
+        "}\n");
+    Program prog4;
+    testing::internal::CaptureStderr();
+    int const rc4 = prog4.compileFiles(
+        {src4.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux-exec"});
+    auto const err4 = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(rc4, 0)
+        << "an `asm goto` whose template branches to its own label must LOWER; "
+           "got:\n" << err4;
+}
+
 // D-CAP-MARKER-MULTI-TARGET-E2E-PIN close (e4508b9 → next 2026-06-01):
 // the prior anchor was reserved because `D_TargetMachineCodeMismatch`
 // joined `kUnsuppressableCodes` and bypasses all cap/dedup gates —
@@ -1773,7 +2082,8 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
         opts.pipelineOverride = &inlining;
         auto const before = rep.errorCount();
         ASSERT_TRUE(optimizeModule(merged->mir, **targetR,
-                                   merged->host.interner(), opts, rep))
+                                   merged->host.interner(), opts,
+                                   PipelineStage::Program, rep))
             << "optimizing the merged module with [Inlining] must succeed";
         EXPECT_EQ(rep.errorCount(), before)
             << "the merged-module optimize must not emit any error";
@@ -1793,11 +2103,151 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
         CompileOptions opts{DiagnosticBudget::libraryDefault()};
         opts.pipelineOverride = &identity;
         ASSERT_TRUE(optimizeModule(merged->mir, **targetR,
-                                   merged->host.interner(), opts, rep));
+                                   merged->host.interner(), opts,
+                                   PipelineStage::Program, rep));
         EXPECT_EQ(countOpInModule(merged->mir, MirOpcode::Call), 1u)
             << "with an [Identity] pipeline (no Inlining) the cross-CU Call MUST survive "
                "— the inlining in arm 1 is what removes it (RED-on-disable witness)";
     }
+}
+
+// P10 (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE): the SHIPPED stage routing, end to
+// end through the real channel — NO override. Both directions of the shape
+// pin the anchor demands, each at the SITE that owns it:
+//   • UNIT stage: `buildCuMir` runs release-unit (its Inlining CANNOT inline
+//     main→add5 — the callee is extern per-CU, unresolvable), so the Call
+//     survives the build.
+//   • PROGRAM stage: the full release document over the merged module kills
+//     it (the merge made the call intra-module direct).
+TEST(Program_WholeProgramMerge, ShippedStageRoutingInlinesCrossCuAtProgramStage) {
+    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(grammarR.has_value());
+    auto grammar = *grammarR;
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto formatR = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(formatR.has_value());
+
+    DiagnosticReporter rep;
+    auto const abi = dss::ffi::resolveAbi(**targetR, **formatR, rep);
+    ASSERT_TRUE(abi.has_value());
+    ASSERT_NE(abi->cc, nullptr);
+    auto const ccSpan = (*targetR)->callingConventions();
+    auto const ccIndex = static_cast<std::uint16_t>(
+        std::distance(ccSpan.data(), abi->cc));
+
+    // RELEASE options — the config whose document declares the two-stage
+    // topology (`unitPipeline: release-unit`). No pipelineOverride: the
+    // resolution must flow config → resolvePipelineName → stage routing.
+    CompileOptions relOpts{DiagnosticBudget::libraryDefault()};
+    relOpts.config = CompileConfig::Release;
+
+    auto buildCu = [&](std::string src, std::string label) {
+        UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
+        builder.addInMemory(std::move(src), std::move(label));
+        return std::move(builder).finish();
+    };
+    CompilationUnit cuMain = buildCu(
+        "extern int add5(int x);\nint main() { return add5(37); }\n", "main.c");
+    CompilationUnit cuHelper =
+        buildCu("int add5(int x) { return x + 5; }\n", "helper.c");
+
+    // ── UNIT direction: the extern Call SURVIVES the per-CU build. ──
+    auto mirMain = buildCuMir(cuMain, *grammar, **targetR, **formatR, ccIndex,
+                              rep, relOpts);
+    ASSERT_TRUE(mirMain.has_value()) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(countOpInModule(mirMain->mir, MirOpcode::Call), 1u)
+        << "the unit stage's Inlining cannot resolve an EXTERN callee — "
+           "main→add5 must survive buildCuMir under the shipped release-unit "
+           "schedule (the stage boundary is real: cross-CU inlining is the "
+           "PROGRAM stage's job)";
+
+    auto mirHelper = buildCuMir(cuHelper, *grammar, **targetR, **formatR,
+                                ccIndex, rep, relOpts);
+    ASSERT_TRUE(mirHelper.has_value());
+
+    std::vector<CuMirModule> cuMirs;
+    cuMirs.push_back(std::move(*mirMain));
+    cuMirs.push_back(std::move(*mirHelper));
+    std::vector<MergeCuInput> inputs;
+    for (auto& cm : cuMirs) {
+        MergeCuInput in;
+        in.mir      = &cm.mir;
+        in.interner = &cm.model.lattice().interner();
+        in.nameOf   = [cmP = &cm](SymbolId s) -> std::string {
+            if (SymbolRecord const* r = cmP->model.recordFor(s)) return r->name;
+            for (auto const& e : cmP->externImports) {
+                if (e.symbol.v == s.v) return e.mangledName;
+            }
+            return std::string{};
+        };
+        in.externImports = cm.externImports;
+        inputs.push_back(std::move(in));
+    }
+    TypeLattice host{cuMirs[0].cuId,
+                     std::string{cuMirs[0].model.lattice().registry().sourceLanguage()}};
+    std::vector<std::string> entryNames;
+    for (auto const& decl : grammar->semantics().declarations) {
+        for (auto const& n : decl.implicitReturnZeroForFunctionNames) {
+            entryNames.push_back(n);
+        }
+    }
+    auto merged = mergeCuMirs(
+        std::span<MergeCuInput const>{inputs.data(), inputs.size()},
+        std::move(host),
+        std::span<std::string const>{entryNames.data(), entryNames.size()}, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+    // ── PROGRAM direction: the full document over the merged module. ──
+    auto const before = rep.errorCount();
+    ASSERT_TRUE(optimizeModule(merged->mir, **targetR, merged->host.interner(),
+                               relOpts, PipelineStage::Program, rep))
+        << "the program stage over the merged module must succeed through the "
+           "shipped release document";
+    EXPECT_EQ(rep.errorCount(), before);
+    EXPECT_EQ(countOpInModule(merged->mir, MirOpcode::Call), 0u)
+        << "the PROGRAM stage's Inlining resolves the now-intra-module call — "
+           "the cross-CU Call must be gone";
+}
+
+// P10: the UNIT STAGE runs the DOCUMENT the `unitPipeline` key names — a
+// strict red arm for the dispatch itself. `release-unit` contains NO Cse, so
+// a load pair CSE would fold (`*p + *p` → two Loads → one) SURVIVES the unit
+// stage; the config's own FULL document contains Cse and would fold it. If
+// the stage router is deleted (both stages run the config doc), this reads 1
+// and reds. This is the pin the routing audit demanded: every other witness
+// of the two-stage topology stays green over a deleted router.
+TEST(Program_WholeProgramMerge, UnitStageRunsTheUnitDocumentNotTheConfigDoc) {
+    auto grammarR = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(grammarR.has_value());
+    auto grammar = *grammarR;
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto formatR = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(formatR.has_value());
+
+    DiagnosticReporter rep;
+    auto const abi = dss::ffi::resolveAbi(**targetR, **formatR, rep);
+    ASSERT_TRUE(abi.has_value());
+    ASSERT_NE(abi->cc, nullptr);
+    auto const ccSpan = (*targetR)->callingConventions();
+    auto const ccIndex = static_cast<std::uint16_t>(
+        std::distance(ccSpan.data(), abi->cc));
+
+    CompileOptions relOpts{DiagnosticBudget::libraryDefault()};
+    relOpts.config = CompileConfig::Release;
+
+    UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
+    builder.addInMemory(
+        "int twice(int* p) { return *p + *p; }\n", "twice.c");
+    CompilationUnit cu = std::move(builder).finish();
+    auto mir = buildCuMir(cu, *grammar, **targetR, **formatR, ccIndex, rep,
+                          relOpts);
+    ASSERT_TRUE(mir.has_value()) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(countOpInModule(mir->mir, MirOpcode::Load), 2u)
+        << "the unit stage runs release-unit, which has NO Cse — the load "
+           "pair must survive buildCuMir. One load means the FULL config "
+           "document ran at the unit site: the stage router is gone";
 }
 
 // ── Model 3 per-OBJECT-FORMAT shipped-library resolution (2026-06-09) ─────────
@@ -2635,6 +3085,236 @@ TEST(Program_CuParallelism, MultiTuArtifactBytesIdenticalPoolVsSynchronous) {
            "speed, never bytes";
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// D-PERF-4-CU-PARALLELISM, THE FRONT HALF — preprocess / splice /
+// tokenize / expand / parse / resolve-imports now run one job per TU on
+// the same pool (`Program::compileUnits`'s `buildCus`). The pins above
+// inject the executor and therefore now exercise BOTH halves; the ones
+// below exist because the front half fails DIFFERENTLY:
+//
+//   * its diagnostics never pass through a scratch reporter at all —
+//     each lands inside the `CompilationUnit` being built, and the drain
+//     walks the CU vector — so what must be pinned is that the CU VECTOR
+//     is assembled in index order, not that a merge is;
+//   * its diagnostics are produced STRICTLY EARLIER than any semantic
+//     error, so a front-half ordering bug is invisible to a fixture
+//     whose markers are undeclared identifiers (the pins above);
+//   * it mints BufferId / TreeId / CompilationUnitId from process-global
+//     monotonic counters (`substrate::mintMonotonicId`), so the IDS a
+//     parallel run assigns genuinely DO depend on completion order. No
+//     driver output is keyed on their values — these pins are what makes
+//     that a measured fact rather than a reading of the code.
+// ═══════════════════════════════════════════════════════════════════
+
+// THE front-half determinism pin, and the one fixture that carries every
+// axis at once: SIX TUs, each emitting a DISTINCT `#warning` — a
+// PREPROCESS-phase diagnostic, produced inside `buildCus` itself, and
+// non-fatal, so the same run ALSO produces a linkable artifact. Pool vs
+// SynchronousExecutor must agree on (1) the diagnostic sequence exactly,
+// (2) the marker order being CU order, and (3) the artifact BYTES.
+//
+// RED-on-disable: collect the CUs in completion order instead of index
+// order (or drain into `rep` from inside a job) and (1)/(2) diverge from
+// the always-CU-ordered synchronous baseline.
+TEST(Program_CuParallelism, FrontHalfMultiTuDiagnosticsAndBytesPoolVsSynchronous) {
+    constexpr int kTus = 6;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    std::vector<std::string> files;
+    for (int i = 0; i < kTus; ++i) {
+        // The `#warning` is the front-half marker; the function body makes
+        // the unit contribute real code so the link has something to merge.
+        auto const body = "#warning zzfront_cu" + std::to_string(i) + "\n"
+                        + "int frontf" + std::to_string(i)
+                        + "(void) { return " + std::to_string(i) + "; }\n";
+        files.push_back(writeCSubsetSource(
+            scratch.path(), "front" + std::to_string(i) + ".c", body)
+                            .generic_string());
+    }
+    scratch.useAsCwd();
+
+    struct RunResult {
+        std::vector<std::pair<DiagnosticCode, std::string>> diags;
+        std::vector<std::uint8_t>                           bytes;
+    };
+    auto runAndCollect = [&](substrate::IExecutor* exec,
+                             fs::path const&       outDir) {
+        Program prog;
+        prog.setExecutor(exec);
+        prog.setOutputDir(outDir);
+        DiagnosticReporter rep;
+        int const rc = prog.compileUnits(
+            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+        EXPECT_EQ(rc, 0) << "#warning must not fail the build";
+        RunResult out;
+        for (auto const& d : rep.all()) out.diags.emplace_back(d.code, d.actual);
+        out.bytes = readAllBytes(outDir / "front0.o");
+        return out;
+    };
+
+    substrate::SynchronousExecutor sync;
+    substrate::ThreadPool          pool{kTus};   // force real concurrency
+    auto const seq = runAndCollect(&sync, scratch.path() / "front_sync");
+    auto const par = runAndCollect(&pool, scratch.path() / "front_pool");
+
+    // (0) the fixture must actually produce the markers it pins — otherwise
+    // every equality below is vacuously true.
+    auto markerText = [](std::vector<std::pair<DiagnosticCode, std::string>> const& v) {
+        std::string s;
+        for (auto const& d : v) { s += d.second; s += '\n'; }
+        return s;
+    };
+    std::string const seqText = markerText(seq.diags);
+    for (int i = 0; i < kTus; ++i) {
+        ASSERT_NE(seqText.find("zzfront_cu" + std::to_string(i)), std::string::npos)
+            << "the fixture produced no front-half diagnostic for CU " << i
+            << " — this pin would assert nothing. Diagnostics seen:\n" << seqText;
+    }
+
+    // (1) the pool's diagnostic stream is element-for-element the sync stream.
+    ASSERT_EQ(seq.diags.size(), par.diags.size())
+        << "pool + synchronous must surface the SAME number of front-half "
+           "diagnostics";
+    EXPECT_EQ(seq.diags, par.diags)
+        << "pool front-half diagnostics must match the single-threaded "
+           "reference EXACTLY — a mismatch means the CUs were collected in "
+           "completion order, not index order";
+
+    // (2) the markers appear in CU (source) ORDER.
+    std::string const parText = markerText(par.diags);
+    std::size_t       prev    = 0;
+    for (int i = 0; i < kTus; ++i) {
+        auto const pos = parText.find("zzfront_cu" + std::to_string(i));
+        ASSERT_NE(pos, std::string::npos) << "CU " << i << "'s marker is missing";
+        if (i > 0) {
+            EXPECT_GT(pos, prev)
+                << "CU " << i << "'s front-half diagnostic must FOLLOW CU "
+                << (i - 1) << "'s — the CU vector must be index-ordered";
+        }
+        prev = pos;
+    }
+
+    // (3) byte-identical artifacts, from the very same run.
+    ASSERT_FALSE(seq.bytes.empty()) << "the artifact must be non-empty";
+    EXPECT_EQ(seq.bytes, par.bytes)
+        << "the pool-built object must be BYTE-IDENTICAL to the "
+           "single-threaded build — parallelism may change speed, never bytes";
+}
+
+// The two-clock substrate's PAYOFF pin: on a multi-TU pool build the front
+// half must ACTUALLY overlap. Every pin above proves the parallel path equals
+// the serial one — bytes, order, stability — and a `submit` that silently
+// regressed to inline execution keeps ALL of them green while shipping the
+// cycle's headline property unguarded. `peakConcurrency` is the direct
+// witness: two scopes of one phase simultaneously alive is thread-level
+// concurrency regardless of how many cores the host actually schedules them
+// onto (the inverse of invariant (d2), which pins peak==1 on a serial
+// compile in the two-clock test above).
+TEST(Program_CuParallelism, FrontHalfActuallyRunsConcurrently) {
+    constexpr int kTus = 8;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    std::vector<std::string> files;
+    for (int i = 0; i < kTus; ++i) {
+        auto const body = "#warning zzconc_cu" + std::to_string(i) + "\n"
+                        + "int concf" + std::to_string(i)
+                        + "(void) { return " + std::to_string(i) + "; }\n";
+        files.push_back(writeCSubsetSource(
+            scratch.path(), "conc" + std::to_string(i) + ".c", body)
+                            .generic_string());
+    }
+    scratch.useAsCwd();
+
+    substrate::PhaseTimers::reset();
+    substrate::ThreadPool pool{kTus};   // force real concurrency, as above
+    Program prog;
+    prog.setExecutor(&pool);
+    prog.setOutputDir(scratch.path() / "conc_out");
+    DiagnosticReporter rep;
+    ASSERT_EQ(prog.compileUnits(files, "c-subset",
+                                {"x86_64:elf64-x86_64-linux"}, rep),
+              0);
+
+    // Some FRONT-half phase (preprocess … resolve-imports … semantic) must
+    // have seen two of its own scopes alive at once. The front phases are
+    // named, not inferred, so a future phase renumbering cannot silently
+    // point this pin at the (already-parallel) back half and keep it green
+    // for the wrong reason.
+    static substrate::CompilePhase const kFront[] = {
+        substrate::CompilePhase::Preprocess,      substrate::CompilePhase::PreprocessSplice,
+        substrate::CompilePhase::PreprocessTokenize, substrate::CompilePhase::PreprocessExpand,
+        substrate::CompilePhase::Tokenize,        substrate::CompilePhase::Parse,
+        substrate::CompilePhase::Reparse,         substrate::CompilePhase::ResolveImports,
+        substrate::CompilePhase::Semantic,
+    };
+    bool anyFrontOverlap = false;
+    for (substrate::CompilePhase const p : kFront) {
+        auto const row = substrate::PhaseTimers::read(p);
+        if (row.runs > 0 && row.peakConcurrency >= 2u) anyFrontOverlap = true;
+    }
+    EXPECT_TRUE(anyFrontOverlap)
+        << "no front-half phase ever reported two concurrent scopes — the "
+           "front half ran SERIALLY through the pool (a regressed submit "
+           "stays green on every byte-identity pin; only this test sees it)";
+}
+
+// Repeat-stability for the FRONT half (a probabilistic race catcher). One
+// parallel run proves nothing about a schedule-dependent bug: the pool can
+// happen to run jobs in submission order. K=20 runs of a multi-TU build
+// must agree on BOTH the artifact bytes and the full diagnostic sequence.
+//
+// This is also the pin that covers the process-global id counters: the
+// BufferIds / TreeIds / CompilationUnitIds handed out differ between these
+// runs (the pool interleaves differently each time), so if any of them
+// reached the output, these 20 runs would not agree.
+TEST(Program_CuParallelism, FrontHalfMultiTuPoolIsRepeatStable) {
+    constexpr int kTus = 6;
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    std::vector<std::string> files;
+    for (int i = 0; i < kTus; ++i) {
+        auto const body = "#warning zzrepeat_cu" + std::to_string(i) + "\n"
+                        + "int repeatf" + std::to_string(i)
+                        + "(void) { return " + std::to_string(i) + "; }\n";
+        files.push_back(writeCSubsetSource(
+            scratch.path(), "repeat" + std::to_string(i) + ".c", body)
+                            .generic_string());
+    }
+    scratch.useAsCwd();
+
+    substrate::ThreadPool pool{kTus};
+    auto const            outDir = scratch.path() / "repeat_out";
+
+    std::vector<std::uint8_t>                           firstBytes;
+    std::vector<std::pair<DiagnosticCode, std::string>> firstDiags;
+    for (int k = 0; k < 20; ++k) {
+        Program prog;
+        prog.setExecutor(&pool);
+        prog.setOutputDir(outDir);
+        DiagnosticReporter rep;
+        int const rc = prog.compileUnits(
+            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+        ASSERT_EQ(rc, 0) << "run " << k << " must succeed";
+        std::vector<std::pair<DiagnosticCode, std::string>> diags;
+        for (auto const& d : rep.all()) diags.emplace_back(d.code, d.actual);
+        auto const bytes = readAllBytes(outDir / "repeat0.o");
+        ASSERT_FALSE(bytes.empty()) << "run " << k << " produced no artifact";
+        if (k == 0) {
+            firstBytes = bytes;
+            firstDiags = diags;
+            ASSERT_EQ(firstDiags.size(), static_cast<std::size_t>(kTus))
+                << "each TU must contribute exactly one front-half diagnostic "
+                   "— otherwise the sequence comparison below is not pinning "
+                   "per-CU ordering";
+        } else {
+            EXPECT_EQ(diags, firstDiags)
+                << "run " << k << "'s front-half diagnostic SEQUENCE diverged "
+                   "from run 0 — the per-CU front-end build is schedule-"
+                   "dependent";
+            EXPECT_EQ(bytes, firstBytes)
+                << "run " << k << " diverged from run 0 — a data race in the "
+                   "per-CU front-end build perturbed the image";
+        }
+    }
+}
+
 // Repeat-stability (a probabilistic race catcher): the SAME multi-TU input
 // built via the pool K=20 times must yield identical artifact bytes AND a
 // clean diagnostic sequence every time. A latent data race in the per-CU
@@ -2970,9 +3650,9 @@ diagnosticCodeSet(DiagnosticReporter const& r) {
 // rides along either, so a future re-ordering that swaps the `#error` cascade
 // for some other front-end noise class still goes red.
 //
-// RED-ON-DISABLE (verified, not assumed): move the pre-flight target
-// resolution at src/program/program.cpp:992-1012 back below the CU build (or
-// merely drop its `if (rep.hasErrors()) { … return 1; }` gate at :1013-1016 so
+// RED-ON-DISABLE (verified, not assumed): move `runCusToTargets`' pre-flight
+// target/format resolution pass back below the CU build (or merely drop the
+// `if (rep.hasErrors()) { … return 1; }` drain that immediately follows it, so
 // the front-end runs anyway) and the front-end preprocesses with no
 // architecture predefines → `P_PreprocessorErrorDirective` joins the set and
 // the set equality fails. Half (a) keeps passing in that state, which is the

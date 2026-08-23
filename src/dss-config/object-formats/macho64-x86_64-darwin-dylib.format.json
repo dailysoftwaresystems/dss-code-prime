@@ -1,4 +1,8 @@
 {
+  "$absentKeyRationaleComment": "Machine-read by tests/link/test_object_format_family_symmetry.cpp: every root key a SIBLING of this format declares and this file does not must appear below with a non-empty reason, and every entry below must correspond to a real absence. Both directions fail loud, so this table can neither be skipped nor rot after a gap is closed. CREATED 2026-08-19 (cycle P12) the moment the arm64 dylib sibling opted into tlsAccess -- before that this file had no absent sibling key and therefore no table.",
+  "$absentKeyRationale": {
+    "tlsAccess": "DELIBERATE: the arm64 dylib sibling's TLS opt-in (D-LK3-DYLIB-TLS-MODEL, closed 2026-08-19) rides the SHARED macho-tlv walker machinery, but x86_64 Darwin TLS depends on the x86_64 EXEC's own TLS opt-in (macho64-x86_64-darwin-exec deliberately declares no tlsAccess -- its $absentKeyRationale, pinned by Linker.TdataItemOnNonOptedInFormatsRejectsAtAcceptsGate, and MEASURED zero _Thread_local consumers in the staged upstream corpus; the sibling's Rosetta run leg landed 2026-08-19, so nothing here waits on runtime reachability). A _Thread_local TU on this format walls loud (K_FormatLacksThreadLocalSupport / the supportedDataSections gate), which is the correct outcome until an x86_64 Darwin TLS cycle lands."
+  },
   "$comment": "Mach-O 64-bit DYNAMIC LIBRARY (MH_DYLIB, .dylib) for x86_64 macOS -- c171 conformance (the x86_64 sibling of macho64-arm64-darwin-dylib). CONFIG-ONLY for the writer: EVERY dylib divergence in `src/link/format/macho.cpp` is FILETYPE-keyed (`isDylib = filetype==Dylib`), never cputype-keyed -- MH_DYLIB routes unconditionally to `encodeExecDynamic` (the x86_64 macOS dynamic writer is in fact the ORIGINAL one, D-LK6-5); the sole cputype dispatch in the dynamic path is `__stubs` (`machoStubSizeFor` x86_64=6-byte FF 25 disp32, already supported); the export trie, ad-hoc code signing (execSegFlags is a caller-supplied per-flavor arg -- dylib=0, arch-neutral), and segment layout (`kPageSize = im.segmentPageSize`) are all arch-neutral. So this needs NO writer code, only this schema. Differs from macho64-arm64-darwin-dylib in ONLY the arch-specific fields: cputype (16777223 x86_64 vs 16777228 arm64), cpusubtype (3 vs 0), segmentPageSize (4096 x86_64 4 KiB pages vs 16384 Apple-Silicon 16 KiB), text virtualAddress (= segmentPageSize), longDoubleFormat (x87-80, x86_64's 80-bit extended -- arm64 uses IEEE-128 and omits it), and the reloc rows (X86_64_RELOC_* vs ARM64_RELOC_*). **RUNTIME IS macOS-x86_64/Rosetta-GATED**: there is NO macOS-x86_64 CI leg (macos-latest is Apple Silicon), so this ships with STRUCTURAL byte-pins ONLY (the writer emits it correctly -- proven at the byte level), and its exit-code RUN witness rides a future macOS-x86_64/Rosetta leg (the D-LK1-MACHO-X8664-DARWIN-DATA-SECTION untested-form discipline; follow-up D-LK-MACHO-X8664-DYLIB-RUNTIME). Code signing is KEPT (ad-hoc SHA-256) though x86_64 macOS does not REQUIRE it (unlike Apple Silicon) -- a signed dylib loads everywhere and mirrors modern ld64, which ad-hoc-signs all output.",
 
   "dssObjectFormatVersion": 1,
@@ -15,8 +19,8 @@
   "cSymbolDecoration": { "scheme": "leading-underscore" },
   "$predefinedMacrosComment": "TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the C-visible face of this file's `dataModel` above, DERIVED FROM THAT VALUE AND NEVER FROM THIS FILE'S NAME -- the loader synthesizes no macro name and the engine performs no format-identity branch; it merges whatever rows are declared here with the language's `preprocess.predefinedMacros` and the target's `predefinedMacros`, applying `availableObjectFormats` exactly once. DECLARED ON THE FORMAT because the data model is per-(OS x format), not per-CPU: the same x86_64 target is LP64 here and LLP64 under pe64-x86_64-windows-*, so a target-side row would be wrong on one of its own formats -- which is exactly what both .target.json files say when they record `__LP64__`/`_LP64` as DELIBERATELY NOT SHIPPED and defer to the format. BOTH spellings, each value 1: MEASURED 2026-07-30 with `/usr/bin/clang -dM -E -x c /dev/null -target <triple>` (Apple clang 21.0.0), __LP64__ and _LP64 are BOTH defined as 1 on arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu and x86_64-unknown-linux-gnu, and NEITHER is defined on x86_64-pc-windows-msvc. COLLISION POLICY: a name declared by this file AND the language or target config is FATAL (C_ConflictingPredefinedMacro) -- no side silently wins. WHAT IT UNBLOCKS, MEASURED: the macOS SDK gates 234 occurrences across 91 headers on __LP64__, so without these rows DSS compiled the SDK's ILP32 arms while its own widths were LP64 (sizeof(long)==8), and $SDK/usr/include/mach/port.h:113-114 then asserted the user32 struct size 12 instead of user64's 16 -- sqlite mem1.c's three error[S0029]. RED-ON-DISABLE: delete this key and examples/c-subset/predefined_lp64_macho stops exiting 42.",
   "predefinedMacros": [
-    { "name": "__LP64__", "kind": "constant", "value": "1" },
-    { "name": "_LP64",    "kind": "constant", "value": "1" }
+    { "name": "__LP64__", "kind": "constant", "value": "1", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "_LP64",    "kind": "constant", "value": "1", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } }
   ],
 
 
@@ -112,10 +116,11 @@
 
   "relocations": [
     {
-      "$comment": "X86_64_RELOC_BRANCH -- the extern-call reloc on a __stubs entry (a plain rel32 branch). kind = 1 matches x86_64.target.json's `rel32` row (nativeId is the packed (type<<28)|(length<<25)|(pcrel<<24)).",
+      "$comment": "X86_64_RELOC_BRANCH -- the extern-call reloc on a __stubs entry (a plain rel32 branch). kind = 1 matches x86_64.target.json's `rel32` row (nativeId is the packed (type<<28)|(length<<25)|(pcrel<<24)). ⚠⚠ VALUE CORRECTED 2026-08-20 (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-ROW): this row declared nativeId 369098752 = 0x16000000, which under the packing THIS COMMENT ITSELF states -- (type<<28)|(length<<25)|(pcrel<<24) -- decodes to r_type=1 (X86_64_RELOC_SIGNED), r_length=3 (8 bytes), r_pcrel=0. Every one of those three fields contradicts the row's own name and stated intent: BRANCH is r_type=2, 4 bytes, PC-relative. The `-darwin` and `-staticlib` siblings have always carried the correct 620756992 = 0x25000000 = (2<<28)|(2<<25)|(1<<24), and the arm64 family agrees on that same packed value for its own BRANCH26. ⓘ THE DEFECT WAS LATENT, NOT LIVE, AND IT IS WORTH SAYING WHICH: relocation_info records are emitted only by the MH_OBJECT writer, which reads the `-darwin`/`-staticlib` documents, so nothing consumed this number. It is corrected rather than left alone because the exec format serves a real `cli` profile with a real run leg, and a wrong declared value that no consumer reads today is precisely the shape that becomes a silent miscompile the day one does. ★ `isCall` (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL, 2026-08-20): this wire relocation can ONLY target executable code, so an object reader that meets an undefined extern through it has PROVEN the extern is a function rather than a data object -- the only classification signal a symbol-name-only reference offers. It is declared HERE, on the format row, and not derived from the target's formula, because a formula describes ARITHMETIC and not ROLE: `S + A - P` is the identical arithmetic for a call and for a PC-relative data reference, so the x86_64 target's `linear` is honest and simply carries no role, while aarch64's `aarch64_call26` looked like a role only because that CPU's branch has its own instruction encoding. ✔MEASURED 2026-08-20: every macho64-x86_64 archive member calling any library function was unreadable for exactly this reason while the arm64 sibling read the same source cleanly. The target document cannot carry it -- it is PER-CPU and shared with ELF, where the same `rel32` genuinely serves data references too.",
       "name": "X86_64_RELOC_BRANCH",
       "kind": 1,
-      "nativeId": 369098752
+      "nativeId": 620756992,
+      "isCall": true
     },
     {
       "$comment": "X86_64_RELOC_UNSIGNED (length 3 = 8 bytes) -- an abs64 data pointer; the walker emits a dyld rebase for it under the base slide. kind = 2.",
@@ -124,10 +129,10 @@
       "nativeId": 100663296
     },
     {
-      "$comment": "X86_64_RELOC_UNSIGNED (length 2 = 4 bytes) -- an abs32 data slot. kind = 3.",
+      "$comment": "X86_64_RELOC_UNSIGNED (length 2 = 4 bytes) -- an abs32 data slot. kind = 3. ⚠ VALUE CORRECTED 2026-08-20 (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-ROW): declared 33554432 = 0x02000000, which is r_length=1 = TWO bytes, for a row named _4 and (in the dylib sibling) commented \"length 2 = 4 bytes\". The correct packing is (0<<28)|(2<<25)|(0<<24) = 0x04000000 = 67108864, which is what the `-darwin`/`-staticlib` siblings carry. Same latency as the BRANCH row above: the MH_OBJECT writer is the only consumer of these numbers and it reads a different document.",
       "name": "X86_64_RELOC_UNSIGNED_4",
       "kind": 3,
-      "nativeId": 33554432
+      "nativeId": 67108864
     }
   ]
 }

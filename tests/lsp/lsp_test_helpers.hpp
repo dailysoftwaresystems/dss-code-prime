@@ -5,6 +5,9 @@
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/transport.hpp"
+#include "test_wait_budget.hpp"
+
+#include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
@@ -138,13 +141,30 @@ public:
         transport_->pushClientMessage(std::move(body));
     }
 
-    // Block until the server's `run()` returns, OR the timeout
-    // elapses. Caller is expected to have queued an `exit` notif
-    // before calling this. Returns the exit code.
-    [[nodiscard]] int runUntilExit(std::chrono::seconds timeout =
-                                       std::chrono::seconds(2)) {
+    // Block until the server's `run()` returns, OR the budget elapses. Caller is
+    // expected to have queued an `exit` notif before calling this. Returns the
+    // exit code, or -1 on expiry.
+    //
+    // ★ THE DEFAULT IS `kWaitBudget`, NOT A LITERAL — read the derivation in
+    // `test_wait_budget.hpp`. It was `std::chrono::seconds(2)`, and ✔that reddened
+    // the `linux-clang-asan` leg on CI run 32585879580 while the same sanitized
+    // binary passed in 622 ms on an idle host and took 1912 ms under 3x CPU
+    // contention. The wait returns the instant the server exits, so the budget
+    // costs a healthy run nothing.
+    //
+    // ★★ AND EXPIRY REPORTS ITSELF. Every call site compares this against an
+    // expected EXIT CODE, so a bare -1 reads as `Which is: -1` — a wrong exit
+    // status, which is not what happened. The added failure names the real event;
+    // the -1 return is kept so no call site has to change.
+    // D-TEST-LSP-WAIT-DEADLINE-IS-SIZED-FOR-AN-IDLE-HOST
+    [[nodiscard]] int runUntilExit(
+        std::chrono::seconds timeout = dss::test_support::kWaitBudget) {
         if (exitFuture_.wait_for(timeout) != std::future_status::ready) {
-            return -1; // timed out — caller should ASSERT_NE(-1, ...)
+            ADD_FAILURE() << "the LSP server did not return from run() within "
+                          << timeout.count()
+                          << "s of the `exit` notification; this is a TIMEOUT, "
+                             "not an exit status — the -1 below is the sentinel";
+            return -1;
         }
         return exitFuture_.get();
     }

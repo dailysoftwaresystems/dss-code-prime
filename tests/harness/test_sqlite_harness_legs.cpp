@@ -3495,6 +3495,390 @@ TEST_F(HarnessLegs, BothDriversImplementEveryProviderTheCatalogueDeclares) {
     }
 }
 
+// ── THE OTHER DIRECTION OF THE SAME CONTRACT ────────────────────────────────
+//
+// `BothDriversImplementEveryProviderTheCatalogueDeclares` walks from the
+// DECLARATION to the drivers. Nothing walked the other way, and a whole provider
+// survived ten days in the gap (`3e86a187`, 2026-08-10, to 2026-08-20):
+// `ubuntu-ports-arm64` was retired from
+// `LIBRARY_PROVIDERS` when the elf64-arm64 leg moved to `pinned-archive`, but
+// build-and-test.sh kept its `case` arm, its ~45-line `ensure_arm64_libs`
+// acquisition and its `ARM64_LIBDIR` override, and BOTH drivers went on naming it
+// as KNOWN in the very message whose job is to tell a reader what is accepted.
+// build-and-test.ps1's read "Exactly one DECLARED provider still lands in this
+// arm: ubuntu-ports-arm64" — false in both halves, and it cited a CLOSED row as
+// live. A reader who believed either would have written a declaration
+// `harness_legs.py --lint` refuses outright.
+// ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+// D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
+//
+// The existing pin could not see any of it: every one of those sites is a
+// provider the catalogue does NOT declare, so its loop never looked at the name.
+//
+// ★ WHY THE RULE IS ABOUT *LIVE* LINES AND NOT ABOUT MENTIONS. A comment
+// narrating a retirement — including the one directly above — is exactly what a
+// reader needs, and banning the word would delete the history along with the
+// defect. What must not survive is a live line: a dispatch arm, or a diagnostic
+// that advertises the name to someone deciding what to declare. `liveLines`
+// draws that line already, and the same helper the forward pin uses draws it the
+// same way, so the two cannot disagree about what counts as code.
+[[nodiscard]] std::set<std::string> retiredLibraryProviders() {
+    // Names that were once dispatchable and are now REFUSED by the resolver.
+    // Self-retiring in the other direction from `knownDriverLocalProviders`: if
+    // one of these ever re-enters the vocabulary, the test below reds demanding
+    // the entry be deleted rather than silently permitting the name again.
+    return {"ubuntu-ports-arm64"};
+}
+
+// RED-ON-DISABLE: put `ubuntu-ports-arm64)` back as a case arm in
+// build-and-test.sh, or name it in either driver's unknown-provider refusal, and
+// this fails naming the driver, the provider and the line.
+TEST_F(HarnessLegs, NeitherDriverKeepsAProviderTheResolverNoLongerKnows) {
+    auto const r = run({"--library-providers"});
+    ASSERT_TRUE(r.spawned) << r.diagnostic;
+    ASSERT_EQ(r.exitCode, 0u) << r.output;
+    std::set<std::string> vocabulary;
+    {
+        std::istringstream in{r.output};
+        std::string        line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty()) vocabulary.insert(line);
+        }
+    }
+    // The verb is the whole basis of this test, so a collapsed read must fail
+    // rather than vacuously pass: an empty vocabulary would satisfy every loop
+    // below without checking one thing.
+    ASSERT_FALSE(vocabulary.empty())
+        << "harness_legs.py --library-providers printed no provider names, so"
+           " this pin has nothing to check. It is the OWNER of the closed set"
+           " LIBRARY_PROVIDERS — an empty print means the verb broke, not that"
+           " the vocabulary is empty.\n"
+        << r.output;
+
+    // Every DECLARED provider must be in the vocabulary, or the shipped
+    // catalogue would not lint — stated here because it is what makes the
+    // vocabulary the right set for the driver checks below.
+    for (auto const& p : declaredProviders(catalogue_)) {
+        EXPECT_TRUE(vocabulary.count(p))
+            << "the catalogue declares provider '" << p << "', which"
+               " LIBRARY_PROVIDERS does not contain.";
+    }
+
+    struct Driver {
+        char const* name;
+        bool        powershell;
+    };
+    constexpr Driver kDrivers[] = {{"build-and-test.sh", false},
+                                   {"build-and-test.ps1", true}};
+    for (auto const& d : kDrivers) {
+        auto const lines = liveLines(harnessDir() / d.name, d.powershell);
+        ASSERT_FALSE(lines.empty()) << d.name;
+        // (a) EVERY name in the vocabulary is dispatchable here — the forward
+        //     pin only demands this of the ONE provider the catalogue currently
+        //     declares, so a vocabulary entry no leg happens to use today could
+        //     be added with an arm in one driver and not the other and nothing
+        //     would notice until a leg declared it.
+        for (auto const& p : vocabulary) {
+            std::string const needle =
+                d.powershell ? ("'" + p + "'") : (p + ")");
+            bool arm = false;
+            for (auto const& line : lines) {
+                auto const at = line.find(needle);
+                if (at == std::string::npos) continue;
+                if (d.powershell
+                    && line.find('{', at + needle.size()) == std::string::npos) {
+                    continue;   // a mention, not a switch arm
+                }
+                arm = true;
+                break;
+            }
+            EXPECT_TRUE(arm)
+                << d.name << " has no dispatch arm for library provider '" << p
+                << "', which harness_legs.py --library-providers lists as KNOWN."
+                   " A leg declaring it would lint clean and then be buildable"
+                   " from one driver and not the other.";
+        }
+        // (b) NO retired name survives in a live line.
+        for (auto const& p : retiredLibraryProviders()) {
+            if (vocabulary.count(p)) {
+                ADD_FAILURE()
+                    << "provider '" << p << "' is listed as RETIRED but"
+                       " LIBRARY_PROVIDERS contains it again. Delete it from"
+                       " retiredLibraryProviders() — a stale retirement is how a"
+                       " reopened route comes to look closed.";
+                continue;
+            }
+            for (auto const& line : lines) {
+                EXPECT_EQ(line.find(p), std::string::npos)
+                    << d.name << " still carries the RETIRED library provider '"
+                    << p << "' in a LIVE line:\n  " << line
+                    << "\nThe resolver REFUSES that name, so this is either dead"
+                       " dispatch code or a diagnostic advertising a"
+                       " declaration that cannot load. A comment may narrate the"
+                       " retirement; code may not keep performing it.";
+            }
+        }
+    }
+}
+
+// ── THE TWO DRIVERS MUST REACH THE SAME VERDICT FOR THE SAME CONDITION ──────
+//
+// ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+// D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT
+//
+// ★★ WHAT THE TWO PINS ABOVE COULD NOT SEE, AND WHY. Both of them walk dispatch
+// arm EXISTENCE and retired-name ABSENCE. Neither asks what an arm DOES — so a
+// condition that both drivers handled, correctly spelled in each file, could be
+// handled with two different OUTCOMES and every existing assertion stayed green.
+// ✔MEASURED 2026-08-20, for a leg declaring a library provider NEITHER driver
+// implements:
+//   * build-and-test.sh's `*)` arm called `die` = `exit 1`, from a TOP-LEVEL
+//     `for leg in "${LEG_ORDER[@]}"` loop — so ONE leg's bad declaration cost
+//     the ENTIRE run and the other four legs never reached any verdict at all;
+//   * build-and-test.ps1's `default` arm returned `Ok = $false`, which its own
+//     docblock defined as ALWAYS `skipped-build-input-missing` — an
+//     ENVIRONMENTAL skip, which merely WARNS unless DSS_STRICT_ARM_VERDICTS=1.
+// One tree, one condition, exit 1 on one host and exit 0 on the other; and the
+// exit-0 half filed a HARNESS/CATALOGUE bug as a fact about the operator's
+// machine, which this project treats as worse than a loud failure.
+//
+// ★ THE FIX IS `poisoned` IN BOTH, and it minted no new verdict: `poisoned` is
+// the closed vocabulary's FAILURE class and BOTH drivers already used it for
+// this exact shape one level down (`unit_not_run` / `Set-LegVerdict`, which
+// record "HARNESS DEFECT: …" when a driver meets a member of a closed
+// vocabulary it cannot classify). Per leg, run continues, exit non-zero.
+//
+// ★★★ AND THE ASSERTION HAS TO EXECUTE THE ARMS, NOT READ THEM. That is what
+// (c) buys: the decision now lives in the MIRRORED `dss:unknown-library-provider`
+// region, and `harness_legs.py --check-regions` EXTRACTS BOTH COPIES FROM THE
+// SHIPPED DRIVERS, RUNS THEM ON BYTE-IDENTICAL INPUT and compares the answers —
+// with an `expect`, so two copies agreeing on a WRONG token red too. A reader of
+// either file would have seen a correct-looking token in both.
+//
+// ⓘ (c) ALSO WIRES THAT VERIFIER INTO ctest FOR THE FIRST TIME. It shipped as a
+// Step-0 self-test of the drivers, i.e. it ran only when a human started a
+// multi-hour corpus run — so the one instrument that can compare the twins by
+// EXECUTION had no gate entry at all.
+TEST_F(HarnessLegs, BothDriversRefuseAnUnimplementedProviderWithTheSameVerdict) {
+    struct Driver {
+        char const* name;
+        bool        powershell;
+        char const* decisionSymbol;
+        // The live text that proves the decision's VERDICT TOKEN is consumed
+        // rather than computed and thrown away. Calling the shared decision and
+        // then recording a HARD-CODED token is the original defect wearing the
+        // new structure as a costume, and every other assertion here would stay
+        // green through it: the region is untouched, the differential passes,
+        // the symbol is defined once and called once.
+        char const* tokenIsConsumed;
+    };
+    constexpr Driver kDrivers[] = {
+        {"build-and-test.sh", false, "unknown_library_provider_verdict",
+         "leg_marks_harness_defect \"$leg\" \"$_uv\""},
+        {"build-and-test.ps1", true, "Get-UnknownLibraryProviderVerdict",
+         "Set-LegVerdict $lg.label \"$($r.Verdict)\""}};
+
+    // ── (a) BOTH DRIVERS ROUTE THROUGH THE ONE MIRRORED DECISION ────────────
+    // Defined once and CALLED at least once. A driver that grew a second,
+    // driver-local answer would still pass the differential — the region's copy
+    // would be untouched and simply unused — so the CALL is asserted too, not
+    // only the definition.
+    for (auto const& d : kDrivers) {
+        auto const lines = liveLines(harnessDir() / d.name, d.powershell);
+        ASSERT_FALSE(lines.empty()) << d.name;
+        unsigned defined = 0;
+        unsigned called  = 0;
+        for (auto const& line : lines) {
+            if (line.find(d.decisionSymbol) == std::string::npos) continue;
+            auto const at   = line.find_first_not_of(" \t");
+            auto const trim = at == std::string::npos ? std::string{}
+                                                      : line.substr(at);
+            bool const isDef =
+                d.powershell
+                    ? trim.rfind("function ", 0) == 0
+                    : (trim.rfind(d.decisionSymbol, 0) == 0
+                       && trim.find("()") != std::string::npos);
+            if (isDef) ++defined; else ++called;
+        }
+        EXPECT_EQ(defined, 1u)
+            << d.name << " defines `" << d.decisionSymbol << "` " << defined
+            << " time(s); the unknown-provider verdict is ONE mirrored decision"
+               " and a second definition is a second answer.";
+        EXPECT_GE(called, 1u)
+            << d.name << " never CALLS `" << d.decisionSymbol << "`. The"
+               " mirrored region would then be dead code that the differential"
+               " battery keeps proving correct while the driver answers the"
+               " condition some other way.";
+        bool consumed = false;
+        for (auto const& line : lines) {
+            if (line.find(d.tokenIsConsumed) != std::string::npos) {
+                consumed = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(consumed)
+            << d.name << " no longer records the verdict TOKEN the shared"
+               " decision returned — no live line contains `"
+            << d.tokenIsConsumed
+            << "`. A driver that computes the token and then writes a"
+               " hard-coded one back into the ledger has re-opened the exact"
+               " divergence this test exists for, with every other assertion"
+               " here still green.";
+    }
+
+    // ── (b) THE .sh ARM MUST NOT END THE RUN ────────────────────────────────
+    // The control-flow half, and the ONE half the differential cannot see: the
+    // shared prelude turns a `die` into `exit 9`, which the battery reports as
+    // "the .sh copy RAN: FAIL" — but only for code INSIDE the region, and the
+    // dispatch arm is not inside it (it lives in the `for leg` loop). So the arm
+    // is bounded here by its own STRUCTURE — the `*)` that follows the
+    // `pinned-archive)` arm, up to the next `;;` — never by a line number.
+    {
+        auto const lines = liveLines(harnessDir() / "build-and-test.sh", false);
+        ASSERT_FALSE(lines.empty());
+        auto trimmed = [&lines](std::size_t i) {
+            auto const at = lines[i].find_first_not_of(" \t");
+            return at == std::string::npos ? std::string{} : lines[i].substr(at);
+        };
+        std::size_t pinned = std::string::npos;
+        for (std::size_t i = 0; i < lines.size(); ++i) {
+            if (trimmed(i) == "pinned-archive)") { pinned = i; break; }
+        }
+        ASSERT_NE(pinned, std::string::npos)
+            << "build-and-test.sh has no `pinned-archive)` case arm, so this pin"
+               " cannot locate the provider dispatch it is about. That is a"
+               " changed structure, not a passing test.";
+        std::size_t open = std::string::npos, close = std::string::npos;
+        for (std::size_t i = pinned + 1; i < lines.size(); ++i) {
+            auto const trim = trimmed(i);
+            if (open == std::string::npos) {
+                if (trim == "esac") break;          // no default arm at all
+                if (trim == "*)") open = i;
+                continue;
+            }
+            if (trim == ";;") { close = i; break; }
+        }
+        ASSERT_NE(open, std::string::npos)
+            << "the provider `case` in build-and-test.sh has no `*)` arm, so a"
+               " leg declaring an unknown provider would fall through it"
+               " SILENTLY to an empty library pair and be reported as a missing"
+               " build input — the exact silence that arm exists to prevent.";
+        ASSERT_NE(close, std::string::npos)
+            << "the `*)` arm opened at the provider dispatch never closes with"
+               " `;;`, so the arm could not be bounded and nothing below was"
+               " actually checked.";
+        bool sawContinue = false;
+        for (std::size_t i = open + 1; i < close; ++i) {
+            auto const trim = trimmed(i);
+            if (trim == "continue") sawContinue = true;
+            // `die` and `exit` END THE RUN. One leg's bad declaration must never
+            // cost the other legs their verdicts — which is exactly what the
+            // deleted `ensure_arm64_libs` docblock argued, in this file, about
+            // this arm, while the arm went on doing it.
+            EXPECT_TRUE(trim.rfind("die ", 0) != 0 && trim.rfind("die\"", 0) != 0
+                        && trim.rfind("exit ", 0) != 0)
+                << "build-and-test.sh's unknown-provider arm ENDS THE RUN:\n  "
+                << lines[i]
+                << "\nOne leg declaring a provider no driver implements must cost"
+                   " THAT LEG a `poisoned` verdict and nothing else; the .ps1 twin"
+                   " records a per-leg verdict and carries on, so a terminating"
+                   " call here is the two drivers disagreeing about an exit code"
+                   " for one condition.";
+        }
+        EXPECT_TRUE(sawContinue)
+            << "build-and-test.sh's unknown-provider arm does not `continue`."
+               " Falling out of the arm reaches the missing-libraries check"
+               " below it, which OVERWRITES the harness-defect verdict with"
+               " `skipped-build-input-missing` — filing our bug as a fact about"
+               " the operator's machine.";
+    }
+
+    // ── (c) THE ARMS ARE EXECUTED, AND THEIR ANSWERS COMPARED ───────────────
+    // `harness_legs.py --check-regions` owns the extraction, the interpreter
+    // probing and the normalisation; re-implementing any of that here would be a
+    // second copy of the machinery whose whole subject is second copies.
+    auto const regions = run({"--check-regions"});
+    ASSERT_TRUE(regions.spawned) << regions.diagnostic;
+    EXPECT_EQ(regions.exitCode, 0u)
+        << "harness_legs.py --check-regions FAILED. It is the only instrument"
+           " that compares the two drivers BY EXECUTION rather than by reading"
+           " them:\n"
+        << regions.output;
+    // The battery's own summary must be present AND must be the zero-failure
+    // one: a run that died before printing it would otherwise leave this pin
+    // asserting nothing but an exit code.
+    EXPECT_NE(regions.output.find("failed=0"), std::string::npos)
+        << "--check-regions printed no `failed=0` summary line:\n"
+        << regions.output;
+    // And the case THIS test is about really ran. A differential that was
+    // deleted, renamed, or skipped for a missing interpreter must not read as
+    // agreement — a skip is not a pass.
+    // The PASS PREFIX is asserted, not merely the label: `check_dss_regions`
+    // writes `  ok   <label>`, `  FAIL <label>` and `  SKIP <label> — <why>`, so
+    // searching for the bare label finds a SKIP just as happily as a pass, and a
+    // skipped differential is exactly the state this pin must not accept.
+    // ★★ AND THE ONE NON-PASS THIS HOST CANNOT DO ANYTHING ABOUT IS SEPARATED
+    // FROM THE REST, BY READING THE INSTRUMENT'S OWN STATED REASON.
+    // D-TEST-HARNESS-DIFFERENTIAL-NEEDS-A-POWERSHELL-INTERPRETER-AND-DOES-NOT-SAY-SO:
+    // this differential executes BOTH driver copies, so it needs a PowerShell
+    // interpreter, and `pwsh` does not exist on every gate host. ✔MEASURED
+    // 2026-08-21 across the four legs: Windows has it, WSL has it at
+    // `/usr/bin/pwsh` — and the arm64 VPS and macOS have NEITHER. So the pin as
+    // first written turned a host capability into a red on half the matrix.
+    // ★ THE GATE READS `check_dss_regions`'s OWN SKIP REASON rather than probing
+    // for an interpreter here: that function "owns the extraction, the
+    // interpreter probing and the normalisation" (the note above says so), and a
+    // second probe in this file would be the very duplication this whole test is
+    // about. A skip for ANY OTHER reason is still a hard failure, which is what
+    // keeps `a skip is not a pass` true where it can be evaluated.
+    // ⚠ The needle is the instrument's own wording. If that wording changes this
+    // reds rather than silently widening — the correct direction for a gate.
+    std::string absentInterpreter;
+    for (char const* needle :
+         {"differential unknown-library-provider: identical answers",
+          "differential unknown-library-provider: the .sh answer is CORRECT",
+          "differential unknown-library-provider: the .ps1 answer is CORRECT"}) {
+        std::string const label{needle};
+        if (regions.output.find("  ok   " + label) != std::string::npos) continue;
+
+        std::string const skipHead = "  SKIP " + label;
+        auto const        at       = regions.output.find(skipHead);
+        if (at != std::string::npos) {
+            auto const eol = regions.output.find('\n', at);
+            std::string const why =
+                regions.output.substr(at, (eol == std::string::npos
+                                               ? regions.output.size()
+                                               : eol) - at);
+            if (why.find("is not on PATH") != std::string::npos) {
+                absentInterpreter = why;
+                continue;
+            }
+        }
+        bool const ran = regions.output.find(label) != std::string::npos;
+        ADD_FAILURE()
+            << "--check-regions did not report `  ok   " << label << "`; the"
+               " label was "
+            << (ran ? "present but NOT as a pass, and NOT a skip for an absent"
+                      " interpreter either — so it is a real FAIL or a skip this"
+                      " test does not know how to excuse"
+                    : "ABSENT ENTIRELY, so the differential case was deleted,"
+                      " renamed, or never reached")
+            << ".\n"
+            << regions.output;
+    }
+    if (!absentInterpreter.empty() && !::testing::Test::HasFailure()) {
+        GTEST_SKIP()
+            << "the two-driver differential cannot run on this host and the"
+               " instrument says why:\n  "
+            << absentInterpreter
+            << "\nThe structural halves above (a) and (b) DID run and passed;"
+               " only the BY-EXECUTION comparison is unavailable. This pin is"
+               " evaluated on every host that has a PowerShell interpreter —"
+               " ✔Windows and WSL among this project's four gate legs.";
+    }
+}
+
 // IT REFUSES RATHER THAN IMPROVISING.
 // Offline with a cold cache is the case that matters: the tempting behaviour is
 // to fall back to "whatever tcl is on this machine", which would build the leg
@@ -3632,7 +4016,7 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 // `-e`. That is why `--` is called out by name below instead of being lumped in
 // with "some other token" — it reads like the safe spelling and is not.
 //
-// WHAT IT COST, so nobody re-litigates the severity: tools/ssh-arm64-vps.ps1 ran
+// WHAT IT COST, so nobody re-litigates the severity: scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 ran
 // `wsl.exe bash -lc "ssh … $Command"`, so `-Command 'hostname; uname -m'`
 // printed the VPS hostname and then the LOCAL WSL architecture — x86_64 for an
 // aarch64 box — while exiting 0. A cross-host verification instrument answering
@@ -3659,11 +4043,12 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 //     regex, `build-wsl/` and `$wslKey` out of it without naming any of them;
 //   · a PowerShell SPLAT (`& wsl.exe @a`) is the correct fix's own shape — there
 //     is no string left to escape — so it is accepted only when the array it
-//     splats is bound to `-e` nearby. That is how tools/ssh-arm64-vps.ps1 passes.
+//     splats is bound to `-e` nearby. That is how scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 passes.
 //
 // COVERAGE IS BY DIRECTORY, NOT BY LIST: both sqlite drivers plus every
-// `tools/*.ps1` and `tools/*.sh`, so a NEW tools script is governed the day it
-// lands. The catalogue's launcher argv and the resolver's translator argv are
+// `.ps1` and `.sh` anywhere under `scripts/`, so a NEW script is governed the
+// day it lands. The walk is RECURSIVE because scripts/ is one directory per
+// script with the siblings inside it, so every script sits one level down. The catalogue's launcher argv and the resolver's translator argv are
 // held to the same rule from their DATA, in the second test — and those are the
 // two places that actually carried `--`.
 //
@@ -3681,20 +4066,41 @@ struct Script {
     bool     powershell;
 };
 
-// Every script this rule governs. `tools/` is enumerated rather than listed so
-// a new script there cannot land outside the rule.
+// Every script this rule governs. `scripts/` is ENUMERATED rather than listed
+// so a new script there cannot land outside the rule.
+//
+// ★★★ AND THE ENUMERATION HAS A FLOOR, which is not defensive clutter: the
+// walk swallows its error_code, so a directory that is missing or renamed
+// yields an EMPTY range and every assertion below iterates nothing. This test
+// would then pass while governing only the two sqlite drivers — a guard that
+// reads exactly like a guard that found nothing. ✔That is not hypothetical:
+// this walk said `tools/` until 2026-08-19, when that directory was merged
+// into scripts/, and nothing here would have reported the loss.
 [[nodiscard]] std::vector<Script> shellScriptsUnderTest() {
     std::vector<Script> out;
     out.push_back({harnessDir() / "build-and-test.ps1", true});
     out.push_back({harnessDir() / "build-and-test.sh", false});
     std::error_code       ec;
+    auto const            scriptsDir = repoRoot() / "scripts";
     std::vector<fs::path> tools;
-    for (auto const& e : fs::directory_iterator(repoRoot() / "tools", ec)) {
+    for (auto const& e : fs::recursive_directory_iterator(scriptsDir, ec)) {
         if (!e.is_regular_file()) continue;
         auto const ext = e.path().extension().string();
         if (ext == ".ps1" || ext == ".sh") tools.push_back(e.path());
     }
     std::sort(tools.begin(), tools.end());   // a stable failure order
+
+    // The floor. Far below the live figure (22 on 2026-08-19) so ordinary
+    // churn never trips it, and high enough that a collapsed walk cannot pass.
+    constexpr std::size_t kScriptFloor = 16;
+    EXPECT_GE(tools.size(), kScriptFloor)
+        << "only " << tools.size() << " .sh/.ps1 scripts were found under "
+        << scriptsDir.string()
+        << (ec ? " (walk error: " + ec.message() + ")" : "")
+        << ".\nThe enumeration COLLAPSED — this test would then govern only the"
+           " two sqlite drivers and still report a pass. Fix the walk; do not"
+           " lower the floor.";
+
     for (auto const& p : tools) {
         out.push_back({p, p.extension() == ".ps1"});
     }
@@ -3857,7 +4263,7 @@ TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
                         << " but nothing within 12 live lines above binds `$"
                         << var << "` to an argv naming '-e':\n  " << line
                         << "\nA real argv is the RIGHT fix for this defect — it"
-                           " is what tools/ssh-arm64-vps.ps1 does — but only if"
+                           " is what scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 does — but only if"
                            " `-e` is actually in it.";
                     continue;
                 }
@@ -3874,7 +4280,7 @@ TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
                        " [echo A=x86_64] without `-e` and [echo A=$(uname -m)]"
                        " with it, and a SINGLE-QUOTED $HOME in a payload still"
                        " expanded. Quoting cannot fix it — pass `-e`, or build a"
-                       " real argv and splat it as tools/ssh-arm64-vps.ps1 does.";
+                       " real argv and splat it as scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 does.";
             }
         }
     }

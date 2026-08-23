@@ -2,6 +2,8 @@
     "dssPipelineVersion": 1,
     "pipeline": {
         "name": "debug",
-        "passes": ["Identity"]
+        "passes": [
+            {"fixpoint": {"max": 1, "passes": ["Identity"]}}
+        ]
     }
 }

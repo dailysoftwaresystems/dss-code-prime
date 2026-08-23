@@ -52,6 +52,11 @@ inline constexpr EnumNameTable<PredefinedMacroKind, 5> kPredefinedMacroKindTable
     { PredefinedMacroKind::Time,     "time"     },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kPredefinedMacroKindTable);
+
 [[nodiscard]] constexpr std::string_view
 predefinedMacroKindName(PredefinedMacroKind k) noexcept {
     return kPredefinedMacroKindTable.name(k);
@@ -89,6 +94,227 @@ predefinedMacroKindFromName(std::string_view s) noexcept {
 packVersionComponents(std::string_view           versionText,
                       std::span<const long long> weights);
 
+// ---- RULING B' SS6: SAME-NAME ROWS MUST DECLARE THE SAME `impliedSurface` ----
+//
+// Walk every `*.json` under `configRootDir`, collect every `predefinedMacros`
+// entry (both the language spelling `/preprocess/predefinedMacros` and the
+// target/format spelling `/predefinedMacros`), group by macro NAME, and report
+// every name whose rows do NOT agree on `impliedSurface`. Returns one message
+// per disagreeing name, each naming the documents; EMPTY means agreement.
+//
+// *** WHY THIS CANNOT BE A LOAD-TIME CHECK, AND THEREFORE WHY IT IS A SWEEP.
+// The duplicates are ACROSS DOCUMENTS, not within one: MEASURED, `_LP64` and
+// `__LP64__` are each declared by 18 different `.format.json` files. A single
+// build loads exactly ONE format document, so no compile ever has two of them in
+// scope and no loader can see the disagreement. Only a walk of the whole config
+// tree can. Same posture, and same reason, as `ffi::validateShippedIncludeClosure`.
+//
+// *** AND WHY NOT SIMPLY DEDUPLICATE THE ROWS. Per-document declaration is
+// DELIBERATE -- `setFormatPredefinedMacros` exists precisely because two
+// documents of one format kind may legitimately declare different macros -- so
+// collapsing them would remove a capability to fix a bookkeeping problem. The
+// invariant is agreement, not uniqueness. It mirrors the shared-typedef rule
+// (`D-LANG-TYPE-IDENTITY-VOCABULARY`): a fact declared in N places must resolve
+// identically in all N, or the load fails loud.
+//
+// WARNING: THE COMPARISON IS JSON VALUE EQUALITY, NOT LITERAL BYTES, and the
+// deviation from "byte-identical" is stated rather than left to look like
+// compliance. A JSON object is unordered by specification, so two rows that
+// spell the same claim with `kind` and `headers` in a different order state the
+// SAME fact; refusing them would be this check inventing a difference the format
+// does not have. Whitespace and key order are therefore not part of the fact;
+// the presence, absence and value of every key is.
+[[nodiscard]] DSS_EXPORT std::vector<std::string>
+predefinedMacroDocumentDisagreements(std::string_view configRootDir);
+
+// ── D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE ────────────────────────
+//
+// ONE claim inside a predefined macro's `requires`: including the shipped header
+// `header` must make every name in `names` VISIBLE, on every object format the
+// macro is effective on.
+//
+// ★ WHY A (header, names) PAIR AND NOT A BARE HEADER LIST. A header list alone
+// is satisfied by a descriptor FILE EXISTING, and existence is not the fact the
+// macro promises. The defect this whole mechanism exists to prevent is exactly
+// an existence-shaped claim that was true while the thing it implied was false:
+// `_MSC_VER` was declared on pe for months, promising the MSVC header world, and
+// the surface behind it was never shipped — so real code (sqlite's `hwtime.h`,
+// `windirent.h`) took a branch DSS could not satisfy, silently, at the point of
+// use rather than at the point of the claim. Naming the NAMES is what makes the
+// claim CHECKABLE instead of NOMINAL, and it is why `names` may not be empty.
+//
+// ★ AND WHY IT IS CHECKED AGAINST THE ACTIVE CLOSURE, NOT THE ONE DESCRIPTOR.
+// The promise a macro makes is about what the USER'S source can do: `#include
+// <h>` then call `f`. A real header reaches many of its names through its own
+// `#include`s, so the honest subject is the header's transitive closure ON THAT
+// FORMAT — which is the same closure, walked by the same walker, with the same
+// edge gate, that the compile itself uses. Checking one file would refuse
+// truthful claims; checking a format-blind closure would accept false ones.
+struct DSS_EXPORT ShippedSurfaceClaim {
+    // The shipped header NAME, resolved by the SAME `<stem>.json` convention a
+    // source `#include <h>` uses ("dirent.h" → dirent.json, "sys/uio.h" →
+    // sys/uio.json). Non-empty; unique within one `requires`.
+    std::string              header;
+    // The names including `header` must make visible — a symbol, a constant, a
+    // typedef, a macro, a struct/union tag: whatever the descriptor surface
+    // declares. AT LEAST ONE, and each non-empty + unique. A claim with no names
+    // is a claim that cannot fail, and a shape that admits one has not solved
+    // the problem it was built for.
+    std::vector<std::string> names;
+};
+
+// ---- THE THREE STATES OF `impliedSurface` (operator ruling B-prime) --------
+//
+// EVERY predefined-macro row must declare one of these. There is NO bare `null`
+// and no defaulted absence.
+//
+// *** WHY A TAGGED STATE AND NOT `null`. The first cut of this field was
+// `null`-or-claim, and MEASURED against the real corpus it was already decaying:
+// 80 of 84 rows were `null`, and FIVE of those nulls were surface-implying
+// platform identities written as `null` while populating the very mechanism
+// built to prevent that -- two OS-selection rows whose format serves 97
+// symbols, 64 typedefs, 89 constants and 16 structs, and three platform-vendor
+// rows whose format serves a whole POSIX cluster. (The SPELLINGS are config's
+// business and are deliberately not repeated here -- see the registry row.)
+// The operator's conclusion is the design bar for this shape: the question is
+// not whether those five were wrong, it is WHAT FINDS THE SIXTH.
+//
+// *** AND WHY NOT THE OBVIOUS RULE -- "force a claim only on FORMAT-GATED
+// macros". MEASURED: it reaches 19 of 84 rows and EXEMPTS the four COMPILER-
+// identity rows, which are ungated because a compiler identity is not a
+// platform one -- the subtlest class there is. One of those four is what forces
+// the competing (false) toolchain identity out through the exclusion rule, and
+// the extended inline asm this compiler already ships is an obligation it
+// incurs. A rule guarding the OS rows but not the compiler ones guards the case
+// we found and misses the case we already knew about.
+//
+// *** WHY A CLOSED TAG BEATS FREE TEXT: it makes copy-paste decay REVIEWABLE.
+// A `null` inherited from a copied row is invisible in a diff. A TAG that is
+// wrong for the new macro is something a reviewer and a diff can both see.
+enum class ImpliedSurfaceKind {
+    // The macro's presence ASSERTS a shipped header surface, stated as claims.
+    Surface,
+    // The macro deliberately implies no shipped surface, for a declared REASON
+    // drawn from the closed set below.
+    ClaimsNothing,
+    // *** THE HONEST THIRD STATE: the macro DOES imply a surface and THIS
+    // PREDICATE CANNOT STATE IT. The compiler-identity rows imply LANGUAGE
+    // extensions -- statement expressions, inline asm with operand constraints,
+    // attribute syntax -- which are properties of the LANGUAGE, not of any
+    // shipped header, so no `{header, names}` claim can express them. Recording that is not the same as claiming nothing, and
+    // collapsing the two would hide precisely the class the census shows is
+    // subtlest. `note` is REQUIRED here: the whole value of the state is the
+    // sentence saying WHAT is not expressible.
+    // WARNING: B-prime requires this state to be RECORDED, never EVALUATED. A
+    // language-feature predicate is explicitly deferred by the operator; do not
+    // build one here on the strength of this enumerator existing.
+    NotExpressible,
+};
+
+inline constexpr EnumNameTable<ImpliedSurfaceKind, 3> kImpliedSurfaceKindTable{{{
+    { ImpliedSurfaceKind::Surface,        "surface"         },
+    { ImpliedSurfaceKind::ClaimsNothing,  "claims-nothing"  },
+    { ImpliedSurfaceKind::NotExpressible, "not-expressible" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kImpliedSurfaceKindTable);
+
+[[nodiscard]] constexpr std::string_view
+impliedSurfaceKindName(ImpliedSurfaceKind k) noexcept {
+    return kImpliedSurfaceKindTable.name(k);
+}
+[[nodiscard]] constexpr std::optional<ImpliedSurfaceKind>
+impliedSurfaceKindFromName(std::string_view s) noexcept {
+    return kImpliedSurfaceKindTable.fromName(s);
+}
+
+// The CLOSED reason set for `claims-nothing`. Validated at load; an unknown
+// value fails loud, which is the whole point -- a free-text reason could not be
+// audited across 39 rows, and a reason that cannot be audited is a `null` with
+// extra keystrokes.
+//
+// The three were enumerated from the real corpus census (rows / distinct names):
+// `erases-to-nothing` 8/8, `arch-property` 52/16, `standard-defined` 10/10.
+enum class ClaimsNothingReason {
+    // The macro EXPANDS TO NOTHING -- a calling-convention or decoration
+    // spelling the target does not need (`__stdcall`, `WINAPI`). It cannot imply
+    // a surface because it contributes no tokens.
+    ErasesToNothing,
+    // The macro states a property of the PROCESSOR or its ABI (`__x86_64__`,
+    // `__LP64__`, `__BYTE_ORDER__`). The fact is true of the target, not of any
+    // shipped header, so there is no surface to point at.
+    ArchProperty,
+    // The macro is mandated by the language STANDARD and its meaning is fixed by
+    // that document (`__STDC__`, `__LINE__`, `__STDC_VERSION__`). Its backing is
+    // the implementation's conformance, not a shipped header.
+    StandardDefined,
+};
+
+inline constexpr EnumNameTable<ClaimsNothingReason, 3> kClaimsNothingReasonTable{{{
+    { ClaimsNothingReason::ErasesToNothing, "erases-to-nothing" },
+    { ClaimsNothingReason::ArchProperty,    "arch-property"     },
+    { ClaimsNothingReason::StandardDefined, "standard-defined"  },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kClaimsNothingReasonTable);
+
+[[nodiscard]] constexpr std::string_view
+claimsNothingReasonName(ClaimsNothingReason r) noexcept {
+    return kClaimsNothingReasonTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<ClaimsNothingReason>
+claimsNothingReasonFromName(std::string_view s) noexcept {
+    return kClaimsNothingReasonTable.fromName(s);
+}
+
+// One row's declared `impliedSurface`. Exactly one of the three states, with
+// only that state's fields populated -- the loader refuses a row that carries a
+// key belonging to a different state, so an unreachable field can never sit in
+// config looking like it does something.
+struct DSS_EXPORT ImpliedSurface {
+    ImpliedSurfaceKind kind = ImpliedSurfaceKind::ClaimsNothing;
+    // kind == Surface: NON-EMPTY. Each claim names a header AND the names it
+    // must make visible -- see `ShippedSurfaceClaim` for why header granularity
+    // alone is nearly vacuous once transitive re-export exists.
+    std::vector<ShippedSurfaceClaim> headers;
+    // kind == ClaimsNothing: REQUIRED, from the closed set.
+    std::optional<ClaimsNothingReason> reason;
+    // OPTIONAL under ClaimsNothing -- this is what keeps the honest rows cheap,
+    // and it is deliberate: 39 rows must not become 39 essays. REQUIRED and
+    // non-empty under NotExpressible.
+    std::string note;
+};
+
+// WARNING: THE KEY IS `impliedSurface`, AND IT WAS DELIBERATELY RENAMED AWAY
+// FROM `requires` ON 2026-08-18 -- DO NOT REINTRODUCE THAT SPELLING.
+//
+// `requires` already carries other meanings in this project -- the DOCUMENT-level
+// grammar HOLES contract (`<lang>.lang.json` `/requires` = `{rules, tokens}`,
+// parsed by `parseRequires` in `grammar_schema_json.cpp`, live in
+// `asm.lang.json`) and the sqlite harness's environment-probe list -- so a third
+// would have been the second collision, not the first. The first instinct was to
+// keep the spelling and write a cross-reference, on the grounds that the scopes
+// are disjoint and neither parser can accept the other's shape. *** THE OPERATOR
+// OVERRULED THAT, AND THE REASONING IS THE REUSABLE PART: "different scopes, no
+// parse ambiguity" is a correct statement about the PARSER and the wrong test for
+// a config key -- the parser was never the reader at risk. The two are not even
+// the same RELATION. Grammar-holes `requires` marks known INCOMPLETENESS; this
+// one is a hard load-time REFUSAL on the honesty of an identity claim. A reader
+// carrying the first meaning into the second reads the low-content form as "no
+// known holes" instead of "this macro claims no platform surface" -- and that
+// misread defeats the one device the mechanism has against recurrence, because
+// the low-content form only works if writing it forces a thought.
+//
+// `impliedSurface` names what the claim IMPLIES rather than what it needs, which
+// is what reads correctly in the claims-nothing case, and that case is the one
+// that has to be unmistakable.
+
 // FC15b: one config-declared predefined macro (C 6.10.8). `name` is the macro
 // identifier (matched by TEXT, like the directive words); `kind` selects the
 // materialization behavior; `value` is the literal replacement spelling and is
@@ -121,6 +347,30 @@ struct DSS_EXPORT PredefinedMacroDef {
     // ONLY, without leaking into elf/macho. Format names are validated at load
     // (an unknown name fails loud), never matched by an `if (name=="pe")` branch.
     std::vector<std::string> availableObjectFormats;
+
+    // D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE: the `impliedSurface`
+    // field -- what this macro's presence ASSERTS about the shipped surface.
+    //
+    // ** MANDATORY IN JSON, IN ALL THREE STATES. There is no `null` and no
+    // default. A defaulted absence is indistinguishable from an author who never
+    // considered the question, and "nobody considered it" is precisely the state
+    // that shipped `_MSC_VER` on a platform whose header world did not exist --
+    // and, measured on the first cut of this very field, the state that wrote
+    // five surface-implying identities as `null`. A field you MUST answer with a
+    // TAG is a question that gets answered visibly.
+    //
+    // The load guarantees this is populated and internally consistent for every
+    // row that reaches this struct: a malformed row never lands.
+    ImpliedSurface impliedSurface;
+
+    // PROVENANCE — the JSON POINTER of this entry inside its declaring document
+    // (e.g. "/preprocess/predefinedMacros/7"), set by the shared entry parser.
+    // The declaring FILE FAMILY is supplied by the merge, which is the only
+    // place that knows which of the three families a row came from. Together
+    // they let a requirement failure say WHICH document and WHICH row to edit,
+    // instead of naming a macro and leaving the author to grep three config
+    // families for it.
+    std::string declaredAt;
 };
 
 // FC15c (`__has_c_attribute` -- C23 6.10.1p4): one config-declared standard
@@ -245,6 +495,45 @@ enum class PragmaEffect : std::uint8_t {
 struct DSS_EXPORT PragmaEffectRow {
     std::vector<std::string> prefix;   // e.g. {"clang","diagnostic"} or {"pack"}
     PragmaEffect             effect = PragmaEffect::Unsupported;
+};
+
+// ── D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC: one MUTUALLY EXCLUSIVE group ──
+//
+// A set of predefined-macro NAMES of which AT MOST ONE may be EFFECTIVE for any
+// one (language x target x format) triple. Checked over the merged, already
+// format-filtered set (`mergePredefinedMacros`), which is the only place all
+// three config families and the active format are known at once.
+//
+// ★ WHY THIS IS CONFIG AND NOT AN ENGINE RULE. The contradicting names are
+// SOURCE-LANGUAGE dialect vocabulary (for C: the two rival toolchain-identity
+// spellings, one of which every real compiler defines and never both), and a
+// literal either one in shared substrate is exactly the source-language
+// hard-coding the project's agnosticism bar vetoes — a rule enforced by
+// `TFC83IdentityMacroNamesAreNotInEngineCpp`, which is why not even this
+// comment spells them. So the RULE ("these names contradict each other") is
+// declared by whichever `.lang.json` owns the vocabulary, and the engine
+// enforces whatever it is told, for every group, generically. `toy.lang.json`
+// declares none and is therefore unchecked, which is also this pin's
+// red-on-disable: delete the key and the co-definition stops being refused.
+//
+// ★ WHY IT IS CHECKED AFTER THE FORMAT FILTER, unlike the cross-family NAME
+// collision above it. A collision is about who OWNS a name and must be found
+// before gating can hide it. This is the opposite question — what a TU actually
+// SEES — and the whole defect it exists to catch is a pair that is individually
+// legitimate and only contradictory once a particular format makes both live
+// (the found instance: one member un-gated across every format, the other
+// gated to a single one, so that ONE leg saw both). Checking before the filter
+// would report every format at once and could not name the offending one.
+struct DSS_EXPORT PredefinedMacroExclusionGroup {
+    // The mutually exclusive NAMES. At least 2, unique, each non-empty —
+    // validated at load, because a 0/1-name group is a rule that can never fire
+    // and would sit in config looking like protection.
+    std::vector<std::string> macros;
+    // Why they contradict each other, quoted VERBATIM into the diagnostic.
+    // REQUIRED and non-empty: the whole value of this pin at the moment it
+    // fires is that the reader learns why the combination is impossible instead
+    // of being told only that some rule said no.
+    std::string reason;
 };
 
 // Every field is validated at load (`C_InvalidPreprocess` / `C_MissingField`
@@ -522,6 +811,13 @@ struct DSS_EXPORT PreprocessConfig {
     // OPTIONAL: an empty registry with `unknownPragmaIsError == false` is
     // byte-for-byte the pre-TF-C82 drop-everything behavior.
     std::vector<PragmaEffectRow> pragmaEffects;
+
+    // D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC: groups of predefined-macro
+    // names that may never be EFFECTIVE together for one (language x target x
+    // format) triple. OPTIONAL — an empty list is exactly the unchecked
+    // pre-pin behaviour, which is what makes the shipped group's removal a
+    // real red-on-disable rather than a no-op.
+    std::vector<PredefinedMacroExclusionGroup> mutuallyExclusivePredefinedMacros;
 
     // TF-C82: the `structPacking` operand SUB-VOCABULARY — the two words that
     // select the STACK forms of C's `#pragma pack` (`pack(push, N)` /

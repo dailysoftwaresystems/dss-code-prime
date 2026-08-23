@@ -14,12 +14,21 @@ name: Publish packages
 # (see packaging/README.md for the exact variables/secrets each needs).
 #
 # ── PREREQUISITES (compiler-repo, currently behind the linker/FFI hold) ───────
-# The rendered manifests install a `dsscp` command + its shared lib and assume
-# an install layout + rpath. They depend on:
-#   (1) the CMake install()/rpath work (the "keep exe+lib" choice), and
-#   (2) the dss-code-prime -> dsscp binary rename.
-# Until both land, keep ENABLE_PKG_PUBLISH unset — the scaffolding is here and
-# ready, but a live publish would ship a manifest that can't install cleanly.
+# The rendered manifests install a `dsscp` command, its shared lib AND its config
+# tree, from a release tarball that is a PREFIX TREE (bin/, lib/, share/)
+# produced by `cmake --install`. They depend on:
+#   (1) ✅ the CMake install()/rpath work — LANDED, `cmake/DssInstall.cmake`, the
+#       single owner of what ships (D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE);
+#   (2) the dss-code-prime -> dsscp binary rename — still queued.
+# Until (2) lands, keep ENABLE_PKG_PUBLISH unset — the scaffolding is here and
+# ready, but a live publish would ship a manifest naming a binary that is still
+# built as `dss-code-prime`.
+#
+# ⛔ EVERY CONSUMER BELOW TAKES THE TREE WHOLE AND NEVER CHERRY-PICKS FILES OUT
+# OF IT. `dsscp` locates its config by a path RELATIVE TO ITS OWN EXECUTABLE
+# (`../share/dss-code-prime/<version>/dss-config`), so rearranging bin/ and
+# share/ produces a compiler that installs cleanly and then cannot resolve a
+# single `#include <stdio.h>`.
 #
 # Channels: a `vX.Y.Z` tag is stable (package name `dsscp`); a `vX.Y.Z-beta` tag
 # is beta (package name `dsscp-beta`, so stable + beta coexist in one tap/bucket).
@@ -308,12 +317,18 @@ jobs:
           pip install --quiet cloudsmith-cli
           build_and_push() {
             local url="$1" deb_arch="$2"
-            rm -rf stage pkg; mkdir -p stage/usr/bin stage/usr/lib pkg
-            curl -fSL --retry 3 -o t.tgz "$url"; tar -xzf t.tgz
-            install -Dm755 bin/dss/dsscp stage/usr/bin/dsscp
-            shopt -s nullglob; libs=(bin/dss/*.so bin/dss/*.so.*); shopt -u nullglob
-            [ ${#libs[@]} -gt 0 ] || { echo "::error::no shared lib matched bin/dss/*.so from $url — would ship dsscp with no runtime lib"; exit 1; }
-            for l in "${libs[@]}"; do install -Dm644 "$l" "stage/usr/lib/$(basename "$l")"; done
+            rm -rf stage pkg extract; mkdir -p stage/usr pkg extract
+            curl -fSL --retry 3 -o t.tgz "$url"; tar -xzf t.tgz -C extract
+            # The tarball IS a prefix tree, and /usr is a prefix — so copy it
+            # whole. Picking the exe and the lib out of it (what this step used
+            # to do) would drop share/dss-code-prime and break the exe's relative
+            # hop to it, shipping a package that installs cleanly and then cannot
+            # compile anything.
+            cp -a extract/. stage/usr/
+            chmod 755 stage/usr/bin/dsscp
+            shopt -s nullglob; libs=(stage/usr/lib/*.so stage/usr/lib/*.so.*); shopt -u nullglob
+            [ ${#libs[@]} -gt 0 ] || { echo "::error::no shared lib under lib/ in $url — would ship dsscp with no runtime lib"; exit 1; }
+            [ -d stage/usr/share/dss-code-prime ] || { echo "::error::no share/dss-code-prime config tree in $url — would ship a dsscp that cannot resolve #include <stdio.h>"; exit 1; }
             fpm -s dir -t deb -n "$PKGNAME" -v "$VERSION" -a "$deb_arch" -p "pkg/" \
               --license "$LICENSE" --description "$DESCRIPTION" --url "$HOMEPAGE" --maintainer "$MAINTAINER" \
               -C stage .
@@ -344,12 +359,18 @@ jobs:
           pip install --quiet cloudsmith-cli
           build_and_push() {
             local url="$1" rpm_arch="$2"
-            rm -rf stage pkg; mkdir -p stage/usr/bin stage/usr/lib pkg
-            curl -fSL --retry 3 -o t.tgz "$url"; tar -xzf t.tgz
-            install -Dm755 bin/dss/dsscp stage/usr/bin/dsscp
-            shopt -s nullglob; libs=(bin/dss/*.so bin/dss/*.so.*); shopt -u nullglob
-            [ ${#libs[@]} -gt 0 ] || { echo "::error::no shared lib matched bin/dss/*.so from $url — would ship dsscp with no runtime lib"; exit 1; }
-            for l in "${libs[@]}"; do install -Dm644 "$l" "stage/usr/lib/$(basename "$l")"; done
+            rm -rf stage pkg extract; mkdir -p stage/usr pkg extract
+            curl -fSL --retry 3 -o t.tgz "$url"; tar -xzf t.tgz -C extract
+            # The tarball IS a prefix tree, and /usr is a prefix — so copy it
+            # whole. Picking the exe and the lib out of it (what this step used
+            # to do) would drop share/dss-code-prime and break the exe's relative
+            # hop to it, shipping a package that installs cleanly and then cannot
+            # compile anything.
+            cp -a extract/. stage/usr/
+            chmod 755 stage/usr/bin/dsscp
+            shopt -s nullglob; libs=(stage/usr/lib/*.so stage/usr/lib/*.so.*); shopt -u nullglob
+            [ ${#libs[@]} -gt 0 ] || { echo "::error::no shared lib under lib/ in $url — would ship dsscp with no runtime lib"; exit 1; }
+            [ -d stage/usr/share/dss-code-prime ] || { echo "::error::no share/dss-code-prime config tree in $url — would ship a dsscp that cannot resolve #include <stdio.h>"; exit 1; }
             fpm -s dir -t rpm -n "$PKGNAME" -v "$VERSION" -a "$rpm_arch" -p "pkg/" \
               --license "$LICENSE" --description "$DESCRIPTION" --url "$HOMEPAGE" --maintainer "$MAINTAINER" \
               -C stage .

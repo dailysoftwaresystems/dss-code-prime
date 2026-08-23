@@ -261,13 +261,59 @@ jobs:
         run: cmake --build "${{ 'build' }}" --parallel
         timeout-minutes: 90
 
+      # ── Stage the INSTALL SET, and tar THAT ───────────────────────────────
+      # D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE. This step used to be
+      # absent and the packaging step below tarred `bin` straight out of the
+      # build directory — so every release shipped a bare executable with NO
+      # `src/dss-config/`, and a packaged compiler could not resolve a single
+      # `#include <stdio.h>`: the shipped-header descriptors, target register
+      # files, object formats, optimizer pipelines and language grammars all
+      # live in that tree.
+      #
+      # ⛔ THE COPY LIST IS NOT HERE, AND MUST NOT BE. `cmake/DssInstall.cmake`
+      # is the ONE owner of what a package contains; this step only asks it to
+      # run. A copy list in YAML would be a second owner, free to drift from the
+      # real one, and the drift would reach users as "the compiler cannot find
+      # its config" rather than as a failed build. The scratch-prefix ctest entry
+      # `install_scratch_prefix_smoke` exercises this exact install set.
+      - name: Stage install set
+        run: |
+          set -e
+          cmake --install "${{ 'build' }}" --prefix "$PWD/stage" --config Release
+
+          # The existing archive check below only asserts "at least one file",
+          # which a bare executable satisfies — that is precisely how a release
+          # shipped without its config tree and nothing noticed.
+          #
+          # ⛔ COMPARED AGAINST THE SOURCE TREE, never against a list written
+          # here: a list would be a second owner of what the config tree contains,
+          # and the next subdirectory added under src/dss-config/ would go missing
+          # from every release while this check stayed green. This leg is the only
+          # guard on release branches — the `install_scratch_prefix_smoke` ctest
+          # entry that covers the same ground does not run here (tests are OFF).
+          cfg="$(find stage/share -type d -name dss-config -print -quit)"
+          [ -n "$cfg" ] || { echo "::error::the staged install set carries no dss-config tree at all."; exit 1; }
+          ( cd src/dss-config && find . -type f ! -path './runtime/platform/dist/*' | sort ) > /tmp/want.txt
+          ( cd "$cfg"        && find . -type f | sort )                                  > /tmp/got.txt
+          if ! missing="$(comm -23 /tmp/want.txt /tmp/got.txt)" || [ -n "$missing" ]; then
+            echo "::error::the staged install set is missing $(printf '%s\n' "$missing" | grep -c .) config file(s) — a packaged compiler with an incomplete config tree cannot resolve #include <stdio.h>."
+            printf '%s\n' "$missing" | head -50
+            exit 1
+          fi
+          echo "staged $(wc -l < /tmp/want.txt) config files under $cfg."
+        timeout-minutes: 10
+
       - name: Package artifact
         env:
           ARTIFACT_NAME: ${{ needs.resolve-version.outputs.artifact-name }}
           VERSION: ${{ needs.resolve-version.outputs.version }}
           PLATFORM: ${{ matrix.platform }}
-          BUILD_DIR: ${{ 'build' }}
-          ARTIFACT_PATHS: ${{ 'bin' }}
+          # The staged PREFIX TREE (bin/, lib/, share/), not the build dir. The
+          # exe finds its config by a path relative to itself, so the tarball
+          # must preserve that relative layout — which is exactly what a prefix
+          # tree is.
+          BUILD_DIR: ${{ 'stage' }}
+          ARTIFACT_PATHS: ${{ '.' }}
           PACKAGE_COMMAND: ${{ '' }}
         run: |
           set -e

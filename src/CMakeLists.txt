@@ -115,6 +115,15 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
             list(APPEND _dss_runtime_dlls "${_dss_toolchain_bin}/${_dll}.dll")
         endif()
     endforeach()
+    # ONE owner for "which runtime DLLs travel with these binaries". The install
+    # set (cmake/DssInstall.cmake) ships the same list beside the INSTALLED exe —
+    # without them a packaged Windows build dies at load with 0xC0000139 on any
+    # machine whose PATH offers a different libstdc++. Published as a cache
+    # variable because that install code runs in the top-level directory scope,
+    # which cannot see this one's locals; re-deriving the list there would let
+    # the shipped runtime disagree with the one the binaries were built against.
+    set(DSS_MINGW_RUNTIME_DLLS "${_dss_runtime_dlls}" CACHE INTERNAL
+        "MinGW runtime DLLs shipped beside the DSS binaries")
     if(_dss_runtime_dlls)
         add_custom_command(TARGET dss-code-prime-lib POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different

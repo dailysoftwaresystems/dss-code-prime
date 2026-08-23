@@ -59,6 +59,38 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    ONLY for work behind a genuine named blocker or an unfired trigger, pinned per §F/§D. If
    the hard part truly cannot land now, that is a **decision gate** (§B): bring the options,
    do not quietly defer.
+3b. **★★★ THE GOAL IS TO *WORK*. A REFERENCE THAT FAILS IS NOT A LICENCE TO FAIL — AND NEVER A
+   REASON TO BREAK SOMETHING THAT WORKS.** Operator ruling, 2026-08-19, verbatim: *"we must never
+   crash on correct code, even if gcc fails, we must do it right. […] If we have a reference that
+   works, we must too (of course, with the implementation always following our project's best
+   practices)."*
+   - **The test is the DISJUNCTION, not the consensus:** if **any** reference compiler (gcc, clang,
+     MSVC, …) compiles and runs the construct correctly, **DSS must too**. One working reference is
+     enough to make the behaviour required. Unanimity among references is not needed, and a majority
+     that fails does not excuse us.
+   - **Therefore a reference's FAILURE is never evidence against DSS.** When DSS accepts something a
+     particular reference rejects, the question is *"does some reference accept it, and is the
+     construct correct?"* — not *"do we match the one that failed?"*. If the answer is yes, DSS is
+     **right**, and the divergence is a **NON-DSS CONFOUND**: attribute it away from DSS, record it,
+     and move on. Never "fix" DSS by teaching it to fail in company.
+   - ⚠ **THIS BOUNDS §A.4's BIDIRECTIONALITY — read them together.** "Accepting what no reference
+     accepts is also a defect" still holds, and the operative word is **NO**: the defect is accepting
+     what **not one** reference accepts. It was never a rule that DSS must reproduce every
+     reference's failure, and reading it that way inverts the project's purpose.
+   - ★ **The implementation still has to be ours**: the whole bar applies to *how* it works —
+     agnostic, config-driven, best-long-term, fail-loud, strictly tested. "It works" is the
+     requirement, not the excuse.
+   ✔**THE CASE THAT PRODUCED THIS RULING** (cycle P14, and it nearly went the wrong way): sqlite's
+   `ext/misc/fileio.c` compiles under **MSVC** (its `_MSC_VER` activates `windirent.h`'s shim, which
+   pulls in `<windows.h>`) and **fails under mingw-gcc** (the shim is gated out). DSS compiles it, by
+   a third route — its shipped `<direct.h>` → `<dirent.h>` → `<windows.h>` descriptor chain. A cycle
+   was about to *narrow that chain so DSS would fail too*, on the reasoning that DSS should agree
+   with gcc. ⇒ **That would have broken working code to match a reference's bug.** MSVC works, so DSS
+   working is the correct outcome; the gcc oracle's failure on that TU is a confound to attribute,
+   not a defect to import. ⚠ Note what the measurement had to be to see this: **each reference
+   probed separately**, not "the reference" as one voice — gcc's failure and MSVC's success are
+   different facts, and only one of them was on file when the wrong conclusion was drawn.
+
 4. **Fail loud.** Every unsupported construct emits a real diagnostic, never a silent
    miscompile or a swallowed error. Follow the `*Fatal` + `X_*`/`D-*` patterns already in
    `src/`.
@@ -96,11 +128,24 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      still worthless. **Add a fourth check: assert the witness is absent from the mutant BY THE
      SAME MATCHER THE PIN USES**, not by eye and not by a different reader. Describe a mutation in
      the harness's output, never inside the mutated file.
+     ★★ **AND AN EMPTY MUTATION ANCHOR MATCHES EVERYWHERE — SO A FAIL-CLOSED CHECK WRITTEN
+     AROUND ONE FIRES *AFTER* THE DAMAGE.** ⚠ ✔MEASURED 2026-08-20 (cycle P23,
+     `D-GATE-RED-ON-DISABLE-EMPTY-RESTORE-ANCHOR-MATCHES-EVERYWHERE`): a mutation whose replacement
+     text was the empty string made the RESTORE anchor `""`, and `str.count("")` returns **`len + 1`**
+     — 8,181 on the subject file. The uniqueness clause therefore tripped on the restore, *after*
+     the forward half had already run, and the source was left mutated with a totality
+     `static_assert` silently gone. It was caught only because the lane re-read the file.
+     ⇒ **Forbid an empty anchor** — delete by replacing with a marker, never with nothing — **and
+     run the restore from a `finally` whose success is itself asserted.**
+     ★★ The generalization is worth more than the fix: **a fail-closed check placed after an
+     irreversible step is not fail-closed, it is a post-mortem.** Every clause above guards the
+     VERDICT; this is the one that corrupts the TREE, and the next cycle would have inherited a
+     source file that silently disagreed with its own pin.
    - **★★★ A GREEN RED-ON-DISABLE IS UNPROVEN UNTIL THE MUTANT IS SHOWN TO HAVE BEEN *READ*.**
-     ✔MEASURED 2026-08-13 — **two independent mechanisms in ONE cycle** each produced a green pin over
-     a live mutant, and in both the four fail-closed clauses above were fully satisfied. They are not
-     variants of one bug; they fail at different layers, which is why the rule has to be about the
-     *read*, not about any one layer:
+     ✔MEASURED — **three independent mechanisms**, two in one cycle (2026-08-13) and a third in
+     P23 (2026-08-20), each produced a green pin over a live mutant with the four fail-closed clauses
+     above fully satisfied. They are not variants of one bug; they fail at different layers, which is
+     why the rule has to be about the *read*, not about any one layer:
      - **The mutant was never COMPILED IN.** `ninja -t deps <obj>` reported **`#deps 0`** — ninja had
        recorded zero header dependencies, so a header-only change did not rebuild its consumer.
        **10 of 403 objects** in `build-dbg` were in that state
@@ -113,10 +158,46 @@ bar **stops and reports** — it never pushes a partial or a workaround.
        in, so a worktree binary run from the shared tree's cwd read the *shared* config and never saw
        the mutant (`D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE`). ⇒ **a config-level
        red-on-disable MUST run through `ctest`, never a bare `.exe`.**
+     - **The mutant was COMPILED IN — TO THE WRONG BINARY.** ✔MEASURED 2026-08-20 (cycle P23,
+       `D-TEST-RED-ON-DISABLE-MTIME-WITNESS-MUST-BE-THE-ARTIFACT-THAT-RUNS-THE-ASSERTION`): the
+       mutated predicate was a **header inline**. A narrow build rebuilt the shared library and its
+       mtime advanced — the instrument the clause above prescribes, behaving exactly as written
+       — and the pin stayed **GREEN**, because the assertion under test calls the copy of the
+       inline compiled into the **TEST EXECUTABLE**, which was never relinked. ⇒ **The witness must
+       be the artifact that *RUNS* the assertion, not merely one that CONTAINS the mutated bytes.**
+       For a `.cpp` in the shared library those are the same file, which is why the shorter wording
+       survived this long; for a header inline, a `constexpr`, a template, or anything else the test
+       TU compiles for itself, they are different files. ★ The tell was in the output and is worth
+       keeping: the run reported *"1 failed"* and that one failure was an unrelated `(Not Run)` from
+       another lane — **a mutant that reds the WRONG test is the same signal as one that reds
+       nothing.** Read *which* test went red, never the count.
      ⇒ **The fifth check, and it subsumes the others: prove the mutated bytes reached the process that
      ran the pin.** A changed file on disk is not a changed input. Show the artifact rebuilt (mtime),
      or the config tree that was read (`DSS_CONFIG_ROOT`), or both — and if you cannot show it, the
      demonstration proved nothing no matter how red or green it came out.
+   - **★★★ AND THE FIFTH CHECK HAS A MIRROR: PROVE THE *RESTORED* BYTES REACHED THE PROCESS TOO.**
+     A red-on-disable makes **two** claims — *mutant RED* **and** *subject GREEN* — and a stale binary
+     silently invalidates the second. The rule above is stated only for the mutate direction, and every
+     word of it applies identically to the restore.
+     ✔MEASURED 2026-08-17 (`D-GATE-RED-ON-DISABLE-RESTORE-NOT-PROVEN-TO-REACH-THE-PROCESS`): a mutation
+     script restored the SOURCE in its `finally` and never rebuilt, so the next script's "UNMUTATED"
+     column ran against a binary that still contained the mutant. **Both of its columns were therefore
+     the mutant — and they agreed perfectly, which reads exactly like a stable measurement.** It
+     produced a false *"these shapes fail even unmutated"* verdict that briefly looked like a
+     correctness bug in the fix under test; the corrected run **inverted the verdict outright**.
+     ⇒ assert a build witness on **every** transition — warm-up → GOOD → MUTANT → RESTORED — and abort
+     fail-closed if any artifact's mtime did not advance. Measure the good column only after a
+     witnessed rebuild.
+   - **★★ A VACUOUS ASM PIN CAN SURVIVE *BOTH* ARMS — `release` is not a rescue.** ✔MEASURED 2026-08-17,
+     twice, in two different shapes. (a) A two-input asm example behind a CALL left its mutant GREEN at
+     baseline and red only at release; the same defect lowered directly in `main` reddened baseline.
+     (b) Worse: a **single `"+r"` operand** stayed green over a live mutant at **both** debug and
+     release — the read half's `mov` targets a dead vreg emitted just before the template, the result
+     vreg's range starts right after, they never overlap, and the linear scan hands the result that
+     very register, already holding the right value. Two tied operands → red on both arms.
+     ⇒ **run the mutant against every arm and report which actually went red.** A pin that survives
+     because an undefined register happened to hold the right value is not a pin, and which shape gets
+     that luck cannot be read off the source.
    - **★★ A PIN MUST DRIVE ITS SUBJECT THROUGH THE SUBJECT'S REAL INPUT PATH — never re-type its
      data.** ✔MEASURED 2026-08-06: a pin stubbed a driver's vocabulary list with eight hand-typed
      tokens — clean by construction, in a shape the driver NEVER RECEIVES — and so could not see
@@ -260,7 +341,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      - **REPORT THE OPEN COUNT AT STEP 10, EVERY CYCLE, WITH ITS DELTA.** A cycle that closes
        fewer rows than it opens is not automatically wrong — a real investigation legitimately
        opens rows — but a sustained positive delta means the quick-fix rule is being skipped, and
-       the number is what makes that visible instead of arguable. `tools/check-anchor-registry.sh`
+       the number is what makes that visible instead of arguable. `scripts/check-anchor-registry/check-anchor-registry.sh`
        already prints the total; the per-cycle honest line is "opened N, closed M, net ±K".
    A workaround that *hides* an issue (excluding a failing test, catch-and-swallow, "it's green
    on the other leg so ignore it here") is the exact silent-failure the bar exists to prevent —

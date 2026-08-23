@@ -71,7 +71,12 @@
 #      Darwin dylibs for the macho legs. A leg whose DECLARED inputs are not on
 #      this machine (or cannot be acquired) records `skipped-build-input-missing`
 #      — LOUDLY, naming every name and path it searched, or quoting the
-#      resolver's refusal — and the run continues with the other legs.
+#      resolver's refusal — and the run continues with the other legs. A leg
+#      declaring a provider NO DRIVER IMPLEMENTS is a different fact and gets a
+#      different verdict: `poisoned`, the closed vocabulary's FAILURE class, per
+#      leg, run continues, exit != 0 — because nothing about this machine could
+#      have changed it. Both drivers answer that condition identically; the
+#      decision itself is the mirrored `dss:unknown-library-provider` region.
 #   7. PER LEG, generate a `.dss-project.json` (language c-subset / profile cli /
 #      the leg's target spec / artifactName testfixture / the 185 TUs as absolute
 #      `sources` / the sqlite+tcl+zlib include dirs / the recipe defines / that
@@ -192,6 +197,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Overridable via env: SQLITE_WSL_DIR  DSS_JOBS  DSS_BIN  SKIP_DSS_BUILD
+#                      DSS_ALLOW_NONRELEASE_COMPILER
 #                      DSS_TIER  DSS_CONFIG  DSS_TEST_FILE  DSS_CONFOUNDS
 #                      DSS_TIER_EXCLUDES  DSS_MAX_RESUMES
 #                      DSS_BRANCH  DSS_COMMIT
@@ -212,6 +218,28 @@
 #               malformed-value handling: an unrecognised value is neither "on"
 #               nor "off", it is a LOUD refusal to start (read at Step 1, so a
 #               typo costs a second rather than a multi-hour corpus run).
+#
+# ── THE COMPILER THIS RUN USES, AND THE ONE CONTRACT ALL THREE SHARE ────────
+# ★★ Step 5 uses a RELEASE dss-code-prime, and the build type is READ from the
+# CMakeCache.txt of the tree that produced the binary and PRINTED next to its
+# path — by every one of these three paths, because the twin (build-and-test.sh)
+# builds -DCMAKE_BUILD_TYPE=Release unconditionally and a number from one driver
+# is comparable with a number from the other only if both say which compiler
+# produced it. See Step 5 for the measured defect this replaces.
+# DSS_BIN     — use THIS binary. An override, never a hint: a path that does not
+#               exist is a refusal, never a silent fall-back to a searched one.
+#               Its build type is still read and still printed.
+# SKIP_DSS_BUILD=1 — reuse a binary already under an eligible root instead of
+#               building. Only a RELEASE one is eligible; with none, this REFUSES
+#               (it is an instruction not to build, so it cannot repair itself)
+#               and lists every candidate it rejected, with each one's build type
+#               and where that answer was read from.
+# DSS_ALLOW_NONRELEASE_COMPILER — 1|true|TRUE|yes proceeds with a non-Release
+#               compiler instead of refusing. It silences NOTHING: the run then
+#               states the actual build type on the Step-5 banner AND in the
+#               Step-9 verdict, so a log from such a run cannot later be quoted
+#               as a controlled measurement. Same three-state parse as
+#               DSS_STRICT_ARM_VERDICTS, read at Step 1 for the same reason.
 #
 # DSS_BRANCH  — the branch you INTEND to test. Unset (default) = whatever the
 #               checkout is on. Set, and Step 2 ASSERTS it and DIES on a mismatch.
@@ -1303,6 +1331,29 @@ DSS_STRICT_ARM_VERDICTS='$($env:DSS_STRICT_ARM_VERDICTS)' is neither on nor off.
 "@
   }
 }
+# DSS_ALLOW_NONRELEASE_COMPILER is read HERE for the same reason, and it is the
+# MORE expensive typo of the two: the check it governs lives in Step 5, which sits
+# AFTER the sqlite clone + configure + stage, so a misspelling discovered there
+# costs the whole staging run rather than a second. Same three-state parse.
+# ★ WHAT IT OPTS OUT OF IS THE REFUSAL, NEVER THE STATEMENT: it permits a
+# non-Release dss-code-prime, and the run then says which build type it actually
+# used on every report line. The variable is CONTROLLED either way — the flag only
+# decides whether an uncontrolled-looking run stops or announces itself.
+$AllowNonReleaseDss = $false
+if ($null -ne $env:DSS_ALLOW_NONRELEASE_COMPILER) {
+  if     ($env:DSS_ALLOW_NONRELEASE_COMPILER -cin @('1','true','TRUE','yes'))     { $AllowNonReleaseDss = $true }
+  elseif ($env:DSS_ALLOW_NONRELEASE_COMPILER -cin @('','0','false','FALSE','no')) { $AllowNonReleaseDss = $false }
+  else {
+    Die @"
+DSS_ALLOW_NONRELEASE_COMPILER='$($env:DSS_ALLOW_NONRELEASE_COMPILER)' is neither on nor off.
+      Recognised (case-sensitive, the SAME set as DSS_STRICT_ARM_VERDICTS above):
+        ON: 1 true TRUE yes   OFF: (empty) 0 false FALSE no
+      An unrecognised value is refused rather than folded into OFF. Folding it into OFF would
+      even be the SAFE direction here (the run would stop at Step 5 either way) and it is still
+      refused: a flag whose typo means something is a flag nobody can read from a log.
+"@
+  }
+}
 try {
   $null = Invoke-WebRequest -Uri 'https://github.com' -Method Head -TimeoutSec 20 -UseBasicParsing
 } catch { Die "offline — cannot reach https://github.com ($($_.Exception.Message))." }
@@ -1365,6 +1416,48 @@ if ($LegFilterRaw.Count) {
   $Legs        = @($AllLegs | Where-Object { $LegFilterRaw -contains $_.label })
   $FilteredOut = @($AllLegs | Where-Object { $LegFilterRaw -notcontains $_.label } | ForEach-Object { $_.label })
 }
+# >>> dss:run-fidelity-select >>>
+# DSS_RUN_FIDELITY: restrict this run to legs whose artefact executes at a given
+# FIDELITY. [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+#
+# ★ WHY THIS IS NOT DSS_LEGS WITH EXTRA STEPS. `DSS_LEGS=elf64-arm64` names a LEG;
+# the operator then has to know, per host, whether that leg reaches real hardware
+# here — the host-keyed reasoning this harness exists to remove from operators'
+# heads. `DSS_RUN_FIDELITY=native,foreign-kernel` names the EVIDENCE wanted and
+# lets the resolver work out which legs supply it on THIS box, so one command means
+# the same thing on the Mac, the arm64 VPS and this desktop.
+#
+# ★★ IT SELECTS THE RUN, NEVER THE BUILD, and a deselected leg is still LEDGERED —
+# `not-selected-by-runner`, the same class DSS_LEGS uses, with a detail naming the
+# fidelity it actually has here. Silence about a declared leg is a harness bug.
+#
+# ⚠ VALIDATED AT THE DOOR against the resolver's own vocabulary, never against a
+# list re-typed in this driver: a typo would otherwise select zero legs, which
+# reads exactly like a host that can execute nothing.
+$FidelityFilter = if ($env:DSS_RUN_FIDELITY) { @($env:DSS_RUN_FIDELITY -split '[,\s]+' | Where-Object { $_ }) } else { @() }
+$FidelityDropped = @()
+if ($FidelityFilter.Count) {
+  # ⚠ THE DIRECT FORM, NOT Invoke-LegResolver: that helper is defined ~1,400
+  # lines BELOW this point and PowerShell binds functions as the script executes,
+  # so calling it here would fail at runtime on the one path an operator reaches
+  # by typing a filter. Everything else in Step 1 uses this same direct spelling.
+  $fidOut = @(& $python3.Source $LegsPy '--run-fidelities' 2>&1)
+  if ($LASTEXITCODE -ne 0) { Die "could not read the run-fidelity vocabulary from harness_legs.py: $($fidOut -join ' ')" }
+  $fidKnown = @($fidOut | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+  $fidBad = @($FidelityFilter | Where-Object { $fidKnown -notcontains $_ })
+  if ($fidBad.Count) {
+    Die "DSS_RUN_FIDELITY names $($fidBad.Count) value(s) this harness does not declare: $($fidBad -join ' ')`n      Known: $($fidKnown -join ' ')`n      A value nothing matches would silently select ZERO legs, which reads exactly like a host that can execute nothing."
+  }
+  $keep = @($Legs | Where-Object { "$($_.run.fidelity)" -and $FidelityFilter -contains "$($_.run.fidelity)" })
+  $FidelityDropped = @($Legs | Where-Object { -not ("$($_.run.fidelity)" -and $FidelityFilter -contains "$($_.run.fidelity)") } | ForEach-Object { $_.label })
+  if (-not $keep.Count) {
+    $have = (($Legs | ForEach-Object { "$($_.label)=$(if ("$($_.run.fidelity)") { $_.run.fidelity } else { '<never runs>' })" }) -join ' ')
+    Die "DSS_RUN_FIDELITY='$($env:DSS_RUN_FIDELITY)' selected NO leg on this host.`n      Per-leg fidelity here: $have`n      A run that covers nothing must stop, not report a clean sweep of zero legs."
+  }
+  $Legs = $keep
+  $FilteredOut = @($FilteredOut + $FidelityDropped | Select-Object -Unique)
+}
+# <<< dss:run-fidelity-select <<<
 Info "catalogue declares $($AllLegs.Count) leg(s) — the SAME set on every host:"
 $SelectedLabels = @($Legs | ForEach-Object { $_.label })
 foreach ($lg in $AllLegs) {
@@ -1376,6 +1469,12 @@ foreach ($lg in $AllLegs) {
     'launched' { "run: LAUNCHED via '$($lg.run.launcher -join ' ')'$(if ("$($lg.run.pathTranslation)" -ne 'none') { " [paths -> $($lg.run.pathTranslation)]" })" }
     default    { "run: skip [$($lg.run.verdict)]" }
   }
+  # ★ THE FIDELITY, BESIDE THE MODE — the two are not the same fact, and the whole
+  # reason this field exists is that one `launched` line can mean real aarch64
+  # hardware and another can mean qemu. Printing the mode alone is what made the
+  # distinction unreadable. [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-
+  # RECORDED-NOR-SELECTABLE]
+  if ("$($lg.run.fidelity)") { $runTxt = "$runTxt  fidelity: $($lg.run.fidelity)" }
   Info "  [$sel] $($lg.label.PadRight(15)) $($lg.spec.PadRight(34)) build: ATTEMPTED   $runTxt"
 }
 if ($FilteredOut.Count) {
@@ -2626,14 +2725,52 @@ Assert-StagedSourceCoherence 'staged sqlite (Step 4)'
 Pass "recipe: $nTus TUs, $nDefs defines, $nIncs include dirs (sqlite @ $sqliteHead) staged under $Stage"
 
 # ── Step 5 — locate (or build) the dss-code-prime compiler ───────────────────
-# Picks the NEWEST existing binary (build-rel Release / build MSVC / build-dbg
-# Ninja-Debug) — newest-wins deliberately avoids a STALE Release binary that
-# predates a project-config field (the exact trap that fails loud below). With
-# no binary present (a fresh clone) it configures + builds Release into build-rel.
+# Picks the newest existing RELEASE binary across every known build root.
+# NEWEST-wins deliberately avoids a STALE binary that predates a project-config
+# field (the exact trap that fails loud below); RELEASE-only is the contract this
+# driver shares with its .sh twin. With no Release binary under any eligible root
+# (a fresh clone) it configures + builds one into the release root.
+# ⚠ THE ROOT LIST IS TRANSITION-SAFE AND SPANS BOTH LAYOUTS. The repo is
+# consolidating onto a single `build/` root with per-build subdirectories
+# (D-BUILD-LAYOUT-FLAT-ROOT-BUILD-DIRS-NOT-MIGRATED); listing only the new paths
+# would break every run made before the physical move, and listing only the
+# legacy ones would keep this harness pinned to trees that are being deleted.
+# New paths come FIRST so that once both exist the new layout wins. Existence
+# decides, never a version flag — the list follows the tree instead of having to
+# be kept in sync with it.
 # ★ THE COMPILER IS A HOST BINARY AND HAS NOTHING TO DO WITH THE LEG SET: ONE
 # dss-code-prime emits every one of the five targets, selected from config. That
 # is why there is one Step 5 and not one per leg.
-Step '5/9  Locate / build dss-code-prime (newest existing, else build Release)'
+#
+# ★★★ THE COMPILER'S OWN BUILD TYPE IS A VARIABLE OF EVERY RUN THIS DRIVER MAKES,
+# AND UNTIL 2026-08-18 IT WAS THE ONE VARIABLE NOBODY CONTROLLED OR EVEN PRINTED.
+# What stood here returned the NEWEST binary across every root WITH NO REGARD FOR
+# HOW IT HAD BEEN BUILT, and reported only its path and its mtime. On any
+# developer box `build/dbg` is the tree the gate rebuilds many times a day, so it
+# is always the newest and newest-wins silently meant "the DEBUG compiler,
+# always" — while the .sh twin builds `-DCMAKE_BUILD_TYPE=Release`
+# unconditionally (build-and-test.sh Step 5) and every POSIX leg therefore timed
+# an `-O3 -DNDEBUG` binary. Two drivers, ONE contract, two different answers, and
+# NEITHER LOG SAID WHICH — which is the same shape as every other twin-divergence
+# defect in this file's history, only this one moved a NUMBER rather than a
+# verdict.
+#
+# ⚠ THE TRAP THAT KEPT IT INVISIBLE IS STILL HERE, so it gets said out loud: this
+# harness's $Config (DSS_CONFIG, default `release`) is the OPTIMIZER PIPELINE THE
+# ARTEFACT IS BUILT WITH — a property of the sqlite build. The COMPILER BINARY'S
+# OWN build type is a completely different variable, and it had no name, no print
+# and no check. Both read as "release" in a log; only one of them was controlled.
+#
+# ✔MEASURED 2026-08-18, and the cost was not a slow run — it was a FALSE
+# COMPARISON written into the anchor registry as a HOST defect. The previous
+# cycle's `build/real-examples/win-probe.log` records
+# `compiler: …\build\dbg\bin\dss\dss-code-prime.exe`, and that tree's
+# CMakeCache.txt says `CMAKE_BUILD_TYPE:STRING=Debug` (-g, no -O, no NDEBUG). The
+# figure that run produced opened
+# D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX and survived a whole cycle.
+# Re-measured with this variable controlled, the ratio is ~2.1x: the row was
+# never about Windows, it was about -O0 against -O3.
+Step '5/9  Locate / build dss-code-prime (RELEASE — build type READ from CMakeCache.txt)'
 # ★★ DISCOVER THE LAYOUT UNDER A BUILD ROOT; DO NOT ENUMERATE IT.
 # [D-HARNESS-PS1-COMPILER-LOOKUP-BLIND-TO-A-MULTI-CONFIG-GENERATOR]
 #
@@ -2657,12 +2794,94 @@ Step '5/9  Locate / build dss-code-prime (newest existing, else build Release)'
 # why this was invisible on every POSIX leg. The ROOTS below remain a declared
 # POLICY list — which build directories are eligible, and their precedence is by
 # mtime, newest wins — while the layout BENEATH each root is discovered.
-function Find-Dss {
+
+# ★★ THE BUILD TYPE IS A FACT ABOUT THE TREE THAT PRODUCED THE BINARY, SO IT IS
+# READ FROM THAT TREE — never inferred from a directory name, never taken from
+# anyone's intent. `build/rel` is a NAME; `CMAKE_BUILD_TYPE` is an ANSWER, and
+# the two are one command away from disagreeing
+# (`cmake -B build/rel -DCMAKE_BUILD_TYPE=Debug` reconfigures that tree in place
+# and renames nothing). The tree is found by walking UP from the binary to the
+# nearest ancestor holding a CMakeCache.txt, for precisely the reason Find-Dss
+# walks DOWN with -Recurse: where the pieces sit relative to a root is a property
+# of the GENERATOR, and every attempt to restate that property here is how a cell
+# comes to be missing.
+#
+# ★ TWO GENERATOR FAMILIES KEEP THE ANSWER IN TWO DIFFERENT PLACES — the same
+# single- vs multi-config split that produced the anchor above:
+#   * SINGLE-config (Ninja, Unix Makefiles): the cache's CMAKE_BUILD_TYPE IS the
+#     answer. EMPTY is not "unknown" and must never be rounded up to Release — it
+#     is CMake's own default of NO optimisation flags at all, so it is reported
+#     as <none> and refused like any other non-Release build.
+#   * MULTI-config (Visual Studio — the default on a stock Windows box): the
+#     cache CANNOT answer, because one tree holds every config at once and
+#     CMAKE_BUILD_TYPE is an entry the generator IGNORES. `cmake -B t
+#     -DCMAKE_BUILD_TYPE=Release` followed by `cmake --build t --config Debug`
+#     leaves a cache saying Release standing over a Debug binary — so trusting
+#     the cache there would reintroduce this step's own defect with a citation
+#     attached. What the generator DOES state is the config it actually built,
+#     written into the OUTPUT PATH; the answer is therefore the path component
+#     that matches one of the configs the cache DECLARES in
+#     CMAKE_CONFIGURATION_TYPES. That is two facts the tree states about itself,
+#     cross-checked against each other — a path component matching nothing
+#     declared is NOT an answer, and is reported as unknown rather than guessed.
+function Get-DssCompilerBuildType($binPath) {
+  $res = [pscustomobject]@{ Path = $binPath; Type = '<unknown>'; Tree = ''; Source = ''; Detail = '' }
+  # Walk UP to the build tree: the nearest ancestor that holds a CMakeCache.txt.
+  $walk = @(); $tree = $null
+  $dir = [System.IO.Path]::GetDirectoryName($binPath)
+  while ($dir) {
+    $walk += $dir
+    if (Test-Path -LiteralPath ([System.IO.Path]::Combine($dir, 'CMakeCache.txt')) -PathType Leaf) { $tree = $dir; break }
+    $parent = [System.IO.Path]::GetDirectoryName($dir)
+    if (-not $parent -or $parent -eq $dir) { break }
+    $dir = $parent
+  }
+  if (-not $tree) {
+    $res.Source = "NO CMakeCache.txt in any ancestor of the binary — nothing on this machine states how it was built (walked: $($walk -join '; '))"
+    return $res
+  }
+  $res.Tree = $tree
+  $cachePath = [System.IO.Path]::Combine($tree, 'CMakeCache.txt')
+  $btype = ''; $cfgTypes = ''; $gen = ''
+  foreach ($ln in (Get-Content -LiteralPath $cachePath)) {
+    # `NAME:TYPE=VALUE`, anchored on the FULL name: `CMAKE_BUILD_TYPE-ADVANCED`
+    # is a different entry and must not be mistaken for this one.
+    if     ($ln -match '^CMAKE_BUILD_TYPE:[^=]*=(.*)$')          { $btype    = $Matches[1].Trim() }
+    elseif ($ln -match '^CMAKE_CONFIGURATION_TYPES:[^=]*=(.*)$') { $cfgTypes = $Matches[1].Trim() }
+    elseif ($ln -match '^CMAKE_GENERATOR:[^=]*=(.*)$')           { $gen      = $Matches[1].Trim() }
+  }
+  if ($cfgTypes) {
+    $declared = @($cfgTypes -split ';' | Where-Object { $_ })
+    $rel   = $binPath.Substring($tree.Length).Trim('\', '/')
+    $parts = @($rel -split '[\\/]' | Where-Object { $_ })
+    # DEEPEST match wins: the config directory is the one closest to the binary.
+    $hits  = @($parts | Where-Object { $declared -contains $_ })
+    if ($hits.Count -ge 1) {
+      $res.Type   = $hits[-1]
+      $res.Source = "the multi-config generator's own output subdirectory '$($hits[-1])', cross-checked against CMAKE_CONFIGURATION_TYPES=$cfgTypes in $cachePath (generator '$gen')"
+    } else {
+      $res.Source = "$cachePath is a MULTI-CONFIG tree (generator '$gen' declares CMAKE_CONFIGURATION_TYPES=$cfgTypes) and NO component of '$rel' names one of them — the config this binary was built with is stated nowhere this driver can read"
+    }
+    if ($btype) { $res.Detail = "the cache also carries CMAKE_BUILD_TYPE=$btype, which a MULTI-config generator IGNORES — it is not the answer here and is printed only so the disagreement is visible" }
+  } elseif ($btype) {
+    $res.Type   = $btype
+    $res.Source = "CMAKE_BUILD_TYPE in $cachePath (single-config generator '$gen')"
+  } else {
+    $res.Type   = '<none>'
+    $res.Source = "$cachePath declares NO CMAKE_BUILD_TYPE (single-config generator '$gen') — not a missing answer: it is CMake's default of no optimisation flags"
+  }
+  return $res
+}
+# One RECORD per candidate binary — path, mtime, and what its own tree says it
+# is. The build type is attached HERE, at discovery, so the SELECTION can honour
+# the contract instead of the contract being checked after a choice was already
+# made for other reasons.
+function Find-DssCandidates {
   # Both spellings on every host: the executable suffix is a fact about the
   # machine this compiler RUNS on, and probing for a name that cannot exist here
   # costs nothing.
   $names = @('dss-code-prime.exe', 'dss-code-prime')
-  $roots = @('build-rel', 'build', 'build-dbg')
+  $roots = @('build/rel', 'build/dbg', 'build-rel', 'build', 'build-dbg')
   $script:DssSearchedDirs = @()
   $cands = @()
   foreach ($r in $roots) {
@@ -2674,46 +2893,188 @@ function Find-Dss {
       $cands += @(Get-ChildItem -LiteralPath $binDir -Filter $n -File -Recurse -ErrorAction SilentlyContinue)
     }
   }
-  $best = $cands | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-  if ($best) { return $best.FullName }
-  return $null
+  $seen = @{}; $out = @()
+  foreach ($c in $cands) {
+    # The roots overlap by construction (`build` contains `build/rel`), and both
+    # name probes can land on one file; a duplicate would make the same binary
+    # look like two candidates in the diagnostics below.
+    if ($seen.ContainsKey($c.FullName)) { continue }
+    $seen[$c.FullName] = $true
+    $bt = Get-DssCompilerBuildType $c.FullName
+    $out += [pscustomobject]@{
+      Path = $c.FullName; LastWriteTime = $c.LastWriteTime
+      Type = $bt.Type; Tree = $bt.Tree; Source = $bt.Source; Detail = $bt.Detail
+    }
+  }
+  return @($out | Sort-Object LastWriteTime -Descending)
 }
-# The searched set, spelled out, for the two `Die`s below: "not found" with no paths
+# ⓘ CASE-INSENSITIVE ON PURPOSE. PowerShell's -eq is case-insensitive for
+# strings, and that is the RIGHT comparison here rather than an accident of the
+# language: CMake uppercases the build type to look up CMAKE_<LANG>_FLAGS_<CFG>,
+# so `-DCMAKE_BUILD_TYPE=release` selects the identical flags as `Release`.
+#
+# ★ ONE SELECTOR FOR ALL THREE BRANCHES, so DSS_ALLOW_NONRELEASE_COMPILER means
+# exactly one thing everywhere: it makes a non-Release binary ELIGIBLE. It never
+# makes one PREFERRED (Release still wins whenever one exists) and it never
+# silences anything — what it returns still passes through the single gate below,
+# which prints the actual build type and marks the run as not comparable.
+# ⚠ THIS WAS CAUGHT BY RUNNING THE REFUSAL RATHER THAN READING IT: the first
+# version of this step selected Release-only in every branch while the
+# SKIP_DSS_BUILD diagnostic offered DSS_ALLOW_NONRELEASE_COMPILER=1 as the remedy
+# — a message advertising an escape hatch that branch did not have. A diagnostic
+# that names a fix which does not work is worse than one that names none.
+function Select-DssCompiler($cands) {
+  $rel = ($cands | Where-Object { $_.Type -eq 'Release' } | Select-Object -First 1)
+  if ($rel -or -not $AllowNonReleaseDss) { return $rel }
+  return ($cands | Select-Object -First 1)   # newest of whatever exists
+}
+function Format-DssCandidateList($cands) {
+  if (-not $cands -or @($cands).Count -eq 0) { return '        <none>' }
+  return ((@($cands) | ForEach-Object { "        $($_.Path)`n            build type: $($_.Type)   built: $($_.LastWriteTime)`n            read from : $($_.Source)" }) -join "`n")
+}
+# The searched set, spelled out, for the `Die`s below: "not found" with no paths
 # is what turned this into a log dive instead of a one-line diagnosis.
 function Get-DssSearchNote {
-  $dirs = if ($script:DssSearchedDirs) { $script:DssSearchedDirs -join '; ' } else { '<Find-Dss not yet called>' }
+  $dirs = if ($script:DssSearchedDirs) { $script:DssSearchedDirs -join '; ' } else { '<Find-DssCandidates not yet called>' }
   return ("searched at any depth under: $dirs (for dss-code-prime.exe or dss-code-prime). " +
           "A multi-config generator lands it in a per-config subdirectory (bin/dss/Release); " +
-          "a single-config one in bin/dss. Set `$env:DSS_BIN to name a binary outside these roots.")
+          "a single-config one in bin/dss. Only a RELEASE binary is eligible, and each candidate's " +
+          "build type is read from its own tree's CMakeCache.txt. Set `$env:DSS_BIN to name a binary " +
+          "outside these roots.")
 }
-if ($env:DSS_BIN -and (Test-Path $env:DSS_BIN)) {
-  $DssBin = (Resolve-Path $env:DSS_BIN).Path
+
+$DssBin = $null; $DssInfo = $null; $DssCands = @()
+if ($env:DSS_BIN) {
+  # ★ AN EXPLICITLY NAMED BINARY IS USED, NEVER SEARCHED FOR — AND IT IS STILL
+  # ASKED WHAT IT IS. `$env:DSS_BIN` decides WHICH binary runs; it does not
+  # decide WHAT that binary is, and keeping those two apart is the whole of this
+  # step.
+  # ⚠ THE GUARD USED TO BE `if ($env:DSS_BIN -and (Test-Path $env:DSS_BIN))`, so a
+  # DSS_BIN naming a path that does not exist fell THROUGH to the search and the
+  # run proceeded with a different compiler than the one the operator named — a
+  # silent substitution in the exact variable this step exists to state. A named
+  # path that is absent is now a refusal.
+  if (-not (Test-Path -LiteralPath $env:DSS_BIN -PathType Leaf)) {
+    Die "`$env:DSS_BIN='$($env:DSS_BIN)' does not name an existing file. It is an override, not a hint: it is never silently replaced by a searched binary."
+  }
+  $DssBin  = (Resolve-Path -LiteralPath $env:DSS_BIN).Path
+  $DssInfo = Get-DssCompilerBuildType $DssBin
   Info "using `$env:DSS_BIN — $DssBin"
 } elseif ($env:SKIP_DSS_BUILD -eq '1') {
-  $DssBin = Find-Dss
-  if (-not $DssBin) { Die ("SKIP_DSS_BUILD=1 but no dss-code-prime binary exists: " + (Get-DssSearchNote)) }
+  $DssCands = Find-DssCandidates
+  $DssInfo  = Select-DssCompiler $DssCands
+  if (-not $DssInfo) {
+    # SKIP_DSS_BUILD is an instruction NOT to build, so this cannot be repaired
+    # by building one — it can only be reported. The two situations it covers are
+    # named apart, because "no binary at all" and "binaries, none of them
+    # eligible" ask the operator for different things, and the remedy list is
+    # conditional for the same reason: an escape hatch that is already ON, or that
+    # would have nothing to select, must not be offered as the fix.
+    Die @"
+SKIP_DSS_BUILD=1 but no eligible dss-code-prime exists, and SKIP_DSS_BUILD forbids building one.
+      $(if (@($DssCands).Count -eq 0) { 'NO dss-code-prime binary exists under any eligible root at all.' } else { 'Every candidate below was rejected on BUILD TYPE — only a Release compiler is eligible.' })
+      This driver times a RELEASE compiler because its .sh twin builds one unconditionally
+      (build-and-test.sh Step 5). Proceeding with a Debug binary compares -O0 against -O3 and
+      publishes the difference as a property of this HOST — which is how
+      D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX came to be opened against the wrong subject.
+      candidates found (build type read from each tree's CMakeCache.txt):
+$(Format-DssCandidateList $DssCands)
+      $(Get-DssSearchNote)
+      Build one (cmake -B build/rel -DCMAKE_BUILD_TYPE=Release && cmake --build build/rel --target dss-code-prime),
+      or unset SKIP_DSS_BUILD and let this step do it$(if (@($DssCands).Count -gt 0 -and -not $AllowNonReleaseDss) { ', or set DSS_ALLOW_NONRELEASE_COMPILER=1 to reuse the newest candidate above ANYWAY — with every report line of the run saying so' }).
+"@
+  }
+  $DssBin = $DssInfo.Path
   Info "SKIP_DSS_BUILD=1 — reusing $DssBin"
 } else {
-  $DssBin = Find-Dss
-  if (-not $DssBin) {
-    Info "no existing binary — configuring + building Release (build-rel)"
-    $bdir = Join-Path $RepoRoot 'build-rel'
-    if (-not (Test-Path $bdir)) { & cmake -S $RepoRoot -B $bdir -DCMAKE_BUILD_TYPE=Release; if ($LASTEXITCODE -ne 0) { Die "cmake configure failed" } }
+  $DssCands = Find-DssCandidates
+  $DssInfo  = Select-DssCompiler $DssCands
+  if (-not $DssInfo) {
+    # SAY WHY A BUILD IS ABOUT TO HAPPEN. "nothing here" and "things here, none
+    # of them eligible" are different facts about this machine, and a reader must
+    # not have to infer which one from the absence of a line.
+    if (@($DssCands).Count -gt 0) {
+      Warn ("no RELEASE dss-code-prime under any eligible root — the following exist and were REJECTED on build type:`n" + (Format-DssCandidateList $DssCands))
+    } else {
+      Info "no dss-code-prime binary under any eligible root"
+    }
+    # A FRESH build always goes to the NEW layout — there is no reason to create
+    # another legacy root. `Find-DssCandidates` above still finds a legacy tree if
+    # one exists, so this only decides where a from-scratch build LANDS.
+    $relDir = if (Test-Path (Join-Path $RepoRoot 'build-rel')) { 'build-rel' } else { 'build/rel' }
+    Info "configuring + building Release ($relDir)"
+    $bdir = Join-Path $RepoRoot $relDir
+    # ⚠ -DCMAKE_BUILD_TYPE=Release is passed on EVERY configure, not only when the
+    # directory is new: an EXISTING tree configured Debug would otherwise keep its
+    # cached answer and this step would "build Release" into a Debug tree. Passing
+    # it re-sets the cache entry, and the gate below re-READS the result rather
+    # than trusting that this line worked.
+    & cmake -S $RepoRoot -B $bdir -DCMAKE_BUILD_TYPE=Release
+    if ($LASTEXITCODE -ne 0) { Die "cmake configure failed" }
     & cmake --build $bdir --config Release --target dss-code-prime -j $Jobs
     if ($LASTEXITCODE -ne 0) { Die "dss-code-prime build failed" }
-    $DssBin = Find-Dss
+    $DssCands = Find-DssCandidates
+    $DssInfo  = Select-DssCompiler $DssCands
+    if ($DssInfo) { $DssBin = $DssInfo.Path }
+  } else {
+    $DssBin = $DssInfo.Path
   }
 }
-if (-not $DssBin -or -not (Test-Path $DssBin)) {
+if (-not $DssBin -or -not (Test-Path -LiteralPath $DssBin)) {
   # ⚠ If the build above SUCCEEDED and you are reading this, the binary landed
-  # outside every eligible root — say WHERE in the report below rather than adding
-  # another cell to a list. [D-HARNESS-PS1-COMPILER-LOOKUP-BLIND-TO-A-MULTI-CONFIG-GENERATOR]
-  Die ("dss-code-prime binary not found after the build step: " + (Get-DssSearchNote))
+  # outside every eligible root, or landed in a tree whose CMakeCache.txt does not
+  # say Release — say WHICH in the report below rather than adding another cell to
+  # a list. [D-HARNESS-PS1-COMPILER-LOOKUP-BLIND-TO-A-MULTI-CONFIG-GENERATOR]
+  Die (@"
+no RELEASE dss-code-prime binary after the build step.
+      $(Get-DssSearchNote)
+      candidates found (build type read from each tree's CMakeCache.txt):
+$(Format-DssCandidateList $DssCands)
+"@)
 }
-$dssAge = (Get-Item $DssBin).LastWriteTime
-Info "compiler: $DssBin  (built $dssAge)"
+# ── ONE GATE, REACHED BY EVERY BRANCH ABOVE ─────────────────────────────────
+# Searched, SKIP_DSS_BUILD, $env:DSS_BIN and freshly-built all arrive here. A
+# check only some branches reach is a check the next branch gets written around,
+# and this step already has three branches because it grew one at a time.
+if (-not $DssInfo) { $DssInfo = Get-DssCompilerBuildType $DssBin }
+$dssAge = (Get-Item -LiteralPath $DssBin).LastWriteTime
+# ★★ THE BUILD TYPE IS PRINTED NEXT TO THE PATH, AND IT CARRIES HOW IT WAS
+# LEARNED. It is printed even when it is the expected answer: a timing produced
+# by this run is comparable with another run's only if BOTH state it, and the
+# defect this replaces was invisible precisely because the expected case printed
+# nothing.
+Info "compiler  : $DssBin  (built $dssAge)"
+Info "build type: $($DssInfo.Type)"
+Info "  read from: $($DssInfo.Source)"
+if ($DssInfo.Detail) { Info "  note     : $($DssInfo.Detail)" }
+# Carried to the Step-9 verdict so the closing citation states the same variable
+# the opening banner did — see the $dssDivergeNote precedent directly above it.
+$DssBuildTypeNote = "  (compiler build type: $($DssInfo.Type))"
+if ($DssInfo.Type -ne 'Release') {
+  if (-not $AllowNonReleaseDss) {
+    Die @"
+this run would be timed against a NON-RELEASE compiler. It REFUSES rather than proceed quietly.
+      compiler   : $DssBin
+      build type : $($DssInfo.Type)
+      read from  : $($DssInfo.Source)
+      note       : $(if ($DssInfo.Detail) { $DssInfo.Detail } else { '(none)' })
+      The .sh twin builds -DCMAKE_BUILD_TYPE=Release unconditionally, so a number from this driver and a
+      number from that one are only comparable if this one is Release too. A Debug dss-code-prime is -g,
+      no -O and no NDEBUG: it compiles the same program correctly and takes several times as long, and
+      the difference lands in whatever the run is being read for.
+      Either build a Release compiler (cmake -B build/rel -DCMAKE_BUILD_TYPE=Release && cmake --build
+      build/rel --target dss-code-prime), or set DSS_ALLOW_NONRELEASE_COMPILER=1 to proceed with THIS
+      binary — the run then says so on every report line, so no measurement taken from it can be quoted
+      as a controlled one.
+"@
+  }
+  # The opt-out does not silence anything; it changes the run's SELF-DESCRIPTION
+  # so a log from an opt-out run cannot later be read as a controlled measurement.
+  $DssBuildTypeNote = "  (compiler build type: $($DssInfo.Type) — NOT Release, DSS_ALLOW_NONRELEASE_COMPILER=1)"
+  Warn "DSS_ALLOW_NONRELEASE_COMPILER=1 — proceeding with a $($DssInfo.Type) compiler. TIMINGS FROM THIS RUN ARE NOT COMPARABLE with build-and-test.sh or with any other run: that driver always times a Release compiler."
+}
 Warn "if the build below fails with a stale-manifest-field error (e.g. unknown 'artifactName'), this binary predates the project-config extensions — rebuild it (delete build-rel or set SKIP_DSS_BUILD off)."
-Pass "dss-code-prime located"
+Pass "dss-code-prime located — $($DssInfo.Type) build"
 
 # ── Step 6 — PER-LEG build inputs (each leg's OWN tcl + z resolve-libraries) ──
 # ★ WHAT CHANGED AND WHY. This used to be two globals — $TclDll/$ZlibDll — that
@@ -2794,12 +3155,59 @@ function Invoke-LegResolver([string[]]$callArgs) {
   }
 }
 
-# Resolve ONE leg's declared (tcl, z) pair. Returns @{ Ok; Tcl; Z; Detail } — plus,
-# for a provider that ACQUIRED its libraries, `Acquired` (the resolver's own
-# per-library records, which Step 7 stages beside the artefact).
-# Ok=$false is ALWAYS `skipped-build-input-missing` with a Detail that names the
-# provider, every candidate NAME and every candidate PATH — a reader must be able
-# to act on it without reading this script.
+# ── A PROVIDER NO DRIVER IMPLEMENTS — THE VERDICT, DECIDED IN ONE PLACE ──────
+# [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+#
+# ★★ THE TWO DRIVERS USED TO ANSWER THIS CONDITION DIFFERENTLY. Until 2026-08-20
+# build-and-test.sh's `*)` arm called `die` — `exit 1`, from a TOP-LEVEL loop, so
+# ONE leg declaring an unimplemented provider cost the whole run and the other
+# four legs never reached a verdict — while THIS driver returned a per-leg record
+# and carried on. Same condition, same tree, two exit codes.
+#
+# ★★★ AND `Ok = $false` WAS THE WRONG ANSWER HERE TOO, in the other direction.
+# The docblock below says (correctly) that Ok=$false is always
+# `skipped-build-input-missing`, which is an ENVIRONMENTAL skip: it only WARNS
+# unless DSS_STRICT_ARM_VERDICTS=1, so this driver filed a HARNESS/CATALOGUE bug
+# as a fact about the operator's machine and exited 0. A leg declaring a provider
+# NO DRIVER IMPLEMENTS is not a missing build input; nothing about that box could
+# have changed the outcome. `poisoned` is the closed vocabulary's FAILURE class
+# and both drivers ALREADY use it for the same shape one level down — see
+# Set-LegVerdict / Set-UnitNotRun, which record `poisoned` + "HARNESS DEFECT: …"
+# when this driver meets a member of a closed vocabulary it cannot classify. So
+# no new verdict is minted, the run still CONTINUES to every other leg, and the
+# run can no longer exit 0.
+#
+# WHY THIS IS A FUNCTION AND WHY IT IS IN A `dss:` REGION. The verdict TOKEN and
+# the message are now one pure function of their arguments, mirrored in the .sh,
+# so `harness_legs.py --check-regions` EXTRACTS BOTH COPIES FROM THE SHIPPED
+# DRIVERS, EXECUTES THEM ON IDENTICAL INPUT AND COMPARES THE ANSWERS. A pin that
+# only READ the two arms could not have caught the divergence that produced this
+# region — the tokens were both spelled correctly in their own file.
+#
+# ⚠ THE MESSAGE IS ASCII ON PURPOSE, for the reason MIRROR_CASES states for the
+# zero-progress sentinel: it is compared BYTE-FOR-BYTE between a PowerShell
+# string and a bash string that reach the battery through two different file
+# readers, and a non-ASCII character would put an encoding question inside the
+# one value the comparison rests on.
+# >>> dss:unknown-library-provider >>>  (region mirrored in build-and-test.sh)
+function Get-UnknownLibraryProviderVerdict($driver, $leg, $provider, $tclNames, $zNames, $known) {
+  return "poisoned`tHARNESS DEFECT: leg '$leg' declares library provider '$provider', which $driver has no dispatch arm for, so this driver cannot obtain that leg's DECLARED inputs (tcl: $tclNames / z: $zNames). ACQUISITION IS NOT DRIVER-LOCAL - pinned-archive is performed by harness_legs.py --acquire, on every host - so NO declared provider should reach this arm; reaching it means the catalogue or LIBRARY_PROVIDERS grew a provider and this driver was not extended in the same change. Add the arm to BOTH drivers: a capability in one driver and not the other is this project's canonical silent harness bug. Known providers: $known (printed by harness_legs.py --library-providers, never copied here)."
+}
+# <<< dss:unknown-library-provider <<<
+
+# Resolve ONE leg's declared (tcl, z) pair. Returns @{ Ok; Verdict; Tcl; Z; Detail }
+# — plus, for a provider that ACQUIRED its libraries, `Acquired` (the resolver's
+# own per-library records, which Step 7 stages beside the artefact).
+# ★ EVERY `Ok = $false` RETURN NAMES ITS OWN `Verdict`, and that is a contract,
+# not a convenience. It used to be a rule stated here instead — "Ok=$false is
+# ALWAYS skipped-build-input-missing" — and the rule was WRONG for one arm: the
+# unknown-provider `default` below is a HARNESS defect, not a missing input, and
+# reporting it as environmental made a bug read as an operator's problem and let
+# the run exit 0. A `Verdict` left off a false return arrives at Set-LegVerdict
+# as an EMPTY token, which that function already refuses loudly — so forgetting
+# one is a red, never a silent default.
+# The Detail must name the provider, every candidate NAME and every candidate
+# PATH — a reader must be able to act on it without reading this script.
 function Resolve-LegLibraries($leg) {
   $libs     = $leg.build.libraries
   $provider = "$($libs.provider)"
@@ -2828,7 +3236,7 @@ function Resolve-LegLibraries($leg) {
       if (-not $z)   { $z   = Find-DeclaredLib $zNames   $roots }
       if ($tcl -and $z) { return @{ Ok = $true; Tcl = $tcl; Z = $z; Detail = "provider 'search-paths'" } }
       $missing = @(); if (-not $tcl) { $missing += "tcl ($($tclNames -join ' | '))" }; if (-not $z) { $missing += "z ($($zNames -join ' | '))" }
-      return @{ Ok = $false; Tcl = $tcl; Z = $z; Detail = "provider 'search-paths' found no $($missing -join ' and no ') under any declared search path [$($roots -join ' ; ')] — install them, add a path via `$env:DSS_PE_LIBDIR, or point `$env:TCL_DLL/`$env:ZLIB_DLL straight at them" }
+      return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = $tcl; Z = $z; Detail = "provider 'search-paths' found no $($missing -join ' and no ') under any declared search path [$($roots -join ' ; ')] — install them, add a path via `$env:DSS_PE_LIBDIR, or point `$env:TCL_DLL/`$env:ZLIB_DLL straight at them" }
     }
     'host-system' {
       $roots = @(Get-HostSystemLibRoots)
@@ -2836,7 +3244,7 @@ function Resolve-LegLibraries($leg) {
       $z   = Find-DeclaredLib $zNames   $roots
       if ($tcl -and $z) { return @{ Ok = $true; Tcl = $tcl; Z = $z; Detail = "provider 'host-system'" } }
       $missing = @(); if (-not $tcl) { $missing += "tcl ($($tclNames -join ' | '))" }; if (-not $z) { $missing += "z ($($zNames -join ' | '))" }
-      return @{ Ok = $false; Tcl = $tcl; Z = $z; Detail = "provider 'host-system' found no $($missing -join ' and no ') under any candidate root [$($roots -join ' ; ')] — this machine has no copy of that target's tcl/zlib runtime; put one anywhere and name the directory in `$env:DSS_HOST_LIBDIR" }
+      return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = $tcl; Z = $z; Detail = "provider 'host-system' found no $($missing -join ' and no ') under any candidate root [$($roots -join ' ; ')] — this machine has no copy of that target's tcl/zlib runtime; put one anywhere and name the directory in `$env:DSS_HOST_LIBDIR" }
     }
     'pinned-archive' {
       # ★ THE LEG'S DECLARED ROUTE, PERFORMED BY THE RESOLVER — never by this
@@ -2858,14 +3266,14 @@ function Resolve-LegLibraries($leg) {
       Info "[$($leg.label)] provider 'pinned-archive' — acquiring this leg's DECLARED libraries via harness_legs.py --acquire (cached after the first run; a cold cache downloads)"
       $acqRun = Invoke-LegResolver @('--acquire', "$($leg.label)")
       if ($acqRun.Rc -ne 0) {
-        return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': harness_legs.py --acquire $($leg.label) FAILED (rc=$($acqRun.Rc)). The declared route could not be completed and nothing was improvised in its place:`n$(($acqRun.Text -split "`n" | ForEach-Object { "        $_" }) -join "`n")" }
+        return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': harness_legs.py --acquire $($leg.label) FAILED (rc=$($acqRun.Rc)). The declared route could not be completed and nothing was improvised in its place:`n$(($acqRun.Text -split "`n" | ForEach-Object { "        $_" }) -join "`n")" }
       }
       $acq = $null
       try { $acq = ($acqRun.Stdout -join "`n") | ConvertFrom-Json } catch {
-        return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': harness_legs.py --acquire $($leg.label) exited 0 but did not print the JSON report this driver reads ($($_.Exception.Message)). Output was:`n$(($acqRun.Text -split "`n" | Select-Object -First 20 | ForEach-Object { "        $_" }) -join "`n")" }
+        return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': harness_legs.py --acquire $($leg.label) exited 0 but did not print the JSON report this driver reads ($($_.Exception.Message)). Output was:`n$(($acqRun.Text -split "`n" | Select-Object -First 20 | ForEach-Object { "        $_" }) -join "`n")" }
       }
       $cdir = "$($acq.cacheDir)"
-      if (-not $cdir) { return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': the acquisition report for $($leg.label) carries no cacheDir, so there is no directory to resolve this leg's libraries out of." } }
+      if (-not $cdir) { return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = ''; Z = ''; Detail = "provider 'pinned-archive': the acquisition report for $($leg.label) carries no cacheDir, so there is no directory to resolve this leg's libraries out of." } }
       # ★ THE SUBSTITUTION IS STATED, NEVER HIDDEN. An acquired library is a
       # STAND-IN: we read its export surface here, and the target machine loads
       # its OWN copy. Its embedded identity is the PACKAGER's (MEASURED: the
@@ -2933,7 +3341,7 @@ function Resolve-LegLibraries($leg) {
       # the artefact, and that copy is driven off this very field. Dropping it on
       # the failure path would produce a binary that links clean here and fails in
       # the target's loader — the one failure this host cannot observe.
-      return @{ Ok = $false; Tcl = $tcl; Z = $z; Acquired = @($acq.libraries | Where-Object { $_ })
+      return @{ Ok = $false; Verdict = 'skipped-build-input-missing'; Tcl = $tcl; Z = $z; Acquired = @($acq.libraries | Where-Object { $_ })
                 TclScriptDir = $tclScriptDir
                 Detail = "provider 'pinned-archive' acquired $(@($acq.libraries | Where-Object { $_ }).Count) file(s) into $cdir but none of them is a declared $($missing -join ' and none is a declared ') — the leg's acquire members and its tclNames/zNames disagree in legs.json (the 'as' name a member materialises under MUST be one this leg's own name list can resolve)." }
     }
@@ -2949,19 +3357,39 @@ function Resolve-LegLibraries($leg) {
       # (`harness_legs.py --acquire`) and is dispatched right here, on every host —
       # which is how a Windows box acquires Darwin dylibs for the macho legs.
       #
-      # ★ EXACTLY ONE DECLARED PROVIDER STILL REACHES THIS ARM, BY NAME:
-      # ubuntu-ports-arm64, the bespoke ancestor of `pinned-archive`.
-      # build-and-test.sh performs it inline with curl + dpkg-deb, and generalising
-      # it into the shared resolver needs a .deb reader — MEASURED 2026-08-04, not
-      # safely doable yet: a modern .deb's inner archive can be zstd, whose stdlib
-      # module arrived only in Python 3.14 (this Windows host has 3.14, the WSL leg
-      # has 3.12), so that route would be a capability that exists on one HOST and
-      # not another — the same defect one level down. It is therefore named here,
-      # with its anchor, instead of quietly passing, and
-      # tests/harness/test_sqlite_harness_legs.cpp carries the self-retiring
-      # exemption that reds the day it IS implemented in both drivers.
+      # ★ NO DECLARED PROVIDER REACHES THIS ARM ANY MORE, AND THE TEXT THAT SAID
+      # OTHERWISE WAS FALSE FOR NINE DAYS. It asserted "exactly one DECLARED
+      # provider still lands here: ubuntu-ports-arm64" and cited that anchor as
+      # live. Both halves had stopped being true: TF-C123 moved the elf64-arm64
+      # leg onto `pinned-archive`, the row CLOSED, `LIBRARY_PROVIDERS` in
+      # harness_legs.py dropped the name — so `--lint` now REFUSES a leg that
+      # declares it — and the self-retiring exemption in
+      # tests/harness/test_sqlite_harness_legs.cpp went to ZERO. A refusal that
+      # names a provider the resolver rejects sends its reader to write a
+      # declaration that cannot load.
+      # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
       # D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
-      return @{ Ok = $false; Tcl = ''; Z = ''; Detail = "library provider `"$provider`" has no dispatch arm in build-and-test.ps1, so this driver cannot obtain this leg's declared inputs (tcl: $($tclNames -join ' | ') / z: $($zNames -join ' | ')). ACQUISITION ITSELF IS NOT DRIVER-LOCAL — pinned-archive is performed HERE, by harness_legs.py --acquire, on every host. Exactly one DECLARED provider still lands in this arm: ubuntu-ports-arm64, whose .deb route build-and-test.sh performs inline with curl + dpkg-deb and which is not generalised into the shared resolver yet (a .deb's inner archive can be zstd, whose stdlib module arrived only in Python 3.14 — a route that works on one HOST and not another is the same defect one level down). D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE. If the provider named above is a DIFFERENT one, the catalogue (or LIBRARY_PROVIDERS in harness_legs.py) grew a provider and this driver was not extended in the same change — add the arm to BOTH drivers, because a capability in one driver and not the other is this project's canonical silent harness bug." }
+      #
+      # ⇒ Reaching this arm now means exactly one thing: the vocabulary grew and
+      # this driver was not extended in the same change. The message says that,
+      # and prints the vocabulary from the set's OWNER rather than a copy that
+      # can drift the way the last one did.
+      # `.Stdout` and not `.Text`: Stdout is already the non-error lines, trimmed.
+      # A refusal that dies computing its own text tells nobody anything, so an
+      # empty result degrades to a pointer rather than to silence.
+      $knownProviders = @((Invoke-LegResolver @('--library-providers')).Stdout |
+                          Where-Object { $_ }) -join ' '
+      if ([string]::IsNullOrWhiteSpace($knownProviders)) {
+        $knownProviders = '<resolver did not print them - read LIBRARY_PROVIDERS in harness_legs.py>'
+      }
+      # ★ NOT A SKIP. The verdict and the message come from the mirrored
+      # `dss:unknown-library-provider` region above, so this driver and the .sh
+      # answer this condition with the SAME token and the SAME words - which is
+      # the whole point, and what they did not do until 2026-08-20.
+      # [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+      $uv = (Get-UnknownLibraryProviderVerdict 'build-and-test.ps1' "$($leg.label)" $provider `
+               ($tclNames -join ' ') ($zNames -join ' ') $knownProviders) -split "`t", 2
+      return @{ Ok = $false; Verdict = $uv[0]; Tcl = ''; Z = ''; Detail = $uv[1] }
     }
   }
 }
@@ -3214,7 +3642,18 @@ foreach ($lg in $AllLegs) {
 # a HARNESS-class non-verification — the runner did not select it — which is the
 # meaning `not-selected-by-runner` already carries in the closed vocabulary.
 foreach ($lbl in $FilteredOut) {
-  Set-LegVerdict $lbl 'not-selected-by-runner' "removed from this run by DSS_LEGS='$($env:DSS_LEGS)' — DECLARED coverage that was not exercised"
+  # ★ WHICH FILTER DROPPED IT, by name. Two filters can remove a leg now, and a
+  # detail that blamed DSS_LEGS for a DSS_RUN_FIDELITY drop would send a reader to
+  # correct a variable they never set. The fidelity arm also states the fidelity
+  # the leg ACTUALLY has here, which is the fact that decides what to type next.
+  # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+  if ($FidelityDropped -contains $lbl) {
+    $lgf = @($AllLegs | Where-Object { $_.label -eq $lbl })[0]
+    $had = if ($lgf -and "$($lgf.run.fidelity)") { "$($lgf.run.fidelity)" } else { '<never runs here>' }
+    Set-LegVerdict $lbl 'not-selected-by-runner' "removed from this run by DSS_RUN_FIDELITY='$($env:DSS_RUN_FIDELITY)' — this leg's run fidelity on this host is '$had'. DECLARED coverage that was not exercised"
+  } else {
+    Set-LegVerdict $lbl 'not-selected-by-runner' "removed from this run by DSS_LEGS='$($env:DSS_LEGS)' — DECLARED coverage that was not exercised"
+  }
 }
 
 # ── WHAT EACH LAUNCHER NEEDS BEYOND ITS OWN argv[0] ─────────────────────────
@@ -3353,8 +3792,20 @@ foreach ($lg in $Legs) {
     Info "[$($lg.label)] tcl : $($r.Tcl)"
     Info "[$($lg.label)] z   : $($r.Z)"
   } else {
-    Set-LegVerdict $lg.label 'skipped-build-input-missing' $r.Detail
-    Warn "[$($lg.label)] BUILD INPUT MISSING — the TESTFIXTURE will NOT be built for this leg on this machine."
+    # ★ THE VERDICT IS THE RESOLVER'S, NOT THIS LOOP'S. It was the literal
+    # 'skipped-build-input-missing' here, which made EVERY unresolved leg
+    # environmental — including the one whose provider no driver implements, a
+    # HARNESS defect that then only warned and let the run exit 0. Each false
+    # return now names its own class; an omitted one arrives EMPTY and
+    # Set-LegVerdict refuses it loudly.
+    # [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+    Set-LegVerdict $lg.label "$($r.Verdict)" $r.Detail
+    if ("$($r.Verdict)" -eq 'poisoned') {
+      Warn "[$($lg.label)] HARNESS DEFECT [poisoned] — the TESTFIXTURE will NOT be built for this leg, and the reason is OURS, not this machine's."
+      Warn "      The other legs are unaffected and the run CONTINUES — but it CANNOT exit 0."
+    } else {
+      Warn "[$($lg.label)] BUILD INPUT MISSING — the TESTFIXTURE will NOT be built for this leg on this machine."
+    }
     Warn "      $($r.Detail)"
     # Said out loud, because it changes what the next steps will do: the CLI is a
     # separate artefact with a separate precondition and Step 7b still tries it.
@@ -4145,17 +4596,36 @@ foreach ($leg in $BuildableLegs) {
   # one does and the build failed. Both leave the leg with NO ORACLE, said in
   # those terms at Step 9, and the corpus still runs.
   $LegLedger[$lbl].Oracle = ''; $LegLedger[$lbl].OracleCc = ''; $LegLedger[$lbl].OracleTriple = ''
+  # ★★ THE ORACLE'S *STATUS*, KEPT ON EVERY OUTCOME — the fact the old code threw
+  # away. [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] `build-failed` means
+  # THE CONTROL RAN AND AGREED WITH US; `no-reference-compiler` means there is no
+  # control at all. Both used to leave an empty Oracle and print the same "NO
+  # ORACLE" line, so a leg whose reference rejects exactly what dss rejects read as
+  # a leg with a missing control. Taken from the resolver's own JSON, never
+  # re-derived from the rc here or from whether a log file happens to exist.
+  $LegLedger[$lbl].OracleStatus = ''
+  $LegLedger[$lbl].OracleLog = (Join-Path $legOut 'reference-oracle.log')
+  $LegLedger[$lbl].BuildAttribution = ''
   $oracleRun = Invoke-LegResolver @('--build-reference-oracle', $lbl,
                                     '--manifest', $manifest,
                                     '--oracle-dir', $legOut,
-                                    '--oracle-log', (Join-Path $legOut 'reference-oracle.log'))
+                                    '--oracle-log', $LegLedger[$lbl].OracleLog)
+  $orep = $null
+  try { $orep = ($oracleRun.Stdout | Where-Object { $_ -match '^\s*\{' } | Select-Object -Last 1) | ConvertFrom-Json } catch { $orep = $null }
+  if ($orep) { $LegLedger[$lbl].OracleStatus = "$($orep.status)" }
   if ($oracleRun.Rc -eq 0) {
-    $orep = ($oracleRun.Stdout | Select-Object -Last 1) | ConvertFrom-Json
     $LegLedger[$lbl].Oracle       = "$($orep.path)"
     $LegLedger[$lbl].OracleCc     = "$($orep.cc)"
     $LegLedger[$lbl].OracleTriple = "$($orep.triple)"
     Info "[$lbl] same-platform ORACLE built by $($orep.cc) ($($orep.triple)) -> $($orep.path)"
   } else {
+    # ★ AND THE TWO NON-ZERO ARMS ARE NOT ONE EVENT. rc 3 = the control RAN and
+    # could not build the very sources dss is about to be handed, which is the
+    # EVIDENCE the per-TU attribution below consumes. rc 4 = this host owns no
+    # compiler for this leg, which is evidence about nothing.
+    if ($oracleRun.Rc -eq 3) {
+      Info "[$lbl] the same-platform ORACLE also FAILED to build these sources — its diagnostics are the CONTROL for this leg's build ($($LegLedger[$lbl].OracleLog))"
+    }
     # The resolver's own words, never this driver's paraphrase of them.
     foreach ($l in ($oracleRun.Text -split "`n")) { if ($l.Trim()) { Warn "[$lbl] oracle: $l" } }
   }
@@ -4171,8 +4641,42 @@ foreach ($leg in $BuildableLegs) {
   $ctimeSuffix = $build.TimeSuffix
   if (-not $build.Ok) {
     Get-Content $clog | Select-String -Pattern 'error\[' | Select-Object -First 5 | ForEach-Object { Info "      $($_.Line)" }
-    Set-LegVerdict $lbl 'poisoned' "build FAILED$ctimeSuffix — $($build.Error). See $clog"
-    Warn "[$lbl] BUILD FAILED$ctimeSuffix — $($build.Error). See $clog"
+    $why = "$($build.Error)"
+    # >>> dss:build-attribution >>>
+    # ★★★ WHOSE FAILURE IS THIS? Asked ONLY when dss actually emitted diagnostics,
+    # because that is the only arm with anything to compare against the control.
+    # [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] The DECISION is the
+    # resolver's — ONE implementation for both drivers, exactly as the confound
+    # report is — and this block only prints what it returned. A resolver refusal
+    # is NOT an attribution: nothing is excused and the detail stays as it was,
+    # which is the safe direction.
+    if ($build.ErrCount -gt 0) {
+      $attrRun = Invoke-LegResolver @('--attribute-build', $lbl,
+                                      '--compile-log', $clog,
+                                      '--oracle-log', $LegLedger[$lbl].OracleLog,
+                                      '--oracle-status', $LegLedger[$lbl].OracleStatus,
+                                      '--manifest', $manifest)
+      $attr = $null
+      if ($attrRun.Rc -eq 0 -or $attrRun.Rc -eq 3) {
+        try { $attr = ($attrRun.Stdout -join "`n") | ConvertFrom-Json } catch { $attr = $null }
+      }
+      if ($attr) {
+        # EVERY TU IS PRINTED, upstream ones included: an upstream TU that vanished
+        # from the log would be indistinguishable from one that compiled.
+        foreach ($l in $attr.report) { if ("$l".Trim()) { Info "$l" } }
+        $charged = @($attr.chargedToDss)
+        $LegLedger[$lbl].BuildAttribution =
+          "$($charged.Count) of $(@($attr.tus).Count) rejected TU(s) charged to DSS" +
+          $(if ($charged.Count) { ": " + (($charged | ForEach-Object { ($_ -split '/')[-1] }) -join ' ') } else { '' })
+        $why = "$($build.Error) — $($LegLedger[$lbl].BuildAttribution)"
+      } else {
+        foreach ($l in ($attrRun.Text -split "`n")) { if ($l.Trim()) { Warn "[$lbl] attribution: $l" } }
+        Warn "[$lbl] build attribution UNAVAILABLE (rc $($attrRun.Rc)) — every diagnostic stays charged to dss, which is the safe direction"
+      }
+    }
+    # <<< dss:build-attribution <<<
+    Set-LegVerdict $lbl 'poisoned' "build FAILED$ctimeSuffix — $why. See $clog"
+    Warn "[$lbl] BUILD FAILED$ctimeSuffix — $why. See $clog"
     continue
   }
   $fixture = $build.Path
@@ -4261,6 +4765,20 @@ foreach ($leg in $Legs) {
   $legLibRes = $LegLibsAll[$lbl]
   if (-not "$($legLibRes.Z)") {
     $CliFails++
+    # ★ THE REASON IS THE LEG'S OWN, NOT AN ASSUMED ENVIRONMENT FACT. "No zlib"
+    # has two causes and they are not the same claim: this machine really has no
+    # copy of that target's zlib (environmental — the message below), or Step 6
+    # never got as far as looking because the leg's own resolution was a HARNESS
+    # DEFECT (a provider no driver implements). Printing the environmental
+    # sentence for the second one files our bug as a fact about the operator's
+    # box. The resolver already named the class, so it is READ, not re-derived —
+    # and the .sh twin makes the same distinction at the same place.
+    # [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+    if ("$($legLibRes.Verdict)" -eq 'poisoned') {
+      Set-DssArtifactVerdict $lbl 'sqlite3' 'poisoned' "$($legLibRes.Detail)  (the CLI links zlib too, so it is lost to the same defect.)"
+      Warn "[$lbl] CLI POISONED — $((Get-DssArtifactVerdict $lbl 'sqlite3').Detail)"
+      continue
+    }
     Set-DssArtifactVerdict $lbl 'sqlite3' 'skipped-build-input-missing' "no zlib could be resolved for this leg on this host, and the CLI links zlib (SQLITE_HAVE_ZLIB=1 reaches a live '#include <zlib.h>' in shell.c). Resolver said: $($legLibRes.Detail)"
     Warn "[$lbl] CLI build NOT ATTEMPTED [skipped-build-input-missing] — $((Get-DssArtifactVerdict $lbl 'sqlite3').Detail)"
     continue
@@ -5692,7 +6210,7 @@ $legRec.Report = $rep
 Step '9/9  Results'
 # $dssDivergeNote is the Step-2 measurement, reprinted verbatim so the opening
 # banner and the closing verdict cannot disagree about the same run.
-Info "compiler : $DssBin @ $dssHead$dssDivergeNote"
+Info "compiler : $DssBin @ $dssHead$dssDivergeNote$DssBuildTypeNote"
 Info "sqlite   : $SqliteWslDir @ $sqliteHead   (staged: $Stage)"
 Info "recipe   : $nTus TUs, $nDefs defines"
 # The ATTRIBUTION ORACLE, surfaced where a human triaging a failure will actually
@@ -5742,8 +6260,18 @@ foreach ($lbl in $LegOrder) {
                                '--reference-path', "$RefOracle",
                                '--leg-oracle', "$(if ($lr) { $lr.Oracle })",
                                '--leg-oracle-cc', "$(if ($lr) { $lr.OracleCc })",
-                               '--leg-oracle-triple', "$(if ($lr) { $lr.OracleTriple })")
+                               '--leg-oracle-triple', "$(if ($lr) { $lr.OracleTriple })",
+                               '--oracle-status', "$(if ($lr) { $lr.OracleStatus })")
   foreach ($l in ($orep.Text -split "`n")) { if ($l.Trim()) { Info "oracle   : $l" } }
+  # ★★ AND WHAT THE ORACLE WAS *FOR*, on the same shelf as the oracle line itself.
+  # [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] An attribution that appears
+  # only in the per-leg build chatter thousands of lines up is one nobody reads,
+  # and the summary is the part of this run that is always read. Printed only when
+  # there IS one — a leg that built has nothing to attribute, and a blank line here
+  # would read as a missing answer rather than an absent question.
+  if ($lr -and "$($lr.BuildAttribution)".Trim()) {
+    Info "oracle   : $lbl build attribution: $($lr.BuildAttribution)"
+  }
 }
 # The RUN reference's own absence, on its own line: the per-leg verdicts above
 # already say NO ORACLE where it matters, and this names the log that explains

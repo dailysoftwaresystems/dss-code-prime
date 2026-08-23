@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <optional>    // std::optional (the declared-or-absent va_list strategy; core lookup)
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>     // std::move, std::pair
 #include <vector>
@@ -27,6 +28,15 @@ namespace {
 // synthesizeThreadsShim's / synthesizePeStartup's.)
 class IdentityClonePolicy final : public opt::passes::MirRebuildPolicy {
 public:
+    // The rebuild DRIVER this policy belongs to — printed by every
+    // `MirFunctionRebuilder` fatal.
+    // See D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS (one line: a wrapped
+    // anchor name mints a second, unregistered anchor).
+    // A MIR merge step, not a `kPassNameTable` pipeline pass.
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "SynthStdioShim";
+    }
+
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
         std::vector<MirBlockId> blocks;

@@ -4,6 +4,13 @@
 //   parse → version → required → optional → enum-resolve → validate → return
 // + the D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD contract (unknown
 // sub-keys reject loud, not silently load with defaults).
+//
+// P10 (2026-08-18) — the schedule-tree grammar: `passes` elements are
+// pass-name leaves or {"repeat":{count,passes}} / {"fixpoint":{max,
+// passes}} nodes; flat documents desugar at load to ONE top-level
+// fixpoint; one spelling per document; load-time budgets (count/max
+// bounds, depth, total worst-case invocations) all fail loud with
+// X_PipelineMalformed.
 
 #include "core/types/parse_diagnostic.hpp"
 #include "opt/optimizer.hpp"
@@ -13,6 +20,7 @@
 #include <algorithm>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace dss;
 
@@ -23,57 +31,106 @@ bool hasCode(std::vector<ConfigDiagnostic> const& diags, DiagnosticCode code) {
         [code](ConfigDiagnostic const& d) { return d.code == code; });
 }
 
+// Message-substring witness — the refusal pins below assert BOTH the
+// code (hasCode) and the diagnostic's own words, so a refactor that
+// keeps the code but blurs the remediation (e.g. stops naming both
+// spellings) still reds.
+bool msgHas(std::vector<ConfigDiagnostic> const& diags,
+            std::string_view needle) {
+    return std::any_of(diags.begin(), diags.end(),
+        [needle](ConfigDiagnostic const& d) {
+            return d.message.find(needle) != std::string::npos;
+        });
+}
+
+// Leaf pass sequence in interpreter (depth-first, left-to-right) order
+// — the loader-test twin of the engine's walk. For the single-root
+// schedules the shipped docs normalize to, this is exactly the
+// document's flat pass list.
+std::vector<opt::PassId>
+leafSequence(opt::OptPipelineNode const& n) {
+    std::vector<opt::PassId> out;
+    switch (n.kind) {
+    case opt::OptPipelineNode::Kind::Leaf:
+        out.push_back(n.passId);
+        break;
+    case opt::OptPipelineNode::Kind::Repeat:
+    case opt::OptPipelineNode::Kind::Fixpoint:
+        for (auto const& c : n.children) {
+            auto sub = leafSequence(c);
+            out.insert(out.end(), sub.begin(), sub.end());
+        }
+        break;
+    }
+    return out;
+}
+
 } // namespace
 
 // Shipped `debug.pipeline.json` loads cleanly + resolves the Identity
 // pass. This is the end-to-end sanity pin — fail here means the JSON
-// file's shape drifted from the loader.
+// file's shape drifted from the loader. P10: the shipped doc now uses
+// the STRUCTURAL spelling (fixpoint{max:1,[Identity]}), which the
+// loader normalizes to root Fixpoint{1,[Identity]} — desugar-identical
+// to the pre-P10 flat `["Identity"]` document.
 TEST(PipelineLoader, ShippedDebugLoadsIdentity) {
     auto r = opt::loadShippedPipeline("debug");
     ASSERT_TRUE(r.has_value()) << "shipped debug.pipeline.json failed to load";
     EXPECT_EQ(r->name, "debug");
-    ASSERT_EQ(r->passes.size(), 1u);
-    EXPECT_EQ(r->passes[0], opt::PassId::Identity);
+    EXPECT_EQ(r->schedule,
+              opt::OptPipelineNode::fixpoint(1, {opt::OptPipelineNode::leaf(
+                                                     opt::PassId::Identity)}))
+        << "debug must desugar to Fixpoint{1, [Identity]} — identical to "
+           "the pre-P10 flat document's schedule";
 }
 
 // Shipped `release.pipeline.json` declares
 // [Identity, Inlining, ConstFold, Mem2Reg, CopyProp, Cse, Licm,
-// SimplifyCfg, Dce] with maxIterations=4 + inlineThreshold=50.
+// SimplifyCfg, Dce] under a top-level fixpoint{max:4}.
 // Inlining runs EARLY (index 1, right after Identity, before
 // ConstFold) so the inlined callee bodies flow through the entire
 // downstream battery — ConstFold folds now-constant arguments,
 // Mem2Reg promotes any spliced allocas, CSE/LICM/SimplifyCFG/DCE
-// clean up — and the maxIterations=4 fixed-point loop re-optimizes
-// (OPT7 cycle 28: inlining shipped, bounded by the size threshold).
+// clean up — and the fixpoint{max:4} loop re-optimizes (OPT7 cycle
+// 28: inlining shipped, bounded by the size threshold).
 // LICM sits AFTER CSE (canonicalized SSA graph) and BEFORE SimplifyCFG
 // (hoisting unconditional defs into the preheader may expose new
 // constant-condition CondBrs the SimplifyCFG pass can fold).
 //
-// EXACT-LIST pin: adding/removing/reordering a pass in the JSON breaks
-// this — it MUST be updated in lockstep (a complementary `contains`
-// check below — `ShippedReleaseContainsInlining` — guards the
-// Inlining membership specifically).
+// EXACT-SCHEDULE pin (P10): the structural doc must desugar to EXACTLY
+// today's schedule — one Fixpoint{4} over the 9 passes in this order —
+// which is exactly what the pre-P10 flat document
+// (`passes:[...9...], maxIterations:4`) desugared to. The top-level
+// `maxIterations` key is GONE from the doc (one-spelling rule).
 TEST(PipelineLoader, ShippedReleaseLoadsAllPasses) {
     auto r = opt::loadShippedPipeline("release");
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->name, "release");
-    ASSERT_EQ(r->passes.size(), 9u);
-    EXPECT_EQ(r->passes[0], opt::PassId::Identity);
-    EXPECT_EQ(r->passes[1], opt::PassId::Inlining);
-    EXPECT_EQ(r->passes[2], opt::PassId::ConstFold);
-    EXPECT_EQ(r->passes[3], opt::PassId::Mem2Reg);
-    EXPECT_EQ(r->passes[4], opt::PassId::CopyProp);
-    EXPECT_EQ(r->passes[5], opt::PassId::Cse);
-    EXPECT_EQ(r->passes[6], opt::PassId::Licm);
-    EXPECT_EQ(r->passes[7], opt::PassId::SimplifyCfg);
-    EXPECT_EQ(r->passes[8], opt::PassId::Dce);
-    EXPECT_EQ(r->maxIterations, 4u);
+    ASSERT_EQ(r->schedule.kind, opt::OptPipelineNode::Kind::Fixpoint);
+    EXPECT_EQ(r->schedule.count, 4u);
+    auto const seq = leafSequence(r->schedule);
+    ASSERT_EQ(seq.size(), 9u);
+    EXPECT_EQ(seq[0], opt::PassId::Identity);
+    EXPECT_EQ(seq[1], opt::PassId::Inlining);
+    EXPECT_EQ(seq[2], opt::PassId::ConstFold);
+    EXPECT_EQ(seq[3], opt::PassId::Mem2Reg);
+    EXPECT_EQ(seq[4], opt::PassId::CopyProp);
+    EXPECT_EQ(seq[5], opt::PassId::Cse);
+    EXPECT_EQ(seq[6], opt::PassId::Licm);
+    EXPECT_EQ(seq[7], opt::PassId::SimplifyCfg);
+    EXPECT_EQ(seq[8], opt::PassId::Dce);
     EXPECT_EQ(r->inlineThreshold, 50u);
+    // All nine are DIRECT children of the root fixpoint (the collapse
+    // rule — no wrapper fixpoint{1} around the doc's single fixpoint).
+    ASSERT_EQ(r->schedule.children.size(), 9u);
+    for (auto const& c : r->schedule.children) {
+        EXPECT_EQ(c.kind, opt::OptPipelineNode::Kind::Leaf);
+    }
 }
 
-// maxIterations bounds (D-OPT-FIXED-POINT-LOOP): rejected when 0
-// (silent-no-op trap) or > kMaxPipelineIterations (non-convergence
-// signal). Missing field defaults to 1.
+// maxIterations bounds (D-OPT-FIXED-POINT-LOOP), flat spelling:
+// rejected when 0 (silent-no-op trap) or > kMaxPipelineIterations
+// (non-convergence signal).
 TEST(PipelineLoader, MaxIterationsZeroRejects) {
     auto r = opt::loadPipelineFromText(
         R"({"dssPipelineVersion": 1, "pipeline":
@@ -101,13 +158,379 @@ TEST(PipelineLoader, MaxIterationsNonIntegerRejects) {
     EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
 }
 
+// Missing maxIterations on a FLAT document desugars to Fixpoint{1}.
 TEST(PipelineLoader, MaxIterationsMissingDefaultsToOne) {
     auto r = opt::loadPipelineFromText(
         R"({"dssPipelineVersion": 1, "pipeline":
             {"name": "x", "passes": ["Identity"]}})",
         "no-max-iter.json");
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->maxIterations, 1u);
+    EXPECT_EQ(r->schedule,
+              opt::OptPipelineNode::fixpoint(
+                  1, {opt::OptPipelineNode::leaf(opt::PassId::Identity)}));
+}
+
+// ── P10: the schedule-tree grammar ─────────────────────────────────────
+
+// ★ THE DESUGARING PIN: a flat document and its structural twin load
+// to the IDENTICAL tree. The flat twin carries top-level
+// maxIterations:4; the structural twin spells the same loop as
+// {"fixpoint":{"max":4,...}} and MUST NOT combine it with maxIterations
+// (one spelling). This is the load-side half of the sequence-identity
+// proof — the desugaring maps the loop nest (iteration × passes) 1:1.
+TEST(PipelineLoader, FlatAndStructuralTwinsLoadIdenticalTrees) {
+    auto flat = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "twin", "passes": ["ConstFold", "Dce"],
+             "maxIterations": 4}})",
+        "twin-flat.json");
+    auto structural = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "twin", "passes": [
+               {"fixpoint": {"max": 4, "passes": ["ConstFold", "Dce"]}}]}})",
+        "twin-structural.json");
+    ASSERT_TRUE(flat.has_value());
+    ASSERT_TRUE(structural.has_value());
+    EXPECT_EQ(flat->schedule, structural->schedule)
+        << "the structural spelling MUST collapse to the flat spelling's "
+           "root fixpoint — otherwise the two documents would not be "
+           "desugar-identical and the byte-identity battery would diverge";
+    EXPECT_EQ(flat->name, structural->name);
+    EXPECT_EQ(flat->inlineThreshold, structural->inlineThreshold);
+    EXPECT_EQ(flat->verifyEveryPass, structural->verifyEveryPass);
+
+    opt::OptPipelineNode const expected =
+        opt::OptPipelineNode::fixpoint(4, {opt::OptPipelineNode::leaf(
+                                               opt::PassId::ConstFold),
+                                           opt::OptPipelineNode::leaf(
+                                               opt::PassId::Dce)});
+    EXPECT_EQ(flat->schedule, expected);
+    EXPECT_EQ(structural->schedule, expected);
+}
+
+// A MIXED structural document (leaves + a node, or a lone repeat)
+// normalizes to root Fixpoint{1, [elements]} — the wrap case.
+TEST(PipelineLoader, StructuralDocWrapsInUnitFixpointRoot) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "wrap", "passes": [
+               "Identity",
+               {"repeat": {"count": 2, "passes": ["ConstFold"]}},
+               {"fixpoint": {"max": 3, "passes": ["Dce", "Cse"]}}]}})",
+        "wrap.json");
+    ASSERT_TRUE(r.has_value());
+    opt::OptPipelineNode const expected = opt::OptPipelineNode::fixpoint(
+        1, {opt::OptPipelineNode::leaf(opt::PassId::Identity),
+            opt::OptPipelineNode::repeat(
+                2, {opt::OptPipelineNode::leaf(opt::PassId::ConstFold)}),
+            opt::OptPipelineNode::fixpoint(
+                3, {opt::OptPipelineNode::leaf(opt::PassId::Dce),
+                    opt::OptPipelineNode::leaf(opt::PassId::Cse)})});
+    EXPECT_EQ(r->schedule, expected);
+}
+
+// NESTED structural nodes parse recursively.
+TEST(PipelineLoader, NestedNodesParse) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "nested", "passes": [
+               {"fixpoint": {"max": 2, "passes": [
+                   "ConstFold",
+                   {"repeat": {"count": 3, "passes": ["Cse", "Dce"]}}]}}]}})",
+        "nested.json");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->schedule,
+              opt::OptPipelineNode::fixpoint(
+                  2, {opt::OptPipelineNode::leaf(opt::PassId::ConstFold),
+                      opt::OptPipelineNode::repeat(
+                          3, {opt::OptPipelineNode::leaf(opt::PassId::Cse),
+                              opt::OptPipelineNode::leaf(opt::PassId::Dce)})}));
+}
+
+// ★ ONE SPELLING PER DOCUMENT: a structural document REFUSES top-level
+// maxIterations — X_PipelineMalformed naming BOTH spellings.
+TEST(PipelineLoader, MaxIterationsBesideStructuralNodeRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "both-spellings", "maxIterations": 4, "passes": [
+               {"fixpoint": {"max": 2, "passes": ["Identity"]}}]}})",
+        "both-spellings.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+    EXPECT_TRUE(msgHas(r.error(), "maxIterations"));
+    EXPECT_TRUE(msgHas(r.error(), "fixpoint"))
+        << "the refusal must name BOTH spellings so the remediation is "
+           "actionable, not just 'malformed'";
+    // A `repeat` node triggers the same one-spelling refusal.
+    auto r2 = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "both-spellings-repeat", "maxIterations": 4, "passes": [
+               {"repeat": {"count": 2, "passes": ["Identity"]}}]}})",
+        "both-spellings-repeat.json");
+    ASSERT_FALSE(r2.has_value());
+    EXPECT_TRUE(hasCode(r2.error(), DiagnosticCode::X_PipelineMalformed));
+    EXPECT_TRUE(msgHas(r2.error(), "maxIterations"));
+    EXPECT_TRUE(msgHas(r2.error(), "repeat"));
+}
+
+// ★ UNKNOWN NODE KIND: an object element declaring neither repeat nor
+// fixpoint (seq / when / parallel do not exist — the grammar is CLOSED)
+// → X_PipelineMalformed naming the two legal node kinds.
+TEST(PipelineLoader, UnknownNodeKindRejects) {
+    for (std::string_view kind : {"seq", "when", "parallel"}) {
+        // The fixture must be WELL-FORMED JSON — a broken document fails
+        // at the json parse step with a different code/message and this
+        // test would pass its ASSERTs for the wrong reason. Braces: inner
+        // passes [], the node-value object, the node object, the top
+        // passes array, pipeline, document.
+        auto r = opt::loadPipelineFromText(
+            std::string{"{\"dssPipelineVersion\": 1, \"pipeline\": "
+                        "{\"name\": \"x\", \"passes\": [\"Identity\", {\""}
+                   + kind.data() + std::string{"\": {\"passes\": [\"Dce\"]}}]}}"},
+            "unknown-node.json");
+        ASSERT_FALSE(r.has_value()) << "node kind '" << kind << "'";
+        EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+        EXPECT_TRUE(msgHas(r.error(), "unknown pipeline node kind"))
+            << "node kind '" << kind << "'";
+    }
+}
+
+// A node object declaring BOTH repeat and fixpoint → refusal (exactly
+// one of the two).
+TEST(PipelineLoader, BothNodeKindsRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": [
+               {"repeat": {"count": 2, "passes": ["Identity"]},
+                "fixpoint": {"max": 2, "passes": ["Dce"]}}]}})",
+        "both-kinds.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+    EXPECT_TRUE(msgHas(r.error(), "exactly ONE"));
+}
+
+// Unknown keys on/inside a node object → X_PipelineMalformed
+// (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD extends to the node grammar).
+TEST(PipelineLoader, UnknownNodeKeyRejects) {
+    // sibling key on the node object
+    auto r1 = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": [
+               {"repeat": {"count": 2, "passes": ["Identity"]},
+                "when": "x86_64"}]}})",
+        "node-sibling-key.json");
+    ASSERT_FALSE(r1.has_value());
+    EXPECT_TRUE(hasCode(r1.error(), DiagnosticCode::X_PipelineMalformed));
+    // unknown key inside the node body (a per-step pass param would
+    // land here — forbidden)
+    auto r2 = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": [
+               {"fixpoint": {"max": 2, "passes": ["Identity"],
+                             "threshold": 9}}]}})",
+        "node-body-key.json");
+    ASSERT_FALSE(r2.has_value());
+    EXPECT_TRUE(hasCode(r2.error(), DiagnosticCode::X_PipelineMalformed));
+    EXPECT_TRUE(msgHas(r2.error(), "unknown key"));
+}
+
+// ── `$`-DOCUMENTATION KEYS, ON EVERY OBJECT ──────────────────────────────
+//
+// The repo-wide convention is that ANY config object may carry a `$`-prefixed
+// PROSE key. This loader's hand-written `rejectUnknownKeys` applied NO such
+// carve-out — not a literal, not a predicate — so a `$comment` explaining why
+// a pipeline is shaped the way it is was REFUSED as a typo, at every one of
+// its four objects. A real refusal of a valid document: the inverse of a
+// silent drop, and just as wrong. The check now comes from
+// `core/types/config_key_vocabulary.hpp`, where the carve-out is unskippable
+// because the caller no longer writes the loop.
+//
+// ⚠ Each accept is paired with the SAME document carrying a NON-`$` unknown
+// key in the SAME position. Without that pairing this test would also pass
+// against a loader that accepted everything, which is the defect the
+// discriminator exists to prevent (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD).
+//
+// RED-ON-DISABLE: remove the `isDocumentationKey` skip in `dss::detail::
+// rejectUnknownKeys` and the accepting arms go red; remove the membership loop
+// and the rejecting arms go red.
+TEST(PipelineLoader, DocumentationKeysAcceptedAtEveryObjectOrdinaryKeysStillRejected) {
+    // Root, `pipeline`, and a node body — all three objects at once.
+    auto ok = opt::loadPipelineFromText(
+        R"({"$comment": "why this schedule",
+             "dssPipelineVersion": 1,
+             "pipeline": {"$nameComment": "the flat spelling",
+               "name": "x", "passes": [
+                 {"fixpoint": {"$boundComment": "converges fast",
+                               "max": 2, "passes": ["Identity"]}}]}})",
+        "doc-keys-ok.json");
+    ASSERT_TRUE(ok.has_value())
+        << "a `$`-prefixed key is PROSE at every config object, and the prefix "
+           "is the rule — not the single spelling `$comment`";
+
+    // The same three positions, each with an ORDINARY unknown key: all refused.
+    struct Arm { char const* label; char const* text; };
+    Arm const arms[] = {
+        {"root", R"({"comment": "x", "dssPipelineVersion": 1,
+                     "pipeline": {"name": "x", "passes": ["Identity"]}})"},
+        {"pipeline block", R"({"dssPipelineVersion": 1,
+                     "pipeline": {"comment": "x", "name": "x",
+                                  "passes": ["Identity"]}})"},
+        {"node body", R"({"dssPipelineVersion": 1,
+                     "pipeline": {"name": "x", "passes": [
+                       {"fixpoint": {"comment": "x", "max": 2,
+                                     "passes": ["Identity"]}}]}})"},
+    };
+    for (auto const& a : arms) {
+        auto bad = opt::loadPipelineFromText(a.text, "doc-keys-bad.json");
+        EXPECT_FALSE(bad.has_value())
+            << "an ordinary unknown key at the " << a.label << " must still be "
+               "refused — otherwise the `$` accept above proves only that the "
+               "discriminator was switched off";
+        if (bad.has_value()) continue;
+        EXPECT_TRUE(hasCode(bad.error(), DiagnosticCode::X_PipelineMalformed));
+        EXPECT_TRUE(msgHas(bad.error(),
+                           "D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD"))
+            << "the anchor id must survive the move to the shared check — it "
+               "is how this rule is found from a failing document";
+    }
+}
+
+// Non-string, non-object element → X_PipelineMalformed.
+TEST(PipelineLoader, NonStringNonObjectElementRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1,
+             "pipeline": { "name": "x", "passes": ["Identity", 42] } })",
+        "numeric-element.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+}
+
+// ★ count/max BOUNDS on node objects: 0 and 33 both reject, mirroring
+// the flat maxIterations trio.
+TEST(PipelineLoader, NodeCountBoundsReject) {
+    for (std::string_view v : {"0", "33"}) {
+        auto r = opt::loadPipelineFromText(
+            std::string{"{\"dssPipelineVersion\": 1, \"pipeline\": "
+                        "{\"name\": \"x\", \"passes\": [{\"repeat\": "
+                        "{\"count\": "}
+                   + v.data() + std::string{", \"passes\": [\"Identity\"]}}]}}"},
+            "count-bound.json");
+        ASSERT_FALSE(r.has_value()) << "repeat count " << v;
+        EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+        EXPECT_TRUE(msgHas(r.error(), "[1, 32]"));
+    }
+}
+
+TEST(PipelineLoader, NodeMaxBoundsReject) {
+    for (std::string_view v : {"0", "33"}) {
+        auto r = opt::loadPipelineFromText(
+            std::string{"{\"dssPipelineVersion\": 1, \"pipeline\": "
+                        "{\"name\": \"x\", \"passes\": [{\"fixpoint\": "
+                        "{\"max\": "}
+                   + v.data() + std::string{", \"passes\": [\"Identity\"]}}]}}"},
+            "max-bound.json");
+        ASSERT_FALSE(r.has_value()) << "fixpoint max " << v;
+        EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+        EXPECT_TRUE(msgHas(r.error(), "[1, 32]"));
+    }
+}
+
+// ★ DEPTH BUDGET: combinator nesting ≤ 8 (the normalized root
+// fixpoint counts as 1). Root + 7 nested repeats = depth 8 (accepted);
+// root + 8 = depth 9 (rejected) — both sides of the boundary pinned.
+namespace {
+// {"repeat":{"count":1,"passes":[ <inner> ]}} — `inner` is either a
+// leaf list ("Identity") or another nesting level.
+std::string nestedRepeats(unsigned levels) {
+    std::string doc =
+        "{\"dssPipelineVersion\": 1, \"pipeline\": {\"name\": \"d\", "
+        "\"passes\": [";
+    for (unsigned i = 0; i < levels; ++i) {
+        doc += "{\"repeat\":{\"count\":1,\"passes\":[";
+    }
+    doc += "\"Identity\"";
+    for (unsigned i = 0; i < levels; ++i) {
+        doc += "]}}";
+    }
+    doc += "]}}";
+    return doc;
+}
+} // namespace
+
+TEST(PipelineLoader, DepthBudgetRejectsNineLevels) {
+    auto nine = opt::loadPipelineFromText(nestedRepeats(8), "depth-9.json");
+    ASSERT_FALSE(nine.has_value());
+    EXPECT_TRUE(hasCode(nine.error(), DiagnosticCode::X_PipelineMalformed));
+    EXPECT_TRUE(msgHas(nine.error(), "nesting depth"));
+
+    auto eight = opt::loadPipelineFromText(nestedRepeats(7), "depth-8.json");
+    ASSERT_TRUE(eight.has_value())
+        << "depth 8 (root + 7 nested combinators) is INSIDE the budget — "
+           "rejecting it would tighten the rule without a ruling";
+}
+
+// ★ TOTAL-BUDGET OVERFLOW via nested repeats: repeat(32,[repeat(32,
+// [8 passes])]) unrolls to 32×32×8 = 8192 > 4096 worst-case
+// invocations → rejected; a within-budget twin loads.
+TEST(PipelineLoader, InvocationBudgetOverflowRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": [
+               {"repeat": {"count": 32, "passes": [
+                 {"repeat": {"count": 32, "passes": [
+                   "Identity","Identity","Identity","Identity",
+                   "Identity","Identity","Identity","Identity"]}}]}}]}})",
+        "budget-overflow.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+    EXPECT_TRUE(msgHas(r.error(), "4096"));
+
+    // Within budget: repeat(2,[fixpoint(4,[3 passes])]) = 24.
+    auto ok = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "y", "passes": [
+               {"repeat": {"count": 2, "passes": [
+                 {"fixpoint": {"max": 4, "passes": ["Identity","Dce","Cse"]}}]}}]}})",
+        "budget-ok.json");
+    ASSERT_TRUE(ok.has_value());
+}
+
+// ★ EMPTY BODIES inside nodes reject (existing empty-pipeline
+// discipline, extended to every node — an empty body would run
+// nothing). Includes the NESTED-empty shape.
+TEST(PipelineLoader, EmptyNodeBodyRejects) {
+    auto r1 = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": [
+               {"repeat": {"count": 2, "passes": []}}]}})",
+        "empty-repeat.json");
+    ASSERT_FALSE(r1.has_value());
+    EXPECT_TRUE(hasCode(r1.error(), DiagnosticCode::X_PipelineMalformed));
+    EXPECT_TRUE(msgHas(r1.error(), "at least one entry"));
+
+    auto r2 = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": [
+               {"fixpoint": {"max": 3, "passes": ["Identity",
+                 {"repeat": {"count": 1, "passes": []}}]}}]}})",
+        "empty-nested.json");
+    ASSERT_FALSE(r2.has_value());
+    EXPECT_TRUE(hasCode(r2.error(), DiagnosticCode::X_PipelineMalformed));
+    EXPECT_TRUE(msgHas(r2.error(), "at least one entry"))
+        << "an empty body nested inside another node's body must reject "
+           "too — the check is per-node, not only top-level";
+}
+
+// A fixpoint node with an unknown pass name in its body →
+// X_UnknownPassName with node-path context.
+TEST(PipelineLoader, UnknownPassNameInsideNodeRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": [
+               {"fixpoint": {"max": 2, "passes": ["MadeUpPass"]}}]}})",
+        "unknown-in-node.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_UnknownPassName));
 }
 
 // inlineThreshold bounds (OPT7 cycle 28 cost model) — MIRRORS the
@@ -161,14 +584,14 @@ TEST(PipelineLoader, InlineThresholdInRange) {
 
 // SHIP pin (complementary to the exact-list ShippedReleaseLoadsAllPasses
 // above): the shipped `release.pipeline.json` CONTAINS `PassId::Inlining`
-// — a `std::find` membership check, robust to future reordering. OPT7
+// — a walk over the loaded tree, robust to future reordering. OPT7
 // cycle 28 shipped inlining in release (bounded by inlineThreshold).
-// RED-on-disable: removing "Inlining" from release.json makes the find
-// fail this assertion.
+// RED-on-disable: removing "Inlining" from release.json makes the
+// membership fail this assertion.
 TEST(PipelineLoader, ShippedReleaseContainsInlining) {
     auto r = opt::loadShippedPipeline("release");
     ASSERT_TRUE(r.has_value());
-    auto const& passes = r->passes;
+    auto const passes = leafSequence(r->schedule);
     EXPECT_NE(std::find(passes.begin(), passes.end(), opt::PassId::Inlining),
               passes.end())
         << "the shipped release pipeline MUST contain Inlining (OPT7 cycle "
@@ -176,14 +599,12 @@ TEST(PipelineLoader, ShippedReleaseContainsInlining) {
 }
 
 // D-OPT1-PASS-DUP-POLICY: a pipeline declaring the SAME pass twice
-// (e.g. `[ConstFold, ConstFold]`) is structurally legal. The pipeline-
-// level fixed-point loop already lets a pass re-run; declaring the
+// (e.g. `[ConstFold, ConstFold]`) is structurally legal. The
+// pipeline-level fixed-point loop already lets a pass re-run; declaring the
 // duplicate explicitly is the OPT2b "transpile-readable" use case
 // where const-fold runs first, peephole rewrites land between, then
 // const-fold runs again to fold the rewrites' constants. The loader
-// MUST accept this without complaint. (Future opt-time rejection of
-// pathological pipelines is a separate concern — the loader's job is
-// schema-conformance, not optimality.)
+// MUST accept this without complaint.
 TEST(PipelineLoader, DuplicatePassesInPipelineAreLegal) {
     auto r = opt::loadPipelineFromText(
         R"({"dssPipelineVersion": 1, "pipeline":
@@ -192,9 +613,10 @@ TEST(PipelineLoader, DuplicatePassesInPipelineAreLegal) {
         "dup-passes.json");
     ASSERT_TRUE(r.has_value()) << "duplicate PassIds in a pipeline must load";
     EXPECT_EQ(r->name, "double-const-fold");
-    ASSERT_EQ(r->passes.size(), 2u);
-    EXPECT_EQ(r->passes[0], opt::PassId::ConstFold);
-    EXPECT_EQ(r->passes[1], opt::PassId::ConstFold);
+    auto const seq = leafSequence(r->schedule);
+    ASSERT_EQ(seq.size(), 2u);
+    EXPECT_EQ(seq[0], opt::PassId::ConstFold);
+    EXPECT_EQ(seq[1], opt::PassId::ConstFold);
 }
 
 // Missing version → X_PipelineVersionMismatch. The version gate is the
@@ -260,8 +682,8 @@ TEST(PipelineLoader, UnknownNameResolutionFails) {
                         DiagnosticCode::X_PipelineNameResolutionFailed));
 }
 
-// Empty `passes` array → X_PipelineMalformed. The optimizer engine's
-// loop runs zero times on an empty pipeline + returns ok=true with
+// Empty `passes` array → X_PipelineMalformed. The optimizer engine
+// would run zero passes on an empty pipeline + return ok=true with
 // passesRun=0 — silently signalling "ran an optimizer" when nothing
 // happened. The loader rejects load-time to prevent this.
 TEST(PipelineLoader, EmptyPassesArrayRejects) {
@@ -283,12 +705,63 @@ TEST(PipelineLoader, MalformedJsonRejects) {
 }
 
 // Non-string entry in passes array → X_PipelineMalformed (NOT
-// X_UnknownPassName — those are distinct remediations).
+// X_UnknownPassName — those are distinct remediations). Kept from the
+// pre-P10 suite via the non-string/non-object arm.
 TEST(PipelineLoader, NonStringPassEntryRejects) {
     auto r = opt::loadPipelineFromText(
         R"({ "dssPipelineVersion": 1,
-             "pipeline": { "name": "x", "passes": ["Identity", 42] } })",
+             "pipeline": { "name": "x", "passes": ["Identity", true] } })",
         "non-string.json");
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+}
+
+// ── P10 stage topology: the `unitPipeline` key (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE) ──
+
+// A non-empty string key is accepted and lands on the loaded pipeline — the
+// name the UNIT stage resolves instead of this document.
+TEST(PipelineLoader, UnitPipelineNameLandsOnThePipeline) {
+    auto r = opt::loadPipelineFromText(
+        R"({ "dssPipelineVersion": 1, "unitPipeline": "release-unit",
+             "pipeline": { "name": "release",
+                          "passes": [{"fixpoint": {"max": 4, "passes": ["Identity"]}}] } })",
+        "unit-name.json");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->unitPipelineName, "release-unit");
+}
+
+// The SHIPPED release document declares the two-stage topology; the shipped
+// debug document does NOT (Identity at both stages, the pre-P10 behavior).
+// A JSON edit that drops or renames the key silently reverts the unit stage
+// to the full schedule — this pin makes that a RED, not a silent revert.
+TEST(PipelineLoader, ShippedDocsDeclareTheirStageTopology) {
+    auto rel = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(rel.has_value());
+    EXPECT_EQ(rel->unitPipelineName, "release-unit")
+        << "release.pipeline.json must keep declaring its unit stage";
+    auto un = opt::loadShippedPipeline("release-unit");
+    ASSERT_TRUE(un.has_value());
+    EXPECT_TRUE(un->unitPipelineName.empty())
+        << "the unit document itself must not chain another unit stage";
+    auto dbg = opt::loadShippedPipeline("debug");
+    ASSERT_TRUE(dbg.has_value());
+    EXPECT_TRUE(dbg->unitPipelineName.empty())
+        << "debug ships ONE schedule for both stages by design";
+}
+
+// EMPTY and non-string names are refused at load — an empty name is a typo
+// away from "run nothing at the unit stage" and would read as the absent-key
+// default in every log.
+TEST(PipelineLoader, UnitPipelineEmptyOrNonStringRejects) {
+    for (std::string_view bad : {"\"\"", "7"}) {
+        auto r = opt::loadPipelineFromText(
+            std::string{R"({ "dssPipelineVersion": 1, "unitPipeline": )"}
+                + std::string{bad}
+                + std::string{R"(, "pipeline": { "name": "x",
+                                               "passes": ["Identity"] } })"},
+            "unit-bad.json");
+        ASSERT_FALSE(r.has_value()) << "unitPipeline=" << bad;
+        EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+        EXPECT_TRUE(msgHas(r.error(), "unitPipeline"));
+    }
 }

@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
+#include <string_view>
 
 namespace dss::crypto {
 
@@ -161,6 +163,58 @@ std::array<std::uint8_t, 32> sha256(std::span<std::uint8_t const> data) {
         digest[i * 4 + 3] = static_cast<std::uint8_t>(h[i] & 0xffu);
     }
     return digest;
+}
+
+std::string toHexLower(std::span<std::uint8_t const> bytes) {
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (std::uint8_t const byte : bytes) {
+        out.push_back(kHexDigits[byte >> 4]);
+        out.push_back(kHexDigits[byte & 0x0fu]);
+    }
+    return out;
+}
+
+std::string toBase32Lower(std::span<std::uint8_t const> bytes) {
+    // RFC 4648 §6's alphabet, lowercased. Every symbol is its own
+    // case-folding, which is the property the header's ★★★ note is about.
+    static constexpr char kAlphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
+    std::string           out;
+    out.reserve((bytes.size() * 8u + 4u) / 5u);
+
+    // At most 12 live bits at any moment (4 carried + 8 freshly shifted in),
+    // so a 32-bit accumulator cannot overflow for any input length.
+    std::uint32_t accumulator = 0;
+    unsigned      live        = 0;
+    for (std::uint8_t const byte : bytes) {
+        accumulator = (accumulator << 8) | byte;
+        live += 8;
+        while (live >= 5) {
+            live -= 5;
+            out.push_back(kAlphabet[(accumulator >> live) & 0x1fu]);
+        }
+    }
+    // The trailing partial group is ZERO-EXTENDED and emitted rather than
+    // dropped: dropping it would make two inputs differing only in their last
+    // bits render identically, which is exactly the aliasing this encoder is
+    // chosen to avoid. `live` is 0 for any length that is a multiple of 5.
+    if (live != 0) {
+        out.push_back(kAlphabet[(accumulator << (5u - live)) & 0x1fu]);
+    }
+    return out;
+}
+
+std::array<std::uint8_t, 32> sha256OfText(std::string_view text) {
+    // `text.data()` may be null for an empty view, and `span{nullptr, 0}` is
+    // well-formed — sha256 of zero bytes is the canonical empty digest, which
+    // is what an empty document should hash to.
+    return sha256(std::span<std::uint8_t const>{
+        reinterpret_cast<std::uint8_t const*>(text.data()), text.size()});
+}
+
+std::string sha256Hex(std::string_view text) {
+    return toHexLower(sha256OfText(text));
 }
 
 } // namespace dss::crypto

@@ -17,3 +17,12 @@ dss_add_test(NAME opt/test_mir_alias       SOURCES test_mir_alias.cpp)
 dss_add_test(NAME opt/test_mir_memory_clobbers SOURCES test_mir_memory_clobbers.cpp)
 dss_add_test(NAME opt/test_call_graph_scc  SOURCES test_call_graph_scc.cpp)
 dss_add_test(NAME opt/test_mir_rebuild_helper SOURCES test_mir_rebuild_helper.cpp)
+
+# Inline-asm P5 (plan 29 §4.4): the MIR asm descriptor survives EACH of the
+# FOUR verbatim-copy sites individually, and an asm block is an opaque memory
+# barrier to Load motion. Site 4 is `mir/merge/mir_merge.cpp`'s cross-CU cloner —
+# it lives here rather than in tests/mir so all four sites are asserted in ONE
+# file against ONE sentinel descriptor; a census split across two files is what
+# let site 4 go missing in the first place.
+dss_add_test(NAME opt/test_inline_asm_rebuild_carriage
+             SOURCES test_inline_asm_rebuild_carriage.cpp)

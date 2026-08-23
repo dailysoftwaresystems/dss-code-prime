@@ -6,6 +6,7 @@
 #include "hir/attributes/always_inline_attr.hpp"
 #include "hir/attributes/diagnostic_info.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
+#include "hir/attributes/inline_definition_attr.hpp"
 #include "hir/attributes/linkage_attr.hpp"
 #include "hir/attributes/mutability_attr.hpp"
 #include "hir/attributes/no_inline_attr.hpp"
@@ -88,6 +89,19 @@ using HirNoOptimizeMap = HirAttribute<NoOptimizeAttr>;
 // is empty), so the observable property is that the fact survives and is queryable
 // (see `NoSanitizeThreadAttr`, which refuses to overstate that).
 using HirNoSanitizeThreadMap = HirAttribute<NoSanitizeThreadAttr>;
+
+// D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED (C99 6.7.4p7): native
+// FUNCTION DEFINITIONS that are INLINE DEFINITIONS — every file-scope declaration
+// spelled `inline` without `extern`, so the definition provides no external
+// definition and must never be emitted. Populated by CST→HIR lowering, which now
+// lowers the body (it previously discarded it) so the optimizer's inliner can use
+// it as 6.7.4p7's "alternative to an external definition"; read at HIR→MIR to
+// sanction the ONE function-and-extern SymbolId pair that is legal, and NOT
+// stamped onto `MirFunc` — the surviving carrier past that seam is the pair
+// itself (see `InlineDefinitionAttr`, which explains why a MIR-side flag would be
+// lost at the first rebuild). Keyed on the FUNCTION node, unlike the five maps
+// above which are keyed on the DECLARATION node.
+using HirInlineDefinitionMap = HirAttribute<InlineDefinitionAttr>;
 
 // Native-declaration mutability (const vs writable) for globals that carried a
 // source CONST qualifier. Populated by CST→HIR lowering from the bound symbol's

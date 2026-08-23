@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# PURPOSE: census the real-example corpus into a run-identified report instead of one overwritten log.
 # TF-C86 (D-CSUBSET-STDARG-F001A) — LAUNCHER ONLY.
 #
 # The census itself lives in `scripts/corpus-census/corpus-census.py`, once. This file finds a

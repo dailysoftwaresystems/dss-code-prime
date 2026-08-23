@@ -39,10 +39,15 @@
       "emulator": ""
     }
   ],
+  "optimizationObservable": {
+    "clause": "C99 6.7.4p7"
+  },
   "optimizedPipelines": [
     {
+      "$comment": "★★★ THE TWO ARMS ASSERT THE TWO HALVES OF 6.7.4p7, AND NEITHER HALF IS THE OTHER'S EVIDENCE (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED). BASELINE 42 proves cu_a EMITTED NOTHING for `pick`: the only body that can return 42 is cu_b's external definition, so the call left cu_a's image. RELEASE 7 proves the inliner USED THE INLINE DEFINITION: the only body that returns 7 is cu_a's own, and it is reachable only by being spliced in, because it is never emitted as a symbol in either arm. Read alone, 42 looks like it also witnesses the release behaviour and 7 looks like it also witnesses non-emission; they are DIFFERENT claims and it takes both arms to make both. ★★ AND 7 IS NOT A DSS CHOICE -- ✔MEASURED on gcc 13.3.0, clang 18.1.3 and clang 19, this exact two-CU program, `-std` in {default, c99, gnu17}: every one of them exits 42 at `-O0` and 7 at `-O1`, `-O2`, `-O3` and `-Os`. `nm cu_a.o` shows `U pick` at -O0 and NO `pick` symbol at all from -O1 up. 6.7.4p7 makes the inline definition 'an alternative to an external definition, which a translator may use to implement any call to the function in the same translation unit' and says outright that 'it is unspecified whether a call to the function uses the inline definition or the external definition', so both exit codes are conforming and the divergence is the standard's, not the optimizer's. That clause is what `optimizationObservable` above cites, and the runner REFUSES this arm's `exitCode` without it.",
       "label": "release",
       "shippedPipeline": "release",
+      "exitCode": 7,
       "mustDifferFromBaseline": true
     }
   ]

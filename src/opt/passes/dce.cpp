@@ -10,7 +10,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <format>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -290,17 +292,37 @@ void collectSymbolAddrTargets(MirLiteralValue const& v,
     return out;
 }
 
+// ONE spelling of this pass's name for EVERY diagnostic it can emit — the
+// runtime-init Info below and every `MirFunctionRebuilder` fatal
+// (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS). Pipeline spelling
+// (`kPassNameTable`, opt/optimizer.hpp).
+constexpr std::string_view kPassName = "Dce";
+
 // DCE rebuild policy: filters dead non-Phi value insts via the
 // shared MirFunctionRebuilder's `shouldEmit` hook + filters
-// unreachable-pred phi incomings via `acceptPhiIncoming`. Terminator
-// results are not recorded in the rewrite map (the original DCE
-// convention — terminator results are never read as operands so the
-// hashmap inserts are pure overhead).
+// unreachable-pred phi incomings via `acceptPhiIncoming`.
+//
+// ⚠ THIS COMMENT USED TO END "terminator results are not recorded in the rewrite
+// map (the original DCE convention — terminator results are never read as
+// operands so the hashmap inserts are pure overhead)". That sentence described
+// the `recordTerminatorInRewrite` override immediately below, which was DELETED
+// this cycle because the claim in its own justification is FALSE: an `asm goto`
+// with outputs anchors a `ReturnPiece` to the block's TERMINATOR, and answering
+// `false` here aborted the compiler on a legal program
+// (D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER). Terminators are now
+// recorded UNCONDITIONALLY by the substrate; a class comment still asserting the
+// old convention is the "comment records the full fact while the code uses half
+// of it" trap, so it is corrected here rather than left for the next reader to
+// believe.
 class DcePolicy : public MirRebuildPolicy {
 public:
     DcePolicy(std::vector<MirBlockId> const& reachable,
               std::unordered_set<std::uint32_t> const& liveInsts)
         : reachable_(reachable), liveInsts_(liveInsts) {}
+
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return kPassName;
+    }
 
     [[nodiscard]] std::size_t instructionsEliminated() const noexcept {
         return eliminated_;
@@ -323,9 +345,17 @@ public:
         return blockMap.count(inc.pred.v) != 0;
     }
 
-    [[nodiscard]] bool recordTerminatorInRewrite() const noexcept override {
-        return false;
-    }
+    // (No `recordTerminatorInRewrite` override — the hook is gone. This policy
+    // used to answer `false` to save one hash insert per block, and that answer
+    // aborted the compiler on an `asm goto` with outputs, whose `ReturnPiece`
+    // anchors to the terminator.
+    // ⚠ THE ANCHOR NAME STAYS ON ONE LINE — wrapping it across a line break is
+    // not a formatting nit, it MINTS A SECOND ANCHOR. The first spelling here
+    // was `…-ABORTS-THE-MIR-` + `REBUILDER` on the next comment line, and
+    // `anchor_registry_guard` correctly reported an unregistered
+    // `D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR` (its scanner reads one line,
+    // and the truncation then matched as a prefix in four other files).
+    // See D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER.)
 
 private:
     std::vector<MirBlockId> const&           reachable_;
@@ -357,9 +387,14 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
             ParseDiagnostic d;
             d.code     = DiagnosticCode::X_OptPassSkipped;
             d.severity = DiagnosticSeverity::Info;
-            d.actual   = "opt::Dce: skipped — module has >= 1 runtime-init "
-                         "global; func-id remap not yet implemented "
-                         "(D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS).";
+            // Same `opt::<pass>:` shape `cloneGlobalsOrCarveOut` emits, off the
+            // same single `kPassName` constant the rebuilder fatals print — DCE
+            // hand-rolls the carve-out (see above) but must not hand-roll a
+            // SECOND spelling of its own name.
+            d.actual   = std::format(
+                "opt::{}: skipped — module has >= 1 runtime-init global; "
+                "func-id remap not yet implemented "
+                "(D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS).", kPassName);
             reporter.report(std::move(d));
             result.ok = true;
             return result;

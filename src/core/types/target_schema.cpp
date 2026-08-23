@@ -774,10 +774,13 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                     || s == EncodingSlotKind::OpcodePlusReg
                     || s == EncodingSlotKind::Rd;
             };
-            bool const has2AddrDestWire = o.requires2Address
+            // The wire that supplies the destination is the one on the
+            // TIED operand — index 0 for every shipped opcode, whatever
+            // `twoAddressSourceOperand` declares for a non-zero tie.
+            bool const has2AddrDestWire = o.requires2Address.has_value()
                 && std::any_of(v.wires.begin(), v.wires.end(),
                                [&](TargetEncodingWire const& w) {
-                                   return w.index == 0
+                                   return w.index == *o.requires2Address
                                        && isDestSlot(w.slotKind);
                                });
             // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: a variant that wires
@@ -927,35 +930,41 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         //   * a variant whose operandKinds[0] is NOT `reg` — would
         //     trigger the pass's hard-fail at runtime; reject at
         //     load instead.
-        if (o.requires2Address) {
+        // ⚠ EVERY CLAUSE IS KEYED ON THE DECLARED INDEX, NEVER ON A
+        // LITERAL 0 (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE). A rule that
+        // kept checking operand 0 while the legalize pass copied
+        // operand j would validate a shape the pass never builds — the
+        // exact silent divergence the index replaced the bool to avoid.
+        if (o.requires2Address.has_value()) {
+            std::size_t const tied = *o.requires2Address;
             if (o.result == TargetResultRule::None) {
                 fail(std::format("/opcodes/{}/requires2Address", i),
                      std::format("opcode '{}': `requires2Address: true` "
                                  "requires `result != none` — the "
-                                 "legalize pass copies operands[0] INTO "
+                                 "legalize pass copies operands[{}] INTO "
                                  "result, which doesn't exist when "
                                  "result is `none`",
-                                 o.mnemonic));
+                                 o.mnemonic, tied));
             }
-            if (o.maxOperands < 1) {
+            if (o.maxOperands <= tied) {
                 fail(std::format("/opcodes/{}/requires2Address", i),
-                     std::format("opcode '{}': `requires2Address: true` "
-                                 "requires `maxOperands >= 1` — "
-                                 "operand 0 must exist to be copied "
-                                 "to the destination",
-                                 o.mnemonic));
+                     std::format("opcode '{}': the two-address tie names "
+                                 "operand {}, so `maxOperands` must exceed "
+                                 "it (declared {}) — the tied operand must "
+                                 "exist to be copied to the destination",
+                                 o.mnemonic, tied, o.maxOperands));
             }
             for (std::size_t vi = 0; vi < o.encoding.variants.size(); ++vi) {
                 auto const& v = o.encoding.variants[vi];
-                if (!v.operandKinds.empty()
-                    && v.operandKinds[0] != OperandKindFilter::Reg) {
-                    fail(std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/0", i, vi),
-                         std::format("opcode '{}' variant {}: "
-                                     "`requires2Address: true` requires "
-                                     "operandKinds[0] to be 'reg' — the "
+                if (v.operandKinds.size() > tied
+                    && v.operandKinds[tied] != OperandKindFilter::Reg) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", i, vi, tied),
+                         std::format("opcode '{}' variant {}: the "
+                                     "two-address tie names operand {}, so "
+                                     "operandKinds[{}] must be 'reg' — the "
                                      "legalize pass needs a Reg operand "
                                      "to copy from",
-                                     o.mnemonic, vi));
+                                     o.mnemonic, vi, tied, tied));
                 }
             }
         }
@@ -1013,7 +1022,9 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     // catches the misconfiguration once.
     bool const anyRequires2Address = std::any_of(
         opcodes.begin(), opcodes.end(),
-        [](TargetOpcodeInfo const& o) { return o.requires2Address; });
+        [](TargetOpcodeInfo const& o) {
+            return o.requires2Address.has_value();
+        });
     if (anyRequires2Address && mnemonicIndex.find("mov") == mnemonicIndex.end()) {
         fail("/opcodes",
              "at least one opcode declares `requires2Address: true` "
@@ -1500,6 +1511,73 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         checkRefs(i, "returnVrs",   cc.returnVrs,   TargetRegClass::VR);
         checkRefs(i, "callerSaved", cc.callerSaved, TargetRegClass::None);
         checkRefs(i, "calleeSaved", cc.calleeSaved, TargetRegClass::None);
+
+        // ── D-TARGET-ARG-POOLS-WITHOUT-DWARF-NUMBERS-CANNOT-BE-RELATED ──
+        //
+        // Whether two arg pools share ONE cursor is DERIVED rather than
+        // declared: `lir_callconv::argPoolsShareACursor` compares the
+        // `dwarfNumber` of their slot-0 registers, because that is DWARF's own
+        // identifier for a PHYSICAL register and therefore the only field that
+        // says "these two class names are two widths of one file".
+        // ⚠ `hwEncoding` CANNOT answer it. ✔MEASURED over both shipped
+        // targets: it is a per-file register NUMBER, so arm64 `gpr × vr` share
+        // all 32 values and x86_64 `fpr × gpr` share 16 — a derivation reading
+        // it would relate the integer and vector files on both.
+        //
+        // The derivation is fail-CLOSED (an absent number means "cannot be
+        // shown to share", i.e. independent cursors), and independent cursors
+        // are the safe answer: the cost is a wasted register, never handing
+        // slot k out twice. But a target that declares two or more arg pools
+        // and OMITS the numbers that would relate them is describing a
+        // register file it cannot substantiate — it loads clean and gets an
+        // answer nobody chose. Refuse it here, where the config is judged,
+        // rather than letting a silent default stand in for a declaration.
+        {
+            std::vector<std::pair<char const*, std::vector<std::string> const*>>
+                const pools{{"argGprs", &cc.argGprs},
+                            {"argFprs", &cc.argFprs},
+                            {"argVrs",  &cc.argVrs}};
+            std::size_t declared = 0;
+            for (auto const& [name, pool] : pools) {
+                if (pool->empty()) continue;
+                ++declared;
+            }
+            // ⚠⚠ GATED ON THE TARGET HAVING OPTED INTO THE NUMBERING AT ALL —
+            // the SAME condition the frame-register rule above uses, and the
+            // first draft of this check omitted it and RED two deliberate
+            // contracts: `TargetDwarfNumbering.ATargetDeclaringNeitherHalfStillLoads`
+            // and the sub-register validation fixture both build a target that
+            // declares NO dwarf numbers anywhere, which must still load.
+            // ★ The rule is "if you number your registers, number the ones that
+            // carry ABI meaning" — not "you must number your registers". A
+            // target that declares none has opted out uniformly and its arg
+            // pools get independent cursors as a documented consequence; a
+            // target that numbers SOME registers and not its arg registers is
+            // the inconsistent case, and that is what this refuses.
+            bool anyRegNumbered = false;
+            for (auto const& r : registers) {
+                if (r.dwarfNumber.has_value()) { anyRegNumbered = true; break; }
+            }
+            if (anyRegNumbered && declared >= 2) {
+                for (auto const& [name, pool] : pools) {
+                    if (pool->empty()) continue;
+                    auto const it = registerIndex.find(pool->front());
+                    if (it == registerIndex.end()) continue;  // reported above
+                    if (registers[it->second].dwarfNumber.has_value()) continue;
+                    fail(std::format("/callingConventions/{}/{}/0", i, name),
+                         std::format(
+                             "calling convention '{}': arg register '{}' carries "
+                             "no 'dwarfNumber', so this pool cannot be related to "
+                             "the {} other arg pool(s) this convention declares — "
+                             "whether two pools are two WIDTHS of one physical "
+                             "register file (one shared cursor) or two separate "
+                             "files (independent cursors) is read off the DWARF "
+                             "numbers, and an absent number makes that answer a "
+                             "default rather than a declaration",
+                             cc.name, pool->front(), declared - 1));
+                }
+            }
+        }
 
         // Link register (AAPCS64-shape). When declared, must resolve to
         // a GPR-class register — ML7 will spill it in the prologue.

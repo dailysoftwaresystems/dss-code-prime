@@ -105,6 +105,14 @@ struct DirRow {
     std::string section;              // empty = omit the key
     unsigned    unitBytes   = 0;      // 0     = omit the key
     bool        operandOnly = false;  // false = omit the key
+    // D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED: `rule` is REQUIRED on `frameRule`
+    // and REFUSED elsewhere; `offsetFromCfa` is legal only on a `frameRule`
+    // stating a per-register SAVE. Both carry an omit sentinel for the same
+    // reason every key above does — the loader treats present-and-wrong
+    // differently from absent, so a fixture that always emitted them could not
+    // express the rows those refusals are about.
+    std::string rule;                 // empty = omit the key
+    bool        offsetFromCfa = false;// false = omit the key
 };
 
 inline void setDirectives(nlohmann::json& doc,
@@ -118,6 +126,8 @@ inline void setDirectives(nlohmann::json& doc,
         if (!r.section.empty()) row["section"]     = r.section;
         if (r.unitBytes != 0)   row["unitBytes"]   = r.unitBytes;
         if (r.operandOnly)      row["operandOnly"] = true;
+        if (!r.rule.empty())    row["rule"]        = r.rule;
+        if (r.offsetFromCfa)    row["offsetFromCfa"] = true;
         arr.push_back(std::move(row));
     }
     doc["assembly"]["directives"] = std::move(arr);

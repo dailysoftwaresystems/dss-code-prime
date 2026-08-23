@@ -17,6 +17,7 @@
 #include "hir/hir.hpp"
 #include "hir/hir_attrs.hpp"
 #include "hir/hir_op.hpp"
+#include "hir/hir_inline_asm.hpp"
 #include "hir/hir_text.hpp"
 #include "repo_root.hpp"
 
@@ -66,6 +67,11 @@ std::string expectRoundTrip(Hir const& hir, HirTextContext const& ctx) {
     // Thread the rebuilt pool so a pooled module re-emits its inline values
     // (byte-identity would otherwise fail when the first emit used a pool).
     if (ctx.literalPool) ctx2.literalPool = &res->literalPool;
+    // Inline-asm P5: the same rethreading, for the same reason. Without it a
+    // module carrying an asm descriptor re-emits through the `#<handle>`
+    // fallback and byte-identity fails on the SECOND emit -- which would look
+    // like a writer bug and is really an un-threaded pool.
+    if (ctx.inlineAsmPool) ctx2.inlineAsmPool = &res->inlineAsmPool;
 
     DiagnosticReporter r3;
     std::string const second = emitHir(res->hir, ctx2, r3);
@@ -1080,4 +1086,315 @@ TEST(HirText, VocabularyTagEmitsAndSurvivesReparse) {
     EXPECT_EQ(ctlText.find('"' + std::string{"long"}), std::string::npos)
         << "an ANONYMOUS primitive must print with no tag at all:\n" << ctlText;
     (void)only;
+}
+
+// ── inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS) ───────────────────────────
+
+// The BARE BARRIER must render EXACTLY as it did before P5 -- a lone
+// `inline_asm` line, no descriptor, no children.
+// * THIS IS THE COMPATIBILITY PIN, and it is the reason `payload == 0` is the
+// sentinel rather than "index 0 is the first descriptor": every pre-P5 golden
+// and every consumer that treats `InlineAsm` as a leaf stays byte-identical.
+TEST(HirText, InlineAsmBareBarrierStillRendersAsALoneKeyword) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64 = in.primitive(TypeKind::I64);
+    TypeId const sig = in.fnSig({}, i64, CallConv::CcSysV);
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm);
+    HirNodeId const ret  = b.makeReturn(b.makeLiteral(i64, 0));
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN, ret});
+    HirNodeId const fn   = b.makeFunction(sig, /*symbol=*/1, {}, body);
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirLiteralPool pool;
+    (void)pool.add(HirLiteralValue{std::int64_t{0}, TypeKind::I64});
+    HirTextContext ctx;
+    ctx.interner = &in; ctx.symbolNames = &names; ctx.literalPool = &pool;
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find("\n      inline_asm\n"), std::string::npos)
+        << "the barrier form must stay a lone keyword line:\n" << text;
+    EXPECT_EQ(text.find("inline_asm #"), std::string::npos)
+        << "payload 0 must not render as a handle";
+}
+
+// A FULL descriptor -- every field populated -- must survive
+// emit -> parse -> re-emit byte-identically, and the parse must re-mint the
+// pool handle rather than trusting one from the text.
+TEST(HirText, InlineAsmDescriptorRoundTripsWithEveryField) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64 = in.primitive(TypeKind::I64);
+    TypeId const sig = in.fnSig({}, i64, CallConv::CcSysV);
+
+    HirInlineAsmPool asmPool;
+    HirInlineAsmDescriptor d;
+    // ⚠ NO `\n` IN THIS TEMPLATE, AND THE REASON IS A REAL FINDING RATHER
+    // THAN A TEST CONVENIENCE. `hir_text`'s shared `quote()` escapes `"` and
+    // `\\` and NOTHING ELSE, so a template containing a newline is emitted
+    // with a RAW newline inside the quoted string. It still round-trips
+    // byte-identically (the lexer accepts it), but the rendered `.dsshir`
+    // has a string spanning two lines. That is pre-existing and shared with
+    // every `str` literal value, so it is reported rather than changed here.
+    // A multi-instruction template covering the escape path lives in the
+    // dedicated case below.
+    d.templateText           = "mov %0, %1; nop";
+    d.outputCount            = 1;
+    d.isGoto                 = true;
+    d.isExtended             = true;
+    d.clobbersMemory         = true;
+    d.clobbersConditionCodes = true;
+    d.clobbers               = {"rax", "rbx"};
+    d.labelOrdinals          = {2, 7};
+    // !! THE LABEL ORDINAL AND THE LABEL'S POSITIONAL SPELLING ARE DIFFERENT
+    // NUMBERS, and they are deliberately different here. The ordinal is the
+    // per-FUNCTION label id (2 and 7 -- whatever the enclosing function handed
+    // out); the positional spelling is `operandCount + position` within THIS
+    // statement, so with two operands the two labels are `%l2` and `%l3`. A
+    // writer that "helpfully" rendered the ordinal as the spelling, or a
+    // consumer that re-derived one from the other, is caught by this pair and
+    // by nothing else in the suite.
+    d.labelSpellings         = {{"%l[done]", "%l2"}, {"%l[again]", "%l3"}};
+    {
+        HirInlineAsmOperand out;
+        out.symbolicName        = "dst";
+        out.spellings           = {"%0", "%[dst]"};
+        out.constraint          = parseAsmConstraint("=&r").value;
+        out.isOutput            = true;
+        out.regClassResolved    = true;
+        out.regClass            = 3;
+        d.operands.push_back(std::move(out));
+
+        HirInlineAsmOperand inp;
+        // NO symbolic name was written, so this operand answers to ONE
+        // spelling. A one-element group and a two-element group in the same
+        // dump is what proves the section is length-driven rather than fixed.
+        inp.spellings     = {"%1"};
+        inp.constraint    = parseAsmConstraint("a").value;
+        inp.fixedRegister = "rax";
+        d.operands.push_back(std::move(inp));
+    }
+    std::uint32_t const handle = asmPool.add(std::move(d));
+    EXPECT_EQ(handle, 1u) << "handles are 1-BASED so 0 stays the no-descriptor "
+                             "sentinel and cannot be produced by add()";
+
+    HirLiteralPool lits;
+    HirBuilder b{"c-subset"};
+    std::vector<HirNodeId> const kids{b.makeRef(i64, /*symbol=*/2),
+                                      b.makeRef(i64, /*symbol=*/3)};
+    HirNodeId const asmN = b.addParent(HirKind::InlineAsm, kids, InvalidType, handle);
+    HirNodeId const ret  = b.makeReturn(b.makeLiteral(i64, lits.add(
+                              HirLiteralValue{std::int64_t{0}, TypeKind::I64})));
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN, ret});
+    HirNodeId const fn   = b.makeFunction(sig, /*symbol=*/1, {}, body);
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main", "x", "y"};
+    HirTextContext ctx;
+    ctx.interner = &in; ctx.symbolNames = &names;
+    ctx.literalPool = &lits; ctx.inlineAsmPool = &asmPool;
+    std::string const text = expectRoundTrip(hir, ctx);
+
+    // Each rendered fact pinned by NAME, so a field silently dropped from the
+    // writer reds here rather than surviving as a still-byte-identical
+    // round-trip of a SMALLER descriptor (which is what a pure identity check
+    // would happily accept).
+    EXPECT_NE(text.find(R"(inline_asm "mov %0, %1; nop" { extended goto mem cc)"),
+              std::string::npos) << text;
+    EXPECT_NE(text.find("outputs 1 operands ("), std::string::npos) << text;
+    EXPECT_NE(text.find(R"("=&r" [dst] spells ( "%0", "%[dst]" ) class 3 -> )"),
+              std::string::npos) << text;
+    EXPECT_NE(text.find(R"("a" spells ( "%1" ) pin "rax" -> )"),
+              std::string::npos) << text;
+    EXPECT_NE(text.find(R"(clobbers ( "rax", "rbx" ))"), std::string::npos) << text;
+    EXPECT_NE(
+        text.find(
+            R"(labels ( L2 spells ( "%l[done]", "%l2" ), L7 spells ( "%l[again]", "%l3" ) ))"),
+        std::string::npos) << text;
+
+    // The PARSE must reconstruct the descriptor, not just the bytes.
+    DiagnosticReporter r;
+    auto res = parseHir(text, CompilationUnitId{9}, r);
+    ASSERT_TRUE(res->ok);
+    ASSERT_EQ(res->inlineAsmPool.size(), 1u);
+    auto const& back = res->inlineAsmPool.at(1);
+    EXPECT_EQ(back.templateText, "mov %0, %1; nop");
+    EXPECT_EQ(back.outputCount, 1u);
+    EXPECT_TRUE(back.isGoto);
+    EXPECT_TRUE(back.isExtended);
+    EXPECT_TRUE(back.clobbersMemory);
+    EXPECT_TRUE(back.clobbersConditionCodes);
+    EXPECT_TRUE(back.protectsRegisters());
+    ASSERT_EQ(back.operands.size(), 2u);
+    EXPECT_EQ(back.operands[0].symbolicName, "dst");
+    EXPECT_EQ(back.operands[0].constraint.raw, "=&r");
+    EXPECT_TRUE(back.operands[0].constraint.isOutput);
+    EXPECT_TRUE(back.operands[0].constraint.earlyClobber);
+    EXPECT_TRUE(back.operands[0].isOutput);
+    EXPECT_EQ(back.operands[0].regClass, 3);
+    EXPECT_FALSE(back.operands[1].isOutput)
+        << "isOutput is recovered from outputCount, not re-read from the text";
+    EXPECT_EQ(back.operands[1].fixedRegister, "rax");
+    EXPECT_EQ(back.clobbers, (std::vector<std::string>{"rax", "rbx"}));
+    EXPECT_EQ(back.labelOrdinals, (std::vector<std::uint32_t>{2u, 7u}));
+    // The spellings are the field every tier below HIR COMPARES against, so a
+    // round trip that lost them would hand the next tier an asm statement whose
+    // operands answer to no `%N` at all. Asserted by CONTENT, per group.
+    EXPECT_EQ(back.operands[0].spellings,
+              (std::vector<std::string>{"%0", "%[dst]"}));
+    EXPECT_EQ(back.operands[1].spellings, (std::vector<std::string>{"%1"}));
+    EXPECT_EQ(back.labelSpellings,
+              (std::vector<std::vector<std::string>>{{"%l[done]", "%l2"},
+                                                     {"%l[again]", "%l3"}}));
+}
+
+// The OTHER half of the label section: a descriptor whose labels carry NO
+// spellings at all. That is the honoured-absence case -- a language whose
+// `templateLabelPlaceholder` is declared `null` cannot spell a label reference
+// -- and it must stay distinguishable from a descriptor whose spellings were
+// DROPPED, which is what the writer's `spells` group being length-driven (and
+// omitted when empty) buys.
+//
+// !! IT IS ALSO THE PIN FOR A REAL ROUND-TRIP HAZARD. The writer renders an
+// empty group as nothing; the parser must therefore rebuild an empty group
+// rather than skipping the entry, or the two lists come back different LENGTHS
+// and `HirVerifier::checkInlineAsm` reds on text `emitHir` itself produced.
+TEST(HirText, InlineAsmLabelsWithNoSpellingsStillRoundTripOneGroupPerOrdinal) {
+    HirInlineAsmPool asmPool;
+    HirInlineAsmDescriptor d;
+    d.templateText   = "nop";
+    d.isGoto         = true;
+    d.isExtended     = true;
+    d.labelOrdinals  = {4, 5};
+    d.labelSpellings = {{}, {}};
+    std::uint32_t const handle = asmPool.add(std::move(d));
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm, InvalidType, handle);
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN});
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{body});
+    Hir hir = std::move(b).finish(root);
+
+    HirTextContext ctx;
+    ctx.inlineAsmPool = &asmPool;
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find("labels ( L4, L5 )"), std::string::npos)
+        << "an empty spelling group renders as NOTHING, not as an empty pair of "
+           "parens:\n" << text;
+
+    DiagnosticReporter r;
+    auto res = parseHir(text, CompilationUnitId{17}, r);
+    ASSERT_TRUE(res->ok) << text;
+    ASSERT_EQ(res->inlineAsmPool.size(), 1u);
+    auto const& back = res->inlineAsmPool.at(1);
+    EXPECT_EQ(back.labelOrdinals, (std::vector<std::uint32_t>{4u, 5u}));
+    EXPECT_EQ(back.labelSpellings, (std::vector<std::vector<std::string>>{{}, {}}))
+        << "one group per ordinal, or the verifier reds on the writer's own "
+           "output";
+}
+
+// !! THE NO-POOL ARM IS NOT A SILENT DEGRADATION, and this pin is the
+// difference. `lit` with no pool renders `lit #3` and is still recognisably a
+// literal; an asm statement rendered without its operands would read as a BARE
+// BARRIER -- a different program. So the writer emits an explicit handle form
+// AND reports.
+TEST(HirText, InlineAsmWithNoPoolReportsRatherThanRenderingABarrier) {
+    HirBuilder b{"c-subset"};
+    HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm, InvalidType, /*payload=*/4);
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN});
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{body});
+    Hir hir = std::move(b).finish(root);
+
+    HirTextContext ctx;   // deliberately NO inlineAsmPool
+    DiagnosticReporter r;
+    std::string const text = emitHir(hir, ctx, r);
+    EXPECT_NE(text.find("inline_asm #4"), std::string::npos) << text;
+    EXPECT_GT(countCode(r, DiagnosticCode::H_TextMalformed), 0u)
+        << "an unresolvable descriptor handle must be REPORTED, never quietly "
+           "rendered as the barrier form";
+}
+
+// !! THE PIN FOR A BUG THIS FORMAT ALMOST SHIPPED. The descriptor's flags are
+// bare keywords and one of them is `goto` -- which is ALSO a statement keyword,
+// and this lexer is newline-blind. Before the tail was braced,
+//
+//     inline_asm "nop"
+//     goto L1
+//
+// parsed the NEXT STATEMENT's `goto` as this asm's goto FLAG and then choked on
+// `L1`. Found by reading the grammar rather than by a failing test, which is
+// exactly why the test now exists: the shape only breaks when an asm statement
+// is IMMEDIATELY FOLLOWED by a statement whose keyword collides, so no
+// single-statement round-trip would ever have caught it.
+TEST(HirText, InlineAsmDoesNotSwallowAFollowingGotoStatement) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i64 = in.primitive(TypeKind::I64);
+    TypeId const sig = in.fnSig({}, i64, CallConv::CcSysV);
+
+    HirInlineAsmPool asmPool;
+    HirInlineAsmDescriptor d;
+    d.templateText = "nop";          // NO flags and NO sections: the bare tail
+    std::uint32_t const handle = asmPool.add(std::move(d));
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const asmN  = b.addLeaf(HirKind::InlineAsm, InvalidType, handle);
+    HirNodeId const gotoN = b.makeGotoStmt(1);
+    HirNodeId const lbl   = b.makeLabelStmt(1, b.makeReturn(std::nullopt));
+    HirNodeId const body  = b.makeBlock(std::vector<HirNodeId>{asmN, gotoN, lbl});
+    HirNodeId const fn    = b.makeFunction(sig, /*symbol=*/1, {}, body);
+    HirNodeId const root  = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx;
+    ctx.interner = &in; ctx.symbolNames = &names; ctx.inlineAsmPool = &asmPool;
+    std::string const text = expectRoundTrip(hir, ctx);
+
+    // The two statements must survive as TWO statements -- the round-trip check
+    // above would already red, but this makes the failure name itself.
+    DiagnosticReporter r;
+    auto res = parseHir(text, CompilationUnitId{11}, r);
+    ASSERT_TRUE(res->ok) << text;
+    ASSERT_EQ(res->inlineAsmPool.size(), 1u);
+    EXPECT_FALSE(res->inlineAsmPool.at(1).isGoto)
+        << "the FOLLOWING statement's `goto` was eaten as this asm's goto flag";
+    EXPECT_NE(text.find("\n      inline_asm \"nop\"\n"), std::string::npos)
+        << "a bare template must emit no brace group at all:\n" << text;
+}
+
+// The multi-instruction template the case above deliberately did NOT use.
+// A real asm template is usually several instructions joined by `\n\t`, so the
+// round trip has to survive one -- and it does, byte-identically. What it does
+// NOT do is ESCAPE the newline: `hir_text`'s shared `quote()` escapes only `"`
+// and `\`, so the emitted `.dsshir` carries a string literal spanning two
+// lines. Pre-existing and shared with every `str` literal value; pinned here as
+// the CURRENT behaviour so a later change to `quote()` reds deliberately
+// instead of silently reflowing every asm template in every golden.
+TEST(HirText, InlineAsmTemplateWithANewlineStillRoundTripsByteIdentically) {
+    HirInlineAsmPool asmPool;
+    HirInlineAsmDescriptor d;
+    d.templateText = "nop\n\tnop";
+    std::uint32_t const handle = asmPool.add(std::move(d));
+
+    HirBuilder b{"c-subset"};
+    HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm, InvalidType, handle);
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN});
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{body});
+    Hir hir = std::move(b).finish(root);
+
+    HirTextContext ctx;
+    ctx.inlineAsmPool = &asmPool;
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find("nop\n\tnop"), std::string::npos)
+        << "the newline is emitted RAW today (quote() escapes only \" and \\):\n"
+        << text;
+
+    DiagnosticReporter r;
+    auto res = parseHir(text, CompilationUnitId{13}, r);
+    ASSERT_TRUE(res->ok) << text;
+    ASSERT_EQ(res->inlineAsmPool.size(), 1u);
+    EXPECT_EQ(res->inlineAsmPool.at(1).templateText, "nop\n\tnop")
+        << "the template must survive the round trip byte for byte";
 }

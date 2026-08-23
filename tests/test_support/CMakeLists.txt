@@ -39,6 +39,21 @@ dss_add_test(NAME test_support/test_arm_verdict_ledger
 # argv), which is why it must stay a SEPARATE target from its siblings above.
 dss_add_test(NAME test_support/test_run_binary_capture
              SOURCES test_run_binary_capture.cpp)
+# D-TEST-SCHEMA-MUTATION-HELPER-FAILS-OPEN. `mutate_target_schema.hpp` is the
+# instrument ~54 pins use to build a MUTANT target schema, and it could mutate
+# NOTHING and report success by three routes (unmatched mnemonic, countless
+# erase/remove_if, an undocumented bare `return` on a document with no
+# `opcodes`). An instrument that silently no-ops does not weaken one test — it
+# certifies every pin downstream of it, which had already happened once (see the
+# null-experiment note in tests/core/test_target_schema.cpp). Every failure arm
+# of the new contract is EXERCISED here rather than read, and every case asserts
+# on message CONTENT, so a helper that threw the WRONG error still reds.
+# ★ Links nlohmann_json directly: the cases drive the JSON document form of the
+# helper (and its `detail::` seam) rather than only the mnemonic-list form.
+dss_add_test(NAME test_support/test_mutate_target_schema
+             SOURCES test_mutate_target_schema.cpp)
+target_link_libraries(dss_test_support_test_mutate_target_schema
+                      PRIVATE nlohmann_json::nlohmann_json)
 # D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-SUSPEND. The same chokepoint's
 # DEADLINE: it used to be spent on `steady_clock`, which on Darwin counts host
 # suspend, so a napping laptop was billed to the child. Pins which clock is

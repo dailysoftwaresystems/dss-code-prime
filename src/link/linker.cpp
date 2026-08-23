@@ -1,5 +1,7 @@
 #include "link/linker.hpp"
 
+#include "core/types/config_key_vocabulary.hpp"  // renderAllowedList
+#include "core/types/enum_name_table.hpp"        // namesWhere
 #include "core/types/object_format_kind.hpp"  // externCallUsesIndirectShape
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"        // relocBearingGlobalSection (c145 chokepoint)
@@ -15,6 +17,7 @@
 
 #include <format>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -26,6 +29,27 @@ namespace dss::linker {
 namespace {
 
 using dss::report;
+
+// The exit mechanisms a format may actually DECLARE — `kExitMechanismTable`
+// MINUS the `None` sentinel, which `exitMechanismFromName("none")` resolves and
+// the `processExit` loader arm then refuses explicitly.
+//
+// ★ THE REMEDY HALF OF A DIAGNOSTIC RENDERS THIS, NEVER A RETYPED LITERAL
+// (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET). A set typed
+// into a sentence is a SECOND OWNER of a fact the table already owns: the rows
+// keep deciding what is accepted while the sentence quietly advertises whatever
+// the enum looked like on the day it was typed, and the config author who reads
+// it is told BY NAME that a spelling the loader accepts does not exist. No test
+// catches that, because the sentence is what a test would read.
+// ✔MEASURED at the moment of conversion: the literal this replaced said
+// "'syscall' or 'by-name-import'" and the table's non-sentinel rows are exactly
+// {"syscall", "by-name-import"} — so this one had NOT yet drifted. The
+// conversion buys the future, not a repair.
+// The `2` is checked by `namesWhere` in a constant-evaluated context, so a third
+// mechanism breaks THIS initializer rather than silently shortening the message.
+constexpr auto kDeclarableExitMechanismNames =
+    namesWhere<2>(kExitMechanismTable,
+                  [](ExitMechanism m) { return m != ExitMechanism::None; });
 
 // D-LK4-3 — build the collision-proof compound-key symbol index for one module.
 // Every function / data item / extern import is keyed by `(module.cuId, SymbolId)`
@@ -225,9 +249,36 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
     // names BOTH defining CompilationUnits (existing + incoming) — byte-for-byte the
     // original wording, before the conflict data was reduced to a name. The winner table
     // flows into reference-resolution + the resolvedGlobalDefs copy below.
-    std::vector<CrossCuDef> defs;
+    //
+    // ★ ONE TRIPLE PER DEFINITION, NOT PER ROW. `m.symbols` is a NAME table and a
+    // single definition may hold SEVERAL rows —
+    // D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW.
+    // The two shapes are not the same thing and this flatten is where they
+    // part company:
+    //   * an ALIAS SET — several DIFFERENT names on one SymbolId — contributes one
+    //     triple per NAME, because each name resolves against the rest of the link
+    //     on its own and each may be shadowed independently;
+    //   * a REPEATED row — the same name on the same SymbolId, which
+    //     `ObjectSymbolNames` classifies as NOT an alias precisely because it is the
+    //     same name — is ONE definition described twice, and is fed ONCE.
+    // ✔MEASURED before this guard existed: feeding the repeat made the pure kernel
+    // rank a key against ITSELF and record a two-strong conflict, so a legal object
+    // was REFUSED with `K_SymbolRedefinedAcrossUnits` naming one CompilationUnit as
+    // both parties — "CU #1 and CU #1" — which sends the reader hunting a second
+    // definition that does not exist. (Weak and Local repeats never reached it: the
+    // kernel's all-weak arm resolves a key against itself to itself, and Local rows
+    // are excluded outright — so the bug fired only for the strong shape.)
+    // The key is (cuId, SymbolId, name); both leading fields are decimal digits, so
+    // the two separators delimit unambiguously and an arbitrary trailing name cannot
+    // forge a different triple's key.
+    std::vector<CrossCuDef>         defs;
+    std::unordered_set<std::string> seenDefs;
     for (auto const& m : modules) {
         for (auto const& s : m.symbols) {
+            if (!seenDefs.insert(std::format("{}:{}:{}", m.cuId.v, s.symbol.v, s.name))
+                     .second) {
+                continue;   // the same definition, described twice
+            }
             defs.push_back(CrossCuDef{s.name, s.binding, LinkedSymbolKey{m.cuId, s.symbol}});
         }
     }
@@ -310,6 +361,24 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
 // SymbolId{3} locals are different functions). Every function's relocations are
 // retargeted from (its cuId, old SymbolId) to the merged id.
 //
+// ★★ A DEFINITION MAY CARRY SEVERAL NAMES, AND THE MERGE IS PER-NAME WHEREVER NAMES
+// ARE THE SUBJECT — D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW. Equal-offset defined
+// symbols collapse to ONE atom with several `ModuleSymbol` rows (a `SymbolId` and a
+// name each), which is what `__attribute__((weak, alias(...)))` produces and what all
+// three relocatable-object readers emit. So the merge distinguishes:
+//   * the id space is per ATOM — one fresh merged id per winning KEY, shared by every
+//     name that key won (a per-NAME mint burned ids and left `nameToId` pointing at
+//     phantoms nothing defines);
+//   * the symbol table is per NAME — every surviving row is carried, keyed on
+//     (merged id, name), so an alias reaches `.symtab` / `.dynsym` / the export tables;
+//   * the shadow decision splits in two — `isShadowedAtom` (do these BYTES survive)
+//     and `isShadowedName` (does this NAME survive), which have the same answer only
+//     when every atom has exactly one name.
+// Both cross-CU questions an alias raises are answered by the resolver, not here: an
+// alias name is fed to `resolveCrossCuDefs` like any other definition, so a reference
+// to it binds to its atom, and two CUs defining one alias name STRONG fail loud with
+// K_SymbolRedefinedAcrossUnits exactly as two ordinary definitions would.
+//
 // Cross-CU REFERENCE resolution is keyed on the FORMAT's declared extern-call shape
 // (`externCallDispatch` — config, never format identity; c154):
 //
@@ -368,34 +437,119 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         if (r.widthBytes == 8 && !r.pcRelative) { absPtrKind = r.kind; break; }
     }
 
-    // Per-module SymbolId.v -> ModuleSymbol for O(1) name/binding lookup during remap.
-    std::vector<std::unordered_map<std::uint32_t, ModuleSymbol const*>> byId(modules.size());
+    // Per-module SymbolId.v -> EVERY `ModuleSymbol` row carrying it, in table order.
+    //
+    // ★ ONE id LEGITIMATELY CARRIES SEVERAL ROWS — the subject of
+    // D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW. Equal-offset defined symbols collapse
+    // to ONE atom under several names (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-
+    // TWIN-ATOMS): `strong_fn` GLOBAL + `weak_alias` WEAK at one address is what gcc
+    // emits for `__attribute__((weak, alias("strong_fn")))`, it is the representation
+    // `object_symbol_names.hpp`'s `definedAliases` reads, and every relocatable-object
+    // reader produces it. This map used to keep only the FIRST row per id, so every
+    // question the merge asked about a symbol — which name won, which id to fold onto,
+    // which rows to carry — was answered by the CANONICAL name alone and the alias
+    // names were invisible to the whole merge.
+    // The FIRST row stays canonical: `ObjectSymbolNames` is first-row-wins, so keeping
+    // input order here keeps the merged module's canonical identical to its input's.
+    std::vector<std::unordered_map<std::uint32_t,
+                                   std::vector<ModuleSymbol const*>>>
+        rowsById(modules.size());
     for (std::size_t i = 0; i < modules.size(); ++i) {
-        for (auto const& ms : modules[i].symbols) byId[i].emplace(ms.symbol.v, &ms);
+        for (auto const& ms : modules[i].symbols) {
+            rowsById[i][ms.symbol.v].push_back(&ms);
+        }
     }
 
     // (cuId, old SymbolId) -> fresh merged SymbolId.v. Pre-assign one fresh id per
-    // resolved global name (the winning definition); same-name versions fold onto it.
+    // WINNING DEFINITION KEY; same-name versions elsewhere fold onto it.
     std::unordered_map<LinkedSymbolKey, std::uint32_t> remap;
     std::unordered_map<std::string, std::uint32_t>     nameToId;
+    // The keys that WON a name here — read later by `isShadowedAtom`, which cannot use
+    // `remap` for the question because `mergedIdFor` memoizes FOLDS into it before the
+    // emission walk runs, making a folded key indistinguishable from a pre-assigned one.
+    std::unordered_set<LinkedSymbolKey> winningKeys;
     std::uint32_t nextId = 1;
+    // ★ ONE FRESH id PER KEY, NEVER ONE PER NAME —
+    // D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW.
+    // An alias set puts SEVERAL winning names on ONE key. Minting per name burned
+    // an id for every name after the first — the `remap` emplace lost to the id already
+    // recorded for that key — and left `nameToId` pointing at an id NO atom would ever
+    // carry. `mergedIdFor` folds a LOSING same-name definition through `nameToId`, so
+    // that phantom became the retarget of every relocation naming the alias, and the
+    // emission path (whose compound index is built from the MERGED module) then rejected
+    // a legal program with K_SymbolUndefined. `try_emplace` + a conditional bump makes
+    // every name of one atom share that atom's id.
     for (auto const& [name, key] : image.resolvedGlobalDefs) {
-        std::uint32_t const id = nextId++;
-        remap.emplace(key, id);
-        nameToId.emplace(name, id);
+        auto const [it, freshKey] = remap.try_emplace(key, nextId);
+        if (freshKey) ++nextId;
+        nameToId.emplace(name, it->second);
+        winningKeys.insert(key);
     }
     auto mergedIdFor = [&](std::size_t modIdx, SymbolId old) -> std::uint32_t {
         LinkedSymbolKey const key{modules[modIdx].cuId, old};
         if (auto it = remap.find(key); it != remap.end()) return it->second;
-        // Not a pre-assigned winner: fold an externally-visible same-name def onto its
-        // winner; otherwise mint a fresh id (Local / extern import / unnamed).
-        if (auto sit = byId[modIdx].find(old.v); sit != byId[modIdx].end()) {
-            ModuleSymbol const& ms = *sit->second;
-            if (ms.binding != SymbolBinding::Local) {
-                if (auto nit = nameToId.find(ms.name); nit != nameToId.end()) {
-                    remap.emplace(key, nit->second);
-                    return nit->second;
+        // Not a pre-assigned winner: fold an externally-visible same-name def onto the
+        // atom that WON its name; otherwise mint a fresh id (Local / extern import /
+        // unnamed).
+        // EVERY row is consulted, not just the canonical one: each name of an alias set
+        // is a real ABI name that resolves on its own. They must agree on ONE surviving
+        // atom — a losing atom whose names won in DIFFERENT places cannot be retargeted
+        // at all, because a relocation names the ATOM and not the name it was written
+        // through, so either pick would bind half this CU's references to the wrong
+        // body. That is precisely the "genuinely-unsupported merge interaction"
+        // K_CrossCuMergeUnsupported is reserved for.
+        //
+        // ★ ONE DIAGNOSTIC PER ATOM — AND THAT NOW HOLDS FOR BOTH HALVES OF THE
+        // WORD "once". The memoizing `remap.emplace` below short-circuits every
+        // later CALL for this key, which is what the previous note said; it says
+        // nothing about the ITERATIONS of this one loop, and the loop used to
+        // `report` from INSIDE it, once per diverging name. A 3-name alias set
+        // whose names win in three different places therefore emitted TWO
+        // diagnostics from a SINGLE call, each naming the canonical and one
+        // rival — while the sentence beside it claimed one per atom, and the pin
+        // watching it asserted `== 1u` at TWO names, the one width at which the
+        // two readings coincide. The partial pairing is also the weaker message:
+        // what a reader needs is the whole set of names that failed to agree,
+        // not an arbitrary pairing of it. So divergences are COLLECTED and
+        // reported ONCE, naming every name involved.
+        if (auto sit = rowsById[modIdx].find(old.v); sit != rowsById[modIdx].end()) {
+            std::optional<std::uint32_t> folded;
+            ModuleSymbol const*          foldedBy = nullptr;
+            std::vector<std::string>     divergingNames;
+            for (ModuleSymbol const* ms : sit->second) {
+                if (ms->binding == SymbolBinding::Local) continue;
+                auto const nit = nameToId.find(ms->name);
+                if (nit == nameToId.end()) continue;
+                if (!folded.has_value()) {
+                    folded   = nit->second;
+                    foldedBy = ms;
+                    continue;
                 }
+                if (*folded == nit->second) continue;
+                divergingNames.push_back(ms->name);
+            }
+            if (!divergingNames.empty()) {
+                // The canonical first, then every name that resolved elsewhere:
+                // `"a", "b" and "c"`.
+                std::string names = "\"" + foldedBy->name + "\"";
+                for (std::size_t k = 0; k < divergingNames.size(); ++k) {
+                    names += (k + 1 == divergingNames.size() ? " and " : ", ");
+                    names += "\"" + divergingNames[k] + "\"";
+                }
+                report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported,
+                       DiagnosticSeverity::Error,
+                       "symbol #" + std::to_string(old.v) + " (CU #" +
+                       std::to_string(modules[modIdx].cuId.v) +
+                       ") is one definition carrying the names " + names +
+                       ", and those names resolve to "
+                       "DIFFERENT definitions elsewhere in the link — one definition "
+                       "cannot be folded onto two, and a relocation names the definition "
+                       "rather than the name it was written through, so no retarget is "
+                       "correct (D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW).");
+            }
+            if (folded.has_value()) {
+                remap.emplace(key, *folded);
+                return *folded;
             }
         }
         std::uint32_t const id = nextId++;
@@ -631,7 +785,8 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                            " — the (cuId, SymbolId) uniqueness contract the compound "
                            "index enforces was breached (D-LK11-EXTERN-IMPORT-DEDUP).");
                 }
-                // `isEagerImport` — OR-COMBINE, as extern_import.hpp:112-114 mandates
+                // `isEagerImport` — OR-COMBINE, as the `isEagerImport` docblock in
+                // `core/types/extern_import.hpp` mandates
                 // and the MIR-tier merge implements. Keeping a NON-eager row when a
                 // sibling CU declared the same import EAGER would let
                 // `rejectOrDropUnreferencedExterns` DROP a shipped-descriptor symbol
@@ -668,41 +823,83 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         }
     }
 
-    // A defined symbol (function or data) is SHADOWED when it is an externally-visible
-    // (Global/Weak) definition whose name's WINNING definition (image.resolvedGlobalDefs)
-    // lives at a DIFFERENT (cuId, SymbolId) — i.e. this body lost the weak-vs-strong /
-    // all-weak resolution. Its body MUST be DROPPED (not emitted): every reference to the
-    // name already folds onto the winner's merged id via `mergedIdFor`, so emitting the
-    // loser's body would mint a SECOND function/data item carrying the SAME merged id —
-    // the within-image duplicate-SymbolId collision the compound index rejects. This is
-    // the EMISSION-tier completion of strong-over-weak: the resolution layer picks the
-    // winner; here we drop the loser's bytes (exactly what a real linker does — the
-    // shadowed weak body never lands in the image). Local / unnamed bodies are never
-    // shadowed (Local is module-private; absent from resolvedGlobalDefs).
-    auto isShadowedDuplicate = [&](std::size_t modIdx, SymbolId sym) -> bool {
-        auto sit = byId[modIdx].find(sym.v);
-        if (sit == byId[modIdx].end()) return false;          // unnamed / synthesized — keep
-        ModuleSymbol const& ms = *sit->second;
-        if (ms.binding == SymbolBinding::Local) return false; // module-private — keep
+    // ── The two SHADOW questions, which used to be one ──────────────────────────
+    // A merged image asks TWO different questions about a losing definition, and they
+    // have the same answer only while every definition carries exactly ONE name:
+    //   * do these BYTES survive?  — a property of the ATOM (`isShadowedAtom`);
+    //   * does this NAME survive?  — a property of the ROW  (`isShadowedName`).
+    // With an alias set (one atom, several names) they genuinely diverge: a WEAK
+    // `weak_alias` losing to a sibling CU's strong `weak_alias` must drop THAT ROW while
+    // the atom keeps living under its canonical `strong_fn` — exactly what ld does.
+    // D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW.
+
+    // Does THIS ROW's name lose the cross-CU resolution — i.e. does the WINNING
+    // definition of `ms.name` (image.resolvedGlobalDefs) live at a DIFFERENT
+    // (cuId, SymbolId)? A Local name is module-private (never in the winner table) and
+    // an empty name is "no name recorded", so neither can lose.
+    auto isShadowedName = [&](std::size_t modIdx, ModuleSymbol const& ms) -> bool {
+        if (ms.binding == SymbolBinding::Local) return false;  // module-private — keep
+        if (ms.name.empty()) return false;                     // no name recorded — keep
         auto wit = image.resolvedGlobalDefs.find(ms.name);
-        if (wit == image.resolvedGlobalDefs.end()) return false;  // not a resolved global — keep
-        LinkedSymbolKey const winner = wit->second;
-        LinkedSymbolKey const self{modules[modIdx].cuId, sym};
-        return !(winner == self);  // a different key won → this body is shadowed
+        if (wit == image.resolvedGlobalDefs.end()) return false;  // unresolved — keep
+        return !(wit->second == LinkedSymbolKey{modules[modIdx].cuId, ms.symbol});
     };
 
-    std::unordered_set<std::uint32_t> seenMergedSymIds;
+    // Do these BYTES get dropped? Exactly when the atom FOLDS ONTO ANOTHER ATOM: it won
+    // no name of its own, yet at least one externally-visible name it carries has its
+    // winning definition elsewhere, so `mergedIdFor` will answer with THAT atom's merged
+    // id. Emitting the bytes anyway would mint a SECOND function/data item carrying one
+    // merged id — the within-image duplicate-SymbolId collision the compound index
+    // rejects. This is the EMISSION-tier completion of strong-over-weak: the resolution
+    // layer picks the winner, here the loser's bytes are dropped (what a real linker
+    // does — the shadowed weak body never lands in the image).
+    // ★ The predicate is written as the EXACT COMPLEMENT of `mergedIdFor`'s fold
+    // condition, deliberately: "the bytes are dropped" and "the id belongs to someone
+    // else" must be ONE statement. They were two before, agreeing only because every
+    // atom had exactly one name — an atom that lost its CANONICAL name while WINNING an
+    // alias name had its bytes dropped and the winning name left defined by nothing.
+    // ★ EVERY row is scanned, not the canonical one. A Local row is SKIPPED, never
+    // treated as an answer: `mergedIdFor` skips Local rows too when it looks for a name
+    // to fold on, so an atom whose FIRST row is a compiler-private label and whose
+    // SECOND is a lost ABI name still folds — reading only the canonical row would keep
+    // those bytes while handing them the winner's merged id, which is two bodies under
+    // one id. ELF orders `.symtab` locals before globals, so a re-read object presents
+    // exactly that row order. An atom named ONLY Locally folds onto nothing (no non-Local
+    // row to fold on) and keeps its own fresh id; so does an unnamed / synthesized one.
+    auto isShadowedAtom = [&](std::size_t modIdx, SymbolId sym) -> bool {
+        if (winningKeys.contains(LinkedSymbolKey{modules[modIdx].cuId, sym})) {
+            return false;   // won a name of its own — this atom IS the definition
+        }
+        auto sit = rowsById[modIdx].find(sym.v);
+        if (sit == rowsById[modIdx].end()) return false;  // unnamed / synthesized — keep
+        for (ModuleSymbol const* ms : sit->second) {
+            if (ms->binding == SymbolBinding::Local) continue;   // module-private name
+            if (nameToId.contains(ms->name)) return true;        // folds onto that atom
+        }
+        return false;
+    };
+
+    // The identity of a SYMTAB ROW is (merged id, NAME) — which is what the walk below
+    // emits, one row at a time. Keying the dedup on the merged ID ALONE dropped every
+    // row after the first for any atom carrying several names, i.e. every alias
+    // (D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW). What the dedup PROTECTS is unchanged and
+    // still reachable: a reader may hand the merge two byte-identical rows for one id
+    // (`ObjectSymbolNames` classifies such a repeat as NOT an alias, and emitting it
+    // twice is a duplicate-symbol error at a foreign linker). The pair is used directly
+    // rather than an encoded string so injectivity is structural, not an argument about
+    // separators.
+    std::set<std::pair<std::uint32_t, std::string>> seenMergedSymRows;
     for (std::size_t i = 0; i < modules.size(); ++i) {
         auto const& m = modules[i];
         for (auto const& fn : m.functions) {
-            if (isShadowedDuplicate(i, fn.symbol)) continue;  // shadowed weak body — drop
+            if (isShadowedAtom(i, fn.symbol)) continue;  // shadowed weak body — drop
             AssembledFunction out = fn;  // bytes + relocations + sourceMap copied
             out.symbol = SymbolId{mergedIdFor(i, fn.symbol)};
             retargetRelocs(i, out.relocations);
             combined.functions.push_back(std::move(out));
         }
         for (auto const& di : m.dataItems) {
-            if (isShadowedDuplicate(i, di.symbol)) continue;  // shadowed global data — drop
+            if (isShadowedAtom(i, di.symbol)) continue;  // shadowed global data — drop
             AssembledData out = di;
             out.symbol = SymbolId{mergedIdFor(i, di.symbol)};
             retargetRelocs(i, out.relocations);  // same chokepoint as the function path
@@ -721,15 +918,22 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         // (the c150 ET_DYN `.dynsym` exports, the c139 ET_REL `.symtab` names, the
         // dylib/DLL export tables) all read `module.symbols`, so a merge that drops
         // the table would silently emit an EXPORT-LESS library image (witnessed on
-        // the c154 dyn probe before this rebuild: an empty `.dynsym`). A shadowed
-        // duplicate's row is dropped with its body; same-name versions folded onto
-        // one winner id keep exactly the winner's row (`seenMergedSymIds` dedups —
-        // defensive; the shadow drop already excludes losers).
+        // the c154 dyn probe before this rebuild: an empty `.dynsym`).
+        //
+        // ★ EVERY row is carried, not one per merged id — an atom under several names
+        // is several rows (D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW). Two independent
+        // filters, in this order, because they answer different questions:
+        //   * the whole ATOM folded onto another definition ⇒ none of its names denote
+        //     anything here (the winner carries them), so drop the row with its bytes;
+        //   * the atom survives but THIS NAME lost ⇒ drop only this row — the sibling
+        //     CU that won the name emits it, and emitting it here too would put one
+        //     name on two definitions in the merged symtab.
         for (auto const& ms : m.symbols) {
             if (ms.name.empty()) continue;
-            if (isShadowedDuplicate(i, ms.symbol)) continue;
+            if (isShadowedAtom(i, ms.symbol)) continue;
+            if (isShadowedName(i, ms)) continue;
             std::uint32_t const mergedId = mergedIdFor(i, ms.symbol);
-            if (!seenMergedSymIds.insert(mergedId).second) continue;
+            if (!seenMergedSymRows.emplace(mergedId, ms.name).second) continue;
             combined.symbols.push_back(ModuleSymbol{
                 SymbolId{mergedId}, ms.name, ms.binding, ms.visibility});
         }
@@ -1047,8 +1251,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // ★ THE GATE ASKS `isExecFlavor()`, NOT `processExit().has_value()`.
     // The old spelling tested the very field the emitter would have
     // failed on (`injectEntryTrampoline`'s opening `!peOpt.has_value()`
-    // refusal — entry_trampoline.cpp:219-229 today; grep the predicate,
-    // not the line, when it drifts) — so the emitter's own fail-loud
+    // refusal, in `entry_trampoline.cpp`) — so the emitter's own fail-loud
     // was DEAD CODE BY
     // CONSTRUCTION: the caller could never reach it. `false` here meant
     // the whole injection block was skipped with NO diagnostic, and the
@@ -1079,7 +1282,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // IN-MEMORY construction path — `ObjectFormatSchema{ObjectFormatData}`
     // is a public constructor that runs no validation, and every walker
     // is likewise callable directly. The precedent is recorded in prose
-    // at the image-request gate above (linker.cpp:769-773): the first cut
+    // at this file's `mergeModules` extern-dedup retarget: the first cut
     // split the capability and bounds checks between the gate and the
     // walker, and a direct `pe::encode` call then wrote an out-of-range
     // stack reserve and reported success. A gate that is unreachable
@@ -1100,8 +1303,10 @@ LinkedImage link(std::span<AssembledModule const> modules,
                      "a claim that the platform cannot terminate otherwise "
                      "(a Mach-O LC_MAIN entry, for one, is CALLED by dyld "
                      "rather than jumped to). REMEDY: add a "
-                     "'processExit' block (mechanism 'syscall' or "
-                     "'by-name-import') plus the paired "
+                     "'processExit' block (mechanism "
+                   + dss::detail::renderAllowedList(
+                         kDeclarableExitMechanismNames, " or ")
+                   + ") plus the paired "
                      "'entryCallingConvention' to this format's schema, or "
                      "build for a format that declares them. The refusal is "
                      "the point: before this gate the trampoline was skipped "
@@ -1417,7 +1622,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
         // false. It distinguishes a genuinely EMPTY module (a valid 0-function
         // success — D-CSUBSET-TESTTU-SILENT-EXIT1) from a failure that also
         // ended with `resolvedFuncCount == expectedFuncCount == 0` (e.g. the
-        // undefined-extern early-return at :610-611).
+        // undefined-extern early-return in `resolveCrossCuSymbols`' walk).
         image.linkedCleanly = true;
     }
 

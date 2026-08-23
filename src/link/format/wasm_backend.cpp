@@ -108,6 +108,20 @@ char const* const kRejectedRootFields[] = {
             // ... and its remedy axis: WASM/SPIR-V do not participate in the
             // stack-reserve conversation at all, so neither key belongs.
             "stackReserveUnsupportedReason",
+            // D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the weak-
+            // DEFINITION spelling names a COFF COMDAT section, an ELF symbol
+            // binding or a Mach-O n_desc flag. This walker encodes none of
+            // them and never asks the schema which one it should use, so a
+            // `weakDefinition` block here would be read by NOBODY — the dead-
+            // config class this whole list exists to make loud.
+            // ⚠ REJECTING THE KEY IS NOT A CLAIM THAT THE FORMAT CANNOT
+            // EXPRESS A WEAK DEFINITION. That claim is the capability shape
+            // the anchor above refuses to encode in config; this row says only
+            // that no reader of this key exists on this backend. If a WASM
+            // weak-definition encoder lands, it arrives WITH its dialect row
+            // and this entry goes — the same direction the list's other
+            // entries move in.
+            "weakDefinition",
 };
 
 class WasmBackend final : public ObjectFormatBackend {

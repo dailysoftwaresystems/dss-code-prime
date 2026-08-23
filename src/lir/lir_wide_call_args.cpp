@@ -6,6 +6,7 @@
 // same include lir_callconv uses for them.
 #include "mir/mir_opcode.hpp"
 #include "lir/lir_node.hpp"
+#include "lir/lir_callconv.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -44,11 +45,6 @@ constexpr std::uint32_t kOutgoingSlotBytes = 8u;
 lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
              TargetCallingConvention const& cc, std::uint16_t storeOutgoingOp,
              LirBuilder& b, DiagnosticReporter& reporter) {
-    std::uint32_t const gprPoolSize =
-        static_cast<std::uint32_t>(cc.argGprs.size());
-    std::uint32_t const fprPoolSize =
-        static_cast<std::uint32_t>(cc.argFprs.size());
-    std::uint32_t const slotAlignedPoolSize = std::max(gprPoolSize, fprPoolSize);
 
     auto const& funcInfo = src.funcArena().at(fn);
     b.addFunction(SymbolId{funcInfo.symbol});
@@ -88,11 +84,18 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                                                    payload, flags, srcToDst,
                                                    "widecall", reporter))
                     return false;
+                // D-LIR-PER-INST-REG-CONSTRAINTS: `emitTerminator` is the last
+                // thing this arm appends, so `lastInst()` IS the rebuilt
+                // terminator (the emit succeeded — the arm above returned
+                // otherwise).
+                lir_pass_util::carryInstSideData(src, inst, b);
                 continue;
             }
 
             if (info == nullptr || !info->isCall) {
-                b.addInst(op, result, newOps, payload, flags);
+                LirInstId const dstInst =
+                    b.addInst(op, result, newOps, payload, flags);
+                lir_pass_util::carryInstSideData(src, inst, b, dstInst);
                 continue;
             }
 
@@ -118,7 +121,7 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
             for (std::size_t k = 0; k < firstArgIdx && k < ops.size(); ++k)
                 keepOps.push_back(ops[k]);
 
-            std::uint32_t gprIdx = 0, fprIdx = 0, slotIdx = 0;
+            ArgCursors argCursors{schema, cc};
             std::uint32_t overflowIdx = 0;   // monotonic outgoing-slot cursor
             std::uint32_t argRegionIdx = 0;  // 0-based arg position
             for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
@@ -141,9 +144,9 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                         (aggBytes + kOutgoingSlotBytes - 1u) / kOutgoingSlotBytes;
                     std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
                     if (ex == kByValueStackArgExhaustGpr)
-                        gprIdx = std::max(gprIdx, gprPoolSize);
+                        argCursors.exhaust(LirRegClass::GPR);
                     else if (ex == kByValueStackArgExhaustFpr)
-                        fprIdx = std::max(fprIdx, fprPoolSize);
+                        argCursors.exhaust(LirRegClass::FPR);
                     ++argRegionIdx;
                     continue;
                 }
@@ -155,17 +158,16 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                     continue;
                 }
                 LirRegClass const cls = argOp.reg.regClass();
-                std::uint32_t argIndex, poolSize;
-                if (cc.slotAligned) {
-                    argIndex = slotIdx++;
-                    poolSize = slotAlignedPoolSize;
-                } else if (cls == LirRegClass::FPR) {
-                    argIndex = fprIdx++;
-                    poolSize = fprPoolSize;
-                } else {
-                    argIndex = gprIdx++;
-                    poolSize = gprPoolSize;
-                }
+                // ★ THE SAME OBJECT callconv's placement loop walks, so
+                // "advance the shared cursors exactly as callconv does" is no
+                // longer a promise this file keeps by hand
+                // (D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR).
+                // ⚠ A class with no pool row gets index 0 / poolSize 0, i.e.
+                // the OVERFLOW arm — which routes it to a `store_outgoing_arg`
+                // carrier and leaves the loud refusal to the placement site.
+                auto const slot = argCursors.next(cls);
+                std::uint32_t const argIndex = slot.has_value() ? slot->index : 0u;
+                std::uint32_t const poolSize = slot.has_value() ? slot->poolSize : 0u;
                 bool const forceStack =
                     variadicForcesStack && argRegionIdx >= fixedOps;
                 if (argIndex < poolSize && !forceStack) {
@@ -184,7 +186,12 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 std::array<LirOperand, 1> so{LirOperand::makeReg(s.value)};
                 b.addInst(storeOutgoingOp, InvalidLirReg, so, s.slot, /*flags=*/0);
             }
-            b.addInst(op, result, keepOps, payload, flags);
+            // D-LIR-PER-INST-REG-CONSTRAINTS: 1 → N `store_outgoing_arg`
+            // carriers + 1 shrunken Call. The side data belongs to the CALL —
+            // the carriers are this pass's own outgoing-arg plumbing.
+            LirInstId const dstCall =
+                b.addInst(op, result, keepOps, payload, flags);
+            lir_pass_util::carryInstSideData(src, inst, b, dstCall);
         }
     }
     return true;
@@ -215,9 +222,12 @@ lowerWideCallArgs(Lir const& src, TargetSchema const& schema,
     }
 
     LirBuilder b{schema};
-    // Carry the wide-literal pool across the rebuild (LiteralIndex operands
-    // reference it by index) — same discipline as rewrite/callconv.
-    lir_pass_util::copyLiteralPool(src, b);
+    // Carry every module side structure across the rebuild in one call — the
+    // wide-literal pool (LiteralIndex operands reference it by index) and the
+    // register-constraint pool. Same discipline as rewrite/callconv; the
+    // per-instruction handles into the second pool ride `carryInstSideData`
+    // inside `lowerOneFunc`.
+    lir_pass_util::copyModuleSideStructures(src, b);
     std::size_t const funcCount = src.moduleFuncCount();
     for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
         LirFuncId const fn = src.funcAt(fi);

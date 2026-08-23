@@ -1,0 +1,77 @@
+{
+  "$comment": "D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM: the corpus witness for that row, and the only example whose whole subject is FILE-LOCAL SYMBOLS SURVIVING A STATIC-ARCHIVE ROUND TRIP. `filelocal.c` is built into a static library (a `.lib` on pe64, a `.a` on the elf64 and macho64 legs) and `main.c` is then built against it via `--resolve-library`, so the member is pulled and READ BACK -- the only path on which this defect appears. The member exports exactly ONE name, `dss_file_local_answer`; everything that makes the answer 42 is `static`, so every byte beyond that one symbol reaches the image only by a file-local symbol being reconstructed as an ATOM. THE MECHANISM IT PINS: `pe::readRelocatableObject` and `macho::readRelocatableObject` classified every non-external defined section symbol as a bodyless interior block label rather than an atom, so a file-local body never entered the image -- loud (`K_SymbolUndefined`) when something referenced it, SILENT when nothing did; `elf::readRelocatableObject` escaped because it builds an AssembledFunction from any STT_FUNC with non-zero size regardless of binding. FOUR DISTINCT FILE-LOCAL SHAPES, deliberately not four copies of one: (1) `probe_shadow`, a function NOTHING references -- the silent arm, placed first in the TU so it is emitted below the first external atom; (2) `k_weights`, read-only DATA loaded by code -- a `.text` relocation onto a class-STATIC `.rdata` symbol, which is the half D-LK-COFF-ARCHIVE-MEMBER-READER-LOSES-STATIC-RODATA-SYMBOLS names; (3) `fold_step`, a function CALLED BY NAME -- the loud arm; (4) `k_fold_slot`, const DATA holding the ADDRESS of a file-local function -- one absolute-width relocation with a local symbol at BOTH ends, running from the data section into the text section, the reverse direction of (2). WHAT WOULD HAVE FAILED BEFORE THIS CYCLE, stated as an assertion rather than a hope: the exec link returning rc=0. ⚠ INFERRED, NOT RE-MEASURED HERE -- the pre-fix compiler cannot be rebuilt cheaply from this tree, so this rests on two things that WERE measured and recorded at P21: the identical shape (a `static` helper CALLED from an exported one in an archived member) red on exactly pe64-x86_64 and macho64-arm64 with `K_SymbolUndefined` while both elf64 legs linked, and an UNCALLED one linked rc=0 with its bytes dropped and the image byte-identical. Shapes (2), (3) and (4) each emit a relocation whose target is a demoted, bodyless symbol, so `resolveCrossCuSymbols` refuses with `K_SymbolUndefined` on pe64-x86_64, macho64-arm64 and macho64-x86_64; shape (1) emits no relocation at all, and the assertion that catches it is the same rc=0, because P21's reader-agnostic partial-coverage guard `everyDefinedSymbolIsCoveredByAnAtom` turns a dropped body into a hard `F_ObjectReaderSymbolBodyDropped` refusal once the symbol's offset is covered by no atom -- which is why `probe_shadow` is emitted FIRST, below the first external atom, rather than trailing it. The two elf64 legs would have stayed green throughout, so they are the matched control rather than the witness. ★★ IT EXERCISES THE DEFECT AT **BOTH** CONFIGURATIONS, WHICH ITS TWO SIBLINGS CANNOT. In `staticlib_resolve_roundtrip` and `fat_archive_merge` the single file-local helper is reached only by a direct call, so at `--config=release` Inlining removes the call and DCE removes the function -- MEASURED with `nm`: their optimized archives carry NO local symbol at all, and the arm would link green against a reader that still had the bug. Here `k_fold_slot` holds `fold_step`'s address, so the body cannot be deleted. MEASURED on this example's pe64-x86_64 archive with `nm` and `objdump -r`: at BASELINE the member carries FIVE symbols -- four LOCAL (`probe_shadow` at text offset 0, the two `.rdata` items, `fold_step`) and one external -- with three `.text` REL32s and one `.rdata` ADDR64, every one of them targeting a local; at `--config=release` `probe_shadow` is gone (DCE) and the direct-call REL32 is gone (Inlining), but the `.rdata` ADDR64 against the surviving local text symbol REMAINS, alongside three `.text` REL32s onto the two local data symbols. So the SILENT arm alone is baseline-only and shapes (2), (3) and (4) are witnessed at BOTH configurations. RED-ON-DISABLE, MEASURED with the shipped CLI on this host at the baseline configuration, all five legs, `-staticlib` build then `--resolve-library` exec link: rc=0 everywhere with zero diagnostics, and the pe64 executable runs exit 42 at BOTH configurations. The discriminating control is the keyword itself: dropping `static` makes each symbol an ordinary external, which every reader has always promoted to an atom, so the example links, runs 42 and asserts NOTHING -- restoring the keyword is what restores the test. ⚠ WHY THERE IS NO ADDRESS-TAKEN LABEL ANYWHERE IN THIS EXAMPLE, which the shape of the defect would otherwise invite -- an interior `&&label` block symbol and a whole file-local body are spelled identically (`sym_<id>`, non-external) and telling them apart is exactly what the Mach-O `N_ALT_ENTRY` / `MH_SUBSECTIONS_VIA_SYMBOLS` pair now does. MEASURED 2026-08-20, four cells, shipped CLI, baseline config: (a) a computed goto INSIDE THE ARCHIVED MEMBER reds the exec link on pe64-x86_64, macho64-arm64 and macho64-x86_64 with `K_SymbolUndefined ... relocation in CU #N targets symbol #M`, both elf64 legs green; (b) the SAME two translation units linked directly as a multi-CU exec, with no archive in the picture, are rc=0 on every leg -- so the archive READ-BACK is the locus; (c) a computed goto in the CONSUMER instead reds ALL FIVE legs with `K_SymbolUndefined ... relocation in symbol #N references undefined symbol #M`, but only when `--resolve-library` actually PULLS a member: the same consumer built standalone, or built with `--resolve-library` present but self-contained, is rc=0; (d) a local array and a plain non-computed `goto` in the consumer are both rc=0 with a member pulled, so it is the address-taken label specifically, not statement shape. (a) is D-LINK-OBJECT-READERS-DROP-INTERIOR-SYMBOL-OFFSET, whose row still describes itself as `not yet load-bearing` -- these measurements are a user-reachable repro that it is. (c) is not described by any row read while writing this. Adding a label here would therefore red three of five legs, or all five, for a defect this example is not about; it belongs here the day those close, and the shapes it would join are already in place. TARGETS: the four its two sibling `dependsOn` manifests declare, PLUS macho64-x86_64. That fifth leg is deliberate and it closes a blind spot a registry row names in as many words -- the corpus's only two `dependsOn` manifests target macho64-arm64 and never x86_64, which is why D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT went unnoticed twice on the leg where its two format schemas declare CONFLICTING relocation nativeIds for one kind. It is `runOn: []` because no reachable host runs Mach-O x86_64 (the only Mac here is Apple Silicon), so it contributes BUILD coverage through the in-process runner -- which compiles every declared target on every host and asserts the artifact before it consults `runOn` -- and contributes zero (arm x runOn) pairs to the corpus emulator lint. MEASURED rc=0 at both configurations on that leg too. Leg-by-leg RUN results are NOT recorded here -- whoever runs the legs writes them.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        {
+          "sources": ["filelocal.c"],
+          "spec": "x86_64:pe64-x86_64-windows-staticlib",
+          "artifact": "filelocal.lib",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "dependsOn": [
+        {
+          "sources": ["filelocal.c"],
+          "spec": "x86_64:elf64-x86_64-linux-staticlib",
+          "artifact": "filelocal.a",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "dependsOn": [
+        {
+          "sources": ["filelocal.c"],
+          "spec": "arm64:elf64-aarch64-linux-staticlib",
+          "artifact": "filelocal.a",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "dependsOn": [
+        {
+          "sources": ["filelocal.c"],
+          "spec": "arm64:macho64-arm64-darwin-staticlib",
+          "artifact": "filelocal.a",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        {
+          "sources": ["filelocal.c"],
+          "spec": "x86_64:macho64-x86_64-darwin-staticlib",
+          "artifact": "filelocal.a",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

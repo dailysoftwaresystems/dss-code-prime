@@ -64,20 +64,98 @@ emitTerminator(LirBuilder& b, std::uint16_t op,
                std::string_view passName,
                DiagnosticReporter& reporter);
 
-// D-CSUBSET-BITFIELD-WIDE-UNIT: copy the source module's wide-literal
-// pool into the destination builder, PRESERVING indices. Every pass
-// that walks an input `Lir` and builds a fresh one copies `LiteralIndex`
-// OPERANDS verbatim (the index is an opaque module-level reference), so
-// the new builder's pool MUST hold the same entries at the same indices
-// or those operands dangle (LirLiteralPool::at out-of-range at encode
-// time). The destination builder MUST be freshly constructed (empty
-// pool) so appending entries 0..N-1 in order reproduces the source
-// indices exactly. Call once, right after `LirBuilder b{schema}`,
-// before any `addInst`. (Before FC8 no real value rode `LiteralIndex`
-// to the encoder — strings/floats never reached it — so this latent
-// rebuild gap was invisible; the `mov r64, imm64` carrier exposes it.)
+// Copy EVERY module-level SIDE STRUCTURE from the source module into the
+// destination builder, PRESERVING indices. Today that is two pools:
+//
+//   * the wide-literal pool (D-CSUBSET-BITFIELD-WIDE-UNIT) — every pass
+//     that walks an input `Lir` and builds a fresh one copies
+//     `LiteralIndex` OPERANDS verbatim (the index is an opaque module-
+//     level reference), so the new builder's pool MUST hold the same
+//     entries at the same indices or those operands dangle
+//     (`LirLiteralPool::at` out-of-range at encode time). Before FC8 no
+//     real value rode `LiteralIndex` to the encoder — strings/floats
+//     never reached it — so this latent rebuild gap was invisible; the
+//     `mov r64, imm64` carrier exposed it.
+//   * the per-instruction register-constraint pool
+//     (D-LIR-PER-INST-REG-CONSTRAINTS) — same by-index reference
+//     discipline, referenced from `detail::LirInst::regConstraints`
+//     instead of from an operand.
+//
+// The destination builder MUST be freshly constructed (both pools empty)
+// so appending entries 0..N-1 in order reproduces the source indices
+// exactly. Call once, right after `LirBuilder b{schema}`, before any
+// `addInst`.
+//
+// ★★★ THIS IS ONE FUNCTION ON PURPOSE, AND THAT IS THE WHOLE MECHANISM.
+// FOUR passes rebuild a module into a fresh builder (✔MEASURED
+// 2026-08-14, `grep -rn "copyModuleSideStructures" src/` —
+// `lir_2addr_legalize.cpp`, `lir_callconv.cpp`, `lir_rewrite.cpp` and
+// `lir_wide_call_args.cpp`; note FOUR, not the three that two separate
+// documents claimed. The grep is cited instead of line numbers because
+// the line numbers this comment used to carry went stale the first time
+// anyone edited those passes). A side structure whose carry-across is
+// written out per-pass is a side structure that the FIFTH pass forgets,
+// and forgetting it is not a crash — it is a dangling index or a vanished
+// clobber set, i.e. a silent miscompile. So there is exactly one place to
+// add a new side structure and zero per-pass copy code to keep in sync.
+// ⚠ If you add a third pool, add it HERE and add its rules to
+// `checkSideStructureIntegrity` + `verifyLirRebuild` (`lir_verifier.cpp`);
+// do NOT add a second copy call anywhere.
 DSS_EXPORT void
-copyLiteralPool(Lir const& src, LirBuilder& dst);
+copyModuleSideStructures(Lir const& src, LirBuilder& dst);
+
+// Carry the per-INSTRUCTION side data of one source instruction onto the
+// instruction a pass has just appended to `dst`.
+//
+// ★★ THIS IS THE ONE CALL A REBUILDING PASS MUST MAKE PER INSTRUCTION,
+// AND IT IS UNAVOIDABLE — a per-instruction field cannot survive a
+// rebuild "by construction" the way `flags` does. `flags` survives
+// because every pass already threads it through `addInst(op, res, ops,
+// payload, flags)`; `regConstraints` rides the POD, and the rebuild
+// re-CREATES the instruction, so only the pass knows which new
+// instruction corresponds to which old one. Adding a 7th defaulted
+// `addInst` parameter would not fix that: the default IS the drop.
+//
+// The two-argument overload targets `dst.lastInst()`, which is what a
+// terminator needs — the shared `emitTerminator` dispatch returns a bool
+// (it routes to one of five builder entrypoints), so its callers have no
+// id for what it just emitted.
+//
+// ⚠⚠ PREFER THE FOUR-ARGUMENT OVERLOAD, AND PASS THE ID `addInst`
+// RETURNED. "The rebuilt instruction" is NOT "the last instruction the
+// pass appended" — ✔MEASURED 2026-08-14 across the four rebuild passes,
+// TWO of them append AFTER it:
+//
+//   * `lir_rewrite` emits `frame_load` reloads BEFORE the instruction and
+//     a `frame_store` AFTER it when the result is spilled, so the
+//     correspondent is in the MIDDLE of a 1→(k+2) expansion;
+//   * `lir_callconv`'s call arm emits the arg-setup moves before the
+//     `call` and the return-value capture move AFTER it.
+//
+// ★ THE PRECISE CLAIM, because the loose one is false and was measured to
+// be false: at the exact statement that FOLLOWS the emit, `lastInst()` is
+// still correct in both passes, and substituting it there is green. What
+// the id buys is that the binding survives the carry being MOVED — to the
+// end of the loop body, past the spill store or past the capture move,
+// which is where a reader would naturally put "one call per rebuilt
+// instruction". Under that move the constraint set lands on a compiler-
+// synthesized store/move: a WRONG instruction rather than a missing one,
+// which the verifier's reference census cannot see (the count is still 1).
+// Only the ordering pins in `tests/lir/test_lir_pass_util.cpp` catch it.
+//
+// The two-argument overload is for the terminator path, where
+// `emitTerminator` returns no id and is by construction the last thing the
+// arm appends. ⚠ Gate it on that emit having SUCCEEDED: a failed
+// `emitTerminator` appends nothing, and then `lastInst()` is the previous
+// instruction.
+//
+// Precondition: `copyModuleSideStructures` has already run on `dst`, so
+// the source handle's pool index is valid in the destination.
+DSS_EXPORT void
+carryInstSideData(Lir const& src, LirInstId srcInst,
+                  LirBuilder& dst, LirInstId dstInst);
+DSS_EXPORT void
+carryInstSideData(Lir const& src, LirInstId srcInst, LirBuilder& dst);
 
 // D-AS-REWRITE-SPILL-SCRATCH-INCOMING-ARG-CLOBBER: resolve the physical
 // INCOMING argument register a register-machine `arg` op's parameter arrives

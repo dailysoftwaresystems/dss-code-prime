@@ -249,7 +249,7 @@ TEST(DiagnosticCode, DependsOnBandContinuationAfterTheSuppressSlot) {
     //
     // ⓘ THIS LITERAL IS NO LONGER THE ONLY THING STANDING BETWEEN AN ALLOCATION
     // AND AN UNPINNED CODE, and that is the point of the change that raised it
-    // to 8. `tools/check-diagnostic-codes.py` reads the ENUM itself and fails on
+    // to 8. `scripts/check-diagnostic-codes/check-diagnostic-codes.py` reads the ENUM itself and fails on
     // any code no compiled test names — a hand-maintained table can only check
     // rows somebody remembered to add, which is precisely how 0xD02A shipped
     // engine code while appearing in zero test files. Keep raising this literal;
@@ -308,7 +308,7 @@ TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
 //       inherits this guarantee automatically instead of silently escaping a
 //       hand-maintained list, which is how the original defect survived.
 //
-// The scan carries a FLOOR (same reasoning as tools/check-anchor-registry.sh's
+// The scan carries a FLOOR (same reasoning as scripts/check-anchor-registry/check-anchor-registry.sh's
 // per-root floors): a scan that discovers nothing would otherwise pass while
 // checking nothing.
 TEST(DiagnosticCode, PrefixOptimizerBandRendersAsXWithNibbleStripped) {
@@ -391,4 +391,80 @@ TEST(ScopeKind, NameMapping) {
     EXPECT_EQ(scopeName(ScopeKind::Block),   "Block");
     EXPECT_EQ(scopeName(ScopeKind::Generic), "Generic");
     EXPECT_EQ(scopeName(static_cast<ScopeKind>(2048)), "Custom");
+}
+
+// The inline-asm operand-binding codes occupy a CONTIGUOUS run at the top of the
+// semantic band, 0xE065..0xE06C, immediately after the P1 arc's last code
+// (`S_InlineAsmDuplicateQualifier`, 0xE064). Seven arrived with P5; the eighth,
+// `S_InlineAsmDuplicateSymbolicName` (0xE06C), with cycle P20 — a code the arc
+// NEEDED only because P20 made `%[name]` bind, which turned a repeated name from
+// a fail-loud refusal into a silent wrong register. Same three properties the
+// D_* band pin above asserts, at the one place the S_* band has just grown:
+//
+//   (1) the NAMES. `diagnosticCodeName` has a no-`default:` exhaustive switch
+//       under `-Werror=switch` (D-DIAG-CODENAME-EXHAUSTIVE-WARN), so a code
+//       added with NO name arm fails the BUILD on GCC/Clang — but on a local
+//       MSVC build that gate is `/we4062`, and either way "the switch has an
+//       arm" is not "the arm returns the right string". A copy-pasted arm
+//       returning its neighbour's name compiles clean and is caught only here.
+//
+//   (2) the VALUES. The number is the operator-visible identity (`error[S0065]`
+//       on stderr, in `.diag` goldens, in `expectDiagnostics` manifests), so it
+//       is pinned literally rather than derived from the enumerator.
+//
+//   (3) CONTIGUITY with 0xE064. The S_* band is dense — ✔MEASURED over the
+//       enum's own declaration lines at this commit: 108 codes spanning
+//       0xE001..0xE06C with NO gaps, FOUR of them RETIRED-but-reserved
+//       (0xE015, 0xE04E, 0xE04F, 0xE052 — reserved, never renumbered, never
+//       reused) — so "the next free value" is a fact about the band and not a
+//       guess. A future code that lands on a used slot, or that skips one,
+//       reds here instead of colliding silently with a golden.
+TEST(DiagnosticCode, InlineAsmOperandBindingBandIsContiguousAndRenders) {
+    struct Row {
+        DiagnosticCode   code;
+        std::uint16_t    value;
+        std::string_view rendered;
+        std::string_view name;
+    };
+    // Allocation order; `value` ascends by exactly 1 per row.
+    constexpr Row kRows[] = {
+        {DiagnosticCode::S_InlineAsmConstraintLetterUndeclared, 0xE065, "S0065",
+         "S_InlineAsmConstraintLetterUndeclared"},
+        {DiagnosticCode::S_InlineAsmConstraintUnsupportedForm, 0xE066, "S0066",
+         "S_InlineAsmConstraintUnsupportedForm"},
+        {DiagnosticCode::S_InlineAsmOperandModifierUnsupported, 0xE067, "S0067",
+         "S_InlineAsmOperandModifierUnsupported"},
+        {DiagnosticCode::S_InlineAsmClobberUnknown, 0xE068, "S0068",
+         "S_InlineAsmClobberUnknown"},
+        {DiagnosticCode::S_InlineAsmTemplateUnparsable, 0xE069, "S0069",
+         "S_InlineAsmTemplateUnparsable"},
+        {DiagnosticCode::S_InlineAsmPlaceholderOutOfRange, 0xE06A, "S006A",
+         "S_InlineAsmPlaceholderOutOfRange"},
+        {DiagnosticCode::S_InlineAsmPlaceholderInBasicTemplate, 0xE06B, "S006B",
+         "S_InlineAsmPlaceholderInBasicTemplate"},
+        {DiagnosticCode::S_InlineAsmDuplicateSymbolicName, 0xE06C, "S006C",
+         "S_InlineAsmDuplicateSymbolicName"},
+    };
+
+    int checked = 0;
+    std::uint16_t previous = 0xE064;  // S_InlineAsmDuplicateQualifier, the predecessor.
+    ASSERT_EQ(static_cast<std::uint16_t>(DiagnosticCode::S_InlineAsmDuplicateQualifier),
+              previous)
+        << "the predecessor this run is anchored to was renumbered, so the "
+           "contiguity check below would compare against a stale value";
+    for (Row const& row : kRows) {
+        EXPECT_EQ(static_cast<std::uint16_t>(row.code), row.value)
+            << row.name << " was renumbered";
+        EXPECT_EQ(row.value, static_cast<std::uint16_t>(previous + 1u))
+            << row.name << " is not contiguous with its predecessor";
+        previous = row.value;
+        ASSERT_EQ(row.value & 0xF000u, 0xE000u)
+            << row.name << " escaped the S_* semantic band";
+        // The name arm exists AND returns this code's own name.
+        EXPECT_EQ(diagnosticCodeName(row.code), row.name);
+        EXPECT_EQ(diagnosticCodePrefix(row.code), row.rendered);
+        ++checked;
+    }
+    // Non-vacuity: a counter incremented in the loop, not sizeof the array.
+    EXPECT_EQ(checked, 8);
 }

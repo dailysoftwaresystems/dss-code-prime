@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <optional>    // std::optional (the once-adapter symbol, minted iff call_once present)
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>     // std::move, std::pair
 #include <vector>
@@ -28,6 +29,15 @@ namespace {
 // appended after the clone loop.
 class IdentityClonePolicy final : public opt::passes::MirRebuildPolicy {
 public:
+    // The rebuild DRIVER this policy belongs to — printed by every
+    // `MirFunctionRebuilder` fatal.
+    // See D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS (one line: a wrapped
+    // anchor name mints a second, unregistered anchor).
+    // A MIR merge step, not a `kPassNameTable` pipeline pass.
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return "SynthThreadsShim";
+    }
+
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
         std::vector<MirBlockId> blocks;

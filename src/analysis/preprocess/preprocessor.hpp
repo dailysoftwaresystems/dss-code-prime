@@ -73,6 +73,7 @@
 #include "core/types/source_span.hpp"
 #include "tokenizer/token_stream.hpp"
 
+#include <array>          // kPredefinedMacroFamilyPaths (the shared family-path table)
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -301,6 +302,24 @@ struct DSS_EXPORT PreprocessResult {
 // All three are paired only at COMPILE time, when a (language, target, format)
 // triple actually exists, so this is where the merge — and the collision check
 // — must live.
+// The THREE config families' `predefinedMacros` locations, in merge order:
+// language, then target, then object format. ONE copy, shared by the collision
+// diagnostic (which must name BOTH declaring files) and by the `requires`
+// satisfaction diagnostic (which must name the declaring file and the row).
+//
+// ★ Each entry carries the FILE FAMILY as well as the JSON pointer, because the
+// target and format families use the SAME pointer (`/predefinedMacros`) — a
+// bare pointer names two different files identically, which is exactly the
+// "which file do I edit?" failure these strings exist to prevent.
+//
+// ★ AND IT IS ONE TABLE RATHER THAN THREE STRINGS AT THREE CALL SITES: a second
+// copy is a copy that can disagree, and a diagnostic naming the wrong config
+// file is worse than one naming none.
+inline constexpr std::array<std::string_view, 3> kPredefinedMacroFamilyPaths{
+    std::string_view{"<lang>.lang.json /preprocess/predefinedMacros"},
+    std::string_view{"<arch>.target.json /predefinedMacros"},
+    std::string_view{"<name>.format.json /predefinedMacros"}};
+
 struct DSS_EXPORT MergedPredefinedMacros {
     // The effective list: language entries FIRST, then target, then format,
     // each in declaration order, with the per-entry `availableObjectFormats`
@@ -336,11 +355,27 @@ struct DSS_EXPORT MergedPredefinedMacros {
 //  (d) EMPTY `targetMacros` + EMPTY `formatMacros` yields exactly the
 //      language-only list the pre-TF-C74 engine computed — the no-regression
 //      invariant, which is also the LSP / FFI-header-parser configuration.
+//  (e) D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC: every group in
+//      `exclusiveGroups` may contribute AT MOST ONE effective macro. Two or
+//      more ⇒ a conflict naming the group's members, the group's `reason`, and
+//      the OFFENDING FORMAT — so the message identifies the leg to fix rather
+//      than merely asserting that some rule was broken.
+//      ★ Checked AFTER the format filter, unlike (a): the defect class is a
+//      pair that is individually legitimate and becomes contradictory only
+//      once a particular format makes both live — typically one member gated
+//      to a single format and the other un-gated. BEFORE the filter every leg
+//      looks equally guilty and none can be named.
+//      ★ EMPTY `exclusiveGroups` is exactly the unchecked pre-pin behaviour —
+//      which is what makes deleting the shipped group a genuine red-on-disable
+//      rather than a no-op. Single-family callers (the dump's origin
+//      attribution) pass `{}` because the authoritative check already ran over
+//      the full merge; re-running it per family could only under-report.
 [[nodiscard]] DSS_EXPORT MergedPredefinedMacros mergePredefinedMacros(
     std::span<PredefinedMacroDef const> languageMacros,
     std::span<PredefinedMacroDef const> targetMacros,
     std::span<PredefinedMacroDef const> formatMacros,
-    std::optional<ObjectFormatKind>     activeFormat);
+    std::optional<ObjectFormatKind>     activeFormat,
+    std::span<PredefinedMacroExclusionGroup const> exclusiveGroups = {});
 
 // ── c105 (D-PP-USER-DEFINE): the ONE owner of `--define NAME[=VALUE]` ─────
 //

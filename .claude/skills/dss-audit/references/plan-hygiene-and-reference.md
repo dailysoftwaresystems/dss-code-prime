@@ -27,7 +27,7 @@ when-unsure-don't discipline, applied to that skill's standing test-discipline p
 |---|---|
 | Build | `cmake --build build` |
 | Full suite | `ctest --test-dir build --output-on-failure` |
-| Anchor guard | `tools/check-anchor-registry.ps1` (or `.sh`) |
+| Anchor guard | `scripts/check-anchor-registry/check-anchor-registry.ps1` (or `.sh`) |
 | Delta since baseline | `git log --oneline <baseline>..HEAD` |
 | CI legs (unverifiable locally) | `gh run list` — flag, don't claim |
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0 / §0.1 |

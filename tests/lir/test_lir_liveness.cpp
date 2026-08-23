@@ -7,6 +7,8 @@
 //   * straight-line / branching / loop / switch / call shapes
 //   * D-3e.1 lowerSwitch first-cmp + first-jcc block-placement pin
 //   * D-3e.9 ICmp dispatch across all 10 predicates
+//   * D-LIR-PER-INST-REG-CONSTRAINTS: an early-clobber result's def lands on
+//     the instruction's EARLY slot, with a matched plain-result control
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
@@ -25,6 +27,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <span>
+#include <tuple>
 #include <vector>
 
 using namespace dss;
@@ -407,4 +411,136 @@ TEST(LirLiveness, OrphanBlockIsAppendedAfterReachable) {
     EXPECT_EQ(flow.blockOrder[0].v, entry.v);
     EXPECT_EQ(flow.blockOrder[1].v, orphan.v);
     expectRangeInvariants(flow);
+}
+
+// ── EARLY-CLOBBER RESULT (`kLirInstFlagEarlyClobberResult`) ─────────────
+//
+// The LIVENESS half of inline asm's `"=&r"`. The allocator half — that a
+// plain result SHARES an input's register while an early-clobber result does
+// not — lives in `tests/lir/test_lir_regalloc.cpp`; this file pins the single
+// mechanism both rest on: WHICH OF THE INSTRUCTION'S TWO SLOTS the def lands
+// on.
+//
+// ⚠⚠ THE SLOT IS THE DISCRIMINATING VARIABLE, NOT WHICH INSTRUCTION CARRIES
+// THE DEF. An earlier handoff recorded the fix as "place the `&` output's def
+// at the FIRST expanded instruction, since `firstDef` is a min over defs"; for
+// the SINGLE-instruction template — the shape inline asm actually needs, and
+// the shape of sqlite's arm64 `hwtime.h` arm — the def is ALREADY on the first
+// instruction, so that edit is a no-op. What matters is that `firstDef` moves
+// from `2N+1` to `2N`, because the inputs' ranges end at `2N+1` and
+// `expireActive` frees a range when `end <= currentStart`.
+//
+// The matched control is not decoration: a pin that only checks the
+// early-clobber start would pass on an analyzer that put EVERY def at the
+// early slot, which would be a different bug (every result would falsely
+// interfere with every input). The PAIR is the assertion.
+namespace {
+
+// `f() { vIn = mov #7 ; vOut = mov vIn ; vSink = mov vOut ; ret }`
+// Instruction 1 is the SUBJECT and carries `subjectFlags`. Three instructions
+// is the minimum that gives vOut a USE (so its range has a meaningful end) and
+// makes vIn's LAST use the subject itself (so it would otherwise expire under
+// the subject's result).
+struct SlotProbe {
+    Lir           lir;
+    std::uint32_t inVReg   = 0;
+    std::uint32_t outVReg  = 0;
+};
+
+[[nodiscard]] SlotProbe buildSlotProbe(TargetSchema const& schema,
+                                       std::uint8_t subjectFlags) {
+    auto const movOp = schema.opcodeByMnemonic("mov");
+    auto const retOp = schema.opcodeByMnemonic("ret");
+    EXPECT_TRUE(movOp.has_value());
+    EXPECT_TRUE(retOp.has_value());
+
+    LirBuilder b{schema};
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+
+    LirReg const vIn = b.newVReg(LirRegClass::GPR);
+    std::array<LirOperand, 1> const seed{LirOperand::makeImmInt32(7)};
+    (void)b.addInst(*movOp, vIn, seed);                       // inst 0 — pos 0/1
+
+    LirReg const vOut = b.newVReg(LirRegClass::GPR);
+    std::array<LirOperand, 1> const consumeIn{LirOperand::makeReg(vIn)};
+    (void)b.addInst(*movOp, vOut, consumeIn, /*payload=*/0,
+                    subjectFlags);                            // inst 1 — pos 2/3
+
+    LirReg const vSink = b.newVReg(LirRegClass::GPR);
+    std::array<LirOperand, 1> const consumeOut{LirOperand::makeReg(vOut)};
+    (void)b.addInst(*movOp, vSink, consumeOut);               // inst 2 — pos 4/5
+
+    b.addReturn(*retOp, std::span<LirOperand const>{});       // inst 3 — pos 6/7
+
+    return SlotProbe{std::move(b).finish(), vIn.id, vOut.id};
+}
+
+} // namespace
+
+TEST(LirLiveness, EarlyClobberResultDefMovesToTheEarlySlotAndPlainDoesNot) {
+    // Both shipped targets: the mechanism is a `flags` bit read by a
+    // target-blind analysis, so a divergence here would mean the analysis had
+    // grown a target opinion.
+    for (char const* targetName : {"x86_64", "arm64"}) {
+        auto target = TargetSchema::loadShipped(targetName);
+        ASSERT_TRUE(target.has_value()) << targetName;
+
+        SlotProbe const control = buildSlotProbe(**target, /*flags=*/0);
+        SlotProbe const subject =
+            buildSlotProbe(**target, kLirInstFlagEarlyClobberResult);
+
+        LirFuncLiveness const cFlow =
+            analyzeFuncLiveness(control.lir, control.lir.funcAt(0));
+        LirFuncLiveness const sFlow =
+            analyzeFuncLiveness(subject.lir, subject.lir.funcAt(0));
+
+        auto const* cOut = findRange(cFlow, control.outVReg);
+        auto const* sOut = findRange(sFlow, subject.outVReg);
+        auto const* cIn  = findRange(cFlow, control.inVReg);
+        auto const* sIn  = findRange(sFlow, subject.inVReg);
+        ASSERT_NE(cOut, nullptr) << targetName;
+        ASSERT_NE(sOut, nullptr) << targetName;
+        ASSERT_NE(cIn,  nullptr) << targetName;
+        ASSERT_NE(sIn,  nullptr) << targetName;
+
+        // The subject instruction is #1 → early slot 2, late slot 3.
+        EXPECT_EQ(cOut->start, 3u)
+            << targetName << ": a PLAIN result must be defined at the LATE "
+               "slot — that is what lets it reuse an input's register, which "
+               "is the reference-compiler behaviour for `\"=r\"`.";
+        EXPECT_EQ(sOut->start, 2u)
+            << targetName << ": an EARLY-CLOBBER result must be defined at "
+               "the EARLY slot, so its range overlaps the slot at which the "
+               "instruction's inputs are read.";
+
+        // The input's range is IDENTICAL in both — the flag moves the def, it
+        // does not extend the use. Without this the pin could not tell the
+        // intended fix from "make everything live longer".
+        EXPECT_EQ(cIn->start, sIn->start) << targetName;
+        EXPECT_EQ(cIn->end,   sIn->end)   << targetName;
+        // ...and it ends exactly at the subject's late slot, which is why the
+        // plain case shares: `expireActive` frees at `end <= currentStart`.
+        EXPECT_EQ(cIn->end, 3u) << targetName;
+
+        // The result's END is untouched (last use at pos 4 → end 5): only the
+        // START moved. A pin that checked `start` alone could not distinguish
+        // "def moved earlier" from "range widened at both ends".
+        EXPECT_EQ(cOut->end, 5u) << targetName;
+        EXPECT_EQ(sOut->end, 5u) << targetName;
+
+        // Collateral: the documented substrate invariants survive the slot
+        // change — the pairing, the sort, and `start < end`.
+        EXPECT_EQ(sFlow.positionToInst[2].v, sFlow.positionToInst[3].v)
+            << targetName << ": positionToInst[2N] == positionToInst[2N+1]";
+        EXPECT_TRUE(std::is_sorted(
+            sFlow.ranges.begin(), sFlow.ranges.end(),
+            [](LirLiveRange const& a, LirLiveRange const& b) {
+                return std::tie(a.start, a.vreg.id)
+                     < std::tie(b.start, b.vreg.id);
+            })) << targetName;
+        expectRangeInvariants(sFlow);
+        expectRangeInvariants(cFlow);
+    }
 }

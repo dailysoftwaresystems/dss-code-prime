@@ -8,7 +8,7 @@ The sweep **never invents** a value; it reads it from the authority and reconcil
 |---|---|
 | Current ctest count | a fresh `ctest --test-dir build --output-on-failure` |
 | Push / commit state | `git log`, `git rev-list … origin/<branch>` |
-| Anchor exists / is cited in src | `tools/check-anchor-registry.{ps1,sh}` + grep `src/` |
+| Anchor exists / is cited in src | `scripts/check-anchor-registry/check-anchor-registry.{ps1,sh}` + grep `src/` |
 | Anchor is *closed* | code present + test green + full anchor scope covered; else a flag |
 | What an implementation actually does | `src/` + the cycle that landed it (git) |
 | Plan-file lifecycle (`- ok`/`- tbd`) | the plan's own §0 status + git (flag the rename) |
@@ -35,7 +35,7 @@ it is always a flag rather than an auto-fix.
 | Need | Command / path |
 |---|---|
 | Real suite count | `ctest --test-dir build --output-on-failure` |
-| Anchor guard (src↔registry) | `tools/check-anchor-registry.ps1` (or `.sh`) |
+| Anchor guard (src↔registry) | `scripts/check-anchor-registry/check-anchor-registry.ps1` (or `.sh`) |
 | Push state | `git rev-list --left-right --count origin/<branch>...HEAD` |
 | All plans | `.plans/` (numbered `00`–`22`, `08.x`, registry, `v2-gap-catalog`, `ZZ-final-goal`) |
 | Anchor registry | `.plans/_deferred-anchor-registry.md` |

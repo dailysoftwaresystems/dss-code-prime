@@ -32,6 +32,8 @@
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 
+#include "format_reject_support.hpp"   // rejectSummary — the reject-shape printer
+
 #include "gcc_lib_c164_object.inc"
 #include "gcc_section_relative_c167.inc"
 
@@ -46,6 +48,7 @@
 #include <vector>
 
 using namespace dss;
+using dss::link_format::test::rejectSummary;
 
 namespace {
 
@@ -1072,6 +1075,49 @@ TEST(RelocatableObjectReader, EmitOnlyRowThatAliasesNothingFailsLoud) {
     EXPECT_TRUE(named);
 }
 
+// The THIRD rule about an emission alias, and the one that completes the pair
+// above: an alias may not also carry a `"isCall"` ROLE. An `emitOnly` row is
+// deliberately EXCLUDED from the nativeId -> kind reverse map every object
+// reader builds, which is the same loop that collects the call signals -- so a
+// role declared there could never be consulted. That is worse than useless: it
+// is SILENT, and it reads to the next maintainer as a guarantee in force.
+// Refuse the combination at LOAD (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL).
+//
+// The POSITIVE control is the first half: the same document with `isCall` on
+// the row that OWNS the wire id loads clean, so the rejection is attributable
+// to the pairing and not to `isCall` being rejected everywhere.
+TEST(RelocatableObjectReader, IsCallOnAnEmitOnlyAliasFailsLoud) {
+    auto ok = ObjectFormatSchema::loadFromText(
+        R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
+            "cSymbolDecoration":{"scheme":"none"},
+            "format":{"name":"elf-role-ok","kind":"elf"},
+            "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
+            "relocations":[{"name":"A","kind":1,"nativeId":7,"isCall":true},
+                           {"name":"B","kind":2,"nativeId":7,"emitOnly":true}]})");
+    ASSERT_TRUE(ok.has_value())
+        << "isCall on the OWNING row alongside an alias is the correct shape "
+           "and must load: " << rejectSummary(ok);
+    ASSERT_NE((*ok)->relocationByName("A"), nullptr);
+    EXPECT_TRUE((*ok)->relocationByName("A")->isCall);
+
+    auto bad = ObjectFormatSchema::loadFromText(
+        R"({"dssObjectFormatVersion":1,"dataModel":"LP64","headerNameMatching":"case-sensitive",
+            "cSymbolDecoration":{"scheme":"none"},
+            "format":{"name":"elf-role-bad","kind":"elf"},
+            "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
+            "relocations":[{"name":"A","kind":1,"nativeId":7},
+                           {"name":"B","kind":2,"nativeId":7,"emitOnly":true,"isCall":true}]})");
+    ASSERT_FALSE(bad.has_value())
+        << "a role declared on a row no reader can consult must not load";
+    bool named = false;
+    for (auto const& d : bad.error()) {
+        if (d.message.find("can never be consulted") != std::string::npos) named = true;
+    }
+    EXPECT_TRUE(named)
+        << "the refusal must say WHY the pair is a contradiction, and where to "
+           "put the declaration instead: " << rejectSummary(bad);
+}
+
 TEST(RelocatableObjectReader, NonElfFormatSchemaFailsLoud) {
     auto loaded = loadShipped();
     ASSERT_TRUE(loaded.target && loaded.format);
@@ -1088,4 +1134,367 @@ TEST(RelocatableObjectReader, NonElfFormatSchemaFailsLoud) {
     for (auto const& d : rep.all())
         if (d.code == DiagnosticCode::F_UnsupportedBinaryFormat) saw = true;
     EXPECT_TRUE(saw);
+}
+
+// ============================================================================
+// THE GEOMETRY FALLBACK ON ELF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
+// BLOCK-LABEL-NOT-ATOM, the third of the three readers (operator ruling
+// 2026-08-20: the fallback lands on all of them).
+//
+// ★★ ELF IS WHERE IT FIRES LEAST, AND SAYING SO PRECISELY IS THE POINT -- a
+// call site that no object can reach would be the vacuous coverage this repo
+// keeps finding. `st_size` means nearly every defined symbol here declares its
+// own extent and is sliced by the ordinary arms, and a ZERO-size symbol is a
+// MARKER the shared rule skips outright. Exactly one shape is left: a symbol in
+// a TEXT section with a NON-ZERO st_size that is not STT_FUNC. The `rk == Text`
+// arm slices only `STT_FUNC && size > 0`, so an STT_NOTYPE body with real bytes
+// -- an assembler label given a `.size` but no `.type @function` -- reaches
+// `stageBodiless()` and used to be REFUSED by the coverage guard.
+//
+// The objects below are DSS's own writer output with ONE BYTE patched: st_info's
+// type nibble, STT_FUNC (2) -> STT_NOTYPE (0). Everything else is identical, so
+// whatever changes is attributable to that nibble.
+// ============================================================================
+
+namespace {
+// Elf64_Sym is name(4) info(1) other(1) shndx(2) value(8) size(8) -- st_info is
+// the FIFTH byte, and its low nibble is the TYPE (high nibble is the binding).
+// Derived from the layout rather than written as a literal, because a literal is
+// the kind of number that silently stops pointing at the field it names.
+constexpr std::size_t kSymEntSize  = 24;
+constexpr std::size_t kStInfoOff   = 4;
+constexpr std::uint8_t kSttFunc    = 2;
+constexpr std::uint8_t kSttNoType  = 0;
+constexpr std::uint8_t kStbGlobal  = 1;
+
+// The two-function module the fallback tests share: `fn1` at .text[0,8),
+// `fn2` at .text[8,16). Symtab: 0 = UNDEF, 1 = .text SECTION, 2 = fn1, 3 = fn2.
+[[nodiscard]] AssembledModule twoFunctionModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction f1; f1.symbol = SymbolId{1}; f1.bytes.assign(8, 0x90);
+    AssembledFunction f2; f2.symbol = SymbolId{2}; f2.bytes.assign(8, 0xCC);
+    mod.functions = {f1, f2};
+    mod.symbols = {
+        ModuleSymbol{SymbolId{1}, "fn1", SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{2}, "fn2", SymbolBinding::Global, SymbolVisibility::Default},
+    };
+    return mod;
+}
+
+void retypeSymbol(std::vector<std::uint8_t>& obj, std::size_t symIndex,
+                  std::uint8_t bind, std::uint8_t type) {
+    std::size_t const st = symtabBody(obj);
+    obj[st + symIndex * kSymEntSize + kStInfoOff] =
+        static_cast<std::uint8_t>((bind << 4) | type);
+}
+
+[[nodiscard]] AssembledFunction const* funcByName(AssembledModule const& m,
+                                                  std::string const& name) {
+    for (auto const& f : m.functions) {
+        if (nameOf(m, f.symbol) == name) return &f;
+    }
+    return nullptr;
+}
+} // namespace
+
+// A SIZED, NON-STT_FUNC body in `.text` that no atom covers is RECOVERED.
+//
+// RED-ON-DISABLE (watched): make `uncoveredDefinedSymbolsThatStartAnAtom`
+// return {} -- `fn1` is staged bodiless, nothing covers offset 0, and the
+// coverage post-condition refuses the whole read, so the ASSERT_TRUE goes red.
+TEST(RelocatableObjectReader, ElfSizedNoTypeTextBodyIsRecoveredByGeometry) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    DiagnosticReporter wrep;
+    auto obj = elf::encode(twoFunctionModule(), *loaded.target, *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+
+    // Confirm the premise from the BYTES before mutating it: symbol 2 is fn1 and
+    // it really is STT_FUNC today. Without this the patch below could be
+    // retyping a symbol that had already stopped being a function.
+    std::size_t const st = symtabBody(obj);
+    ASSERT_GT(st, 0u);
+    ASSERT_EQ(obj[st + 2 * kSymEntSize + kStInfoOff] & 0x0Fu, kSttFunc);
+    retypeSymbol(obj, 2, kStbGlobal, kSttNoType);
+
+    DiagnosticReporter rep;
+    auto got = elf::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value())
+        << "a sized NOTYPE body in `.text` that no atom covers is a body, not a "
+           "label -- it must be recovered rather than refused; errors="
+        << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // TWO atoms of EIGHT bytes each. The count and the extents are what
+    // discriminate: the byte total is 16 whether `fn1` was recovered, absorbed
+    // into `fn2`, or dropped and replaced by a 16-byte `fn2`.
+    ASSERT_EQ(got->functions.size(), 2u);
+    auto const* recovered = funcByName(*got, "fn1");
+    ASSERT_NE(recovered, nullptr)
+        << "the recovered body must carry the symbol it came from, not a "
+           "synthetic id";
+    EXPECT_EQ(recovered->bytes.size(), 8u)
+        << "sliced to its own st_size -- ELF never infers an extent from the "
+           "next boundary, which is why its call site needs no re-slice";
+    EXPECT_EQ(recovered->bytes.front(), 0x90u)
+        << "...and the bytes are fn1's, not fn2's";
+    auto const* other = funcByName(*got, "fn2");
+    ASSERT_NE(other, nullptr);
+    EXPECT_EQ(other->bytes.size(), 8u)
+        << "the untouched function must not have grown to swallow the recovered "
+           "one";
+    std::size_t named = 0;
+    for (auto const& sy : got->symbols) named += (sy.name == "fn1") ? 1u : 0u;
+    EXPECT_EQ(named, 1u) << "a promoted symbol must not be recorded twice";
+}
+
+// THE NEGATIVE CONTROL: the same retyped symbol, COVERED. Geometry must have
+// nothing to say about a symbol that lies inside a reconstructed atom -- that
+// is the whole discrimination the fallback rests on, and without this arm the
+// test above could not tell "promoted because uncovered" from "promoted because
+// NOTYPE".
+TEST(RelocatableObjectReader, ElfNoTypeTextSymbolInsideAFunctionIsNotPromoted) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    DiagnosticReporter wrep;
+    auto obj = elf::encode(twoFunctionModule(), *loaded.target, *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+
+    // Retype fn2 (symbol 3) and move it INSIDE fn1's [0,8): st_value 8 -> 4,
+    // st_size 8 -> 2. fn1 stays STT_FUNC and still owns [0,8), so the retyped
+    // symbol is covered.
+    std::size_t const st = symtabBody(obj);
+    ASSERT_GT(st, 0u);
+    retypeSymbol(obj, 3, kStbGlobal, kSttNoType);
+    wr64(obj, st + 3 * kSymEntSize + 8, 4ull);    // st_value
+    wr64(obj, st + 3 * kSymEntSize + 16, 2ull);   // st_size
+
+    DiagnosticReporter rep;
+    auto got = elf::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errors=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(got->functions.size(), 1u)
+        << "an interior sized label must NOT split the function containing it -- "
+           "that is the miscompile the coverage test exists to avoid";
+    EXPECT_EQ(got->functions.front().bytes.size(), 8u);
+    EXPECT_EQ(nameOf(*got, got->functions.front().symbol), "fn1");
+    EXPECT_NE(nameOf(*got, SymbolId{0}), "fn2");  // fn2 is still a ModuleSymbol
+}
+
+// THE RUN RULE, ELF's branch of it: a DECLARED extent is evidence, so two
+// uncovered SIZED symbols are two bodies -- the merge that protects COFF and
+// Mach-O (where extents are inferred from the next boundary) must not fire here.
+//
+// ★ THIS IS THE SAME SHARED RULE reaching a different answer on different
+// evidence, which is exactly why it lives in the header and not in a reader.
+// RED-ON-DISABLE (watched): drop the `declaredSize` branch of the run rule so
+// every run merges -- `fn2` stops being an atom and the count goes 2 -> 1.
+TEST(RelocatableObjectReader, ElfTwoUncoveredSizedBodiesAreBothRecovered) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    DiagnosticReporter wrep;
+    auto obj = elf::encode(twoFunctionModule(), *loaded.target, *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+    retypeSymbol(obj, 2, kStbGlobal, kSttNoType);
+    retypeSymbol(obj, 3, kStbGlobal, kSttNoType);
+
+    DiagnosticReporter rep;
+    auto got = elf::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value())
+        << "with NO STT_FUNC left, `.text` reconstructs entirely through the "
+           "fallback; errors=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(got->functions.size(), 2u)
+        << "a stated extent is evidence -- only an INFERRED one has to merge";
+    auto const* a = funcByName(*got, "fn1");
+    auto const* b = funcByName(*got, "fn2");
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    EXPECT_EQ(a->bytes.size(), 8u);
+    EXPECT_EQ(b->bytes.size(), 8u);
+    EXPECT_EQ(a->bytes.front(), 0x90u);
+    EXPECT_EQ(b->bytes.front(), 0xCCu)
+        << "...and each carries its OWN bytes, so this is a real split and not "
+           "two views of one slice";
+}
+
+// ============================================================================
+// -- EQUAL-ST_VALUE DEFINED SYMBOLS ARE ONE ATOM UNDER SEVERAL NAMES --------
+//
+// D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS. ELF reaches the shape
+// through an ALIAS: `extern int f(int) __attribute__((weak, alias("g")))`.
+// ✔MEASURED, gcc 13.3.0 `-O1` on a two-line C file:
+//
+//     3: value 0  size 21  FUNC GLOBAL  .text  g
+//     5: value 0  size 21  FUNC WEAK    .text  f
+//     .rela.text: R_X86_64_PLT32 at offset 9 -> sink
+//
+// Same `st_value`, same `st_size`, and the function's own call relocation at
+// offset 9 -- INSIDE the span the two names share. Slicing an atom per symbol
+// made byte-identical twins, and `findInterval` hands that relocation to
+// exactly ONE of them; the other shipped with an un-patched call.
+//
+// The objects below are DSS's own writer output with TWO FIELDS patched into
+// that shape -- `fn2`'s st_value moved onto `fn1`'s, and its binding flipped to
+// WEAK. Everything else is the writer's, so whatever changes is attributable to
+// those fields. (DSS's own writer cannot emit the shape: its atoms all start at
+// distinct offsets, which is why this defect never fired on DSS output.)
+// ============================================================================
+
+namespace {
+constexpr std::size_t  kStValueOff = 8;    // Elf64_Sym.st_value
+constexpr std::size_t  kStSizeOff  = 16;   // Elf64_Sym.st_size
+constexpr std::uint8_t kStbWeak    = 2;
+
+// fn1 at .text[0,16) carrying a rel32 at offset 8 whose target is fn2; fn2 at
+// .text[16,32). Symtab: 0 = UNDEF, 1 = .text SECTION, 2 = fn1, 3 = fn2.
+[[nodiscard]] AssembledModule twoFunctionsOneCallingTheOther() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction f1;
+    f1.symbol = SymbolId{1};
+    f1.bytes.assign(16, 0x90);
+    // ⚠ THE ADDEND IS 64 AND IT IS LOAD-BEARING -- it points OUTSIDE the
+    // 16-byte body it names. A reference is bound BY IDENTITY (symbol + addend,
+    // resolved at layout), which is exactly what a non-aliased target already
+    // gets, and an alias must behave exactly as its owner would. Without the
+    // explicit remap the target falls through to the SECTION-RELATIVE redirect
+    // instead, which binds by GEOMETRY: it looks for the atom owning byte
+    // `st_value + addend` = 64, finds none in a 32-byte `.text`, and refuses
+    // the whole object. ✔MEASURED: with addend 0 the two routes agree exactly,
+    // so an addend of 0 here pinned nothing at all.
+    f1.relocations.push_back(Relocation{8u, SymbolId{2}, RelocationKind{1}, 64});
+    AssembledFunction f2;
+    f2.symbol = SymbolId{2};
+    f2.bytes.assign(16, 0xCC);
+    mod.functions = {f1, f2};
+    mod.symbols = {
+        ModuleSymbol{SymbolId{1}, "fn1", SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{2}, "fn2", SymbolBinding::Global, SymbolVisibility::Default},
+    };
+    return mod;
+}
+
+[[nodiscard]] std::uint64_t symField(std::vector<std::uint8_t> const& obj,
+                                     std::size_t symIndex, std::size_t fieldOff) {
+    return rd64(obj, symtabBody(obj) + symIndex * kSymEntSize + fieldOff);
+}
+
+void setSymField(std::vector<std::uint8_t>& obj, std::size_t symIndex,
+                 std::size_t fieldOff, std::uint64_t value) {
+    std::size_t const at = symtabBody(obj) + symIndex * kSymEntSize + fieldOff;
+    for (std::size_t k = 0; k < 8; ++k)
+        obj[at + k] = static_cast<std::uint8_t>((value >> (8u * k)) & 0xFFu);
+}
+} // namespace
+
+// RED-ON-DISABLE (watched): make `resolveEqualOffsetAtomAliases` skip its
+// grouping arm (`if (h - g > 1)` -> `if (false)`) -- `fn2` mints a twin again,
+// the count goes to 2, and the rel32 at section offset 8 is routed to whichever
+// twin `findInterval` reaches first, so one of them carries no relocation.
+TEST(RelocatableObjectReader, EqualStValueAliasSharesOneAtomAndItsRelocations) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    DiagnosticReporter wrep;
+    auto obj = elf::encode(twoFunctionsOneCallingTheOther(), *loaded.target,
+                           *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+
+    // Confirm the premise from the BYTES before mutating it -- symbol 2 is fn1
+    // at [0,16) and symbol 3 is fn2 at [16,32), both STT_FUNC. Without this the
+    // patch below could be moving a symbol that is no longer what it names.
+    std::size_t const st = symtabBody(obj);
+    ASSERT_GT(st, 0u);
+    ASSERT_EQ(obj[st + 2 * kSymEntSize + kStInfoOff] & 0x0Fu, kSttFunc);
+    ASSERT_EQ(obj[st + 3 * kSymEntSize + kStInfoOff] & 0x0Fu, kSttFunc);
+    ASSERT_EQ(symField(obj, 2, kStValueOff), 0u);
+    ASSERT_EQ(symField(obj, 2, kStSizeOff), 16u);
+    ASSERT_EQ(symField(obj, 3, kStValueOff), 16u);
+    ASSERT_EQ(symField(obj, 3, kStSizeOff), 16u);
+
+    // gcc's alias shape: same st_value, same st_size, WEAK against a STRONG.
+    setSymField(obj, 3, kStValueOff, 0u);
+    retypeSymbol(obj, 3, kStbWeak, kSttFunc);
+
+    DiagnosticReporter rep;
+    auto got = elf::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errors=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // ONE atom. The byte total is the same either way -- twins are
+    // byte-identical -- so the COUNT and the identity set are the only things
+    // that can tell the two reconstructions apart.
+    ASSERT_EQ(got->functions.size(), 1u)
+        << "fn1 and fn2 name one body now; a second atom would be its twin";
+    AssembledFunction const& atom = got->functions[0];
+    EXPECT_EQ(atom.bytes.size(), 16u) << "sliced to st_size, as ELF always is";
+    EXPECT_EQ(nameOf(*got, atom.symbol), "fn1")
+        << "the STRONG name owns the atom; the WEAK one is the alias";
+
+    // The alias keeps its own name AND its own linkage -- only the body is
+    // shared. An id -> row lookup keeps the FIRST row, so the canonical row
+    // must have been recorded before this one.
+    ModuleSymbol const* alias = nullptr;
+    for (auto const& s : got->symbols) if (s.name == "fn2") { alias = &s; break; }
+    ASSERT_NE(alias, nullptr) << "the aliased name must survive the collapse";
+    EXPECT_EQ(alias->symbol, atom.symbol);
+    EXPECT_EQ(alias->binding, SymbolBinding::Weak);
+
+    // BOTH halves of the rule, in one relocation: its SITE (section offset 8)
+    // lies in the span the two names share and must reach the one atom, and its
+    // TARGET named `fn2` -- an identity that owns no body once the twin is gone
+    // -- so it must bind to the atom instead of failing `K_SymbolUndefined`.
+    ASSERT_EQ(atom.relocations.size(), 1u);
+    EXPECT_EQ(atom.relocations[0].offset, 8u);
+    EXPECT_EQ(atom.relocations[0].target, atom.symbol);
+    EXPECT_EQ(nameOf(*got, atom.relocations[0].target), "fn1");
+    EXPECT_EQ(atom.relocations[0].addend, 64)
+        << "an alias binds BY IDENTITY, so the addend survives untouched -- "
+           "exactly what the owner's own name would have got";
+}
+
+// THE REFUSAL. Two symbols at one offset whose declared extents DISAGREE are
+// not two names for one body -- they are NESTED bodies, and a relocation past
+// the shorter extent belongs unambiguously to the longer while one inside it is
+// claimed by both. There is no atom that is right for both, so the reader
+// refuses and names them. ELF is the only reader that can reach this: COFF and
+// Mach-O derive an atom's end from the next boundary, so their equal-offset
+// candidates get equal extents by construction.
+//
+// RED-ON-DISABLE (watched): delete the conflicting-extent arm from
+// `resolveEqualOffsetAtomAliases` and the read returns a 16-byte atom that
+// silently swallows the 8-byte symbol's extent.
+TEST(RelocatableObjectReader, EqualStValueWithDifferentStSizeFailsLoud) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    DiagnosticReporter wrep;
+    auto obj = elf::encode(twoFunctionsOneCallingTheOther(), *loaded.target,
+                           *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+    ASSERT_EQ(symField(obj, 3, kStSizeOff), 16u);
+
+    setSymField(obj, 3, kStValueOff, 0u);   // same start as fn1...
+    setSymField(obj, 3, kStSizeOff, 8u);    // ...but HALF the extent
+
+    DiagnosticReporter rep;
+    auto got = elf::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value())
+        << "a nested body is not an alias -- guessing an extent for it is the "
+           "silent miscompile the refusal exists to prevent";
+    EXPECT_GT(rep.errorCount(), 0u);
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("DIFFERENT extents") != std::string::npos
+            && d.actual.find("fn1") != std::string::npos
+            && d.actual.find("fn2") != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named) << "the diagnostic must name BOTH symbols and the reason";
 }

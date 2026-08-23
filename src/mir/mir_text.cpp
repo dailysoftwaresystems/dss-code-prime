@@ -1,9 +1,11 @@
 #include "mir/mir_text.hpp"
 
+#include "core/types/config_key_vocabulary.hpp"  // renderAllowedList (the refusals project their table)
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/enum_name_table.hpp"  // EnumNameTable / allNames — ONE owner per text spelling set
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"   // symbolBindingName / symbolVisibilityName
-#include "core/types/target_schema.hpp"  // callConvName / callConvFromName
+#include "core/types/target_schema.hpp"  // callConvName / kCallConvTable
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_literal_pool.hpp"
@@ -83,86 +85,159 @@ constexpr int kVersion = 1;
     return out;
 }
 
+// A dependent `false` for the `static_assert` that closes `appendLiteral`'s
+// `if constexpr` ladder. A bare `static_assert(false, …)` there would fire during
+// the template's DEFINITION rather than only on an unhandled instantiation; making
+// the value depend on `T` defers it to the arm that is actually reached.
+template <typename>
+inline constexpr bool kMirTextNoSuchLiteralArm = false;
+
+// ★★★ D-TEXT-TIER-READERS-KEEP-HAND-WRITTEN-FROMNAME-IF-CHAINS. Both spelling
+// sets below used to exist twice in this file — a `…Name` switch for the writer
+// and a `…FromName` if-chain for the reader — which is two owners of one fact on
+// a WRITE-THEN-READ surface. The failure is not a stale message: rename a
+// spelling on one side and `.dssmir` text this compiler EMITS stops loading in
+// this compiler's own reader, in one direction only, with both halves compiling
+// and a green suite. One table, both directions projected off it; see the same
+// note in `hir_text.cpp` for why the table lives at the text tier rather than
+// beside the enum.
+//
+// ⚠ `primName` is a deliberate SUBSET of `TypeKind` (aggregates and pointers
+// have their own bracketed syntax), so it projects through `nameOrEmpty`:
+// `EnumNameTable::name`'s row-0 fall-back would render a `Struct` as the keyword
+// `bool`. `markerName`'s fall-back IS `"linear"` and `Linear` is row 0, so
+// `name()` there reproduces the old switch exactly.
+inline constexpr EnumNameTable<TypeKind, 19> kMirTextPrimTable{{{
+    { TypeKind::Bool, "bool" },
+    { TypeKind::Char, "char" },
+    { TypeKind::Byte, "byte" },
+    { TypeKind::Void, "void" },
+    { TypeKind::I8,   "i8"   },
+    { TypeKind::I16,  "i16"  },
+    { TypeKind::I32,  "i32"  },
+    { TypeKind::I64,  "i64"  },
+    { TypeKind::I128, "i128" },
+    { TypeKind::U8,   "u8"   },
+    { TypeKind::U16,  "u16"  },
+    { TypeKind::U32,  "u32"  },
+    { TypeKind::U64,  "u64"  },
+    { TypeKind::U128, "u128" },
+    { TypeKind::F16,  "f16"  },
+    { TypeKind::F32,  "f32"  },
+    { TypeKind::F64,  "f64"  },
+    { TypeKind::F80,  "f80"  },
+    { TypeKind::F128, "f128" },
+    // ⚠ `NullptrT` is deliberately ABSENT, and the absence is a CONTRACT, not an
+    // oversight: `I_NullptrTypeInMir` is a verifier tripwire, so a nullptr_t
+    // type never reaches MIR at all. The hir-tier table DOES carry it, which is
+    // why these two tables are not one table — the two tiers accept genuinely
+    // different sets, and merging them would teach the MIR reader a spelling the
+    // MIR verifier refuses.
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMirTextPrimTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextPrimTable));
+
 [[nodiscard]] std::string_view primName(TypeKind k) noexcept {
-    switch (k) {
-        case TypeKind::Bool: return "bool";
-        case TypeKind::Char: return "char";
-        case TypeKind::Byte: return "byte";
-        case TypeKind::Void: return "void";
-        case TypeKind::I8:   return "i8";
-        case TypeKind::I16:  return "i16";
-        case TypeKind::I32:  return "i32";
-        case TypeKind::I64:  return "i64";
-        case TypeKind::I128: return "i128";
-        case TypeKind::U8:   return "u8";
-        case TypeKind::U16:  return "u16";
-        case TypeKind::U32:  return "u32";
-        case TypeKind::U64:  return "u64";
-        case TypeKind::U128: return "u128";
-        case TypeKind::F16:  return "f16";
-        case TypeKind::F32:  return "f32";
-        case TypeKind::F64:  return "f64";
-        case TypeKind::F80:  return "f80";
-        case TypeKind::F128: return "f128";
-        default: return {};
-    }
+    return kMirTextPrimTable.nameOrEmpty(k);
 }
 
 [[nodiscard]] std::optional<TypeKind> primKindFromName(std::string_view s) noexcept {
-    if (s == "bool") return TypeKind::Bool;
-    if (s == "char") return TypeKind::Char;
-    if (s == "byte") return TypeKind::Byte;
-    if (s == "void") return TypeKind::Void;
-    if (s == "i8")   return TypeKind::I8;
-    if (s == "i16")  return TypeKind::I16;
-    if (s == "i32")  return TypeKind::I32;
-    if (s == "i64")  return TypeKind::I64;
-    if (s == "i128") return TypeKind::I128;
-    if (s == "u8")   return TypeKind::U8;
-    if (s == "u16")  return TypeKind::U16;
-    if (s == "u32")  return TypeKind::U32;
-    if (s == "u64")  return TypeKind::U64;
-    if (s == "u128") return TypeKind::U128;
-    if (s == "f16")  return TypeKind::F16;
-    if (s == "f32")  return TypeKind::F32;
-    if (s == "f64")  return TypeKind::F64;
-    if (s == "f80")  return TypeKind::F80;
-    if (s == "f128") return TypeKind::F128;
-    return std::nullopt;
+    return kMirTextPrimTable.fromName(s);
 }
+
+// ── the LITERAL-CORE vocabulary, which is NOT the prim vocabulary ──────────
+//
+// A `MirLiteralValue::core` is a bare keyword in both directions, and the set of
+// keywords legal THERE is the prim table PLUS the structural kinds an aggregate /
+// pointer / enum constant can carry. `kMirTextPrimTable` deliberately omits those
+// (a structural TYPE has bracketed syntax — `ptr<T>`, `arr<T,N>` — and a row here
+// would make the bare keyword resolve to a prim and swallow the operand), so this
+// position needs its own table rather than a row added over there.
+//
+// ★ IT HAD A HAND-WRITTEN IF-CHAIN ON EACH SIDE, which is exactly the two-owners
+// shape `D-TEXT-TIER-READERS-KEEP-HAND-WRITTEN-FROMNAME-IF-CHAINS` closed for the
+// prim and marker sets in this same file — the sweep that converted those two
+// walked past this one. The writer's chain and the reader's chain were separate
+// copies of one set several hundred lines apart, and the reader's had no final
+// `else`: an unrecognized core spelling left `core` at `Void` and the parse
+// SUCCEEDED (`D-MIR-TEXT-UNKNOWN-LITERAL-CORE-SILENTLY-DEGRADED-TO-VOID`).
+inline constexpr EnumNameTable<TypeKind, 6> kMirTextLiteralCoreTable{{{
+    { TypeKind::Struct, "struct" },
+    { TypeKind::Union,  "union"  },
+    { TypeKind::Array,  "array"  },
+    { TypeKind::Ptr,    "ptr"    },
+    { TypeKind::Ref,    "ref"    },
+    { TypeKind::Enum,   "enum"   },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMirTextLiteralCoreTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextLiteralCoreTable));
+
+// The spelling of a literal's core, or EMPTY when this format has none for it.
+// ⚠ `nameOrEmpty` on BOTH tables, never `name`: neither lists an invalid
+// sentinel, so the row-0 fall-back would render an unspelled kind as `bool` /
+// `struct` — a wrong answer that reads as a legitimate declaration.
+[[nodiscard]] std::string_view literalCoreName(TypeKind k) noexcept {
+    std::string_view const p = kMirTextPrimTable.nameOrEmpty(k);
+    return p.empty() ? kMirTextLiteralCoreTable.nameOrEmpty(k) : p;
+}
+
+[[nodiscard]] std::optional<TypeKind> literalCoreFromName(std::string_view s) noexcept {
+    if (auto const k = kMirTextPrimTable.fromName(s); k.has_value()) return k;
+    return kMirTextLiteralCoreTable.fromName(s);
+}
+
+// The accepted set for that position, projected off BOTH owning tables so the
+// sentence cannot be narrower, wider or staler than the lookup above it.
+[[nodiscard]] std::string literalCoreAccepted() {
+    std::string out{detail::renderAllowedList(allNames(kMirTextPrimTable))};
+    out += ", ";
+    out += detail::renderAllowedList(allNames(kMirTextLiteralCoreTable));
+    return out;
+}
+
+inline constexpr EnumNameTable<StructCfMarker, 12> kMirTextMarkerTable{{{
+    { StructCfMarker::Linear,     "linear"     },
+    { StructCfMarker::EntryBlock, "entry"      },
+    { StructCfMarker::ExitBlock,  "exit"       },
+    { StructCfMarker::LoopHeader, "loopheader" },
+    { StructCfMarker::LoopLatch,  "looplatch"  },
+    { StructCfMarker::LoopExit,   "loopexit"   },
+    { StructCfMarker::IfThen,     "ifthen"     },
+    { StructCfMarker::IfElse,     "ifelse"     },
+    { StructCfMarker::IfJoin,     "ifjoin"     },
+    { StructCfMarker::SwitchHead, "switchhead" },
+    { StructCfMarker::SwitchCase, "switchcase" },
+    { StructCfMarker::SwitchJoin, "switchjoin" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMirTextMarkerTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextMarkerTable));
 
 [[nodiscard]] std::string_view markerName(StructCfMarker m) noexcept {
+    // The `-Werror=switch` backstop, owning no spelling: a new marker with no
+    // table row would otherwise take the row-0 fall-back and be WRITTEN OUT as
+    // `linear`, silently losing the structural role on every round trip.
     switch (m) {
-        case StructCfMarker::Linear:     return "linear";
-        case StructCfMarker::EntryBlock: return "entry";
-        case StructCfMarker::ExitBlock:  return "exit";
-        case StructCfMarker::LoopHeader: return "loopheader";
-        case StructCfMarker::LoopLatch:  return "looplatch";
-        case StructCfMarker::LoopExit:   return "loopexit";
-        case StructCfMarker::IfThen:     return "ifthen";
-        case StructCfMarker::IfElse:     return "ifelse";
-        case StructCfMarker::IfJoin:     return "ifjoin";
-        case StructCfMarker::SwitchHead: return "switchhead";
-        case StructCfMarker::SwitchCase: return "switchcase";
-        case StructCfMarker::SwitchJoin: return "switchjoin";
+        case StructCfMarker::Linear: case StructCfMarker::EntryBlock:
+        case StructCfMarker::ExitBlock: case StructCfMarker::LoopHeader:
+        case StructCfMarker::LoopLatch: case StructCfMarker::LoopExit:
+        case StructCfMarker::IfThen: case StructCfMarker::IfElse:
+        case StructCfMarker::IfJoin: case StructCfMarker::SwitchHead:
+        case StructCfMarker::SwitchCase: case StructCfMarker::SwitchJoin:
+            break;
     }
-    return "linear";
-}
-
-[[nodiscard]] std::optional<StructCfMarker> markerFromName(std::string_view s) noexcept {
-    if (s == "linear")     return StructCfMarker::Linear;
-    if (s == "entry")      return StructCfMarker::EntryBlock;
-    if (s == "exit")       return StructCfMarker::ExitBlock;
-    if (s == "loopheader") return StructCfMarker::LoopHeader;
-    if (s == "looplatch")  return StructCfMarker::LoopLatch;
-    if (s == "loopexit")   return StructCfMarker::LoopExit;
-    if (s == "ifthen")     return StructCfMarker::IfThen;
-    if (s == "ifelse")     return StructCfMarker::IfElse;
-    if (s == "ifjoin")     return StructCfMarker::IfJoin;
-    if (s == "switchhead") return StructCfMarker::SwitchHead;
-    if (s == "switchcase") return StructCfMarker::SwitchCase;
-    if (s == "switchjoin") return StructCfMarker::SwitchJoin;
-    return std::nullopt;
+    return kMirTextMarkerTable.name(m);
 }
 
 [[nodiscard]] std::optional<MirOpcode> opcodeFromMnemonic(std::string_view s) noexcept {
@@ -298,12 +373,39 @@ private:
             case TypeKind::Union:
                 out_ += "union "; out_ += quote(in.name(t)); out_ += " {";
                 args(in.operands(t)); out_ += '}'; return;
+            // ★★ THE UNDERLYING KIND IS SPELLED BY NAME, NOT BY ITS ORDINAL, and
+            // that is a correctness requirement rather than a readability one.
+            // This arm used to write `std::to_string(sc[0])` — the raw `TypeKind`
+            // integer — and the reader cast it straight back. Two facts make that
+            // wrong: `core_type.hpp` states in three separate placement notes that
+            // NO TypeKind ordinal is serialized (which is why new kinds may be
+            // appended freely), and the `wfloat` literal arm in the sibling HIR
+            // tier already wrote the rule out — serialize "a STABLE semantic
+            // discriminator, NOT the version-fragile TypeKind ordinal". The name
+            // comes off the SAME table the rest of the type grammar reads, so the
+            // two directions cannot drift and inserting an enumerator cannot
+            // silently re-point an existing `.dssir`
+            // (D-TEXT-TIER-ENUM-UNDERLYING-SERIALIZED-AS-A-TYPEKIND-ORDINAL).
             case TypeKind::Enum: {
                 out_ += "enum "; out_ += quote(in.name(t));
                 auto sc = in.scalars(t);
                 if (!sc.empty() && static_cast<TypeKind>(sc[0]) != TypeKind::I32) {
-                    out_ += " : ";
-                    out_ += std::to_string(sc[0]);
+                    auto const k = static_cast<TypeKind>(sc[0]);
+                    std::string_view const n = primName(k);
+                    if (n.empty()) {
+                        // No spelling for it ⇒ say so and emit NOTHING, which makes
+                        // the type read back as the plain `enum "N"` (I32) rather
+                        // than as some other kind. A wrong underlying type silently
+                        // resizes every enumerator.
+                        report(std::format(
+                            "enum '{}' has an underlying TypeKind (ordinal {}) this "
+                            "format has no spelling for; the underlying type is NOT "
+                            "rendered and the text will read back as the default",
+                            in.name(t), sc[0]));
+                    } else {
+                        out_ += " : ";
+                        out_ += n;
+                    }
                 }
                 return;
             }
@@ -369,18 +471,56 @@ private:
                 // F5: link-time symbol-address literal (`&sym [+ addend]`).
                 out_ += std::format("symaddr %{}", v.symbol);
                 if (v.addend != 0) out_ += std::format(" + {}", v.addend);
+            } else if constexpr (std::is_same_v<T, BitIntValue>) {
+                // C4b `_BitInt` value. SAME spelling as the HIR tier's
+                // `appendLiteralValue` — the two pools hold the SAME host type, so a
+                // second syntax for it would be a second owner of one serialization.
+                out_ += std::format("bitint {} {} {}", v.width(),
+                                    v.isSigned() ? 1 : 0, v.limbs().size());
+                for (std::uint64_t l : v.limbs()) out_ += std::format(" {}", l);
+            } else if constexpr (std::is_same_v<T, WideFloatValue>) {
+                // LD-3 folded F80/F128 value, again the HIR tier's spelling: the
+                // FORMAT BIT-WIDTH (80|128) is the stable discriminator, never the
+                // TypeKind ordinal.
+                WideFloatValue::Packed const p = v.pack();
+                out_ += std::format("wfloat {} {} {}",
+                                    (v.kind() == TypeKind::F128) ? 128 : 80, p.hi, p.lo);
+            } else {
+                // ★★★ THE ARM THAT DID NOT EXIST, AND ITS ABSENCE WAS SILENT.
+                // This chain had no final `else`, so the two arms above it — both
+                // reachable, `toMirLiteral` copies a `BitIntValue`/`WideFloatValue`
+                // straight across from the HIR pool — rendered NOTHING AT ALL: a
+                // `_BitInt` or folded long-double constant came out as `lit  : ?`,
+                // its value dropped, with no diagnostic on either side
+                // (D-MIR-TEXT-WRITER-DROPS-UNHANDLED-LITERAL-VARIANT-ARMS).
+                //
+                // ★ A COMPILE ERROR, NOT A RUNTIME REFUSAL, because the set is
+                // closed AT COMPILE TIME: `MirLiteralValue::value` is a variant, so
+                // "did every arm get rendered" is decidable by the compiler, and a
+                // runtime diagnostic would only report the miss on the runs that
+                // happen to reach it. Adding an arm to the variant now FAILS THE
+                // BUILD here, naming this writer, which is what the previous two
+                // arms needed and did not get.
+                static_assert(kMirTextNoSuchLiteralArm<T>,
+                              "MirLiteralValue gained a variant arm that this "
+                              "writer does not render — add an arm above (and its "
+                              "twin in parseLiteral) rather than letting the value "
+                              "serialize as nothing");
             }
         }, lv.value);
         out_ += " : ";
-        std::string_view const p = primName(lv.core);
-        if (!p.empty()) out_ += p;
-        else if (lv.core == TypeKind::Struct) out_ += "struct";
-        else if (lv.core == TypeKind::Union)  out_ += "union";
-        else if (lv.core == TypeKind::Array)  out_ += "array";
-        else if (lv.core == TypeKind::Ptr)    out_ += "ptr";
-        else if (lv.core == TypeKind::Ref)    out_ += "ref";
-        else if (lv.core == TypeKind::Enum)   out_ += "enum";
-        else { report("unprintable literal core kind"); out_ += '?'; }
+        // ⚠ ONE OWNER FOR THE CORE SPELLINGS, both directions. The `else if` ladder
+        // that used to stand here was a second copy of `parseLiteral`'s ladder, and
+        // its final arm wrote a bare `?` under a message that named no kind — so the
+        // reader (whose ladder had no final arm at all) took the `?` as `Void` and
+        // the round trip silently changed the literal's core.
+        std::string_view const n = literalCoreName(lv.core);
+        if (!n.empty()) { out_ += n; return; }
+        report(std::format(
+            "literal core TypeKind ordinal {} has no spelling in this format; "
+            "rendered as '?', which the reader REFUSES — accepted: {}",
+            static_cast<std::uint32_t>(lv.core), literalCoreAccepted()));
+        out_ += '?';
     }
 
     void emitGlobal(MirGlobalId g) {
@@ -608,6 +748,63 @@ private:
                 // `seh_try_end <region>` — the payload is the region id.
                 out_ += std::format(" {}", mir_.instPayload(id));
                 break;
+            // ★★★ INLINE ASM: RENDER THE EDGES, AND SAY WHAT CANNOT BE RENDERED
+            // (D-MIR-TEXT-INLINE-ASM-RENDERS-A-POOL-INDEX-AND-NO-EDGES).
+            //
+            // Both asm opcodes used to fall into `default:`, which rendered the
+            // operands and then the raw `instPayload` — an index into the module's
+            // `MirAsmDescriptorPool` that means NOTHING once the text is detached
+            // from the module that produced it — and, because `default:` renders no
+            // successors, an `asm goto` printed with **no CFG edges at all**.
+            // ⚠ THE HALF THAT IS A DECLARED LIMITATION IS NOT THIS ONE. The parser
+            // REFUSES both mnemonics by name and states the reason (the descriptor
+            // carries text and constraints this format does not spell), so the text
+            // is deliberately one-way. A one-way dump is a choice; a dump that
+            // silently omits a terminator's edges while looking complete is not, and
+            // an `asm goto` is the first terminator this reached.
+            // ★ WHAT IS RENDERED: the operands, then every successor — the labels in
+            // source order followed by the FALL-THROUGH, which is the successor
+            // convention `MirBuilder::addInlineAsmGoto` establishes and the MIR
+            // verifier enforces — then an explicit marker in place of the descriptor.
+            // The marker names the absence rather than substituting a number for it,
+            // which is the whole difference between this and what it replaced.
+            case MirOpcode::InlineAsm:
+            case MirOpcode::InlineAsmGoto: {
+                auto operands = mir_.instOperands(id);
+                if (!operands.empty()) {
+                    out_ += " (";
+                    bool first = true;
+                    for (MirInstId const op2 : operands) {
+                        if (!first) out_ += ", ";
+                        out_ += std::format("%v{}", op2.v);
+                        first = false;
+                    }
+                    out_ += ')';
+                }
+                if (op == MirOpcode::InlineAsmGoto) {
+                    auto succs = mir_.blockSuccessors(block);
+                    for (std::size_t k = 0; k < succs.size(); ++k) {
+                        // The last successor is the fall-through; labelling it in the
+                        // text is what lets a reader check the convention instead of
+                        // counting on having remembered it.
+                        out_ += std::format(" {}%b{}",
+                                            (k + 1 == succs.size()) ? "fallthrough " : "",
+                                            succs[k].v);
+                    }
+                }
+                // ⚠ ONE TOKEN, HYPHENATED, AND THAT IS A REQUIREMENT RATHER
+                // THAN A STYLE. ✔MEASURED: the first spelling of this marker was
+                // the English phrase `<descriptor not spelled by this format>`,
+                // and the round-trip ABORTED the process --
+                // `addInst: opcode 'not' takes [1, 1] operands but got 0`. The
+                // parser refuses the `inlineasm*` mnemonic and its recovery then
+                // re-tokenizes the rest of the line, where the bare word `not` is
+                // a real MIR mnemonic. A writer must not hand the parser a valid
+                // opcode inside prose, so the marker is a single token with no
+                // interior spaces.
+                out_ += " <asm-descriptor-unspelled>";
+                break;
+            }
             default: {
                 // Generic: render all operands.
                 auto operands = mir_.instOperands(id);
@@ -921,6 +1118,26 @@ private:
         errors_ = true;
     }
 
+    // Resolve a spelling against the vocabulary's OWN table, and REFUSE a miss
+    // rather than keeping `dflt` — the twin of `hir_text.cpp`'s `orMalformed`,
+    // and the reason it is a template over the TABLE rather than over an
+    // already-resolved `std::optional`: the lookup and the advertised set then
+    // come off the same rows, so the sentence cannot be narrower, wider or
+    // staler than the check
+    // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+    //
+    // ⚠ `dflt` is returned ONLY so the parse can keep collecting diagnostics;
+    // `emitUnknownName` has already set `errors_`, so `finalize()` discards the
+    // module and the caller never sees a value built on it.
+    template <class E, std::size_t N>
+    [[nodiscard]] E orUnknownName(EnumNameTable<E, N> const& table,
+                                  std::string_view name, char const* what, E dflt) {
+        if (auto const v = table.fromName(name); v.has_value()) return *v;
+        emitUnknownName(std::format("unknown {} '{}' — accepted: {}", what, name,
+                                    detail::renderAllowedList(allNames(table))));
+        return dflt;
+    }
+
     bool expect(TokKind k) {
         Tok t = lex_.take();
         if (t.kind != k) {
@@ -991,6 +1208,23 @@ private:
             while (i < num.size() && std::isdigit(static_cast<unsigned char>(num[i]))) {
                 v = v * 10 + static_cast<std::uint32_t>(num[i] - '0');
                 ++i;
+            }
+            // ⚠ THE DIGITS ARE THE HANDLE; NO DIGITS IS NOT HANDLE ZERO. The loop
+            // above used to be the whole arm, so `%b`, `%vx` or `%g_tmp` fell out
+            // with `v == 0` and NO diagnostic — and 0 is a LIVE SLOT NUMBER here,
+            // which is what turns a typo into a wrong answer rather than a lookup
+            // miss. ✔MEASURED 2026-08-21 with this guard removed: in a function
+            // whose entry block is `%b0`, `br %b` silently became `br %b0` — a
+            // SELF-LOOP on the entry block, from text that named no block at all.
+            // `i == 1` means the class letter was followed by nothing numeric;
+            // `i != num.size()` means digits then trailing junk (`%b3x`), which is
+            // equally not a handle
+            // (D-MIR-TEXT-PERCENT-HANDLE-WITHOUT-DIGITS-SILENTLY-BECOMES-ZERO).
+            if (i == 1 || i != num.size()) {
+                emitMalformed(std::format(
+                    "malformed handle '%{}': a '%' handle is an optional "
+                    "'b'/'v'/'f'/'g' class letter followed by DIGITS", t.text));
+                return 0;
             }
             return v;
         }
@@ -1090,13 +1324,30 @@ private:
             if (name.kind != TokKind::String) {
                 emitMalformed("expected enum name"); return InvalidType;
             }
+            // ⚠ FAIL LOUD, AND SPELL THE KIND BY NAME. This arm read an INTEGER and
+            // cast it straight to `TypeKind` with no range check whatsoever, so
+            // `enum "E" : 9999` produced an enum whose underlying kind was not a
+            // kind at all, and `enum "E" : 24` silently made an aggregate the
+            // underlying type of an enumeration — in both cases the parse SUCCEEDED.
+            // The `hir_text.cpp` twin at least bounded the ordinal by `Count_`, and
+            // there an out-of-range value silently kept `I32`: the same defect
+            // wearing a range check
+            // (D-TEXT-TIER-ENUM-UNDERLYING-SERIALIZED-AS-A-TYPEKIND-ORDINAL).
+            // The spelling now comes off `kMirTextPrimTable`, the SAME table the
+            // rest of this type grammar reads, so an unrecognized name is refused
+            // with the accepted set projected from those rows.
             TypeKind underlying = TypeKind::I32;
             if (lex_.peek().kind == TokKind::Colon) {
                 lex_.take();
                 Tok n = lex_.take();
-                std::int64_t const k = parseNumber<std::int64_t>(n.text,
-                    "enum underlying kind ordinal");
-                underlying = static_cast<TypeKind>(k);
+                if (n.kind != TokKind::Ident) {
+                    emitMalformed(std::format(
+                        "expected an enum underlying type name after ':', got '{}'",
+                        n.text));
+                } else {
+                    underlying = orUnknownName(kMirTextPrimTable, n.text,
+                                               "enum underlying type", TypeKind::I32);
+                }
             }
             return interner_.enumType(name.text, underlying);
         }
@@ -1116,7 +1367,24 @@ private:
             if (peekIdent("cc")) {
                 lex_.take();
                 Tok n = lex_.take();
-                if (auto c = callConvFromName(n.text); c.has_value()) cc = *c;
+                // ⚠ FAIL LOUD, and this arm was SILENT — the same shape as the
+                // block marker below, one tier further down and with a worse
+                // consequence. It read `if (auto c = callConvFromName(n.text);
+                // c.has_value()) cc = *c;` with no `else`, so an unrecognized
+                // calling convention left `cc` at `CcSysV` and the parse
+                // SUCCEEDED. A `.dssir` naming `ms64` or `aapcs64` under any
+                // spelling this table does not carry would come back SysV: an
+                // ABI CHANGE — different argument registers, different stack
+                // discipline — applied silently to a function signature, on a
+                // format whose whole contract is lossless round-trip
+                // (D-MIR-TEXT-UNKNOWN-CALLING-CONVENTION-SILENTLY-DEGRADED-TO-SYSV).
+                if (auto c = kCallConvTable.fromName(n.text); c.has_value()) {
+                    cc = *c;
+                } else {
+                    emitUnknownName(std::format(
+                        "unknown calling convention '{}' — accepted: {}", n.text,
+                        detail::renderAllowedList(allNames(kCallConvTable))));
+                }
             }
             return interner_.fnSig(params, ret, cc);
         }
@@ -1133,8 +1401,17 @@ private:
             emitMalformed("expected literal variant tag"); return lv;
         }
         if (tag.text == "bool") {
+            // ⚠ FAIL LOUD. This read `lv.value = (v.text == "true");`, so EVERY
+            // spelling other than `true` — `False`, `1`, `treu`, a truncated token,
+            // anything — silently became `false` and the parse SUCCEEDED. The
+            // `hir_text.cpp` twin already refused it by name; the two readers of one
+            // format disagreed about what a boolean literal is
+            // (D-MIR-TEXT-UNKNOWN-BOOL-SPELLING-SILENTLY-DEGRADED-TO-FALSE).
             Tok v = lex_.take();
-            lv.value = (v.text == "true");
+            if (v.text == "true")       lv.value = true;
+            else if (v.text == "false") lv.value = false;
+            else emitMalformed(std::format(
+                "expected 'true' or 'false' after a bool literal, got '{}'", v.text));
         } else if (tag.text == "int") {
             Tok v = lex_.take();
             lv.value = parseNumber<std::int64_t>(v.text, "int literal");
@@ -1158,20 +1435,49 @@ private:
             }
             (void)expect(TokKind::RBrace);
             lv.value = std::move(agg);
+        } else if (tag.text == "bitint") {
+            // C4b: the inverse of `appendLiteral`'s `bitint` arm, and the SAME
+            // spelling `hir_text.cpp`'s `parseLiteralValue` reads —
+            // `bitint <width> <signed 0|1> <nLimbs> <limb…>`.
+            std::uint64_t const width  = parseNumber<std::uint64_t>(lex_.take().text, "bitint width");
+            std::uint64_t const sgn    = parseNumber<std::uint64_t>(lex_.take().text, "bitint signedness");
+            std::uint64_t const nLimbs = parseNumber<std::uint64_t>(lex_.take().text, "bitint limb count");
+            std::vector<std::uint64_t> limbs;
+            limbs.reserve(static_cast<std::size_t>(nLimbs));
+            for (std::uint64_t i = 0; i < nLimbs; ++i) {
+                limbs.push_back(parseNumber<std::uint64_t>(lex_.take().text, "bitint limb"));
+            }
+            lv.value = BitIntValue(std::move(limbs),
+                                   static_cast<std::uint32_t>(width), sgn != 0);
+        } else if (tag.text == "wfloat") {
+            // LD-3: `wfloat <bits> <hi> <lo>`; the BIT-WIDTH selects the unpack
+            // layout, never a serialized TypeKind ordinal.
+            std::uint64_t const bits = parseNumber<std::uint64_t>(lex_.take().text, "wfloat bit width");
+            std::uint64_t const hi   = parseNumber<std::uint64_t>(lex_.take().text, "wfloat high word");
+            std::uint64_t const lo   = parseNumber<std::uint64_t>(lex_.take().text, "wfloat low word");
+            lv.value = WideFloatValue::fromPacked(
+                lo, hi, (bits == 128) ? TypeKind::F128 : TypeKind::F80);
         } else if (tag.text == "monostate") {
             // monostate already default
         } else {
             emitMalformed(std::format("unknown literal tag '{}'", tag.text));
         }
         (void)expect(TokKind::Colon);
+        // ⚠ THE LADDER HAD NO FINAL ARM. An unrecognized core spelling left
+        // `lv.core` at `Void` and the parse SUCCEEDED — and the WRITER reaches this
+        // exact state, emitting a bare `?` for any kind it has no spelling for, so
+        // this compiler's own output read back with the literal's core silently
+        // changed. Refused by name now, with the accepted set projected off BOTH
+        // owning tables
+        // (D-MIR-TEXT-UNKNOWN-LITERAL-CORE-SILENTLY-DEGRADED-TO-VOID).
         Tok coreT = lex_.take();
-        if (auto k = primKindFromName(coreT.text); k.has_value()) lv.core = *k;
-        else if (coreT.text == "struct") lv.core = TypeKind::Struct;
-        else if (coreT.text == "union")  lv.core = TypeKind::Union;
-        else if (coreT.text == "array")  lv.core = TypeKind::Array;
-        else if (coreT.text == "ptr")    lv.core = TypeKind::Ptr;
-        else if (coreT.text == "ref")    lv.core = TypeKind::Ref;
-        else if (coreT.text == "enum")   lv.core = TypeKind::Enum;
+        if (auto k = literalCoreFromName(coreT.text); k.has_value()) {
+            lv.core = *k;
+        } else {
+            emitUnknownName(std::format(
+                "unknown literal core type '{}' — accepted: {}",
+                coreT.text, literalCoreAccepted()));
+        }
         return lv;
     }
 
@@ -1266,11 +1572,23 @@ private:
                     visibility = *v;
                     continue;
                 }
+                // ⚠ THIS SENTENCE USED TO RETYPE BOTH CLOSED SETS —
+                // `(local | global | weak)` and `(default | hidden | protected |
+                // internal)` — as string literals beside checks that read
+                // `symbolBindingFromName` / `symbolVisibilityFromName`. Two owners
+                // of one fact, on the same surface and in the same cycle that
+                // converted the marker and calling-convention arms below/above:
+                // add a binding and the check takes it while the sentence keeps
+                // calling it invalid
+                // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+                // Both halves are projected off the tables the lookups use.
                 emitMalformed(std::format(
-                    "unknown function attribute '{}' — expected a binding "
-                    "(local | global | weak), a visibility (default | hidden | "
-                    "protected | internal), '{}', '{}', '{}' or '{}'",
-                    a.text, kMirTextNoInlineAttr, kMirTextAlwaysInlineAttr,
+                    "unknown function attribute '{}' — expected a binding ({}), "
+                    "a visibility ({}), '{}', '{}', '{}' or '{}'",
+                    a.text,
+                    detail::renderAllowedList(allNames(kSymbolBindingTable), " | "),
+                    detail::renderAllowedList(allNames(kSymbolVisibilityTable), " | "),
+                    kMirTextNoInlineAttr, kMirTextAlwaysInlineAttr,
                     kMirTextNoOptimizeAttr, kMirTextNoSanitizeThreadAttr));
                 break;
             }
@@ -1327,7 +1645,28 @@ private:
                 if (lex_.peek().kind == TokKind::LBracket) {
                     lex_.take();
                     Tok m = lex_.take();
-                    if (auto mk = markerFromName(m.text); mk.has_value()) marker = *mk;
+                    // ⚠ FAIL LOUD, and this arm used to be SILENT. It read
+                    // `if (auto mk = markerFromName(m.text); mk) marker = *mk;`
+                    // with no `else`: an unrecognized marker spelling left
+                    // `marker` at `Linear` and the parse SUCCEEDED, so a
+                    // `.dssmir` carrying a typo'd — or simply NEWER — marker
+                    // loaded clean with the block's structural role silently
+                    // erased. That is the worst shape available here: the role
+                    // is what the loop/if/switch consumers read, so the text
+                    // round trip returned a module that DIFFERS from the one
+                    // written and nothing said so. The refusal renders the
+                    // accepted set off the same table the lookup uses, so it
+                    // cannot go stale
+                    // (D-MIR-TEXT-UNKNOWN-BLOCK-MARKER-SILENTLY-DEGRADED-TO-LINEAR).
+                    if (auto mk = kMirTextMarkerTable.fromName(m.text);
+                        mk.has_value()) {
+                        marker = *mk;
+                    } else {
+                        emitUnknownName(std::format(
+                            "unknown block marker '{}' — accepted: {}", m.text,
+                            detail::renderAllowedList(
+                                allNames(kMirTextMarkerTable))));
+                    }
                     (void)expect(TokKind::RBracket);
                 }
                 // Create the block now with the correct marker. Body
@@ -1360,15 +1699,32 @@ private:
     [[nodiscard]] MirBlockId resolveBlockRef(std::uint32_t slot) {
         auto it = blockMap_.find(slot);
         if (it != blockMap_.end()) return it->second;
-        // Reached only on MALFORMED input: a `br`/`condbr`/`switch`
-        // names a block-slot that was not declared as a `block %bN`
-        // header. `scanBlockHeaders` would have pre-created every
-        // declared block; the lookup miss here means the reference
-        // is to a non-existent block. Create a Linear placeholder
-        // so the builder doesn't abort; the verify-on-load pass
-        // will flag the orphan (block created but never filled, OR
-        // referenced from a terminator whose target doesn't appear
-        // in the function's block range).
+        // Reached only on MALFORMED input: a `br`/`condbr`/`switch` names a
+        // block-slot that was not declared as a `block %bN` header.
+        // `scanBlockHeaders` pre-creates every declared block, so a lookup miss
+        // here means the reference is to a block that does not exist.
+        //
+        // ★★★ THE COMMENT THAT USED TO STAND HERE DELEGATED THE REFUSAL TO A PASS
+        // THAT CANNOT RUN. It said the placeholder was made "so the builder doesn't
+        // abort" and that "the verify-on-load pass will flag the orphan" — and both
+        // halves are wrong in the same way. Verify-on-load runs AFTER
+        // `MirBuilder::finish()`, and `closeFunction_` ABORTS THE PROCESS on any
+        // block created but never filled, which is exactly what this placeholder
+        // is. With no diagnostic emitted, `errors_` stayed false, `finalize()` did
+        // NOT short-circuit, and the reader died in the builder instead of
+        // returning a refusal. ✔MEASURED 2026-08-21 through the sibling switch arm,
+        // whose identical shape produced `dss::MirBuilder fatal: block MirBlockId=1
+        // has no terminator` and exit `0xc0000409`
+        // (`D-MIR-TEXT-UNDECLARED-BRANCH-TARGET-DELEGATES-ITS-REFUSAL-TO-A-PASS-THAT-CANNOT-RUN`).
+        //
+        // ★ The placeholder still gets created — the parse is collect-all and the
+        // caller needs a block id to hand the builder — but the diagnostic is what
+        // makes it safe: `errors_` is now set, so `finalize()` discards the module
+        // before `finish()` is ever called. Same discipline as the block-marker and
+        // switch-default arms: refuse here, discard there, never abort.
+        emitUnknownName(std::format(
+            "branch target %b{} was never declared as a 'block %b{}' header in this "
+            "function", slot, slot));
         MirBlockId const b = builder_.createBlock(StructCfMarker::Linear);
         blockMap_[slot] = b;
         return b;
@@ -1397,6 +1753,30 @@ private:
         // finish()`'s abort. Bailing first keeps the builder in a
         // clean state regardless of the finalize() path.
         if (!expect(TokKind::LBrace)) return;
+        // ★★★ AND BAIL ON AN EARLIER ERROR TOO, BECAUSE finalize()'s GUARD IS IN
+        // THE WRONG PLACE TO CATCH THIS ONE.
+        //
+        // ✔MEASURED 2026-08-19 (cycle P20) on the first `.dssir` text ever emitted
+        // containing an `inlineasmgoto`: the process ABORTED with
+        // `block MirBlockId=1 has no terminator`. Not in `finish()` — in
+        // `beginBlock`, HERE, which refuses to open a block while the previous one
+        // is unterminated.
+        //
+        // ⚠ THE REFUSAL SITE'S OWN COMMENT NAMES THE RULE IT WAS BREAKING —
+        // *"a refusal that crashes is not a refusal"* — and it was right about the
+        // principle and wrong about the coverage: `finalize()` short-circuits on
+        // `errors_` and so never calls `finish()`, but an instruction refused
+        // mid-block leaves that block unterminated and the NEXT `%bN {` never
+        // reaches `finalize()` at all. The guard protected the last step of a walk
+        // that dies two steps earlier.
+        //
+        // ★ Stopping here rather than sealing the block with a synthesized
+        // `unreachable`: the module is already being discarded by `finalize()`, so
+        // a synthetic terminator would exist only to satisfy a builder invariant
+        // for a module nobody will read — and it would make a REFUSED parse and a
+        // SUCCESSFUL one produce structurally similar builders, which is how the
+        // discard path stops being obviously correct.
+        if (errors_) return;
         builder_.beginBlock(b);
         while (true) {
             Tok pk = lex_.peek();
@@ -1441,6 +1821,21 @@ private:
             return;
         }
         MirOpcode const op = *opOpt;
+        // Inline-asm P5: an asm block's payload indexes the module's
+        // `MirAsmDescriptorPool`, and this text format has no syntax for the
+        // descriptor — the template, the constraint list and the clobber list are
+        // simply not in the `.dssir` grammar yet. Accepting the mnemonic would
+        // build an instruction whose payload names a pool slot that does not
+        // exist, and `MirBuilder::addInst` would ABORT the process on the way
+        // there. Refuse it as a parse diagnostic instead: a refusal that crashes
+        // is not a refusal (D-LIR-TEXT-PARSE-UNSEALED-BLOCK-ABORT's class).
+        if (op == MirOpcode::InlineAsm || op == MirOpcode::InlineAsmGoto) {
+            emitMalformed(std::format(
+                "opcode '{}' cannot be read from MIR text: an inline-asm block "
+                "carries a descriptor (template + constraints + clobbers) that "
+                "this format does not yet spell", mnemonic));
+            return;
+        }
         TypeId resultType = InvalidType;
         if (lex_.peek().kind == TokKind::Colon) {
             lex_.take();
@@ -1565,9 +1960,26 @@ private:
                     }
                 }
                 (void)expect(TokKind::RBrace);
-                if (sawDefault) {
-                    builder_.addSwitch(disc, cases, defaultBB);
+                // ⚠ THE FALSE BRANCH USED TO BE AN UNNAMED DEFAULT — and the thing
+                // it silently defaulted to was DROPPING A TERMINATOR. With no
+                // `default -> %bN` arm this was a bare `if (sawDefault)` with no
+                // `else`, so the `switch` instruction was never built, `errors_`
+                // stayed false, and the block reached `finalize()` unterminated —
+                // where `MirBuilder::finish()` ABORTS THE PROCESS. That is the class
+                // this file already names two arms above: a refusal that crashes is
+                // not a refusal (`D-LIR-TEXT-PARSE-UNSEALED-BLOCK-ABORT`). The
+                // emitter always writes the default (it is `succs.back()`), so text
+                // without one is hand-written or truncated — exactly the input a
+                // reader owes a diagnostic
+                // (D-MIR-TEXT-SWITCH-WITHOUT-DEFAULT-SILENTLY-DROPS-THE-TERMINATOR).
+                if (!sawDefault) {
+                    emitMalformed(std::format(
+                        "switch on %v{} has no 'default -> %b<n>' arm; a MIR switch "
+                        "terminator requires one (the emitter always writes it as "
+                        "the last successor)", discSlot));
+                    break;
                 }
+                builder_.addSwitch(disc, cases, defaultBB);
                 break;
             }
             case MirOpcode::Return: {

@@ -28,6 +28,7 @@
 #include "link/format/object_format_backends.hpp"
 
 #include "core/substrate/diagnostic_collector.hpp"
+#include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/macho.hpp"
 #include "link/object_format_schema.hpp"
@@ -151,19 +152,45 @@ public:
                         } else {
                             coll.emit(DiagnosticCode::C_MalformedJson,
                                       "/macho/filetype",
-                                      "'filetype' must be 'object' / "
-                                      "'execute' / 'dylib'");
+                                      std::format(
+                                          "'filetype' must be {}",
+                                          ::dss::detail::renderAllowedList(
+                                              allNames(kMachOObjectTypeTable),
+                                              " / ")));
                         }
                     } else if (ft.is_number_integer()) {
+                        // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-
+                        // CLOSED-SET, on the WIRE half. `MachOObjectType`'s
+                        // enumerators ARE the MH_* wire values, so the accepted
+                        // integers are a projection of the same table the string
+                        // arm resolves through — this used to be a 1/2/6
+                        // if-chain with `{1,2,6}` retyped into the refusal, i.e.
+                        // a second AND a third owner of one fact.
                         std::int64_t const v = ft.get<std::int64_t>();
-                        if (v == 1) data.macho.filetype = MachOObjectType::Object;
-                        else if (v == 2) data.macho.filetype = MachOObjectType::Execute;
-                        else if (v == 6) data.macho.filetype = MachOObjectType::Dylib;
-                        else {
+                        bool matched = false;
+                        for (auto const& row : kMachOObjectTypeTable.rows) {
+                            if (v != static_cast<std::int64_t>(
+                                         static_cast<std::uint32_t>(row.first))) {
+                                continue;
+                            }
+                            data.macho.filetype = row.first;
+                            matched = true;
+                            break;
+                        }
+                        if (!matched) {
+                            std::string accepted;
+                            for (auto const& row : kMachOObjectTypeTable.rows) {
+                                if (!accepted.empty()) accepted += ", ";
+                                accepted += std::format(
+                                    "{} ('{}')",
+                                    static_cast<std::uint32_t>(row.first),
+                                    row.second);
+                            }
                             coll.emit(DiagnosticCode::C_MalformedJson,
                                       "/macho/filetype",
-                                      std::format("'filetype' integer {} "
-                                                  "not in {{1,2,6}}", v));
+                                      std::format("'filetype' integer {} is not "
+                                                  "an MH_* wire value — "
+                                                  "accepted: {}", v, accepted));
                         }
                     } else {
                         coll.emit(DiagnosticCode::C_MalformedJson,
@@ -718,14 +745,23 @@ public:
             // semantics so the combination is semantically nonsensical.
             if (macho.filetype == MachOObjectType::Object
              && machoImage.useChainedFixups) {
+                // The two spellings are PROJECTED from the table that owns
+                // them (`machoObjectTypeName`), not retyped: a remedy that
+                // names a spelling by hand goes stale on a rename exactly as a
+                // retyped accepted-set does, and a remedy nobody can follow is
+                // worse than none (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-
+                // THEIR-CLOSED-SET, at single-value scale).
                 fail("/image/useChainedFixups",
-                     "'useChainedFixups' = true is invalid for "
-                     "Mach-O MH_OBJECT (filetype = 'object') — "
-                     "chained fixups are a linker-output binding "
-                     "format; relocatable .o files have no dyld "
-                     "binding semantics. Either set 'filetype' = "
-                     "'execute' (and route through encodeExecDynamic) "
-                     "or clear 'useChainedFixups'.");
+                     std::format(
+                         "'useChainedFixups' = true is invalid for "
+                         "Mach-O MH_OBJECT (filetype = '{}') — "
+                         "chained fixups are a linker-output binding "
+                         "format; relocatable .o files have no dyld "
+                         "binding semantics. Either set 'filetype' = "
+                         "'{}' (and route through encodeExecDynamic) "
+                         "or clear 'useChainedFixups'.",
+                         machoObjectTypeName(MachOObjectType::Object),
+                         machoObjectTypeName(MachOObjectType::Execute)));
             }
         }
         // Mach-O nativeId packing reserves bit 27 (r_extern) and

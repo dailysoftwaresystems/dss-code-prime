@@ -8,7 +8,9 @@
 // spilled scalar arg's register-vs-overflow decision matches theirs.
 #include "mir/mir_opcode.hpp"
 #include "lir/lir_node.hpp"
+#include "lir/lir_callconv.hpp"
 #include "lir/lir_pass_util.hpp"
+#include "lir/lir_reg_constraints.hpp"
 
 #include <algorithm>
 #include <array>
@@ -243,13 +245,14 @@ resolveReg(LirReg r, LirFuncAllocation const& alloc,
 // value (a call has few operands); indexed by the operand loop below.
 [[nodiscard]] std::vector<std::optional<LirRegClass>>
 classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
+                    TargetSchema const& schema,
                     TargetCallingConvention const& cc) {
     std::vector<std::optional<LirRegClass>> out(ops.size(), std::nullopt);
-    std::uint32_t const gprPoolSize =
-        static_cast<std::uint32_t>(cc.argGprs.size());
-    std::uint32_t const fprPoolSize =
-        static_cast<std::uint32_t>(cc.argFprs.size());
-    std::uint32_t const slotAlignedPoolSize = std::max(gprPoolSize, fprPoolSize);
+    // ★ ONE OBJECT, SHARED WITH callconv AND lir_wide_call_args — see
+    // D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR. The
+    // `schema` parameter is what the cursor GROUPING needs: which classes share
+    // a counter is read off the target's own `dwarfNumber`s, not declared.
+    ArgCursors argCursors{schema, cc};
 
     bool const hasIrr = ::dss::call_payload::hasIndirectResult(payload);
     std::size_t const firstArgIdx = hasIrr ? 2u : 1u;
@@ -257,7 +260,6 @@ classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
         cc.variadicArgsAlwaysStack && ::dss::call_payload::isVariadic(payload);
     std::uint32_t const fixedOps = ::dss::call_payload::fixedOperandCount(payload);
 
-    std::uint32_t gprIdx = 0, fprIdx = 0, slotIdx = 0;
     std::uint32_t argRegionIdx = 0;
     for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
         LirOperand const& argOp = ops[k];
@@ -270,25 +272,21 @@ classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
             // Advance the shared cursors + class-exhaust clamp as callconv does.
             std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
             if (ex == kByValueStackArgExhaustGpr)
-                gprIdx = std::max(gprIdx, gprPoolSize);
+                argCursors.exhaust(LirRegClass::GPR);
             else if (ex == kByValueStackArgExhaustFpr)
-                fprIdx = std::max(fprIdx, fprPoolSize);
+                argCursors.exhaust(LirRegClass::FPR);
             ++argRegionIdx;
             continue;
         }
         if (argOp.kind != LirOperandKind::Reg) { ++argRegionIdx; continue; }
         LirRegClass const cls = argOp.reg.regClass();
-        std::uint32_t argIndex, poolSize;
-        if (cc.slotAligned) {
-            argIndex = slotIdx++;
-            poolSize = slotAlignedPoolSize;
-        } else if (cls == LirRegClass::FPR) {
-            argIndex = fprIdx++;
-            poolSize = fprPoolSize;
-        } else {
-            argIndex = gprIdx++;
-            poolSize = gprPoolSize;
-        }
+        // ⚠ A class with no pool row gets index 0 / poolSize 0, i.e. NOT
+        // register-passed — which keeps the ordinary scratch-reload path (the
+        // safe branch this function's own comment names) and leaves the loud
+        // refusal to the placement site that owns it.
+        auto const slot = argCursors.next(cls);
+        std::uint32_t const argIndex = slot.has_value() ? slot->index : 0u;
+        std::uint32_t const poolSize = slot.has_value() ? slot->poolSize : 0u;
         bool const forceStack =
             variadicForcesStack && argRegionIdx >= fixedOps;
         if (argIndex < poolSize && !forceStack) {
@@ -519,7 +517,8 @@ rewriteOneFunc(Lir const&               src,
             // scratch (the func-2088 exhaustion). Empty for non-calls / no cc.
             std::vector<std::optional<LirRegClass>> callRegArgClass;
             if (info != nullptr && info->isCall && ccForArgs != nullptr) {
-                callRegArgClass = classifyCallRegArgs(ops, payload, *ccForArgs);
+                callRegArgClass =
+                    classifyCallRegArgs(ops, payload, schema, *ccForArgs);
             }
 
             // D-AS-REGALLOC-ARG-REGISTER-OCCUPIED (c75 correctness fix,
@@ -534,24 +533,22 @@ rewriteOneFunc(Lir const&               src,
             // implicitClobbersCrossedBy keeps VREG HOMES off these ordinals
             // across the op, but the rewriter's transient reload scratch is
             // a SEPARATE pool needing the same exclusion AT the op. Driven
-            // by the per-opcode schema declaration (no `if (op == idiv)`) —
-            // the SAME inputs∪clobbered union collectImplicitClobberPositions
+            // by the per-instruction schema declaration (no `if (op == idiv)`)
+            // — the SAME inputs∪clobbered union collectImplicitClobberPositions
             // builds. Calls + `arg` ops carry no implicitRegisters, so this
             // is DISJOINT from the isCall-op0 / spilled-arg-result filters.
-            std::vector<std::uint16_t> implicitForbidden;
-            if (info != nullptr && info->implicitRegisters.has_value()) {
-                auto const& ir = *info->implicitRegisters;
-                implicitForbidden.reserve(ir.inputOrdinals.size()
-                                          + ir.clobberedOrdinals.size());
-                for (auto const o : ir.inputOrdinals)
-                    implicitForbidden.push_back(o);
-                for (auto const o : ir.clobberedOrdinals) {
-                    bool dup = false;
-                    for (auto const e : implicitForbidden)
-                        if (e == o) { dup = true; break; }
-                    if (!dup) implicitForbidden.push_back(o);
-                }
-            }
+            //
+            // ★ CHOKEPOINT (2026-08-15, D-LIR-PER-INST-REG-CONSTRAINTS): "the
+            // SAME union" is now literally the same CODE, not a third
+            // hand-rolled copy of it — `effectiveForbiddenOrdinals` reads the
+            // per-OPCODE carrier AND the per-INSTRUCTION pool. The hand-rolled
+            // version here read only the opcode row, so an inline-asm
+            // statement's declared clobbers could not keep a reload scratch
+            // off the registers the statement destroys: the exact shape of the
+            // miscompile this forbid exists to prevent (121 not 160), one
+            // carrier over.
+            std::vector<std::uint16_t> implicitForbidden =
+                effectiveForbiddenOrdinals(src, schema, inst);
             // D-AS-REWRITE-SPILL-SCRATCH-INCOMING-ARG-CLOBBER: union the still-
             // pending incoming-arg ordinals into the DEFAULT forbid so a spilled
             // operand/result reload for THIS instruction (possibly a def the
@@ -671,6 +668,20 @@ rewriteOneFunc(Lir const&               src,
                 }
             }
 
+            // D-LIR-PER-INST-REG-CONSTRAINTS: carry the source instruction's
+            // per-instruction side data onto the instruction emitted HERE.
+            //
+            // ★ THE ID FROM `addInst` BINDS THE CARRY TO THE INSTRUCTION, NOT
+            // TO A POSITION IN THE EMIT SEQUENCE — and that is the whole
+            // point, because this pass expands 1 source instruction into
+            // (k reload `frame_load`s) + the instruction + (0 or 1
+            // `frame_store`). ✔MEASURED: swapping this for the `lastInst()`
+            // overload IN PLACE is green (nothing has been appended yet);
+            // MOVING the carry past the spill store below is a wrong-
+            // instruction bug that the verifier's reference census cannot see
+            // — the count is still 1 — and only the ordering pin in
+            // `tests/lir/test_lir_pass_util.cpp` catches it. Taking the id
+            // makes that reordering harmless instead of silent.
             bool const isTerm = (info != nullptr && info->isTerminator());
             if (isTerm) {
                 auto const succs = src.blockSuccessors(srcBlock);
@@ -679,8 +690,13 @@ rewriteOneFunc(Lir const&               src,
                                                    "rewrite", reporter)) {
                     return false;
                 }
+                // A terminator has no spilled result to store after it, so
+                // `emitTerminator` is the last append of this iteration.
+                lir_pass_util::carryInstSideData(src, inst, b);
             } else {
-                b.addInst(op, newResult, newOps, payload, flags);
+                LirInstId const dstInst =
+                    b.addInst(op, newResult, newOps, payload, flags);
+                lir_pass_util::carryInstSideData(src, inst, b, dstInst);
             }
 
             if (pendingStore.has_value()) {
@@ -924,9 +940,12 @@ rewriteWithAllocation(Lir const&           src,
                       LirAllocation const& alloc,
                       DiagnosticReporter&  reporter) {
     LirBuilder b{schema};
-    // D-CSUBSET-BITFIELD-WIDE-UNIT: carry the wide-literal pool across
-    // the rebuild (LiteralIndex operands reference it by index).
-    lir_pass_util::copyLiteralPool(src, b);
+    // Carry every module side structure across the rebuild in one call — the
+    // wide-literal pool (D-CSUBSET-BITFIELD-WIDE-UNIT: LiteralIndex operands
+    // reference it by index) and the register-constraint pool
+    // (D-LIR-PER-INST-REG-CONSTRAINTS; its per-instruction handles ride
+    // `carryInstSideData` inside `rewriteOneFunc`).
+    lir_pass_util::copyModuleSideStructures(src, b);
     auto const baseline = reporter.errorCount();
     bool anyFunctionFailed = false;
 

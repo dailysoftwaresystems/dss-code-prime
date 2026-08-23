@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>   // std::size_t (do not rely on a transitive include)
 #include <string>
 #include <vector>
 
@@ -448,4 +449,171 @@ TEST(ArmVerdictHostIdentity, HostArchMatchesTheHostNativeTargetSpec) {
     EXPECT_EQ(dss::test_support::currentHostArch(), fromNativeTarget)
         << "currentHostArch() and hostNativeTarget() disagree about this host —"
            " one of the two `#if` ladders is missing an arm";
+}
+
+// ── The host binding rule ──────────────────────────────────────────────────
+//
+// D-TEST-INTEGRATED-TESTS-CANNOT-PASS-ON-A-NATIVE-ARM64-LINUX-HOST. The
+// CLI-subprocess runner binds ONE target per manifest, and it used to bind the
+// FIRST whose `runOn` admits the host. `runOn` names an OS, not a machine, so on
+// a native aarch64 Linux box that rule bound the corpus's x86_64 arm — which
+// cannot execute there and declares no emulator — and skipped the arm64 arm that
+// runs natively. That host verified ZERO runtime behaviour while reporting 4353
+// skips, and only [Test 5]'s "no stdout pin was non-empty" guard made it visible.
+//
+// ★ WHY THESE ARE UNIT TESTS AND NOT ONLY A CORPUS RUN, which is the same
+// argument the header of this file makes for the verdict classes and is stronger
+// here: the rule's INTERESTING host is one almost nobody runs. On windows,
+// darwin and x86_64 linux the old rule and the new one agree by construction, so
+// a green suite on any of those three says nothing about the rule at all. These
+// tests hand every host the whole (manifest shape × host) table, so a revert to
+// first-match reds on the developer's own machine instead of only on the VPS.
+namespace {
+
+using dss::test_support::HostBindingCandidate;
+using dss::test_support::kNoBoundTarget;
+using dss::test_support::selectBoundTargetIndex;
+
+// The corpus's REAL per-OS shapes, in declaration order (✔MEASURED over
+// examples/**/expected.json): windows and darwin manifests offer exactly one
+// `runOn` match, linux offers two with the x86_64 arm FIRST.
+[[nodiscard]] std::vector<HostBindingCandidate> corpusShapeForHostOs(
+        std::string const& hostOs) {
+    bool const win = hostOs == "windows";
+    bool const lin = hostOs == "linux";
+    bool const mac = hostOs == "darwin";
+    return {
+        {"x86_64:pe64-x86_64-windows-exec",   win},
+        {"x86_64:elf64-x86_64-linux-exec",    lin},
+        {"arm64:elf64-aarch64-linux-exec",    lin},
+        {"arm64:macho64-arm64-darwin-exec",   mac},
+    };
+}
+
+[[nodiscard]] std::string boundSpecFor(std::string const& hostOs,
+                                       std::string const& hostArch) {
+    auto const candidates = corpusShapeForHostOs(hostOs);
+    auto const i          = selectBoundTargetIndex(candidates, hostArch);
+    return i == kNoBoundTarget ? std::string{"<none>"} : candidates[i].spec;
+}
+
+}  // namespace
+
+// THE NO-REGRESSION PIN for the three hosts that are green today, and the fix
+// for the one that is not — one table, so a rule change that helps arm64 Linux
+// by moving Windows/WSL/macOS cannot pass this file.
+//
+// ⚠ Each row runs through a `void` callable: a bare loop of `ASSERT_*` would let
+// the FIRST failing host cancel every row after it, and the whole point of the
+// table is to report which hosts moved, not just that one did.
+TEST(HostTargetBinding, EveryHostBindsTheTargetItCanActuallyRun) {
+    struct Row {
+        std::string hostOs;
+        std::string hostArch;
+        std::string expectedSpec;
+        std::string why;
+    };
+    std::vector<Row> const rows = {
+        {"windows", "x86_64", "x86_64:pe64-x86_64-windows-exec",
+         "one runOn match; old and new rules agree"},
+        {"linux", "x86_64", "x86_64:elf64-x86_64-linux-exec",
+         "two runOn matches and the FIRST is native — unchanged by the rule"},
+        {"linux", "arm64", "arm64:elf64-aarch64-linux-exec",
+         "THE FIX: two runOn matches, the native one is declared SECOND"},
+        {"darwin", "arm64", "arm64:macho64-arm64-darwin-exec",
+         "one runOn match; old and new rules agree"},
+        {"darwin", "x86_64", "arm64:macho64-arm64-darwin-exec",
+         "no native arm declared ⇒ the first runOn match, exactly as before"},
+    };
+    auto const checkRow = [](Row const& r) -> void {
+        EXPECT_EQ(boundSpecFor(r.hostOs, r.hostArch), r.expectedSpec)
+            << "host " << r.hostOs << '/' << r.hostArch << " — " << r.why;
+    };
+    for (auto const& r : rows) checkRow(r);
+}
+
+// ⚠ THE COMMON SHAPE IS NOT THE ONLY SHAPE, and saying "windows/darwin/WSL are
+// untouched" while testing only the majority layout would be exactly the
+// unstated-scope over-read this project keeps paying for. ✔MEASURED over all
+// 602 shipped manifests: the binding moves on 457 for linux/arm64 (the fix), on
+// ZERO for windows/x86_64 and darwin/arm64, and on SIX manifests that declare
+// their arm64 arm FIRST — `large_frame_arm64` and `large_frame_beyond_16mib`
+// (linux, x86_64 declared second as the documented "non-Windows control leg"),
+// and four macho manifests that matter only to an INTEL Mac. Those six are the
+// shape below, and in every one of them the rule moves the binding from an arm
+// this host must emulate to one it executes natively — which is the whole point
+// of the rule, not an exception to it.
+TEST(HostTargetBinding, TheOutlierShapeMovesFromEmulatedToNative) {
+    std::vector<HostBindingCandidate> const largeFrameShape = {
+        {"arm64:elf64-aarch64-linux-exec", true},   // declared FIRST
+        {"x86_64:elf64-x86_64-linux-exec", true},   // the native control leg
+    };
+    EXPECT_EQ(selectBoundTargetIndex(largeFrameShape, "x86_64"), 1u)
+        << "an x86_64 Linux host must bind its own arm, not the qemu one";
+    EXPECT_EQ(selectBoundTargetIndex(largeFrameShape, "arm64"), 0u)
+        << "and an arm64 Linux host still binds the arm64 arm";
+
+    std::vector<HostBindingCandidate> const machoShape = {
+        {"arm64:macho64-arm64-darwin-exec",  true},  // declared FIRST
+        {"x86_64:macho64-x86_64-darwin-exec", true},
+    };
+    EXPECT_EQ(selectBoundTargetIndex(machoShape, "x86_64"), 1u)
+        << "an Intel Mac must bind the x86_64 image, which it can actually run";
+    EXPECT_EQ(selectBoundTargetIndex(machoShape, "arm64"), 0u)
+        << "an Apple Silicon Mac is unaffected — its arm is already first";
+}
+
+// The FALLBACK, on a host this repo has never shipped a target for. It is the
+// clause that keeps the rule from being an arch identity check: nothing in it
+// knows the names "arm64" or "x86_64", so an unrecognised host still binds the
+// first `runOn` match rather than nothing at all.
+TEST(HostTargetBinding, FallsBackToTheFirstRunOnMatchWhenNoArmIsNative) {
+    auto const candidates = corpusShapeForHostOs("linux");
+    EXPECT_EQ(selectBoundTargetIndex(candidates, "riscv64"), 1u)
+        << "a host with no native arm must still bind the first runOn match";
+}
+
+// The OS gate OUTRANKS the arch preference. Red-on-disable: drop the
+// `runsOnHost` guard from the loop and this binds a darwin image on Linux —
+// an image this machine's loader cannot even map, chosen because its
+// INSTRUCTIONS happen to match.
+TEST(HostTargetBinding, NeverBindsATargetWhoseRunOnExcludesThisHost) {
+    std::vector<HostBindingCandidate> const candidates = {
+        {"arm64:macho64-arm64-darwin-exec", false},   // native arch, wrong OS
+        {"arm64:elf64-aarch64-linux-exec",  true},
+    };
+    EXPECT_EQ(selectBoundTargetIndex(candidates, "arm64"), 1u);
+}
+
+// No target admits this host at all ⇒ NO binding, never index 0. Red-on-disable:
+// initialise the fallback to `0` instead of the sentinel and this returns a
+// target the runner would then compile and try to spawn.
+TEST(HostTargetBinding, BindsNothingWhenNoTargetAdmitsThisHost) {
+    auto const candidates = corpusShapeForHostOs("plan9");
+    EXPECT_EQ(selectBoundTargetIndex(candidates, "x86_64"), kNoBoundTarget);
+    EXPECT_EQ(selectBoundTargetIndex({}, "x86_64"), kNoBoundTarget)
+        << "a manifest with no targets at all must bind nothing";
+}
+
+// The rule must not merely PREFER the native arm — it must find it wherever the
+// manifest declared it. Red-on-disable: a `return` after the first runOn match
+// (the old rule) passes the first row and reds the other two.
+TEST(HostTargetBinding, FindsTheNativeArmAtAnyDeclarationPosition) {
+    auto const nativeAt = [](std::size_t position) -> std::size_t {
+        std::vector<HostBindingCandidate> candidates = {
+            {"x86_64:elf64-x86_64-linux-exec", true},
+            {"x86_64:elf64-x86_64-linux-exec", true},
+            {"x86_64:elf64-x86_64-linux-exec", true},
+        };
+        candidates[position].spec = "arm64:elf64-aarch64-linux-exec";
+        return selectBoundTargetIndex(candidates, "arm64");
+    };
+    auto const checkPosition = [&nativeAt](std::size_t position) -> void {
+        EXPECT_EQ(nativeAt(position), position)
+            << "the native arm was declared at index " << position
+            << " and the runner bound something else";
+    };
+    for (std::size_t position = 0; position < 3; ++position) {
+        checkPosition(position);
+    }
 }

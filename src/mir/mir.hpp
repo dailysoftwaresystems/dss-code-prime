@@ -5,11 +5,15 @@
 #include "core/substrate/arena_container.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_id.hpp"
+#include "mir/mir_asm_descriptor.hpp"
 #include "mir/mir_literal_pool.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_return_piece_payload.hpp"
 
 #include <cstdint>
+#include <cstdio>       // AsmGotoResult::continuation's fail-loud (inline, see below)
+#include <cstdlib>      //   ditto — std::abort
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -75,6 +79,7 @@ public:
         std::vector<MirBlockId> instBlock, std::vector<MirInstId> operandPool,
         std::vector<MirPhiIncoming> phiPool, std::vector<MirBlockId> succPool,
         MirLiteralPool literalPool,
+        MirAsmDescriptorPool asmDescriptorPool,
         MirAliasingMode aliasingMode,
         bool charTypesAliasAll) noexcept;
 
@@ -136,7 +141,12 @@ public:
     [[nodiscard]] SymbolId      globalAddrSymbol(MirInstId id) const;  // GlobalAddr
     [[nodiscard]] MirBlockId    blockAddressTarget(MirInstId id) const;// BlockAddress
     [[nodiscard]] std::uint32_t intrinsicId(MirInstId id) const;       // IntrinsicCall
-    [[nodiscard]] std::uint32_t returnPieceOrdinal(MirInstId id) const;// ReturnPiece
+    [[nodiscard]] std::uint32_t returnPieceOrdinal(MirInstId id) const;// ReturnPiece — per-class index
+    // ReturnPiece — WHICH per-class pool `returnPieceOrdinal` indexes. Carried
+    // explicitly since plan 29 §4.4.5; do NOT re-derive it from the piece's type.
+    [[nodiscard]] TargetRegClass returnPieceRegClass(MirInstId id) const;
+    // InlineAsm / InlineAsmGoto — the index into `asmDescriptorPool()`.
+    [[nodiscard]] std::uint32_t asmDescriptorIndex(MirInstId id) const;
 
     // D-CSUBSET-COMPUTED-GOTO (MF-C): is `block` the target of some `BlockAddress`
     // in its function (i.e. its runtime address is taken via `&&label`)? DERIVED by
@@ -171,11 +181,20 @@ public:
     // structural violation the ML3 verifier flags first; this is defense in depth).
     [[nodiscard]] MirInstId blockTerminator(MirBlockId id) const;
     // CFG successor blocks (from the succ pool). Convention: Br → [target];
-    // CondBr → [ifTrue, ifFalse]; Switch → [case targets…, default]; Return /
-    // Unreachable → empty. For a Switch, the case targets pair POSITIONALLY with
-    // the terminator's operands: `instOperands(term)[0]` is the discriminant and
+    // CondBr → [ifTrue, ifFalse]; Switch → [case targets…, default];
+    // InlineAsmGoto → [label targets…, fall-through]; Return / Unreachable →
+    // empty. For a Switch, the case targets pair POSITIONALLY with the
+    // terminator's operands: `instOperands(term)[0]` is the discriminant and
     // `instOperands(term)[1+i]` is the case constant whose target is
     // `blockSuccessors(block)[i]`; the final successor is the default.
+    //
+    // ⚠ `InlineAsmGoto` PUTS ITS TRAILING SUCCESSOR TO A DIFFERENT USE, and a
+    // reader that assumes Switch's "the last one is the default" reads the
+    // fall-through as a label. Its label targets pair positionally with
+    // `asmDescriptor(term).labelSpellings` — `labelSpellings.size()` of them —
+    // and the ONE successor after those is the fall-through: where control
+    // continues when the template does not branch. See the opcode's own banner
+    // for why that edge exists and why it is last.
     [[nodiscard]] std::span<MirBlockId const> blockSuccessors(MirBlockId id) const;
 
     // ── function accessors ──
@@ -303,6 +322,18 @@ public:
     }
     [[nodiscard]] MirLiteralPool const& literalPool() const noexcept { return literalPool_; }
 
+    // ── inline-asm descriptors (P5) ──
+    // The descriptor an `InlineAsm` / `InlineAsmGoto` instruction's payload
+    // indexes. Aborts on a wrong-opcode id (the typed-payload-reader discipline)
+    // and on an out-of-range index (a dropped-descriptor rebuild).
+    [[nodiscard]] MirAsmDescriptor const& asmDescriptor(MirInstId id) const;
+    [[nodiscard]] MirAsmDescriptor const& asmDescriptorAt(std::uint32_t index) const {
+        return asmDescriptorPool_.at(index);
+    }
+    [[nodiscard]] MirAsmDescriptorPool const& asmDescriptorPool() const noexcept {
+        return asmDescriptorPool_;
+    }
+
     // ── module-level alias-analysis polarity ──
     // Read by CSE/LICM Load admission to thread the source language's
     // strict-aliasing opt-in into `mirMayAlias`. The rebuild substrate
@@ -331,6 +362,7 @@ private:
                                                // contiguous slice is meaningful)
     std::vector<MirBlockId>     succPool_;      // terminator CFG successors
     MirLiteralPool              literalPool_;
+    MirAsmDescriptorPool        asmDescriptorPool_;  // inline-asm templates + constraints
     MirAliasingMode             aliasingMode_ = MirAliasingMode::Permissive;
     bool                        charTypesAliasAll_ = true;
 };
@@ -527,12 +559,197 @@ public:
     // value (`type` = a pointer). `target` may be a forward block reference.
     MirInstId addBlockAddress(MirBlockId target, TypeId type,
                               MirInstFlags flags = MirInstFlags::None);
-    // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): the k-th register piece of a
-    // struct-returning `call` (≥1 — piece 0 is the call's own result). `ordinal`
-    // is the PER-CLASS return-register index; `pieceType` is the piece's register
-    // type (I64/F64). The `call` operand anchors ordering + value-numbering.
-    MirInstId addReturnPiece(MirInstId call, std::uint32_t ordinal, TypeId pieceType,
+    // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS) + inline-asm P5: the k-th result
+    // piece of a multi-result `producer` — a struct-returning `call` (piece 0 is
+    // the call's own result, so pieces are ≥1) or an `InlineAsm` / `InlineAsmGoto`
+    // block. `ordinal` is the PER-CLASS result-register index; `regClass` is WHICH
+    // pool that ordinal indexes; `pieceType` is the piece's value type. The
+    // `producer` operand anchors ordering + value-numbering.
+    //
+    // ★ `regClass` IS NOT DERIVABLE FROM `pieceType` AND MUST BE PASSED (plan 29
+    // §4.4.5). For a Call it happens to agree with `regClassForCoreType(pieceType)`
+    // because the ABI classifier chose both; for an asm output it does not, because
+    // the CONSTRAINT chooses the class (`"=x"` on an integer is SSE). Both facts now
+    // ride `payload` — see `mir_return_piece_payload.hpp`.
+    MirInstId addReturnPiece(MirInstId producer, std::uint32_t ordinal,
+                             TargetRegClass regClass, TypeId pieceType,
                              MirInstFlags flags = MirInstFlags::None);
+
+    // ── embedded assembly (inline-asm P5) ──
+    // `__asm__(...)` as a non-terminator. `operands` are the INPUT values in
+    // source order (1:1 with `descriptor.inputs`); `resultType` is output 0's type
+    // or `InvalidType` when the block has no outputs. Outputs 1..N-1 are
+    // `addReturnPiece(<this>, k, class, type)` reads placed immediately after —
+    // the same adjacency a struct-returning Call's pieces observe.
+    //
+    // A DEDICATED BUILDER, not `addInst`, because the descriptor must be re-added
+    // to the destination module's pool on every rebuild; `addInst` REFUSES this
+    // opcode so a copy site that forgets aborts instead of forwarding an index
+    // into an empty pool.
+    MirInstId addInlineAsm(MirAsmDescriptor descriptor,
+                           std::span<MirInstId const> operands,
+                           TypeId resultType = InvalidType,
+                           MirInstFlags flags = MirInstFlags::None);
+
+    // One `asm goto` landing edge, as returned by `addInlineAsmGoto`.
+    //
+    // ⚠ THE FIELD THAT USED TO BE CALLED `label` IS NOW `onward`, AND THE RENAME
+    // IS THE POINT. The edge list gained a FALL-THROUGH entry, for which the
+    // source named no label at all — so a field spelled `label` would have been
+    // true of every entry but one, which is exactly the half-true fact this
+    // codebase's descriptor docblocks warn about. Renaming turns every stale
+    // reader into a COMPILE error instead of a silently reinterpreted field.
+    struct AsmGotoEdge {
+        // The block the terminator actually branches to. Equal to `onward` when
+        // the edge carries no result pieces; otherwise a fresh landing block
+        // whose sole predecessor is the `asm goto`'s own block.
+        MirBlockId successor{};
+        // Where control continues once this edge's pieces have been captured:
+        // the label block the source named, or — on the fall-through edge — the
+        // CONTINUATION block this builder minted for the statements that follow
+        // the asm. A filler branches here after writing the pieces, whichever
+        // kind of edge it is.
+        MirBlockId onward{};
+        // Was a landing block interposed (i.e. does `successor != onward`)?
+        bool       split = false;
+        // ★ Is this the fall-through edge — the one the source named no label
+        // for? Exactly one edge of every result carries it, and it is the LAST.
+        // Carried rather than inferred from position, the `tiedOutput` rule:
+        // "the last one" is derivable only while every producer happens to build
+        // in that order.
+        bool       isFallthrough = false;
+    };
+
+    // `asm goto (...)` — the TERMINATOR form. `labels` are the target blocks in
+    // source order; they become the leading CFG successors (possibly via the
+    // interposed landing blocks described below), followed by the FALL-THROUGH
+    // edge this builder mints. Returns one `AsmGotoEdge` per label in the same
+    // order, then the fall-through edge.
+    //
+    // ★★★ THE FALL-THROUGH EDGE, AND WHY THE BUILDER OWNS ITS BLOCK. An
+    // `asm goto` whose template does not branch continues at the next statement
+    // — ✔MEASURED on gcc 13.3.0, clang 19.1.1 and aarch64-linux-gnu-gcc — so
+    // that continuation is a CFG successor like any other. This builder CREATES
+    // the continuation block and returns it (as the fall-through edge's
+    // `onward`), rather than taking one from the caller: a caller-supplied block
+    // can be a label block or an already-sealed one and the builder cannot tell,
+    // which would be a new way to be silently wrong in the very method whose job
+    // is an honest CFG. Builder-minted, it is single-predecessor by construction
+    // and inherits `finish()`'s per-block "filled + terminated" sweep for free —
+    // a caller that never opens it ABORTS rather than shipping a hole.
+    //
+    // ⚠ `descriptor.labelSpellings` must hold exactly one entry per label. The
+    // two are one fact seen from two sides (the front end mints the spellings
+    // from the same label list it resolves here), and the pairing is what lets
+    // `cloneInlineAsmGoto` and the MIR verifier tell a dropped edge from a
+    // legitimately shorter one.
+    //
+    // ★★★ THE EDGE-PLACEMENT RULE, AND WHY IT EXISTS. Result-piece capture
+    // requires the piece to IMMEDIATELY FOLLOW its producer — ✔MEASURED in
+    // `lir_callconv`'s piece-capture pass, where broken adjacency is already
+    // fail-loud. A terminator has nothing after it in its block, so an `asm goto`
+    // with outputs can only place its pieces at the head of a SUCCESSOR. The
+    // builder therefore interposes a landing block on every edge of an asm goto
+    // that HAS outputs, opens each one for the caller to fill with pieces, and
+    // terminates it with a `Br` onward.
+    //
+    // ★ THE FALL-THROUGH EDGE IS SPLIT UNDER THE SAME RULE AS EVERY OTHER, not
+    // exempted for being builder-minted. An `asm goto` with outputs may be read
+    // on the fall-through path (both references compile that program), so that
+    // path needs its pieces too — and taking the uniform arm keeps "every piece
+    // block is single-predecessor by construction" a property of the rule rather
+    // than of a case analysis.
+    //
+    // ⚠ THE SPLIT IS UNCONDITIONAL RATHER THAN CRITICAL-EDGE-CONDITIONAL, AND THAT
+    // IS A MEASUREMENT, NOT A SHORTCUT. Whether an edge is critical is a question
+    // about the label block's PREDECESSOR COUNT, which is not knowable while the
+    // function is still being built: ✔MEASURED, `hir_to_mir`'s
+    // `getOrCreateLabelBlock` creates a label block on first reference and any
+    // LATER `goto` — textually after this asm — adds a predecessor to it. A
+    // build-time "is it critical" test would therefore answer for the CFG so far,
+    // not the CFG that ships. Interposing unconditionally makes every asm-goto
+    // piece block single-predecessor BY CONSTRUCTION, which is the property the
+    // placement needs; an edge that turns out non-critical has simply paid for one
+    // unconditional branch, and the pieces are still exactly where they belong.
+    // An asm goto with NO outputs interposes nothing: its successors ARE the
+    // labels, plus the continuation.
+    //
+    // The caller fills each split edge and then continues in the continuation:
+    //     auto r = mir.addInlineAsmGoto(desc, ins, labels);
+    //     for (auto const& e : r.edges) if (e.split) {
+    //         mir.beginBlock(e.successor);
+    //         ... addReturnPiece(r.terminator, k, class, type) ...  // at the HEAD
+    //         mir.addBr(e.onward);
+    //     }
+    //     mir.beginBlock(r.continuation());   // the statements after the asm
+    // A split block left unopened is caught by `finish()`'s "every created block
+    // must be filled + terminated" sweep, so a forgotten edge cannot ship — and
+    // that sweep covers the continuation too.
+    struct AsmGotoResult {
+        // The `InlineAsmGoto` instruction itself -- every result piece anchors
+        // to it, so the caller needs it before it can fill the landing blocks.
+        MirInstId                terminator{};
+        // One entry per label in the order the labels were given, then the
+        // fall-through edge.
+        std::vector<AsmGotoEdge> edges;
+
+        // The block the statements AFTER the asm goto belong in — the
+        // fall-through edge's `onward`. DERIVED from `edges`, never stored
+        // beside it: one fact, one owner. Aborts if the edge list carries no
+        // fall-through edge, which only a hand-built result can manage.
+        //
+        // ⓘ DEFINED INLINE ON PURPOSE, not for speed. ✔DOCUMENTED from the build
+        // files: `dss-code-prime-lib` is SHARED and `CMAKE_CXX_VISIBILITY_PRESET`
+        // is `hidden`, so only `DSS_EXPORT` symbols cross the boundary — and a
+        // NESTED type's members are not covered by the enclosing class's export
+        // attribute. An out-of-line definition here would therefore have to be
+        // exported separately, which is a portability question this file does not
+        // need to answer. Inline sidesteps it, which is why the two C headers
+        // above are included.
+        [[nodiscard]] MirBlockId continuation() const {
+            for (AsmGotoEdge const& e : edges) {
+                if (e.isFallthrough) return e.onward;
+            }
+            std::fputs("dss::MirBuilder fatal: AsmGotoResult::continuation: this result "
+                       "carries no fall-through edge — every `asm goto` has exactly one, "
+                       "so this result did not come from addInlineAsmGoto\n", stderr);
+            std::abort();
+        }
+    };
+    AsmGotoResult addInlineAsmGoto(MirAsmDescriptor descriptor,
+                                   std::span<MirInstId const> operands,
+                                   std::span<MirBlockId const> labels,
+                                   MirInstFlags flags = MirInstFlags::None);
+
+    // The REBUILD-path primitive for `InlineAsmGoto`: emit the terminator with
+    // `successors` taken VERBATIM and interpose nothing. A clone already has the
+    // landing blocks — they are ordinary blocks of the source function and the
+    // rebuilder maps them like any other — so re-running the placement rule would
+    // interpose a second layer on every optimizer pass. Named `clone…` rather than
+    // overloading `addInlineAsmGoto` because the difference is not a defaulted
+    // argument: one of them owns the edge-placement rule and the other must not.
+    // The descriptor is passed BY VALUE and re-added to THIS module's pool — the
+    // whole reason a raw payload copy is refused.
+    //
+    // ★★★ THE ARITY IS CHECKED AGAINST THE DESCRIPTOR, NOT MERELY AGAINST THE
+    // OPCODE ROW, AND THAT CLOSES A SILENT SEAM. The row's range is `[2, ∞)`, so
+    // a clone that dropped the fall-through edge of a TWO-label goto still lands
+    // inside it and the edge is gone with no diagnostic — the code after the asm
+    // loses its predecessor and the unreachable prune deletes it, which is the
+    // exact defect the fall-through edge exists to fix, re-introduced one tier
+    // later. `successors.size()` must therefore equal
+    // `descriptor.labelSpellings.size() + 1`: carry the fact, never reconstruct
+    // it from the shape.
+    MirInstId cloneInlineAsmGoto(MirAsmDescriptor descriptor,
+                                 std::span<MirInstId const> operands,
+                                 std::span<MirBlockId const> successors,
+                                 MirInstFlags flags = MirInstFlags::None);
+
+    // Append a descriptor to the module's inline-asm pool and return its index.
+    // The rebuild path's re-add primitive (mirrors `literalPoolAdd`): a pass that
+    // copies an `InlineAsm` calls this on the DESTINATION module rather than
+    // forwarding the source's payload.
+    [[nodiscard]] std::uint32_t asmDescriptorPoolAdd(MirAsmDescriptor descriptor);
     // FC7 C3 (AAPCS64/Apple x8 sret). Callee-side entry read of the indirect-
     // result register (the incoming result-storage pointer); `pointerType` is the
     // pointer-to-result type. (The caller side needs NO builder: the sret pointer
@@ -654,6 +871,14 @@ private:
     // Validate an operand/successor id belongs to this module (untagged literals
     // pass — test ergonomics), aborting loud on a foreign-module id.
     void checkSameModule_(std::uint32_t arenaTag, char const* what) const;
+    void checkAsmOperandAlignment_(MirAsmDescriptor const& descriptor,
+                                   std::size_t operandCount, char const* builder) const;
+    // Shared by both `asm goto` builders: the descriptor's per-label spellings
+    // and the CFG successor list are one fact seen from two sides, so
+    // `labelSpellings.size() + 1 == successorCount` (the +1 is the fall-through).
+    void checkAsmGotoLabelAlignment_(MirAsmDescriptor const& descriptor,
+                                     std::size_t successorCount,
+                                     char const* builder) const;
     void closeBlock_();     // requires the open block (if any) be terminated
     void closeFunction_();  // closes the block, requires every block filled + ≥1 block
 
@@ -670,6 +895,7 @@ private:
     std::vector<MirPhiIncoming> phiPool_;
     std::vector<MirBlockId>     succPool_;
     MirLiteralPool              literalPool_;
+    MirAsmDescriptorPool        asmDescriptorPool_;
     MirAliasingMode             aliasingMode_ = MirAliasingMode::Permissive;
     bool                        charTypesAliasAll_ = true;
 

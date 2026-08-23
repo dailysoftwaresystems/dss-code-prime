@@ -40,11 +40,14 @@
 //   * SHN_UNDEF symbols become `externImports` (the mangled name is the
 //     symbol name). `isData` is seeded from the symtab type (STT_FUNC ->
 //     false, STT_OBJECT -> true, STT_NOTYPE -> data by default) and forced
-//     to false (function) when a CALL/BRANCH-class reloc targets it -- the
-//     x86_64 PLT-variant native id AND the aarch64 CALL26 branch formula
-//     (agnostic; no hardcoded reloc number). This correctly types an
-//     address-taken extern FUNCTION (called AND `&fn`-referenced) and every
-//     aarch64 extern call (aarch64 declares no PLT-variant id).
+//     to false (function) when a reloc carrying one of the format's DECLARED
+//     call signals targets it -- the x86_64 PLT-variant native id
+//     (`pltNativeId`) AND any row declared `"isCall": true` (aarch64 CALL26)
+//     (agnostic; no hardcoded reloc number, and no inference from the
+//     target's arithmetic formula -- D-LK-MACHO-ISDATA-NO-CALL-SIGNAL). This
+//     correctly types an address-taken extern FUNCTION (called AND
+//     `&fn`-referenced) and every aarch64 extern call (aarch64 declares no
+//     PLT-variant id).
 //   * each RELA entry becomes a `Relocation{offset, target, kind,
 //     addend}`: the ELF `r_type` (the low 32 bits of r_info) is mapped
 //     back to the universal `RelocationKind` through the format schema's
@@ -56,6 +59,16 @@
 //   * defined function / data / section symbols become `ModuleSymbol`
 //     rows (name + binding + visibility) for the merge's cross-CU
 //     name-matching.
+//   * TWO defined symbols sharing an `st_value` are ONE atom under
+//     SEVERAL NAMES, never two byte-identical twins: the most
+//     externally-visible name (strong before weak) owns the body, every
+//     other name keeps its row but carries the owner's SymbolId, and a
+//     relocation naming any of them binds to the owner. gcc emits this
+//     for `__attribute__((weak, alias("g")))`. Equal `st_value` with
+//     DIFFERENT `st_size` is a NESTING, not an alias, and fails loud. The
+//     rule is shared, not per-format --
+//     `link/format/object_atom_coverage.hpp`,
+//     D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS.
 //
 // Fail-loud discipline (mirrors the c159-c161 readers): EVERY field is
 // bounds-checked against the buffer with the overflow-safe

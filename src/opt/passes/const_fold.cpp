@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -138,6 +139,14 @@ MirLiteralValue toMirLiteral(HirLiteralValue const& src) {
     }
 }
 
+// ONE spelling of this pass's name for EVERY diagnostic it can emit — the
+// carve-out Info below and every `MirFunctionRebuilder` fatal
+// (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS). Two literals would be two
+// facts that can drift; this is the pipeline's own spelling (`kPassNameTable`,
+// opt/optimizer.hpp), so `[pass=ConstFold]` greps against a `*.pipeline.json`
+// entry and a `DSS_OPT_TRACE` line alike.
+constexpr std::string_view kPassName = "ConstFold";
+
 // Constant-folding policy. The shared `MirFunctionRebuilder` owns the
 // 3-phase walk + rewrite map + fail-loud contract; this policy adds
 // the pass-specific tryRewrite that performs the fold.
@@ -145,6 +154,10 @@ class ConstFoldPolicy : public MirRebuildPolicy {
 public:
     ConstFoldPolicy(Mir const& src, TypeInterner const& interner)
         : src_(src), interner_(interner) {}
+
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return kPassName;
+    }
 
     [[nodiscard]] std::size_t instructionsFolded() const noexcept {
         return folded_;
@@ -315,7 +328,7 @@ ConstFoldResult runConstFold(Mir& mir, TypeInterner const& interner,
     ConstFoldResult result{};
     MirBuilder builder;
 
-    if (cloneGlobalsOrCarveOut(mir, builder, reporter, "ConstFold")
+    if (cloneGlobalsOrCarveOut(mir, builder, reporter, kPassName)
         == GlobalClonePrelude::CarvedOut) {
         result.ok = true;
         return result;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/export.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
 #include "lir/lir_reg.hpp"
@@ -7,6 +8,7 @@
 #include <cstdint>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 // LIR node PODs (plan 12 §2.1 file tree → `lir_inst.hpp` + per-block /
 // per-function shape). Each POD ≤ 32 bytes for cache density; the
@@ -43,6 +45,58 @@ inline constexpr std::uint8_t kLirInstFlagWidth32 = 0x01;
 inline constexpr std::uint8_t kLirInstFlagWidth8  = 0x02;
 inline constexpr std::uint8_t kLirInstFlagWidth16 = 0x04;
 
+// ── EARLY-CLOBBER RESULT (GNU inline asm's `&`, e.g. `"=&r"`) ────────
+//
+// "This instruction WRITES its result before it has finished READING its
+// inputs, so the result must not share a register with any of them."
+//
+// ⚠⚠ WITHOUT IT THE DEFAULT IS SHARING, AND THE SHARING IS DELIBERATE.
+// ✔MEASURED: for a SINGLE-instruction block at position P the inputs are used
+// at the early slot (range ends P+1) and the result is defined at the late slot
+// (range starts P+1); `expireActive` frees a range when `end <= currentStart`,
+// so the input's register is returned to the free list and — the list being
+// LIFO — handed straight back to the result. gcc and clang do exactly the same
+// thing: a plain `"=r"` with one input assigns `%0` and `%1` the SAME register
+// on x86_64 (`%eax`/`%eax`) and on aarch64 (`x0`/`x0`). That is correct for an
+// ordinary instruction, which consumes its operands before it defines anything.
+// A template that writes `%0` before reading `%1` breaks the assumption, and
+// `&` is how the author says so. Accepting `&` and ignoring it is therefore not
+// a missing optimisation — it is a value silently destroyed before it is read.
+//
+// ★★ THE CARRIER IS `flags` BECAUSE `flags` SURVIVES A REBUILD BY CONSTRUCTION.
+// ✔MEASURED 2026-08-14: every rebuilding pass already threads `flags` through
+// `addInst(op, res, ops, payload, flags)` — all EIGHT sites across
+// `lir_2addr_legalize`, `lir_callconv`, `lir_rewrite`, `lir_wide_call_args` and
+// the `.dsslir` reader — and the text round-trip emits `flags=M` unconditionally
+// as a raw value, so an unknown bit is neither dropped nor rejected. The
+// per-instruction constraint POOL explicitly does NOT have that property (see
+// `detail::LirInst::regConstraints` below), which is why an earlyclobber bit
+// does not ride there: a dropped `&` reads as the perfectly legal "no
+// earlyclobber" and the allocator re-shares the register.
+//
+// ★ WHERE IT IS CONSUMED, AND WHY THAT IS THE ONLY PLACE: `lir_liveness.cpp`
+// records the def at the instruction's EARLY slot instead of its late slot.
+// The result's live range then OVERLAPS the slot at which every input is read,
+// so no input expires before the result is allocated and the linear scan cannot
+// hand the result an input's register — through the ordinary machinery, with no
+// second exclusion list to keep in sync. ⚠ The discriminating variable is EARLY
+// SLOT vs LATE SLOT, *not* which instruction of a multi-instruction expansion
+// carries the def: for the single-instruction case the def is already on the
+// first instruction, so "move the def to the first instruction" is a NO-OP (a
+// previous handoff recorded that as the fix and it was measured wrong). The
+// multi-instruction case is already safe, because a later instruction's late
+// slot is past every input's use.
+//
+// ⚠ THE PRODUCER IS NOT WIRED YET AND THAT IS THE REMAINING HALF OF THE BUG.
+// ✔MEASURED 2026-08-15: the front end already parses `&` into
+// `AsmOperandConstraint::earlyClobber` (`hir/hir_inline_asm.hpp`) and MIR
+// already carries it as `AsmOperandDescriptor::isEarlyClobber`
+// (`mir/mir_asm_descriptor.hpp`), and NEITHER has a consumer anywhere — grep
+// for both names finds only their own declarations. The MIR→LIR asm expansion
+// must set this bit on the emitted instruction from that descriptor; until it
+// does, `&` is still parsed, carried, and dropped.
+inline constexpr std::uint8_t kLirInstFlagEarlyClobberResult = 0x08;
+
 // The instruction's operation width in bits, derived from its flags.
 [[nodiscard]] constexpr std::uint8_t
 lirInstWidthBits(std::uint8_t flags) noexcept {
@@ -50,6 +104,14 @@ lirInstWidthBits(std::uint8_t flags) noexcept {
     if ((flags & kLirInstFlagWidth16) != 0) return std::uint8_t{16};
     return (flags & kLirInstFlagWidth32) != 0 ? std::uint8_t{32}
                                               : std::uint8_t{64};
+}
+
+// True iff this instruction's result must not share a register with any of its
+// inputs. Named rather than open-coded so the one consumer and every future
+// producer agree on the bit.
+[[nodiscard]] constexpr bool
+lirInstResultIsEarlyClobber(std::uint8_t flags) noexcept {
+    return (flags & kLirInstFlagEarlyClobberResult) != 0;
 }
 
 // Operand variant tag carried on each entry of the LIR operand pool.
@@ -226,6 +288,99 @@ struct LirOperand {
 static_assert(sizeof(LirOperand) == 8, "LirOperand POD must stay 8 bytes");
 static_assert(std::is_trivially_copyable_v<LirOperand>);
 
+// ── per-INSTRUCTION register-constraint pool ─────────────────────
+//
+// D-LIR-PER-INST-REG-CONSTRAINTS. Fixed-register semantics ("this
+// instruction destroys rcx and needs its shift count
+// in cl") existed ONLY per-OPCODE, on `TargetOpcodeInfo::
+// implicitRegisters` — a field the target JSON owns and the loader
+// populates. An inline-asm statement declares the same contract
+// per-INSTRUCTION: two `asm` statements sharing one opcode declare
+// different clobbers, so the opcode row cannot express it.
+//
+// ★★ WHY THIS IS A SECOND CARRIER FOR THE **SAME STRUCT** RATHER THAN
+// A SECOND WRITER OF THE OPCODE FIELD. `implicitRegisters` is
+// config-owned: one field with two writers (the JSON loader AND a
+// lowering) is the shape where a target's declared contract and a
+// statement's declared contract silently overwrite each other, and
+// which one wins depends on load order. So the TYPE is reused
+// verbatim (`ImplicitRegisterConstraint` — same three semantically
+// distinct sets, same role projection, same validator vocabulary) and
+// only the CARRIER is new. A consumer that wants the full contract
+// for an instruction reads the opcode's set AND this one; neither
+// mutates the other.
+//
+// ★★ WHY A MODULE-LEVEL POOL RATHER THAN AN INLINE FIELD. The
+// constraint is SEVEN std::vectors — already several times the 32-byte
+// cache-density budget `detail::LirInst` is built around
+// (`static_assert(sizeof(LirInst) <= 32)`) before a single element is
+// stored, and UNBOUNDED after (each vector owns heap, and the strings
+// inside own more). So the instruction stores
+// a HANDLE and the value lives here, exactly the discipline
+// `LirLiteralPool` already uses for wide literals: by-index, no
+// dedup, identity-preserving. Two side structures with one shape is
+// one thing to remember; `lir_pass_util::copyModuleSideStructures`
+// carries both across a rebuild in ONE call for exactly that reason.
+//
+// ⚠ AN OPERAND KIND WAS CONSIDERED AND REJECTED. Appending a
+// clobber-carrying operand breaks `operandsMatchGuard`'s positional
+// kind equality (`src/asm/format/walker_util.hpp`) and the verifier's
+// "last two operands are MemBase then MemOffset" invariant, and a
+// clobber-only operand structurally cannot express a fixed-register
+// INPUT (an input has to be a *use* the allocator sees, in a
+// *position* the encoder does not).
+class DSS_EXPORT LirRegConstraintPool {
+public:
+    // Append a constraint set; returns its INDEX (0-origin), which the
+    // instruction stores as a 1-based HANDLE — see
+    // `lirRegConstraintHandleForIndex` below. No dedup: two `asm`
+    // statements that happen to clobber the same registers are still
+    // two statements, and preserving identity is what makes a rebuild's
+    // index-by-index copy provably lossless. Same discipline as
+    // `LirLiteralPool::add`.
+    [[nodiscard]] std::uint32_t add(ImplicitRegisterConstraint c);
+
+    // Out-of-range is a producer bug, not a recoverable state: it means
+    // a handle outlived the pool it indexed (the exact silent-miscompile
+    // this pool's verifier rule exists to catch). Aborts, mirroring
+    // `LirLiteralPool::at`. Callers that must not abort ask
+    // `Lir::instRegConstraints`, which returns `nullptr` for "none".
+    // ⚠ DO NOT ASSUME THE VERIFIER SAW THE MODULE FIRST. ✔MEASURED
+    // 2026-08-14: `lir_verifier.hpp` is included by exactly ONE
+    // production TU (`lir_text.cpp`, the `.dsslir` reader) and by five
+    // test TUs — `verifyLir` and `verifyLirPostRegalloc` have ZERO
+    // production call sites, and `compile_pipeline.cpp` runs the MIR
+    // verifier only. So on the real compile path this abort IS the
+    // first line of defence, not the second.
+    [[nodiscard]] ImplicitRegisterConstraint const& at(std::uint32_t index) const;
+
+    [[nodiscard]] std::size_t size()  const noexcept { return pool_.size(); }
+    [[nodiscard]] bool        empty() const noexcept { return pool_.empty(); }
+
+private:
+    std::vector<ImplicitRegisterConstraint> pool_;
+};
+
+// The "this instruction declares no per-instruction constraints"
+// handle. ★ It is 0 SO THAT EVERY INSTRUCTION EVER BUILT — including
+// the hand-built LIR in ~40 test files and every `detail::LirInst`
+// that predates this field — means "none" by construction, exactly
+// the back-compat argument `kLirInstFlagWidth32` records above. The
+// handle is therefore 1-based and `at()` is 0-based; the two
+// converters below are the ONLY places that arithmetic appears.
+inline constexpr std::uint32_t kLirNoRegConstraints = 0;
+
+[[nodiscard]] constexpr std::uint32_t
+lirRegConstraintHandleForIndex(std::uint32_t poolIndex) noexcept {
+    return poolIndex + 1;
+}
+// Precondition: `handle != kLirNoRegConstraints` (callers test first —
+// the "none" state is not an index and has no pool slot).
+[[nodiscard]] constexpr std::uint32_t
+lirRegConstraintIndexForHandle(std::uint32_t handle) noexcept {
+    return handle - 1;
+}
+
 namespace detail {
 
 // ── instruction POD ──────────────────────────────────────────────
@@ -246,7 +401,29 @@ struct LirInst {
     std::uint32_t operandStart = 0;          // 4 — into operand pool
     std::uint32_t operandCount = 0;          // 4
     std::uint32_t payload      = 0;          // 4 — per-opcode scalar (label id, etc.)
-    std::uint32_t _pad2        = 0;          // 4 — explicit pad to 24B; future field
+    // 4 — 1-based handle into the module's `LirRegConstraintPool`;
+    // `kLirNoRegConstraints` (0) = this instruction declares none. Claims
+    // the slot previously reserved as `_pad2` ("explicit pad to 24B;
+    // future field") — the field it was reserved FOR.
+    //
+    // ⚠ UNLIKE `flags`, THIS DOES **NOT** SURVIVE A REBUILD BY
+    // CONSTRUCTION, and pretending otherwise is how it would become a
+    // silent miscompile. `flags` survives because every rebuilding pass
+    // already threads it through `addInst(op, res, ops, payload, flags)`;
+    // this handle rides the POD and `addInst` never sees it, so a pass
+    // that rebuilds an instruction drops it to 0 — which reads as the
+    // perfectly legal "no constraints" and lets the allocator reuse a
+    // register the instruction destroys. A per-instruction field is
+    // inherently uncarriable without the pass's participation: the
+    // rebuild re-creates the instruction and only the pass knows the
+    // correspondence. So the mechanism is (a) `lir_pass_util::
+    // carryInstSideData` — ONE call per rebuilt instruction, the whole
+    // participation surface — and (b) the verifier's `L_SideStructure
+    // ReferenceLost` rule, which turns a forgotten (a) LOUD: the shared
+    // copy helper carries the POOL unconditionally, so a dropped handle
+    // leaves a pool entry that NO instruction references, and that is
+    // detectable from the rebuilt module alone.
+    std::uint32_t regConstraints = kLirNoRegConstraints;
 };
 static_assert(sizeof(LirInst) <= 32, "detail::LirInst grew unexpectedly");
 static_assert(std::is_trivially_copyable_v<LirInst>);

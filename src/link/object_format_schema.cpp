@@ -1,6 +1,7 @@
 #include "link/object_format_schema.hpp"
 
 #include "core/substrate/relocation_table.hpp"
+#include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList — the ONE closed-set renderer
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -114,6 +115,67 @@ ObjectFormatSchema::loadShipped(std::string_view name) {
     return loadFromFile(*path);
 }
 
+// ── The one reverse map (D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS) ──
+//
+// Deliberately adjacent to `ObjectFormatData::validate()` below, because the
+// two halves are one rule: `validate()` PROMISES that at most one non-alias
+// row claims a wire id and that every alias aliases a real row, and this is
+// the code that SPENDS that promise. Splitting them across a reader is how
+// two of the three readers came to spend a promise they never applied.
+//
+// Order-independent: the `emitOnly` skip means the row owning a wire id wins
+// no matter where either row sits in the document.
+std::expected<RelocationDecodeTable, std::string>
+ObjectFormatSchema::relocationDecodeTable() const {
+    RelocationDecodeTable table;
+
+    // Duplicate-nativeId guard: a wire id mapping to two DIFFERENT kinds is an
+    // ambiguous schema — say so rather than let "last row wins" silently
+    // mis-decode. Returns the message, or nullopt to continue.
+    auto mapNative = [&](std::uint32_t nid,
+                         RelocationKind kind) -> std::optional<std::string> {
+        auto const ins = table.nativeToKind.emplace(nid, kind);
+        if (!ins.second && ins.first->second.v != kind.v) {
+            return "object format schema '" + std::string{name()}
+                 + "' maps native reloc id " + std::to_string(nid)
+                 + " to two different RelocationKinds ("
+                 + std::to_string(ins.first->second.v) + " and "
+                 + std::to_string(kind.v) + ") -- ambiguous reverse map.";
+        }
+        return std::nullopt;
+    };
+
+    for (auto const& r : d_.relocations) {
+        // AN EMISSION ALIAS IS NOT DECODABLE. It shares its wire type with a
+        // real row and exists only so the EMITTER can reach that type through
+        // a second DSS kind (x86_64's DWARF FDE pointer vs the call-site
+        // rel32 — same R_X86_64_PC32, different implicit addend bias). The
+        // wire carries no bias, so there is nothing to decode differently;
+        // including it here would make the map ambiguous and reject every
+        // object using that entirely ordinary relocation. `validate()`
+        // guarantees the aliased row is present, so skipping never leaves the
+        // wire id unmapped.
+        if (r.emitOnly) continue;
+        if (auto e = mapNative(r.nativeId, r.kind)) {
+            return std::unexpected(std::move(*e));
+        }
+        // `pltNativeId` is read UNCONDITIONALLY, from the schema, for every
+        // format. It is 0 on every shipped Mach-O and PE document — which is
+        // a fact about those formats (an extern call is the same wire id
+        // whether or not the linker synthesizes a stub), not a reason for
+        // their readers to omit the leg. Omitting it is what made this loop
+        // format-keyed in two places at once.
+        if (r.pltNativeId != 0u) {
+            if (auto e = mapNative(r.pltNativeId, r.kind)) {
+                return std::unexpected(std::move(*e));
+            }
+            table.callSignalNativeIds.insert(r.pltNativeId);
+        }
+        if (r.isCall) table.callSignalNativeIds.insert(r.nativeId);
+    }
+    return table;
+}
+
 namespace detail {
 
 namespace {
@@ -165,8 +227,10 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // for being unresolved, instead of being silently adjudicated as ELF.
     if (backend == nullptr) {
         fail("/format/kind",
-             "format kind 'unknown' is reserved as the invalid sentinel; "
-             "declare one of 'elf' / 'pe' / 'macho' / 'wasm' / 'spirv'");
+             std::format("format kind '{}' is reserved as the invalid "
+                         "sentinel; declare one of {}",
+                         kObjectFormatKindSentinelName,
+                         link::objectFormatBackendNameList()));
     }
 
     // FC3 c1: the data model is REQUIRED (the loader rejects a missing
@@ -175,10 +239,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // invalid sentinel, never a silent width choice).
     if (dataModelName(dataModel).empty()) {
         fail("/dataModel",
-             "missing required 'dataModel' — every object format must "
-             "declare its C-family width triple ('LP64', 'LLP64', or "
-             "'ILP32'); a silent default would bake wrong primitive "
-             "widths");
+             std::format("missing required 'dataModel' — every object format "
+                         "must declare its C-family width triple ({}); a "
+                         "silent default would bake wrong primitive widths",
+                         detail::renderAllowedList(allNames(kDataModelTable),
+                                                   ", ")));
     }
 
     // D-PP-HEADER-CASE-INSENSITIVE-PE: the header-name case rule is REQUIRED
@@ -187,13 +252,15 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // zero default is the invalid sentinel, never a silent case rule).
     if (headerNameMatchingName(headerNameMatching).empty()) {
         fail("/headerNameMatching",
-             "missing required 'headerNameMatching' — every object format "
-             "must declare how an `#include` header NAME is matched "
-             "('case-sensitive' or 'case-insensitive'); a silent default "
-             "would let the BUILD HOST's filesystem decide, which both "
-             "wrongly rejects `<Windows.h>` for a pe target on a "
-             "case-sensitive host and silently ACCEPTS `<Stdio.h>` for an "
-             "elf target on a case-insensitive one");
+             std::format("missing required 'headerNameMatching' — every "
+                         "object format must declare how an `#include` header "
+                         "NAME is matched ({}); a silent default would let the "
+                         "BUILD HOST's filesystem decide, which both wrongly "
+                         "rejects `<Windows.h>` for a pe target on a "
+                         "case-sensitive host and silently ACCEPTS `<Stdio.h>` "
+                         "for an elf target on a case-insensitive one",
+                         detail::renderAllowedList(
+                             allNames(kHeaderNameMatchingTable), " or ")));
     }
 
     // ── D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN: the C-symbol decoration
@@ -234,11 +301,43 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // constant, or the reason it is safe disappears with it.
     if (cSymbolDecorationSchemeName(cSymbolDecoration.scheme).empty()) {
         fail("/cSymbolDecoration",
-             "missing required 'cSymbolDecoration' — every object format must "
-             "declare how a canonical C identifier is decorated to obtain its "
-             "linker-visible name ('none' or 'leading-underscore'); a silent "
-             "default would re-hide the rule in the engine's C++ table, which "
-             "is the two-owner defect this key exists to remove");
+             std::format("missing required 'cSymbolDecoration' — every object "
+                         "format must declare how a canonical C identifier is "
+                         "decorated to obtain its linker-visible name ({}); a "
+                         "silent default would re-hide the rule in the engine's "
+                         "C++ table, which is the two-owner defect this key "
+                         "exists to remove",
+                         detail::renderAllowedList(
+                             allNames(kCSymbolDecorationSchemeTable), " or ")));
+    }
+
+    // ── D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: a PRESENT
+    //    `weakDefinition` block must name a real dialect ─────────────────
+    //
+    // Presence is the declaration, so ABSENCE is not an error here — the
+    // walker that needs the answer refuses when it needs it, and a format
+    // that never encodes a weak definition never has to answer. What is an
+    // error is a block that is PRESENT and says nothing: the sentinel has no
+    // spelling (it is deliberately absent from `kWeakDefinitionDialectTable`,
+    // so no JSON string can produce it), which means the only way to reach
+    // this state is a HAND-BUILT `ObjectFormatData` — the
+    // `ObjectFormatSchema{ObjectFormatData}` public constructor runs no
+    // validation, and every in-memory producer reaches the walkers through it.
+    // Without this arm such a schema would carry an engaged optional whose
+    // dialect matches no encoder, and the walker's refusal would name the
+    // empty string.
+    if (weakDefinition.has_value()
+     && weakDefinitionDialectName(weakDefinition->dialect).empty()) {
+        fail("/weakDefinition/dialect",
+             std::format("'weakDefinition' is present but names no dialect — a "
+                         "DECLARED block must state HOW this format spells a "
+                         "weak definition ({}). Omit the block entirely to "
+                         "leave the question unanswered; an engaged block with "
+                         "the invalid sentinel is neither an answer nor an "
+                         "omission. D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-"
+                         "DECLARED.",
+                         detail::renderAllowedList(
+                             allNames(kWeakDefinitionDialectTable), " or ")));
     }
 
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): container rules ──
@@ -321,6 +420,22 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                          "relocation '{}' declares emitOnly but no other row "
                          "claims nativeId {}; an emission alias must alias a "
                          "real row, otherwise nothing can DECODE this wire id",
+                         relocations[i].name, relocations[i].nativeId));
+            }
+        }
+        // D-LK-MACHO-ISDATA-NO-CALL-SIGNAL: `isCall` is consumed through the
+        // very reverse map an `emitOnly` row is EXCLUDED from, so the pair is a
+        // contradiction -- the declaration could never be read. Silent, and it
+        // reads to a maintainer as a guarantee that is in force. Refuse it.
+        for (std::size_t i = 0; i < relocations.size(); ++i) {
+            if (relocations[i].isCall && relocations[i].emitOnly) {
+                fail(std::format("/relocations/{}/isCall", i),
+                     std::format(
+                         "relocation '{}' declares both \"isCall\" and "
+                         "\"emitOnly\". An emission alias is excluded from the "
+                         "nativeId -> kind reverse map object readers build, so "
+                         "its call/branch role can never be consulted -- declare "
+                         "\"isCall\" on the row that OWNS nativeId {} instead",
                          relocations[i].name, relocations[i].nativeId));
             }
         }

@@ -53,6 +53,273 @@ namespace dss {
 
 class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full header
 
+// ═══════════════════════════════════════════════════════════════════════════
+// WHICH ARGUMENTS THE **DRIVER** MUST SUPPLY — and where each one is witnessed
+// (D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ★★★ WHY THIS BLOCK EXISTS. Every entry point below has thorough unit
+// coverage, and for a whole class of defect that coverage cannot help: a unit
+// case CONSTRUCTS the argument the driver is supposed to derive, so it tests
+// the callee while ASSUMING the caller. Cycle P22 measured the consequence —
+// dropping a newly-threaded parameter at ONE driver call site reproduced the
+// original CLI failure exactly while the entire in-process suite stayed green
+// at 32/32. The gap was found by a mutant, not by review, and nothing in the
+// suite could have found it.
+//
+// ── THE CRITERION. A parameter is DRIVER-SUPPLIED when all three hold: ──────
+//   1. its correct value is DERIVED by `src/program/program.cpp` — from a CLI
+//      argument, from the loaded `.lang`/`.target`/`.format` document, or from
+//      earlier pipeline state — rather than handed to the driver;
+//   2. a WRONG value COMPILES: a default argument, an empty span/container,
+//      `nullopt`, `false`, a zero ordinal, or a same-typed sibling is sitting
+//      right there at the call site;
+//   3. the wrong value still produces a BUILD. The loss is a dropped
+//      capability, a wrong ABI, or a silently different optimizer schedule —
+//      never a diagnostic.
+// A parameter a UNIT TEST LEGITIMATELY CONSTRUCTS fails at least one clause:
+// it is the case's own input (the source text, the schema under test, the
+// reporter the test reads back), or a wrong value is a compile error, or a
+// wrong value fails loud on its own. Clause 3 decides most rows, because a
+// mis-supply that failed loud would already be caught by any test that
+// compiles anything.
+//
+// ★★ AND THE CLASSIFICATION IS PER **ROUTE**, NOT PER ENTRY POINT. The driver
+// reaches `linkAndWriteWithStaticArchives` by THREE routes (the `encode` tier,
+// the N==1 sole CU, the N>1 merge) and `optimizeModule` by THREE (archive
+// member, N==1, merged). Each is a separate argument list a later edit can
+// change independently — which is exactly how a parameter ends up threaded to
+// two call sites out of three. A pin on one route says NOTHING about the
+// others, so every citation below names its route.
+//
+// ⚠ THIS IS A JUDGEMENT, AND DELIBERATELY NOT A GATE. What a unit test may
+// legitimately construct cannot be decided mechanically; a detector would need
+// an allowlist that re-states this convention in the place least likely to be
+// read — the same ruling that withdrew the `.sh`/`.ps1` pairing anchors. It
+// lives here, beside the declarations, and is updated when a signature changes.
+//
+// ── MEASURED, with the instrument ──────────────────────────────────────────
+// ⚠ AND THE INSTRUMENT ITSELF HAS TO SURVIVE BEING QUOTED HERE. The first
+// spelling of this paragraph cited `grep -c` for the bare export macro and said
+// 21. ✔RE-MEASURED: that command returns 22, because THIS COMMENT contains the
+// very token it counts — the citation went stale the moment it landed, inside
+// its own cycle, which is the same failure mode as citing a line number. Anchor
+// the pattern to the START of a declaration line and no prose can pollute it,
+// because every line in this block opens with a slash pair:
+//     grep -cE '^(struct |\[\[nodiscard\]\] )?DSS_EXPORT' <this header>  = 21
+// — EIGHTEEN exported functions plus three exported structs (`CuMirModule`,
+// `EntryCandidate`, `ResolvedEntry`). Driver call-site counts below come from a
+// COMMENT-STRIPPED scan of `src/program/program.cpp` — 21 call sites over 13 of
+// the 18 entry points. A raw grep over-counts there too: `linkAndWrite`
+// "appears" twice and both occurrences are prose.
+//
+// ── A. NO DRIVER SEAM — `program.cpp` never calls these ────────────────────
+// `effectiveLongDoubleFormat`, `compileSingleUnit`, `assembleUnit`,
+// `linkAndWrite`, `pullStaticArchiveMembers`. Their callers live in
+// `compile_pipeline.cpp`, so the composition is inside one TU and any test that
+// builds a CU exercises the supplying. ★ `pullStaticArchiveMembers` is the P22
+// case and belongs here for a reason worth keeping: it has no driver seam of
+// its OWN — its `dynamicLibraries` value is supplied one level up, by
+// `linkAndWriteWithStaticArchives`, which is where the pin had to go.
+//
+// ── B. DRIVER-SUPPLIED, WITNESSED ──────────────────────────────────────────
+// `copyDiagnostics` (3 driver calls: the N>1 pooled per-CU scratch drain, plus
+//   the front-half drains of a CU's own diagnostics and of each Tree's) — `dst`
+//   is the RUN-WIDE reporter carrying the CLI's diagnostic policy; `src` is a
+//   SCRATCH, i.e. earlier pipeline state. Several reporters are in scope and all
+//   are the same type, so a drain into the wrong one compiles and the build
+//   still succeeds — the diagnostics simply never reach the operator. PINNED by
+//   `program/test_compile_pipeline`
+//   `Program_CuParallelism.MultiTuDiagnosticsAreCuOrderedPoolVsSynchronous`
+//   (the per-CU scratch drain) and `Program_CompileFiles.MalformedSourceRendersPositionedCaret`
+//   (the per-Tree drain); `program/test_max_diagnostics_reaches_every_tier`
+//   drives the same route end-to-end for the budget axis.
+//
+// `assembleAsmUnit` (1) — `format` (the WHOLE schema, never a hand-picked
+//   slice) and `opts` (the DYNAMIC half of `--resolve-library`, `ar` archives
+//   already partitioned out). Its own docblock records that a DEFAULTED `opts`
+//   was REJECTED, which is clause 2 written down as a design rule. PINNED by
+//   `program/test_asm_extern_binding`
+//   (`AsmExternBinding.CallToLibcBindsAndLinksAnExecOnEveryFormat` plus the
+//   `--resolve-library` cases).
+//
+// `buildCuMir` (2: the synchronous N==1 call and the pooled N>1 call) —
+//   `callingConventionIndex`, resolved by `dss::ffi::resolveAbi` and turned into
+//   an ordinal by pointer distance. ✔MEASURED: `x86_64.target.json` declares
+//   `sysv_amd64` at ordinal 0 and `ms_x64` at 1, so the literal `0` compiles and
+//   silently emits SysV register assignments on pe64 — `D-FF3-3`, exactly.
+//   PINNED by `program/test_entry_argv_run`
+//   `EntryArgvRun.RealCommandLineReachesMainByteExact`: a real `CreateProcess`
+//   command line into `main(int, char**)`, which reads rcx/rdx under MS_x64 and
+//   rdi/rsi under SysV. ⚠ Windows-only, and it takes `compileFiles` — the N==1
+//   route. See section D for the merged route.
+//
+// `optimizeModule` (3) — `stage` is STRUCTURAL knowledge of WHICH call site this
+//   is, and nothing downstream can check it; `externImports` is DEFAULTED `= {}`.
+//   PINNED per route: archive member by `program/test_static_link`
+//   `StaticArchive.ReleaseMemberIsProgramStageOptimized`; N==1 by
+//   `program/test_driver_argument_supply`
+//   `DriverArgumentSupply.SingleCuRouteRunsTheProgramStageOptimize`; merged by
+//   `DriverArgumentSupply.MergedMultiCuRouteRunsTheProgramStageOptimize`. All
+//   three count `PhaseTimers::read(Optimize).runs`, which is EXACT rather than a
+//   proxy — the phase scope opens INSIDE `optimizeModule`, so the count IS the
+//   invocation count. `externImports` is witnessed by the corpus:
+//   `examples/c-subset/inline_c99_undefined_error` (N==1) and
+//   `inline_c99_inline_definition_crosscu` (merged).
+//   ⚠⚠ `Program_WholeProgramMerge.ShippedStageRoutingInlinesCrossCuAtProgramStage`
+//   and `Program_WholeProgramMerge.UnitStageRunsTheUnitDocumentNotTheConfigDoc`
+//   are NOT driver pins despite the `Program_` prefix: they call `buildCuMir` /
+//   `optimizeModule` directly and re-derive `ccIndex` themselves. The prefix
+//   names the SUBJECT, not the tier. ✔MEASURED 2026-08-20: with the driver's
+//   merged program-stage call short-circuited away, BOTH of them stayed green.
+//   Reading them as driver coverage is the mistake this block exists to stop.
+//
+// `lowerCuMirToAssembly` (2: archive member, N==1) — FIVE format-declared facts
+//   read off the schema at the call site. `processArgs` / `sehPersonality` are
+//   optionals (a `nullopt` compiles), `entryVerbs` is a span (an empty one
+//   compiles AND means "this format starts no program"), `formatName` is a
+//   `string_view` (any string compiles). PINNED: `processArgs` by
+//   `program/test_entry_argv_run` `EntryArgvRun.RealCommandLineReachesMainByteExact`
+//   (a nullopt makes the entry read register garbage); `entryVerbs` on this
+//   route by the corpus pair `examples/c-subset/entry_wmain_only_refused_elf` /
+//   `entry_wmain_only_refused_macho`.
+//
+// `resolveProgramEntry` (1, merged route) — `formatVerbs`. ★★★ THE WORST
+//   FAILURE SHAPE IN THIS HEADER, AND IT IS SILENT: an EMPTY span is a DECLARED
+//   answer, so it takes the "this format starts no program" arm and resolves by
+//   NAME with no verb requirement and NO ambiguity check, returning candidate 0.
+//   A driver that passed `{}` on an EXEC format would restore the exact
+//   first-match-wins defect this function was created to remove. PINNED by
+//   `program/test_driver_argument_supply`
+//   `DriverArgumentSupply.MergedMultiCuRouteSuppliesTheFormatsEntryVerbs`.
+//
+// `isArArchiveFile` (1) — the supply risk is the driver not making the CALL, so
+//   a `.a` on `--resolve-library` goes to the dynamic export reader. PINNED by
+//   `program/test_static_link` `StaticLink.DriverStaticLinkBuildsSelfContainedExec`
+//   (`StaticLink.ArMagicDispatchByBytesNotExtension` is the UNIT half — it calls
+//   this predicate directly and cannot see the driver skipping it).
+//
+// `extractStaticArchiveMembers` (1) — `archivePaths`, the STATIC half of the
+//   `--resolve-library` partition. An empty span compiles and silently ships an
+//   incomplete "fat" library. PINNED by `program/test_static_link`
+//   `StaticLink.StaticLibDriverMergesInputStaticArchive` and
+//   `StaticLink.StaticLibFatArchiveExecRunsFortyTwo`.
+//
+// `linkAndWriteWithStaticArchives` (3: `encode` tier, N==1, merged) —
+//   `staticArchives`, `dynamicLibraries` and `imageRequest`. `imageRequest` is
+//   DEFAULTED, which is clause 2 in its purest form: a route that omits it
+//   links, writes the artifact and reports success while the operator's
+//   `--stack-reserve` has vanished — at runtime indistinguishable from never
+//   having asked. PINNED per route: N==1 by `program/test_artifact_report`
+//   `ArtifactReport.ALinkFailureAfterThePathIsKnownReportsNoArtifact`; merged by
+//   `program/test_driver_argument_supply`
+//   `DriverArgumentSupply.MergedMultiCuRouteSuppliesTheImageRequest`; `encode`
+//   tier by `DriverArgumentSupply.AsmEncodeRouteSuppliesTheImageRequest`.
+//   `dynamicLibraries` (the P22 parameter — deliberately NOT defaulted, though an
+//   empty span still compiles) is pinned on the N==1 route by
+//   `program/test_static_link`
+//   `StaticLink.PeArchiveMemberBindsAnOperatorNamedLibraryThroughTheDriver`.
+//
+// `linkAndWriteStaticArchive` (1) — `memberNames` (parallel to `modules`) and
+//   `imageRequest`. This route's CONTRACT is the refusal: no archive format
+//   declares `stackReserveControl`, so a request routed here must be REFUSED,
+//   and "accepting the parameter and ignoring it is what would let the request
+//   vanish on a `staticlib` target" (its own docblock). PINNED by
+//   `program/test_driver_argument_supply`
+//   `DriverArgumentSupply.StaticArchiveRouteSuppliesTheImageRequest`;
+//   `memberNames` by `program/test_static_link`
+//   `StaticLink.ElfStaticLibDriverEmitsArchiveWithArmap`.
+//
+// `lowerMergedToAssembly` (1, merged) — NINE driver-derived arguments with an
+//   observable consequence, every one of them now pinned on this route by
+//   `program/test_driver_argument_supply`. It is the largest concentration in
+//   the kernel and the least-travelled route to it, so each pin names the
+//   argument it protects:
+//     `bitFieldStrategy`         → `DriverArgumentSupply.MergedMultiCuRouteSuppliesTheFormatsBitFieldStrategy`
+//     `dataModel`                → `…SuppliesTheFormatsDataModel`
+//     `callingConventionIndex`   → `…SuppliesTheCallingConventionIndex`
+//     `externCallDispatch`       → `…SuppliesTheFormatsExternCallDispatch`
+//     `dataImportBinding`        → `…SuppliesTheFormatsDataImportBinding`
+//     `externAddrBinding`        → `…SuppliesTheFormatsExternAddrBinding`
+//     `sehScopes`                → `…SuppliesTheSehScopes`
+//     `wideFloatSoftcallLibrary` → `…SuppliesTheWideFloatSoftcallLibrary`
+//     `tlsAccess`                → `program/test_compile_pipeline`
+//                                  `Program_CompileFiles.CrossCuExternThreadLocalMergesAndAccessesTpRelativeE2E`
+//   ★★ EVERY ONE OF THOSE PINS ASSERTS THE OBSERVABLE CONSEQUENCE IN THE
+//   PRODUCED IMAGE, NEVER THE ARGUMENT'S SHAPE — bytes of a const-init global, a
+//   relocation type, an unwind-info flag, a declared library name. Six of the
+//   arguments are optionals or containers whose EMPTY value is the CORRECT
+//   answer for some shipped format, so "it is non-empty" would be a FALSE
+//   assertion on those legs and a tautology on the rest.
+//   ✔MEASURED 2026-08-20 by mutating the driver one argument at a time: SIX of
+//   the eight mutants produce a SILENT WRONG ARTIFACT (exit 0, zero
+//   diagnostics, a binary that builds and — where it can be run — answers
+//   wrong: `bitFieldStrategy`, `dataModel`, `callingConventionIndex`,
+//   `dataImportBinding`, `externAddrBinding`, `sehScopes`), and TWO fail loud
+//   at MIR→LIR (`externCallDispatch`, `wideFloatSoftcallLibrary` — each refuses
+//   rather than guessing). In every case the two in-process UNIT suites for the same callee
+//   — `lir/test_mir_to_lir` and `mir/test_mir_merge`, which CONSTRUCT these
+//   arguments — stayed green. That contrast is the whole point of this block.
+//
+// ── C. DRIVER-SUPPLIED BUT CLAUSE-2-SAFE ───────────────────────────────────
+// `collectEntryCandidates` (1, merged) — two out-parameters and a model that is
+//   earlier pipeline state. No confusable same-typed value sits at the call
+//   site, so the driver cannot quietly supply the wrong one; the only failure
+//   available is walking the wrong CU set, which the merge then reports.
+//
+// `lowerMergedToAssembly`'s `cuId` — the TENTH driver-derived argument, and the
+//   one with no pin, because on this route it has no observable consequence to
+//   pin. `lowerMergedToAssembly`'s own docblock says so: the merged image
+//   carries CU0's id and it is "cosmetic, since the linker gets one module" —
+//   the merge already collapsed every CU into ONE symbol space, so the
+//   `(cuId, SymbolId)` key the linker builds has a single cuId whatever value
+//   arrives. It fails clause 3. ⚠ That is a statement about THIS route only:
+//   on the archive-member route a member must never share a cuId with another
+//   (`linkAndWriteStaticArchive`'s symbol index is keyed by the pair), and
+//   there the same argument is load-bearing.
+//
+// ── D. WITNESSED, BUT ONLY WHERE THE IMAGE RUNS — the honest remainder ─────
+// No driver-derived argument of any entry point above is UNWITNESSED any more.
+// What is left is narrower and worth naming precisely, because a reader who
+// assumes "pinned" means "pinned on every leg" would be wrong about two of
+// them: their DISCRIMINATING arm needs a pe64 image to EXECUTE, so it runs on
+// the Windows leg and is skipped elsewhere. On the other legs those two pins
+// still assert the build and their own premise — they simply cannot tell a
+// correct supply from a wrong one there.
+//   * `callingConventionIndex` on the merged route. ✔MEASURED: every static
+//     signature of the wrong ordinal — which register `main` reads `argc` from,
+//     which callee-saved registers spill, the `sub rsp` in a calling frame, the
+//     UNWIND_INFO save offsets — keys on a REGISTER-ALLOCATION OUTCOME, so a
+//     byte pin on any of them would red on honest allocator work. The N==1
+//     route's pin (`program/test_entry_argv_run`
+//     `EntryArgvRun.RealCommandLineReachesMainByteExact`) is Windows-gated for
+//     exactly the same reason; this is its merged twin, not a new compromise.
+//   * `dataImportBinding` on the merged route. The consequence is a wrong VALUE
+//     at run time (the address materialization stops one indirection short and
+//     yields the import slot's own address). ✔MEASURED that the ELF twin does
+//     NOT discriminate: a merged program comparing `stdout` against `stderr`
+//     still sees two distinct non-null words when both are slot addresses, so it
+//     exits 42 either way — which is why the pe64 `_mbcasemap`/`__p__mbcasemap`
+//     AGREEMENT ladder is the instrument.
+// ⚠ Do not read this as "acceptable" either. It is the remainder, recorded so
+// the next reader inherits the measurement instead of re-deriving it — and if a
+// host-independent signature for either is ever found that is not a register-
+// allocation outcome, it belongs here in place of the run.
+//
+// ── AND WHAT THE MERGED ROUTE COSTS TO REACH AT ALL ────────────────────────
+// ✔MEASURED — by walking `examples/` for directories carrying an
+// `expected.json` and counting their `.c`/`.s` files — the merged route is
+// reachable ONLY through `Program::compileUnits` with ≥2 sources, and 22 of 613
+// shipped corpus example manifests have ≥2 such sources, so the corpus
+// exercises it about 3.6% as often as the single-CU route. (An earlier
+// spelling of this line said "22 of 614" with no instrument named; the
+// numerator reproduces, the denominator does not — hence the instrument.)
+// That ratio is why this route accumulated the gaps, and why
+// each pin above builds its own 2-CU program rather than reusing a fixture: a
+// pin that quietly lost its second source would keep passing while testing the
+// sole-CU path instead.
+// ═══════════════════════════════════════════════════════════════════════════
+
 // Drain every diagnostic from `src` into `dst`. Shared driver-tier
 // helper — used by `program.cpp::compileFiles` (drains CU +
 // per-Tree reporters) AND by `compile_pipeline.cpp::compileSingleUnit`
@@ -242,6 +509,22 @@ resolvePipelineName(CompileConfig config) noexcept {
     auto const idx = static_cast<std::size_t>(config);
     if (idx >= kCompileConfigCount) return std::nullopt;
     return kPipelineNameTable[idx].second;
+}
+
+// The REVERSE lookup over the SAME table (P10: the examples runner's
+// `shippedPipeline: <name>` arm resolves a pipeline NAME back to the
+// CompileConfig that selects it, so that arm exercises the REAL production
+// channel — config → resolvePipelineName → loadShippedPipeline → stage
+// routing — instead of injecting a `pipelineOverride`). One table, both
+// directions: a second mapping would drift. Nullopt on an unknown name —
+// callers fail loud (an unknown name in a manifest is a config error, never
+// a silent debug fallback).
+[[nodiscard]] constexpr std::optional<CompileConfig>
+resolveCompileConfigFromPipelineName(std::string_view name) noexcept {
+    for (auto const& [cfg, pipeline] : kPipelineNameTable) {
+        if (pipeline == name) return cfg;
+    }
+    return std::nullopt;
 }
 
 // Assemble ONE standalone-assembly CompilationUnit at the `encode` pipeline
@@ -472,12 +755,41 @@ buildCuMir(CompilationUnit const&         cu,
 // byte-identical (`buildCuMir` calls this with the same arguments it used inline).
 // `interner` is the type space the module's TypeIds index into — the per-CU lattice's
 // interner for `buildCuMir`, the merged host lattice's interner for the merged path.
+//
+// ── P10 stage topology (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE, operator ruling
+// 2026-08-18: "first class LTO implementation, 100% config driven") ──
+// The DRIVER owns the slots (which call sites exist is structural knowledge);
+// the DOCUMENT owns what runs in each. `Unit` runs wherever a CU is built
+// (buildCuMir); `Program` runs wherever a FINAL module is about to be lowered
+// — the N>1 merged module, the N==1 sole CU, and each static-archive member.
+// WHICH pipeline a stage runs: `opts.pipelineOverride` wins at every site
+// (unchanged semantics); else the config's document, and — at the Unit stage
+// only — if that document declares a top-level `"unitPipeline": "<name>"`,
+// THAT named pipeline runs instead. Absent key ⇒ same document at both
+// stages (the pre-P10 behavior, and what `debug` ships). N==1 needs no
+// special case: its buildCuMir call is a Unit site, its pre-lower call is a
+// Program site, and both fall out of the config — never a driver `if` on
+// stage content.
+enum class PipelineStage : std::uint8_t {
+    Unit = 0,     // per-CU build (buildCuMir)
+    Program = 1,  // final module pre-lower (merged / N==1 / archive member)
+};
+
 [[nodiscard]] DSS_EXPORT bool
 optimizeModule(Mir&                  mir,
                TargetSchema const&   target,
                TypeInterner const&   interner,
                CompileOptions const& opts,
-               DiagnosticReporter&   reporter);
+               PipelineStage         stage,
+               DiagnosticReporter&   reporter,
+               // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: the
+               // module's extern table. `opt::optimize`'s unconditional strip
+               // epilogue reads it to find the C99 6.7.4p7 inline definitions
+               // that must not be emitted (a function whose SymbolId is also an
+               // extern's). BOTH call sites pass their own module's table —
+               // per-CU here, whole-program in `Program::compileOneTarget` —
+               // because a body surviving either optimize reaches codegen.
+               std::span<ExternImport const> externImports = {});
 
 // LOWER half: MIR → LIR → liveness → regalloc → rewrite → legalize → callconv →
 // assemble → symbol-table populate → user-entry scan. Consumes the `CuMirModule`
@@ -687,11 +999,28 @@ isArArchiveFile(std::filesystem::path const& path);
 // archive-parse / member-read failure (fail loud via `reporter`). The reader's
 // `ok()` is a tautology for reader output (see elf_object_reader.hpp), so this
 // consumes the reader's `optional` return as the read-success signal -- never
-// `module.ok()`. SCOPE: ELF (the reader is ELF-only; a non-ELF `format` makes
-// `readRelocatableObject` fail loud -- Mach-O/COFF are named follow-ups).
+// `module.ok()`. Member parsing dispatches on the member's own
+// `ObjectFormatKind` (ELF / Mach-O / PE) through one shared chokepoint; a format
+// whose kind has no reader arm fails loud rather than mis-parsing a member.
+//
+// ── `dynamicLibraries` (D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-
+// LIBRARY) ──────────────────────────────────────────────────────────────────
+// An object file records an undefined symbol's NAME and nothing else -- no
+// format has anywhere to say WHICH library owns it. So a member whose extern was
+// bound to a library when it was COMPILED reads back unbound, and the binding
+// must be re-derived here, before the merge, from the same authorities that
+// derived it the first time: the binaries the operator NAMED (this parameter,
+// which WINS) and then the shipped-descriptor corpus (the platform default).
+//
+// ⚠ Pass the DYNAMIC half of `--resolve-library` -- the same partition the
+// driver hands to the per-CU build. The `ar` archives in that list are
+// `archivePaths` here: they are merged INTO the image and record no import at
+// all, and feeding one to the export reader is refused loud (correctly), which
+// would fail an otherwise good build. Empty is a valid no-op.
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<AssembledModule>>
 pullStaticArchiveMembers(AssembledModule const&                 clientModule,
                          std::span<std::filesystem::path const> archivePaths,
+                         std::span<ResolveLibrarySpec const>    dynamicLibraries,
                          TargetSchema const&                    target,
                          ObjectFormatSchema const&              format,
                          DiagnosticReporter&                    reporter);
@@ -729,9 +1058,17 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
 // `mergeModules` binds each archive reference to the pulled member's definition
 // (stripping the extern import) exactly as it does a sibling-CU reference.
 // Returns true iff the pull, merge, link, and write all succeeded.
+//
+// `dynamicLibraries` rides through to `pullStaticArchiveMembers` -- see its
+// contract above for why a pulled member's library binding has to be re-derived
+// and why this must be the DYNAMIC half of `--resolve-library`. It is NOT
+// defaulted: every route that produces an image has to answer the question, and
+// a default would let a new route silently inherit the gap this parameter
+// closes.
 [[nodiscard]] DSS_EXPORT bool
 linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
                                std::span<std::filesystem::path const> staticArchives,
+                               std::span<ResolveLibrarySpec const>    dynamicLibraries,
                                TargetSchema const&                    target,
                                ObjectFormatSchema const&              format,
                                std::filesystem::path const&           outPath,

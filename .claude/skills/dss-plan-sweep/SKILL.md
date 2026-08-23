@@ -49,7 +49,7 @@ something is mechanical or a judgment, it is a judgment.**
    If a `/loop` or `dss-cycle` is *actively editing the plans right now*, do not write those files —
    flag their staleness in the report instead and list them as skipped.
 2. **Baseline the authorities.** Run `ctest --test-dir build --output-on-failure` for the real suite
-   count, `tools/check-anchor-registry.{ps1,sh}` for src↔registry, and
+   count, `scripts/check-anchor-registry/check-anchor-registry.{ps1,sh}` for src↔registry, and
    `git rev-list --left-right --count origin/<branch>...HEAD` for push state.
 3. **Inventory.** Every file under `.plans/`, plus `README.md` and the sibling skills. Name them in
    the report — an unswept plan is a hole in the guarantee.

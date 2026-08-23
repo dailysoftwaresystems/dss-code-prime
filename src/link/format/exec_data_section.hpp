@@ -7,9 +7,11 @@
 #include "core/types/target_schema.hpp"   // F5: TargetSchema::relocationInfo (abs64)
 #include "link/format/byte_emit.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -103,7 +105,27 @@ struct ExecDataSectionLayout {
     // the static/relocatable arms — the RodataDataItemWithRelocationFailsLoud
     // discipline): the item then fails loud here, never a silent unpatched
     // slot. Deferral anchor: D-LK1-ELF-RODATA-DATAITEM-RELOC.
-    bool                              allowItemRelocations = false) {
+    bool                              allowItemRelocations = false,
+    // OPT-OUT for items the CALLER lays out in a section of their OWN rather
+    // than in this shared one -- `dataItems` indices this call must SKIP
+    // ENTIRELY. Skipped, not merely left unnamed: an excluded item contributes
+    // no bytes, no offset and no span here, so the shared section stays
+    // byte-identical to what it would have been had the item never existed.
+    // (An item that still occupied space would leave a hole no linker can
+    // account for AND a second copy of its bytes in the section that really
+    // owns it.)
+    //
+    // The COFF writer is the caller: COFF expresses a WEAK DEFINED symbol as a
+    // COMDAT select-any section holding exactly ONE body (PE/COFF spec,
+    // "COMDAT Sections (Object Only)"; D-LK-OBJECT-WEAK-DEF-RELOCATABLE),
+    // because the duplicate-resolution policy is a property of the SECTION --
+    // two weak bodies sharing one section would be kept or discarded as a
+    // unit, which is a different and wrong program.
+    //
+    // ⚠ MUST BE SORTED ASCENDING -- the membership test below is a binary
+    // search. The default excludes nothing, so every other caller (ELF ET_REL
+    // + exec, Mach-O, the PE image arm) is unchanged BY CONSTRUCTION.
+    std::span<std::size_t const>      excludedItemIndices = {}) {
     using ::dss::link::format::detail::emit;
 
     ExecDataSectionLayout layout;
@@ -122,6 +144,14 @@ struct ExecDataSectionLayout {
     for (std::size_t i = 0; i < dataItems.size(); ++i) {
         auto const& d = dataItems[i];
         if (d.section != kind) continue;     // belongs to another section
+        // Laid out by the caller in a section of its own (see the parameter's
+        // note) -- contributes nothing at all here. ASCENDING by contract, so
+        // the membership test is a binary search rather than a linear scan
+        // inside a per-item loop (this runs over every data item of a module).
+        if (std::binary_search(excludedItemIndices.begin(),
+                               excludedItemIndices.end(), i)) {
+            continue;
+        }
         // A data item carrying its OWN relocations (data->data references —
         // a vtable / fn-ptr table / cross-CU thunk slot). Where the caller
         // patches/emits them (`allowItemRelocations=true`) they flow through;

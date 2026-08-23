@@ -1,8 +1,14 @@
 # Maintainer: @MAINTAINER@
 # AUR binary package for the dsscp compiler. Rendered by packaging/render.py
 # and pushed to the AUR on each release (stable -> dsscp, beta -> dsscp-beta).
-# Depends on the queued install-layout + dsscp-rename prerequisites (installs a
-# `dsscp` binary + lib).
+#
+# The release tarball is a PREFIX TREE produced by `cmake --install`
+# (bin/, lib/, share/) — see cmake/DssInstall.cmake, which is the single owner
+# of what ships. `share/dss-code-prime/<version>/dss-config/` is NOT optional
+# packaging garnish: the compiler locates it by a path RELATIVE TO ITS OWN
+# EXECUTABLE, so the bin/-to-share/ relationship must survive packaging intact
+# or the installed compiler cannot resolve `#include <stdio.h>`.
+# Still depends on the queued dss-code-prime -> dsscp binary rename.
 pkgname=@PKGNAME@
 pkgver=@VERSION@
 pkgrel=1
@@ -18,10 +24,20 @@ sha256sums_x86_64=('@SHA256_LINUX_X64@')
 sha256sums_aarch64=('@SHA256_LINUX_ARM64@')
 
 package() {
-  install -Dm755 "bin/dss/dsscp" "$pkgdir/usr/bin/dsscp"
-  # Shared library alongside the CLI (rpath $ORIGIN/../lib resolves it).
-  for _lib in bin/dss/*.so bin/dss/*.so.*; do
-    [ -e "$_lib" ] || continue
-    install -Dm644 "$_lib" "$pkgdir/usr/lib/$(basename "$_lib")"
-  done
+  # The tarball's layout IS the target layout, so copy the tree WHOLE rather than
+  # picking files out of it. Two reasons, both correctness rather than brevity:
+  # the exe reaches its config through `../share/...`, which only holds if bin/
+  # and share/ keep their relative positions; and a hand-listed copy set here
+  # would be a second owner of what ships, silently omitting whatever CMake adds
+  # to the install set next.
+  install -d "$pkgdir/usr"
+  cp -a bin lib share "$pkgdir/usr/"
+  chmod 755 "$pkgdir/usr/bin/dsscp"
+
+  # Fail loudly rather than ship a compiler that cannot find its own config —
+  # the failure would otherwise land on the user as an unresolvable <stdio.h>.
+  [ -d "$pkgdir/usr/share/dss-code-prime" ] || {
+    echo "dsscp: the release tarball carries no share/dss-code-prime config tree" >&2
+    return 1
+  }
 }

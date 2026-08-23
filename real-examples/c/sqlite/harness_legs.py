@@ -46,6 +46,7 @@ repo already uses the python-core/thin-shell-wrapper shape in scripts/.
 
 USAGE
   harness_legs.py --verdict-vocabulary
+  harness_legs.py --library-providers
   harness_legs.py --plan [--host-os OS] [--host-arch ARCH] [--format json|sh]
                          [--launchers-available a,b,... | --launchers-none]
   harness_legs.py --header-stages
@@ -1322,6 +1323,14 @@ CONFOUND_MATCH_KINDS = {
                   "`permutation/file` (e.g. `^veryquick/nolock\\.test$`) — the "
                   "only name an abort has, because it dies before the unit that "
                   "killed it can be reported",
+    "build-tu": "the row's pattern is matched against a TRANSLATION UNIT PATH "
+                "(e.g. `ext/misc/fileio\\.c$`) — the only name a BUILD failure "
+                "has, because it dies before any unit exists to be named. "
+                "★ UNLIKE EVERY OTHER KIND, THE ROW ALONE EXCUSES NOTHING: it is "
+                "honoured only when THIS RUN's same-platform reference oracle, "
+                "given this leg's own manifest, also rejected that TU. See "
+                "attribute_build_failure "
+                "[D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION]",
 }
 CONFOUND_MATCH_DEFAULT = "unit"
 
@@ -1389,6 +1398,23 @@ def confound_scope_prefix(scope):
 # says a scoped row is SUPPLIED but not in force here, and names the run mode
 # that would put it in force.
 RUN_MODES = ("native", "launched", "skip")
+# ── RUN FIDELITY — does the artefact execute on ITS OWN INSTRUCTION SET? ─────
+# [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+# A SEPARATE axis from RUN_MODES, and separate because it answers a different
+# question. `mode` says HOW the artefact is reached (directly / through a
+# declared launcher / not at all); `fidelity` says WHAT KIND OF EVIDENCE the run
+# produces. They are independent: two `launched` runs of the SAME leg can differ
+# here, which is the whole reason this exists.
+#   native          this host's own kernel, this host's own ISA.
+#   foreign-kernel  same ISA, another kernel — wsl.exe on an arm64 Windows box
+#                   runs aarch64 code on aarch64 silicon. REAL hardware.
+#   emulated        the ISA is translated — qemu-user, Rosetta, box64.
+# ⛔ NOT SPELLED AFTER A TOOL. `qemu` in the name would be wrong for Rosetta and
+# for every emulator not yet written; the property is the ISA crossing, and it is
+# read from data `plan_leg` already computes rather than from a launcher's name
+# — the proxy this project has already refused once for confound scopes
+# [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST].
+RUN_FIDELITIES = ("native", "foreign-kernel", "emulated")
 CONFOUND_SCOPE_RUN_MODES = {
     "native": ("native",),
     # `emulated` is the operator-facing DSS_CONFOUNDS spelling and is
@@ -3631,11 +3657,42 @@ def resolve_target_cc(leg, runner=None, which=None):
 
 # The verdict vocabulary. Closed, because "the oracle is sort of available" is
 # the state this whole anchor is about.
+# ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE
+#
+# ★★★ `--build-reference-oracle` HAS ALWAYS REPORTED WHICH OF THESE HAPPENED, AND
+# THE CLASSIFIER THREW IT AWAY. The statuses below are that command's own return
+# vocabulary; `attribute_build_failure` already reads them, and this constant now
+# OWNS them so the two readers cannot drift. A second spelling of a fact that has
+# an owner is the defect this file's own header argues against.
+ORACLE_STATUS_BUILT = "built"
+ORACLE_STATUS_BUILD_FAILED = "build-failed"
+ORACLE_STATUS_NO_COMPILER = "no-reference-compiler"
+ORACLE_STATUS_NOT_CALLED = ""
+ORACLE_STATUSES = (ORACLE_STATUS_BUILT, ORACLE_STATUS_BUILD_FAILED,
+                   ORACLE_STATUS_NO_COMPILER, ORACLE_STATUS_NOT_CALLED)
+# The two that mean the control RAN. Named once, read by the classifier AND by
+# attribute_build_failure, because "did the control run?" is one question.
+ORACLE_STATUSES_ATTEMPTED = (ORACLE_STATUS_BUILT, ORACLE_STATUS_BUILD_FAILED)
+
 ORACLE_CLASSES = {
     "same-platform": "a reference binary built for THIS LEG'S OWN TARGET — run "
                      "it on the same input to attribute a failure",
     "cross-platform": "a reference binary exists, but for a DIFFERENT PLATFORM "
                       "— it is NOT an oracle for this leg",
+    # ★★ THE THREE STATES `absent` USED TO SPELL AS ONE. They differ in what the
+    # READER should do next, which is the only test that matters for a verdict
+    # line: fix the harness's reader / accept there is no control on this host /
+    # go find out why it was never attempted. Collapsing them cost cycles P13 and
+    # P14, which spent two full passes hunting a dss miscompile that was upstream,
+    # because "the leg reports NO ORACLE" read as "no control was possible" when
+    # the truth was "the control ran, failed, and its log is on disk".
+    "build-failed": "the leg's OWN same-platform reference compiler RAN AND "
+                    "FAILED to build this leg's manifest — a control was "
+                    "attempted, its log exists, and reading it is the next step",
+    "no-reference-compiler": "no declared targetCc candidate both exists on this "
+                             "host AND targets this leg, so no same-platform "
+                             "control can be built HERE — an environment limit, "
+                             "not a finding about this leg",
     "absent": "no reference binary survived this run at all",
 }
 
@@ -3655,7 +3712,7 @@ ORACLE_FALLBACK_CONTROL = (
 )
 
 
-def oracle_class_for_leg(leg, ref_target, ref_path):
+def oracle_class_for_leg(leg, ref_target, ref_path, oracle_status=""):
     """(class, why) — is the run's reference binary an oracle for THIS leg?
 
     PURE: no filesystem, no process, no host. `ref_target` is the triple
@@ -3663,8 +3720,35 @@ def oracle_class_for_leg(leg, ref_target, ref_path):
     empty when no reference survived the run. The comparison is the same
     arch+OS rule `machine_matches_spec` applies to a compiler's `-dumpmachine`,
     because "does this binary belong to that target" and "does this compiler
-    produce that target" are one question asked of two artefacts."""
+    produce that target" are one question asked of two artefacts.
+
+    `oracle_status` is `--build-reference-oracle`'s own reported status for THIS
+    leg, verbatim from ORACLE_STATUSES. It only ever refines the no-binary case:
+    a binary that exists is classified by its TARGET and nothing else, because a
+    status cannot make a cross-platform binary into an oracle.
+    [D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE]
+
+    ⚠ An UNRECOGNISED status RAISES rather than degrading to `absent`. A verdict
+    line is exactly where a typo'd flag value must not buy silence: it would
+    print the most pessimistic class and read as a measured fact."""
+    if oracle_status not in ORACLE_STATUSES:
+        raise LegError(
+            "oracle status %r is not one this catalogue declares (known: %s). "
+            "The status is `--build-reference-oracle`'s OWN return vocabulary "
+            "and this classifier will not guess at a value it has never heard "
+            "of — a wrong verdict line is worse than a refused one."
+            % (oracle_status, ", ".join(repr(s) for s in ORACLE_STATUSES)))
     if not ref_path:
+        if oracle_status == ORACLE_STATUS_BUILD_FAILED:
+            return ("build-failed",
+                    "this leg's own same-platform reference compiler RAN and "
+                    "FAILED — the control was ATTEMPTED and its build log is on "
+                    "disk, so this is a lead, not a dead end")
+        if oracle_status == ORACLE_STATUS_NO_COMPILER:
+            return ("no-reference-compiler",
+                    "no declared targetCc candidate both exists on this host and "
+                    "targets this leg, so no same-platform control can be built "
+                    "HERE — the leg is fine; this host cannot check it")
         return ("absent", "no reference binary was produced or preserved")
     if not ref_target:
         return ("absent",
@@ -3695,7 +3779,7 @@ def oracle_class_for_leg(leg, ref_target, ref_path):
 
 
 def oracle_report_lines(leg, ref_target, ref_path, leg_oracle=None,
-                        resolver=None):
+                        resolver=None, oracle_status=""):
     """The per-leg oracle verdict, as the lines a driver PRINTS verbatim.
 
     ONE implementation of the prose, called by both drivers — the same argument
@@ -3723,7 +3807,8 @@ def oracle_report_lines(leg, ref_target, ref_path, leg_oracle=None,
                      % (spec, leg_oracle.get("cc", "<unnamed cc>"),
                         leg_oracle.get("triple", "<unmeasured triple>")))
         return lines
-    cls, why = oracle_class_for_leg(leg, ref_target, ref_path)
+    cls, why = oracle_class_for_leg(leg, ref_target, ref_path,
+                                    oracle_status)
     if cls == "same-platform":
         lines.append("%s: SAME-PLATFORM (the run reference) — %s"
                      % (label, ref_path))
@@ -3804,6 +3889,416 @@ def reference_oracle_argv(cc, manifest, output, link_flags):
         argv.append(lib["path"] if isinstance(lib, dict) else lib)
     argv.extend(link_flags or [])
     return argv
+
+
+# ── PER-TU BUILD ATTRIBUTION, DRIVEN BY THE LEG'S OWN ORACLE ────────────────
+#
+# ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION
+#
+# ★★★ THE GAP. `--build-reference-oracle` already compiles this leg's OWN
+# manifest with this leg's OWN same-platform compiler — the control is BUILT and
+# its diagnostics are already on disk. But a control that FAILED collapsed to
+# `absent` in oracle_class_for_leg, so a leg whose reference agreed with dss
+# printed `NO ORACLE — no reference binary was produced or preserved`. That reads
+# as *the control is missing*, when what actually happened is *the control ran and
+# agreed with us*. Those are opposite facts and the report gave them one sentence.
+# The consequence is the one this whole file exists to prevent: a real dss
+# regression and an upstream defect are INDISTINGUISHABLE in the leg verdict.
+#
+# ★★ AND THE FIX IS NOT A SECOND LEDGER. The `confounds` ledger already answers
+# "is this failure the compiler's?" for two name spaces (a unit's test NAME, an
+# abort's `permutation/file`), and its own header says why there must not be a
+# third list: "What differs is only the NAME the failure arrives under." A build
+# failure arrives under the name of a TRANSLATION UNIT. So this is a third
+# `matches` kind on the SAME rows, earned by the SAME mandatory provenance and
+# checked by the SAME lint — not a parallel mechanism.
+#
+# ★★★ WHAT MAKES A `build-tu` ROW DIFFERENT FROM EVERY OTHER CONFOUND ROW, AND
+# IT IS THE POINT: A ROW ALONE EXCUSES NOTHING. Every other row is a declaration
+# that a human earned once and the harness then trusts. A `build-tu` row is a
+# declaration that THIS RUN MUST RE-EARN, because the control is rebuilt every
+# run from the same manifest dss consumes. The row says WHICH TU; the run's own
+# reference compiler says WHETHER. A row whose TU the reference compiled CLEANLY
+# is reported as UNCORROBORATED and excuses nothing — which is also how a stale
+# row (upstream fixed it) announces itself instead of rotting into furniture.
+# This is why `upstreamSubjects: []` is legal here while `abortDiagnostic: ""` is
+# not: the abort row's identity constraint has to be written down because nothing
+# measures it, and this row's identity constraint IS a measurement.
+#
+# ⚠ WHAT THIS COMPARISON CAN AND CANNOT DISTINGUISH — stated here because a
+# reader deciding whether to trust an amnesty needs it before the code:
+#   CAN   — a TU the reference REJECTS from a TU the reference ACCEPTS. That is
+#           the whole verdict, and it is a measured rc + located diagnostics.
+#   CAN   — a dss error naming an identifier the reference NEVER named anywhere
+#           in that TU. That is the residue, and it is what keeps a dss
+#           regression visible inside an upstream-broken TU.
+#   CANNOT— align two compilers' ERROR RECOVERY. ✔MEASURED 2026-08-18 on this
+#           leg: gcc abandoned `fileTimeToUnixTime` at its parameter list
+#           (fileio.c:296) and never reached `ULARGE_INTEGER` at :299/:301; dss
+#           recovered and named it. Same root cause, one extra name. A residue
+#           entry is therefore a QUESTION, not a conviction, and clearing it
+#           costs a declared `upstreamSubjects` entry carrying its measurement.
+#   CANNOT— attribute a dss diagnostic that names no identifier at all (a
+#           cascade message such as "arrow operator '->' pointee is not a
+#           composite type" — 44 of the 105 on this leg). There is nothing to
+#           compare, so they are COUNTED AND PRINTED as unattributable-by-name
+#           and they neither grant nor deny amnesty. A dss regression that
+#           manifests ONLY as extra cascade messages inside an already-broken TU
+#           is the blind spot, and it is exactly this size.
+BUILD_ATTRIBUTIONS = {
+    "upstream": "the leg's OWN same-platform reference compiler, given this "
+                "leg's OWN manifest, ALSO rejected this TU, an earned "
+                "`matches: build-tu` row names it, and every identifier dss "
+                "named the reference named too",
+    "dss": "dss rejected this TU and the reference did not — or did, and dss "
+           "named something the reference never did. Charged to dss.",
+    "unattributable": "no control was available for this TU (no oracle was "
+                      "attempted, or the TU is not in the manifest the oracle "
+                      "compiled), so nothing about it has been measured",
+}
+
+# A dss diagnostic head: `error[S0006]: [target=<spec>] <subject>`. The target
+# tag is OPTIONAL in this pattern on purpose — it is emitted by the project
+# driver and not by every front end, and a parser that REQUIRED it would silently
+# find zero diagnostics in a log shape that is otherwise perfectly readable.
+# Finding zero diagnostics is the one outcome this whole mechanism must never
+# reach quietly, because "dss said nothing" and "I could not read what dss said"
+# produce the same empty set and opposite conclusions.
+DSS_DIAGNOSTIC_HEAD = re.compile(
+    r"^(error|warning|info)\[([A-Za-z0-9_]+)\]:\s*(?:\[target=[^\]]*\]\s*)?(.*)$")
+# `  --> <path>:<line>:<col>`. GREEDY on the path because a Windows path carries
+# its own colon (`C:/...`) — the trailing two numeric groups are what anchor it.
+DSS_DIAGNOSTIC_LOC = re.compile(r"^\s*-->\s*(.+):(\d+):(\d+)\s*$")
+
+# The GNU/clang diagnostic line, in both the with-column and without-column
+# spellings. `note:` is captured too — not to attribute anything, but so that a
+# log FULL of notes and nothing else cannot be mistaken for an unreadable log.
+REFERENCE_DIAGNOSTIC = re.compile(
+    r"^(.+?):(\d+):(?:(\d+):)?\s*(error|warning|note):\s*(.*)$")
+# gcc and clang both append a SPELLING SUGGESTION to a diagnostic. A suggestion
+# names something the compiler is NOT complaining about, and this comparison asks
+# "did the reference NAME this identifier here?" — so a suggestion left in would
+# corroborate a dss error about a name the reference merely proposed. Stripped
+# before extraction, in the direction that makes amnesty HARDER.
+REFERENCE_SUGGESTION = re.compile(r"[;,]?\s*did you mean\s*'[^']*'\s*\??")
+# What a diagnostic NAMES: the single-quoted tokens, split into C identifiers.
+# Both compilers quote the subject; neither prints a bare identifier that is not
+# quoted somewhere in the same message.
+_QUOTED = re.compile(r"'([^']*)'")
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A dss subject is an IDENTIFIER when it is exactly one, or a HEADER NAME when it
+# looks like one (`unistd.h` — the subject of a `file not found`). Anything else
+# is prose and is unattributable BY NAME; see the CANNOT list above.
+_BARE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_HEADER_NAME = re.compile(r"^[A-Za-z0-9_./+-]+\.(?:h|hh|hpp|inc)$")
+
+
+def normalise_tu_path(path):
+    """One spelling for one file. Backslashes to forward slashes and no case
+    folding: the two logs are produced by two different compilers on the same
+    host, and only the separator has ever differed between them. Case folding
+    would silently merge two real files on a case-sensitive target."""
+    return (path or "").strip().replace("\\", "/")
+
+
+def dss_build_diagnostics(log_text):
+    """Every dss diagnostic in a build log, as
+    [{severity, code, subject, file, line, col}] in log order.
+
+    PURE — takes text, returns rows — so the parser is unit-testable without a
+    compiler, which is the same argument reference_oracle_argv makes for
+    composing argv rather than spawning."""
+    lines = (log_text or "").splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        m = DSS_DIAGNOSTIC_HEAD.match(line)
+        if not m:
+            continue
+        loc = DSS_DIAGNOSTIC_LOC.match(lines[i + 1]) if i + 1 < len(lines) else None
+        out.append({
+            "severity": m.group(1), "code": m.group(2),
+            "subject": m.group(3).strip(),
+            "file": normalise_tu_path(loc.group(1)) if loc else "",
+            "line": int(loc.group(2)) if loc else 0,
+            "col": int(loc.group(3)) if loc else 0,
+        })
+    return out
+
+
+def dss_subject_identifier(subject):
+    """The NAME a dss diagnostic is about, or "" when it names none.
+
+    "" is a real answer and it means *this diagnostic cannot be compared*, never
+    *this diagnostic is fine*. Every caller here treats it as its own class."""
+    s = (subject or "").strip()
+    if _BARE_IDENTIFIER.match(s) or _HEADER_NAME.match(s):
+        return s
+    return ""
+
+
+def reference_build_diagnostics(log_text):
+    """Every GNU/clang diagnostic in a reference log, as
+    [{file, line, col, severity, message, names}] in log order.
+
+    `names` is every identifier the message QUOTES, with any spelling suggestion
+    removed first. It is deliberately gathered from warnings as well as errors:
+    C23 makes an implicit function declaration an ERROR, and the reference here
+    is a gnu17-default gcc that reports the identical construct as a WARNING —
+    ✔MEASURED 2026-08-18 on this leg, 16 such names in one TU. Reading only the
+    reference's errors would charge every one of them to dss.
+    ⚠ THE COST, and it is real: a name the reference merely WARNED about
+    corroborates a dss ERROR about that name. A construct the reference accepts
+    with a warning and dss rejects outright is therefore invisible to the residue
+    check. That is a deliberate trade against the 16 false accusations, and it is
+    why `severity` is kept on every row: a caller that wants the strict answer
+    can filter, and the report PRINTS which severity corroborated each name."""
+    out = []
+    for line in (log_text or "").splitlines():
+        m = REFERENCE_DIAGNOSTIC.match(line)
+        if not m:
+            continue
+        message = m.group(5)
+        names = []
+        for quoted in _QUOTED.findall(REFERENCE_SUGGESTION.sub("", message)):
+            for tok in _IDENTIFIER.findall(quoted):
+                if tok not in names:
+                    names.append(tok)
+        out.append({
+            "file": normalise_tu_path(m.group(1)),
+            "line": int(m.group(2)), "col": int(m.group(3) or 0),
+            "severity": m.group(4), "message": message.strip(), "names": names,
+        })
+    return out
+
+
+def build_tu_row_findings(label, row):
+    """Everything WRONG with one `matches: build-tu` row, as lint findings.
+
+    A FUNCTION rather than a block inside lint() so the self-test can drive the
+    real rule on a real row instead of re-typing its conditions — the same
+    argument classify_abort_decisions makes for being callable without a
+    catalogue. [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION]"""
+    pat = row.get("pattern")
+    findings = []
+    # ★ REQUIRED AS A KEY, and `[]` is the ordinary answer — the same
+    # missing-is-not-empty discipline `requires` carries, and for the identical
+    # reason: a missing key cannot be told from an empty one, and the difference
+    # is whether a name the reference NEVER mentioned is being waved through.
+    subs = row.get("upstreamSubjects")
+    if subs is None:
+        findings.append(
+            "leg '%s': confound %r declares matches='build-tu' but no "
+            "'upstreamSubjects'. It is REQUIRED and `[]` is the ordinary answer "
+            "— 'the reference names everything dss names in this TU'. A "
+            "non-empty list is the RESIDUE this row waves through, and every "
+            "entry has to be justified in `mechanism`: it is a name the leg's "
+            "own reference compiler never mentioned." % (label, pat))
+    elif (not isinstance(subs, list)
+          or not all(isinstance(s, str) and s.strip() for s in subs)):
+        findings.append(
+            "leg '%s': confound %r declares `upstreamSubjects` %r — it must be "
+            "a list of non-empty identifier strings" % (label, pat, subs))
+    if not str(pat).endswith("$"):
+        # A TU pattern is matched with re.search against a FULL path, so an
+        # unanchored tail matches every longer sibling: `fileio\.c` also matches
+        # `fileio_extra.c`. An over-wide attribution row is silent by
+        # construction — it grants amnesty to a file nobody measured.
+        findings.append(
+            "leg '%s': confound %r declares matches='build-tu' but its pattern "
+            "is not anchored at the end ('$'). TU patterns are searched against "
+            "a full path, so an unanchored tail silently attributes every "
+            "longer sibling path as well." % (label, pat))
+    return findings
+
+
+def build_tu_rows(decisions):
+    """The ACTIVE `matches: build-tu` rows out of a leg's confound decisions —
+    the same accessor shape as leg_confounds / leg_abort_confounds, and for the
+    same reason: a matcher written for one name space must never be handed
+    another's rows."""
+    return [d for d in decisions
+            if d["active"] and d["matches"] == "build-tu" and not d["scopedOut"]]
+
+
+def attribute_build_failure(dss_log_text, reference_log_text, oracle_status,
+                            manifest_sources, decisions, label="<unlabelled>"):
+    """WHOSE failure is this build? One answer per TU dss rejected.
+
+    `oracle_status` is `--build-reference-oracle`'s own reported status verbatim
+    (`built` / `build-failed` / `no-reference-compiler` / "" when it was never
+    called). ONLY `built` and `build-failed` mean the control RAN; every other
+    value grants nothing to anything, which is the whole discipline — a missing
+    control is not a silent control.
+
+    `manifest_sources` is the manifest's `sources` list — the SAME file dss
+    consumed and the oracle compiled. A TU dss names that is not in it was never
+    put to the reference, so it cannot be attributed however the logs read.
+
+    Returns a report dict. Never raises for a LOG it cannot read: an unreadable
+    log is a REPORTED finding (`parserGap`), because raising would take the whole
+    leg's account down with it and the harness must survive everything."""
+    attempted = oracle_status in ORACLE_STATUSES_ATTEMPTED
+    sources = {normalise_tu_path(s) for s in (manifest_sources or [])}
+    dss_rows = [r for r in dss_build_diagnostics(dss_log_text)
+                if r["severity"] == "error"]
+    ref_rows = reference_build_diagnostics(reference_log_text)
+
+    # ★ A LOG THAT PARSED TO NOTHING IS A FINDING, NOT AN ANSWER. The reference
+    # is whichever compiler the leg DECLARED and this host verified; a leg that
+    # one day declares an MSVC-shaped `targetCc` would produce a log this reader
+    # finds zero diagnostics in — and zero reference diagnostics silently denies
+    # every amnesty AND hides that the reader is the reason. It fails in the safe
+    # direction and it still has to say so out loud.
+    parser_gap = ""
+    if oracle_status == ORACLE_STATUS_BUILD_FAILED and not ref_rows:
+        parser_gap = (
+            "the reference build FAILED and this harness parsed ZERO diagnostics "
+            "out of its log. Nothing can be attributed and the shape of that log "
+            "is not one REFERENCE_DIAGNOSTIC reads — read it by hand and widen "
+            "the reader; every TU below is charged to dss meanwhile")
+
+    ref_by_tu = {}
+    for r in ref_rows:
+        bucket = ref_by_tu.setdefault(r["file"], {"error": 0, "warning": 0,
+                                                  "names": {}, "firstError": ""})
+        if r["severity"] in ("error", "warning"):
+            bucket[r["severity"]] += 1
+            for n in r["names"]:
+                bucket["names"].setdefault(n, r["severity"])
+        if r["severity"] == "error" and not bucket["firstError"]:
+            bucket["firstError"] = "%s:%d:%d: error: %s" % (
+                r["file"], r["line"], r["col"], r["message"])
+
+    tus = []
+    for tu in sorted({r["file"] for r in dss_rows if r["file"]}):
+        mine = [r for r in dss_rows if r["file"] == tu]
+        named, cascade = [], 0
+        for r in mine:
+            ident = dss_subject_identifier(r["subject"])
+            if ident:
+                if ident not in named:
+                    named.append(ident)
+            else:
+                cascade += 1
+        ref = ref_by_tu.get(tu, {"error": 0, "warning": 0, "names": {},
+                                 "firstError": ""})
+        row = next((d for d in build_tu_rows(decisions)
+                    if re.search(d["pattern"], tu)), None)
+        allowed = list(row["row"].get("upstreamSubjects", [])) if row else []
+        residue = [n for n in named
+                   if n not in ref["names"] and n not in allowed]
+        excused = [n for n in named if n not in ref["names"] and n in allowed]
+        # ⚠ DEFENDED RATHER THAN ASSUMED, and red-on-disable is what asked for it.
+        # ✔MEASURED 2026-08-18: when the `row is None` arm below was deleted to
+        # prove that pin bites, the two arms after it dereferenced `row["pattern"]`
+        # and the answer was `TypeError: 'NoneType' object is not subscriptable` —
+        # a python message about a python rule, from the one function whose whole
+        # job is to say whose defect this is. A None deref must never be a
+        # diagnostic, so the name is resolved ONCE, here, and reads `<no row>`.
+        row_pattern = row["pattern"] if row else "<no row>"
+
+        if not attempted or tu not in sources:
+            verdict, why = "unattributable", (
+                "no oracle was attempted for this leg (status %r)" % oracle_status
+                if not attempted else
+                "this TU is not among the %d sources the oracle compiled, so the "
+                "reference was never asked about it" % len(sources))
+        elif ref["error"] < 1:
+            verdict, why = "dss", (
+                "the reference compiled this TU with %d error(s) and %d "
+                "warning(s) — it ACCEPTED what dss rejected"
+                % (ref["error"], ref["warning"]))
+        elif row is None:
+            verdict, why = "dss", (
+                "the reference ALSO rejected this TU (%d error(s)), but NO "
+                "`matches: build-tu` row on leg '%s' names it. An unearned "
+                "attribution is not an attribution: write the row, with its "
+                "measurement, and this run will corroborate it. First reference "
+                "error: %s" % (ref["error"], label, ref["firstError"]))
+        elif residue:
+            verdict, why = "dss", (
+                "the reference ALSO rejected this TU (%d error(s)) and row %r "
+                "names it, but dss named %d identifier(s) the reference named "
+                "NOWHERE in this TU: %s. Each is either a dss defect hiding "
+                "inside an upstream-broken TU, or an error-recovery difference "
+                "that must be declared in that row's `upstreamSubjects` with its "
+                "measurement." % (ref["error"], row_pattern, len(residue),
+                                  ", ".join(residue)))
+        else:
+            verdict, why = "upstream", (
+                "the reference REJECTED this TU too — %d error(s), %d "
+                "warning(s), first: %s — row %r names it, and every one of the "
+                "%d identifier(s) dss named was named by the reference%s"
+                % (ref["error"], ref["warning"], ref["firstError"],
+                   row_pattern, len(named),
+                   "" if not excused else
+                   " or is a declared recovery difference (%s)"
+                   % ", ".join(excused)))
+        tus.append({
+            "tu": tu, "attribution": verdict, "why": why,
+            "dssErrors": len(mine), "dssNamed": named,
+            "dssCascade": cascade,
+            "referenceErrors": ref["error"], "referenceWarnings": ref["warning"],
+            "referenceFirstError": ref["firstError"],
+            "corroborated": [n for n in named if n in ref["names"]],
+            "corroboratedBy": {n: ref["names"][n] for n in named
+                               if n in ref["names"]},
+            "excusedByDeclaration": excused,
+            "residue": residue,
+            "row": row["pattern"] if row else "",
+        })
+
+    charged = [t["tu"] for t in tus if t["attribution"] != "upstream"]
+    return {
+        "leg": label, "oracleStatus": oracle_status,
+        "oracleAttempted": attempted, "parserGap": parser_gap,
+        "dssErrors": len(dss_rows),
+        "dssErrorsWithNoLocation": len([r for r in dss_rows if not r["file"]]),
+        "referenceErrors": len([r for r in ref_rows if r["severity"] == "error"]),
+        "tus": tus, "chargedToDss": charged,
+        "verdictClass": "dss" if (charged or parser_gap) else "upstream",
+    }
+
+
+def build_attribution_report_lines(report):
+    """The lines a driver PRINTS verbatim — one implementation, both drivers, the
+    same argument oracle_report_lines and confound_report_lines make.
+
+    ★ EVERY TU APPEARS, whoever it is charged to. An upstream-attributed TU that
+    vanished from this list would be indistinguishable from a TU that compiled,
+    and "the build failed and here is why it is not ours" is a claim that has to
+    be readable, not merely acted on. Silence is the failure mode."""
+    label = report.get("leg", "<unlabelled>")
+    lines = []
+    if not report.get("tus"):
+        lines.append("[%s] build attribution: NO dss error carries a source "
+                     "location — nothing to attribute" % label)
+        return lines
+    up = [t for t in report["tus"] if t["attribution"] == "upstream"]
+    lines.append(
+        "[%s] build attribution: %d TU(s) rejected by dss — %d UPSTREAM "
+        "(the leg's own same-platform reference rejects them too), %d charged "
+        "to DSS. Oracle status: %s."
+        % (label, len(report["tus"]), len(up),
+           len(report["tus"]) - len(up), report["oracleStatus"] or "<not run>"))
+    if report.get("parserGap"):
+        lines.append("[%s]   HARNESS GAP: %s" % (label, report["parserGap"]))
+    for t in report["tus"]:
+        lines.append("[%s]   %s  %s  (%d dss error(s), %d of them naming no "
+                     "identifier)"
+                     % (label, t["attribution"].upper(), t["tu"],
+                        t["dssErrors"], t["dssCascade"]))
+        lines.append("[%s]     %s" % (label, t["why"]))
+        if t["dssCascade"]:
+            # NAMED EVERY TIME, including on an UPSTREAM TU — this is the blind
+            # spot stated in the header, and a blind spot nobody is reminded of
+            # is a blind spot that grows.
+            lines.append(
+                "[%s]     %d dss error(s) in this TU name no identifier and are "
+                "NOT individually attributable by this comparison; they neither "
+                "granted nor denied the verdict above."
+                % (label, t["dssCascade"]))
+    return lines
 
 
 # ── The helper extension the loadext corpus dlopen()s, PER TARGET ───────────
@@ -6737,12 +7232,31 @@ def plan_leg(leg, host_os, host_arch, available, kernel_measurements=None):
     # anything — and the rows are RESOLVED (paths expanded, probe argv built) but
     # never EXECUTED here, because `plan_leg` is pure and injectable and a plan
     # that consulted the filesystem would stop being reproducible.
+    # `sameIsa` RECORDS `arch_ok`, which this function has always computed and
+    # always thrown away. `fidelity` is the answer it makes sayable: does the
+    # artefact execute on ITS OWN INSTRUCTION SET on this host?
+    # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+    # ★★ WHY A THIRD VALUE AND NOT A BOOLEAN `emulated`. `mode == "launched"`
+    # conflates two situations that are not the same evidence, and the catalogue
+    # already says so in prose it could not enforce: elf64-arm64 declares BOTH
+    # `(windows, arm64) -> wsl.exe` — same ISA, real hardware, foreign kernel —
+    # and `(windows, x86_64) -> wsl.exe -e qemu-aarch64` — genuine translation.
+    # A boolean keyed on "went through a launcher" calls both emulated, which is
+    # the exact error legs.json's `scopeLegacyBlocker` documents as unfixable
+    # from inside the `scope` vocabulary. Keyed on the ISA instead, all four
+    # cases fall out right, INCLUDING Rosetta (`arch -x86_64` on darwin/arm64 is
+    # os_ok with arch_ok false -> emulated, correctly).
+    # ⓘ `fidelity` is populated ONLY FOR A RUN, exactly as `verdict` is populated
+    # only for a NON-run — the two are complements, and a leg that never executes
+    # has no fidelity to report rather than a defaulted one a reader would trust.
     run = {"mode": None, "launcher": [], "env": {}, "verdict": None, "detail": "",
            "pathTranslation": "none", "pathTranslator": [],
-           "envTransfer": "inherit", "runFilesystem": "driver", "requires": []}
+           "envTransfer": "inherit", "runFilesystem": "driver", "requires": [],
+           "sameIsa": arch_ok, "fidelity": None}
 
     if os_ok and arch_ok:
         run["mode"] = "native"
+        run["fidelity"] = "native"
         run["detail"] = ("host %s/%s matches runOn=[%s] and target arch %s"
                          % (host_os, host_arch, ",".join(run_on), arch))
     else:
@@ -6788,6 +7302,11 @@ def plan_leg(leg, host_os, host_arch, available, kernel_measurements=None):
             missing = [c for c in needed if not launcher_available(c, available)]
             if not missing:
                 run["mode"] = "launched"
+                # SAME ISA through a launcher is a FOREIGN KERNEL, not emulation:
+                # wsl.exe on an arm64 Windows host executes aarch64 instructions
+                # on aarch64 hardware. Calling that `emulated` is what the
+                # mode-only vocabulary cannot avoid.
+                run["fidelity"] = "foreign-kernel" if arch_ok else "emulated"
                 run["launcher"] = command
                 run["env"] = dict(entry.get("env", {}))
                 run["pathTranslation"] = verb
@@ -7172,6 +7691,15 @@ def emit_sh(resolved):
         put("LEG_FORMAT", leg["format"])
         put("LEG_ARCH", leg["targetArch"])
         put("LEG_RUN_MODE", run["mode"])
+        # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+        # ★ TRANSPORTED, not re-derived. The .ps1 reads the JSON plan and sees
+        # `run.fidelity` directly; the .sh reads THESE flattened arrays, so a
+        # fidelity it could not see is a selector only one driver could honour —
+        # which is this project's canonical silent harness bug. "" for a leg that
+        # never runs, exactly as LEG_RUN_VERDICT is "" for one that does: a
+        # defaulted value here would be a measurement a reader could trust.
+        put("LEG_RUN_FIDELITY", run.get("fidelity") or "")
+        put("LEG_RUN_SAME_ISA", "1" if run.get("sameIsa") else "0")
         put("LEG_RUN_VERDICT", run["verdict"] or "")
         put("LEG_RUN_DETAIL", run["detail"])
         put("LEG_LAUNCH", " ".join(q(x) for x in run["launcher"]))
@@ -7951,6 +8479,8 @@ def lint(path=CATALOGUE):
                         "pattern without the separator can never match one and "
                         "would sit here reading as a proven exemption while "
                         "excusing nothing." % (label, pat))
+                elif kind == "build-tu":
+                    findings.extend(build_tu_row_findings(label, row))
                 for k in CONFOUND_PROVENANCE_KEYS:
                     v = row.get(k, "")
                     if not isinstance(v, str) or not v.strip():
@@ -8290,6 +8820,30 @@ DSS_REGIONS = {
     "confound-report": {
         "drivers": ["build-and-test.sh", "build-and-test.ps1"],
         "verifiers": ["harness_legs.py"], "mirror": True},
+    # [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] BOTH DRIVERS, and
+    # `mirror` deliberately NOT claimed — the two halves are the same CAPABILITY
+    # in two languages, not the same text, and asserting a byte-sameness that was
+    # never true is the defect the corpus-engine row records. What IS enforced is
+    # the PAIRING: a driver that failed to ask "whose failure is this?" would
+    # charge an upstream defect to dss on its side only, and the two drivers would
+    # render different verdicts on the same tree — this project's canonical silent
+    # harness bug. The DECISION itself is single-implementation in this module
+    # (attribute_build_failure) and pinned by the self-test, so what the drivers
+    # can still get wrong is asking at all, which is exactly what these verify.
+    "build-attribution": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["test-confound-scope.sh", "test-confound-scope.ps1"]},
+    # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+    # BOTH DRIVERS, `mirror` NOT claimed: the two halves read the fidelity through
+    # genuinely different transports (the .sh from emit_sh's flattened
+    # LEG_RUN_FIDELITY array, the .ps1 from `run.fidelity` in the JSON plan), which
+    # is the same argument confound-supply makes. An operator switch honoured by
+    # one driver and ignored by the other is the worst shape available here — the
+    # ignoring side would run legs the operator excluded and report them as
+    # covered, which is a FALSE claim of coverage rather than a missing one.
+    "run-fidelity-select": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["test-confound-scope.sh", "test-confound-scope.ps1"]},
     "loadext-stage": {"drivers": ["build-and-test.sh"],
                       "verifiers": ["test-confound-scope.sh",
                                     "test-confound-scope.ps1"]},
@@ -8299,6 +8853,24 @@ DSS_REGIONS = {
                         "verifiers": ["test-confound-scope.sh"]},
     "verdict-vocabulary": {"drivers": ["build-and-test.sh"],
                            "verifiers": ["test-driver-contracts.sh"]},
+    # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+    # D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT
+    # `mirror` IS claimed, and this is the case the claim was written for. The two
+    # drivers used to answer ONE condition -- a leg declaring a library provider
+    # NEITHER driver implements -- with two different outcomes: the .sh `die`d
+    # (exit 1 from a top-level loop, so one leg cost the whole run) while the .ps1
+    # returned a per-leg `Ok = $false`, which its own docblock defines as
+    # `skipped-build-input-missing` -- an ENVIRONMENTAL skip that only warns, so
+    # the same tree gave exit 1 on one host and exit 0 on the other, and the
+    # second one filed a harness bug as a fact about the operator's machine.
+    # Neither half was visible to a pin that READ the drivers: both spellings were
+    # correct in their own file. The decision is now ONE pure function of six
+    # scalars, mirrored, and the differential battery EXECUTES both copies on
+    # byte-identical input and compares the answers -- plus an `expect`, so the
+    # two agreeing on a WRONG token still reds.
+    "unknown-library-provider": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["harness_legs.py"], "mirror": True},
     # ── the regions that are READER MARKERS and nothing more ────────────────
     # Each states WHY, because "nobody checks this" must be a decision on the
     # record rather than a gap someone has to notice.
@@ -8436,6 +9008,11 @@ MIRROR_PAIRS = [
     # ── dss:confound-report ─────────────────────────────────────────────────
     {"sh": "print_confound_report", "ps1": "Write-ConfoundReport",
      "differential": "confound-report"},
+    # ── dss:unknown-library-provider ────────────────────────────────────────
+    # D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT
+    {"sh": "unknown_library_provider_verdict",
+     "ps1": "Get-UnknownLibraryProviderVerdict",
+     "differential": "unknown-library-provider"},
 ]
 
 # The symbol-definition grammar of each driver language, used to enumerate what
@@ -8744,6 +9321,38 @@ MIRROR_CASES = {
             "REPORT> [elf64-x86_64] confound row INACTIVE: ^walsetlk- - NOT honoured here: clock-realtime-steps: absent",
         ],
     },
+    # ── THE VERDICT FOR A PROVIDER NEITHER DRIVER IMPLEMENTS ────────────────
+    #
+    # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+    # D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT
+    #
+    # ★ THIS IS THE CASE THAT CATCHES A DISAGREEMENT NO READER OF THE DRIVERS
+    # COULD SEE. The two arms are executed and their answers compared, so a
+    # driver that changed the TOKEN (say back to `skipped-build-input-missing`,
+    # which is what the .ps1 really returned until 2026-08-20) reds -- and so
+    # does one that changed a single word of the message, because the two drivers
+    # saying different things about the same defect is how a reader comes to
+    # believe they behave differently.
+    #
+    # ★ AND IT CARRIES AN `expect`, for the reason abort-file-from-traceback
+    # does: two copies that both answer `skipped-build-input-missing` agree
+    # perfectly. The token is pinned to `poisoned` -- the closed vocabulary's
+    # FAILURE class -- per arm, so a wrong-but-identical pair reds too.
+    #
+    # ⓘ A `die`/`Die` in EITHER arm is caught by construction and needs no
+    # assertion of its own: the shared prelude defines them as `exit 9`, and an
+    # arm that exits non-zero is reported as "the .<lang> copy RAN: FAIL". That
+    # is exactly the control-flow half of the original divergence.
+    "unknown-library-provider": {
+        "region": "unknown-library-provider",
+        "sh": ('unknown_library_provider_verdict "$UNKNOWN_DRIVER" "$UNKNOWN_LEG" '
+               '"$UNKNOWN_PROVIDER" "$UNKNOWN_TCL" "$UNKNOWN_Z" "$UNKNOWN_KNOWN"'),
+        "ps1": ("Get-UnknownLibraryProviderVerdict $UNKNOWN_DRIVER $UNKNOWN_LEG "
+                "$UNKNOWN_PROVIDER $UNKNOWN_TCL $UNKNOWN_Z $UNKNOWN_KNOWN"),
+        # ONE line: "<verdict>	<detail>". The TAB is the separator both drivers
+        # split on, so it is part of the answer and not formatting.
+        "expect": ["poisoned\t" + "HARNESS DEFECT: leg 'elf64-arm64' declares library provider 'ubuntu-ports-arm64', which driver-under-test has no dispatch arm for, so this driver cannot obtain that leg's DECLARED inputs (tcl: libtcl8.6.so libtcl8.6.so.0 / z: libz.so.1). ACQUISITION IS NOT DRIVER-LOCAL - pinned-archive is performed by harness_legs.py --acquire, on every host - so NO declared provider should reach this arm; reaching it means the catalogue or LIBRARY_PROVIDERS grew a provider and this driver was not extended in the same change. Add the arm to BOTH drivers: a capability in one driver and not the other is this project's canonical silent harness bug. Known providers: host-system pinned-archive search-paths (printed by harness_legs.py --library-providers, never copied here)."],
+    },
 }
 
 
@@ -9010,12 +9619,29 @@ def _mirror_write_fixtures(work):
               "[elf64-x86_64] confound rows ACTIVE (1 of 2): ^zipfile-25.0$\r\n"
               "[elf64-x86_64] confound row INACTIVE: ^walsetlk- - NOT honoured "
               "here: clock-realtime-steps: absent")
+    # ── dss:unknown-library-provider: SIX SCALARS, NO FILE ──────────────────
+    # The pair is a pure function of its arguments, so a fixture file would add a
+    # parsing step to each arm whose divergence this case would then be measuring
+    # instead of the thing it exists to measure -- the same reasoning
+    # zero-progress-signature states for its literals.
+    # ⚠ `UNKNOWN_KNOWN` IS INPUT DATA, NOT A CLAIM ABOUT THE LIVE VOCABULARY. The
+    # real value is whatever `--library-providers` prints at run time; this is a
+    # fixed argument so the two arms can be driven on byte-identical input. It is
+    # NOT a second copy of LIBRARY_PROVIDERS and nothing reads it as one.
+    # `UNKNOWN_PROVIDER` is the RETIRED name on purpose: it is the provider that
+    # really did reach this arm, so the case reads as the history it came from.
     return {"CORPUSDIR": "corpus", "PERMSFILE": "corpus/permutations.test",
             "TIERFILE": "tier.test", "LISTFILE": "corpus.lst",
             "NAMESFILE": "names.lst", "LOGFILE": "segment.log",
             "FACTFILE": "facts.tsv", "BOUNDARY": "swarmvtab.test",
             "ABORTLOG": "abort-segment.log", "ABORTFACTS": "abort-facts.tsv",
-            "REPORT": report}
+            "REPORT": report,
+            "UNKNOWN_DRIVER": "driver-under-test",
+            "UNKNOWN_LEG": "elf64-arm64",
+            "UNKNOWN_PROVIDER": "ubuntu-ports-arm64",
+            "UNKNOWN_TCL": "libtcl8.6.so libtcl8.6.so.0",
+            "UNKNOWN_Z": "libz.so.1",
+            "UNKNOWN_KNOWN": "host-system pinned-archive search-paths"}
 
 
 # The two languages a mirrored region is written in, in the order every report
@@ -9046,22 +9672,173 @@ def mirror_case_inventory(case):
     return inv
 
 
+_MIRROR_BASH = []          # memo: [] unprobed, [None, why] unusable, [path] usable
+
+
+def mirror_bash_candidates():
+    """Every bash worth trying, in the order they are tried.
+
+    ★★★ THE ORDER IS THE WHOLE CONTENT OF THIS FUNCTION, AND IT IS MEASURED.
+    ✔On this repository's Windows workstation `shutil.which("bash")` answers
+    `C:/Program Files/Git/usr/bin/bash.EXE`, whose `$OSTYPE` is **msys** — Git
+    Bash, the shell that actually runs this repository's `.sh` files there. ✔On
+    the SAME machine `C:/Windows/System32/bash.exe` also exists and answers
+    **linux-gnu**: it is WSL's, a different operating system reached through a
+    Windows path, and it cannot see the Windows fixture directory this battery
+    writes.
+    ⚠ On the GitHub `windows-latest` runner `which` finds the System32 one FIRST,
+    and that runner has no WSL distribution installed — so the arm exited 1 with
+    `Windows Subsystem for Linux has no installed distributions.` (UTF-16LE, which
+    is why the CI log shows it interleaved with NULs) and the whole differential
+    reddened on a host where nothing was wrong. CI run 32585879580.
+    ★ `$BASH` still wins outright: on macOS a bare `bash` is /bin/bash 3.2, not the
+    bash 4+ the drivers re-exec themselves into — the same rule
+    D-HARNESS-SELFTEST-BSD-SED-PORTABILITY made for the self-tests.
+    """
+    out, seen = [], set()
+
+    def add(path):
+        # An absolute candidate that does not exist is not a candidate: it would
+        # reach the probe, raise FileNotFoundError, and land in the "everything was
+        # tried" diagnostic as noise. A bare NAME still goes through, because only
+        # the probe can resolve it.
+        if not path or path in seen:
+            return
+        if os.path.isabs(path) and not os.path.isfile(path):
+            return
+        seen.add(path)
+        out.append(path)
+
+    add(os.environ.get("BASH"))
+    if os.name == "nt":
+        # BEFORE the PATH lookup, deliberately: the PATH answer is the one that
+        # was measured wrong, and a Git Bash found here is the shell the rest of
+        # this file's comments are written about.
+        for root in (os.environ.get("ProgramFiles"),
+                     os.environ.get("ProgramW6432"),
+                     os.environ.get("ProgramFiles(x86)"),
+                     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+            if root:
+                for sub in ("bin", os.path.join("usr", "bin")):
+                    add(os.path.join(root, "Git", sub, "bash.exe"))
+    # EVERY bash on PATH, not just the first. `shutil.which` returns one answer,
+    # and ✔the one it returned on the CI runner was the unusable one — so a Git
+    # Bash sitting later on the same PATH would have been invisible. Guessing the
+    # install location (above) and enumerating the PATH (here) are two independent
+    # ways to reach it; the probe decides which one works.
+    for entry in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not entry:
+            continue
+        for name in ("bash.exe", "bash") if os.name == "nt" else ("bash",):
+            cand = os.path.join(entry, name)
+            if os.path.isfile(cand):
+                add(cand)
+    return out
+
+
+def mirror_bash_probe(cand):
+    """(ok, detail) — does THIS bash run a one-line script and say so?
+
+    ★★ THE PROBE IS A RUN. `shutil.which` answers "is there a file by this name",
+    and ✔that is exactly the question that was wrong on CI: the file existed, was
+    executable, and could not run anything. Kept separate from the SELECTION below
+    so the selection can be driven by --self-test without spawning.
+    """
+    import subprocess  # local, matching the rest of this module's spawn sites
+    if not os.path.isabs(cand) and not shutil.which(cand):
+        return False, "not on PATH"
+    try:
+        proc = subprocess.Popen([cand, "-c", "printf usable"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(timeout=60)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    answer = out.decode("utf-8", "replace").strip()
+    if proc.returncode == 0 and answer == "usable":
+        return True, ""
+    # ★ THE NULs ARE STRIPPED ON PURPOSE. ✔WSL's refusal arrives as UTF-16LE, so
+    # the CI log rendered it as `W\0i\0n\0d\0o\0w\0s\0 ...` — a diagnostic nobody
+    # can read is most of the way to no diagnostic at all.
+    detail = (err.decode("utf-8", "replace").replace("\x00", "").strip()
+              or answer or "no output")
+    return False, "exited %s (%s)" % (proc.returncode, detail[:160])
+
+
+def mirror_pick_bash(candidates, probe):
+    """(path, why-not) — the first candidate the probe PROVES can run a script.
+
+    Pure: every spawn is the caller's `probe`. That is what lets --self-test pin
+    both directions, including the exact refusal the GitHub Windows runner gave.
+    """
+    tried = []
+    for cand in candidates:
+        ok, detail = probe(cand)
+        if ok:
+            return cand, ""
+        tried.append("%s: %s" % (cand, detail))
+    return None, ("no usable bash on this host — every candidate was tried and "
+                  "each refused to run a one-line script: " + "; ".join(tried))
+
+
+def mirror_bash():
+    """The memoised answer for THIS host."""
+    if not _MIRROR_BASH:
+        path, why = mirror_pick_bash(mirror_bash_candidates(), mirror_bash_probe)
+        _MIRROR_BASH[:] = [path] if path else [None, why]
+    return (_MIRROR_BASH[0], _MIRROR_BASH[1] if _MIRROR_BASH[0] is None else "")
+
+
 def mirror_interpreter(lang):
-    """The interpreter argv PREFIX one arm is executed with.
+    """The interpreter argv PREFIX one arm is executed with, or None.
 
     ★ NAMED ONCE, because the AVAILABILITY PROBE and the SPAWN must be talking
-    about the same program. They were two literals — `_sh.which("pwsh")` in the
+    about the same program. They were two literals — `shutil.which("pwsh")` in the
     verifier and `["pwsh", …]` in the runner — and a pair like that fails in
     both directions: probe a spelling the spawn does not use and a "present"
     interpreter OSErrors into a FAIL; probe a spelling the spawn does not use
-    the other way and an available interpreter is skipped as absent. The probe
-    below takes argv[0] of THIS list, so neither can happen."""
+    the other way and an available interpreter is skipped as absent.
+    ★★ `sh` now resolves through `mirror_bash`, which PROVES its answer by running
+    it. Returning None is how this function says "this host has no such
+    interpreter" — the caller then SKIPS the arm with a reason instead of running
+    a program that cannot work and calling the failure a defect.
+    """
     if lang == "sh":
-        # `$BASH` first: on macOS a bare `bash` is /bin/bash 3.2, not the bash 4+
-        # the drivers re-exec themselves into — the same rule
-        # D-HARNESS-SELFTEST-BSD-SED-PORTABILITY made for the self-tests.
-        return [os.environ.get("BASH", "bash")]
-    return ["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+        path, _why = mirror_bash()
+        return [path] if path else None
+    # ⚠⚠ `ps1` KEEPS THE `which` TEST, AND RETURNING None WHEN IT FAILS IS THE
+    # WHOLE POINT. ✔MEASURED 2026-08-22 on the macOS host, and it is a defect THIS
+    # CYCLE'S OWN FIX INTRODUCED: the first draft made `have[lang]` mean "the
+    # resolver returned something", and this branch returns an argv
+    # UNCONDITIONALLY — so a host with no pwsh was suddenly "present". The Mac went
+    # from `passed=356 failed=0 skipped=15` to `passed=356 failed=25 skipped=0`:
+    # fifteen honestly-skipped assertions became twenty-five failures on a host that
+    # simply has no PowerShell.
+    # ★ That is the SAME defect class as the bash one being fixed here — a presence
+    # answer that is wrong — pointing the other way, and the only reason it was
+    # caught is that a THIRD host was asked before this was committed.
+    # ★ `which` and not a run-probe, deliberately: bash earned the stronger probe by
+    # being MEASURED wrong (a found binary that could not run a script). Nothing has
+    # measured pwsh wrong, and inventing a behaviour change without a measurement is
+    # exactly how the paragraph above happened.
+    return (["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+            if shutil.which("pwsh") else None)
+
+
+def mirror_interpreter_display(lang):
+    """What to CALL the interpreter in a report, present or not."""
+    argv = mirror_interpreter(lang)
+    if argv:
+        return argv[0]
+    return "bash" if lang == "sh" else "pwsh"
+
+
+def mirror_interpreter_absence(lang):
+    """Why this host cannot execute `lang`, or "" when it can."""
+    if lang == "sh":
+        _path, why = mirror_bash()
+        return why
+    return ("" if mirror_interpreter(lang)
+            else "pwsh is not on PATH, so this host cannot execute a .ps1 arm")
 
 
 def _mirror_run(lang, region, case, work, env):
@@ -9090,7 +9867,10 @@ def _mirror_run(lang, region, case, work, env):
         head = "".join("$%s = %s\n" % (k, _ps1_single_quote(v))
                        for k, v in sorted(env.items()))
         text = MIRROR_PRELUDE_PS1 + head + region + "\n" + body + "\n"
-    argv = mirror_interpreter(lang) + [rel]
+    prefix = mirror_interpreter(lang)
+    if prefix is None:
+        return False, [], mirror_interpreter_absence(lang), ""
+    argv = prefix + [rel]
     script = os.path.join(work, rel)
     with open(script, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
@@ -9348,13 +10128,20 @@ def check_dss_regions(harness_dir, out=None):
         # reduction in the same breath as the count. See mirror_case_inventory,
         # which is what makes that claim checkable rather than asserted.
         region_text = {"sh": sh_text, "ps1": ps_text}
-        interp = dict((lang, mirror_interpreter(lang)[0]) for lang in MIRROR_LANGS)
-        have = dict((lang, _sh.which(interp[lang])) for lang in MIRROR_LANGS)
+        # ★★ PRESENCE IS A RUN, NOT A `which`. See mirror_bash: the defect this
+        # replaces was a `which` that found `C:/Windows/System32/bash.exe` — WSL's,
+        # on a runner with no distribution installed — and this battery's own rule
+        # ("a PRESENT interpreter that could not run its arm is a FAILURE, never a
+        # skip") then correctly turned that into a red. The rule is right; the
+        # presence answer was wrong.
+        interp = dict((lang, mirror_interpreter_display(lang)) for lang in MIRROR_LANGS)
+        have = dict((lang, mirror_interpreter(lang) is not None)
+                    for lang in MIRROR_LANGS)
         absent = [lang for lang in MIRROR_LANGS if not have[lang]]
-        why_absent = ("%s is not on PATH, so this host cannot execute the .%s "
-                      "copy of a mirrored region"
-                      % (" and ".join(interp[l] for l in absent),
-                         "/.".join(absent)) if absent else "")
+        why_absent = ("; ".join(mirror_interpreter_absence(l) for l in absent)
+                      + (" — so this host cannot execute the .%s copy of a "
+                         "mirrored region" % "/.".join(absent))
+                      if absent else "")
         if absent:
             reduced.append((name, list(absent),
                             [interp[l] for l in absent], list(cases)))
@@ -9879,6 +10666,68 @@ def self_test(path=CATALOGUE, out=sys.stdout):
 
     findings = lint(path)
     check("the leg catalogue lints clean", not findings, "\n      ".join(findings))
+
+    # ── the mirrored-region interpreter, and the CI failure that produced it ──
+    # D-HARNESS-MIRROR-BASH-RESOLVES-TO-WSL-ON-A-WINDOWS-RUNNER.
+    # ✔MEASURED on CI run 32585879580: `which("bash")` on `windows-latest` answers
+    # `C:/Windows/System32/bash.exe` — WSL's — on a runner with no distribution
+    # installed, so the .sh arm exited 1 and this battery's own rule ("a PRESENT
+    # interpreter that could not run its arm is a FAILURE, never a skip") turned a
+    # host difference into a red. The rule is right; the presence answer was wrong.
+    WSL_REFUSAL = ("exited 1 (Windows Subsystem for Linux has no installed "
+                   "distributions.)")
+    picked, why = mirror_pick_bash(
+        ["C:/Windows/System32/bash.exe", "C:/Program Files/Git/bin/bash.exe"],
+        lambda c: (False, WSL_REFUSAL) if "System32" in c else (True, ""))
+    check("a bash that cannot run a script is passed over for one that can",
+          picked == "C:/Program Files/Git/bin/bash.exe" and why == "",
+          "picked=%r why=%r" % (picked, why))
+
+    picked, why = mirror_pick_bash(
+        ["C:/Windows/System32/bash.exe"], lambda c: (False, WSL_REFUSAL))
+    check("when no bash runs, the answer is ABSENT and not a false present",
+          picked is None, "picked=%r" % (picked,))
+    check("...and the reason names every candidate and what it answered",
+          "System32" in why and "no installed distributions" in why, "why=%r" % (why,))
+
+    check("an absent .sh interpreter is reported as absent, never as a defect",
+          mirror_pick_bash([], lambda c: (True, ""))[0] is None)
+
+    # The ORDER is the fix: a Git Bash must be reached before the PATH answer,
+    # because the PATH answer is the one measured wrong.
+    # ★ UNCONDITIONAL, so passed+failed is the SAME TOTAL on every host — the rule
+    # this battery already holds its mirrored-region inventory to. The System32
+    # clause simply has nothing to bite on where no such bash exists.
+    cands = mirror_bash_candidates()
+    gits = [i for i, c in enumerate(cands) if "Git" in c]
+    sys32 = [i for i, c in enumerate(cands)
+             if "system32" in c.replace("\\", "/").lower()]
+    check("no System32 bash is tried before a Git Bash, and the list is non-empty",
+          bool(cands) and (not sys32 or (gits and min(gits) < min(sys32))),
+          "candidates=%r" % (cands,))
+
+    # ⚠ PRESENCE MUST STILL BE A QUESTION FOR EVERY LANGUAGE, and this arm exists
+    # because the first draft of the fix above broke exactly that: `ps1` returned an
+    # argv unconditionally, so a host with no pwsh became "present" and ✔the macOS
+    # host went from `passed=356 failed=0 skipped=15` to `356/25/0`. An interpreter
+    # this host does not have must resolve to None so the arms SKIP with a reason.
+    for _lang in MIRROR_LANGS:
+        _argv = mirror_interpreter(_lang)
+        _exe = mirror_interpreter_display(_lang)
+        check("%s presence is a real question, not an unconditional yes" % _lang,
+              (_argv is not None) == bool(shutil.which(_exe) or
+                                          (_argv and os.path.isfile(_argv[0]))),
+              "argv=%r display=%r which=%r" % (_argv, _exe, shutil.which(_exe)))
+        check("an absent %s names its own reason" % _lang,
+              bool(mirror_interpreter_absence(_lang)) == (_argv is None),
+              "argv=%r reason=%r" % (_argv, mirror_interpreter_absence(_lang)))
+
+    # And the host's OWN answer must be usable, because every mirrored region
+    # depends on it. A host with no bash is a real state; a host whose bash is
+    # unusable while `which` says otherwise is the defect above.
+    _bash, _why = mirror_bash()
+    check("this host resolves a bash that actually runs a script",
+          _bash is not None, _why)
 
     # ── the stage build configuration ────────────────────────────────────────
     # Asserted on CONTENT, not on shape. "four keys are present" was satisfied
@@ -10422,6 +11271,51 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("a NATIVE run declares an empty requires list",
           plan_leg(_probe_leg, "linux", "arm64", every)["run"]["requires"] == [])
 
+    # ── RUN FIDELITY: DOES THE ARTEFACT EXECUTE ON ITS OWN ISA? ─────────────
+    # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+    # ★★ THE PAIR THIS WHOLE FIELD EXISTS FOR, and the reason `mode` alone could
+    # not answer it: ONE leg, TWO Windows hosts, SAME `mode` — and they are not
+    # the same evidence. On arm64 Windows `wsl.exe` runs aarch64 instructions on
+    # aarch64 silicon; on x86_64 Windows the same leg goes through qemu. Asserted
+    # as a DISAGREEMENT rather than as two separate values, because the defect
+    # this pin guards is exactly the two collapsing back into one.
+    # The REAL catalogue leg, not the fixture: this pin is about the three
+    # launchers `elf64-arm64` actually declares, and a fixture with one entry
+    # could not express the pair.
+    _arm_leg = leg_by_label(legs, "elf64-arm64")
+    _wsl_native = plan_leg(_arm_leg, "windows", "arm64", every)["run"]
+    _wsl_qemu = plan_leg(_arm_leg, "windows", "x86_64", every)["run"]
+    check("the wsl.exe pair AGREES on mode — which is why mode cannot decide it",
+          _wsl_native["mode"] == _wsl_qemu["mode"] == "launched",
+          "%r vs %r" % (_wsl_native["mode"], _wsl_qemu["mode"]))
+    check("...and DISAGREES on fidelity, which is the distinction being recorded",
+          (_wsl_native["fidelity"], _wsl_qemu["fidelity"])
+          == ("foreign-kernel", "emulated"),
+          "%r vs %r" % (_wsl_native["fidelity"], _wsl_qemu["fidelity"]))
+    check("...carried by sameIsa, the value plan_leg always computed and dropped",
+          _wsl_native["sameIsa"] is True and _wsl_qemu["sameIsa"] is False)
+    # A translation layer on the leg's OWN OS is still emulation: Rosetta is
+    # os_ok with arch_ok false, so a rule keyed on runOn alone would call it
+    # native. Keyed on the ISA it falls out right without naming Rosetta at all.
+    _rosetta = plan_leg(leg_by_label(legs, "macho64-x86_64"),
+                        "darwin", "arm64", every)["run"]
+    check("a same-OS TRANSLATION layer (Rosetta) is emulated, not native",
+          _rosetta["mode"] == "launched" and _rosetta["fidelity"] == "emulated",
+          "%r" % (_rosetta,))
+    # Complementary to `verdict`, which is populated only for a NON-run. A leg
+    # that never executes has no fidelity to report, and a defaulted one would
+    # be a value a reader could mistake for a measurement.
+    check("a SKIPPED leg reports no fidelity at all, as verdict's complement",
+          all(p["run"]["fidelity"] is None
+              for p in (plan_leg(l, "darwin", "arm64", set()) for l in legs)
+              if p["run"]["mode"] == "skip"))
+    check("every RUNNING leg reports a fidelity from the closed vocabulary",
+          all(p["run"]["fidelity"] in RUN_FIDELITIES
+              for host in (("linux", "arm64"), ("windows", "x86_64"),
+                           ("darwin", "arm64"))
+              for p in (plan_leg(l, host[0], host[1], every) for l in legs)
+              if p["run"]["mode"] != "skip"))
+
     # ── THE NEW VERDICT IS IN THE VOCABULARY, IN THE LEDGER'S POSITION ──────
     # `tests/harness/test_sqlite_harness_legs.cpp` compares this list against
     # armVerdictName() over kAllArmVerdicts IN ORDER, so the position is not a
@@ -10504,7 +11398,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # handed straight to an assertion.
     # ⚠ THE FIXTURE ANCHOR NAMES ARE DELIBERATELY INERT, AND THAT IS NOT STYLE.
     # ✔MEASURED (TF-C124): `real-examples/` is a SCANNED ROOT of the anchor guard
-    # (tools/check-anchor-registry.sh, over *.sh *.ps1 *.py — added by
+    # (scripts/check-anchor-registry/check-anchor-registry.sh, over *.sh *.ps1 *.py — added by
     # [[D-HARNESS-ANCHOR-GUARD-SKIPS-HARNESS-DRIVERS]]), so ANY anchor-shaped
     # literal in THIS file — test data, sample output, docstring — is a CITATION
     # as far as the guard is concerned, and a first draft of this fixture failed
@@ -10781,6 +11675,82 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           _cls == "absent")
     check("no reference at all is not an oracle",
           oracle_class_for_leg(legs[0], _elf_ref, "")[0] == "absent")
+    # ── D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE ───────────
+    # ★★★ THE THREE STATES `absent` USED TO SPELL AS ONE. The defect was never
+    # that the harness lacked the fact — `--build-reference-oracle` returns it
+    # and `attribute_build_failure` reads it — it was that the VERDICT LINE threw
+    # it away, so "the control ran and failed" and "no control was possible" came
+    # out as the same sentence. That cost P13 and P14 two full cycles hunting a
+    # dss miscompile that was upstream. These assert the CLASS and the WORDS,
+    # because the words are what a reader acts on.
+    _no_bin = ""
+    check("a control that RAN AND FAILED is its own class, never 'absent'",
+          oracle_class_for_leg(legs[0], _elf_ref, _no_bin,
+                               ORACLE_STATUS_BUILD_FAILED)[0] == "build-failed")
+    check("'no compiler on this host' is its own class, never 'absent'",
+          oracle_class_for_leg(legs[0], _elf_ref, _no_bin,
+                               ORACLE_STATUS_NO_COMPILER)[0]
+          == "no-reference-compiler")
+    check("a control that was never called is still 'absent'",
+          oracle_class_for_leg(legs[0], _elf_ref, _no_bin,
+                               ORACLE_STATUS_NOT_CALLED)[0] == "absent")
+    # ★ THE THREE MUST NOT SHARE A SENTENCE. Asserting the classes differ is not
+    # enough — the defect was in the PROSE, so the prose is what must differ.
+    _whys = {oracle_class_for_leg(legs[0], _elf_ref, _no_bin, _s)[1]
+             for _s in (ORACLE_STATUS_BUILD_FAILED, ORACLE_STATUS_NO_COMPILER,
+                        ORACLE_STATUS_NOT_CALLED)}
+    check("...and each states a DIFFERENT next step, in different words",
+          len(_whys) == 3, sorted(_whys))
+    # ★★ A STATUS CANNOT PROMOTE A BINARY. The status only ever refines the
+    # NO-BINARY case; a cross-platform binary stays cross-platform however the
+    # build went, or a green status would launder another platform's reference
+    # into this leg's oracle — the exact defect the sibling row closed.
+    _cross = [_l for _l in legs if _l["spec"] != _elf_ref]
+    check("a status never re-classifies a binary that EXISTS",
+          all(oracle_class_for_leg(_l, _elf_ref, "/out/ref", _s)[0]
+              == "cross-platform"
+              for _l in _cross
+              for _s in ORACLE_STATUSES))
+    # ⚠ AN UNKNOWN STATUS RAISES rather than degrading to the pessimistic class.
+    # A typo'd driver flag must not buy a quiet, plausible, wrong verdict line.
+    check("an unrecognised oracle status is REFUSED, never guessed",
+          _raises(lambda: oracle_class_for_leg(legs[0], _elf_ref, _no_bin,
+                                               "build-faild")))
+    # THE REPORT'S WORDS on the build-failed leg: it must still say NO ORACLE
+    # (there is genuinely no binary to run) while naming the log as the lead, and
+    # it must NOT be readable as "no control was possible here".
+    _bf = "\n".join(oracle_report_lines(
+        legs[0], _elf_ref, _no_bin, None, ("", "", ["<fixture>"]),
+        ORACLE_STATUS_BUILD_FAILED))
+    check("a build-failed leg still says NO ORACLE — there is no binary to run",
+          ": NO ORACLE" in _bf and ": SAME-PLATFORM" not in _bf, _bf)
+    check("...but says the control was ATTEMPTED and points at its log",
+          "RAN and" in _bf and "log" in _bf, _bf)
+    check("...and never claims no control was possible",
+          "no reference binary was produced or preserved" not in _bf, _bf)
+    # ★ ONE VOCABULARY, TWO READERS. `attribute_build_failure` and the classifier
+    # must agree on what "the control ran" means; a second literal list is how
+    # they would drift apart silently.
+    # ★★ THE SAFETY PROPERTY, and it is the one worth having: NO status may
+    # conjure an oracle out of a MISSING BINARY. A `built` status with nothing on
+    # disk is still `absent` — the binary is the control, the status is only its
+    # provenance, and a green status must never be able to launder an absent
+    # control into an available one.
+    check("no oracle status can conjure a control out of a missing binary",
+          all(oracle_class_for_leg(legs[0], _elf_ref, _no_bin, _s)[0]
+              != "same-platform" for _s in ORACLE_STATUSES))
+    check("a 'built' status with no surviving binary is still absent",
+          oracle_class_for_leg(legs[0], _elf_ref, _no_bin,
+                               ORACLE_STATUS_BUILT)[0] == "absent")
+    # ONE VOCABULARY, TWO READERS: the attributor's notion of "the control ran"
+    # is a SUBSET of the declared statuses and excludes both no-control states.
+    check("'attempted' is a subset of the declared statuses, excluding both no-control states",
+          set(ORACLE_STATUSES_ATTEMPTED) <= set(ORACLE_STATUSES)
+          and ORACLE_STATUS_NO_COMPILER not in ORACLE_STATUSES_ATTEMPTED
+          and ORACLE_STATUS_NOT_CALLED not in ORACLE_STATUSES_ATTEMPTED)
+    check("every declared oracle status is a class this catalogue can render",
+          all(oracle_class_for_leg(legs[0], _elf_ref, _no_bin, _s)[0]
+              in ORACLE_CLASSES for _s in ORACLE_STATUSES))
     # A leg that DID get its own same-platform oracle claims it, and says by what.
     _own = "\n".join(oracle_report_lines(
         _pe_leg_for_oracle, _elf_ref, "/out/reference-testfixture",
@@ -10905,6 +11875,159 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                 check("abort row %s on %s constrains a DIAGNOSTIC"
                       % (_r["pattern"], _l["label"]),
                       bool(str(_r.get("abortDiagnostic", "")).strip()))
+    # ── THE BUILD HALF OF THE SAME LEDGER ───────────────────────────────────
+    # [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION]
+    # ★★ THE FIXTURES ARE VERBATIM LOG TEXT, in the exact shape each compiler
+    # really emits — dss's `error[CODE]: [target=…] <subject>` + `  --> path:l:c`
+    # and gcc's `path:l:c: error: '<name>' undeclared`. A pin that handed the
+    # attributor pre-parsed rows would be testing the stub, and the parsers are
+    # the half that can silently return an empty set (which reads as "the
+    # compiler said nothing" and grants or denies amnesty on nothing).
+    _tu_up = "/s/ext/misc/fileio.c"
+    _tu_dss = "/s/src/test_fs.c"
+    _dss_log = (
+        "info[X_OptPassSkipped]: [target=t] opt::Licm: skipped loop\n"
+        "error[S0006]: [target=t] LPFILETIME \n"
+        "  --> %s:15737:3\n"
+        "   |\n"
+        "error[S0001]: [target=t] MultiByteToWideChar\n"
+        "  --> %s:15600:11\n"
+        "   |\n"
+        "error[S0006]: [target=t] ULARGE_INTEGER \n"
+        "  --> %s:15740:3\n"
+        "   |\n"
+        "error[S0011]: [target=t] arrow operator '->' pointee is not a composite type\n"
+        "  --> %s:15750:9\n"
+        "   |\n"
+        "error[S0001]: [target=t] open\n"
+        "  --> %s:30194:10\n"
+        "   |\n" % (_tu_up, _tu_up, _tu_up, _tu_up, _tu_dss))
+    _ref_log = (
+        "cc -o ref -DA=1 %s %s\n\n"
+        "%s: In function 'winUtf8To16':\n"
+        "%s:136:31: error: 'CP_UTF8' undeclared (first use in this function)\n"
+        "%s:136:11: warning: implicit declaration of function "
+        "'MultiByteToWideChar' [-Wimplicit-function-declaration]\n"
+        "%s:296:3: error: unknown type name 'LPFILETIME'; did you mean 'ETIME'?\n"
+        % (_tu_up, _tu_dss, _tu_up, _tu_up, _tu_up, _tu_up))
+    _sources = [_tu_up, _tu_dss]
+    _row_up = {"pattern": r"ext/misc/fileio\.c$", "matches": "build-tu",
+               "upstreamSubjects": ["ULARGE_INTEGER"], "requires": [],
+               "earnedOn": "x", "earnedAt": "x", "mechanism": "x", "anchor": "x"}
+    _decs = leg_confound_decisions({"label": "L", "confounds": [_row_up]},
+                                   _gate(_probes_present, _launched_same))
+    # ★ THE PARSERS FIRST, ON CONTENT — a count assertion is satisfied by the
+    # right number of wrong rows, which is precisely how a subject-set comparison
+    # goes quietly wrong.
+    _dparsed = [r for r in dss_build_diagnostics(_dss_log) if r["severity"] == "error"]
+    check("the dss log reader takes the SUBJECT and the FILE off a real "
+          "diagnostic, and ignores info[] lines",
+          [(r["subject"], r["file"]) for r in _dparsed]
+          == [("LPFILETIME", _tu_up), ("MultiByteToWideChar", _tu_up),
+              ("ULARGE_INTEGER", _tu_up),
+              ("arrow operator '->' pointee is not a composite type", _tu_up),
+              ("open", _tu_dss)],
+          "got %r" % ([(r["subject"], r["file"]) for r in _dparsed],))
+    check("a dss subject that is one identifier or a header name IS a name; "
+          "prose is NOT, and \"\" never reads as `fine`",
+          dss_subject_identifier("LPFILETIME") == "LPFILETIME"
+          and dss_subject_identifier("unistd.h") == "unistd.h"
+          and dss_subject_identifier("arrow operator '->' pointee is not a "
+                                     "composite type") == "")
+    # ⚠ THE SUGGESTION STRIP, ASSERTED BY ITS EFFECT. `did you mean 'ETIME'?`
+    # names something the reference is NOT complaining about; left in, it would
+    # corroborate a dss error about `ETIME` and hand out an amnesty nobody
+    # earned. The strip fails in the direction that makes amnesty HARDER.
+    _rparsed = reference_build_diagnostics(_ref_log)
+    _names = sorted({n for r in _rparsed for n in r["names"]})
+    check("the reference reader names what the diagnostic is ABOUT and NOT its "
+          "spelling suggestion",
+          _names == ["CP_UTF8", "LPFILETIME", "MultiByteToWideChar"],
+          "got %r" % (_names,))
+    check("the reference reader keeps WARNING severity, because C23 makes "
+          "gcc's implicit-declaration warning an error",
+          {r["severity"] for r in _rparsed} == {"error", "warning"}
+          and any(r["severity"] == "warning" and "MultiByteToWideChar" in r["names"]
+                  for r in _rparsed))
+    # ★★ THE VERDICTS, BOTH DIRECTIONS, THROUGH THE REAL ATTRIBUTOR.
+    _att = attribute_build_failure(_dss_log, _ref_log, "build-failed", _sources,
+                                   _decs, "L")
+    _by_tu = {t["tu"]: t for t in _att["tus"]}
+    check("a TU the reference ALSO rejects, named by an earned row, with every "
+          "dss identifier corroborated, is UPSTREAM",
+          _by_tu[_tu_up]["attribution"] == "upstream",
+          _by_tu[_tu_up]["why"])
+    check("...and the ONE name the reference never mentioned was cleared by the "
+          "row's DECLARED `upstreamSubjects`, not by the measurement",
+          _by_tu[_tu_up]["excusedByDeclaration"] == ["ULARGE_INTEGER"]
+          and _by_tu[_tu_up]["residue"] == [],
+          "%r" % (_by_tu[_tu_up],))
+    # ★★★ AND THE ROW IS LOAD-BEARING, NOT DECORATION. ✔MEASURED by red-on-disable
+    # 2026-08-18: with this pin absent, deleting the `row is None` gate outright
+    # left the whole battery GREEN — every other fixture happened to carry a row,
+    # so nothing exercised the unearned path and a measured-but-undeclared TU
+    # would have been silently acquitted. The refusal must also SAY what to do,
+    # or a triager reads "charged to dss" and starts hunting a codegen bug.
+    _att_norow = attribute_build_failure(_dss_log, _ref_log, "build-failed",
+                                         _sources, [], "L")
+    _norow = [t for t in _att_norow["tus"] if t["tu"] == _tu_up][0]
+    check("a TU the reference ALSO rejects but that NO earned `build-tu` row "
+          "names is charged to dss, and the refusal names the missing row",
+          _norow["attribution"] == "dss"
+          and "NO `matches: build-tu` row" in _norow["why"]
+          and "write the row" in _norow["why"], _norow["why"])
+    check("a TU the reference ACCEPTED is charged to dss even though the "
+          "reference build as a whole FAILED",
+          _by_tu[_tu_dss]["attribution"] == "dss"
+          and "ACCEPTED what dss rejected" in _by_tu[_tu_dss]["why"],
+          _by_tu[_tu_dss]["why"])
+    check("the cascade errors are COUNTED and named as not attributable, never "
+          "silently folded into either side",
+          _by_tu[_tu_up]["dssCascade"] == 1
+          and any("name no identifier" in l
+                  for l in build_attribution_report_lines(_att)))
+    # ★★★ THE REGRESSION-INSIDE-A-BROKEN-TU PIN, and it is the reason the residue
+    # exists at all. A NEW dss error naming something the reference never named
+    # must re-charge the TU to dss even though the TU is genuinely upstream-broken
+    # and has an earned row. Same fixtures, one added diagnostic.
+    _regressed = _dss_log + ("error[S0001]: [target=t] _wchmod\n"
+                             "  --> %s:15631:8\n   |\n" % _tu_up)
+    _att_r = attribute_build_failure(_regressed, _ref_log, "build-failed",
+                                     _sources, _decs, "L")
+    _up_r = [t for t in _att_r["tus"] if t["tu"] == _tu_up][0]
+    check("a NEW dss-only identifier inside an UPSTREAM-broken TU re-charges "
+          "that TU to dss and NAMES it",
+          _up_r["attribution"] == "dss" and _up_r["residue"] == ["_wchmod"]
+          and "_wchmod" in _up_r["why"], _up_r["why"])
+    # ★★ AN ABSENT CONTROL EXCUSES NOTHING — the discipline the whole mechanism
+    # rests on. Three ways the control can be absent, all three refused.
+    for _status, _srcs, _what in (
+            ("no-reference-compiler", _sources, "no compiler on this host"),
+            ("", _sources, "the oracle was never invoked"),
+            ("build-failed", [_tu_dss], "the TU is not in the manifest")):
+        _a = attribute_build_failure(_dss_log, _ref_log, _status, _srcs, _decs, "L")
+        _t = [t for t in _a["tus"] if t["tu"] == _tu_up][0]
+        check("an amnesty is REFUSED when %s" % _what,
+              _t["attribution"] == "unattributable", "%s -> %r" % (_what, _t))
+    # An unreadable reference log (a shape this reader does not know) must SAY so
+    # and still refuse every amnesty — a silent empty parse would deny amnesties
+    # for a reason no reader could see.
+    _a_gap = attribute_build_failure(_dss_log, "cc: fatal error\n", "build-failed",
+                                     _sources, _decs, "L")
+    check("a reference log this reader parses to ZERO diagnostics is a REPORTED "
+          "harness gap, not a silent denial",
+          "ZERO diagnostics" in _a_gap["parserGap"]
+          and _a_gap["verdictClass"] == "dss"
+          and any("HARNESS GAP" in l
+                  for l in build_attribution_report_lines(_a_gap)))
+    # An unanchored TU pattern silently attributes every longer sibling path.
+    check("the lint REFUSES a `build-tu` pattern that is not anchored at '$'",
+          any("not anchored" in f for f in build_tu_row_findings("L", 
+              dict(_row_up, pattern=r"ext/misc/fileio\.c"))))
+    check("the lint REFUSES a `build-tu` row with no `upstreamSubjects` key, "
+          "because missing cannot be told from empty",
+          any("upstreamSubjects" in f for f in build_tu_row_findings("L", 
+              {k: v for k, v in _row_up.items() if k != "upstreamSubjects"})))
     # A mistyped match kind must be REFUSED, never defaulted — a row meant for an
     # abort that quietly became a unit row excuses nothing and reads as coverage.
     check("an unknown `matches` value RAISES rather than defaulting to `unit`",
@@ -12501,8 +13624,22 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the sh emitter names every leg", all(lbl in sh for lbl in labels))
     statements = sh_statements(sh)
     check("the sh emitter emitted one statement per leg field",
-          len(statements) == 1 + len(labels) * 35,
+          len(statements) == 1 + len(labels) * 37,
           "got %d statements for %d legs" % (len(statements), len(labels)))
+    # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+    # ★★ THE TRANSPORT IS THE WHOLE RISK HERE. The .ps1 reads `run.fidelity` out
+    # of the JSON plan and needs nothing; the .sh reads ONLY these flattened
+    # arrays, so a fidelity that never reached them would leave DSS_RUN_FIDELITY
+    # honoured by one driver and silently ignored by the other — a capability in
+    # one driver and not the other is this project's canonical silent harness bug.
+    check("the sh emitter carries THIS LEG'S run FIDELITY, so the .sh's selector "
+          "reads the same fact the .ps1 reads out of the JSON plan",
+          "LEG_RUN_FIDELITY[" in sh and "LEG_RUN_SAME_ISA[" in sh)
+    check("...and it is the RESOLVED value, not a placeholder",
+          any(s.startswith("LEG_RUN_FIDELITY[") and s.rstrip().endswith("native")
+              for s in statements),
+          "no leg carried a resolved fidelity: %r"
+          % [s for s in statements if s.startswith("LEG_RUN_FIDELITY[")])
     check("the sh emitter carries the launcher's run FILESYSTEM",
           "LEG_RUN_FILESYSTEM[" in sh,
           "without it build-and-test.sh cannot tell a launcher that shares this "
@@ -13810,6 +14947,21 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="harness_legs.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--catalogue", default=CATALOGUE)
+    # ── THE LIBRARY-PROVIDER VOCABULARY, PRINTED ─────────────────────────────
+    # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+    # D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
+    # Same shape and same reason as `--verdict-vocabulary` below it: the closed
+    # set lives in ONE place, and every other file that needs to name it asks
+    # rather than re-typing it. `build-and-test.sh` used to hard-code the list
+    # into its unknown-provider refusal and drifted — it advertised
+    # `ubuntu-ports-arm64` as KNOWN from `3e86a187` (2026-08-10) to 2026-08-20,
+    # after `LIBRARY_PROVIDERS`
+    # stopped containing it, so the message sent a reader toward a declaration
+    # `--lint` refuses. A printed vocabulary cannot drift from the set it prints.
+    p.add_argument("--library-providers", action="store_true",
+                   help="print the closed LIBRARY_PROVIDERS vocabulary, one per "
+                        "line, sorted. The drivers' unknown-provider refusals "
+                        "read THIS instead of carrying their own copy.")
     p.add_argument("--verdict-vocabulary", action="store_true",
                    help="print the closed verdict names, one per line, in order")
     p.add_argument("--plan", action="store_true")
@@ -14002,6 +15154,25 @@ def main(argv=None):
                         "spells the suffix itself has a `.exe` branch in it.")
     p.add_argument("--oracle-log", default="", metavar="PATH",
                    help="where to write the reference compiler's own output")
+    # ── PER-TU ATTRIBUTION OF A BUILD FAILURE ───────────────────────────────
+    p.add_argument("--attribute-build", default=None, metavar="LABEL",
+                   help="decide, PER TRANSLATION UNIT, whether LABEL's failed "
+                        "dss build is charged to dss or to upstream. Needs "
+                        "--compile-log (dss's own log), --oracle-log (the "
+                        "reference's, from THIS run), --oracle-status (what "
+                        "--build-reference-oracle reported) and --manifest. "
+                        "Prints a JSON report with the driver's report lines in "
+                        "it; rc 0 = every rejected TU is upstream-attributable, "
+                        "rc 3 = at least one is charged to dss. An amnesty is "
+                        "granted only where the reference ACTUALLY failed on "
+                        "that TU AND an earned `matches: build-tu` row names it "
+                        "[D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION].")
+    p.add_argument("--compile-log", default="", metavar="PATH",
+                   help="dss's own build log for this leg")
+    p.add_argument("--oracle-status", default="", metavar="STATUS",
+                   help="--build-reference-oracle's reported `status`, verbatim. "
+                        "Only `built`/`build-failed` mean the control RAN; "
+                        "anything else grants no amnesty to anything.")
     # ── the loadext helper the corpus dlopen()s ─────────────────────────────
     # ONE implementation, called by BOTH drivers — the same argument this
     # module's header makes for putting the leg decision here, and the reason
@@ -14161,6 +15332,16 @@ def main(argv=None):
     p.add_argument("--run-filesystems", action="store_true",
                    help="print the closed runFilesystem vocabulary, one verb "
                         "per line (the drivers echo it; the pins assert it)")
+    p.add_argument("--run-fidelities", action="store_true",
+                   help="print the closed RUN FIDELITY vocabulary, one value per "
+                        "line — what KIND of evidence a leg's run produces here "
+                        "(native / foreign-kernel / emulated), as opposed to "
+                        "`mode`, which says only HOW the artefact is reached. "
+                        "Both drivers VALIDATE the operator's DSS_RUN_FIDELITY "
+                        "against this list at the door rather than carrying a "
+                        "second copy of it "
+                        "[D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-"
+                        "RECORDED-NOR-SELECTABLE].")
     p.add_argument("--run-dir-plan", default=None, metavar="LABEL",
                    help="resolve WHERE this leg's corpus runs: the directory in "
                         "the LAUNCHER's own filesystem, the launcher argv with "
@@ -14208,21 +15389,23 @@ def main(argv=None):
                         "leg matches / this host cannot run it (rc 3).")
     args = p.parse_args(argv)
 
-    if not (args.verdict_vocabulary or args.plan or args.lint or args.self_test
+    if not (args.verdict_vocabulary or args.library_providers
+            or args.plan or args.lint or args.self_test
             or args.header_stages or args.config_stages or args.path_translations
             or args.translate_path or args.assert_translated
             or args.env_transfers or args.env_transfer
             or args.acquire or args.acquire_plan or args.resolve_library_argv
             or args.resolve_target_cc or args.build_loadext_helper
             or args.oracle_report or args.build_reference_oracle
-            or args.classify_abort
+            or args.classify_abort or args.attribute_build
             or args.loadext_builder or args.tcl_coherence
-            or args.run_filesystems or args.run_dir_plan
+            or args.run_filesystems or args.run_fidelities or args.run_dir_plan
             or args.stage_build or args.check_launcher or args.identify_binary
             or args.launcher_for_target
             or args.registry_controls or args.check_regions
             or args.probe_environment or args.print_probe_budget):
-        p.error("one of --verdict-vocabulary / --plan / --probe-environment / "
+        p.error("one of --verdict-vocabulary / --library-providers / "
+                "--plan / --probe-environment / "
                 "--print-probe-budget / "
                 "--header-stages / "
                 "--config-stages / --stage-build / --lint "
@@ -14231,8 +15414,10 @@ def main(argv=None):
                 "--registry-controls / --check-regions / "
                 "--acquire / --acquire-plan / --resolve-library-argv / "
                 "--resolve-target-cc / --oracle-report / --classify-abort / "
+                "--attribute-build / "
                 "--build-reference-oracle / --build-loadext-helper / "
                 "--loadext-builder / --tcl-coherence / --run-filesystems / "
+                "--run-fidelities / "
                 "--run-dir-plan / --check-launcher / --identify-binary / "
                 "--launcher-for-target is required")
     if args.artifact and not args.check_launcher:
@@ -14252,6 +15437,14 @@ def main(argv=None):
     try:
         if args.verdict_vocabulary:
             sys.stdout.write("\n".join(VERDICTS) + "\n")
+            return 0
+        if args.library_providers:
+            # ⓘ NO local newline handling: `main` already reconfigured both
+            # streams to `newline="\n"` at the SOURCE (TF-C124), precisely so no
+            # mode has to carry its own copy. A driver reads these back through
+            # `$( )`, where a stray CR would make every name match nothing.
+            for name in sorted(LIBRARY_PROVIDERS):
+                sys.stdout.write("%s\n" % name)
             return 0
         if args.path_translations:
             for verb in sorted(PATH_TRANSLATIONS):
@@ -14364,12 +15557,13 @@ def main(argv=None):
             resolver = None
             if not leg_oracle:
                 cls, _why = oracle_class_for_leg(leg, args.reference_target,
-                                                 args.reference_path)
+                                                 args.reference_path,
+                                                 args.oracle_status)
                 if cls != "same-platform":
                     resolver = resolve_target_cc(leg)
             for line in oracle_report_lines(leg, args.reference_target,
                                             args.reference_path, leg_oracle,
-                                            resolver):
+                                            resolver, args.oracle_status):
                 sys.stdout.write("%s\n" % line)
             return 0
         if args.build_reference_oracle:
@@ -14561,6 +15755,12 @@ def main(argv=None):
             return self_test(args.catalogue)
         if args.run_filesystems:
             sys.stdout.write("\n".join(sorted(RUN_FILESYSTEMS)) + "\n")
+            return 0
+        if args.run_fidelities:
+            # DECLARATION ORDER, not sorted: the values are ordered by how much
+            # they prove (native > foreign-kernel > emulated), and a reader
+            # picking a floor for a run needs that order, not the alphabet.
+            sys.stdout.write("\n".join(RUN_FIDELITIES) + "\n")
             return 0
         if args.identify_binary:
             # Host-free: it reads bytes. Deliberately OUTSIDE the LegError
@@ -14770,7 +15970,8 @@ def main(argv=None):
             # plan and therefore consults all of them.
             verdicts = resolved_kernel_measurements(
                 plan(host_os, host_arch, available, args.catalogue)["legs"],
-                {args.classify_abort} if args.classify_abort else None,
+                ({args.classify_abort or args.attribute_build}
+                 if (args.classify_abort or args.attribute_build) else None),
                 lambda needs: measure_kernel_environments(
                     doc, needs, os.path.abspath(__file__),
                     os.path.abspath(args.catalogue)))
@@ -14829,6 +16030,70 @@ def main(argv=None):
             for k in CONFOUND_PROVENANCE_KEYS:
                 sys.stdout.write("%s: %s\n" % (k, _row["row"].get(k, "")))
             return 0
+        if args.attribute_build:
+            for flag, value in (("--compile-log", args.compile_log),
+                                ("--oracle-log", args.oracle_log),
+                                ("--manifest", args.manifest)):
+                if not value:
+                    p.error("--attribute-build requires %s" % flag)
+            if not args.oracle_status:
+                p.error("--attribute-build requires --oracle-status. It is NOT "
+                        "defaulted and NOT inferred from whether the oracle log "
+                        "exists: a log left behind by a previous run would then "
+                        "grant an amnesty this run never earned "
+                        "[D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION].")
+
+            def _read(path, what):
+                """UNREADABLE IS "" AND IT IS REPORTED — never an abort. An empty
+                reference log denies every amnesty (the safe direction) and an
+                empty dss log attributes nothing; both are visible in the JSON's
+                counts, which is what a reader checks."""
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                        return fh.read()
+                except OSError as exc:
+                    sys.stderr.write("could not read the %s at %s (%s) — it "
+                                     "contributes NOTHING, and an absent control "
+                                     "excuses nothing\n" % (what, path, exc))
+                    return ""
+
+            try:
+                with open(args.manifest, "r", encoding="utf-8") as fh:
+                    _sources = json.load(fh).get("sources", [])
+            except (OSError, ValueError) as exc:
+                raise LegError(
+                    "--attribute-build could not read the manifest %s (%s). The "
+                    "manifest is what proves the reference was asked about a TU "
+                    "at all; without it nothing here is attributable and "
+                    "guessing the source list is the one thing this must not do."
+                    % (args.manifest, exc))
+            # ★ THE SAME ROWS, THE SAME GATE — resolved through plan(), exactly as
+            # --classify-abort is, and for the identical reason: a private gate
+            # here is how one ledger becomes two that disagree.
+            _resolved = plan(host_os, host_arch, available, args.catalogue,
+                             verdicts)
+            _leg = None
+            for _l in _resolved["legs"]:
+                if _l["label"] == args.attribute_build:
+                    _leg = _l
+                    break
+            if _leg is None:
+                raise LegError(
+                    "--attribute-build names leg %r, which this host's plan does "
+                    "not contain (planned: %s)"
+                    % (args.attribute_build,
+                       ", ".join(l["label"] for l in _resolved["legs"])))
+            _report = attribute_build_failure(
+                _read(args.compile_log, "dss compile log"),
+                _read(args.oracle_log, "reference oracle log"),
+                args.oracle_status, _sources,
+                _leg.get("confoundDecisions", []), args.attribute_build)
+            # The report lines travel INSIDE the JSON so a driver prints ONE
+            # account it did not compose — the same transport build_loadext_helper
+            # uses, and the reason the two drivers cannot drift into two stories.
+            _report["report"] = build_attribution_report_lines(_report)
+            sys.stdout.write(json.dumps(_report, indent=1, sort_keys=True) + "\n")
+            return 0 if _report["verdictClass"] == "upstream" else 3
         resolved = plan(host_os, host_arch, available, args.catalogue, verdicts)
         if args.format == "sh":
             sys.stdout.write(emit_sh(resolved))

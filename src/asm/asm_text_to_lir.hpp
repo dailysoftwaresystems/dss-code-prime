@@ -8,6 +8,11 @@
 #include "core/types/target_schema.hpp"
 #include "core/types/tree.hpp"
 #include "lir/lir.hpp"
+// `LirFuncCfi` / `LirCfiOp` — the instruction-anchored unwind carriage the
+// calling-convention materializer ALREADY produces for compiled functions. This
+// producer fills the same type rather than a parallel assembly-only one; see
+// `AsmTextModule::perFuncCfi`.
+#include "lir/lir_callconv.hpp"
 
 #include <optional>
 #include <span>
@@ -157,6 +162,47 @@ struct DSS_EXPORT AsmTextModule {
     // linker reports as an undefined symbol rather than silently — but the
     // diagnostic would point at the linker instead of at the missing wiring.
     std::vector<AsmBlockSymbolBinding> blockSymbolBindings;
+
+    // ★★★ D-ASM-CFI-UNWIND-INFO-SILENTLY-DROPPED: the CALL FRAME INFORMATION
+    // this file's `.cfi_*` directives state — one entry per LIR function,
+    // parallel-indexed with `lir.funcAt(i)`. Until this existed the 18 declared
+    // `.cfi_*` spellings were `ignoredAnnotation`: the file assembled, the
+    // program ran correctly, and nothing could walk its stack.
+    //
+    // ★★ `nullopt` MEANS **UNDESCRIBED**, AND IT IS NOT THE SAME AS AN EMPTY
+    // OP LIST. gas lets a file describe some functions and not others, and an
+    // undescribed one must get no FDE at all. An engaged entry with ZERO ops is
+    // a real description — ✔MEASURED 2026-08-17, gcc 13.3.0 emits
+    // `.cfi_startproc` / `ret` / `.cfi_endproc` around a leaf function and gas
+    // emits an FDE with no ops for it — so "the ops are empty" cannot be the
+    // predicate. Same shape as `elf.cpp`'s and `macho.cpp`'s own
+    // `std::vector<std::optional<CfiFunction>>`.
+    //
+    // ★★ IT IS THE SAME TYPE THE C PATH PRODUCES, DELIBERATELY. `LirFuncCfi`
+    // (`lir/lir_callconv.hpp`) is what `materializeCallingConvention` emits for
+    // a compiled function, keyed the same way — by the `LirInstId` after which
+    // each rule is in effect — and `assemble()` resolves BOTH through one
+    // `resolveFuncCfi`. Two producers, one representation, one resolver: a
+    // hand-written frame and a compiled frame become `.eh_frame` FDEs (and
+    // Win64 `UNWIND_INFO`) through identical code, so neither can drift into
+    // describing frames the other cannot.
+    //
+    // ⚠ ONE STATE IS THIS PRODUCER'S ALONE, AND IT IS NOT A MISS: a rule
+    // written ABOVE the function's first instruction anchors to nothing and
+    // takes effect at byte offset 0, which is an op with an INVALID `inst` and
+    // `atBlockEnd == false`. The callconv producer never emits that shape (its
+    // ops always follow an instruction it just wrote), so `resolveFuncCfi`
+    // names the case explicitly rather than inferring it from a lookup miss —
+    // a miss there is a genuine substrate break and still fails loud.
+    std::vector<std::optional<LirFuncCfi>> perFuncCfi;
+
+    // The frame state every function in this unit starts in, DERIVED from the
+    // target (see `deriveCfiInitialState`) and engaged only once some `.cfi_*`
+    // directive actually needed it. nullopt ⇒ this file described no frame, in
+    // which case `perFuncCfi` is all-empty and no unwind table is produced —
+    // which is the same "nothing to describe" state a `.o` or a hand-built
+    // module is in, and `buildEhFrame` already treats as success.
+    std::optional<CfiInitialState> cfiInitial;
 };
 
 // Lower one parsed `.s` translation unit to `encode`-tier LIR.

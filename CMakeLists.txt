@@ -311,6 +311,69 @@ function(dss_pch_reproducible target)
     endif()
 endfunction()
 
+# ── THE COMPILER'S BUILD STAMP (the runtime object cache's compiler identity) ──
+#
+# `cmake/DssBuildStamp.cmake` computes the value and documents WHY it exists and
+# why the three obvious alternatives (hash the compiler image / (path,size,mtime)
+# / `DSS_PROJECT_VERSION` alone) are each refused. This block is only the wiring,
+# and the wiring carries two decisions worth stating here.
+#
+# ★ IT REGENERATES AT BUILD TIME, NOT AT CONFIGURE TIME. A configure-time
+# `configure_file` would bake the stamp of whenever CMake last ran, so every
+# commit made without re-configuring would build a binary claiming an older
+# identity — and the cache would then serve the OLD compiler's artifacts to the
+# NEW one, silently. `add_custom_target` (always out of date) is what makes the
+# value track the tree. The script writes the header ONLY when the value
+# changed, so an unchanged stamp costs a `git status` and nothing else.
+# ✔MEASURED 2026-08-17 on this workstation, dirty tree (133 entries, a
+# 1,440,179-byte `git diff HEAD`): 63 ms + 231 ms ≈ 0.3 s, ONCE per build.
+#
+# ★★ THE INCLUSION IS SCOPED ON PURPOSE, and this is the part to defend in
+# review. The generated header changes on every dirty edit, so every TU that
+# `#include`s it recompiles on every dirty edit. Reaching it requires opting in
+# through `dss_use_build_stamp()` — a target that does not ask cannot see the
+# header at all. The intended includer is the runtime object cache TU and
+# nothing else; a widely-included header pulling this in would rebuild the world
+# on every keystroke. That is a review-stop, not a preference.
+find_package(Git QUIET)   # → GIT_EXECUTABLE, or undefined on a machine with none
+
+set(DSS_BUILD_STAMP_DIR "${CMAKE_BINARY_DIR}/generated")
+set(DSS_BUILD_STAMP_HEADER
+    "${DSS_BUILD_STAMP_DIR}/program/dss_build_stamp_generated.hpp")
+
+add_custom_target(dss_build_stamp_generate
+    COMMAND ${CMAKE_COMMAND}
+            "-DDSS_STAMP_VERSION=${DSS_VERSION}"
+            "-DDSS_STAMP_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+            "-DDSS_STAMP_GIT=${GIT_EXECUTABLE}"
+            "-DDSS_STAMP_OUTPUT=${DSS_BUILD_STAMP_HEADER}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/DssBuildStamp.cmake"
+    BYPRODUCTS "${DSS_BUILD_STAMP_HEADER}"
+    COMMENT "dss: computing DSS_BUILD_STAMP"
+    VERBATIM)
+
+# Carries the include paths only. `${CMAKE_SOURCE_DIR}/src` is here as well as
+# the generated dir so the pair is self-sufficient: `program/dss_build_stamp.hpp`
+# is the checked-in entry point and it must resolve for anyone who opted in.
+add_library(dss_build_stamp INTERFACE)
+target_include_directories(dss_build_stamp INTERFACE
+    "${DSS_BUILD_STAMP_DIR}"
+    "${CMAKE_SOURCE_DIR}/src")
+
+# THE opt-in. One call wires BOTH halves — the include paths and the ordering
+# edge — because they are useless apart: paths without the edge is a race
+# (the header may not exist yet on a clean build), and the edge without the
+# paths does not compile. `add_dependencies` is named EXPLICITLY on the consumer
+# rather than left to ride the INTERFACE library, so the ordering holds on every
+# generator without depending on how interface-target dependencies propagate.
+# The dependency is ORDER-ONLY in Ninja, so an always-out-of-date generator does
+# NOT drag its consumers into a rebuild — only a changed header does that, via
+# the compiler's own depfile.
+function(dss_use_build_stamp target)
+    target_link_libraries(${target} PRIVATE dss_build_stamp)
+    add_dependencies(${target} dss_build_stamp_generate)
+endfunction()
+
 add_subdirectory(src)
 
 if(DSS_BUILD_TESTS)
@@ -322,6 +385,30 @@ if(DSS_BUILD_TESTS)
     # is off (no testing context in the calling scope) and CI would
     # build the binary but never invoke it through ctest. This gate
     # IS the fix; no separate anchor is tracked.
+    # ★★★ ONE MANIFEST GLOB, READ BY BOTH CORPUS HARNESSES.
+    # D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD gave
+    # `integrated_tests` per-example ctest entries, which means BOTH harnesses now
+    # derive their entry set from the corpus. Hoisted here rather than globbed
+    # twice so the two cannot disagree about WHICH examples exist —
+    # [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] is about capability parity, and
+    # a harness that silently enumerates a different corpus than its sibling is
+    # that divergence in its most basic form.
+    # ⚠ `CONFIGURE_DEPENDS` so a NEW example re-runs cmake instead of being
+    # silently absent until someone reconfigures by hand.
+    file(GLOB_RECURSE DSS_EXAMPLE_MANIFESTS
+        CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/examples/*/*/expected.json")
+    list(LENGTH DSS_EXAMPLE_MANIFESTS DSS_EXAMPLE_MANIFEST_COUNT)
+    # A glob that collapses to nothing would silently retire every corpus entry in
+    # BOTH harnesses and leave a green suite asserting nothing about the corpus.
+    # Refuse at configure time, where it is one line, instead of at review time.
+    if(DSS_EXAMPLE_MANIFEST_COUNT LESS 100)
+        message(FATAL_ERROR
+            "examples/ yielded only ${DSS_EXAMPLE_MANIFEST_COUNT} manifest(s). "
+            "Both corpus harnesses derive their ctest entries from this glob, so "
+            "a collapsed result silently empties the corpus suite. Refusing.")
+    endif()
+
     add_subdirectory(integrated_tests)
     add_subdirectory(tests)
 
@@ -384,32 +471,154 @@ if(DSS_BUILD_TESTS)
             NAME anchor_registry_guard
             COMMAND ${POWERSHELL_EXE}
                     -NoProfile -ExecutionPolicy Bypass
-                    -File "${CMAKE_SOURCE_DIR}/tools/check-anchor-registry.ps1"
+                    -File "${CMAKE_SOURCE_DIR}/scripts/check-anchor-registry/check-anchor-registry.ps1"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         add_test(
             NAME line_endings_guard
             COMMAND ${POWERSHELL_EXE}
                     -NoProfile -ExecutionPolicy Bypass
-                    -File "${CMAKE_SOURCE_DIR}/tools/check-line-endings.ps1"
+                    -File "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.ps1"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         add_test(
             NAME orphan_tests_guard
             COMMAND ${POWERSHELL_EXE}
                     -NoProfile -ExecutionPolicy Bypass
-                    -File "${CMAKE_SOURCE_DIR}/tools/check-orphan-tests.ps1"
+                    -File "${CMAKE_SOURCE_DIR}/scripts/check-orphan-tests/check-orphan-tests.ps1"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     else()
         add_test(
             NAME anchor_registry_guard
-            COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-anchor-registry.sh"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-anchor-registry/check-anchor-registry.sh"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         add_test(
             NAME line_endings_guard
-            COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-line-endings.sh"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.sh"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         add_test(
             NAME orphan_tests_guard
-            COMMAND bash "${CMAKE_SOURCE_DIR}/tools/check-orphan-tests.sh"
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-orphan-tests/check-orphan-tests.sh"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     endif()
+
+    # Script-index guard (2026-08-19 — D-SCRIPTS-NO-INDEX-OF-THE-REPOSITORYS-OWN-TOOLING).
+    # Every directory under `scripts/` must be documented in BOTH indexes
+    # (`scripts/README.md` and the `/dss-cycle` skill's `references/scripts.md`),
+    # with a purpose byte-identical to the script's own `PURPOSE:` declaration.
+    # ✔MEASURED 2026-08-19: this repository had eighteen scripts and no index of
+    # any kind, so a cycle could not be told to prefer an existing tool over
+    # writing a new one — nothing listed the existing tools. The operator's rule
+    # the guard makes reachable: "if a tool has a problem, fix before using
+    # again, not workaround an own tool."
+    #
+    # ★ NOT DISPATCHED BY PLATFORM, unlike the three guards above: this one is a
+    # single Python implementation rather than a `.sh`/`.ps1` twin pair. The
+    # twins exist so a shell-only host can run those guards; the trade they make
+    # is one contract expressed twice, and this guard's whole subject is a fact
+    # expressed in two places drifting apart. Paying that cost inside the guard
+    # against it would be the joke it sounds like. Python is already a
+    # development dependency here — five of the eight `check-*` scripts are
+    # Python, including `check-anchor-balance`, which every cycle must run — so
+    # the interpreter is REQUIRED rather than optional: a guard that silently
+    # skips when a tool is missing is the vacuous pass this entry exists to
+    # refuse (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    #
+    # ★★ AND IT SELF-TESTS ON EVERY RUN. The no-argument form used here verifies
+    # the real tree and then runs 28 arms against a MIRROR — every refusal the
+    # guard has, each asserting the MESSAGE and not merely a non-zero exit — so
+    # this entry cannot pass without also proving the guard can fail.
+    # ⚠ The message assertions are load-bearing: an independent audit found the
+    # first draft's floor arm passing with the floor DELETED, because it
+    # collapsed on a different refusal that happened to share the exit code.
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(
+        NAME scripts_index_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-scripts-index/check-scripts-index.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Closed-vocabulary well-formedness gate (2026-08-21 -
+    # D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE).
+    # An `EnumNameTable<E, N>` written with N-1 initializers COMPILES: the missing
+    # row value-initializes to `{E(0), ""}`, so `fromName("")` starts resolving --
+    # and for a vocabulary whose enumerator 0 is a sentinel, an empty string then
+    # silently selects "this knob does nothing". The predicate that refuses that
+    # shape lives beside the template; this entry refuses a DECLARATION that never
+    # invokes it, which is the hazard the predicate alone cannot cover.
+    # * It reads the declarations, never a hand-maintained list -- the correction
+    #   `check-diagnostic-codes.py` already records: a hand-kept pin can only check
+    #   rows somebody remembered to add to it.
+    # * It self-tests on every run (7 arms, each asserting the MESSAGE of the
+    #   refusal it names), so this entry cannot pass without proving it can fail.
+    #   ⚠ THIS SENTENCE WAS FALSE FOR A DAY, AND THE FIX IS IN THE SCRIPT, NOT HERE.
+    #   ✔MEASURED 2026-08-22: `main()` ran the self-test only under `--self-test`,
+    #   and this entry passes no flag — so the ctest form verified the tree and
+    #   proved nothing. `check-shell-portability` found it while being written
+    #   against the same convention (D-GATE-ENUM-NAME-TABLE-CTEST-FORM-NEVER-SELF-TESTED).
+    add_test(
+        NAME enum_name_table_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-enum-name-table-guards/check-enum-name-table-guards.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Shell-portability guard (2026-08-22 —
+    # D-SCRIPT-CASE-IN-COMMAND-SUBSTITUTION-BREAKS-BASH-3-2).
+    # macOS is a supported host and its `/bin/bash` is 3.2.57 — there is no newer
+    # one, and this repository drives its guards through `bash <script>` on every
+    # non-Windows leg. Two shapes are fatal there and invisible everywhere else:
+    #   · a `case` inside `$( … )` whose patterns are not `(`-prefixed. bash 3.2
+    #     scans for the matching `)` instead of parsing, so the pattern's own `)`
+    #     ends the substitution and the arm expands to LITERAL TEXT.
+    #   · a bash-4+ construct (`mapfile`, `declare -A`, `${v^^}`, …) in a file that
+    #     never says it needs bash 4 — six of the twelve leave the exit status at
+    #     ZERO, so the script runs on with a wrong answer.
+    #
+    # ★★ THE COST OF NOT HAVING THIS WAS MEASURED, NOT IMAGINED. On 2026-08-22 the
+    # `macos-clang-release` leg failed with `anchor_registry_guard` dying inside its
+    # OWN self-test — so the anchor registry had never actually been checked on that
+    # host. ⚠ And `bash -n` cannot see the first shape at all (✔the probe file
+    # parses clean under 3.2 and fails only when the substitution is EXPANDED), which
+    # is why this is a static guard and not a syntax pre-check.
+    #
+    # ★ RIDES CTEST rather than being a CI step, for the reason the guards above
+    # give: every leg then runs it, on the host it is about.
+    # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies the
+    # tree and then drives 34 arms against synthetic fixtures, each red arm asserting
+    # the MESSAGE of the refusal it names, so this entry cannot pass without proving
+    # the guard can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    add_test(
+        NAME shell_portability_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-shell-portability/check-shell-portability.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Citation-stability guard (2026-08-19 — D-PLANS-CITATION-LINE-NUMBERS-SILENTLY-INVALIDATED).
+    # A `path:line` citation is a claim about a file that nothing rechecks: insert
+    # one line above it and it silently points at unrelated prose while still
+    # reading as evidence. Operator rule, 2026-08-19: cite a method name, a
+    # comment id, or a defined anchor — never a line number.
+    #
+    # ★ A RATCHET, NOT A BAN, and the numbers are why: 2376 positional citations
+    # already exist across 20 documents, overwhelmingly inside CLOSED registry
+    # rows describing what was true at some long-past commit. Rewriting those
+    # wholesale would be a vast edit that also destroys the record's precision.
+    # So the inventory holds per-document ceilings that may only come DOWN — a
+    # new citation reds at once, and a converted one reds until its ceiling is
+    # lowered in the same commit, because unclaimed headroom is where the next
+    # one hides. Same shape as check-no-abort-in-tests' abort() inventory.
+    # ⚠ Green here means NO NEW positional citation landed. It never means the
+    # plans cite stably; the inventory is DEBT.
+    add_test(
+        NAME plan_citations_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-plan-citations/check-plan-citations.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()
+
+# ── The install set (D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE) ──
+# Kept whole in its own module rather than interleaved here: it owns what a
+# package ships (the CLI, its shared library, and `src/dss-config/`), it forwards
+# the installed layout to the resolver that has to find it again at runtime, and
+# it registers the scratch-prefix smoke test that proves an installed compiler
+# actually compiles. Included LAST because it modifies targets created by
+# `add_subdirectory(src)` above.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DssInstall.cmake")

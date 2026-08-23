@@ -5,6 +5,9 @@
 // third copy of the loop (`core/types/config_key_vocabulary.hpp`, TF-C74).
 #include "core/types/artifact_profile.hpp"
 #include "core/types/config_key_vocabulary.hpp"
+// The repo's SHA-256 — the independent oracle the retained `contentDigest()`
+// is pinned against (the tests hex-render it themselves; see `hexOracle`).
+#include "core/crypto/sha256.hpp"
 #include "repo_root.hpp"
 
 #include <gtest/gtest.h>
@@ -12,11 +15,13 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -3936,6 +3941,75 @@ TEST(GrammarSchema, ScopesBlockEmptyValidityStaysSilent) {
     ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
 }
 
+// ── `language` BLOCK closed key vocabulary (typo discriminator) ──────────
+//
+// ⚠⚠ THIS BLOCK HAD NO DISCRIMINATOR AT ALL until 2026-08-20, and the absence
+// had already bent the schema rather than merely leaving a diagnostic unfired:
+// `isa` and `identifierClass` sit at TOP LEVEL — where neither belongs — for the
+// stated reason that `language` could not check them, so language-scoped keys
+// were pushed out of the language block to borrow a check living elsewhere.
+// The direct failure was silent in the worst way: `fileExtensons` loaded
+// perfectly clean and produced an EMPTY extension list, i.e. a language that
+// recognises no source file, reported as nothing whatsoever.
+// D-CONFIG-GRAMMAR-LANGUAGE-BLOCK-HAS-NO-TYPO-DISCRIMINATOR.
+
+namespace {
+// A minimal loadable document whose `language` block carries one extra key.
+[[nodiscard]] std::string languageBlockWith(std::string_view extra) {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "LangKeys", "version": "0.1.0"%X% },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": { "root": { "sequence": [ "Semi" ] } }
+    })JSON";
+    auto const pos = cfg.find("%X%");
+    cfg.replace(pos, 3, extra);
+    return cfg;
+}
+} // namespace
+
+// Baseline, and it is not decoration: without it a mutant that rejects EVERY
+// key would still turn the negative cases below green, and the pin would be
+// asserting nothing.
+TEST(GrammarSchema, LanguageBlockClosedKeyBaselineLoadsCleanly) {
+    auto r = GrammarSchema::loadFromText(languageBlockWith(
+        R"(, "fileExtensions": [".lk"])"));
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+}
+
+// The exact real-world shape: one transposed letter in the OPTIONAL key, whose
+// absence means "no extensions". This is the case that used to load clean.
+TEST(GrammarSchema, LanguageBlockMisspelledFileExtensionsReportsMalformed) {
+    auto r = GrammarSchema::loadFromText(languageBlockWith(
+        R"(, "fileExtensons": [".lk"])"));
+    ASSERT_FALSE(r.has_value())
+        << "a misspelled 'fileExtensions' must fail the load — it yields an "
+           "EMPTY extension list, i.e. a language matching no source file";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// A second, differently-spelled key, so the pin asserts the VOCABULARY rather
+// than one special-cased name.
+TEST(GrammarSchema, LanguageBlockUnknownKeyReportsMalformed) {
+    auto r = GrammarSchema::loadFromText(languageBlockWith(
+        R"(, "identifierClass": "unicode")"));
+    ASSERT_FALSE(r.has_value())
+        << "'identifierClass' is a TOP-LEVEL key; inside 'language' it is read "
+           "by nothing and must not be accepted in silence";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+// `$`-prefixed documentation keys stay EXEMPT here too — the carve-out is
+// codebase-wide, and a check that refused them would red every shipped
+// document that annotates its own language block.
+TEST(GrammarSchema, LanguageBlockDocumentationKeyStaysExempt) {
+    auto r = GrammarSchema::loadFromText(languageBlockWith(
+        R"(, "$comment": "why this language exists", "$originComment": "x")"));
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+}
+
 // ── TOP-LEVEL document closed key vocabulary (typo discriminator) ────────
 //
 // The widest-blast-radius instance: every block is optional and absence is
@@ -6542,4 +6616,135 @@ TEST(GrammarSchema, AttributeVocabularyCrossCheckStaysQuietOnWholesaleIgnoringSh
            "route an attribute identifier to its name lookup, so ignoring one "
            "more unrelated specifier by name must stay clean: "
         << errorDiags(result.error());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `contentDigest()` — the retained content digest
+// ─────────────────────────────────────────────────────────────────────────
+//
+// `GrammarSchema::loadFromText` retains the lowercase 64-hex SHA-256 of the
+// EXACT document bytes it was handed, computed at the one chokepoint where
+// those bytes are already in memory. It exists so the runtime-object cache can
+// key on the config a build actually LOADED without re-walking
+// `src/dss-config/` from disk — ~165 ms per invocation, MEASURED 2026-08-17
+// (86 files, 2,078,133 bytes; I/O-dominated: walk+read 152-160 ms, hash only
+// 9-13 ms), which would be paid on every build.
+//
+// ★★ THE ONE-BYTE ARM IS BUILT AT EQUAL LENGTH, AND THAT IS THE POINT OF IT.
+// A "digest" that had quietly become a size or length stamp would sail through
+// a mutation test whose two inputs differ in SIZE — and the mutation this cache
+// has to tell apart is exactly the equal-length kind (MEASURED: a real
+// descriptor mutation was 9149 bytes before AND after). So the fixture ASSERTS
+// equal length and EXACTLY ONE differing byte rather than merely being
+// constructed that way, and it perturbs a byte of STRUCTURAL JSON WHITESPACE so
+// the two documents PARSE IDENTICALLY — the digest cannot then be coming from
+// anything the parser produced.
+
+namespace {
+
+// Lowercase-hex render, written here rather than reached for from
+// `dss::crypto::toHexLower`: an oracle that shares code with the subject
+// cannot witness the subject.
+[[nodiscard]] std::string hexOracle(std::array<std::uint8_t, 32> const& digest) {
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (std::uint8_t const byte : digest) {
+        out.push_back(kHexDigits[byte >> 4]);
+        out.push_back(kHexDigits[byte & 0x0fu]);
+    }
+    return out;
+}
+
+// SHA-256 over `text`'s exact bytes — the INDEPENDENT expectation the retained
+// digest is pinned against, computed here and never read back off the schema.
+[[nodiscard]] std::string digestOracle(std::string_view text) {
+    return hexOracle(dss::crypto::sha256(std::span<std::uint8_t const>{
+        reinterpret_cast<std::uint8_t const*>(text.data()), text.size()}));
+}
+
+// Number of positions at which two strings differ; `npos` if their lengths do
+// (so a length change can never be mistaken for a one-byte change).
+[[nodiscard]] std::size_t differingBytes(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return std::string_view::npos;
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i] != b[i]) ++n;
+    }
+    return n;
+}
+
+// `text` with its first LF turned into a space: same length, one byte
+// different, and provably the same document to the parser — JSON forbids a raw
+// newline inside a string, so every LF in a valid document is structural
+// whitespace and a space is its equal in every position it can occupy.
+[[nodiscard]] std::string withOneWhitespaceByteChanged(std::string_view text) {
+    std::string out{text};
+    auto const pos = out.find('\n');
+    EXPECT_NE(pos, std::string::npos)
+        << "the fixture carries no LF to perturb — reach for another "
+           "same-length mutation rather than dropping this arm";
+    if (pos != std::string::npos) out[pos] = ' ';
+    return out;
+}
+
+} // namespace
+
+TEST(GrammarSchemaContentDigest, IsSixtyFourLowercaseHexDigits) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig);
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    auto const digest = (*result)->contentDigest();
+    EXPECT_EQ(digest.size(), 64u);
+    EXPECT_EQ(digest.find_first_not_of("0123456789abcdef"),
+              std::string_view::npos)
+        << "not lowercase hex: " << digest;
+}
+
+TEST(GrammarSchemaContentDigest, SameTextTwiceYieldsTheSameDigest) {
+    auto a = GrammarSchema::loadFromText(kHappyConfig);
+    auto b = GrammarSchema::loadFromText(kHappyConfig);
+    ASSERT_TRUE(a.has_value()) << errorDiags(a.error());
+    ASSERT_TRUE(b.has_value()) << errorDiags(b.error());
+    ASSERT_NE(a->get(), b->get())
+        << "the two loads returned the SAME object, so an equal digest would "
+           "be a tautology rather than a determinism claim";
+    EXPECT_EQ((*a)->contentDigest(), (*b)->contentDigest());
+}
+
+TEST(GrammarSchemaContentDigest, OneByteAtEqualLengthChangesTheDigest) {
+    std::string const original{kHappyConfig};
+    std::string const perturbed = withOneWhitespaceByteChanged(original);
+
+    ASSERT_EQ(original.size(), perturbed.size())
+        << "the two inputs must be the SAME LENGTH, or a size stamp would "
+           "pass this test";
+    ASSERT_EQ(differingBytes(original, perturbed), 1u);
+
+    auto a = GrammarSchema::loadFromText(original);
+    auto b = GrammarSchema::loadFromText(perturbed);
+    ASSERT_TRUE(a.has_value()) << errorDiags(a.error());
+    ASSERT_TRUE(b.has_value()) << errorDiags(b.error());
+
+    // Parse-identical — the perturbed byte was JSON whitespace …
+    EXPECT_EQ((*a)->name(), (*b)->name());
+    EXPECT_EQ((*a)->version(), (*b)->version());
+    // … and still byte-distinguishable, which is the whole contract.
+    EXPECT_NE((*a)->contentDigest(), (*b)->contentDigest());
+}
+
+TEST(GrammarSchemaContentDigest, EqualsAnIndependentSha256OfTheLoadedBytes) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig);
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->contentDigest(), digestOracle(kHappyConfig));
+}
+
+// ⚠ EMPTY MEANS UNKNOWN, NEVER WRONG. The public `GrammarSchemaData` ctor is
+// the documented bypass (tests build schemas without JSON), and it has no
+// document bytes to digest. An empty digest is a DETECTABLE unknown a cache can
+// refuse to key on; a fabricated or inherited one is a silent wrong key.
+TEST(GrammarSchemaContentDigest, ConstructionBypassingLoadFromTextLeavesItEmpty) {
+    GrammarSchema const schema{detail::GrammarSchemaData{}};
+    EXPECT_TRUE(schema.contentDigest().empty())
+        << "a schema with no document bytes reported a digest: "
+        << schema.contentDigest();
 }

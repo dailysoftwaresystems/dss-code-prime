@@ -82,6 +82,11 @@ inline constexpr EnumNameTable<TargetAbiModel, 3> kTargetAbiModelTable{{{
     { TargetAbiModel::ResultId,        "result-id"        },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetAbiModelTable);
+
 [[nodiscard]] constexpr std::string_view targetAbiModelName(TargetAbiModel m) noexcept {
     return kTargetAbiModelTable.name(m);
 }
@@ -110,6 +115,11 @@ inline constexpr EnumNameTable<CallConv, 9> kCallConvTable{{{
     { CallConv::CcWasm,       "wasm"       },
     { CallConv::CcSpirv,      "spirv"      },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kCallConvTable);
 
 [[nodiscard]] constexpr std::string_view callConvName(CallConv cc) noexcept {
     return kCallConvTable.name(cc);
@@ -213,6 +223,11 @@ kTargetCondCodeTable{{{
     { TargetCondCode::Ford, "ford" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetCondCodeTable);
+
 [[nodiscard]] constexpr std::string_view targetCondCodeName(TargetCondCode c) noexcept {
     return kTargetCondCodeTable.name(c);
 }
@@ -232,8 +247,24 @@ inline constexpr EnumNameTable<TargetResultRule, 3> kTargetResultRuleTable{{{
     { TargetResultRule::Optional, "optional" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetResultRuleTable);
+
 [[nodiscard]] constexpr std::string_view targetResultRuleName(TargetResultRule r) noexcept {
     return kTargetResultRuleTable.name(r);
+}
+// ⚠ THE `…FromName` HALF WAS MISSING, AND THE LOADER FILLED THE GAP ITSELF.
+// `target_schema_json.cpp` carried a private `parseResultRule` if-chain
+// spelling all three names a second time, beside the table that already owned
+// them — the only opcode vocabulary in this header with a name side and no
+// parse side, and the only one whose loader had to invent one. Every sibling
+// enum here exposes BOTH halves off its table; this one now does too, so the
+// loader has nothing left to duplicate.
+[[nodiscard]] constexpr std::optional<TargetResultRule>
+targetResultRuleFromName(std::string_view s) noexcept {
+    return kTargetResultRuleTable.fromName(s);
 }
 
 // Register-class envelope (universal — every target maps its concrete
@@ -262,6 +293,11 @@ inline constexpr EnumNameTable<TargetRegClass, 5> kTargetRegClassTable{{{
     { TargetRegClass::Flags, "flags" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetRegClassTable);
+
 [[nodiscard]] constexpr std::string_view targetRegClassName(TargetRegClass c) noexcept {
     return kTargetRegClassTable.name(c);
 }
@@ -269,6 +305,28 @@ inline constexpr EnumNameTable<TargetRegClass, 5> kTargetRegClassTable{{{
 targetRegClassFromName(std::string_view s) noexcept {
     return kTargetRegClassTable.fromName(s);
 }
+
+// ── the class set a `registerClassOps[]` ROW may name ─────────────────────
+//
+// `None` is a legitimate value of this enum — a register (or an operand) can
+// genuinely have no class — so it is a table row and `targetRegClassFromName`
+// resolves it. It is NOT a legitimate SUBJECT for a per-class operation row:
+// `registerClassOps` declares the move/load/store mnemonics for a class, and
+// the no-class sentinel has no registers to move.
+//
+// ⚠ THE LOADER'S DIAGNOSTIC ALREADY SAID SO AND THE CHECK DID NOT.
+// `/registerClassOps/{}/class` refused nothing beyond a name lookup, so
+// `"class": "none"` LOADED and took row 0, while the sentence beside it read
+// "expected 'gpr' / 'fpr' / 'vr' / 'flags'". A message narrower than its check
+// is the same defect class as a message wider than it — the sentence and the
+// gate disagreed, and the sentence was the one telling the truth about intent.
+// The gate now matches, and both come off this predicate.
+[[nodiscard]] constexpr bool
+isOperableTargetRegClass(TargetRegClass c) noexcept {
+    return c != TargetRegClass::None;
+}
+inline constexpr auto kOperableTargetRegClassNames =
+    namesWhere<4>(kTargetRegClassTable, isOperableTargetRegClass);
 
 // Map a substrate-tier `TypeKind` to its `TargetRegClass`. Universal
 // across all register-machine targets — floats use the FPR envelope,
@@ -404,6 +462,11 @@ inline constexpr EnumNameTable<WideFloatOp, 6> kWideFloatOpTable{{{
     { WideFloatOp::Mul, "mul" }, { WideFloatOp::Div, "div" },
     { WideFloatOp::ToInt32, "to_i32" }, { WideFloatOp::FromFloat64, "from_f64" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kWideFloatOpTable);
 [[nodiscard]] constexpr std::string_view wideFloatOpName(WideFloatOp op) noexcept {
     return kWideFloatOpTable.name(op);
 }
@@ -852,6 +915,11 @@ inline constexpr EnumNameTable<TargetEncodingShape, 3> kTargetEncodingShapeTable
     { TargetEncodingShape::Fixed32,     "fixed32"      },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetEncodingShapeTable);
+
 [[nodiscard]] constexpr std::string_view
 targetEncodingShapeName(TargetEncodingShape s) noexcept {
     return kTargetEncodingShapeTable.name(s);
@@ -929,6 +997,11 @@ inline constexpr EnumNameTable<OperandKindFilter, 7> kOperandKindFilterTable{{{
     { OperandKindFilter::LiteralIndex, "imm64" },  // JSON-side width label
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kOperandKindFilterTable);
+
 [[nodiscard]] constexpr std::string_view
 operandKindFilterName(OperandKindFilter f) noexcept {
     return kOperandKindFilterTable.name(f);
@@ -937,6 +1010,105 @@ operandKindFilterName(OperandKindFilter f) noexcept {
 operandKindFilterFromName(std::string_view s) noexcept {
     return kOperandKindFilterTable.fromName(s);
 }
+
+// ── GNU inline-asm constraint letters (the `asmConstraints` facet) ────
+//
+// A GNU `asm` statement binds every operand with a CONSTRAINT — `"=r"(o)`,
+// `"a"(x)`, `"m"(*p)`, `"i"(7)`. A constraint splits cleanly in two, and the
+// split is the entire reason this facet exists:
+//
+//   * the MODIFIERS (`=` output, `+` in-out, `&` earlyclobber, `%`
+//     commutative) are GNU-asm GRAMMAR. They mean the same thing on every
+//     processor, the C front end parses them, and they NEVER appear here.
+//   * the LETTER is a MACHINE FACT. ✔MEASURED (gcc 13.3.0, `-O2 -S`, with
+//     three competing `"r"` operands live so a lucky allocation cannot be
+//     mistaken for a pin): `"=a"` lands in `%rax` on x86_64 and is rejected
+//     outright on AArch64 ("impossible constraint in 'asm'"). No reading of
+//     the C standard yields that; only the target can say it.
+//
+// ★★★ WHICH LETTER MEANS WHICH REGISTER IS TARGET VOCABULARY AND LIVES IN
+// `.target.json`. A C++ table keyed on architecture would be an agnosticism
+// break that NO GREP CATCHES until the second architecture's inline asm
+// arrives — by which time the table is load-bearing and the break is
+// expensive to undo.
+//
+// ⚠ THIS FACET IS DELIBERATELY NARROWER THAN THE ONE THAT WAS REVERTED.
+// [[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]] killed an
+// `asmSyntax` block on these same two files that carried `registerPrefix`,
+// `immediatePrefix`, comment characters and operand ORDER. ✔MEASURED with
+// gcc on ONE target: AT&T `movq %rsi, (%rdi)` vs Intel `mov QWORD PTR
+// [rdi], rsi` — every one of those differs between two dialects of the SAME
+// CPU, so each is a (target, DIALECT) fact and storing it per-target stored
+// a per-(X,Y) fact per-X. Constraint letters face the identical test and
+// SURVIVE it: `"=a"` means RAX under AT&T and under Intel, in ELF and in PE.
+// The letter names a REGISTER, and a register is a property of a processor.
+// ⇒ NOTHING THAT VARIES WITH DIALECT MAY ENTER THIS FACET — no sigils, no
+// operand order, no mnemonic spellings. The loader enforces the one case a
+// human would actually get wrong (a modifier smuggled into a letter).
+//
+// ★★ THE LETTERS BIND TO VOCABULARY THAT ALREADY EXISTS — there is no fourth
+// axis and no `AsmConstraint*` verb set:
+//   * `r`, `x`, `w` → a register CLASS    (`TargetRegClass`)
+//   * `a`, `d`, `S` → a SPECIFIC register (`registers[].name` → ordinal, the
+//                     same name resolution the `implicitRegisters` roles use)
+//   * `i`, `m`      → an operand FORM     (`OperandKindFilter`)
+enum class AsmConstraintBinding : std::uint8_t {
+    RegisterClass = 0,
+    Register      = 1,
+    OperandKind   = 2,
+};
+
+// ★ THE DISCRIMINATOR SPELLING IS ALSO THE PAYLOAD KEY NAME, and that is
+// load-bearing rather than cute: `"binds": "register"` requires the key
+// `"register"`. ONE table therefore drives the discriminator vocabulary, the
+// key the loader demands, AND the list every diagnostic renders — so they
+// cannot drift apart the way a hand-typed valid-value list does (the failure
+// `kKnownImplicitRegisterRoles` records in its own comment, where the prose
+// told readers a valid role was invalid).
+inline constexpr EnumNameTable<AsmConstraintBinding, 3>
+    kAsmConstraintBindingTable{{{
+        { AsmConstraintBinding::RegisterClass, "registerClass" },
+        { AsmConstraintBinding::Register,      "register"      },
+        { AsmConstraintBinding::OperandKind,   "operandKind"   },
+    }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kAsmConstraintBindingTable);
+
+[[nodiscard]] constexpr std::string_view
+asmConstraintBindingName(AsmConstraintBinding b) noexcept {
+    return kAsmConstraintBindingTable.name(b);
+}
+[[nodiscard]] constexpr std::optional<AsmConstraintBinding>
+asmConstraintBindingFromName(std::string_view s) noexcept {
+    return kAsmConstraintBindingTable.fromName(s);
+}
+
+// One declared constraint letter. EXACTLY ONE payload is engaged and it is
+// the one `binds` names — the loader enforces both halves, so a consumer may
+// `switch (binds)` and dereference the matching arm without re-checking.
+//
+// ★ THE PAYLOADS ARE `optional` RATHER THAN PLAIN VALUES ON PURPOSE. Ordinal
+// 0 is a perfectly valid register (`rax` on x86_64, `x0` on arm64) and
+// `OperandKindFilter::Reg` is 0 as well, so a zero-initialized arm would read
+// back as a PLAUSIBLE answer to a consumer that forgot to switch on `binds` —
+// the silent-wrong-answer shape, not the loud one. `nullopt` is the only
+// value that cannot be mistaken for a measurement.
+struct DSS_EXPORT TargetAsmConstraint {
+    // The letter exactly as it appears in the constraint string, WITHOUT
+    // modifiers. A string rather than a `char` because gcc machine
+    // constraints are not all one character (aarch64 `Ush`, x86 `Yz`), and
+    // because the natural growth direction is longer spellings, not wider
+    // chars. CASE-SENSITIVE and that is load-bearing: ✔MEASURED, x86_64 `d`
+    // is `%rdx` and `D` is `%rdi` — two different registers.
+    std::string letter;
+    AsmConstraintBinding binds = AsmConstraintBinding::RegisterClass;
+    std::optional<TargetRegClass>    registerClass;    // binds == RegisterClass
+    std::optional<std::uint16_t>     registerOrdinal;  // binds == Register
+    std::optional<OperandKindFilter> operandKind;      // binds == OperandKind
+};
 
 // Encoding slot — names WHERE a register/immediate value goes inside
 // the emitted byte sequence. Closed vocabulary. The x86-variable
@@ -1369,6 +1541,11 @@ inline constexpr EnumNameTable<EncodingSlotKind, 32> kEncodingSlotKindTable{{{
     { EncodingSlotKind::MemRelocDisp32,    "memreloc.disp32" },
     { EncodingSlotKind::Imm16Inverted, "imm16.inverted" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kEncodingSlotKindTable);
 
 // Centralised count — promoted from per-translation-unit local
 // constexpr per simplifier review. Used as the size of
@@ -2018,6 +2195,11 @@ inline constexpr EnumNameTable<RelocFormulaKind, 7> kRelocFormulaTable{{{
     { RelocFormulaKind::Aarch64Ld64GotLo12,   "aarch64_ld64_got_lo12" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kRelocFormulaTable);
+
 [[nodiscard]] DSS_EXPORT std::string_view
     relocFormulaName(RelocFormulaKind k) noexcept;
 
@@ -2062,6 +2244,11 @@ inline constexpr EnumNameTable<ExitMechanism, 3> kExitMechanismTable{{{
     { ExitMechanism::Syscall,      "syscall"        },
     { ExitMechanism::ByNameImport, "by-name-import" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kExitMechanismTable);
 
 [[nodiscard]] constexpr std::string_view exitMechanismName(ExitMechanism m) noexcept {
     return kExitMechanismTable.name(m);
@@ -2215,6 +2402,11 @@ inline constexpr EnumNameTable<ArgsMechanism, 3> kArgsMechanismTable{{{
     { ArgsMechanism::CrtArgvAccessors, "crt-argv-accessors"  },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kArgsMechanismTable);
+
 [[nodiscard]] constexpr std::string_view argsMechanismName(ArgsMechanism m) noexcept {
     return kArgsMechanismTable.name(m);
 }
@@ -2352,6 +2544,11 @@ inline constexpr EnumNameTable<TlsVariant, 2> kTlsVariantTable{{{
     { TlsVariant::Variant2, "variant2" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTlsVariantTable);
+
 [[nodiscard]] constexpr std::string_view tlsVariantName(TlsVariant v) noexcept {
     return kTlsVariantTable.name(v);
 }
@@ -2456,6 +2653,11 @@ inline constexpr EnumNameTable<TargetTerminatorKind, 7> kTargetTerminatorKindTab
     { TargetTerminatorKind::Unreachable, "unreachable" },
     { TargetTerminatorKind::IndirectBr,  "indirect-br" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTargetTerminatorKindTable);
 
 [[nodiscard]] constexpr std::string_view
 targetTerminatorKindName(TargetTerminatorKind k) noexcept {
@@ -2582,6 +2784,41 @@ struct DSS_EXPORT ImplicitRegisterConstraint {
         }
         return std::nullopt;
     }
+
+    // ★★★ THE `outputs ⊆ clobbered` INVARIANT, AS A QUERY ON THE TYPE
+    // ITSELF (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-
+    // CLOBBERED, 2026-08-15). Returns the index of the first output
+    // ordinal absent from `clobberedOrdinals`, or nullopt when the
+    // invariant holds.
+    //
+    // ⚠ IT LIVES HERE BECAUSE THIS TYPE HAS **TWO** PRODUCERS AND ONLY
+    // ONE OF THEM MEETS A LOADER. The `.target.json` loader enforces
+    // the rule for the per-OPCODE carrier; `LirBuilder::
+    // regConstraintPoolAdd` accepts a per-INSTRUCTION one built by a
+    // lowering, with no loader in the path. And the register
+    // allocator's forbidden set is `inputs ∪ clobbered` — outputs are
+    // deliberately omitted, on the strength of this invariant holding.
+    // So a violating entry does not fail: it silently leaves a value
+    // allocated to a register the instruction overwrites. Two carriers,
+    // one validator, and a THIRD component's safety argument resting on
+    // the validation only one of them got.
+    //
+    // Reads ORDINALS, not names: a target may spell one register
+    // several ways (sub-register aliases), and two different spellings
+    // of the same physical register must satisfy the rule. Callers that
+    // hold only names must resolve first — which every producer already
+    // does, because the ordinals are what the allocator reads.
+    [[nodiscard]] std::optional<std::size_t>
+    firstOutputNotClobbered() const noexcept {
+        for (std::size_t k = 0; k < outputOrdinals.size(); ++k) {
+            bool found = false;
+            for (auto const cl : clobberedOrdinals) {
+                if (cl == outputOrdinals[k]) { found = true; break; }
+            }
+            if (!found) return k;
+        }
+        return std::nullopt;
+    }
 };
 
 // One row per opcode; index in the vector IS the opcode's numeric
@@ -2624,15 +2861,35 @@ struct DSS_EXPORT TargetOpcodeInfo {
     TargetEncodingInfo   encoding;
 
     // 2-address legalization constraint (plan 13 AS3 — `lir_2addr_
-    // legalize.cpp`). When `true`, the LIR pre-assembly legalize
-    // pass ensures the instruction's `result` register equals
-    // `operands[0]` before the assembler sees it — by inserting an
-    // implicit `mov result, operands[0]` whenever they differ. x86's
+    // legalize.cpp`). ENGAGED means the LIR pre-assembly legalize pass
+    // ensures the instruction's `result` register equals the operand
+    // this names, before the assembler sees it — by inserting an
+    // implicit `mov result, operands[j]` whenever they differ. x86's
     // reg-reg arithmetic (add/sub/mul) needs this (REX.W 0x03 /r
     // writes into r/m, so the dest IS one of the sources); ARM64's
     // reg-reg arithmetic is 3-address natively and leaves this
-    // false.
-    bool                 requires2Address = false;
+    // DISENGAGED.
+    //
+    // ★★★ THE VALUE IS THE TIED SOURCE OPERAND'S INDEX, NOT A FLAG
+    // (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE, 2026-08-15). It was a
+    // `bool` with `0` written as a LITERAL at four consumer sites, so
+    // the only tie the whole pipeline could express was
+    // *result == operand[0]* — no `(result, operand j)` pair existed
+    // anywhere, which is what made a read-write asm operand (`"+r"`)
+    // unrepresentable. `.target.json` spells the default shape as
+    // `requires2Address: true` (⇒ index 0, every shipped opcode's
+    // meaning, unchanged) and a non-zero tie as that key PLUS
+    // `twoAddressSourceOperand: <j>`; the loader rejects the index
+    // without the flag, and rejects an index outside `maxOperands`.
+    //
+    // ⚠ NEVER COMPARE THIS TO `true` OR `false`. `opt == true` is a
+    // VALUE comparison (`*opt == 1`), so it silently means "tied to
+    // operand 1" — the trap that comes with folding a flag and an
+    // index into one field. Ask `.has_value()` (or use it in a
+    // boolean context, which every pre-existing reader already did
+    // and which keeps meaning "is this opcode two-address"), and read
+    // the index with `*`.
+    std::optional<std::uint8_t> requires2Address;
 
     // Implicit-register constraint (cycle 10p substrate, 2026-06-04).
     // Optional per-opcode block describing fixed-register semantics
@@ -2730,6 +2987,25 @@ struct DSS_EXPORT TargetSchemaData {
     // valid until ML6 regalloc requires the section.
     std::vector<TargetRegisterInfo> registers;
     substrate::TransparentStringMap<std::uint16_t> registerIndex;
+
+    // GNU inline-asm constraint letters declared by this target (the
+    // `asmConstraints` root key — see `TargetAsmConstraint` for the
+    // vocabulary-vs-grammar line this facet is drawn on). OPTIONAL and
+    // EMPTY BY DEFAULT: a target that declares none simply refuses every
+    // constraint letter by name, which is the correct answer for a
+    // processor whose inline-asm binding has not been described yet.
+    //
+    // ★ Populated AFTER `registers`, because a `binds: "register"` row
+    // resolves its name to an ORDINAL at load — the same precedent as the
+    // `implicitRegisters` roles. A dangling name is a load error, never a
+    // lookup that fails later at a site with no target in hand.
+    //
+    // ★ No side index. The table is a handful of rows (✔MEASURED: 10 on
+    // x86_64, 4 on arm64) keyed by a one- or two-character string, so a
+    // `TransparentStringMap` would cost more to build than the linear scan
+    // it replaces; the loader rejects duplicate letters, so the scan is
+    // unambiguous by construction rather than by convention.
+    std::vector<TargetAsmConstraint> asmConstraints;
 
     // The CIE's `return_address_register` — the DWARF column an unwinder
     // reads to find where this frame's return address went.
@@ -3009,6 +3285,30 @@ public:
     TargetSchema(TargetSchema&&) noexcept        = default;
     TargetSchema& operator=(TargetSchema&&) noexcept = default;
 
+    // Lowercase 64-hex SHA-256 of the EXACT document bytes this schema was
+    // loaded from — the cache key for the runtime-object cache, which keys on
+    // the config documents a build actually loaded.
+    //
+    // WHY RETAINED RATHER THAN RECOMPUTED. Re-walking `src/dss-config/` from
+    // disk to hash it costs ~165 ms per invocation (MEASURED 2026-08-17: 86
+    // files, 2,078,133 bytes; I/O-dominated — walk+read 152–160 ms, hash only
+    // 9–13 ms), and would be paid on EVERY build. The loaders already hold the
+    // bytes; they read them, parse them, and discard them. Digesting them
+    // where they already are costs zero extra I/O and happens once per load
+    // (loads are memoized in-process), and retaining 32 bytes of digest
+    // instead of up to 440 KB of document is what makes retention free.
+    //
+    // ⚠ EMPTY MEANS UNKNOWN, NEVER "no content". A schema built through a path
+    // that does NOT go via `loadFromText` — the public `TargetSchemaData`
+    // constructor above, which tests and in-memory mutators use — has no
+    // document bytes to digest and leaves this EMPTY. That is deliberate: an
+    // empty digest is a DETECTABLE unknown a cache can refuse to key on,
+    // whereas a fabricated or stale one is a silent wrong key. Every file
+    // route (`loadShipped` → `loadFromFile` → `loadFromText`) is digested.
+    [[nodiscard]] std::string_view  contentDigest() const noexcept {
+        return contentDigest_;
+    }
+
     [[nodiscard]] TargetSchemaId    id()       const noexcept { return d_.id; }
     [[nodiscard]] std::string_view  name()     const noexcept { return d_.name; }
     // Semantic version string declared by the target JSON. Round-trip
@@ -3079,6 +3379,53 @@ public:
         auto it = d_.registerIndex.find(name);
         if (it == d_.registerIndex.end()) return std::nullopt;
         return it->second;
+    }
+
+    // ── GNU inline-asm constraint letters ───────────────────────
+    // Every letter this target declares, in declaration order. EMPTY is a
+    // legitimate state: it means this processor has not described its
+    // inline-asm binding, and every constraint is then refused BY NAME.
+    [[nodiscard]] std::span<TargetAsmConstraint const>
+    asmConstraints() const noexcept {
+        return d_.asmConstraints;
+    }
+    [[nodiscard]] std::size_t asmConstraintCount() const noexcept {
+        return d_.asmConstraints.size();
+    }
+
+    // Resolve one constraint LETTER. Returns nullptr when this target does
+    // not declare it — which the caller must turn into a diagnostic naming
+    // the letter AND the target, never into a fallback guess. ✔MEASURED,
+    // this is exactly gcc's own behaviour: `"=a"` is `%rax` on x86_64 and
+    // "impossible constraint in 'asm'" on AArch64.
+    //
+    // ⚠ Takes the LETTER ONLY. A caller holding `"=&a"` must have stripped
+    // the modifiers first: `=`/`+`/`&`/`%` are GNU-asm grammar owned by the
+    // front end, and the loader refuses to store them, so passing a raw
+    // constraint string here always misses. Case-sensitive (`d` ≠ `D`).
+    [[nodiscard]] TargetAsmConstraint const*
+    asmConstraint(std::string_view letter) const noexcept {
+        for (auto const& c : d_.asmConstraints) {
+            if (c.letter == letter) return &c;
+        }
+        return nullptr;
+    }
+
+    // ★ THE VALID-LIST RENDERER FOR THE CONSUMER'S DIAGNOSTIC, so that the
+    // one message this facet cannot emit itself — "this target does not
+    // declare letter X" — still cannot be written with a hand-typed list.
+    // The list is per-TARGET, so there is no correct constant to type: the
+    // letters differ between processors, which is the whole point of the
+    // facet. ✔MEASURED, x86_64 declares 'a' and arm64 does not.
+    [[nodiscard]] std::string declaredAsmConstraintLetters() const {
+        std::string out;
+        for (auto const& c : d_.asmConstraints) {
+            if (!out.empty()) out += ", ";
+            out += '\'';
+            out += c.letter;
+            out += '\'';
+        }
+        return out;
     }
 
     // The CIE's `return_address_register` (see the field's docblock in
@@ -3313,6 +3660,11 @@ public:
         std::string_view jsonText, std::string_view sourceLabel = "<inline>");
 
 private:
+    // Lowercase 64-hex SHA-256 of the document bytes — see `contentDigest()`.
+    // Written ONLY by `loadFromText` (a static member, so no friend is
+    // needed); every other construction path leaves it empty on purpose.
+    std::string contentDigest_;
+
     detail::TargetSchemaData d_;
 };
 

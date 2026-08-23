@@ -3,8 +3,96 @@
 ### Step 6 — Fail-loud gate
 This is the canonical gate checklist (§A.6 is its one-line statement). Verify every item:
 - `cmake --build build` clean (no link errors).
+- **★★★ THE BUILD IS VERIFIABLE — run this BEFORE trusting any ctest result:**
+
+  ```bash
+  python scripts/check-ninja-deps/check-ninja-deps.py build-dbg
+  ```
+
+  A green ctest proves nothing about the current source if the objects it linked were never
+  rebuilt, and that is not hypothetical here: `ninja -t deps` has twice reported `#deps 0` on
+  live objects — **10 of 403** on 2026-08-13, then **51 of 430** after a seven-lane concurrent
+  cycle, **16 of those being `src/` TUs compiled into the shipped DLL**. A gate run in that state
+  is a green suite over a partly-stale compiler: the same class as a false-green red-on-disable,
+  arriving through the build system instead of through a test
+  (`D-BUILD-NINJA-RECORDS-ZERO-HEADER-DEPS-UNDER-CONCURRENT-BUILDS`).
+  ⚠ `#deps 0` is NEVER legitimate — ✔MEASURED that even a TU with zero `#include` directives
+  records `#deps 1` (gcc lists the source itself), so a zero count is always a lost record, never
+  a header-free file. The tool treats an EMPTY parse as FATAL too: "nothing found" and "nothing
+  ran" look identical from outside, and this project has been burned by that ambiguity before.
 - `ctest --test-dir build --output-on-failure` 100%, including the new tests.
-- anchor-registry guard OK: `tools/check-anchor-registry.ps1` (or `.sh`).
+- ★★★ **A CTEST RUN THAT OVERLAPPED A BUILD IS VOID IN BOTH DIRECTIONS — AND IT CAN STILL LOOK
+  GREEN.** ✔MEASURED 2026-08-17: a lane ran `ninja` while its own gate was executing (the documented
+  *mid-run DLL relink is never OK* hazard), and the run **reported 875/875** while emitting ~400
+  spurious `***Exception` lines. Its one substantive failure, `examples/c-subset/double_to_unsigned`,
+  **passed on a clean re-run** — so the poisoning invented a failure, and a run that can invent one
+  can equally mask one. ⇒ **Never treat an overlapped run as evidence in either direction. Re-run it.**
+  ⚠ **AND KILLING THE WRAPPER DOES NOT KILL `ctest`.** In the same incident `TaskStop` terminated the
+  wrapper while `ctest` kept running and kept writing — so a gate you believe you stopped may still be
+  live, competing for the DLL and the log. Confirm the process is gone before rebuilding, or the next
+  run inherits the first one's corruption. ⓘ The honest reporting standard the same lane then met:
+  *"did not reach a terminal state … the full-suite figure is unmeasured"* — a partial count plus a
+  named reason beats a number nobody can trust.
+  ★★★ **TRIAGE RULE THAT SETTLES THIS CLASS IN ONE GREP — `0xc0000142` EN MASSE IS ENVIRONMENTAL, NEVER
+  A CODE REGRESSION.** ✔MEASURED on the poisoned log: tests **1–100 all passed**, then **775 failures,
+  every single one `Exit code 0xc0000142`** (STATUS_DLL_INIT_FAILED — the process never *started*), with
+  **zero** `(Failed)`, zero `(Subprocess aborted)`, zero `(Timeout)`, and the cutover exactly at
+  teardown. **A code defect produces assertion failures; it cannot stop 775 unrelated binaries from
+  initialising.** ⇒ classify by FAILURE KIND before believing a count: a uniform startup code across
+  hundreds of unrelated suites is the harness or the DLL, and the number is not a verdict about the
+  compiler at all.
+  ⛔ **Two handling rules from the same incident.** (1) When you kill an orphaned `ctest`, match on the
+  COMMAND LINE and kill by explicit PID — killing by process name murders a concurrent operator gate
+  (there were two unrelated `ctest.exe` processes running from `C:\Program Files\CMake\bin`). (2) Do
+  NOT edit a poisoned log to annotate it; drop a `*.POISONED.README.txt` marker beside it. Editing the
+  evidence is how a suspect log later gets read as a clean one.
+- **no NEW `abort()` in test code:**
+
+  ```bash
+  python scripts/check-no-abort-in-tests/check-no-abort-in-tests.py
+  ```
+
+  `std::abort()` in a fixture kills the whole test PROCESS, so every sibling test in that
+  executable loses its verdict and the harness cannot report which unit failed. ✔MEASURED
+  2026-08-17: a config-mutating pin drove `loadShipped` to a **legitimate** refusal and the binary
+  died with `0xc0000409` mid-suite, taking **nine passing tests' results** with it and reporting an
+  exception code instead of the load error — the arm that was working correctly is the one that
+  destroyed the evidence. ★★ The guard is a **RATCHET, not a clean bill**: the row that demanded it
+  named 2 occurrences and the first scan found **61 live sites across 29 files** (the same
+  `ADD_FAILURE(); std::abort();` idiom copy-pasted), so those are recorded in an `INVENTORY` whose
+  per-file ceilings may only come **down**. A new site reds; a *fixed* site also reds until the
+  ceiling is lowered, because unclaimed headroom is where the next regression hides. ⚠ Do not
+  confuse `INVENTORY` with `ALLOWLIST` — the latter is by PROOF and is empty. Burn-down is
+  `D-TEST-ABORT-IN-A-FIXTURE-HAS-NO-GUARD`, which stays OPEN until the inventory is.
+  ⓘ Self-tests: `python scripts/check-no-abort-in-tests/check-no-abort-in-tests.py --selftest` (the comment/string stripper is
+  the whole correctness — a bare token grep would red on the very file that documents the fix).
+- anchor-registry guard OK: `scripts/check-anchor-registry/check-anchor-registry.ps1` (or `.sh`).
+  ⓘ Exit **4** now means *a citation names a RETIRED anchor id* — a name whose registry row opens
+  with the `RETIRED-ID` marker. Resolution is substring-anywhere (load-bearing: it is what lets a
+  line-wrapped citation resolve), so it cannot otherwise tell a live name from a dead one — a stale
+  id resolved for weeks on the strength of the row written to report it as stale
+  (`D-GATE-ANCHOR-CITATION-RESOLVES-VIA-ITS-OWN-BUG-REPORT`).
+- script-index guard OK: `python scripts/check-scripts-index/check-scripts-index.py`.
+  Rides ctest as `scripts_index_guard`, so it runs anyway — run it directly when this cycle
+  added, renamed, deleted or REPURPOSED a script. It reds when the tree and the two indexes
+  (`scripts/README.md`, `references/scripts.md`) disagree, or when a script's own `PURPOSE:`
+  line differs from its index row. Regenerate both with `--write`; never hand-edit the block
+  between the generated-index markers.
+- shell-portability guard OK: `python scripts/check-shell-portability/check-shell-portability.py`.
+  Rides ctest as `shell_portability_guard`, so it runs anyway — run it directly when this cycle
+  touched a `.sh`. It refuses two shapes that are fatal on **macOS bash 3.2** and invisible
+  everywhere else: a `case` inside `$( … )` whose patterns are not `(`-prefixed, and a bash-4+
+  construct in a file with no `BASH_VERSINFO` gate above it.
+  ★★ ⚠ **`bash -n` CANNOT FIND THE FIRST ONE** — ✔MEASURED 2026-08-22: the probe file parses clean
+  under 3.2 (exit 0) and fails only when the substitution is EXPANDED. Do not "check it with the old
+  shell" instead; that instrument is blind by construction. The cost of not having this guard was
+  `anchor_registry_guard` dying inside its OWN self-test on `macos-latest`, so the anchor registry
+  had never been checked on that host (`D-SCRIPT-CASE-IN-COMMAND-SUBSTITUTION-BREAKS-BASH-3-2`).
+  ⓘ It walks the TREE and asks git only what is IGNORED — never `git ls-files`. ✔MEASURED on the
+  macOS leg the same day: a carriage's checkout sits at an old commit with the working tree rsynced
+  over it, so the INDEX named seven deleted `tools/*.sh` paths and the guard reported seven
+  violations on a host where nothing was wrong. Every carriage has that shape, so the distinction is
+  operational, not academic (`D-GATE-SHELL-PORTABILITY-SCANNED-THE-INDEX-NOT-THE-TREE`).
 - agnosticism scan clean (no hardcoded language/CPU/format in shared substrate).
 - CI-hazard screen clean (from Step 5): no GCC-vs-MSVC portability traps. Local green ≠ CI green.
 - review folded clean.
@@ -18,7 +106,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   a gate item with a number, checked exactly like ctest. Count before and after and report both:
 
   ```bash
-  python tools/check-anchor-balance.py
+  python scripts/check-anchor-balance/check-anchor-balance.py
   ```
 
   It prints OPEN-at-base, OPEN-now, and **the name of every row that opened or closed** — the count
@@ -84,13 +172,22 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   is the task not being done.** Before writing ANY row, answer in one sentence: *is this the work I
   was sent to do?* If yes, the row is forbidden and the work is mandatory. That cycle's 22 committed
   rows over five commits are the same arithmetic at a slower rate.
+
+  ⓘ ANCHOR-GUARD-QUOTED-NOT-CITED: `D-PP-COMPILER-IDENTITY-INCOHERENT` `D-PP-IMPL-DETAIL-PREDEFINES-ABSENT` `D-PP-CODE-MODEL-PREDEFINES`
+  — the three ids in the paragraph above are **quoted, not cited**. They name rows that were correctly
+  DELETED, so they resolve to nothing **by design**, and the sentence only carries weight because they
+  are the real names. They must not be given rows, allowlisted, or blurred into placeholders to make a
+  tool green: the record is the authority, the guard is the instrument. The anchor guard exempts them
+  **in this file only**, and reds if any of them is ever cited elsewhere, acquires a plan row, or stops
+  appearing above — see the QUOTED-NOT-CITED block in
+  `scripts/check-anchor-registry/check-anchor-registry.sh`.
 - **★ FOUR ROWS THAT LOOK DIFFERENT AND ARE THE SAME ROW.** Before appending, grep the registry for
   the SYMPTOM, the ARTEFACT and the FILE NAMES in your evidence — not the title you have in mind
   (§C.-1 1b). Nine rows about one absent macro family is one row, or better, one fix.
 - **★★ THE DIAGNOSTIC-CODE ALLOCATION GATE — the ordinal space has no lock, so this is the lock.**
 
   ```bash
-  python tools/check-diagnostic-codes.py
+  python scripts/check-diagnostic-codes/check-diagnostic-codes.py
   ```
 
   `DiagnosticCode` is one flat ordinal space whose values are PUBLISHED identities (`error[D0029]`,
@@ -99,7 +196,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   - ✔**Two concurrent lanes allocated `0xD029`.** One lane was told the slot was free; another had
     already taken it for `D_DependencyBuildFailed`. Nothing mechanical noticed — it was caught only
     because the second lane RE-MEASURED the header instead of trusting its brief. That is diligence,
-    not a mechanism, and it is the same non-mechanism `tools/run-gate.sh` exists to replace.
+    not a mechanism, and it is the same non-mechanism `scripts/run-gate/run-gate.sh` exists to replace.
   - ✔**A code shipped with no test at all.** `D-AP6-NEW-DIAGNOSTIC-CODES-HAD-NO-VALUE-PIN` closed on
     exactly this and **re-opened one cycle later**: `D_LanguageTargetIsaMismatch` (0xD02A) landed
     engine code in `src/` while appearing in ZERO test files.
@@ -222,6 +319,6 @@ what makes "two cycles running shipped on one leg" visible as a pattern instead 
   cannot be compressed, that is a signal the project has more open fronts than priorities, and
   saying so IS the handoff.
 - ⚠ **A handoff written from memory is worse than none.** Re-measure the numbers at cycle end
-  (`ctest`, `tools/check-anchor-balance.py`, `git log --oneline -1`) and paste what they printed.
+  (`ctest`, `scripts/check-anchor-balance/check-anchor-balance.py`, `git log --oneline -1`) and paste what they printed.
   This repo has recorded three counts written from memory that all erred LOW; the handoff is the
   single most-quoted document in the project, so a wrong number there propagates furthest.

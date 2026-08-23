@@ -1,11 +1,10 @@
 # Homebrew formula for the dsscp compiler (macOS + Linux tap).
 # Rendered by packaging/render.py from the release assets on each publish.
 #
-# This is a BINARY formula: it downloads the per-OS/arch release tarball and
-# installs the CLI + its shared library. It ASSUMES the eventual install
-# layout (a `dsscp` executable + the shared lib, with an rpath so the exe finds
-# the lib) — i.e. it depends on the queued `install()`/rpath + `dsscp`-rename
-# prerequisites. Until those land this formula will not `brew install` cleanly.
+# This is a BINARY formula: it downloads the per-OS/arch release tarball, which
+# is a PREFIX TREE produced by `cmake --install` (bin/, lib/, share/) — see
+# cmake/DssInstall.cmake, the single owner of what ships. Still depends on the
+# queued dss-code-prime -> dsscp binary rename.
 class @CLASSNAME@ < Formula
   desc "@DESCRIPTION@"
   homepage "@HOMEPAGE@"
@@ -31,17 +30,33 @@ class @CLASSNAME@ < Formula
   end
 
   def install
-    # The tarball's sole top-level entry is bin/, which Homebrew strips before
-    # `install` runs — so paths here are relative to bin/ (i.e. dss/, NOT bin/dss/).
-    # Install the shared lib into the Homebrew prefix lib and the CLI into bin;
-    # the exe's baked rpath (@loader_path/../lib on macOS, $ORIGIN/../lib on Linux)
-    # resolves the lib.
-    lib.install Dir["dss/*.dylib", "dss/*.so", "dss/*.so.*"]
-    bin.install "dss/dsscp"
+    # The tarball has SEVERAL top-level entries (bin/, lib/, share/), so Homebrew
+    # does NOT strip a leading directory — paths here are the prefix tree itself.
+    # Installed WHOLE into the keg, deliberately: `dsscp` locates its config tree
+    # by a path RELATIVE TO ITS OWN EXECUTABLE (`../share/dss-code-prime/<version>/
+    # dss-config`), and its rpath finds the shared library the same way
+    # (@loader_path/../lib on macOS, $ORIGIN/../lib on Linux). Cherry-picking the
+    # exe and the lib would break both hops, and the compiler would then be unable
+    # to resolve `#include <stdio.h>`. Homebrew symlinks bin/dsscp into its own
+    # bin; the resolver follows symlinks to the real keg path, so the relative hop
+    # still lands inside the keg.
+    prefix.install Dir["*"]
   end
 
   test do
-    # TODO: tighten once dsscp has a stable --version/--help contract.
-    assert_predicate bin/"dsscp", :exist?
+    # Compile something REAL. `--version`/`--help` would pass on a keg with no
+    # config tree at all, which is exactly the breakage this formula shipped
+    # before the install set existed; resolving `#include <stdio.h>` cannot.
+    (testpath/"hello.c").write <<~C
+      #include <stdio.h>
+      int main(void) { printf("ok\\n"); return 42; }
+    C
+    spec = if OS.mac?
+      Hardware::CPU.arm? ? "arm64:macho64-arm64-darwin-exec" : "x86_64:macho64-x86_64-darwin-exec"
+    else
+      Hardware::CPU.arm? ? "arm64:elf64-aarch64-linux-exec" : "x86_64:elf64-x86_64-linux-exec"
+    end
+    system bin/"dsscp", "--compile", "hello.c", "--language", "c-subset",
+                        "--target", spec, "--output", testpath
   end
 end

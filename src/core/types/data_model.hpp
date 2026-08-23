@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> (leaf header — no target_schema cycle)
 
 #include <cstdint>
 #include <optional>
@@ -43,7 +44,10 @@
 // default-constructed / zero `DataModel` is NOT a valid model — the
 // format loader requires the field, `validate()` rejects a zero value
 // from hand-built `ObjectFormatData`, and `dataModelName` returns the
-// empty view for it (EnumNameTable miss).
+// empty view for it — the zero value is deliberately NOT a row of
+// `kDataModelTable`, and the name side asks `nameOrEmpty`, whose whole
+// job is to render an unlisted value as the empty view rather than as
+// row 0's spelling.
 
 namespace dss {
 
@@ -53,29 +57,57 @@ enum class DataModel : std::uint8_t {
     Ilp32 = 3,  // int 32 / long 32 / ptr 32 — declared-only (wasm32 / spirv)
 };
 
-// Hand-rolled name pair instead of the house `EnumNameTable<E,N>`: that
-// template lives in `target_schema.hpp`, which this header CANNOT include
-// — `semantic_config.hpp` (which carries DataModel-keyed maps) is pulled
-// EARLY by `grammar_schema.hpp`, before `LoadResult`/`ConfigDiagnostic`
-// are defined, and `target_schema.hpp` consumes those — the same cycle
-// the `symbol_attrs.hpp` forward-declaration note in semantic_config.hpp
-// documents. Three values; the switch stays trivially in sync with the
-// enum (a new member without a name arm fails the -Wswitch build).
+// ── THE ONE OWNER OF THE DATA-MODEL SPELLINGS ─────────────────────────────
+//
+// ⚠ THIS USED TO BE A SWITCH PLUS AN IF-CHAIN, and the comment that stood here
+// justified it with an include cycle that NO LONGER EXISTS. `EnumNameTable<E,N>`
+// was extracted out of `target_schema.hpp` into the dependency-free
+// `core/types/enum_name_table.hpp` precisely so leaf enum headers could carry
+// tables — that header's own comment names THIS FILE as one of the two
+// motivating cases. The stated blocker had been stale for cycles, and the
+// hand-rolled shape it protected left the spellings with TWO owners (the
+// `switch` and the `if`-chain) plus a THIRD in every loader message that
+// retyped them (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+//
+// ★ THE SENTINEL IS DELIBERATELY NOT A ROW. A zero / default-constructed
+// `DataModel` is not a valid model, and it must have NO spelling: giving it one
+// (even `""`) would let `dataModelFromName` resolve it. It is left out, and the
+// name side asks `nameOrEmpty` rather than `name` so an unlisted value renders
+// EMPTY — which is exactly what `ObjectFormatData::validate()` tests with
+// `dataModelName(dataModel).empty()`. Using `name()` here would return `"LP64"`
+// for a never-declared model and validate() would ACCEPT it.
+inline constexpr EnumNameTable<DataModel, 3> kDataModelTable{{{
+    { DataModel::Lp64,  "LP64"  },
+    { DataModel::Llp64, "LLP64" },
+    { DataModel::Ilp32, "ILP32" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kDataModelTable);
+
 [[nodiscard]] constexpr std::string_view
 dataModelName(DataModel m) noexcept {
+    // ★ THE `-Werror=switch` BACKSTOP, AND IT OWNS NO SPELLING. The table above
+    // owns every name; this switch names only the ENUMERATORS, which the
+    // compiler itself keeps exhaustive (project-wide `-Werror=switch` /
+    // `/we4062`, CMakeLists.txt). Adding a data model without a table row
+    // therefore still fails the BUILD — the one guarantee the hand-written name
+    // switch gave that a bare table lookup would have quietly dropped — while
+    // the spellings stay in exactly one place. The arms fall through to a
+    // single `break` on purpose: there is nothing to return per-model.
     switch (m) {
-        case DataModel::Lp64:  return "LP64";
-        case DataModel::Llp64: return "LLP64";
-        case DataModel::Ilp32: return "ILP32";
+        case DataModel::Lp64:
+        case DataModel::Llp64:
+        case DataModel::Ilp32:
+            break;
     }
-    return {};
+    return kDataModelTable.nameOrEmpty(m);   // NOT .name() — see the table's note
 }
 [[nodiscard]] constexpr std::optional<DataModel>
 dataModelFromName(std::string_view s) noexcept {
-    if (s == "LP64")  return DataModel::Lp64;
-    if (s == "LLP64") return DataModel::Llp64;
-    if (s == "ILP32") return DataModel::Ilp32;
-    return std::nullopt;
+    return kDataModelTable.fromName(s);
 }
 
 // ── Long-double format (FC17.9(e), D-CSUBSET-LONG-DOUBLE): the per-format
@@ -106,26 +138,45 @@ enum class LongDoubleFormat : std::uint8_t {
     Ieee128 = 3,  // IEEE binary128, 16/16 (AAPCS64 linux-arm64)
 };
 
-// Hand-rolled name pair (not EnumNameTable) — same include-cycle constraint
-// as dataModelName above. `None` deliberately has NO JSON spelling: omission
-// is the only way to leave the axis undeclared (a spellable "none" would let
-// a typo'd config look deliberate).
+// The ONE owner of the long-double-axis spellings — the `kDataModelTable`
+// shape, for the same reason (the include-cycle argument that kept both of
+// these hand-rolled is stale; see that table's note).
+//
+// ★ `None` IS DELIBERATELY NOT A ROW, and here the omission is load-bearing in
+// BOTH directions: omission is the only way to leave the axis undeclared, so a
+// spellable "none" would let a typo'd config look deliberate — and a row
+// carrying the EMPTY name would make `longDoubleFormatFromName("")` resolve to
+// `None`, i.e. `"longDoubleFormat": ""` would read as a declaration. Left out
+// of the table, `fromName` refuses every spelling of it and
+// `nameOrEmpty(None)` renders empty, which is the pre-existing contract.
+inline constexpr EnumNameTable<LongDoubleFormat, 3> kLongDoubleFormatTable{{{
+    { LongDoubleFormat::F64,     "f64"     },
+    { LongDoubleFormat::X87_80,  "x87-80"  },
+    { LongDoubleFormat::Ieee128, "ieee128" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kLongDoubleFormatTable);
+
 [[nodiscard]] constexpr std::string_view
 longDoubleFormatName(LongDoubleFormat f) noexcept {
+    // The `-Werror=switch` backstop — see `dataModelName`. `None` is listed
+    // here (the compiler requires it) and carries no arm of its own: it is the
+    // value the table deliberately omits, and `nameOrEmpty` renders it empty.
     switch (f) {
-        case LongDoubleFormat::None:    return {};
-        case LongDoubleFormat::F64:     return "f64";
-        case LongDoubleFormat::X87_80:  return "x87-80";
-        case LongDoubleFormat::Ieee128: return "ieee128";
+        case LongDoubleFormat::None:
+        case LongDoubleFormat::F64:
+        case LongDoubleFormat::X87_80:
+        case LongDoubleFormat::Ieee128:
+            break;
     }
-    return {};
+    return kLongDoubleFormatTable.nameOrEmpty(f);
 }
 [[nodiscard]] constexpr std::optional<LongDoubleFormat>
 longDoubleFormatFromName(std::string_view s) noexcept {
-    if (s == "f64")     return LongDoubleFormat::F64;
-    if (s == "x87-80")  return LongDoubleFormat::X87_80;
-    if (s == "ieee128") return LongDoubleFormat::Ieee128;
-    return std::nullopt;
+    return kLongDoubleFormatTable.fromName(s);
 }
 
 } // namespace dss

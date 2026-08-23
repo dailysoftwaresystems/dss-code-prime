@@ -28,6 +28,7 @@
 #include "link/format/object_format_backends.hpp"
 
 #include "core/substrate/diagnostic_collector.hpp"
+#include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/pe.hpp"
 #include "link/object_format_schema.hpp"
@@ -150,8 +151,14 @@ public:
                     if (tEnum.has_value()) {
                         data.pe.objectType = *tEnum;
                     } else {
+                        // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-
+                        // CLOSED-SET: projected from the table the lookup
+                        // above consults, never retyped beside it.
                         coll.emit(DiagnosticCode::C_MalformedJson, "/pe/type",
-                                  "'type' must be 'obj' / 'exec' / 'dll'");
+                                  std::format("'type' must be {}",
+                                              ::dss::detail::renderAllowedList(
+                                                  allNames(kPeObjectTypeTable),
+                                                  " / ")));
                     }
                 }
             }

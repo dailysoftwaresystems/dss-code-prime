@@ -5,11 +5,14 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
+#include "mir/mir_asm_descriptor.hpp"
 #include "mir/mir_text.hpp"
 
 #include <gtest/gtest.h>
 
 #include <array>
+#include <format>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -804,4 +807,85 @@ TEST(MirText, UnknownFunctionAttributeIsMalformed) {
     EXPECT_FALSE(res->ok)
         << "an unknown function attribute must not parse clean";
     EXPECT_GT(r.errorCount(), 0u);
+}
+
+// ── inline asm in the text format ───────────────────────────────────────────
+//
+// ★★★ THIS FILE HAD **ZERO** COVERAGE OF EITHER ASM OPCODE, IN EITHER
+// DIRECTION, UNTIL 2026-08-19 (D-MIR-TEXT-INLINE-ASM-RENDERS-A-POOL-INDEX-AND-
+// NO-EDGES). Both fell into the writer's `default:` arm, which rendered the
+// operands and then the raw `instPayload` — an index into the module's
+// `MirAsmDescriptorPool`, meaningless once the text leaves the module — and,
+// because `default:` renders no successors, an `asm goto` printed with **no CFG
+// edges at all**. Nothing asserted against either.
+//
+// ⚠ THE ONE-WAY-NESS IS NOT THE DEFECT AND THIS TEST PINS IT AS CORRECT. The
+// parser REFUSES both mnemonics by name and states why (the descriptor carries
+// text and constraints this format does not spell), so the dump is deliberately
+// not re-readable. A one-way dump is a choice; a dump that silently drops a
+// terminator's edges while looking complete is not.
+TEST(MirText, InlineAsmGotoRendersEveryEdgeAndNamesTheUnspelledDescriptor) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, voidT, CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const l0    = b.createBlock(StructCfMarker::Linear);
+    MirBlockId const l1    = b.createBlock(StructCfMarker::Linear);
+    b.beginBlock(entry);
+    MirAsmDescriptor d;
+    d.templateText   = "jmp %l[a]";
+    d.labelSpellings = {{"%l[a]"}, {"%l[b]"}};
+    MirBlockId const labels[] = {l0, l1};
+    auto const r = b.addInlineAsmGoto(std::move(d), {}, labels);
+    ASSERT_TRUE(r.terminator.valid());
+    MirBlockId const cont = r.continuation();
+    b.beginBlock(l0);   b.addReturn();
+    b.beginBlock(l1);   b.addReturn();
+    b.beginBlock(cont); b.addReturn();
+    Mir const m = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    std::vector<std::string> names{"", "f"};
+    MirTextContext ctx{&ti, &names};
+    std::string const text = emitMir(m, ctx, rep);
+
+    // Every edge is rendered, and the fall-through is LABELLED rather than left
+    // to be inferred from its position — a reader checking the convention should
+    // not have to have remembered it.
+    EXPECT_NE(text.find(std::format("%b{}", l0.v)), std::string::npos)
+        << "label 0's edge is missing from the dump:\n" << text;
+    EXPECT_NE(text.find(std::format("%b{}", l1.v)), std::string::npos)
+        << "label 1's edge is missing from the dump:\n" << text;
+    EXPECT_NE(text.find(std::format("fallthrough %b{}", cont.v)), std::string::npos)
+        << "the fall-through edge is missing or unlabelled:\n" << text;
+    EXPECT_NE(text.find("<asm-descriptor-unspelled>"), std::string::npos)
+        << "the absent descriptor must be NAMED, not replaced by a number:\n" << text;
+    // ★★ THE MARKER IS ONE TOKEN BECAUSE A PHRASE BROKE THE PROCESS.
+    // ✔MEASURED while writing this test: spelling it
+    // `<descriptor not spelled by this format>` aborted the run with
+    // `addInst: opcode 'not' takes [1, 1] operands but got 0`. The parser refuses
+    // the `inlineasm*` mnemonic and its recovery then re-tokenizes the rest of the
+    // line, where the bare word `not` IS a real MIR opcode — so the WRITER was
+    // handing the PARSER a valid instruction inside human prose. Asserting that no
+    // space follows the marker is what stops a future edit from reintroducing one.
+    EXPECT_EQ(text.find("<asm-descriptor-unspelled "), std::string::npos)
+        << "the marker must stay a single token — the parser re-tokenizes the "
+           "tail of a refused instruction:\n" << text;
+
+    // ★ THE ANTI-REGRESSION HALF. The old rendering was `payload <pool index>`;
+    // a raw index reads as data and is not one. Asserting its ABSENCE is what
+    // makes reverting the writer arm visible here rather than only in review.
+    EXPECT_EQ(text.find("payload "), std::string::npos)
+        << "a raw descriptor-pool index is back in the dump:\n" << text;
+
+    // ⓘ THE PARSER'S REFUSAL IS THE DECLARED BEHAVIOUR, pinned so a future
+    // round-trip cannot be added on one side only.
+    DiagnosticReporter back;
+    auto parsed = parseMir(text, CompilationUnitId{1}, back);
+    EXPECT_FALSE(parsed->ok)
+        << "the text format does not spell an asm descriptor; the parser must "
+           "refuse rather than build a module missing one";
 }

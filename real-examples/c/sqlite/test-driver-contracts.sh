@@ -875,8 +875,16 @@ pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver 
   # THE SUBJECT FIRST, and on its LAST line: the extraction must END at the eval
   # STATEMENT, so a mutation that removes it cannot leave this pin asserting over a
   # prefix of the call site.
-  ck "the extracted call site ENDS at the eval statement" "yes" \
-     "$(case "$(printf '%s\n' "$callsite" | tail -1)" in *'eval "CONFOUND_PATTERNS=('*) echo yes ;; *) echo no ;; esac)"
+  # ⚠ THIS WAS A `case` INSIDE `$( ... )` AND THAT SHAPE IS UNRUNNABLE ON bash 3.2 --
+  # the `)` closing the pattern ends the substitution early, so the arm expands to
+  # literal text (D-SCRIPT-CASE-IN-COMMAND-SUBSTITUTION-BREAKS-BASH-3-2). This file
+  # gates on bash 4+ so it never met that shell, but the shape spreads by being
+  # copied, and `check-shell-portability` refuses it repository-wide. `ck_has` already
+  # IS the containment predicate, and its `case` is a plain statement rather than a
+  # substitution -- so the fix is to use the helper that exists, and the failure output
+  # improves too (it names the haystack and the needle instead of printing `no`).
+  ck_has "the extracted call site ENDS at the eval statement" \
+     "$(printf '%s\n' "$callsite" | tail -1)" 'eval "CONFOUND_PATTERNS=('
   ck_has "...and it carries the supply call itself" "$callsite" 'leg_confound_patterns "$leg"'
   script="$(mktemp "${TMPDIR:-/tmp}/dss-confound-callsite-XXXXXX.sh")"
   # `$LEG_STATE` / `$AFTER` are written by THIS file; everything between them is

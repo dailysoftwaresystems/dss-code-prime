@@ -43,6 +43,15 @@ std::shared_ptr<SourceBuffer const> BufferRegistry::tryGet(BufferId id) const no
     return (it == byId_.end()) ? nullptr : it->second;
 }
 
+void BufferRegistry::addAll(BufferRegistry const& other) {
+    // Self-merge is a no-op rather than an iterator hazard: `byId_[id] = ...`
+    // over the container being iterated would rehash mid-walk.
+    if (&other == this) return;
+    for (auto const& [id, buf] : other.byId_) {
+        if (buf) byId_[id] = buf;
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // DiagnosticReporter
 // ─────────────────────────────────────────────────────────────────────────
@@ -95,6 +104,29 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
     hitCap_         = snap.hitCap;
     droppedByCap_   = snap.droppedByCap;
     capMarkerIndex_ = snap.capMarkerIndex;
+}
+
+void DiagnosticReporter::reanchorFrom(std::size_t      from,
+                                      BufferId         newBuffer,
+                                      SourceSpan       newSpan,
+                                      std::string_view note) {
+    // Post-admission, in place: no insert, no erase, so `capMarkerIndex_`
+    // stays valid and the dedup window (which tracked the ORIGINAL keys at
+    // admission) is left alone — `remapBuffers`' contract, verbatim.
+    if (from > all_.size()) return;
+    for (std::size_t i = from; i < all_.size(); ++i) {
+        ParseDiagnostic& d = all_[i];
+        // The BUFFER, never the span, decides whether there was a locus to
+        // demote: a zero-width span at a real buffer is a genuine position
+        // (a Missing node at a byte), while no buffer means the diagnostic
+        // was raised text-only and has nothing to hand down.
+        if (d.buffer.valid()) {
+            d.related.push_back(
+                RelatedLocation{d.buffer, d.span, std::string{note}});
+        }
+        d.buffer = newBuffer;
+        d.span   = newSpan;
+    }
 }
 
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
@@ -533,7 +565,17 @@ void appendExpectedActual(std::string& out, ParseDiagnostic const& d) {
             std::format_to(std::back_inserter(out), " — got {}", d.actual);
         }
     } else if (!d.actual.empty()) {
-        std::format_to(std::back_inserter(out), "got {}", d.actual);
+        // ★★★ NO `expected` MEANS NOTHING TO CONTRAST WITH, SO THERE IS NO "got".
+        // `got X` is half of the pair `expected Y — got X`; printed alone it is a
+        // sentence fragment, and for the SEMANTIC band it is an ungrammatical one:
+        // those codes carry a full prose sentence in `actual` and leave `expected`
+        // empty by design, so the render used to read
+        //   error[S006A]: got the inline-asm template references operand `%3` …
+        // ⚠ The condition is on `expected`, NOT on the code's band. Keying it on
+        // the band would be a second owner of "is this a contrast?" that could
+        // disagree with the field the renderer actually reads
+        // (D-DIAG-PROSE-MESSAGE-RENDERS-WITH-A-BARE-GOT-PREFIX).
+        out += d.actual;
     } else {
         out += diagnosticCodeName(d.code);
     }
@@ -550,6 +592,17 @@ void appendScopeStack(std::string& out, ParseDiagnostic const& d) {
 }
 
 } // namespace
+
+// The caller's registry is authoritative; this reporter's own retained
+// buffers answer only what it cannot. The two can never disagree — `BufferId`
+// comes from ONE process-wide monotonic counter — so the order matters for
+// cost, not for correctness.
+std::shared_ptr<SourceBuffer const>
+DiagnosticReporter::resolveBuffer_(BufferId id,
+                                   BufferRegistry const& bufs) const noexcept {
+    if (auto buf = bufs.tryGet(id)) return buf;
+    return ownBuffers_.tryGet(id);
+}
 
 std::string DiagnosticReporter::format(ParseDiagnostic const& d,
                                        BufferRegistry const& bufs) const {
@@ -572,7 +625,7 @@ std::string DiagnosticReporter::format(ParseDiagnostic const& d,
     out += '\n';
 
     // Primary location + caret + source line, if we can resolve the buffer.
-    if (auto buf = bufs.tryGet(d.buffer)) {
+    if (auto buf = resolveBuffer_(d.buffer, bufs)) {
         appendLineWithCaret(out, *buf, d.span, "");
     } else {
         std::format_to(std::back_inserter(out),
@@ -583,7 +636,7 @@ std::string DiagnosticReporter::format(ParseDiagnostic const& d,
     // Related locations.
     for (auto const& rel : d.related) {
         std::format_to(std::back_inserter(out), "note: {}\n", rel.note);
-        if (auto buf = bufs.tryGet(rel.buffer)) {
+        if (auto buf = resolveBuffer_(rel.buffer, bufs)) {
             appendLineWithCaret(out, *buf, rel.span, "");
         } else {
             std::format_to(std::back_inserter(out),

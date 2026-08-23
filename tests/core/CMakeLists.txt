@@ -8,6 +8,10 @@ dss_add_test(NAME core/test_token               SOURCES test_token.cpp)
 dss_add_test(NAME core/test_rule_id             SOURCES test_rule_id.cpp)
 dss_add_test(NAME core/test_parse_diagnostic    SOURCES test_parse_diagnostic.cpp)
 dss_add_test(NAME core/test_config_path_walk    SOURCES test_config_path_walk.cpp)
+# The ONE path-identity chokepoint (D-PATH-IDENTITY-8DOT3-SPELLINGS-SPLIT-KEYS).
+# Its 8.3 arms CONSTRUCT the hazard and SKIP LOUDLY where the volume cannot
+# stage it -- a test that merely hopes to meet a short name is a false green.
+dss_add_test(NAME core/test_path_identity       SOURCES test_path_identity.cpp)
 dss_add_test(NAME core/test_char_decode         SOURCES test_char_decode.cpp)
 dss_add_test(NAME core/test_diagnostic_reporter SOURCES test_diagnostic_reporter.cpp)
 dss_add_test(NAME core/test_diagnostic_budget_threading SOURCES test_diagnostic_budget_threading.cpp)
@@ -72,6 +76,61 @@ dss_add_test(NAME core/test_sha256              SOURCES test_sha256.cpp)
 dss_add_test(NAME core/test_language_references  SOURCES test_language_references.cpp)
 target_link_libraries(dss_core_test_language_references PRIVATE nlohmann_json::nlohmann_json)
 
+# D-CONFIG-UNKNOWN-KEY-CHECK-HAND-ROLLED-SITES-REMAIN: every closed-key block in
+# the grammar + predefined-macro loaders now routes through the ONE shared
+# `dss::detail::rejectUnknownKeys`. The pins MUTATE THE SHIPPED `.lang.json` in
+# memory (nlohmann consumer) at a named JSON pointer per block — a stale pointer
+# THROWS rather than passing vacuously — and assert three things per block: the
+# unmutated document loads, an unknown key is REFUSED by a diagnostic naming that
+# block, and a `$…Comment` prose key stays exempt. Plus `impliedSurface`'s
+# per-ARM vocabulary, where a sibling-arm key must be refused with the arm it
+# belongs to NAMED.
+# ⚠ MUST run through ctest, never a bare .exe: `findShippedConfig` walks the cwd
+# unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME core/test_config_closed_key_vocabulary
+             SOURCES test_config_closed_key_vocabulary.cpp)
+target_link_libraries(dss_core_test_config_closed_key_vocabulary
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET: the sibling class
+# one level up — a site whose key (or value) must name an ENUM, whose not-found
+# arm IS the report, and whose message used to state the accepted set as a
+# literal typed beside the check. Every such message now renders
+# `dss::detail::renderAllowedList` over the `EnumNameTable` projection, so the
+# message cannot disagree with the check.
+# The pins assert three things per site, because no single one carries the claim:
+# the shipped corpus really USES the vocabulary (else deleting a table row reds
+# nothing), every spelling the message advertises LOADS, and the message names
+# every table spelling and no other token.
+# ✔The class was NOT merely a hazard: three shipped messages had already drifted
+# (operandKinds 3-of-7, resultSlot 8-of-32, terminatorKind 6-of-7).
+# ⚠ MUST run through ctest, never a bare .exe: `findShippedConfig` walks the cwd
+# unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME core/test_config_enum_vocabulary_projection
+             SOURCES test_config_enum_vocabulary_projection.cpp)
+target_link_libraries(dss_core_test_config_enum_vocabulary_projection
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET, the `.target.json`
+# loader's half plus the shared predefined-macro parser all three config families
+# inherit. Every refusal renders `dss::detail::renderAllowedList` over the
+# vocabulary's own table (or its selectable projection), and these pins assert
+# the message names EVERY spelling the check accepts and NO other token --
+# driven from the table, so adding a row without touching the message reds here.
+# The SHAPE sentences (`must be an object { ... }`) are pinned the same way:
+# a key list is a closed set and drifts identically.
+# The mutations edit the SHIPPED target JSON in memory (nlohmann consumer), never
+# a parallel hand-written document that could rot against the real config.
+# FOUR of its subjects had ALREADY drifted when the pins were written:
+# bitFieldStrategy 1-of-3, implicitRegisters keys 3-of-5, aggregateLayout keys
+# 2-of-3, availableObjectFormats 3-of-5 -- plus two refusals that named no set.
+# MUST run through ctest, never a bare .exe: `findShippedConfig` walks the cwd
+# unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME core/test_target_vocabulary_projection
+             SOURCES test_target_vocabulary_projection.cpp)
+target_link_libraries(dss_core_test_target_vocabulary_projection
+                      PRIVATE nlohmann_json::nlohmann_json)
+
 # Generalized arena substrate (SP1). The test sources live under substrate/
 # and include the shared `substrate/arena_test_types.hpp`, so this directory
 # is on their include path.
@@ -121,3 +180,70 @@ dss_add_test(NAME core/test_bitfield_abi_conformance   SOURCES test_bitfield_abi
 # gcc/clang `__attribute__((packed))`) and asserts dss's computeLayout(packed) is
 # byte-identical (sizeof + per-field offsetof). Skips when no toolchain.
 dss_add_test(NAME core/test_packed_abi_conformance     SOURCES test_packed_abi_conformance.cpp)
+
+# D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET — the two sites of
+# the class that live OUTSIDE a config loader.
+# (1) `src/ffi/shipped_lib_descriptor.cpp`: its object-format refusals advertised
+#     THREE spellings (`"pe"/"elf"/"macho"`) while `objectFormatKindFromName` +
+#     `isSelectableObjectFormatKind` accept FIVE — a descriptor author writing
+#     `wasm` was told by name it was not allowed. The pins drive the assertion
+#     from `kSelectableObjectFormatKindNames` and from `allNames(kDataModelTable)`,
+#     never from today's sentence, and assert BOTH directions (the refusal names
+#     every accepted spelling AND advertises nothing the reader refuses).
+# (2) `src/lir/lir_reg.hpp`: `lirRegClassName`/`lirRegClassFromName` were a
+#     hand-written switch + if-chain over the five spellings
+#     `kTargetRegClassTable` already owns, and the header's long-standing
+#     `static_assert`s pin the two enums' VALUES only — a rename in the target
+#     table would split `.target.json` from the `.dsslir` text format in silence.
+#     The runtime pin walks the table rows and names the class that lost its
+#     spelling (the header now also refuses to BUILD, but a build failure does
+#     not say which row broke).
+# ⚠ MUST run through ctest, never a bare .exe: the shipped-config resolver walks
+# the cwd unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME core/test_vocabulary_projection_ffi_and_lir
+             SOURCES test_vocabulary_projection_ffi_and_lir.cpp)
+
+# D-CONFIG-GRAMMAR-LOADER-KEY-SHAPE-SENTENCES-RETYPE-THEIR-VOCABULARIES +
+# D-TEXT-TIER-READERS-KEEP-HAND-WRITTEN-FROMNAME-IF-CHAINS — the two halves of
+# the retyped-closed-set class that live in the GRAMMAR loader and in the
+# `.dsshir` / `.dssir` text tiers.
+#
+# ★ NEITHER HALF RETYPES A VOCABULARY. The key half compares a block's SHAPE
+#   sentence against the allow-list `rejectUnknownKeys` renders off that block's
+#   own closed-key table — both taken out of the real loader, so adding a table
+#   row makes the second list grow and reds a sentence that is still a literal.
+#   The value half takes the set OUT OF the refusal and feeds every advertised
+#   spelling back to the same reader, which is the direction an emit→parse→
+#   compare round trip is blind to: `fmtShader`/`fmtTranspile`/`fmtDiag` skip
+#   their sentinel values, so three spellings the reader accepts are never
+#   emitted by the writer at all.
+# ⚠ MUST run through ctest, never a bare .exe: the shipped-config resolver walks
+# the cwd unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME core/test_key_shape_and_text_tier_vocabulary
+             SOURCES test_key_shape_and_text_tier_vocabulary.cpp)
+# Mutates the SHIPPED language JSON in memory at a named JSON pointer per block
+# (nlohmann consumer) — a stale pointer THROWS rather than passing vacuously.
+target_link_libraries(dss_core_test_key_shape_and_text_tier_vocabulary
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET — the member of the
+# class the CENSUS COULD NOT SEE. `CompositeKind` had no name table and no
+# `…FromName`: its three spellings lived in two INLINE `k == "struct"/"union"/
+# "enum"` chains in the grammar loader, with five sentences restating them, and
+# one of the five had already drifted to 2 of 3 ("must be a string 'struct' or
+# 'union'" on the `fieldChildren` TYPE-ERROR arm, above a chain that takes `enum`).
+#
+# ★ THESE PINS ARE KEYED ON THE JSON PATH, which is the difference that matters.
+#   The three arms are three refusals of ONE key, so a per-LOAD search for "some
+#   diagnostic naming the whole set" is satisfied by either honest sibling — and
+#   the two honest siblings are exactly why the drift went unseen. Each arm now
+#   answers for itself at the pointer the loader reports.
+# ⚠ MUST run through ctest, never a bare .exe: `findShippedConfig` walks the cwd
+# unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME core/test_composite_kind_vocabulary_projection
+             SOURCES test_composite_kind_vocabulary_projection.cpp)
+# Mutates the SHIPPED language JSON in memory at pointers found by SEARCHING for
+# the rows that carry a compositeKind (nlohmann consumer) — never by index, and a
+# stale pointer THROWS rather than passing vacuously.
+target_link_libraries(dss_core_test_composite_kind_vocabulary_projection
+                      PRIVATE nlohmann_json::nlohmann_json)

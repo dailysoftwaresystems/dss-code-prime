@@ -1,5 +1,6 @@
 #include "core/types/target_schema.hpp"
 
+#include "core/crypto/sha256.hpp"                 // crypto::sha256Hex — the retained content digest
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table_json.hpp"
@@ -28,16 +29,15 @@ using json = nlohmann::json;
 
 using Collector = substrate::DiagnosticCollector;
 
-[[nodiscard]] std::optional<TargetResultRule> parseResultRule(std::string_view s) noexcept {
-    if (s == "none")     return TargetResultRule::None;
-    if (s == "value")    return TargetResultRule::Value;
-    if (s == "optional") return TargetResultRule::Optional;
-    return std::nullopt;
-}
-
-// Note: `targetTerminatorKindFromName` lives in `target_schema.hpp`
-// alongside the enum, so loader + future emit-side serializers share
-// one source of truth for the string mapping.
+// Note: EVERY opcode-vocabulary `…FromName` lives in `target_schema.hpp`
+// alongside its enum and its `kXxxTable`, so loader + future emit-side
+// serializers share one source of truth for the string mapping.
+// ⚠ There used to be ONE exception, right here: a private `parseResultRule`
+// if-chain respelling `kTargetResultRuleTable`'s three names because that
+// table shipped a `…Name` half and no `…FromName` half. The gap was closed in
+// the header rather than papered over again here — a loader that has to write
+// its own parser has found a hole in the vocabulary, not a reason to keep a
+// local copy (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
 
 // ── D-CONFIG-TARGET-LOADER-CONTAINER-KEYS-UNGATED ─────────────────────────
 //
@@ -65,39 +65,27 @@ using Collector = substrate::DiagnosticCollector;
 //
 // `objectLabel` names the object in the message ("variant", "register row")
 // so the diagnostic reads as prose rather than as a path echo.
+//
+// ★★ THE LOOP ITSELF NOW LIVES IN `core/types/config_key_vocabulary.hpp`,
+// beside `isDocumentationKey`, and the argument above is WHY — it just could
+// not reach past this translation unit while it was written here. Three
+// sibling loaders had independently written the same helper and two of them
+// omitted the `$` carve-out this header spends a paragraph on. What remains
+// here is an ADAPTER, not a fifth copy: it binds the shared check to THIS
+// loader's sink, diagnostic code and `path/key` convention. The allowed-key
+// TABLES stay with the objects they describe, which is the half a maintainer
+// actually edits.
 template <std::size_t N>
 void rejectUnknownKeys(json const& obj,
                        std::array<std::string_view, N> const& known,
                        std::string_view path,
                        std::string_view objectLabel,
                        Collector& coll) {
-    if (!obj.is_object()) return;   // shape is the caller's own diagnostic
-    for (auto it = obj.begin(); it != obj.end(); ++it) {
-        // `$`-prefixed keys are PROSE (config-wide convention). Prefix
-        // predicate, never a literal — see the header note above.
-        if (detail::isDocumentationKey(it.key())) continue;
-        bool found = false;
-        for (auto const& k : known) {
-            if (it.key() == k) { found = true; break; }
-        }
-        if (found) continue;
-        std::string allowed;
-        for (auto const& k : known) {
-            if (!allowed.empty()) allowed += ", ";
-            allowed += '\'';
-            allowed += k;
-            allowed += '\'';
-        }
-        coll.emit(DiagnosticCode::C_MalformedJson,
-                  std::format("{}/{}", path, it.key()),
-                  std::format("unknown key '{}' in {} — allowed keys are {} "
-                              "(plus any '$'-prefixed documentation key). An "
-                              "unrecognized key is REFUSED rather than "
-                              "ignored: a silently-dropped key leaves the "
-                              "feature it names switched off with no "
-                              "diagnostic",
-                              it.key(), objectLabel, allowed));
-    }
+    detail::rejectUnknownKeys(obj, known, objectLabel,
+        [&](std::string_view key, std::string message) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("{}/{}", path, key), std::move(message));
+        });
 }
 
 // Single helper for "read a bounded non-negative integer field". Replaces
@@ -232,8 +220,10 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     // the variant would quietly take the default routing. That is precisely
     // how a renamed axis turns into a wrong-variant election with no
     // diagnostic. Allowlist the known sub-keys and emit per unknown key.
-    // `$comment` is the ONE universally allowed unknown key (config-wide
-    // convention).
+    // Any `$`-PREFIXED key is allowed on top (config-wide prose convention) —
+    // the prefix, not the single spelling `$comment`, which is what
+    // `$framePointerComment` and friends depend on. The helper applies it, so
+    // the table below states only this object's real vocabulary.
     // ⚠ 'negMemoffset' was RENAMED to 'negValue' when the sign axis
     // generalized from a memory displacement to any value-bearing operand;
     // the old spelling now lands here as an unknown key rather than being
@@ -262,9 +252,17 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
         }
         auto const k = operandKindFilterFromName(oks[ki].get<std::string>());
         if (!k.has_value()) {
+            // ⚠ PROJECTED, AND THE RETYPED LIST IT REPLACES WAS ALREADY WRONG:
+            // it named 'reg' / 'imm32' / 'symbol' while the table has SEVEN
+            // rows, so `membase`, `memoffset`, `blockref` and `imm64` were
+            // accepted by the check and denied by the sentence. That is the
+            // drift this class predicts, already realized
+            // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
             coll.emit(DiagnosticCode::C_MalformedJson,
                       std::format("/opcodes/{}/encoding/variants/{}/guard/operandKinds/{}", opIdx, vi, ki),
-                      "expected 'reg' / 'imm32' / 'symbol'");
+                      std::format("expected {}",
+                                  detail::renderAllowedList(
+                                      allNames(kOperandKindFilterTable), " / ")));
             continue;
         }
         variant.operandKinds.push_back(*k);
@@ -517,11 +515,19 @@ void parseVariantResultSlot(json const& v, std::size_t opIdx, std::size_t vi,
     }
     auto const r = encodingSlotKindFromName(v.at("resultSlot").get<std::string>());
     if (!r.has_value()) {
+        // ⚠ THE HAND-WRITTEN LIST THIS REPLACES NAMED **8** OF **32** SLOT
+        // KINDS, grouped by encoding shape with parenthetical annotations. It
+        // was written when eight was the whole vocabulary and was never
+        // revisited; every slot added since — `imm12`, `imm19`,
+        // `imm32.movzmovk`, `memreloc.disp32`, twenty-four in all — is
+        // ACCEPTED by the lookup above and DENIED by the sentence below it.
+        // The grouping annotations went with it, and deliberately: which shape
+        // a slot belongs to is a fact no table owns, so restating it here
+        // would just be the same defect with fewer rows.
         coll.emit(DiagnosticCode::C_MalformedJson, path,
-                  "expected one of: 'modrm.reg' / 'modrm.rm' / "
-                  "'imm32' (x86-variable) or 'rd' / 'rn' / 'rm' "
-                  "(fixed32) or 'disp32' (x86) / 'imm26' (fixed32, "
-                  "symbol-bearing)");
+                  std::format("expected one of: {}",
+                              detail::renderAllowedList(
+                                  allNames(kEncodingSlotKindTable), " / ")));
         return;
     }
     variant.resultSlot = *r;
@@ -645,12 +651,13 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
         }
         auto const sk = encodingSlotKindFromName(o2.at("slotKind").get<std::string>());
         if (!sk.has_value()) {
+            // Same projected slot vocabulary as `parseVariantResultSlot` —
+            // see the note there for what the retyped list was hiding.
             coll.emit(DiagnosticCode::C_MalformedJson,
                       std::format("{}/slotKind", wirePath),
-                      "expected one of: 'modrm.reg' / 'modrm.rm' / "
-                  "'imm32' (x86-variable) or 'rd' / 'rn' / 'rm' "
-                  "(fixed32) or 'disp32' (x86) / 'imm26' (fixed32, "
-                  "symbol-bearing)");
+                      std::format("expected one of: {}",
+                                  detail::renderAllowedList(
+                                      allNames(kEncodingSlotKindTable), " / ")));
             continue;
         }
         wire.slotKind = *sk;
@@ -787,6 +794,18 @@ void parseEncodingVariants(json const& vs,
 
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     std::string_view jsonText, std::string_view sourceLabel) {
+    // ── Content digest ────────────────────────────────────────────────
+    // Digest the bytes AS RECEIVED, before the parser is allowed an opinion
+    // about them. This is the one chokepoint where the document bytes are
+    // already in memory (`loadFromFile` reads them, hands them here, and drops
+    // them), so the digest costs zero extra I/O — versus ~165 ms per
+    // invocation to re-walk and re-read `src/dss-config/` (MEASURED
+    // 2026-08-17, I/O-dominated). Computed BEFORE the parse so it is the
+    // digest of what was actually LOADED, independent of what the parse made
+    // of it. See `contentDigest()` for the full rationale and for why a
+    // non-`loadFromText` construction leaves it EMPTY.
+    std::string digest = crypto::sha256Hex(jsonText);
+
     Collector coll;
     json doc;
     try {
@@ -819,7 +838,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // guard would reject every shipped target on its first load.
     //
     // Every name here is a key the loader genuinely reads.
-    static constexpr std::array<std::string_view, 15> kTargetDocumentKeys{
+    static constexpr std::array<std::string_view, 16> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
@@ -827,6 +846,22 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // which SOURCE LANGUAGE document spells this processor's assembly
         // (a NAME — D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET)
         "defaultAssemblyLanguage",
+        // Which GNU inline-asm constraint LETTER means which register /
+        // register class / operand form on this processor.
+        //
+        // ⚠⚠ THE FACET'S SINGLE HIGHEST-RISK LINE, AND ITS FAILURE MODE IS
+        // ✔MEASURED RATHER THAN ASSUMED. Deleting this one entry (with the
+        // array size dropped to 15 so it still compiles) was built and run:
+        // both shipped targets FAIL TO LOAD with `/asmConstraints: unknown
+        // top-level key 'asmConstraints' (typo discriminator)`, and the
+        // blast radius is **683 of 855 tests red**, including SEGFAULTs in
+        // the lir/asm suites whose consumers deref a schema that never
+        // loaded. ⇒ omitting it is LOUD, not silent — which is exactly what
+        // TF-C74's closed root-key vocabulary buys. Before that vocabulary
+        // existed the same omission would have silently no-op'd the whole
+        // facet, leaving a knob that lies. `ShippedTargetsDeclareAsm-
+        // Constraints` pins that the key is genuinely consumed.
+        "asmConstraints",
         // machine description
         "opcodes", "registers", "registerClassOps", "relocations",
         "condCodeEncoding",
@@ -834,19 +869,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         "wideFloatSoftcalls", "wideFloatSoftcallLibraryByFormat",
         "callingConventions"};
     DSS_CHECK_KEY_VOCABULARY(kTargetDocumentKeys);
-    for (auto it = doc.begin(); it != doc.end(); ++it) {
-        if (detail::isDocumentationKey(it.key())) continue;
-        bool known = false;
-        for (auto const& k : kTargetDocumentKeys) {
-            if (it.key() == k) { known = true; break; }
-        }
-        if (!known) {
-            coll.emit(DiagnosticCode::C_MalformedJson,
-                      std::format("/{}", it.key()),
-                      std::format("unknown top-level key '{}' (typo "
-                                  "discriminator)", it.key()));
-        }
-    }
+    // The ROOT runs the same check as every nested object — it had its own
+    // hand-written loop, which is how the container/leaf asymmetry this
+    // helper's header describes gets in. Empty `path` yields `/key`.
+    rejectUnknownKeys(doc, kTargetDocumentKeys, "", "the target document", coll);
 
     // ── dssTargetVersion ──
     if (!doc.contains("dssTargetVersion")
@@ -936,7 +962,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             data.abiModel = *m;
         } else {
             coll.emit(DiagnosticCode::C_MalformedJson, "/target/abiModel",
-                      "expected 'register-machine' / 'operand-stack' / 'result-id'");
+                      std::format("expected {}",
+                                  detail::renderAllowedList(
+                                      allNames(kTargetAbiModelTable), " / ")));
             return std::unexpected(std::move(coll).release());
         }
     }
@@ -1207,13 +1235,36 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             // capability signal that the target realizes that FCmp
             // predicate via the two-setcc composition instead of a
             // single native condition; see mir_to_lir floatCmpPlan).
-            static constexpr std::array<std::string_view, 17> kCondNames{
-                "eq", "ne", "slt", "sle", "sgt", "sge",
-                "ult", "ule", "ugt", "uge",
-                "fogt", "foge", "foeq", "fone", "fune", "fuo", "ford"};
+            // ⚠ THIS USED TO BE A SECOND COPY OF THE VOCABULARY — seventeen
+            // spellings hand-listed here, in the same order as
+            // `kTargetCondCodeTable`, with a THIRD copy inside the refusal
+            // message below. `data.condCodeEncoding[idx]` indexes by ENUM
+            // ORDINAL, so the two copies also had to agree on ORDER, and
+            // nothing checked that either
+            // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+            static constexpr auto kCondNames = allNames(kTargetCondCodeTable);
             DSS_CHECK_KEY_VOCABULARY(kCondNames);
-            constexpr std::size_t kRequiredCount = 10;
-            std::array<bool, 17> seen{};
+            // ★ THE ORDER IS LOAD-BEARING, so it is ASSERTED rather than
+            // assumed: `idx` is used as an enum ordinal two statements down.
+            // The check names ENUMERATORS, never spellings, so it is not a
+            // fourth copy of the vocabulary.
+            static_assert([] {
+                for (std::size_t i = 0; i < kTargetCondCodeTable.rows.size(); ++i) {
+                    if (static_cast<std::size_t>(kTargetCondCodeTable.rows[i].first) != i) {
+                        return false;
+                    }
+                }
+                return true;
+            }(), "condCodeEncoding indexes by ENUM ORDINAL, so kTargetCondCodeTable "
+                 "row i must declare ordinal i — reordering the table would "
+                 "silently write every encoding into the wrong slot");
+            // The INTEGER codes are the REQUIRED prefix; the float codes are
+            // optional. Derived from the first float enumerator's own ordinal,
+            // never a literal 10 — a new integer code inserted before `Fogt`
+            // moves this boundary automatically.
+            constexpr std::size_t kRequiredCount =
+                static_cast<std::size_t>(TargetCondCode::Fogt);
+            std::array<bool, kTargetCondCodeCount> seen{};
             for (auto it = cc.begin(); it != cc.end(); ++it) {
                 auto const& key = it.key();
                 // A `$`-prefixed key here is PROSE, not a condition. This
@@ -1221,6 +1272,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // same carve-out every other closed vocabulary gets —
                 // without it a `$comment` documenting the table would be
                 // rejected as an unknown cond code.
+                //
+                // ⓘ NOT ROUTED THROUGH `rejectUnknownKeys`, and that is a
+                // judgement rather than an oversight: this is a name→INDEX
+                // lookup whose "not found" arm IS the unknown-key report, and
+                // the index it produces is consumed two statements down. A
+                // shared pre-pass would walk the object twice to learn what
+                // this loop already knows. The carve-out is the shared
+                // predicate, which is the half that was ever gotten wrong.
                 if (detail::isDocumentationKey(key)) continue;
                 std::size_t idx = kCondNames.size();
                 for (std::size_t i = 0; i < kCondNames.size(); ++i) {
@@ -1229,11 +1288,16 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 if (idx >= kCondNames.size()) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               std::format("/condCodeEncoding/{}", key),
-                              std::format("unknown cond-code key '{}' "
-                                          "(expected one of eq/ne/slt/sle/"
-                                          "sgt/sge/ult/ule/ugt/uge or the "
-                                          "float codes fogt/foge/foeq/"
-                                          "fone/fune/fuo/ford)", key));
+                              // ⚠ THE SET WAS UNQUOTED HERE, which is why no
+                              // quoted-token census could see it. The renderer
+                              // quotes each spelling; a bare slash-joined run
+                              // is invisible to every instrument this project
+                              // has, and to every test that reads a message
+                              // back.
+                              std::format("unknown cond-code key '{}' — "
+                                          "accepted: {}", key,
+                                          detail::renderAllowedList(kCondNames,
+                                                                    " / ")));
                     continue;
                 }
                 if (!it.value().is_number_integer()) {
@@ -1268,14 +1332,18 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 }
                 coll.emit(DiagnosticCode::C_MalformedJson,
                           "/condCodeEncoding",
+                          // The COUNT is derived too: "ALL 10" was a fourth
+                          // copy of the same fact, and a new integer code
+                          // would have left it counting to the old number.
                           std::format("missing cond-code(s) {} — when "
-                                      "the table is declared, ALL 10 "
+                                      "the table is declared, ALL {} "
                                       "integer entries must be present "
                                       "so the encoder cannot silently "
                                       "default to 0 for an absent code "
                                       "(the float codes are optional — "
                                       "absence selects the composed "
-                                      "FCmp realization)", list));
+                                      "FCmp realization)", list,
+                                      kRequiredCount));
             } else {
                 data.condCodeEncodingLoaded = true;
             }
@@ -1286,15 +1354,24 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     //    array layout params the generic `type_layout` engine reads. REQUIRED on
     //    a register-machine target — a silent default would bake a wrong alignment
     //    rule into every aggregate (mirrors the format's required `dataModel`). ──
+    // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET: the key
+    // table is declared BEFORE the shape sentence, because the shape sentence
+    // renders it. It used to sit inside the `else` arm below and the sentence
+    // above it named `{ scalarAlignment, maxAlignment }` — TWO of the THREE keys
+    // this block accepts, `bitFieldStrategy` silently absent. A message narrower
+    // than its own check tells an author, by name, that a key the loader takes
+    // is not allowed.
+    static constexpr std::array<std::string_view, 3> kAggregateLayoutKeys{
+        "scalarAlignment", "maxAlignment", "bitFieldStrategy"};
+    DSS_CHECK_KEY_VOCABULARY(kAggregateLayoutKeys);
     if (doc.contains("aggregateLayout")) {
         auto const& al = doc.at("aggregateLayout");
         if (!al.is_object()) {
             coll.emit(DiagnosticCode::C_MalformedJson, "/aggregateLayout",
-                      "must be an object { scalarAlignment, maxAlignment }");
+                      std::format("must be an object {{ {} }}",
+                                  detail::renderAllowedList(
+                                      kAggregateLayoutKeys, ", ")));
         } else {
-            static constexpr std::array<std::string_view, 3> kAggregateLayoutKeys{
-                "scalarAlignment", "maxAlignment", "bitFieldStrategy"};
-            DSS_CHECK_KEY_VOCABULARY(kAggregateLayoutKeys);
             rejectUnknownKeys(al, kAggregateLayoutKeys, "/aggregateLayout",
                               "the aggregate-layout block", coll);
             bool ok = true;
@@ -1302,7 +1379,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 || !al.at("scalarAlignment").is_string()) {
                 coll.emit(DiagnosticCode::C_MissingField,
                           "/aggregateLayout/scalarAlignment",
-                          "missing required 'scalarAlignment' string (e.g. \"natural\")");
+                          std::format("missing required 'scalarAlignment' "
+                                      "string — accepted: {}",
+                                      detail::renderAllowedList(
+                                          allNames(kScalarAlignmentRuleTable),
+                                          " / ")));
                 ok = false;
             } else {
                 auto const name = al.at("scalarAlignment").get<std::string>();
@@ -1310,8 +1391,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 if (!rule) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               "/aggregateLayout/scalarAlignment",
-                              std::format("unknown scalarAlignment '{}' "
-                                          "(expected \"natural\")", name));
+                              std::format("unknown scalarAlignment '{}' — "
+                                          "accepted: {}", name,
+                                          detail::renderAllowedList(
+                                              allNames(kScalarAlignmentRuleTable),
+                                              " / ")));
                     ok = false;
                 } else {
                     data.aggregateLayout.scalarAlignment = *rule;
@@ -1342,11 +1426,27 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             // FAILS LOUD only if a struct with a bit-field is laid out — a
             // bitfield-free target is unaffected). A wrong spelling is a hard
             // error (a typo can't silently fall back to a wrong rule).
+            //
+            // ★ THE WHOLE TABLE, sentinel included, and that is not the same
+            // answer the FORMAT loader gives. A TARGET may write `none`: it
+            // means what omitting the key means, and this check accepts it. A
+            // FORMAT may not, because the format's value falls back to THIS one
+            // when absent, so `none` there would be ambiguous. Each message
+            // states its OWN site's accepted set — which is the property the
+            // projection exists to keep true.
+            // ⚠ ✔MEASURED 2026-08-20: this refusal used to read
+            // `(expected "gnu_packed")` — ONE of the THREE spellings the very
+            // next line accepts. A config author declaring the msvc_straddle
+            // rule was told by name that the spelling the loader takes is not
+            // allowed (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
             if (al.contains("bitFieldStrategy")) {
                 if (!al.at("bitFieldStrategy").is_string()) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               "/aggregateLayout/bitFieldStrategy",
-                              "must be a string (e.g. \"gnu_packed\")");
+                              std::format("must be a string — accepted: {}",
+                                          detail::renderAllowedList(
+                                              allNames(kBitFieldStrategyTable),
+                                              " / ")));
                     ok = false;
                 } else {
                     auto const name = al.at("bitFieldStrategy").get<std::string>();
@@ -1354,8 +1454,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     if (!strat) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
                                   "/aggregateLayout/bitFieldStrategy",
-                                  std::format("unknown bitFieldStrategy '{}' "
-                                              "(expected \"gnu_packed\")", name));
+                                  std::format("unknown bitFieldStrategy '{}' — "
+                                              "accepted: {}", name,
+                                              detail::renderAllowedList(
+                                                  allNames(kBitFieldStrategyTable),
+                                                  " / ")));
                         ok = false;
                     } else {
                         data.aggregateLayout.bitFieldStrategy = *strat;
@@ -1434,20 +1537,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             static constexpr std::array<std::string_view, 2>
                 kCharIsUnsignedKeys{"default", "byObjectFormat"};
             DSS_CHECK_KEY_VOCABULARY(kCharIsUnsignedKeys);
-            for (auto it = cu.begin(); it != cu.end(); ++it) {
-                if (detail::isDocumentationKey(it.key())) continue;
-                bool known = false;
-                for (auto const& k : kCharIsUnsignedKeys) {
-                    if (it.key() == k) { known = true; break; }
-                }
-                if (!known) {
-                    coll.emit(DiagnosticCode::C_MalformedJson,
-                              std::format("/charIsUnsigned/{}", it.key()),
-                              std::format("unknown key '{}' in 'charIsUnsigned' "
-                                          "(expected 'default' / "
-                                          "'byObjectFormat')", it.key()));
-                }
-            }
+            rejectUnknownKeys(cu, kCharIsUnsignedKeys, "/charIsUnsigned",
+                              "the 'charIsUnsigned' block", coll);
 
             if (!cu.contains("default")) {
                 coll.emit(DiagnosticCode::C_MissingField,
@@ -1483,11 +1574,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                       std::format(
                                           "'{}' is not a recognized "
                                           "object-format kind (expected one of "
-                                          "'elf' / 'pe' / 'macho' / 'wasm' / "
-                                          "'spirv'). An unrecognized name would "
+                                          "{}). An unrecognized name would "
                                           "declare an override that never "
                                           "fires, silently leaving the default "
-                                          "in place.", it.key()));
+                                          "in place.", it.key(),
+                                          detail::renderAllowedList(
+                                              kSelectableObjectFormatKindNames,
+                                              " / ")));
                             continue;
                         }
                         if (!isSelectableObjectFormatKind(*kind)) {
@@ -1590,26 +1683,42 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // two variants produce opposite-signed tpoffs, a silent-miscompile
     // axis); `tcbHeaderBytes` is optional (default 0, the Variant-II
     // value) but must be a non-negative integer when present.
+    // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET: declared
+    // ahead of the shape sentence, which renders it rather than retyping it.
+    static constexpr std::array<std::string_view, 2> kTlsKeys{
+        "variant", "tcbHeaderBytes"};
+    DSS_CHECK_KEY_VOCABULARY(kTlsKeys);
     if (doc.contains("tls")) {
         auto const& tb = doc.at("tls");
         if (!tb.is_object()) {
             coll.emit(DiagnosticCode::C_MalformedJson, "/tls",
-                      "'tls' must be an object { \"variant\": "
-                      "\"variant1\"|\"variant2\", \"tcbHeaderBytes\": N }");
+                      std::format("'tls' must be an object with the keys {} "
+                                  "('variant' is one of {})",
+                                  detail::renderAllowedList(kTlsKeys, ", "),
+                                  detail::renderAllowedList(
+                                      allNames(kTlsVariantTable), " / ")));
         } else {
-            static constexpr std::array<std::string_view, 2> kTlsKeys{
-                "variant", "tcbHeaderBytes"};
-            DSS_CHECK_KEY_VOCABULARY(kTlsKeys);
             rejectUnknownKeys(tb, kTlsKeys, "/tls", "the tls block", coll);
             TlsIdentity tlsId{};
             bool ok = true;
             if (!tb.contains("variant") || !tb.at("variant").is_string()) {
+                // ★ THE PER-VALUE PROSE SURVIVES THE PROJECTION. The two
+                // spellings are still named individually — through
+                // `tlsVariantName`, not as literals — because WHICH variant a
+                // target is cannot be guessed from the name alone, and the
+                // sign of the tpoff is the whole reason no default is safe.
                 coll.emit(DiagnosticCode::C_MissingField, "/tls/variant",
-                          "'tls.variant' is required and must be a string "
-                          "(\"variant1\" = tp-at-TCB-head positive tpoff "
-                          "[arm64]; \"variant2\" = tp-past-block-end "
-                          "negative tpoff [x86_64]) — the two produce "
-                          "opposite-signed offsets, so no default is safe");
+                          std::format("'tls.variant' is required and must be a "
+                                      "string — accepted: {} ('{}' = "
+                                      "tp-at-TCB-head positive tpoff [arm64]; "
+                                      "'{}' = tp-past-block-end negative tpoff "
+                                      "[x86_64]) — the two produce "
+                                      "opposite-signed offsets, so no default "
+                                      "is safe",
+                                      detail::renderAllowedList(
+                                          allNames(kTlsVariantTable), " / "),
+                                      tlsVariantName(TlsVariant::Variant1),
+                                      tlsVariantName(TlsVariant::Variant2)));
                 ok = false;
             } else {
                 auto const name = tb.at("variant").get<std::string>();
@@ -1617,8 +1726,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 if (!v.has_value()) {
                     coll.emit(DiagnosticCode::C_MalformedJson, "/tls/variant",
                               std::format("unknown tls variant '{}' — "
-                                          "accepted: \"variant1\", "
-                                          "\"variant2\"", name));
+                                          "accepted: {}", name,
+                                          detail::renderAllowedList(
+                                              allNames(kTlsVariantTable),
+                                              " / ")));
                     ok = false;
                 } else {
                     tlsId.variant = *v;
@@ -1671,8 +1782,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                       "opcode entry must be an object");
             continue;
         }
-        static constexpr std::array<std::string_view, 12> kOpcodeKeys{
+        static constexpr std::array<std::string_view, 13> kOpcodeKeys{
             "mnemonic", "result", "hasSideEffects", "requires2Address",
+            "twoAddressSourceOperand",
             "isCall", "terminatorKind", "minOperands", "maxOperands",
             "minSuccessors", "maxSuccessors", "encoding",
             "implicitRegisters"};
@@ -1695,11 +1807,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                       "missing or non-string 'result'");
             continue;
         }
-        auto const rr = parseResultRule(o.at("result").get<std::string>());
+        auto const rr = targetResultRuleFromName(o.at("result").get<std::string>());
         if (!rr.has_value()) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       std::format("/opcodes/{}/result", i),
-                      "expected 'none' / 'value' / 'optional'");
+                      std::format("expected {}",
+                                  detail::renderAllowedList(
+                                      allNames(kTargetResultRuleTable), " / ")));
             continue;
         }
         info.result = *rr;
@@ -1710,8 +1824,74 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         if (o.contains("hasSideEffects") && o.at("hasSideEffects").is_boolean()) {
             info.hasSideEffects = o.at("hasSideEffects").get<bool>();
         }
-        if (o.contains("requires2Address") && o.at("requires2Address").is_boolean()) {
-            info.requires2Address = o.at("requires2Address").get<bool>();
+        // ── 2-address tie: the FLAG plus the OPTIONAL operand INDEX ──
+        // `requires2Address: true` alone means the historical shape,
+        // *result == operand[0]*, and every shipped opcode spells it that
+        // way. `twoAddressSourceOperand: <j>` refines WHICH operand the
+        // result is tied to (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE).
+        //
+        // ★ THE INDEX IS A SEPARATE KEY RATHER THAN AN INTEGER-VALUED
+        // `requires2Address`, AND THAT IS THE WHOLE SAFETY ARGUMENT. A
+        // polymorphic `requires2Address: 1` would be read by a human as
+        // "true" and by the loader as "tie to operand 1" — a divergence
+        // between what the author meant and what the assembler encodes,
+        // with no diagnostic. Two keys with an ENFORCED dependency cannot
+        // drift (they collapse into the one in-memory field below), and
+        // neither spelling can be misread as the other.
+        //
+        // ⚠ AND THE FLAG IS REJECTED WHEN IT IS NOT A BOOLEAN, which the
+        // pre-index loader merely IGNORED. `"requires2Address": 1` used to
+        // read as "not two-address" and silently skip legalization — an
+        // encoding bug with no diagnostic — and now it is also the most
+        // likely way an author would try to spell the index. Both readings
+        // are wrong; say so instead of picking one.
+        if (o.contains("requires2Address")
+            && !o.at("requires2Address").is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/requires2Address", i),
+                      std::format("opcode '{}': 'requires2Address' must be a "
+                                  "boolean. To tie the result to an operand "
+                                  "other than 0, keep "
+                                  "'requires2Address': true and add "
+                                  "'twoAddressSourceOperand': <index>",
+                                  info.mnemonic));
+        }
+        bool const twoAddressDeclared =
+            o.contains("requires2Address")
+            && o.at("requires2Address").is_boolean()
+            && o.at("requires2Address").get<bool>();
+        if (twoAddressDeclared) info.requires2Address = std::uint8_t{0};
+        if (o.contains("twoAddressSourceOperand")) {
+            auto const& tsoNode = o.at("twoAddressSourceOperand");
+            if (!tsoNode.is_number_unsigned()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("/opcodes/{}/twoAddressSourceOperand", i),
+                          std::format("opcode '{}': 'twoAddressSourceOperand' "
+                                      "must be a non-negative integer — it is "
+                                      "the INDEX of the operand the result is "
+                                      "tied to, not a flag",
+                                      info.mnemonic));
+            } else if (!twoAddressDeclared) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          std::format("/opcodes/{}/twoAddressSourceOperand", i),
+                          std::format("opcode '{}': 'twoAddressSourceOperand' "
+                                      "requires 'requires2Address: true' — an "
+                                      "index with no tie declared would be read "
+                                      "by nothing, so the operand the author "
+                                      "meant to tie would silently stay free",
+                                      info.mnemonic));
+            } else {
+                auto const idx = tsoNode.get<std::uint64_t>();
+                if (idx > 0xFFu) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/opcodes/{}/twoAddressSourceOperand", i),
+                              std::format("opcode '{}': 'twoAddressSourceOperand' "
+                                          "{} does not fit an operand index",
+                                          info.mnemonic, idx));
+                } else {
+                    info.requires2Address = static_cast<std::uint8_t>(idx);
+                }
+            }
         }
         if (o.contains("isCall") && o.at("isCall").is_boolean()) {
             info.isCall = o.at("isCall").get<bool>();
@@ -1723,11 +1903,16 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         if (o.contains("terminatorKind")) {
             auto const& tkNode = o.at("terminatorKind");
             if (!tkNode.is_string()) {
+                // ⚠ THE RETYPED LIST THIS REPLACES OMITTED `indirect-br`,
+                // which the table has carried since the computed-goto work —
+                // accepted by the parse, denied by both sentences.
                 coll.emit(DiagnosticCode::C_MalformedJson,
                           std::format("/opcodes/{}/terminatorKind", i),
-                          "'terminatorKind' must be a string (one of "
-                          "'none' / 'br' / 'cond-br' / 'switch' / "
-                          "'return' / 'unreachable')");
+                          std::format("'terminatorKind' must be a string (one "
+                                      "of {})",
+                                      detail::renderAllowedList(
+                                          allNames(kTargetTerminatorKindTable),
+                                          " / ")));
             } else {
                 auto const tk = targetTerminatorKindFromName(tkNode.get<std::string>());
                 if (tk.has_value()) {
@@ -1735,8 +1920,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 } else {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               std::format("/opcodes/{}/terminatorKind", i),
-                              "expected 'none' / 'br' / 'cond-br' / "
-                              "'switch' / 'return' / 'unreachable'");
+                              std::format("expected {}",
+                                          detail::renderAllowedList(
+                                              allNames(kTargetTerminatorKindTable),
+                                              " / ")));
                 }
             }
         }
@@ -1777,16 +1964,21 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             } else if (!enc.contains("format")) {
                 coll.emit(DiagnosticCode::C_MissingField,
                           std::format("/opcodes/{}/encoding/format", i),
-                          "missing 'format' (required when an 'encoding' "
-                          "block is present; one of 'none' / 'x86-variable' "
-                          "/ 'fixed32')");
+                          std::format("missing 'format' (required when an "
+                                      "'encoding' block is present; one of {})",
+                                      detail::renderAllowedList(
+                                          allNames(kTargetEncodingShapeTable),
+                                          " / ")));
             } else {
                 auto const& fmt = enc.at("format");
                 if (!fmt.is_string()) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               std::format("/opcodes/{}/encoding/format", i),
-                              "'format' must be a string (one of "
-                              "'none' / 'x86-variable' / 'fixed32')");
+                              std::format("'format' must be a string (one "
+                                          "of {})",
+                                          detail::renderAllowedList(
+                                              allNames(kTargetEncodingShapeTable),
+                                              " / ")));
                 } else {
                     auto const shape =
                         targetEncodingShapeFromName(fmt.get<std::string>());
@@ -1795,7 +1987,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     } else {
                         coll.emit(DiagnosticCode::C_MalformedJson,
                                   std::format("/opcodes/{}/encoding/format", i),
-                                  "expected 'none' / 'x86-variable' / 'fixed32'");
+                                  std::format("expected {}",
+                                              detail::renderAllowedList(
+                                                  allNames(kTargetEncodingShapeTable),
+                                                  " / ")));
                     }
                 }
                 // AS2: parse the per-variant rows when present. Walker
@@ -1815,14 +2010,32 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // resolution + validation" block lower in this function).
         // See `ImplicitRegisterConstraint` docblock in
         // target_schema.hpp for the full contract.
+        // ⚠ ✔MEASURED 2026-08-20: the shape sentence below named THREE of the
+        // FIVE keys `kImplicitRegisterKeys` accepts — `inputRoles` and
+        // `outputRoles` were read by the parse arm and advertised by nothing,
+        // so an author declaring either was told BY NAME that a key the loader
+        // takes is not a field of this block. The table is declared ahead of
+        // the sentence and the sentence RENDERS it, which is the only shape in
+        // which the two cannot disagree
+        // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+        // ⓘ NOT the same set as the "empty block" refusal further down: that
+        // one names `inputs`/`outputs`/`clobbered` because those are the three
+        // its own emptiness check reads — `inputRoles`/`outputRoles` are role
+        // MAPS over names declared in those three and cannot make a block
+        // non-empty on their own. A message states ITS OWN check's set.
+        static constexpr std::array<std::string_view, 5>
+            kImplicitRegisterKeys{"inputs", "outputs", "clobbered",
+                                  "inputRoles", "outputRoles"};
+        DSS_CHECK_KEY_VOCABULARY(kImplicitRegisterKeys);
         if (o.contains("implicitRegisters")) {
             auto const& ir = o.at("implicitRegisters");
             if (!ir.is_object()) {
                 coll.emit(DiagnosticCode::C_MalformedJson,
                           std::format("/opcodes/{}/implicitRegisters", i),
-                          "'implicitRegisters' must be an object with "
-                          "optional 'inputs', 'outputs', 'clobbered' "
-                          "string-array fields");
+                          std::format("'implicitRegisters' must be an object "
+                                      "with optional {} fields",
+                                      detail::renderAllowedList(
+                                          kImplicitRegisterKeys, ", ")));
                 // continue past this opcode arm: a malformed block must
                 // not leave a partial-state opcode pushed downstream.
                 // Mirror the duplicate-mnemonic pattern below.
@@ -1838,10 +2051,6 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // carve-out, so a prose key here was reported as a typo — the
                 // INVERSE failure, and the reason `rejectUnknownKeys` applies
                 // the carve-out itself rather than trusting each call site.
-                static constexpr std::array<std::string_view, 5>
-                    kImplicitRegisterKeys{"inputs", "outputs", "clobbered",
-                                          "inputRoles", "outputRoles"};
-                DSS_CHECK_KEY_VOCABULARY(kImplicitRegisterKeys);
                 rejectUnknownKeys(ir, kImplicitRegisterKeys,
                                   std::format("/opcodes/{}/implicitRegisters", i),
                                   "an implicitRegisters block", coll);
@@ -1975,7 +2184,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     } else {
                         coll.emit(DiagnosticCode::C_MalformedJson,
                                   std::format("/registers/{}/class", i),
-                                  "expected 'gpr' / 'fpr' / 'vr' / 'flags' / 'none'");
+                                  std::format("expected {}",
+                                              detail::renderAllowedList(
+                                                  allNames(kTargetRegClassTable),
+                                                  " / ")));
                         continue;
                     }
                 }
@@ -2008,6 +2220,355 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;  // skip push_back so vector & index stay in sync
                 }
                 data.registers.push_back(std::move(info));
+            }
+        }
+    }
+
+    // ── asmConstraints (GNU inline-asm constraint letters — optional) ──
+    //
+    // Which LETTER means which register / register class / operand form on
+    // THIS processor. See `TargetAsmConstraint` in the header for why this is
+    // target vocabulary rather than a C++ table keyed on architecture, and
+    // for the line that separates it from the reverted `asmSyntax` block
+    // ([[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]]).
+    //
+    // ★ PARSED AFTER `registers` ON PURPOSE — a `binds: "register"` row
+    // resolves its NAME to an ORDINAL right here, so a dangling name is a
+    // load error rather than a lookup that fails much later at a site with no
+    // target in hand. Same precedent as the `implicitRegisters` roles and the
+    // wide-float softcall registers.
+    //
+    // OPTIONAL. A target declaring none refuses every constraint letter by
+    // name, which is the correct answer for a processor whose inline-asm
+    // binding has not been described — not a malformed document.
+    if (doc.contains("asmConstraints")) {
+        // Rendered FROM THE TABLE at each use, never re-typed. The comment on
+        // `kKnownImplicitRegisterRoles` records what re-typing costs: a
+        // diagnostic that told the reader their valid role was invalid.
+        auto const renderNames = [](auto const& table) {
+            std::string out;
+            for (auto const& row : table.rows) {
+                if (!out.empty()) out += ", ";
+                out += '\'';
+                out += row.second;
+                out += '\'';
+            }
+            return out;
+        };
+        if (!doc.at("asmConstraints").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/asmConstraints",
+                      "'asmConstraints' must be an array of constraint-letter "
+                      "rows");
+        } else {
+            auto const& rows = doc.at("asmConstraints");
+            data.asmConstraints.reserve(rows.size());
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                auto const& r = rows[i];
+                auto const path = std::format("/asmConstraints/{}", i);
+                if (!r.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "asmConstraints entry must be an object");
+                    continue;
+                }
+                // ★ THE PAYLOAD KEYS ARE THE `binds` SPELLINGS. Adding an
+                // axis to `kAsmConstraintBindingTable` therefore adds its key
+                // here too — the allowlist cannot fall behind the vocabulary.
+                static constexpr std::array<std::string_view, 5>
+                    kAsmConstraintKeys{"letter", "binds", "registerClass",
+                                       "register", "operandKind"};
+                DSS_CHECK_KEY_VOCABULARY(kAsmConstraintKeys);
+                static_assert(kAsmConstraintKeys.size()
+                                  == kAsmConstraintBindingTable.rows.size() + 2,
+                              "every `binds` spelling must also be an accepted "
+                              "payload key (plus 'letter' and 'binds' "
+                              "themselves) — a new axis whose key is missing "
+                              "here would be rejected as unknown at the exact "
+                              "moment it was first used");
+                rejectUnknownKeys(r, kAsmConstraintKeys, path,
+                                  "an asmConstraints row", coll);
+
+                TargetAsmConstraint entry;
+
+                // ── letter ────────────────────────────────────────────
+                if (!r.contains("letter") || !r.at("letter").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/letter", path),
+                              "missing or non-string 'letter' — a constraint "
+                              "row must name the spelling it binds");
+                    continue;
+                }
+                entry.letter = r.at("letter").get<std::string>();
+                if (entry.letter.empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/letter", path),
+                              "'letter' must not be empty — omit the ROW to "
+                              "declare that this target binds nothing");
+                    continue;
+                }
+                // ⚠⚠ THE ONE MISTAKE A HUMAN ACTUALLY MAKES HERE, AND THE
+                // ONE THIS FACET EXISTS TO KEEP OUT. `=`/`+`/`&`/`%` are GNU
+                // *asm grammar* — output, in-out, earlyclobber, commutative —
+                // and they mean the same thing on every processor, so the C
+                // front end owns them. Storing `"=a"` as a letter would put a
+                // grammar fact in the target file, which is precisely how the
+                // reverted `asmSyntax` block got in. It would ALSO silently
+                // never match, because a front end that strips modifiers
+                // before looking up (the only sane order) would search for
+                // `a`. A silent never-match is the worst of the two, so this
+                // is a hard reject with the split spelled out.
+                {
+                    constexpr std::string_view kModifiers = "=+&%";
+                    auto const bad = entry.letter.find_first_of(kModifiers);
+                    if (bad != std::string::npos) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/letter", path),
+                            std::format(
+                                "constraint letter '{}' contains the modifier "
+                                "'{}' — modifiers ({}) are GNU-asm GRAMMAR "
+                                "owned by the source language and are the "
+                                "same on every processor; declare the LETTER "
+                                "alone (e.g. \"a\", not \"=a\") and let the "
+                                "front end strip modifiers before it asks "
+                                "this target",
+                                entry.letter, entry.letter[bad], kModifiers));
+                        continue;
+                    }
+                }
+                // A sigil is dialect grammar too, and whitespace is always a
+                // typo. ⚠ `%` is DELIBERATELY NOT LISTED HERE even though it
+                // is a sigil in AT&T: it is also the commutative-operand
+                // modifier, so the check above already consumed it and a
+                // second listing would describe a branch this line can never
+                // reach — the "comment records a fact the code does not use"
+                // failure, one layer down.
+                if (entry.letter.find_first_of(" \t$#") != std::string::npos) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/letter", path),
+                              std::format("constraint letter '{}' contains "
+                                          "whitespace or a sigil — sigils are "
+                                          "DIALECT grammar (AT&T writes `$7` "
+                                          "where Intel writes `7`, ONE CPU) "
+                                          "and never appear in target "
+                                          "vocabulary",
+                                          entry.letter));
+                    continue;
+                }
+                // ★ Duplicate letters are rejected rather than
+                // last-writer-wins: two rows for `a` is an ambiguity the
+                // consumer cannot see, and silently picking one is how a
+                // config key stops meaning anything. CASE-SENSITIVE —
+                // ✔MEASURED, x86_64 `d` is %rdx and `D` is %rdi.
+                {
+                    bool dup = false;
+                    for (auto const& prior : data.asmConstraints) {
+                        if (prior.letter == entry.letter) { dup = true; break; }
+                    }
+                    if (dup) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/letter", path),
+                                  std::format("duplicate constraint letter "
+                                              "'{}' — one letter binds one "
+                                              "thing; the second row would be "
+                                              "silently unreachable",
+                                              entry.letter));
+                        continue;
+                    }
+                }
+
+                // ── binds (closed discriminator) ──────────────────────
+                if (!r.contains("binds") || !r.at("binds").is_string()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/binds", path),
+                              std::format("constraint '{}': missing or "
+                                          "non-string 'binds' — a letter must "
+                                          "say WHICH AXIS it binds ({})",
+                                          entry.letter,
+                                          renderNames(
+                                              kAsmConstraintBindingTable)));
+                    continue;
+                }
+                auto const bindsStr = r.at("binds").get<std::string>();
+                auto const binds = asmConstraintBindingFromName(bindsStr);
+                if (!binds.has_value()) {
+                    coll.emit(
+                        DiagnosticCode::C_MalformedJson,
+                        std::format("{}/binds", path),
+                        std::format("constraint '{}': unknown binding axis "
+                                    "'{}' — declared axes are {} (the "
+                                    "three axes constraint letters actually "
+                                    "split across; a new one needs core "
+                                    "vocabulary, not a free-form string)",
+                                    entry.letter, bindsStr,
+                                    renderNames(kAsmConstraintBindingTable)));
+                    continue;
+                }
+                entry.binds = *binds;
+
+                // ── exactly the payload `binds` names, and no other ───
+                // ⚠ The OTHER arms must be ABSENT, not merely ignored. A row
+                // carrying both `register` and `registerClass` has two
+                // answers and the loader would silently use one; the operator
+                // who wrote the second one would never learn it was dead.
+                auto const wantKey = asmConstraintBindingName(entry.binds);
+                if (!r.contains(wantKey)) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::format("{}/{}", path, wantKey),
+                              std::format("constraint '{}': binds '{}' but "
+                                          "carries no '{}' key — the payload "
+                                          "key IS the axis name",
+                                          entry.letter, bindsStr, wantKey));
+                    continue;
+                }
+                {
+                    bool extra = false;
+                    for (auto const& row : kAsmConstraintBindingTable.rows) {
+                        if (row.second == wantKey) continue;
+                        if (!r.contains(row.second)) continue;
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/{}", path, row.second),
+                            std::format("constraint '{}': binds '{}', so the "
+                                        "'{}' key is a second answer that "
+                                        "would be silently discarded — a row "
+                                        "carries exactly the payload its "
+                                        "'binds' names",
+                                        entry.letter, bindsStr, row.second));
+                        extra = true;
+                    }
+                    if (extra) continue;
+                }
+
+                json const& payload = r.at(wantKey);
+                if (!payload.is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("{}/{}", path, wantKey),
+                              std::format("constraint '{}': '{}' must be a "
+                                          "string naming the bound {}",
+                                          entry.letter, wantKey, wantKey));
+                    continue;
+                }
+                auto const payloadStr = payload.get<std::string>();
+
+                switch (entry.binds) {
+                case AsmConstraintBinding::RegisterClass: {
+                    auto const cls = targetRegClassFromName(payloadStr);
+                    if (!cls.has_value()) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/registerClass", path),
+                            std::format("constraint '{}': '{}' is not a "
+                                        "register class — declared classes "
+                                        "are {}",
+                                        entry.letter, payloadStr,
+                                        renderNames(kTargetRegClassTable)));
+                        continue;
+                    }
+                    // `none` is a spelling in the table but not a class a
+                    // letter can usefully bind: it means "no register file",
+                    // so the constraint would match nothing while LOOKING
+                    // declared. Reject rather than ship a dead letter.
+                    if (*cls == TargetRegClass::None) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/registerClass", path),
+                            std::format("constraint '{}': binding to class "
+                                        "'{}' declares a letter that can "
+                                        "never match a register — omit the "
+                                        "row instead",
+                                        entry.letter,
+                                        targetRegClassName(*cls)));
+                        continue;
+                    }
+                    // ★ THE CLASS MUST ACTUALLY BE POPULATED ON THIS TARGET.
+                    // ✔MEASURED: x86_64 declares 0 `vr` registers and arm64
+                    // declares 0 `flags` registers, so a letter bound to an
+                    // empty class is a knob that resolves to the empty set —
+                    // it loads clean, reads as support, and allocates
+                    // nothing. Checked against the register table that was
+                    // parsed immediately above, never against a hardcoded
+                    // per-architecture expectation.
+                    {
+                        bool populated = false;
+                        for (auto const& reg : data.registers) {
+                            if (reg.regClass == *cls) { populated = true; break; }
+                        }
+                        if (!populated) {
+                            coll.emit(
+                                DiagnosticCode::C_MalformedJson,
+                                std::format("{}/registerClass", path),
+                                std::format("constraint '{}': class '{}' is "
+                                            "declared by no register in this "
+                                            "target's 'registers' table, so "
+                                            "the letter would resolve to the "
+                                            "empty set while reading as "
+                                            "supported",
+                                            entry.letter, payloadStr));
+                            continue;
+                        }
+                    }
+                    entry.registerClass = *cls;
+                    break;
+                }
+                case AsmConstraintBinding::Register: {
+                    auto it = data.registerIndex.find(payloadStr);
+                    if (it == data.registerIndex.end()) {
+                        // ⚠ The valid list is NOT rendered here, and that is
+                        // a deliberate departure from the small-vocabulary
+                        // diagnostics above: ✔MEASURED, this target's table
+                        // holds 65 (x86_64) / 129 (arm64) names, and pasting
+                        // them turns the message into noise. Nothing is
+                        // hand-typed either way — what IS rendered is the
+                        // count and, when it explains the failure, the
+                        // sigil-stripped name, which catches the exact
+                        // grammar-into-vocabulary mistake this facet guards.
+                        std::string hint;
+                        if (!payloadStr.empty()
+                            && std::string_view{"%$#"}.find(payloadStr.front())
+                                   != std::string_view::npos
+                            && data.registerIndex.find(payloadStr.substr(1))
+                                   != data.registerIndex.end()) {
+                            hint = std::format(
+                                " — did you mean '{}'? a sigil is DIALECT "
+                                "grammar and never appears in target "
+                                "vocabulary", payloadStr.substr(1));
+                        }
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/register", path),
+                            std::format("constraint '{}': names register "
+                                        "'{}', which is not one of the {} "
+                                        "registers this target declares{}",
+                                        entry.letter, payloadStr,
+                                        data.registers.size(), hint));
+                        continue;
+                    }
+                    entry.registerOrdinal =
+                        static_cast<std::uint16_t>(it->second);
+                    break;
+                }
+                case AsmConstraintBinding::OperandKind: {
+                    auto const kind = operandKindFilterFromName(payloadStr);
+                    if (!kind.has_value()) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("{}/operandKind", path),
+                            std::format("constraint '{}': '{}' is not an "
+                                        "operand kind — declared kinds are "
+                                        "{} (the same closed vocabulary the "
+                                        "encoding variant guards use; the "
+                                        "JSON names carry historical width "
+                                        "labels)",
+                                        entry.letter, payloadStr,
+                                        renderNames(kOperandKindFilterTable)));
+                        continue;
+                    }
+                    entry.operandKind = *kind;
+                    break;
+                }
+                }
+
+                data.asmConstraints.push_back(std::move(entry));
             }
         }
     }
@@ -2048,7 +2609,29 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 if (!cls.has_value()) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               std::format("/registerClassOps/{}/class", i),
-                              "expected 'gpr' / 'fpr' / 'vr' / 'flags'");
+                              std::format("expected {}",
+                                          detail::renderAllowedList(
+                                              kOperableTargetRegClassNames,
+                                              " / ")));
+                    continue;
+                }
+                // The sentinel SPELLS correctly, so the lookup above accepts
+                // it — the `isSelectableObjectFormatKind` hazard, on this
+                // vocabulary. A row for the no-class sentinel would occupy
+                // slot 0 of `registerClassOps` and declare move/load/store
+                // mnemonics for registers that by definition do not exist.
+                // See `isOperableTargetRegClass`.
+                if (!isOperableTargetRegClass(*cls)) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/registerClassOps/{}/class", i),
+                              std::format("'{}' is the no-class sentinel, not a "
+                                          "class that owns registers — a "
+                                          "registerClassOps row under it could "
+                                          "never fire. Expected {}",
+                                          targetRegClassName(*cls),
+                                          detail::renderAllowedList(
+                                              kOperableTargetRegClassNames,
+                                              " / ")));
                     continue;
                 }
                 auto& row = data.registerClassOps[static_cast<std::size_t>(*cls)];
@@ -2116,9 +2699,17 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 }
                 auto const op = wideFloatOpFromName(r.at("op").get<std::string>());
                 if (!op.has_value()) {
+                    // ⚠ ALSO AN UNQUOTED SET before this cycle — invisible to
+                    // every quoted-token census, and to any test that reads a
+                    // message back. Projected from the table that owns it
+                    // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               std::format("/wideFloatSoftcalls/{}/op", i),
-                              "expected one of add/sub/mul/div/to_i32/from_f64");
+                              std::format("unknown wideFloatSoftcalls op — "
+                                          "accepted: {}",
+                                          detail::renderAllowedList(
+                                              allNames(kWideFloatOpTable),
+                                              " / ")));
                     continue;
                 }
                 auto& row = data.wideFloatSoftcalls[static_cast<std::size_t>(*op)];
@@ -2198,9 +2789,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         if (!lib.is_object()) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       "/wideFloatSoftcallLibraryByFormat",
-                      "must be an object mapping object-format kind name "
-                      "('elf' / 'pe' / 'macho' / 'wasm' / 'spirv') → library "
-                      "string");
+                      std::format("must be an object mapping object-format "
+                                  "kind name ({}) → library string",
+                                  detail::renderAllowedList(
+                                      kSelectableObjectFormatKindNames, " / ")));
         } else {
             for (auto it = lib.begin(); it != lib.end(); ++it) {
                 if (detail::isDocumentationKey(it.key())) continue;
@@ -2211,11 +2803,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     coll.emit(DiagnosticCode::C_MalformedJson, path,
                               std::format(
                                   "'{}' is not a recognized object-format kind "
-                                  "(expected one of 'elf' / 'pe' / 'macho' / "
-                                  "'wasm' / 'spirv'). An unrecognized name "
+                                  "(expected one of {}). An unrecognized name "
                                   "would declare a softcall library that never "
                                   "resolves, silently leaving the F128 softcall "
-                                  "path with no runtime library.", it.key()));
+                                  "path with no runtime library.", it.key(),
+                                  detail::renderAllowedList(
+                                      kSelectableObjectFormatKindNames, " / ")));
                     continue;
                 }
                 if (!isSelectableObjectFormatKind(*kind)) {
@@ -2355,11 +2948,22 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // FC7: the by-value aggregate CLASSIFICATION strategy (a closed
                 // verb set — the realization tier switches on this enum, never
                 // identity). Unknown strategy ⇒ FAIL-LOUD (no silent fallback).
+                // ⚠ BOTH refusals used to name NO accepted set at all — the
+                // degenerate case of the retyped-closed-set class: a config
+                // author was told the spelling was wrong and given nothing to
+                // write instead. Rendered from the table, so a new strategy
+                // reaches the message with its row
+                // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
                 if (c.contains("aggregateClassification")) {
                     if (!c.at("aggregateClassification").is_string()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
                                   std::format("{}/aggregateClassification", ccPath),
-                                  "'aggregateClassification' must be a strategy-name string");
+                                  std::format("'aggregateClassification' must be "
+                                              "a strategy-name string — "
+                                              "accepted: {}",
+                                              detail::renderAllowedList(
+                                                  allNames(kAggregateClassKindTable),
+                                                  " / ")));
                     } else {
                         auto const s = c.at("aggregateClassification").get<std::string>();
                         if (auto const k = aggregateClassKindFromName(s); k.has_value()) {
@@ -2368,7 +2972,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                             coll.emit(DiagnosticCode::C_MalformedJson,
                                       std::format("{}/aggregateClassification", ccPath),
                                       std::format("unknown aggregate-classification "
-                                                  "strategy '{}'", s));
+                                                  "strategy '{}' — accepted: {}", s,
+                                                  detail::renderAllowedList(
+                                                      allNames(kAggregateClassKindTable),
+                                                      " / ")));
                         }
                     }
                 }
@@ -2660,9 +3267,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                     coll.emit(DiagnosticCode::C_MalformedJson,
                                               std::format("{}/vaListLayout/strategy", ccPath),
                                               std::format("unknown va_list strategy '{}' "
-                                                          "(sysv_register_save / "
-                                                          "homogeneous_pointer / "
-                                                          "aapcs64_dual_cursor)", sname));
+                                                          "— accepted: {}", sname,
+                                                          detail::renderAllowedList(
+                                                              allNames(kVaListStrategyTable),
+                                                              " / ")));
                                     vlOk = false;
                                     strategyResolved = false;
                                 } else {
@@ -2694,6 +3302,18 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                 // the SAME predicate `rejectUnknownKeys` uses
                                 // — a second spelling of it here is how one
                                 // site ends up rejecting `$fooComment`.
+                                //
+                                // ⓘ NOT ROUTED THROUGH `rejectUnknownKeys`,
+                                // deliberately: the vocabulary here is TWO
+                                // tables (common + the declared strategy's
+                                // own), and the whole value of this site is a
+                                // message the shared sentence cannot carry —
+                                // it names the OTHER strategy that would have
+                                // read the key, which is what distinguishes a
+                                // typo from a copy-paste off the wrong ABI
+                                // (D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-
+                                // KEY). Routing it would trade a diagnostic
+                                // for a shape.
                                 if (detail::isDocumentationKey(key)) continue;
                                 if (inSet(kVaListCommonKeys, key)) continue;
                                 if (inSet(own, key)) continue;
@@ -2702,22 +3322,30 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                 // key" into a message the author can act on,
                                 // and it is the difference between a typo and
                                 // a copy-paste from the wrong ABI.
+                                // ⚠ THE SCAN WALKS THE TABLE, not a hand-listed
+                                // triple. It used to name the three
+                                // enumerators inline, which made a fourth
+                                // strategy's keys invisible to this message —
+                                // the author would get the bare "no va_list
+                                // strategy declares it" arm for a key that
+                                // plainly belongs to one, which is the exact
+                                // opposite of what the arm means.
                                 std::string accepted;
-                                for (auto s : {VaListStrategy::SysVRegisterSave,
-                                               VaListStrategy::HomogeneousPointer,
-                                               VaListStrategy::Aapcs64DualCursor}) {
-                                    if (s == layout.strategy) continue;
-                                    if (!inSet(keysOf(s), key)) continue;
+                                for (auto const& row : kVaListStrategyTable.rows) {
+                                    if (row.first == layout.strategy) continue;
+                                    if (!inSet(keysOf(row.first), key)) continue;
                                     if (!accepted.empty()) accepted += "' / '";
-                                    accepted += vaListStrategyName(s);
+                                    accepted += row.second;
                                 }
-                                std::string allowed;
-                                for (auto const& e : kVaListCommonKeys) {
+                                // The shared renderer, not a third copy of the
+                                // quote-and-join loop (`renderAllowedList` is
+                                // the ONE renderer — see its header note).
+                                std::string allowed =
+                                    detail::renderAllowedList(kVaListCommonKeys,
+                                                              ", ");
+                                if (!own.empty()) {
                                     if (!allowed.empty()) allowed += ", ";
-                                    allowed += '\''; allowed += e; allowed += '\'';
-                                }
-                                for (auto const& e : own) {
-                                    allowed += ", '"; allowed += e; allowed += '\'';
+                                    allowed += detail::renderAllowedList(own, ", ");
                                 }
                                 coll.emit(
                                     DiagnosticCode::C_MalformedJson,
@@ -3107,7 +3735,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         return std::unexpected(std::move(coll).release());
     }
 
-    return std::make_shared<TargetSchema>(std::move(data));
+    auto schema = std::make_shared<TargetSchema>(std::move(data));
+    schema->contentDigest_ = std::move(digest);
+    return schema;
 }
 
 } // namespace dss

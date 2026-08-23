@@ -441,8 +441,11 @@ struct DSS_EXPORT AssembledModule {
     // any unresolved `Relocation::target`.
     std::vector<ExternImport>      externImports;
 
-    // Read-only / initialized / zero-fill data items (D-LK-RODATA-
-    // SUBSTRATE). Each entry carries a SymbolId, the section it
+    // Read-only / initialized / zero-fill data items.
+    // Anchored: `D-LK4-RODATA-SUBSTRATE` (ANCHOR, ONE LINE, DO NOT WRAP -- this
+    // citation was wrapped AND missing the `4` until 2026-08-21, so it named a
+    // row that does not exist and no grep could see it either).
+    // Each entry carries a SymbolId, the section it
     // belongs to (typically `SectionKind::Rodata`), the raw bytes,
     // and an alignment hint. The linker walker concatenates items
     // sharing a `section` (with per-item alignment padding), emits

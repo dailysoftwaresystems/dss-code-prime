@@ -42,6 +42,11 @@ inline constexpr EnumNameTable<SymbolBinding, 3> kSymbolBindingTable{{{
     { SymbolBinding::Weak,   "weak"   },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kSymbolBindingTable);
+
 [[nodiscard]] constexpr std::string_view
 symbolBindingName(SymbolBinding b) noexcept {
     return kSymbolBindingTable.name(b);
@@ -66,6 +71,11 @@ inline constexpr EnumNameTable<SymbolVisibility, 4> kSymbolVisibilityTable{{{
     { SymbolVisibility::Protected, "protected" },
     { SymbolVisibility::Internal,  "internal"  },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kSymbolVisibilityTable);
 
 [[nodiscard]] constexpr std::string_view
 symbolVisibilityName(SymbolVisibility v) noexcept {

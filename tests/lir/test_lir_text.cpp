@@ -1503,3 +1503,302 @@ TEST(LirTextParser, VerifyOnLoadCatchesMemOperandPairingViolation) {
            "L_UnsupportedLoweringForOpcode before the architect MED fold)";
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// Register-constraint pool round-trip (D-LIR-PER-INST-REG-CONSTRAINTS).
+// The `.dsslir` format's whole contract is lossless round-
+// trip, and a side structure that survives every PASS but not the text
+// codec is one that vanishes the moment anyone dumps and reloads a module
+// for debugging.
+// ═════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A constraint set exercising all five clauses at once — including the
+// role maps, whose loss would be invisible to a positional-array-only
+// round trip (the role projection is what keeps a quotient capture from
+// silently becoming a remainder capture).
+[[nodiscard]] ImplicitRegisterConstraint fullConstraint() {
+    ImplicitRegisterConstraint c;
+    c.inputNames      = {"rax", "rdx"};
+    c.outputNames     = {"rax"};
+    // ⚠ `rax` is an output, so it MUST also be clobbered — `LirBuilder::
+    // regConstraintPoolAdd` enforces `outputs ⊆ clobbered` (D-LIR-PER-
+    // INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED) and this
+    // fixture goes through the real builder. `rcx` stays a clobber that
+    // is NOT an output, so the round trip still carries a set where the
+    // three arrays genuinely differ.
+    c.clobberedNames  = {"rdx", "rcx", "rax"};
+    c.inputRoleNames  = {{"dividend", "rax"}};
+    c.outputRoleNames = {{"quotient", "rax"}, {"remainder", "rdx"}};
+    return c;
+}
+
+// `f() { rax = mov #42 [rc#0]; ret rax }`.
+[[nodiscard]] Lir buildConstraintBearingModule(TargetSchema const& sch,
+                                               std::uint32_t* rcOut) {
+    LirBuilder b{sch};
+    std::uint32_t const rc = b.regConstraintPoolAdd(fullConstraint());
+    if (rcOut != nullptr) *rcOut = rc;
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const rax = makePhysicalReg(0, LirRegClass::GPR);
+    std::array<LirOperand, 1> movOps{LirOperand::makeImmInt32(42)};
+    LirInstId const mov = b.addInst(*sch.opcodeByMnemonic("mov"), rax, movOps);
+    b.setInstRegConstraints(mov, rc);
+    std::array<LirOperand, 1> retOps{LirOperand::makeReg(rax)};
+    b.addReturn(*sch.opcodeByMnemonic("ret"), retOps);
+    return std::move(b).finish();
+}
+
+} // namespace
+
+TEST(LirText, EmitterAlwaysWritesTheRegConstraintSection) {
+    auto sch = shippedX86();
+    LirBuilder b{*sch};
+    Lir empty = std::move(b).finish();
+    DiagnosticReporter rep;
+    LirTextContext ctx;
+    std::string const text = emitLir(empty, *sch, ctx, rep);
+    EXPECT_NE(text.find("reg_constraints {"), std::string::npos)
+        << "the section is emitted even when empty, same as literal_pool — "
+           "an omitted section and an empty one must not be the same bytes";
+}
+
+TEST(LirTextRoundTrip, RegisterConstraintPoolSurvivesTheTextCodec) {
+    auto sch = shippedX86();
+    std::uint32_t rc = 0;
+    Lir const lir = buildConstraintBearingModule(*sch, &rc);
+    LirTextContext ctx;
+    std::string const text = roundTripOrFail(lir, *sch, ctx, "reg constraints");
+
+    // Shape pins: the section, all five clauses, and the per-inst handle.
+    EXPECT_NE(text.find("rc#0 = in [rax, rdx] out [rax] clobber [rdx, rcx, rax] "
+                        "inrole [dividend = rax] "
+                        "outrole [quotient = rax, remainder = rdx]"),
+              std::string::npos)
+        << "--- emitted ---\n" << text;
+    EXPECT_NE(text.find("rax = mov #42 ; payload=0 flags=0 rc=1"),
+              std::string::npos)
+        << "the per-instruction handle rides the inst tail (1-based; 0 is the "
+           "'declares none' sentinel and is never emitted)\n--- emitted ---\n"
+        << text;
+
+    // ★ And the parsed module must hold the RESOLVED set, not just the
+    // text: names AND the ordinals the reader re-derived through the
+    // schema. A round trip that preserved the spelling but lost the
+    // resolution would satisfy a text-only assertion.
+    DiagnosticReporter rep;
+    auto result = parseLir(text, *sch, rep);
+    ASSERT_TRUE(result->ok);
+    ASSERT_EQ(result->lir.regConstraintPool().size(), 1u);
+    LirFuncId const fn = result->lir.funcAt(0);
+    LirBlockId const bb = result->lir.funcBlockAt(fn, 0);
+    auto const* c =
+        result->lir.instRegConstraints(result->lir.blockInstAt(bb, 0));
+    ASSERT_NE(c, nullptr);
+    EXPECT_EQ(c->inputNames, (std::vector<std::string>{"rax", "rdx"}));
+    EXPECT_EQ(c->clobberedNames,
+              (std::vector<std::string>{"rdx", "rcx", "rax"}));
+    EXPECT_EQ(c->outputRoleNames.size(), 2u);
+    ASSERT_EQ(c->clobberedOrdinals.size(), 3u);
+    EXPECT_EQ(c->clobberedOrdinals[0], *sch->registerByName("rdx"));
+    EXPECT_EQ(c->clobberedOrdinals[1], *sch->registerByName("rcx"));
+    EXPECT_EQ(c->clobberedOrdinals[2], *sch->registerByName("rax"));
+    EXPECT_FALSE(c->firstOutputNotClobbered().has_value())
+        << "the round trip must preserve `outputs ⊆ clobbered` — the "
+           "allocator omits outputs from its forbidden set on that basis";
+    ASSERT_EQ(c->outputRoleOrdinals.size(), 2u);
+    EXPECT_EQ(c->outputRoleOrdinals[0].first, "quotient");
+    EXPECT_EQ(c->outputRoleOrdinals[0].second, *sch->registerByName("rax"));
+}
+
+TEST(LirTextRoundTrip, EmptyRegConstraintPoolRoundTrips) {
+    // The overwhelmingly common shape: no instruction carries a handle, so
+    // no `rc=` appears anywhere and the section is empty. Pinned so the
+    // "emit `rc=` only when non-zero" rule cannot start emitting `rc=0`
+    // and rewrite every golden in the tree to say nothing.
+    auto sch = shippedX86();
+    Lir const lir = buildOneInstFunction(*sch, *sch->opcodeByMnemonic("mov"),
+                                         *sch->opcodeByMnemonic("ret"));
+    LirTextContext ctx;
+    std::string const text = roundTripOrFail(lir, *sch, ctx, "no constraints");
+    EXPECT_NE(text.find("reg_constraints {\n}\n"), std::string::npos);
+    EXPECT_EQ(text.find(" rc="), std::string::npos)
+        << "an instruction that declares no constraints must emit no handle";
+}
+
+TEST(LirTextParser, UnknownRegisterNameInAConstraintIsRefusedNotAborted) {
+    // ⚠ `LirBuilder::regConstraintPoolAdd` ABORTS on an unknown register
+    // name — correct for a producer, fatal for a text READER. The reader
+    // must therefore validate first and refuse the entry itself. This is
+    // the exercise of that arm: a parse error may never become a process
+    // abort.
+    auto sch = shippedX86();
+    std::string const malformed = std::format(
+        "dsslir 1\n"
+        "target {} version \"{}\"\n"
+        "symbols {{\n  %1\n}}\n"
+        "literal_pool {{}}\n"
+        "reg_constraints {{\n"
+        "  rc#0 = in [] out [] clobber [nosuchreg] inrole [] outrole []\n"
+        "}}\n"
+        "module {{\n"
+        "  function %1 {{\n"
+        "    block ^b0 [entry] -> [] {{\n"
+        "      ret ; payload=0 flags=0\n"
+        "    }}\n"
+        "  }}\n"
+        "}}\n",
+        sch->name(), std::string{sch->version()});
+    DiagnosticReporter rep;
+    auto result = parseLir(malformed, *sch, rep);
+    EXPECT_FALSE(result->ok);
+    bool sawUnknown = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::I_TextUnknownName) sawUnknown = true;
+    }
+    EXPECT_TRUE(sawUnknown);
+}
+
+// ★★★ `outputs ⊆ clobbered` IS A **DIAGNOSTIC** HERE, NOT A PROCESS KILL
+// (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED).
+//
+// `LirBuilder::regConstraintPoolAdd` ABORTS on a violating entry — right for a
+// LOWERING, which can only reach it through its own bug — and its message
+// states the obligation this test pins: *"a producer fed by USER text must
+// pre-validate with `firstOutputNotClobbered()` and REPORT"*. The `.dsslir`
+// reader is that producer; every byte it hands the builder came from a file.
+// Before this arm existed the reader pre-validated the NAMES but not the SUBSET,
+// so a hand-written or truncated `.dsslir` would kill the process instead of
+// being diagnosed — and a refusal that crashes is not a refusal.
+//
+// ★ EXERCISED, NOT READ. The whole point is that the arm RUNS: a test that
+// merely inspected the source could not tell a reachable guard from a dead one,
+// and the failure mode being replaced is an `abort()` — so if the guard is
+// removed this test does not fail politely, it takes the runner down. That is
+// the strongest red-on-disable shape available here.
+//
+// RED-ON-DISABLE: delete the `if (!constraintSubsetHolds(c)) continue;` call in
+// `parseRegConstraintPool` → the entry reaches `regConstraintPoolAdd`, which
+// aborts ⇒ the test binary dies with a non-zero exit and no gtest summary.
+TEST(LirTextParser, AnOutputNotInTheClobberSetIsRefusedNotAborted) {
+    auto sch = shippedX86();
+    auto const doc = [&](char const* rc) {
+        return std::format(
+            "dsslir 1\n"
+            "target {} version \"{}\"\n"
+            "symbols {{\n  %1\n}}\n"
+            "literal_pool {{}}\n"
+            "reg_constraints {{\n"
+            "  {}\n"
+            "}}\n"
+            "module {{\n"
+            "  function %1 {{\n"
+            "    block ^b0 [entry] -> [] {{\n"
+            "      rax = mov #1 ; payload=0 flags=0 rc=1\n"
+            "      ret rax ; payload=0 flags=0\n"
+            "    }}\n"
+            "  }}\n"
+            "}}\n",
+            sch->name(), std::string{sch->version()}, rc);
+    };
+
+    // `rax` is written and NOT clobbered — the shape register allocation is
+    // unsafe against, because it omits outputs from its forbidden set.
+    DiagnosticReporter rep;
+    auto result = parseLir(
+        doc("rc#0 = in [] out [rax] clobber [rdx] inrole [] outrole []"),
+        *sch, rep);
+    EXPECT_FALSE(result->ok);
+    bool sawMalformed = false;
+    std::string first;
+    for (auto const& d : rep.all()) {
+        if (d.code != DiagnosticCode::I_TextMalformed) continue;
+        sawMalformed = true;
+        if (first.empty()) first = d.actual;
+    }
+    EXPECT_TRUE(sawMalformed)
+        << "the subset violation must be REPORTED; the builder's abort is the "
+           "backstop for producers that forget, never the answer for a file";
+    // The message must NAME the offending register — "malformed" alone leaves
+    // the author of a 10k-line `.dsslir` with nowhere to look.
+    EXPECT_NE(first.find("rax"), std::string::npos) << first;
+    EXPECT_NE(first.find("clobber"), std::string::npos) << first;
+
+    // ★ THE POSITIVE CONTROL. Without it this pin is satisfied by a reader that
+    // refuses EVERY entry carrying an output — which would make the whole
+    // register-constraint section unreadable and still look green here.
+    DiagnosticReporter okRep;
+    auto good = parseLir(
+        doc("rc#0 = in [] out [rax] clobber [rdx, rax] inrole [] outrole []"),
+        *sch, okRep);
+    EXPECT_TRUE(good->ok)
+        << "the SAME entry with `rax` added to the clobber list must load: "
+        << (okRep.all().empty() ? std::string{} : okRep.all()[0].actual);
+    ASSERT_EQ(good->lir.regConstraintPool().size(), 1u);
+}
+
+TEST(LirTextParser, AnOutOfRangeRcHandleIsRefusedNotAborted) {
+    // Same discipline for the per-instruction handle: `rc=3` against a
+    // one-entry section is a bad FILE, not a bad producer, so it reports.
+    auto sch = shippedX86();
+    std::string const malformed = std::format(
+        "dsslir 1\n"
+        "target {} version \"{}\"\n"
+        "symbols {{\n  %1\n}}\n"
+        "literal_pool {{}}\n"
+        "reg_constraints {{\n"
+        "  rc#0 = in [] out [] clobber [rdx] inrole [] outrole []\n"
+        "}}\n"
+        "module {{\n"
+        "  function %1 {{\n"
+        "    block ^b0 [entry] -> [] {{\n"
+        "      rax = mov #1 ; payload=0 flags=0 rc=3\n"
+        "      ret rax ; payload=0 flags=0\n"
+        "    }}\n"
+        "  }}\n"
+        "}}\n",
+        sch->name(), std::string{sch->version()});
+    DiagnosticReporter rep;
+    auto result = parseLir(malformed, *sch, rep);
+    EXPECT_FALSE(result->ok);
+    bool sawUnknown = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::I_TextUnknownName) sawUnknown = true;
+    }
+    EXPECT_TRUE(sawUnknown);
+}
+
+TEST(LirTextParser, VerifyOnLoadCatchesAnUnreferencedConstraintEntry) {
+    // The text reader writes the two halves of the carrier from two
+    // different sections, so it can produce the exact silent shape a
+    // forgetful rebuild pass produces: the pool declares an entry and no
+    // instruction names it.
+    auto sch = shippedX86();
+    std::string const malformed = std::format(
+        "dsslir 1\n"
+        "target {} version \"{}\"\n"
+        "symbols {{\n  %1\n}}\n"
+        "literal_pool {{}}\n"
+        "reg_constraints {{\n"
+        "  rc#0 = in [] out [] clobber [rdx] inrole [] outrole []\n"
+        "}}\n"
+        "module {{\n"
+        "  function %1 {{\n"
+        "    block ^b0 [entry] -> [] {{\n"
+        "      ret ; payload=0 flags=0\n"
+        "    }}\n"
+        "  }}\n"
+        "}}\n",
+        sch->name(), std::string{sch->version()});
+    DiagnosticReporter rep;
+    auto result = parseLir(malformed, *sch, rep);
+    EXPECT_FALSE(result->ok);
+    bool sawLost = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_SideStructureReferenceLost) sawLost = true;
+    }
+    EXPECT_TRUE(sawLost);
+}
+

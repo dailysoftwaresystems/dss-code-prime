@@ -56,6 +56,19 @@ std::size_t countCode(DiagnosticReporter const& r, DiagnosticCode code) {
     return n;
 }
 
+// P10: the schedule tree's leaf passes in interpreter (depth-first,
+// left-to-right) order — the pre-tree `pipeline.passes` view. For the
+// single-root schedules the shipped docs normalize to, this is exactly
+// the document's flat pass list.
+void collectLeafPasses(opt::OptPipelineNode const& n,
+                       std::vector<opt::PassId>& out) {
+    if (n.kind == opt::OptPipelineNode::Kind::Leaf) {
+        out.push_back(n.passId);
+        return;
+    }
+    for (auto const& c : n.children) collectLeafPasses(c, out);
+}
+
 } // namespace
 
 // D-OPT1-X-UNKNOWNPASSID-UNIT-PIN: an unknown PassId ordinal triggers
@@ -78,8 +91,10 @@ TEST(Optimizer, UnknownPassIdFiresXUnknownPassId) {
     // static_assert in `optimizer.hpp` keeps kPassIdCount honest;
     // here we deliberately reach past that count via numeric
     // construction (the only way for a user to trigger the runtime
-    // guard).
-    pipeline.passes.push_back(static_cast<opt::PassId>(99));
+    // guard). (P10: the flat schedule — one fixpoint iteration over
+    // one leaf.)
+    pipeline.schedule = opt::OptPipelineNode::fixpoint(
+        1u, {opt::OptPipelineNode::leaf(static_cast<opt::PassId>(99))});
 
     auto const result = opt::optimize(mir, target, interner, pipeline, rep);
     EXPECT_FALSE(result.ok);
@@ -357,7 +372,9 @@ TEST(Optimizer, EffectivenessConstFoldRerunPostMem2Reg) {
     // assertions in ARM 1 fail (we assert their inverse here).
     {
         opt::OptPipeline singleIter = releaseShape;
-        singleIter.maxIterations = 1;
+        // (P10: the iteration bound lives on the schedule tree's root
+        // fixpoint node — `count` is the max-traversals bound.)
+        singleIter.schedule.count = 1;
 
         TypeInterner interner{CompilationUnitId{1}};
         Mir mir = buildConstFoldInsideExprMir(interner);
@@ -601,8 +618,11 @@ TEST(Optimizer, EffectivenessAliasArcStrictTBAACapstone) {
         // Pin (a): the shipped pipeline MUST contain Cse. A JSON edit
         // that drops Cse fails this distinct from the effectiveness
         // check below, so the diagnostic surfaces the right cause.
+        // (P10: walk the schedule tree's leaves in interpreter order.)
         bool containsCse = false;
-        for (auto const p : pipelineR->passes) {
+        std::vector<opt::PassId> leafPasses;
+        collectLeafPasses(pipelineR->schedule, leafPasses);
+        for (auto const p : leafPasses) {
             if (p == opt::PassId::Cse) { containsCse = true; break; }
         }
         EXPECT_TRUE(containsCse)
@@ -688,9 +708,9 @@ TEST(Optimizer, MaxIterationsFixedPointLoop) {
     Mir mir = std::move(b).finish();
 
     DiagnosticReporter rep;
-    opt::OptPipeline pipeline{"two-pass", {opt::PassId::ConstFold,
-                                            opt::PassId::Identity}};
-    pipeline.maxIterations = 4;
+    opt::OptPipeline pipeline =
+        opt::OptPipeline::flat("two-pass", {opt::PassId::ConstFold,
+                                            opt::PassId::Identity}, 4);
     auto const result = opt::optimize(mir, target, interner, pipeline, rep);
     EXPECT_TRUE(result.ok);
     EXPECT_TRUE(result.fixedPointReached)
@@ -702,6 +722,188 @@ TEST(Optimizer, MaxIterationsFixedPointLoop) {
     EXPECT_EQ(result.passesRun, 4u)
         << "passes×iters = 2×2 (the second iter detects convergence "
            "AFTER running through the full pipeline list)";
+}
+
+// ── P10 schedule-tree grammar: interpreter semantics pins ────────────────
+// The sqlite-scale proof is the byte-identity battery; these pins catch an
+// interpreter divergence at unit scale, where it shows up first.
+
+namespace {
+
+// The MaxIterationsFixedPointLoop cluster, factored: Add(1,2) converges
+// after iteration 2 under [ConstFold, Identity].
+Mir buildFoldClusterMir(TypeInterner& interner) {
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder b;
+    b.addFunction(fnSig, SymbolId{101});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirLiteralValue v2; v2.value = std::int64_t{2}; v2.core = TypeKind::I32;
+    MirInstId const ops[] = {b.addConst(v1, i32), b.addConst(v2, i32)};
+    b.addReturn(b.addInst(MirOpcode::Add, ops, i32));
+    return std::move(b).finish();
+}
+
+opt::OptPipeline structuralTwin() {
+    opt::OptPipeline p;
+    p.name = "struct-twin";
+    p.schedule = opt::OptPipelineNode::fixpoint(
+        4u, {opt::OptPipelineNode::leaf(opt::PassId::ConstFold),
+             opt::OptPipelineNode::leaf(opt::PassId::Identity)});
+    return p;
+}
+
+} // namespace
+
+// THE DESUGAR PROOF at unit scale: flat{passes, maxIterations} and its
+// structural fixpoint{max, passes} twin are ONE schedule — identical
+// counters on identical input.
+TEST(Optimizer, FlatAndStructuralTwinsRunIdentically) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    TypeInterner interner{CompilationUnitId{1}};
+
+    Mir a = buildFoldClusterMir(interner);
+    DiagnosticReporter ra;
+    auto const flatRes = opt::optimize(
+        a, target, interner,
+        opt::OptPipeline::flat("flat-twin",
+                               {opt::PassId::ConstFold,
+                                opt::PassId::Identity}, 4),
+        ra);
+    Mir b = buildFoldClusterMir(interner);
+    DiagnosticReporter rb;
+    auto const structRes =
+        opt::optimize(b, target, interner, structuralTwin(), rb);
+
+    EXPECT_EQ(flatRes.ok, structRes.ok);
+    EXPECT_EQ(flatRes.passesRun, structRes.passesRun)
+        << "the twins must run the SAME pass invocations";
+    EXPECT_EQ(flatRes.passesMutated, structRes.passesMutated);
+    EXPECT_EQ(flatRes.fixedPointReached, structRes.fixedPointReached);
+    EXPECT_EQ(flatRes.passesRun, 4u) << "2 iterations × 2 passes, as above";
+}
+
+// repeat NEVER early-exits; fixpoint does. Same body [Identity], same
+// bound 3: repeat runs exactly 3 traversals; fixpoint converges after 1.
+TEST(Optimizer, RepeatUnrollsExactlyAndFixpointStopsEarly) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    TypeInterner interner{CompilationUnitId{1}};
+
+    opt::OptPipeline rep;
+    rep.name = "rep3";
+    rep.schedule = opt::OptPipelineNode::repeat(
+        3u, {opt::OptPipelineNode::leaf(opt::PassId::Identity)});
+    Mir a = buildFoldClusterMir(interner);
+    DiagnosticReporter ra;
+    auto const repRes = opt::optimize(a, target, interner, rep, ra);
+    EXPECT_TRUE(repRes.ok);
+    EXPECT_EQ(repRes.passesRun, 3u)
+        << "repeat(3) runs its body EXACTLY 3 times — no convergence "
+           "check exists for it, mutation-free or not";
+
+    opt::OptPipeline fp;
+    fp.name = "fp3";
+    fp.schedule = opt::OptPipelineNode::fixpoint(
+        3u, {opt::OptPipelineNode::leaf(opt::PassId::Identity)});
+    Mir b = buildFoldClusterMir(interner);
+    DiagnosticReporter rb;
+    auto const fpRes = opt::optimize(b, target, interner, fp, rb);
+    EXPECT_TRUE(fpRes.ok);
+    EXPECT_EQ(fpRes.passesRun, 1u)
+        << "fixpoint(3) over [Identity] converges after ONE traversal";
+    EXPECT_TRUE(fpRes.fixedPointReached);
+}
+
+// fixedPointReached for a MULTI-fixpoint tree = EVERY executed fixpoint
+// converged before its cap. Negative arm: a cap-1 fixpoint whose body
+// mutates has NOT converged.
+TEST(Optimizer, MultiFixpointReachedMeansEveryFixpointConverged) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    TypeInterner interner{CompilationUnitId{1}};
+
+    // Inner [Identity] converges instantly; outer [ConstFold, <inner>]
+    // converges on traversal 2 — both converged → reached.
+    opt::OptPipeline both;
+    both.name = "nested";
+    both.schedule = opt::OptPipelineNode::fixpoint(
+        4u, {opt::OptPipelineNode::leaf(opt::PassId::ConstFold),
+             opt::OptPipelineNode::fixpoint(
+                 4u, {opt::OptPipelineNode::leaf(opt::PassId::Identity)})});
+    Mir a = buildFoldClusterMir(interner);
+    DiagnosticReporter ra;
+    auto const okRes = opt::optimize(a, target, interner, both, ra);
+    EXPECT_TRUE(okRes.ok);
+    EXPECT_TRUE(okRes.fixedPointReached)
+        << "both executed fixpoints converged — reached must be true";
+
+    opt::OptPipeline cap1;
+    cap1.name = "cap1";
+    cap1.schedule = opt::OptPipelineNode::fixpoint(
+        1u, {opt::OptPipelineNode::leaf(opt::PassId::ConstFold),
+             opt::OptPipelineNode::leaf(opt::PassId::Identity)});
+    Mir b = buildFoldClusterMir(interner);
+    DiagnosticReporter rb;
+    auto const capRes = opt::optimize(b, target, interner, cap1, rb);
+    EXPECT_TRUE(capRes.ok);
+    EXPECT_FALSE(capRes.fixedPointReached)
+        << "the single traversal mutated — the fixpoint hit its cap "
+           "without a mutation-free traversal";
+}
+
+// The INNER fixpoint's delta scope is its OWN entry snapshot — an
+// OUTER pass's mutation (ConstFold, same traversal) must not make the
+// inner run extra iterations. Correct: inner runs once per outer
+// traversal (2 total) → passesRun == ConstFold(2) + Identity(2) == 4.
+// A leaked-outer-delta inner never converges and burns its full cap
+// every traversal (3+3) → 8.
+TEST(Optimizer, InnerFixpointIgnoresOuterMutations) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    TypeInterner interner{CompilationUnitId{1}};
+
+    opt::OptPipeline p;
+    p.name = "inner-snapshot";
+    p.schedule = opt::OptPipelineNode::fixpoint(
+        2u, {opt::OptPipelineNode::leaf(opt::PassId::ConstFold),
+             opt::OptPipelineNode::fixpoint(
+                 3u, {opt::OptPipelineNode::leaf(opt::PassId::Identity)})});
+    Mir mir = buildFoldClusterMir(interner);
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(mir, target, interner, p, rep);
+    EXPECT_TRUE(result.ok);
+    EXPECT_EQ(result.passesRun, 4u)
+        << "ConstFold 2× + Identity 2× — the inner fixpoint sees only "
+           "its own delta, so it converges immediately every time";
+}
+
+// Programmatic max:0 clamps to ONE traversal (the pre-tree defense),
+// never zero and never a refusal — the LOADER rejects 0, the engine
+// must survive it.
+TEST(Optimizer, FlatZeroIterationsClampsToOneTraversal) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    TypeInterner interner{CompilationUnitId{1}};
+
+    Mir mir = buildFoldClusterMir(interner);
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(
+        mir, target, interner,
+        opt::OptPipeline::flat("zero", {opt::PassId::Identity}, 0), rep);
+    EXPECT_TRUE(result.ok);
+    EXPECT_EQ(result.passesRun, 1u)
+        << "max:0 clamps to ONE traversal exactly as the pre-tree "
+           "engine did";
+    EXPECT_TRUE(result.fixedPointReached);
 }
 
 // D-CSUBSET-DIVISION-OP-CODEGEN closure-gate item (b) (cycle 10r,
@@ -922,9 +1124,9 @@ TEST(Optimizer, DuplicatePassesInPipelineBothDispatch) {
     // pipeline (which would dispatch ConstFold even more times) so
     // `passesRun == 2` cleanly attributes to BOTH pipeline entries
     // being honored.
-    opt::OptPipeline pipeline{"dup-const-fold",
-                              {opt::PassId::ConstFold, opt::PassId::ConstFold}};
-    pipeline.maxIterations = 1;
+    opt::OptPipeline pipeline =
+        opt::OptPipeline::flat("dup-const-fold",
+                               {opt::PassId::ConstFold, opt::PassId::ConstFold}, 1);
     auto const result = opt::optimize(mir, target, interner, pipeline, rep);
     EXPECT_TRUE(result.ok);
     EXPECT_EQ(result.passesRun, 2u)

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/substrate/path_identity.hpp"
+
 // CompilationUnit (CU) — the bundle of trees + driver-resolved cross-tree
 // references + driver-level diagnostics that the semantic phase, IR, and
 // codegen all consume. Phase #7.5 substrate; bridges parser (per-file Tree)
@@ -392,6 +394,16 @@ private:
     TreeId loadAndAdd_(std::filesystem::path const& path, bool& ok,
                        std::shared_ptr<GrammarSchema const> schema);
 
+    // ★★★ The UNCONDITIONAL predefined-macro identity validation, run once from
+    // `finish()`. The cross-family NAME collision, the mutual-exclusion groups
+    // and the `requires` backing claim are statements about a (language, target,
+    // object-format) TRIPLE, not about any TU — so they run for EVERY CU, in
+    // every language, whether or not a preprocessor ran and whether or not any
+    // header was included. See the definition for the three MEASURED paths on
+    // which they previously did not run at all. Reports into
+    // `driverDiagnostics_`.
+    void validatePredefinedMacroIdentity_();
+
     // EVERY registered schema whose `fileExtensions` claims `path`'s extension
     // (case-insensitive, dot included), deduplicated by schema identity and in
     // registration order. Empty for an empty/unclaimed extension.
@@ -458,10 +470,10 @@ private:
     // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE).
     DiagnosticBudget                     budget_;
     DiagnosticReporter                   driverDiagnostics_;
-    std::unordered_set<std::string>      seenPaths_;   // weakly-canonical, for addFile dedup
+    std::unordered_set<core::PathIdentity> seenPaths_;  // for addFile dedup
     // Weakly-canonical path → index into trees_, for include-following dedup
     // (resolve an #include to an already-loaded tree instead of re-parsing).
-    std::unordered_map<std::string, std::size_t> pathToTreeIndex_;
+    std::unordered_map<core::PathIdentity, std::size_t> pathToTreeIndex_;
     std::vector<std::filesystem::path>   includeDirs_;
     std::vector<std::filesystem::path>   systemDirs_;   // FF11 angle-include search path
     std::optional<ObjectFormatKind>      activeFormat_; // c9: per-target __has_include

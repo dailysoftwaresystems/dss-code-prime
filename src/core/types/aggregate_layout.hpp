@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> — dependency-free leaf
 
 #include <cstdint>
 #include <optional>
@@ -46,17 +47,42 @@ enum class ScalarAlignmentRule : std::uint8_t {
     Natural = 1,  // align(scalar) = min(byteSize(scalar), maxAlignment)
 };
 
+// ── THE ONE OWNER OF THIS FILE'S FOUR CLOSED VOCABULARIES ────────────────────
+//
+// Each of the four strategy enums below used to spell its names TWICE — a
+// `switch` returning literals and an `if`-chain comparing the same literals —
+// and every loader message that advertised the accepted set spelled them a
+// THIRD time (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+// Three owners of one fact, and nothing forcing them to agree: ✔MEASURED
+// 2026-08-20, `target_schema_json.cpp`'s bitFieldStrategy refusal named ONE of
+// the three spellings its own check accepts, and had done so since the enum
+// gained its second realized strategy. Adding an enumerator is now one table
+// row; the helpers and every diagnostic follow it automatically.
+//
+// The shape is `kDataModelTable`'s, including the `-Werror=switch` backstop:
+// the table owns the spellings, the switch names only the ENUMERATORS, so a new
+// enumerator without a row still fails the BUILD.
+inline constexpr EnumNameTable<ScalarAlignmentRule, 1> kScalarAlignmentRuleTable{{{
+    { ScalarAlignmentRule::Natural, "natural" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kScalarAlignmentRuleTable);
+
 [[nodiscard]] constexpr std::string_view
 scalarAlignmentRuleName(ScalarAlignmentRule r) noexcept {
+    // The `-Werror=switch` backstop — it owns no spelling. See `dataModelName`.
     switch (r) {
-        case ScalarAlignmentRule::Natural: return "natural";
+        case ScalarAlignmentRule::Natural:
+            break;
     }
-    return {};
+    return kScalarAlignmentRuleTable.nameOrEmpty(r);
 }
 [[nodiscard]] constexpr std::optional<ScalarAlignmentRule>
 scalarAlignmentRuleFromName(std::string_view s) noexcept {
-    if (s == "natural") return ScalarAlignmentRule::Natural;
-    return std::nullopt;
+    return kScalarAlignmentRuleTable.fromName(s);
 }
 
 // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the per-CC
@@ -77,23 +103,40 @@ enum class AggregateClassKind : std::uint8_t {
     Aapcs64Hfa    = 3,  // AAPCS64/Apple: HFA in SIMD, ≤16B in X regs, x8 sret
 };
 
+// ★ `None` IS A ROW HERE, and deliberately so — the `ObjectFormatKind::Unknown`
+// discipline, not the `LongDoubleFormat::None` one. A calling convention with no
+// by-value aggregate support yet is a thing a `.target.json` may STATE, and the
+// realization tier turns that statement into a fail-loud at classification. It
+// is therefore SELECTABLE, and the whole table is what a message here must
+// advertise. (Contrast `BitFieldStrategy` below, whose `none` a FORMAT may not
+// select because the format's value participates in a fallback chain.)
+inline constexpr EnumNameTable<AggregateClassKind, 4> kAggregateClassKindTable{{{
+    { AggregateClassKind::None,          "none"           },
+    { AggregateClassKind::SysVEightbyte, "sysv_eightbyte" },
+    { AggregateClassKind::Win64BySize,   "win64_by_size"  },
+    { AggregateClassKind::Aapcs64Hfa,    "aapcs64_hfa"    },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kAggregateClassKindTable);
+
 [[nodiscard]] constexpr std::string_view
 aggregateClassKindName(AggregateClassKind k) noexcept {
+    // The `-Werror=switch` backstop — it owns no spelling. See `dataModelName`.
     switch (k) {
-        case AggregateClassKind::None:          return "none";
-        case AggregateClassKind::SysVEightbyte: return "sysv_eightbyte";
-        case AggregateClassKind::Win64BySize:   return "win64_by_size";
-        case AggregateClassKind::Aapcs64Hfa:    return "aapcs64_hfa";
+        case AggregateClassKind::None:
+        case AggregateClassKind::SysVEightbyte:
+        case AggregateClassKind::Win64BySize:
+        case AggregateClassKind::Aapcs64Hfa:
+            break;
     }
-    return {};
+    return kAggregateClassKindTable.nameOrEmpty(k);
 }
 [[nodiscard]] constexpr std::optional<AggregateClassKind>
 aggregateClassKindFromName(std::string_view s) noexcept {
-    if (s == "none")           return AggregateClassKind::None;
-    if (s == "sysv_eightbyte") return AggregateClassKind::SysVEightbyte;
-    if (s == "win64_by_size")  return AggregateClassKind::Win64BySize;
-    if (s == "aapcs64_hfa")    return AggregateClassKind::Aapcs64Hfa;
-    return std::nullopt;
+    return kAggregateClassKindTable.fromName(s);
 }
 
 // FC8 bitfields (D-CSUBSET-BITFIELD / D-CSUBSET-BITFIELD-ABI-EXACT): the per-ABI
@@ -145,21 +188,56 @@ enum class BitFieldStrategy : std::uint8_t {
                        // struct size covers the last unit's full declared-type width.
 };
 
+// ★ `none` IS A ROW — the `ObjectFormatKind::Unknown` discipline that
+// `object_format_kind.hpp` names after THIS vocabulary. The sentinel keeps a
+// spelling so a site that must refuse it can tell "you wrote the reserved word"
+// apart from "you wrote a spelling nobody claims" — two different author
+// mistakes earning two different diagnostics. The two consumers differ, and
+// each message must state ITS OWN site's accepted set:
+//   * a `.target.json` `aggregateLayout` may write `none` (it means exactly
+//     what omitting the key means: undeclared) ⇒ the whole table;
+//   * a `.format.json` may NOT (the format's value FALLS BACK to the target's
+//     when absent, so `none` would be ambiguous between "unset, use the
+//     target's" and "override the target with nothing") ⇒ the SELECTABLE
+//     projection below, and an explicit sentinel refusal at that site.
+inline constexpr EnumNameTable<BitFieldStrategy, 3> kBitFieldStrategyTable{{{
+    { BitFieldStrategy::None,         "none"          },
+    { BitFieldStrategy::GnuPacked,    "gnu_packed"    },
+    { BitFieldStrategy::MsvcStraddle, "msvc_straddle" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kBitFieldStrategyTable);
+
+[[nodiscard]] constexpr bool
+isSelectableBitFieldStrategy(BitFieldStrategy s) noexcept {
+    return s != BitFieldStrategy::None;
+}
+
+// The spellings a site that refuses the sentinel accepts — the table minus
+// `none`. `namesWhere<M>` CHECKS `M`: a new strategy, or a second unselectable
+// enumerator, makes this initializer a COMPILE ERROR rather than a list that
+// quietly stops matching what the check takes.
+inline constexpr auto kSelectableBitFieldStrategyNames =
+    namesWhere<kBitFieldStrategyTable.rows.size() - 1>(
+        kBitFieldStrategyTable, isSelectableBitFieldStrategy);
+
 [[nodiscard]] constexpr std::string_view
 bitFieldStrategyName(BitFieldStrategy s) noexcept {
+    // The `-Werror=switch` backstop — it owns no spelling. See `dataModelName`.
     switch (s) {
-        case BitFieldStrategy::None:         return "none";
-        case BitFieldStrategy::GnuPacked:    return "gnu_packed";
-        case BitFieldStrategy::MsvcStraddle: return "msvc_straddle";
+        case BitFieldStrategy::None:
+        case BitFieldStrategy::GnuPacked:
+        case BitFieldStrategy::MsvcStraddle:
+            break;
     }
-    return {};
+    return kBitFieldStrategyTable.nameOrEmpty(s);
 }
 [[nodiscard]] constexpr std::optional<BitFieldStrategy>
 bitFieldStrategyFromName(std::string_view s) noexcept {
-    if (s == "none")          return BitFieldStrategy::None;
-    if (s == "gnu_packed")    return BitFieldStrategy::GnuPacked;
-    if (s == "msvc_straddle") return BitFieldStrategy::MsvcStraddle;
-    return std::nullopt;
+    return kBitFieldStrategyTable.fromName(s);
 }
 
 // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the per-CC va_list TYPE + va_start/va_arg/
@@ -200,21 +278,33 @@ enum class VaListStrategy : std::uint8_t {
     Aapcs64DualCursor  = 2,  // AAPCS64 ARM64-ELF dual gr/vr cursor `__va_list` (FC12c)
 };
 
+// No sentinel: every enumerator is a strategy a `.target.json` may select, so
+// the whole table is what a message here advertises.
+inline constexpr EnumNameTable<VaListStrategy, 3> kVaListStrategyTable{{{
+    { VaListStrategy::SysVRegisterSave,   "sysv_register_save"  },
+    { VaListStrategy::HomogeneousPointer, "homogeneous_pointer" },
+    { VaListStrategy::Aapcs64DualCursor,  "aapcs64_dual_cursor" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kVaListStrategyTable);
+
 [[nodiscard]] constexpr std::string_view
 vaListStrategyName(VaListStrategy s) noexcept {
+    // The `-Werror=switch` backstop — it owns no spelling. See `dataModelName`.
     switch (s) {
-        case VaListStrategy::SysVRegisterSave:   return "sysv_register_save";
-        case VaListStrategy::HomogeneousPointer: return "homogeneous_pointer";
-        case VaListStrategy::Aapcs64DualCursor:  return "aapcs64_dual_cursor";
+        case VaListStrategy::SysVRegisterSave:
+        case VaListStrategy::HomogeneousPointer:
+        case VaListStrategy::Aapcs64DualCursor:
+            break;
     }
-    return {};
+    return kVaListStrategyTable.nameOrEmpty(s);
 }
 [[nodiscard]] constexpr std::optional<VaListStrategy>
 vaListStrategyFromName(std::string_view s) noexcept {
-    if (s == "sysv_register_save")  return VaListStrategy::SysVRegisterSave;
-    if (s == "homogeneous_pointer") return VaListStrategy::HomogeneousPointer;
-    if (s == "aapcs64_dual_cursor") return VaListStrategy::Aapcs64DualCursor;
-    return std::nullopt;
+    return kVaListStrategyTable.fromName(s);
 }
 
 // The per-ABI aggregate-layout parameter block parsed from `.target.json`. A

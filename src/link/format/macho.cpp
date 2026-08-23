@@ -8,6 +8,9 @@
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/macho_chained_fixups.hpp"
+#include "link/format/macho_indirect_symbols.hpp"
+#include "core/types/config_key_vocabulary.hpp"
+#include "core/types/enum_name_table.hpp"
 #include "link/format/macho_codesign.hpp"
 #include "link/format/object_symbol_names.hpp"
 #include "link/format/string_table.hpp"
@@ -69,6 +72,30 @@
 
 namespace dss::macho {
 
+// ── THE SPELLINGS THIS WALKER ACCEPTS, PROJECTED FROM THE TABLE ───────────
+//
+// D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET. The
+// `externCallDispatch` coherence guard below used to name BOTH the value it
+// refused and the value to set as STRING LITERALS, while acceptance was
+// decided by `externCallUsesIndirectShape`. ✔MEASURED before changing it, as
+// the rule requires: the sentence had NOT drifted — with a two-row vocabulary
+// `'direct-plt'` really is the only accepted spelling, and the predicate really
+// is `d == IndirectSlot`. What it carried was the LATENT half: the message
+// asserted which spelling the format declared without ever reading it back, so
+// a third, indirect-shaped spelling would have been reported by the wrong name.
+//
+// Both halves are now projected through the ONE owner: the refused value is
+// rendered from the table, and the remedy is `namesWhere` over the SAME
+// predicate the guard tests, so the message cannot name a set the check does
+// not enforce. `namesWhere<M>` also makes the count a compile-time obligation —
+// adding a direct-shaped spelling without widening this fails to build, which
+// is the loud outcome rather than a quietly stale sentence.
+inline constexpr auto kMachoAcceptedExternCallDispatch =
+    namesWhere<1>(kExternCallDispatchTable, [](ExternCallDispatch d) {
+        return !externCallUsesIndirectShape(d);
+    });
+
+
 namespace {
 
 using dss::report;
@@ -93,6 +120,50 @@ constexpr std::uint8_t N_EXT  = 0x01;
 constexpr std::uint8_t N_UNDF = 0x00;
 constexpr std::uint8_t N_SECT = 0x0E;
 
+// nlist_64.n_desc bits (<mach-o/nlist.h>). N_ALT_ENTRY declares a defined
+// symbol to be an ALTERNATE ENTRY POINT into the atom that precedes it rather
+// than the start of an atom of its own -- the wire spelling of the
+// `.alt_entry` assembler directive. It is the ONLY thing that tells an
+// interior label apart from a whole body in Mach-O, because nlist_64 carries
+// no size field, and it is meaningful exactly when the mach_header declares
+// MH_SUBSECTIONS_VIA_SYMBOLS (which the object/staticlib format schemas do,
+// via `MachOIdentity::flags`) -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
+// BLOCK-LABEL-NOT-ATOM.
+//
+// ⚠ 0x0200, NOT 0x0020 -- ✔MEASURED 2026-08-20 against clang 19 targeting
+// arm64-apple-macos, which emits n_desc=0x0200 for an explicit `.alt_entry`
+// and n_desc=0x0020 (N_NO_DEAD_STRIP) for a `__attribute__((used))` static in
+// the same object. Writing 0x0020 here would stamp every block label
+// "never dead-strip me" and mark none of them as interior.
+constexpr std::uint16_t N_ALT_ENTRY = 0x0200;
+
+// N_WEAK_DEF declares a DEFINED symbol to be a weak (coalesced) definition:
+// several images may define it and the linker keeps one. It is the whole of
+// Mach-O's weak-definition machinery at the RELOCATABLE tier -- there is no
+// second bit and no load command to go with it.
+// D-LK-OBJECT-WEAK-DEF-RELOCATABLE.
+//
+// ⚠ 0x0080, and it is NOT accompanied by a header flag on an MH_OBJECT.
+// ✔MEASURED 2026-08-20 on the operator's Apple Silicon host, two instruments:
+//   * `<mach-o/nlist.h>` from the installed MacOSX.sdk:
+//     `#define N_WEAK_DEF 0x0080 /* coalesed symbol is a weak definition */`,
+//     alongside N_WEAK_REF 0x0040 (a weak REFERENCE -- a different fact);
+//   * `/usr/bin/clang -c` on `__attribute__((weak)) int wk(void){...}`, whose
+//     nlist for `_wk` reads n_type=0x0f n_desc=0x0080, while the MACH HEADER
+//     of that same `.o` reads flags=0x00002000 -- MH_SUBSECTIONS_VIA_SYMBOLS
+//     ONLY. MH_WEAK_DEFINES (0x8000) is ABSENT from the object and appears
+//     only after linking (the exec built from it reads 0x00218085, and a
+//     weak-free control exec reads 0x00200085). `<mach-o/loader.h>` agrees:
+//     it documents MH_WEAK_DEFINES as a property of "the final linked image".
+// ⇒ this writer emits N_WEAK_DEF and does NOT touch the object's header
+// flags. Setting MH_WEAK_DEFINES on an MH_OBJECT would state a fact about a
+// linked image that this file is not, and no reference encoder does it.
+constexpr std::uint16_t N_WEAK_DEF  = 0x0080;
+static_assert(N_WEAK_DEF != N_ALT_ENTRY,
+              "N_WEAK_DEF (0x0080) and N_ALT_ENTRY (0x0200) are different "
+              "n_desc bits -- conflating them would mark every weak "
+              "definition an interior label and lose its body");
+
 constexpr std::size_t kMachHeader64Size   = 32;
 constexpr std::size_t kSegmentCommand64Size = 72;
 constexpr std::size_t kSection64Size      = 80;
@@ -108,6 +179,46 @@ constexpr std::size_t kRelocationInfoSize = 8;
 // (CIE/FDE records pad to the address size) and as that section's
 // alignment.
 constexpr std::uint32_t kMachO64AddressSize = 8;
+
+// ── nlist_64 as a FIXED-WIDTH RECORD, not five appends ─────────
+//
+// D-LINK-MACHO-EXEC-BAND-GUARDS-WERE-TAUTOLOGIES-LABELLED-AS-MEASUREMENTS,
+// the arm that row's own sweep missed. Every symtab builder in this file used
+// to append the five nlist_64 fields one at a time and then REFUSE, once the
+// band was complete, if the buffer had not come out a multiple of
+// `kNlist64Size` -- a predicate no legitimate module can reach, because the
+// five appends are 4+1+1+2+8 and nothing else ever writes that buffer. The
+// exec arm's copy of that refusal was deleted as a tautology; deleting the
+// MH_OBJECT copy alone would have left the invariant merely UNSTATED, so it is
+// made STRUCTURAL instead of asserted: the record is built as a
+// `std::array<std::uint8_t, kNlist64Size>` and inserted whole, so "every append
+// advances the buffer by exactly one record" is a property the COMPILER holds
+// and no runtime check has to restate. A future field-width edit becomes a type
+// error HERE, at the layout's one owner, instead of a size check in another
+// function that can say which byte count was wrong and never which field.
+//
+// ★ It also collapses FOUR hand-rolled copies of the same layout -- MH_OBJECT's
+// `appendNlist`, both image arms' `appendDefinedNlist`, and the dynamic arm's
+// undefined-extern band -- into one owner. Four spellings of one wire record is
+// the drift shape `definedNDesc` exists to prevent one field lower down.
+//
+// nlist_64 (<mach-o/nlist.h>): n_strx(u32) n_type(u8) n_sect(u8) n_desc(u16)
+// n_value(u64), all LITTLE-endian (byte_emit.hpp's note on why every Mach-O POD
+// record is LE and only the code-signature SuperBlob is not).
+void appendNlist64(std::vector<std::uint8_t>& out, std::uint32_t nStrx,
+                   std::uint8_t nType, std::uint8_t nSect,
+                   std::uint16_t nDesc, std::uint64_t nValue) {
+    std::array<std::uint8_t, kNlist64Size> rec{};
+    for (std::size_t i = 0; i < 4; ++i)
+        rec[i] = static_cast<std::uint8_t>(nStrx >> (i * 8));
+    rec[4] = nType;
+    rec[5] = nSect;
+    rec[6] = static_cast<std::uint8_t>(nDesc);
+    rec[7] = static_cast<std::uint8_t>(nDesc >> 8);
+    for (std::size_t i = 0; i < 8; ++i)
+        rec[8 + i] = static_cast<std::uint8_t>(nValue >> (i * 8));
+    out.insert(out.end(), rec.begin(), rec.end());
+}
 
 // ── Fixed-width name field (16 chars, NUL-padded) ──────────────
 
@@ -166,6 +277,21 @@ static_assert(kCodeSigCommandSize == kLinkeditDataCommandSize,
               "linkedit_data_command shape is wire-frozen at 16 bytes; "
               "both LC_CODE_SIGNATURE and LC_DYLD_CHAINED_FIXUPS use it.");
 constexpr std::uint64_t kLoadCmdAlign     = 8;  // pad LCs to 8 bytes
+// D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED: every blob inside a FINAL IMAGE's
+// __LINKEDIT must START on a pointer-sized boundary — 8 on every 64-bit
+// Mach-O. This is not a style preference: Apple's image validator (dyld's
+// `Header::validStructureLinkedit`, which Apple's `ld` runs on every link
+// INPUT) walks the blobs named by LC_DYLD_INFO / LC_DYLD_CHAINED_FIXUPS /
+// LC_DYSYMTAB / LC_SYMTAB / LC_CODE_SIGNATURE and REFUSES the whole image
+// with `ld: mis-aligned LINKEDIT content '<blob>'` on the first one that
+// fails. Two blobs carry a laxer rule (the indirect symbol table needs 4,
+// the string table 1); they are over-aligned to the same 8 here rather than
+// special-cased, because over-alignment always satisfies a laxer rule and
+// ONE rule for the whole chain is what stops the next blob appended to it
+// from silently re-opening this defect. The chain is padded at BOTH ends of
+// the writer — the cursor arithmetic and the byte emission — and the two are
+// cross-checked loud (see `linkeditOverrunBlob` in encodeExecDynamic).
+constexpr std::uint64_t kLinkeditBlobAlign = 8;
 
 // Emit one `build_version_command` (LC_BUILD_VERSION, 24 bytes, ntools=0)
 // — the SINGLE chokepoint shared by both the static (encodeExec) and
@@ -723,6 +849,58 @@ encodeExportTrie(std::vector<ExportTrieNode>& nodes,
 } // namespace
 
 namespace {
+
+// ── A WEAK DEFINITION CANNOT BE STATED ON A MACH-O *IMAGE* NLIST ──────────
+//
+// D-LK3-DYLIB-WEAK-EXPORT, extended from the dylib export trie to BOTH image
+// nlist arms. The two arms used to answer this question differently and by
+// accident: the dylib was covered because the export trie refuses a WEAK
+// `ModuleSymbol` row before the nlist is ever built, while a DYNAMIC EXEC
+// builds no trie -- so a weak ALIAS reached the nlist and was written
+// `N_SECT|N_EXT`, n_desc 0, i.e. SILENTLY STRONG. One answer now, given by
+// both arms.
+//
+// ★ WHY REFUSE RATHER THAN EMIT N_WEAK_DEF, and the argument is a measurement
+// that is already in this file. The OBJECT tier emits N_WEAK_DEF freely and
+// deliberately touches no header flag (see the N_WEAK_DEF constant's docblock)
+// -- because an MH_OBJECT's weak definition is resolved by ld64 at STATIC-LINK
+// time. An IMAGE's is not: dyld coalesces weak definitions ACROSS images, and
+// the header must say so. ✔MEASURED there on real Apple Silicon: the linked
+// exec built from a weak `.o` reads header flags `0x00218085` while its
+// weak-free control reads `0x00200085` -- the difference is MH_WEAK_DEFINES
+// (0x8000), which `<mach-o/loader.h>` documents as a property of "the final
+// linked image". These writers copy `MachOIdentity::flags` verbatim from the
+// schema and never set that bit, so emitting N_WEAK_DEF here would state HALF
+// the fact -- a weak definition no loader was told to coalesce. Emitting it
+// strong instead silently changes cross-image coalescing semantics, which is
+// the exact outcome D-LK3-DYLIB-WEAK-EXPORT exists to prevent. So the honest
+// answer is the loud one, and it names the anchor that has to close before the
+// capability can exist.
+//
+// ⚠ SCOPE, STATED RATHER THAN IMPLIED: this covers the ALIAS rows. A weak
+// CANONICAL reaching an exec arm has the identical silent downgrade and is NOT
+// refused here -- that is the pre-existing reach of
+// D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT (the image tier drops the
+// canonical's binding by design), and widening it would newly refuse inputs a
+// macOS corpus leg may be compiling green today, which no gate reachable from
+// this host can witness. That is a decision to take with the leg in view, not
+// a rider on an alias fix.
+[[nodiscard]] inline bool
+refuseWeakImageAlias(ModuleSymbol const& alias, char const* where,
+                     DiagnosticReporter& reporter) {
+    if (alias.binding != SymbolBinding::Weak) return true;
+    emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+         std::format(
+             "{}: alias '{}' is a WEAK definition, and a Mach-O IMAGE cannot "
+             "state that: N_WEAK_DEF needs MH_WEAK_DEFINES in the mach header "
+             "for dyld to coalesce it, and this writer copies the schema's "
+             "header flags verbatim (D-LK3-DYLIB-WEAK-EXPORT). Emitting it "
+             "N_SECT|N_EXT instead would publish it as a STRONG definition and "
+             "silently change cross-image coalescing.",
+             where, alias.name));
+    return false;
+}
+
 [[nodiscard]] std::vector<std::uint8_t>
 encodeExec(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
@@ -1075,6 +1253,27 @@ encode(AssembledModule const&    module,
     // produces — and the relocation r_symbolnum indices below must match
     // this exact order.
 
+    //
+    // ★★ ALIAS RECORDS ADVANCE THE COUNTER TOO, and getting that wrong is the
+    // sharpest edge in this file. Registration runs BEFORE emission over the
+    // same four collections, so an extra record that emission appends and
+    // registration does not count shifts EVERY later record while the index map
+    // keeps the old values — every relocation past the first alias would then
+    // name the wrong symbol, in a perfectly well-formed object, with no
+    // diagnostic. The `nextSymIdx == numberOfSymbols` belt after the emit loop
+    // is what makes a future divergence loud instead of silent.
+    // D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB.
+
+    // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real source-level C names (already
+    // Mach-O-mangled with a leading `_` by the pipeline — emitted VERBATIM,
+    // never re-mangled) for the externally-visible defined functions;
+    // `_sym_<id>` fallback for static/local/synthesized symbols. Built HERE
+    // rather than at the emit loop because registration needs its alias counts.
+    link::format::ObjectSymbolNames const objNames{module};
+    auto const aliasCount = [&](SymbolId id) -> std::uint32_t {
+        return static_cast<std::uint32_t>(objNames.definedAliases(id).size());
+    };
+
     std::unordered_map<SymbolId, std::uint32_t> symIdxBySymbol;
     symIdxBySymbol.reserve(funcSyms.size() + module.dataItems.size());
     std::uint32_t nextSymIdx = 0;
@@ -1087,6 +1286,7 @@ encode(AssembledModule const&    module,
             return {};
         }
         ++nextSymIdx;
+        nextSymIdx += aliasCount(f.symId);
     }
 
     // D-CSUBSET-COMPUTED-GOTO / jump tables: synthetic per-block symbols
@@ -1155,6 +1355,7 @@ encode(AssembledModule const&    module,
                 return false;
             }
             ++nextSymIdx;
+            nextSymIdx += aliasCount(di.symbol);
             dataSyms.push_back({di.symbol, sectOrdinal,
                                 sectionAddr + layout.itemOffsets[j]});
         }
@@ -1413,44 +1614,86 @@ encode(AssembledModule const&    module,
     auto appendNlist = [&](std::uint32_t nStrx, std::uint8_t nType,
                             std::uint8_t nSect, std::uint16_t nDesc,
                             std::uint64_t nValue) {
-        appendU32LE(nlistBytes, nStrx);
-        appendU8(nlistBytes, nType);
-        appendU8(nlistBytes, nSect);
-        appendU16LE(nlistBytes, nDesc);
-        appendU64LE(nlistBytes, nValue);
+        appendNlist64(nlistBytes, nStrx, nType, nSect, nDesc, nValue);
     };
 
     constexpr std::uint8_t kTextSectionNumber = 1;
 
-    // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real source-level C names (already
-    // Mach-O-mangled with a leading `_` by the pipeline — emitted VERBATIM,
-    // never re-mangled) for the externally-visible defined functions;
-    // `_sym_<id>` fallback for static/local/synthesized symbols.
-    link::format::ObjectSymbolNames const objNames{module};
 
-    // D-LK-OBJECT-WEAK-DEF-RELOCATABLE (fail-loud interim): a WEAK DEFINED
-    // symbol cannot round-trip a Mach-O RELOCATABLE (MH_OBJECT) object today.
-    // `definedBinding` (the shared, format-neutral decision) returns Weak for an
-    // externally-visible `__attribute__((weak))` def; a faithful weak def needs
-    // N_WEAK_DEF (n_desc) + MH_WEAK_DEFINES machinery that is NOT wired. Emitting
-    // it strong (N_SECT|N_EXT) would SILENTLY drop the weak-override semantics,
-    // so fail loud instead — the exact posture the MH_DYLIB export arm already
-    // takes on this case (macho::encodeExecDynamic, D-LK3-DYLIB-WEAK-EXPORT).
-    // Each writer owns its own fail-loud + vocabulary; the Weak decision is the
-    // one shared `definedBinding`, so no `if(format)` leaks into the substrate.
-    auto emitWeakDefinedRelocatableError =
-        [&](std::string_view symName, char const* symKind) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format(
-                     "macho::encode (MH_OBJECT): defined {} symbol '{}' has "
-                     "WEAK binding -- a weak DEFINED symbol cannot be emitted "
-                     "to a Mach-O RELOCATABLE object until N_WEAK_DEF (n_desc) "
-                     "+ MH_WEAK_DEFINES machinery ships "
-                     "(D-LK-OBJECT-WEAK-DEF-RELOCATABLE); emitting it strong "
-                     "(N_SECT|N_EXT) would silently lose weak-override "
-                     "semantics.",
-                     symKind, symName));
-        };
+    // D-LK-OBJECT-WEAK-DEF-RELOCATABLE. A WEAK DEFINITION is `N_SECT|N_EXT`
+    // with N_WEAK_DEF set in n_desc — that bit IS the mechanism at this tier,
+    // and the ONE shared, format-neutral `definedBinding` decision is what
+    // selects it, so no `if(format)` leaks into the substrate: each writer
+    // maps the same `SymbolBinding` to its own vocabulary (COFF spells the
+    // same fact as a COMDAT select-any section; ELF as STB_WEAK).
+    //
+    // The n_desc bits for a DEFINED symbol, given its binding. Kept as one
+    // function rather than open-coded at the function and data sites, because
+    // those two sites drifting apart is precisely the defect
+    // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION was.
+    auto definedNDesc = [&](SymbolBinding binding) -> std::uint16_t {
+        return binding == SymbolBinding::Weak ? N_WEAK_DEF : std::uint16_t{0};
+    };
+    // The n_type for a DEFINED symbol, given the SAME binding `definedNDesc`
+    // reads -- the N_EXT half of the one decision whose n_desc half sits above.
+    // ONE mapping, THREE call sites (functions, data items, alias rows), for the
+    // reason `definedNDesc` is one function: the ELF writer states the identical
+    // fact through `stbForBinding`, and three open-coded ternaries is how the
+    // name/binding pair drifts (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-
+    // COLLISION was exactly that drift).
+    auto definedNType = [&](SymbolBinding binding) -> std::uint8_t {
+        return binding == SymbolBinding::Local
+                   ? N_SECT
+                   : static_cast<std::uint8_t>(N_SECT | N_EXT);
+    };
+
+    // ── ALIAS ROWS — D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB ──
+    //
+    // An atom can carry several names. Each extra name gets its own nlist_64 at
+    // the SAME n_sect / n_value as the canonical, with ITS OWN binding — which
+    // Mach-O expresses per SYMBOL (N_EXT plus the N_WEAK_DEF n_desc bit), so
+    // unlike COFF a weak alias of a strong definition needs nothing special.
+    // Aliases are DELIBERATELY absent from `symIdxBySymbol`: they share a
+    // `SymbolId` by design and a relocation must resolve to exactly one index.
+    //
+    // ★ SAFE UNDER MH_SUBSECTIONS_VIA_SYMBOLS, and that was MEASURED rather
+    // than assumed. This object schema declares that flag, which licenses ld64
+    // to dead-strip at symbol granularity — so a second defined symbol at an
+    // existing address could in principle have minted a ZERO-LENGTH atom, and a
+    // reference reaching only the alias would then keep that empty atom while
+    // the body was stripped: perfect bytes, wrong program, rc=0.
+    // ✔MEASURED 2026-08-20 on real Apple Silicon
+    // (scripts/macho-alias-ld64-matrix): 8 cells — a bare second `.globl` label,
+    // the same plus `.alt_entry`, and a clang-authored `.globl`+`.set` alias as
+    // the attribution control, each linked with and without `-dead_strip`
+    // against a caller referencing ONLY the alias, plus a canonical-only
+    // control. Every cell: both names present, both at the SAME address, the
+    // program RAN and returned 42, and `__text` stayed 0x28 bytes in all eight.
+    // ⇒ a plain alias (n_desc = 0) is correct; N_ALT_ENTRY is NOT needed and
+    // makes no difference, so it is not stamped here — an alias is another name
+    // for the whole atom, not an interior entry point, and saying otherwise
+    // would be a false statement in the format's own vocabulary.
+    // ⚠ THE BINDING RANGE HERE IS NARROWER THAN `definedNType`'s DOMAIN, and
+    // saying so is the point. `definedAliases` admits only rows that pass
+    // `isExternallyVisible`, whose first clause rejects `SymbolBinding::Local`
+    // -- so no alias reaching this loop can be Local, and this site never takes
+    // the mapping's Local arm. It is written through the shared mapping anyway
+    // rather than as a local ternary: an open-coded `Local ? N_SECT : ...` here
+    // reads as a HANDLED case and is not one, and the canonical function and
+    // data loops below DO take that arm (a `static`/synthesized def), so the arm
+    // is live in the mapping and merely unreachable from this caller. The
+    // boundary itself -- a Local-only alias staying absent from a re-emitted
+    // symtab -- is `definedAliases`' own documented gap, and it must be closed
+    // THERE (one predicate, every writer) rather than pre-handled here by a
+    // branch nothing can execute.
+    auto appendAliasNlists = [&](SymbolId id, std::uint8_t nSect,
+                                 std::uint64_t nValue) {
+        for (ModuleSymbol const* alias : objNames.definedAliases(id)) {
+            std::uint32_t const aliasNameOff = strtab.add(alias->name);
+            appendNlist(aliasNameOff, definedNType(alias->binding), nSect,
+                        definedNDesc(alias->binding), nValue);
+        }
+    };
 
     // Defined function symbols: n_sect=1, n_value=offset. n_type binding is
     // coupled to the NAME (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-
@@ -1459,30 +1702,23 @@ encode(AssembledModule const&    module,
     // bind to it at a FOREIGN link; an externally-visible def keeps N_SECT|N_EXT.
     // A Mach-O RELOCATABLE object carries no LC_DYSYMTAB (no local/extern range
     // split to keep in sync — see the symtab-order note above), so the emission
-    // order is unchanged; only the N_EXT bit flips. A WEAK def FAILS LOUD here
-    // (D-LK-OBJECT-WEAK-DEF-RELOCATABLE): the c-subset DOES produce weak defined
-    // symbols (`__attribute__((weak))` → SymbolBinding::Weak, per
-    // `c-subset.lang.json` + examples/c-subset/attributes_syntax's `weak_helper`
-    // and weak_inline_crosscu), but they reach a Mach-O binary ONLY via the EXEC
-    // arms (encodeExec/encodeExecDynamic — `encode` dispatches to them above),
-    // where a weak def is merge-resolved strong-over-weak / forced Global before
-    // the writer. A weak def routed to THIS relocatable path cannot round-trip
-    // until the N_WEAK_DEF machinery ships, so the writer fails loud rather than
-    // silently degrade it to N_SECT|N_EXT (see the lambda + the MH_DYLIB arm).
+    // order is unchanged; only the N_EXT bit flips. A WEAK def keeps
+    // `N_SECT|N_EXT` and adds N_WEAK_DEF in n_desc
+    // (D-LK-OBJECT-WEAK-DEF-RELOCATABLE): the c-subset DOES produce weak
+    // defined symbols (`__attribute__((weak))` → SymbolBinding::Weak, per
+    // `c-subset.lang.json` + examples/c-subset/attributes_syntax's
+    // `weak_helper` and weak_inline_crosscu). Nothing about the section, the
+    // symtab ordering or the mach_header changes — the whole of the weak fact
+    // rides that one n_desc bit, which is why the Mach-O half of this anchor is
+    // a fraction of the size of the COFF half (where the same fact is a section
+    // attribute and costs a section, a section symbol and an aux record).
     for (auto const& f : funcSyms) {
         std::string const symName = objNames.definedName(f.symId, "_sym_");
         SymbolBinding const binding = objNames.definedBinding(f.symId);
-        if (binding == SymbolBinding::Weak) {
-            emitWeakDefinedRelocatableError(symName, "function");
-            return {};
-        }
         std::uint32_t const nameOff = strtab.add(symName);
-        std::uint8_t const nType =
-            (binding == SymbolBinding::Local)
-                ? N_SECT
-                : static_cast<std::uint8_t>(N_SECT | N_EXT);
-        appendNlist(nameOff, nType, kTextSectionNumber, /*n_desc=*/0,
-                    f.valueInText);
+        appendNlist(nameOff, definedNType(binding), kTextSectionNumber,
+                    definedNDesc(binding), f.valueInText);
+        appendAliasNlists(f.symId, kTextSectionNumber, f.valueInText);
     }
     // Synthetic per-block symbols (computed-goto labels / dense-switch
     // jump-table targets): N_SECT LOCALS — deliberately NO N_EXT, so a
@@ -1492,6 +1728,28 @@ encode(AssembledModule const&    module,
     // above (functions → blocks → data → externs) so relocation r_symbolnum
     // indices line up. The ELF ET_REL writer's STB_LOCAL block-symbol leg is
     // the mirror (c147 silent-failure-review fold).
+    //
+    // ★ n_desc = N_ALT_ENTRY — THE DISCRIMINATOR MACH-O PREVIOUSLY LACKED
+    // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM). Before
+    // this, a whole file-local (`static`) FUNCTION and one of these interior
+    // labels were emitted BYTE-IDENTICALLY — bare N_SECT, n_sect=1, n_desc=0,
+    // both spelled `_sym_<id>` — so no reader could tell them apart and every
+    // reader that tried classified the function as a label and dropped its
+    // body. N_ALT_ENTRY says, in the format's own vocabulary, exactly what
+    // these symbols are: alternate entry points INTO the function they sit in,
+    // never atoms of their own. It is the per-symbol half of a pair; the other
+    // half is MH_SUBSECTIONS_VIA_SYMBOLS in the mach_header, which arrives
+    // purely from the format schema (`MachOIdentity::flags`, emitted verbatim
+    // below) and is NOT read by any code here.
+    //
+    // Emitted UNCONDITIONALLY rather than gated on that flag, for two reasons
+    // that both point the same way: the writer would otherwise have to
+    // interpret a config value it currently only copies, and a stray
+    // N_ALT_ENTRY in a non-subsections object is inert to Apple's ld64
+    // (✔MEASURED on real Apple Silicon: flag on/off × N_ALT_ENTRY on/off, each
+    // linked with and without `-dead_strip` — all 8 cells rc=0 with identical
+    // correct output). So if the header flag is ever reverted in config, these
+    // labels stay honest and the reader simply falls back to its narrower rule.
     for (auto const& b : blockSyms) {
         std::string const symName =
             std::string{"_sym_"} + std::to_string(b.symId.v);
@@ -1499,7 +1757,7 @@ encode(AssembledModule const&    module,
         appendNlist(nameOff,
                     /*n_type=*/N_SECT,          // LOCAL: no N_EXT
                     kTextSectionNumber,
-                    /*n_desc=*/0,
+                    /*n_desc=*/N_ALT_ENTRY,     // interior label, not an atom
                     b.flatTextAddr);
     }
     // Defined DATA symbols (D-LK-OBJECT-DATA-SECTION-RELOCATABLE, Mach-O
@@ -1513,22 +1771,16 @@ encode(AssembledModule const&    module,
     // `_sym_<id>` + Local → bare N_SECT, NO N_EXT (the same name+binding
     // coupling the function loop above uses — D-LK-INTERNAL-LINKAGE-FN-EMITTED-
     // GLOBAL-FOREIGN-COLLISION, TF-C54).
-    // A WEAK data def FAILS LOUD, same D-LK-OBJECT-WEAK-DEF-RELOCATABLE reason
-    // as the function loop above (a Mach-O relocatable object has no N_WEAK_DEF
-    // path yet; degrading it to N_SECT|N_EXT would silently drop the semantics).
+    // A WEAK data def takes N_WEAK_DEF in n_desc through the SAME
+    // `definedNDesc` the function loop above uses (D-LK-OBJECT-WEAK-DEF-
+    // RELOCATABLE) - one decision, two sites, so the pair cannot drift.
     for (auto const& d : dataSyms) {
         std::string const symName = objNames.definedName(d.symId, "_sym_");
         SymbolBinding const binding = objNames.definedBinding(d.symId);
-        if (binding == SymbolBinding::Weak) {
-            emitWeakDefinedRelocatableError(symName, "data");
-            return {};
-        }
         std::uint32_t const nameOff = strtab.add(symName);
-        std::uint8_t const nType =
-            (binding == SymbolBinding::Local)
-                ? N_SECT
-                : static_cast<std::uint8_t>(N_SECT | N_EXT);
-        appendNlist(nameOff, nType, d.sectOrdinal, /*n_desc=*/0, d.flatAddr);
+        appendNlist(nameOff, definedNType(binding), d.sectOrdinal,
+                    definedNDesc(binding), d.flatAddr);
+        appendAliasNlists(d.symId, d.sectOrdinal, d.flatAddr);
     }
     // Undefined extern symbols: N_UNDF|N_EXT, n_sect=0, n_value=0.
     // D-LK-OBJECT-EXTERN-CALL-MACHO: the undefined extern carries its REAL
@@ -1548,16 +1800,39 @@ encode(AssembledModule const&    module,
                     /*n_value=*/0);
     }
 
-    // Substrate invariant: every appendNlist writes exactly 16 bytes.
-    if (nlistBytes.size() % kNlist64Size != 0) {
-        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-             std::string{"Mach-O writer: nlist table byte size "}
-                 + std::to_string(nlistBytes.size())
-                 + " is not a multiple of nlist_64 size (16)");
-        return {};
-    }
+    // The "the band is a whole number of records" refusal that used to stand
+    // here is GONE, and it is the arm
+    // D-LINK-MACHO-EXEC-BAND-GUARDS-WERE-TAUTOLOGIES-LABELLED-AS-MEASUREMENTS
+    // swept from `encodeExecDynamic` while leaving its twin here. It compared
+    // `nlistBytes.size() % kNlist64Size` against zero over a buffer whose ONLY
+    // writer appends `kNlist64Size` bytes at a time -- x % 16 == 0 where every
+    // step is +16 -- so no module, legitimate or hostile, could reach it. The
+    // invariant it claimed to hold is now held by `appendNlist64`'s fixed-width
+    // record type (see its header note): a check the compiler makes cannot be
+    // deleted by accident, and it fails at the field whose width changed.
+    // The genuine minted-vs-emitted tripwire below is unaffected -- it compares
+    // two independently produced quantities and CAN fire.
     std::uint32_t const numberOfSymbols =
         static_cast<std::uint32_t>(nlistBytes.size() / kNlist64Size);
+    // ★★ THE INDEX-vs-RECORD TRIPWIRE. `nextSymIdx` is what every
+    // relocation_info r_symbolnum was minted against in the REGISTRATION pass;
+    // `numberOfSymbols` is what the EMISSION pass actually wrote and what ld64
+    // will walk. The two passes iterate the same four collections and were
+    // coupled only by a comment saying they must agree. If they ever disagree,
+    // the emitted object is WELL-FORMED and WRONG: every relocation past the
+    // divergence names a different symbol than the one it was computed for, and
+    // nothing downstream can detect it. The COFF writer carries the same belt.
+    if (nextSymIdx != numberOfSymbols) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encode (MH_OBJECT): minted {} symbol-table "
+                         "index slots but emitted {} nlist_64 records - every "
+                         "relocation's r_symbolnum is computed from the former "
+                         "and resolved against the latter, so a mismatch "
+                         "silently binds relocations to the wrong symbols. "
+                         "Substrate-invariant violation.",
+                         nextSymIdx, numberOfSymbols));
+        return {};
+    }
 
     // ── Layout: header + load commands + section data + relocs
     //    + symtab + strtab ─────────────────────────────────────
@@ -1664,6 +1939,14 @@ encode(AssembledModule const&    module,
     // does not count leaves ld64 walking off the end of the command list.
     appendU32LE(bytes, emitBuildVersion ? 3u : 2u);
     appendU32LE(bytes, static_cast<std::uint32_t>(sizeOfCommands));
+    // flags: VERBATIM from the format schema, interpreted by nothing here.
+    // The object/staticlib schemas declare MH_SUBSECTIONS_VIA_SYMBOLS (0x2000)
+    // — the header half of the pair that lets a reader tell an interior label
+    // from a whole file-local body (see the N_ALT_ENTRY block-symbol loop
+    // above, D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
+    // Deliberately NO code here reads or asserts that bit: the declaration is
+    // the config's to make, so it is one JSON field to change if the ld64
+    // dead-strip evidence ever says otherwise, with no writer edit attached.
     appendU32LE(bytes, id.flags);
     appendU32LE(bytes, 0);  // reserved (64-bit padding)
 
@@ -2037,23 +2320,66 @@ encodeExec(AssembledModule const&    module,
     // ── (f) Build nlist_64 + string table — defined symbols only.
     //       (Extern dyld symbols flow through the encodeExecDynamic
     //       arm with N_UNDF|N_EXT entries; LK6 cycle 2c closed.)
+    //
+    // Real DECLARED function names in the FINAL IMAGE's nlist, from the
+    // format-neutral `module.symbols` carrier through the shared
+    // `ObjectSymbolNames` owner — `imageName`, NOT `definedName`, because
+    // nothing ever re-links an image: its nlist resolves NOTHING and is read
+    // only by debuggers, profilers and crash reporters, for which a `static`'s
+    // real name is precisely the wanted answer.
+    // D-LINK-MACHO-IMAGE-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS: this loop
+    // hardcoded `_sym_<id>`, so every frame of every Mach-O backtrace arrived
+    // anonymised. The `_sym_<id>` fallback survives for exactly the symbols
+    // that genuinely have no declared name — here the linker-injected entry
+    // trampoline, which is functions[0] and carries no `ModuleSymbol` row.
+    // See `imageName`'s docblock for why the two tiers legitimately differ.
+    //
+    // ★ THE BINDING IS DELIBERATELY UNCHANGED (N_SECT|N_EXT for every defined
+    // function). clang marks a `static` N_SECT with NO N_EXT, and matching that
+    // is a real improvement — but it also re-shapes LC_DYSYMTAB's
+    // ilocalsym/iextdefsym bands, so it is its own change with its own witness
+    // rather than a silent rider on the names:
+    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT.
+    //
+    // ── EVERY name bound to the atom, not just the canonical one ───────────
+    // D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB, IMAGE tier. One
+    // `SymbolId` can carry several `module.symbols` rows (equal-offset defined
+    // symbols collapse to ONE atom under several names —
+    // D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS) and `imageName` is
+    // first-row-wins because one nlist entry needs exactly one answer, so every
+    // later name was dropped from the image. The alias is emitted at the
+    // canonical's n_sect / n_value — one address, which is what an alias IS —
+    // and with the SAME N_SECT|N_EXT type as the canonical, because on this
+    // format the image's per-symbol binding question is already owned by
+    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT; giving an alias a binding the
+    // canonical does not get would be a second, undeclared answer to it.
+    link::format::ObjectSymbolNames const imgNames{module};
     StringTable strtab;
     std::vector<std::uint8_t> nlistBytes;
-    for (auto const& fn : module.functions) {
-        std::string const symName =
-            "_sym_" + std::to_string(fn.symbol.v);
-        std::uint32_t const nameOff = strtab.add(symName);
-        std::size_t const fi = static_cast<std::size_t>(&fn - module.functions.data());
-        appendU32LE(nlistBytes, nameOff);
-        appendU8(nlistBytes,
-                 static_cast<std::uint8_t>(N_SECT | N_EXT));
-        appendU8(nlistBytes, /*n_sect=*/1);
-        appendU16LE(nlistBytes, /*n_desc=*/0);
-        appendU64LE(nlistBytes,
-                    sectionVa + funcTextStart[fi]);  // n_value = runtime VA
+    auto appendDefinedNlist = [&](std::string const& symName,
+                                  std::uint64_t      valueVa) {
+        appendNlist64(nlistBytes, strtab.add(symName),
+                      static_cast<std::uint8_t>(N_SECT | N_EXT),
+                      /*n_sect=*/1, /*n_desc=*/0,
+                      /*n_value=*/valueVa);  // n_value = runtime VA
+    };
+    for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+        auto const&         fn      = module.functions[fi];
+        std::uint64_t const symVa   = sectionVa + funcTextStart[fi];
+        appendDefinedNlist(imgNames.imageName(fn.symbol, "_sym_"), symVa);
+        for (ModuleSymbol const* alias : imgNames.definedAliases(fn.symbol)) {
+            if (!refuseWeakImageAlias(*alias, "macho::encodeExec", reporter)) {
+                return {};
+            }
+            appendDefinedNlist(alias->name, symVa);
+        }
     }
+    // DERIVED from the band that was actually emitted, never predicted from
+    // `module.functions.size()`: LC_SYMTAB.nsyms and the file-size arithmetic
+    // below both read it, and a count that disagrees with the bytes makes ld64
+    // and `nm` walk off the end of the table.
     std::uint32_t const numberOfSymbols =
-        static_cast<std::uint32_t>(module.functions.size());
+        static_cast<std::uint32_t>(nlistBytes.size() / kNlist64Size);
 
     std::size_t const headerAndCmds = kMachHeader64Size + sizeofcmds;
 
@@ -2456,15 +2782,18 @@ encodeExecDynamic(AssembledModule const&    module,
      && externCallUsesIndirectShape(*fmt.externCallDispatch())) {
         emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
              std::format("macho::encodeExecDynamic: object format '{}' "
-                         "declares externCallDispatch='indirect-slot' but "
+                         "declares externCallDispatch='{}' but "
                          "the Mach-O walker points each extern symbol's "
                          "VA at its __stubs STUB (direct-plt semantics) "
-                         "— an indirect-slot call site would dereference "
+                         "— such a call site would dereference "
                          "the stub's code bytes as a function pointer and "
-                         "SIGSEGV. Set externCallDispatch='direct-plt' "
-                         "(Mach-O symbolVa→stub is direct-plt, like ELF). "
-                         "D-FFI-EXTERN-CALL-DISPATCH.",
-                         fmt.name()));
+                         "SIGSEGV. Declare one of {} instead "
+                         "(Mach-O symbolVa→stub is direct-plt, like ELF), or "
+                         "omit the key. D-FFI-EXTERN-CALL-DISPATCH.",
+                         fmt.name(),
+                         externCallDispatchName(*fmt.externCallDispatch()),
+                         dss::detail::renderAllowedList(
+                             kMachoAcceptedExternCallDispatch)));
         return {};
     }
 
@@ -2772,22 +3101,18 @@ encodeExecDynamic(AssembledModule const&    module,
     bool const hasTbss  = !tbssLayout.empty();
     bool const hasTls   = hasTdata || hasTbss;
     // c153 F4 fold -- the D-LK3-DYLIB-TLS-MODEL walker belt (the
-    // elf.cpp `isDyn && hasTls` sibling): thread-locals in a dlopen'd
-    // dylib are an UNVERIFIED form on this no-Mac host (dlopen-time
-    // TLV setup + pre-existing-thread access unwitnessed). The shipped
-    // dylib schema advertises no tdata/tbss, so the linker's section
-    // gate rejects first; THIS belt catches a hand-built module / a
-    // future schema opting in without a Mac witness -- never a
-    // silently-shipped unverified TLV image.
-    if (isDylib && hasTls) {
-        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
-             "macho::encodeExecDynamic: thread-local items in an "
-             "MH_DYLIB -- the dlopen-time TLV path is unverified on "
-             "this host; the dylib format must not opt into "
-             "tdata/tbss until a Mac witness exists "
-             "(D-LK3-DYLIB-TLS-MODEL).");
-        return {};
-    }
+    // elf.cpp `isDyn && hasTls` sibling) -- REMOVED 2026-08-19 (cycle P12):
+    // the belt existed to keep a schema from opting into tdata/tbss "until a
+    // Mac witness exists", and that witness now DOES (✔MEASURED on real
+    // Apple Silicon, arm64 macOS 26.5.2: a worker thread dlopen'ing a TLV
+    // image reads its own instance, and a MAIN thread alive BEFORE the load
+    // observes a FRESH, INITIALIZED instance — the per-image TLV descriptor
+    // model dyld documents, now witnessed rather than inferred). The shipped
+    // arm64 dylib schema opts in via supportedDataSections + tlsAccess in the
+    // same commit; `ThreadLocalDylibLinksAndCarriesTLV` pins the positive
+    // path, and the x86_64 dylib sibling still declines (its own Rosetta-gated
+    // arm, D-LK-MACHO-X8664-DYLIB-RUNTIME, now run-witnessed exit-42 — its
+    // TLS half rides the x86_64 EXEC's own opt-in, still declined).
     // Each present section's schema row is MANDATORY (the format opted into
     // tdata/tbss via supportedDataSections; a missing row is a config bug),
     // the tlsAccess model must be macho-tlv, and each section type MUST be the
@@ -3790,14 +4115,112 @@ encodeExecDynamic(AssembledModule const&    module,
             dyldBindBlob.push_back(0);
     }
 
-    // ── (j) Indirect symbols table: one u32 per stub slot + one
-    //       u32 per __got slot. Each entry is the index into
-    //       nlist_64 of the matching undefined extern. nlist_64
-    //       ordering: defined externs first (functions),
-    //       undefined externs next — so undef indices are
-    //       [numDefs .. numDefs + numExterns).
+    // ── (k) Build nlist_64 + string table: defined symbols first,
+    //       undefined externs next; the indirect-symbol table (j) is
+    //       built BETWEEN the two bands, because its every entry is an
+    //       index INTO this table.
+    //
+    // ★★ WHY (j) MOVED BELOW (k)'s FIRST BAND. Every `indirectSyms` entry, plus
+    // LC_DYSYMTAB's `nextdefsym` / `iundefsym`, is `numDefs + <extern index>` —
+    // i.e. all four are stated in coordinates whose ORIGIN is "how many defined
+    // nlist entries precede the undefined band". `numDefs` used to be PREDICTED
+    // (`module.functions.size()`) many lines before the band was emitted, with
+    // nothing but a comment coupling the prediction to the emission — the same
+    // registration-pass/emission-pass split the PE and Mach-O OBJECT writers
+    // were restructured to make unrepresentable, and which they now also carry a
+    // `minted == emitted` tripwire against. An
+    // indirect-symbol entry that shifts is not cosmetic: it mis-binds a lazy or
+    // non-lazy pointer, so a call to `puts` enters `printf`. Deriving the origin
+    // from the emitted band makes the disagreement unrepresentable rather than
+    // guarded, which is why the alias band below can be added at all.
+    //
+    // A defined function's nlist name is its REAL (pre-mangled) declared
+    // source name, on BOTH image flavors — `nm`, `lldb`, `atos`, `otool -tV`'s
+    // call annotations and the macOS crash reporter all read nlist.
+    //
+    // ★ ONE CALL, NOT A FLAVOR TERNARY. c153 (D-LK3-3) named only the DYLIB
+    // arm and routed it through `definedName`, leaving the EXEC arm on a
+    // hardcoded `_sym_<id>`; both halves of that were wrong, and
+    // D-LINK-MACHO-IMAGE-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS closed them
+    // together:
+    //   * the EXEC arm's rationale ("an executable's nlist is not a linking
+    //     surface") is TRUE and is the argument for naming it, not against —
+    //     precisely because nothing re-links an image, a `static`'s real name
+    //     there is safe, and it is the frame a backtrace prints. ✔MEASURED
+    //     pre-fix on real Apple Silicon: the macOS crash reporter printed
+    //     `#0 sym_83 / #1 sym_88 / #2 sym_92` where the source says
+    //     `static_helper` / `global_helper` / `main`.
+    //   * the DYLIB arm used `definedName`, whose `isExternallyVisible` gate
+    //     exists to protect a RELOCATABLE `.o`'s foreign-linker resolution
+    //     keys — a tier this is not. It therefore dropped a `static`'s name
+    //     from a dylib's nlist too (✔MEASURED: `_sym_83` beside a correctly
+    //     named `_dss_lib_entry`).
+    // `imageName` is the final-image companion of `definedName` — the SAME
+    // `module.symbols` carrier, the SAME lookup, minus that one gate. Both
+    // flavors are final images, so the flavor no longer selects a NAMING
+    // rule and the ternary is gone.
+    //
+    // ★ THE EXPORT SURFACE IS UNTOUCHED, and that separation is the point:
+    // the export trie built above is the ABI surface dyld's dlsym walks, and
+    // it has its OWN `isExternallyVisible` gate over `module.symbols` — so a
+    // `static` gains a name in nlist while staying unexportable. ✔MEASURED by
+    // execution on Apple Silicon with an Apple-clang-built dlopen probe:
+    // `dlsym(handle, "lib_static_helper")` stays NULL after this change while
+    // `dlsym(handle, "dss_lib_entry")` resolves and calls correctly.
+    //
+    // NOTE: exported DATA globals appear in the trie only — the dynamic arm's
+    // nlist carries functions + undefined externs (extending it is a
+    // numDefs/LC_DYSYMTAB re-shape deferred until a consumer needs `nm`
+    // visibility for data; dlsym works today via the trie).
+    //
+    // ★ THE BINDING IS DELIBERATELY UNCHANGED (N_SECT|N_EXT for every defined
+    // function) — see the static arm's matching note and
+    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT.
+    //
+    // ── EVERY name bound to the atom, not just the canonical one ───────────
+    // D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB, IMAGE tier. One
+    // `SymbolId` can carry several `module.symbols` rows (equal-offset defined
+    // symbols collapse to ONE atom under several names —
+    // D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS) and `imageName` is
+    // first-row-wins because one nlist entry needs exactly one answer, so every
+    // later name was dropped. On a DYLIB that produced a genuinely inconsistent
+    // image: the export trie above walks `module.symbols` directly, so `dlsym`
+    // resolved BOTH names while `nm`, `lldb` and the crash reporter saw only
+    // one. The alias goes in at the canonical's n_sect / n_value (one address,
+    // which is what an alias IS) with the SAME N_SECT|N_EXT the canonical gets —
+    // this format's image-tier binding question is owned by
+    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT, and giving an alias a binding
+    // its canonical does not get would be a second, undeclared answer to it.
+    link::format::ObjectSymbolNames const imgNames{module};
+    StringTable strtab;
+    std::vector<std::uint8_t> nlistBytes;
+    auto appendDefinedNlist = [&](std::string const& symName,
+                                  std::uint64_t      valueVa) {
+        appendNlist64(nlistBytes, strtab.add(symName),
+                      static_cast<std::uint8_t>(N_SECT | N_EXT),
+                      /*n_sect=*/1, /*n_desc=*/0, /*n_value=*/valueVa);
+    };
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        auto const&         fn    = module.functions[i];
+        std::uint64_t const symVa = sectionVa + funcTextStart[i];
+        appendDefinedNlist(imgNames.imageName(fn.symbol, "_sym_"), symVa);
+        for (ModuleSymbol const* alias : imgNames.definedAliases(fn.symbol)) {
+            if (!refuseWeakImageAlias(*alias, "macho::encodeExecDynamic",
+                                      reporter)) {
+                return {};
+            }
+            appendDefinedNlist(alias->name, symVa);
+        }
+    }
+
+    // ── (j) Indirect symbols table: one u32 per stub slot + one u32 per __got
+    //       slot, each the index into nlist_64 of the matching undefined
+    //       extern. `numDefs` is the DEFINED band's real length, read back off
+    //       the bytes just written — see (k)'s note on why it is derived and
+    //       not predicted. The undefined band appended below therefore occupies
+    //       [numDefs .. numDefs + numExterns) by construction.
     std::uint32_t const numDefs =
-        static_cast<std::uint32_t>(module.functions.size());
+        static_cast<std::uint32_t>(nlistBytes.size() / kNlist64Size);
     std::vector<std::uint32_t> indirectSyms;
     if (!useChainedFixups) {
         // D-LK6-14-INTEGRATION-GOT-SLOTS: chained pointers in __got
@@ -3816,54 +4239,41 @@ encodeExecDynamic(AssembledModule const&    module,
             indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
     }
 
-    // ── (k) Build nlist_64 + string table: defined externs first,
-    //       undefined externs next.
-    //
-    // c153 (D-LK3-3): on the DYLIB arm a defined function's nlist
-    // name is its REAL (pre-mangled) source name when externally
-    // visible — `nm libdss.dylib` and debuggers read nlist, and a
-    // library's symbols are its ABI surface (the c139/c150 real-name
-    // discipline; ObjectSymbolNames falls back to the internal
-    // `_sym_<id>` for static/synthesized functions). dyld's dlsym
-    // resolves against the EXPORT TRIE (above), not nlist — this is
-    // the human-facing surface. The EXEC arm keeps the internal
-    // `_sym_<id>` names unchanged (byte-identical output; an
-    // executable's nlist is not a linking surface). NOTE: exported
-    // DATA globals appear in the trie only — the dynamic arm's nlist
-    // carries functions + undefined externs (extending it is a
-    // numDefs/LC_DYSYMTAB re-shape deferred until a consumer needs
-    // `nm` visibility for data; dlsym works today via the trie).
-    link::format::ObjectSymbolNames const dylibSymNames{module};
-    StringTable strtab;
-    std::vector<std::uint8_t> nlistBytes;
-    for (std::size_t i = 0; i < module.functions.size(); ++i) {
-        auto const& fn = module.functions[i];
-        std::string const symName =
-            isDylib ? dylibSymNames.definedName(fn.symbol, "_sym_")
-                    : "_sym_" + std::to_string(fn.symbol.v);
-        std::uint32_t const nameOff = strtab.add(symName);
-        appendU32LE(nlistBytes, nameOff);
-        appendU8(nlistBytes,
-                 static_cast<std::uint8_t>(N_SECT | N_EXT));
-        appendU8(nlistBytes, /*n_sect=*/1);
-        appendU16LE(nlistBytes, /*n_desc=*/0);
-        appendU64LE(nlistBytes, sectionVa + funcTextStart[i]);
-    }
     for (std::size_t i = 0; i < numExterns; ++i) {
         auto const& ext = module.externImports[i];
         std::uint32_t const nameOff = strtab.add(ext.mangledName);
         std::uint32_t const ord = dylibOrdinal(ext.libraryPath);
-        appendU32LE(nlistBytes, nameOff);
-        appendU8(nlistBytes,
-                 static_cast<std::uint8_t>(N_UNDF | N_EXT));
-        appendU8(nlistBytes, /*n_sect=*/0);  // undefined
         // n_desc bits 8..15 = LIBRARY_ORDINAL (1-based dylib idx).
-        appendU16LE(nlistBytes,
-                    static_cast<std::uint16_t>(ord << 8));
-        appendU64LE(nlistBytes, 0);  // n_value = 0 for undefined
+        appendNlist64(nlistBytes, nameOff,
+                      static_cast<std::uint8_t>(N_UNDF | N_EXT),
+                      /*n_sect=*/0,  // undefined
+                      static_cast<std::uint16_t>(ord << 8),
+                      /*n_value=*/0);  // n_value = 0 for undefined
     }
+    // LC_SYMTAB.nsyms — read back off the emitted bytes, like `numDefs`.
     std::uint32_t const numberOfSymbols =
-        numDefs + static_cast<std::uint32_t>(numExterns);
+        static_cast<std::uint32_t>(nlistBytes.size() / kNlist64Size);
+
+    // ── THE BELT, and it compares two INDEPENDENTLY produced things ────────
+    //
+    // Every `indirectSyms` entry was MINTED from `numDefs + <extern index>` in
+    // the pass above; this follows each one into the table that was actually
+    // EMITTED and requires it to land on an undefined external symbol. A count
+    // comparison could not do this job: `numDefs` and `numberOfSymbols` are
+    // both lengths of the same buffer, so any equation between them reduces to
+    // `x == x`. See `machoIndirectSymbolBreach` for the full argument and for
+    // the two tautologies this replaced.
+    if (std::string const breach = link::format::machoIndirectSymbolBreach(
+            nlistBytes, indirectSyms);
+        !breach.empty()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: the indirect symbol table "
+                         "does not agree with the nlist_64 table it indexes — "
+                         "{}. Emitting this image would bind a lazy or "
+                         "non-lazy pointer to the wrong symbol at runtime.",
+                         breach));
+        return {};
+    }
 
     // ── (l) Layout: compute file offsets for everything ─────────
     //
@@ -4398,27 +4808,73 @@ encodeExecDynamic(AssembledModule const&    module,
     // linkeditFileSize grows by it automatically; the export blob is
     // EMPTY on the exec arm (byte-identical output) and on an
     // exportless dylib.
+    //
+    // ★ EVERY cursor below is `alignUp(prevEnd, kLinkeditBlobAlign)` — see
+    // that constant for why Apple's validator makes this mandatory rather
+    // than tidy (D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED). `rebaseOff` alone
+    // needs no step: `linkeditFileOff` is already page-aligned, and a page is
+    // a multiple of 8 on every Mach-O target. The blob SIZES stay exact —
+    // only the STARTS move — so each LC keeps reporting the true payload
+    // length and the pad bytes belong to nobody.
     std::uint64_t const rebaseOff = linkeditFileOff;
     std::uint64_t const rebaseSize = dyldRebaseBlob.size();
-    std::uint64_t const bindOff = rebaseOff + rebaseSize;
+    std::uint64_t const bindOff =
+        alignUp(rebaseOff + rebaseSize, kLinkeditBlobAlign);
     std::uint64_t const bindSize = dyldBindBlob.size();
-    std::uint64_t const exportOff = bindOff + bindSize;
+    std::uint64_t const exportOff =
+        alignUp(bindOff + bindSize, kLinkeditBlobAlign);
     std::uint64_t const exportSize = exportTrieBlob.size();
-    std::uint64_t const indirectSymtabOff = exportOff + exportSize;
+    std::uint64_t const indirectSymtabOff =
+        alignUp(exportOff + exportSize, kLinkeditBlobAlign);
     std::uint64_t const indirectSymtabSize =
         static_cast<std::uint64_t>(indirectSyms.size()) * 4u;
-    std::uint64_t const symtabOff = indirectSymtabOff + indirectSymtabSize;
+    // ⚠⚠ D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED (CLOSED here). `symtabOff`
+    // used to be packed hard against the preceding blob with NO alignment
+    // step, so the nlist_64 table landed wherever the bind / export /
+    // indirect-symbol sizes left it. An nlist_64 carries an 8-byte `n_value`.
+    // ✔MEASURED 2026-08-17 on real Apple Silicon (macOS 26.5.2): `symoff` =
+    // 50076 (≡ 4 mod 8) on BOTH the exec and the dylib, and BOTH before and
+    // after the sibling name fix — so it was PRE-EXISTING and orthogonal (name
+    // lengths only move the strtab, which is last).
+    // ★★ IT WAS A LIVE CAPABILITY GAP, NOT A COSMETIC ONE, and the first
+    // reading of it was WRONG — this record keeps the correction rather than
+    // quietly rewriting it: `dyld_info -exports` refusing the image looked
+    // like one inspector being strict, until APPLE'S OWN `ld` was asked to
+    // link against the dylib and refused it with the SAME words —
+    //   `ld: mis-aligned LINKEDIT content 'symbol table' in '<dylib>'`
+    // on all four probes (exported symbol / static symbol × before / after).
+    // ⇒ A DSS-built Mach-O dylib could not be consumed as a LINK INPUT by the
+    // Apple toolchain at all. The control that made it OURS rather than a tool
+    // quirk: the same `dyld_info` reads `/usr/lib/libSystem.B.dylib` fine.
+    // ★ WHAT ALWAYS WORKED, so the scope was never overstated: dyld LOADED and
+    // RAN these images (`dlopen` + `dlsym` + CALL all succeeded) and `nm` /
+    // `otool` / `lldb` / the crash reporter read the table — which is exactly
+    // why a green suite and a running binary could not see this.
+    // ★ AND THE BLAST RADIUS WAS BOUNDED BY MEASUREMENT, not assumption: the
+    // MH_OBJECT (relocatable `.o`) writer lays out its OWN LINKEDIT-less
+    // trailer and is UNAFFECTED — a DSS-built `.o` linked by Apple `cc` with
+    // an Apple-compiled `main` gave rc=0 and RAN, before and after this fix.
+    // So the defect was the IMAGE cursor chain, and the whole chain (not only
+    // the one offset that happened to be measured) is aligned above.
+    std::uint64_t const symtabOff =
+        alignUp(indirectSymtabOff + indirectSymtabSize, kLinkeditBlobAlign);
     std::uint64_t const symtabSize =
         static_cast<std::uint64_t>(numberOfSymbols) * kNlist64Size;
+    // The string table's own requirement is 1 (it is a byte stream), and
+    // `symtabSize` is a multiple of 16, so this is 8-aligned for free — pinned
+    // by the same test rather than left to that coincidence.
     std::uint64_t const strtabOff = symtabOff + symtabSize;
     std::uint64_t const strtabSize = strtab.size();
     // LK7: codesign placeholder lives at the tail of __LINKEDIT
-    // (8-byte aligned per Apple's `cs_blobs.h` SuperBlob alignment).
+    // (8-byte aligned per Apple's `cs_blobs.h` SuperBlob alignment — the
+    // SAME `kLinkeditBlobAlign` the rest of the chain now uses, and this
+    // cursor was ALREADY correct before that chain was fixed; it is spelled
+    // with the shared constant so the tail cannot drift from the head).
     // Plan 16 fills the reserved bytes post-link. The segment's
     // filesize covers the reservation so dyld maps it into the
     // __LINKEDIT segment alongside the other linkedit payloads.
     std::uint64_t const codeSigFileOff = emitCodeSig
-        ? alignUp(strtabOff + strtabSize, 8u)
+        ? alignUp(strtabOff + strtabSize, kLinkeditBlobAlign)
         : 0u;
     // LC_CODE_SIGNATURE's `dataoff` field is `uint32_t` per Apple's
     // `linkedit_data_command` definition. If the __LINKEDIT layout
@@ -5091,31 +5547,75 @@ encodeExecDynamic(AssembledModule const&    module,
                      tdataLayout.bytes.end());
     }
 
+    // D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED: the __LINKEDIT blobs are
+    // emitted by APPENDING, while the load commands above already published
+    // each blob's file offset from the cursor arithmetic. `seekTo` is the
+    // single place those two views are reconciled: it writes the alignment
+    // gap the cursors reserved, and it RECORDS an overrun (stream already
+    // past the offset an LC published) instead of silently truncating the
+    // blob that follows. An overrun is an internal invariant break — the
+    // image would load and then read the wrong bytes — so it is reported
+    // loud below rather than shipped.
+    char const* linkeditOverrunBlob = nullptr;
+    std::uint64_t linkeditOverrunAt = 0;
+    auto seekTo = [&](std::uint64_t off, char const* blobName) {
+        if (bytes.size() > off) {
+            if (linkeditOverrunBlob == nullptr) {
+                linkeditOverrunBlob = blobName;
+                linkeditOverrunAt = bytes.size();
+            }
+            return;
+        }
+        while (bytes.size() < off) bytes.push_back(0);
+    };
+    auto linkeditCursorsAgree = [&]() -> bool {
+        if (linkeditOverrunBlob == nullptr) return true;
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: __LINKEDIT emission "
+                         "overran the '{}' cursor — the stream was already "
+                         "at 0x{:x} when that blob's published file offset "
+                         "was reached. The load commands name offsets the "
+                         "byte emission no longer agrees with, so the image "
+                         "would read the wrong bytes at run time "
+                         "(substrate invariant violation, "
+                         "D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED).",
+                         linkeditOverrunBlob, linkeditOverrunAt));
+        return false;
+    };
+
     // Pad to linkeditFileOff
-    while (bytes.size() < linkeditFileOff) bytes.push_back(0);
+    seekTo(linkeditFileOff, "__LINKEDIT segment start");
 
     // __LINKEDIT: F5 dyld REBASE opcode stream — leads __LINKEDIT at
     // rebaseOff == linkeditFileOff and PIE-rebases each __DATA abs64 pointer
     // site (symbol-address globals). Empty for a module with none.
+    seekTo(rebaseOff, "rebase opcodes");
     bytes.insert(bytes.end(), dyldRebaseBlob.begin(), dyldRebaseBlob.end());
 
     // __LINKEDIT: dyld binding bytes (legacy bind opcode stream
     // OR chained-fixups payload depending on useChainedFixups).
+    seekTo(bindOff, useChainedFixups ? "chained fixups" : "bind opcodes");
     bytes.insert(bytes.end(), dyldBindBlob.begin(), dyldBindBlob.end());
 
     // __LINKEDIT: the c153 MH_DYLIB export trie at exportOff (empty on
     // the exec arm / an exportless dylib — zero bytes inserted).
+    seekTo(exportOff, "exports trie");
     bytes.insert(bytes.end(), exportTrieBlob.begin(), exportTrieBlob.end());
 
     // Indirect-symtab
+    seekTo(indirectSymtabOff, "indirect symbol table");
     for (auto const idx : indirectSyms) appendU32LE(bytes, idx);
 
     // nlist_64[]
+    seekTo(symtabOff, "symbol table");
     bytes.insert(bytes.end(), nlistBytes.begin(), nlistBytes.end());
 
     // string table
+    seekTo(strtabOff, "symbol table strings");
     auto strtabBytes = std::move(strtab).release();
     bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
+
+    if (!linkeditCursorsAgree()) return {};
 
     // LK7 / D-LK7-ADHOC-CODESIGN-MACHO: pad to the 8-byte-aligned
     // codesign reservation, then fill it. At this point `bytes.size()`
@@ -5124,7 +5624,14 @@ encodeExecDynamic(AssembledModule const&    module,
     // the signature). The CodeDirectory's `codeLimit` is therefore
     // `codeSigFileOff` and the page hashes cover those bytes.
     if (emitCodeSig) {
-        while (bytes.size() < codeSigFileOff) bytes.push_back(0);
+        // The ad-hoc signature hashes EXACTLY `bytes[0, codeSigFileOff)`, so
+        // an overrun here would silently sign a PREFIX of the image and leave
+        // the tail uncovered by any page hash. Same loud cursor check as the
+        // rest of the chain (requirement of D-LK7-ADHOC-CODESIGN-MACHO now
+        // that D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED moves the blobs ahead
+        // of the reservation).
+        seekTo(codeSigFileOff, "code signature");
+        if (!linkeditCursorsAgree()) return {};
         if (im.codeSignature.has_value()) {
             // Build the real ad-hoc CodeDirectory + SuperBlob over the
             // signed bytes and write it into the reservation. execSeg

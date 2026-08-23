@@ -50,6 +50,16 @@ public:
     // nullptr if not registered.
     [[nodiscard]] std::shared_ptr<SourceBuffer const> tryGet(BufferId id) const noexcept;
 
+    // Register every buffer `other` holds. Idempotent per id, exactly like
+    // `add` — a buffer both registries already share is registered once.
+    // ★ IT EXISTS SO A BUFFER CAN TRAVEL WITH ITS DIAGNOSTICS ACROSS A
+    // REPORTER MERGE. `DiagnosticReporter` retains the buffers minted for its
+    // own diagnostics (see `sourceBuffers()`), and a merge that carried the
+    // diagnostics but not the buffers would hand the destination a diagnostic
+    // whose source is unreachable — the exact `<unknown-buffer:N>` render this
+    // pair of facilities exists to end.
+    void addAll(BufferRegistry const& other);
+
     [[nodiscard]] std::size_t size() const noexcept { return byId_.size(); }
 
 private:
@@ -152,9 +162,86 @@ public:
         for (ParseDiagnostic& d : all_) fn(d.buffer, d.span);
     }
 
+    // ★★★ RE-ANCHOR A RANGE OF ALREADY-ADMITTED DIAGNOSTICS ONTO A NEW PRIMARY
+    // LOCUS, demoting each one's current locus to a related location.
+    //
+    // WHY THIS EXISTS (D-ASM-TEMPLATE-DIAGNOSTIC-DOES-NOT-NAME-THE-C-STATEMENT):
+    // an embedded-assembly template's diagnostics are raised against the
+    // mid-compile-minted `<inline asm>` fragment buffer by code the CALLER
+    // cannot intercept (the grammar machinery and the asm engine report through
+    // the shared `DiagnosticReporter&`). Post-admission mutation is the only
+    // interception point that adds no interface — the precedent `remapBuffers`
+    // set for the preprocessor's line-map. ✔MEASURED, gcc 13.3 and clang 18:
+    // BOTH references make the C statement the PRIMARY locus of an inline-asm
+    // error (clang keeps the template as a `note:` block; gcc echoes its text),
+    // so the fragment locus is DEMOTED, never dropped.
+    //
+    // `from` is an index into `all()`: every diagnostic at index >= `from` gets
+    // (a) its current (buffer, span) appended to `related` with `note` — ONLY IF
+    // the buffer is valid; the buffer, not the span, is the discriminator,
+    // because a zero-width span at a real buffer is a genuine locus (a Missing
+    // node at a position) that must demote, while an invalid buffer means the
+    // diagnostic never had a locus and there is nothing to demote — and then
+    // (b) its primary set to (`newBuffer`, `newSpan`).
+    //
+    // Runs AFTER admission, exactly like `remapBuffers`: the dedup window is
+    // not rebuilt (duplicates were already coalesced on their original keys),
+    // no element is inserted or removed (so the cap marker's index stays
+    // valid), and `from > all().size()` is a no-op — a caller snapshots
+    // `all().size()` before a phase and reanchors after it, whatever the phase
+    // reported in between.
+    void reanchorFrom(std::size_t     from,
+                      BufferId        newBuffer,
+                      SourceSpan      newSpan,
+                      std::string_view note);
+
+    // ★★★ THE BUFFERS THIS REPORTER'S OWN DIAGNOSTICS POINT INTO — the
+    // retention that makes a MID-PIPELINE fragment renderable.
+    //
+    // ⚠ THE PROBLEM IT SOLVES, ✔MEASURED 2026-08-17 THROUGH THE CLI. A
+    // `ParseDiagnostic` carries a `BufferId`, never the buffer; the two travel
+    // separately and are re-paired at the driver, which builds its
+    // `BufferRegistry` from the compiled units (`cu.trees()` +
+    // `cu.auxiliaryBuffers()`). That re-pairing reaches every buffer that
+    // exists BEFORE the compile — and NO buffer minted during it. An embedded
+    // assembly template is parsed at the LIR tier out of a C string literal,
+    // so its `SourceBuffer` is minted mid-compile, is reachable from no
+    // `CompilationUnit`, and on the parse-FAILURE path dies with the `Tree`
+    // that held it. Both of its diagnostic families rendered as
+    //     error[P0001]: expected 'LineEnd' — got '@'
+    //       --> <unknown-buffer:6>:offset 13
+    // — a forwarded parse error AND (measured, and not what the anchor
+    // predicted) every `A_AsmTextUnsupported` refusal the lowering itself
+    // raises, which stamps the same fragment buffer from `tree_.source()`.
+    //
+    // ★ SO THE PAIRING MOVES TO THE OBJECT THAT ALREADY SPANS THE GAP. The
+    // reporter is handed to the fragment parse and outlives it; retaining the
+    // buffer HERE, at the moment it is minted and before a single token is
+    // read, makes it survive the failure path by construction rather than by a
+    // caller remembering to drain something. `format()` consults this store
+    // when the caller-supplied registry cannot resolve — so a reporter can
+    // always render its own diagnostics, whatever registry it is handed,
+    // including an empty one.
+    // ⚠ IT CANNOT MIS-RESOLVE. `BufferId` is minted from ONE process-wide
+    // monotonic counter (`substrate::mintMonotonicId<BufferId>`), so an id that
+    // resolves here and an id that resolves in the driver's registry are the
+    // same buffer; the fallback can only ever ADD an answer where there was
+    // none.
+    // ⓘ REUSES `BufferRegistry` RATHER THAN A SECOND CONTAINER: registration,
+    // idempotency and lookup already have an owner, and a parallel
+    // `vector<shared_ptr<SourceBuffer>>` would be a second spelling of it.
+    // ⓘ NOT ROLLED BACK BY `truncateTo`. A speculative parse that registers a
+    // buffer and is then rewound leaves a retained buffer no diagnostic names —
+    // which costs a map entry and renders nothing. Rolling it back would risk
+    // the opposite (a live diagnostic losing its source), and that failure is
+    // silent while this one is not.
+    [[nodiscard]] BufferRegistry&       sourceBuffers()       noexcept { return ownBuffers_; }
+    [[nodiscard]] BufferRegistry const& sourceBuffers() const noexcept { return ownBuffers_; }
+
     // Pretty-printers. The registry resolves BufferId → SourceBuffer so
     // multi-file diagnostics (related-locations spanning includes, future)
-    // format correctly.
+    // format correctly. `bufs` WINS; `sourceBuffers()` is consulted only for
+    // an id it does not carry.
     [[nodiscard]] std::string formatAll(BufferRegistry const& bufs) const;
     [[nodiscard]] std::string format(ParseDiagnostic const& d,
                                      BufferRegistry const& bufs) const;
@@ -165,6 +252,13 @@ private:
     [[nodiscard]] std::optional<ParseDiagnostic> applyPolicy(ParseDiagnostic d) const;
 
     [[nodiscard]] bool isRecentDuplicate(ParseDiagnostic const& d) const noexcept;
+
+    // `bufs` first, then this reporter's own retained buffers. ONE helper so
+    // the primary location and every related location resolve identically — a
+    // fallback applied to one and not the other is how a related note keeps
+    // printing `<unknown-buffer>` next to a correctly rendered primary.
+    [[nodiscard]] std::shared_ptr<SourceBuffer const>
+    resolveBuffer_(BufferId id, BufferRegistry const& bufs) const noexcept;
 
     // Record that the global cap ate one more diagnostic, and REWRITE the
     // marker's prose so it always states the running total. The rewrite is
@@ -182,6 +276,7 @@ private:
     bool                                    hitCap_ = false;
     std::size_t                             droppedByCap_   = 0;
     std::size_t                             capMarkerIndex_ = 0;  // index into all_; valid only while hitCap_
+    BufferRegistry                          ownBuffers_{};        // see sourceBuffers()
 };
 
 // Ergonomic free function for the common "construct a ParseDiagnostic

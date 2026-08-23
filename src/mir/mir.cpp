@@ -2,6 +2,7 @@
 
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/arg_payload.hpp"
+#include "core/types/target_schema.hpp"   // TargetRegClass (the piece's result-register pool)
 
 #include <cstdio>
 #include <cstdlib>
@@ -10,11 +11,16 @@
 namespace dss {
 
 // The builder's terminator methods hardcode CFG-successor counts (addBr → 1,
-// addCondBr → 2, addSwitch → cases+1 ≥ 1, addReturn/addUnreachable → 0); these
-// counts MUST agree with the opcodeInfo() descriptor that recordSuccessors_ and
-// the ML3 verifier read. The compile-time checks below pin that agreement at
-// the row level — a descriptor edit that breaks the contract fails the build
-// instead of the runtime assertion.
+// addCondBr → 2, addSwitch → cases+1 ≥ 1, addInlineAsmGoto → labels+1 ≥ 2,
+// addReturn/addUnreachable → 0); these counts MUST agree with the opcodeInfo()
+// descriptor that recordSuccessors_ and the ML3 verifier read. The compile-time
+// checks below pin that agreement at the row level — a descriptor edit that
+// breaks the contract fails the build instead of the runtime assertion.
+//
+// ⚠ THE BLOCK IS A CENSUS OF THE TERMINATOR BUILDERS, so a builder missing from
+// it is the gap, not a shorter list. `InlineAsmGoto` was absent while its row
+// said `≥1` and its builder emitted the label list alone; the row and the
+// builder agreed, and both were wrong about the CFG (see the opcode's banner).
 static_assert(opcodeInfo(MirOpcode::Br).minSuccessors == 1
               && opcodeInfo(MirOpcode::Br).maxSuccessors == 1,
               "Br is unconditional → exactly 1 successor");
@@ -24,6 +30,10 @@ static_assert(opcodeInfo(MirOpcode::CondBr).minSuccessors == 2
 static_assert(opcodeInfo(MirOpcode::Switch).minSuccessors == 1
               && opcodeInfo(MirOpcode::Switch).maxSuccessors == kMirUnboundedSuccessors,
               "Switch → ≥1 successor (default is always present)");
+static_assert(opcodeInfo(MirOpcode::InlineAsmGoto).minSuccessors == 2
+              && opcodeInfo(MirOpcode::InlineAsmGoto).maxSuccessors
+                     == kMirUnboundedSuccessors,
+              "InlineAsmGoto → ≥1 label successor PLUS the fall-through, so ≥2");
 static_assert(opcodeInfo(MirOpcode::Return).minSuccessors == 0
               && opcodeInfo(MirOpcode::Return).maxSuccessors == 0,
               "Return → 0 successors");
@@ -41,7 +51,8 @@ void resetMovedFrom_(Mir::InstArena& inst, Mir::BlockArena& block, Mir::FuncAren
                      Mir::GlobalArena& global,
                      std::vector<MirBlockId>& instBlock, std::vector<MirInstId>& operandPool,
                      std::vector<MirPhiIncoming>& phiPool, std::vector<MirBlockId>& succPool,
-                     MirLiteralPool& literalPool) noexcept {
+                     MirLiteralPool& literalPool,
+                     MirAsmDescriptorPool& asmDescriptorPool) noexcept {
     inst   = Mir::InstArena{};
     block  = Mir::BlockArena{};
     func   = Mir::FuncArena{};
@@ -51,6 +62,7 @@ void resetMovedFrom_(Mir::InstArena& inst, Mir::BlockArena& block, Mir::FuncAren
     phiPool.clear();
     succPool.clear();
     literalPool = MirLiteralPool{};
+    asmDescriptorPool = MirAsmDescriptorPool{};
 }
 
 } // namespace
@@ -62,6 +74,7 @@ Mir::Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
          std::vector<MirBlockId> instBlock, std::vector<MirInstId> operandPool,
          std::vector<MirPhiIncoming> phiPool, std::vector<MirBlockId> succPool,
          MirLiteralPool literalPool,
+         MirAsmDescriptorPool asmDescriptorPool,
          MirAliasingMode aliasingMode,
          bool charTypesAliasAll) noexcept
     : instArena_(std::move(instArena)),
@@ -73,6 +86,7 @@ Mir::Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
       phiPool_(std::move(phiPool)),
       succPool_(std::move(succPool)),
       literalPool_(std::move(literalPool)),
+      asmDescriptorPool_(std::move(asmDescriptorPool)),
       aliasingMode_(aliasingMode),
       charTypesAliasAll_(charTypesAliasAll) {
     // The four arenas are tagged by ONE module id (the cross-tier guard relies
@@ -111,13 +125,15 @@ Mir::Mir(Mir&& other) noexcept
       phiPool_(std::move(other.phiPool_)),
       succPool_(std::move(other.succPool_)),
       literalPool_(std::move(other.literalPool_)),
+      asmDescriptorPool_(std::move(other.asmDescriptorPool_)),
       aliasingMode_(other.aliasingMode_),
       charTypesAliasAll_(other.charTypesAliasAll_) {
     other.aliasingMode_ = MirAliasingMode::Permissive;
     other.charTypesAliasAll_ = true;
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
-                    other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_);
+                    other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_,
+                    other.asmDescriptorPool_);
 }
 
 Mir& Mir::operator=(Mir&& other) noexcept {
@@ -131,13 +147,15 @@ Mir& Mir::operator=(Mir&& other) noexcept {
     phiPool_     = std::move(other.phiPool_);
     succPool_    = std::move(other.succPool_);
     literalPool_ = std::move(other.literalPool_);
+    asmDescriptorPool_ = std::move(other.asmDescriptorPool_);
     aliasingMode_ = other.aliasingMode_;
     other.aliasingMode_ = MirAliasingMode::Permissive;
     charTypesAliasAll_ = other.charTypesAliasAll_;
     other.charTypesAliasAll_ = true;
     resetMovedFrom_(other.instArena_, other.blockArena_, other.funcArena_,
                     other.globalArena_, other.instBlock_,
-                    other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_);
+                    other.operandPool_, other.phiPool_, other.succPool_, other.literalPool_,
+                    other.asmDescriptorPool_);
     return *this;
 }
 
@@ -237,7 +255,36 @@ std::uint32_t Mir::intrinsicId(MirInstId id) const {
     return payloadForOpcode_(instArena_.at(id), MirOpcode::IntrinsicCall, id, "intrinsicId");
 }
 std::uint32_t Mir::returnPieceOrdinal(MirInstId id) const {
-    return payloadForOpcode_(instArena_.at(id), MirOpcode::ReturnPiece, id, "returnPieceOrdinal");
+    // The PER-CLASS result-register index (low 16). The high 16 is the register
+    // CLASS the ordinal indexes — see returnPieceRegClass and
+    // mir_return_piece_payload.hpp for why both facts must be stored.
+    return return_piece_payload::ordinal(
+        payloadForOpcode_(instArena_.at(id), MirOpcode::ReturnPiece, id,
+                          "returnPieceOrdinal"));
+}
+TargetRegClass Mir::returnPieceRegClass(MirInstId id) const {
+    return static_cast<TargetRegClass>(return_piece_payload::regClass(
+        payloadForOpcode_(instArena_.at(id), MirOpcode::ReturnPiece, id,
+                          "returnPieceRegClass")));
+}
+std::uint32_t Mir::asmDescriptorIndex(MirInstId id) const {
+    // Both asm forms carry the same payload, so the shared typed reader accepts
+    // either — the opcode guard is "is this an asm block", not "is this the
+    // non-terminator one". Spelt as an explicit two-arm test rather than a
+    // payloadForOpcode_ call because that helper compares one opcode.
+    detail::MirInst const& n = instArena_.at(id);
+    if (n.opcode != MirOpcode::InlineAsm && n.opcode != MirOpcode::InlineAsmGoto) {
+        std::fprintf(stderr,
+                     "dss::Mir fatal: asmDescriptorIndex: MirInstId=%u is '%.*s', "
+                     "not 'inlineasm' or 'inlineasmgoto'\n",
+                     id.v,
+                     static_cast<int>(mnemonic(n.opcode).size()), mnemonic(n.opcode).data());
+        std::abort();
+    }
+    return n.payload;
+}
+MirAsmDescriptor const& Mir::asmDescriptor(MirInstId id) const {
+    return asmDescriptorPool_.at(asmDescriptorIndex(id));
 }
 
 MirFuncId Mir::blockFunc(MirBlockId id) const {
@@ -574,12 +621,22 @@ void MirBuilder::recordSuccessors_(MirOpcode terminator, std::span<MirBlockId co
     // opcodeInfo() descriptor (Br=1, CondBr=2, Switch≥1, …) — so a future
     // terminator builder that recorded the wrong number of edges fails loud here
     // rather than producing a malformed CFG. This assertion is unreachable from
-    // the public API today (the five terminator methods all hardcode counts that
-    // satisfy the table — and the static_asserts at the top of this TU lock that
-    // mutual consistency at compile time); it earns its keep when (a) ML3's
-    // verifier re-runs the same descriptor check on any frozen module — including
-    // the direct-Mir-ctor path this builder doesn't own — and (b) a future
-    // terminator method is added that miscounts.
+    // the public API today (every terminator method hardcodes a count that
+    // satisfies the table — and the static_asserts at the top of this TU lock that
+    // mutual consistency at compile time); it earns its keep when (a) a future
+    // terminator method is added that miscounts, and (b) a caller-supplied count
+    // reaches a builder that takes one — `cloneInlineAsmGoto` passes the
+    // successor span it was HANDED.
+    //
+    // ⚠ THE FROZEN-MODULE HALF IS THE VERIFIER'S, AND IT WAS CLAIMED HERE BEFORE
+    // IT EXISTED. This comment used to say ML3's verifier "re-runs the same
+    // descriptor check on any frozen module — including the direct-Mir-ctor path
+    // this builder doesn't own". ✔MEASURED: `MirVerifier` validated OPERAND arity
+    // against `opcodeInfo` and range-checked edge targets, and had NO successor-
+    // arity check of any kind — so a directly-constructed `Mir` could carry a
+    // malformed terminator with no diagnostic anywhere. The check now exists, in
+    // `MirVerifier::checkStructuralInvariants` beside the edge-range scan; the
+    // sentence is true because it was made true, not because it was written.
     MirOpcodeInfo const info = opcodeInfo(terminator);
     auto const n = succs.size();
     if (n < info.minSuccessors
@@ -637,11 +694,40 @@ MirInstId MirBuilder::addInst(MirOpcode opcode, std::span<MirInstId const> opera
     // The value-origin opcodes and the sentinel have dedicated builders (so a
     // Const's payload is always a real literal-pool index, etc.); reject them here
     // so the only way to spell them is the safe path.
+    //
+    // *** `InlineAsm` IS IN THIS LIST AS A STRUCTURAL BACKSTOP, NOT FOR SYMMETRY.
+    // Its payload indexes the module's `MirAsmDescriptorPool`, and MIR is copied
+    // by FOUR live verbatim-copy sites that forward `instPayload` into a module
+    // whose pool is EMPTY (`opt/passes/mir_rebuild_helper.cpp`,
+    // `opt/passes/inlining.cpp` x2, and `mir/merge/mir_merge.cpp`'s cross-CU
+    // `FunctionCloner`). Forwarding the index there would name the wrong
+    // descriptor -- i.e. drop the clobber list -- with nothing to observe it.
+    // Refusing the opcode here makes a copy site that forgot `addInlineAsm`
+    // ABORT. This cannot be forgotten, because forgetting it does not compile
+    // away -- it aborts on the first asm block that reaches that site.
+    //
+    // ⚠ AND THE FOURTH SITE IS WHY THE COUNT IS WRITTEN OUT RATHER THAN LEFT
+    // VAGUE. This comment said "three" and named only the three OPTIMIZER sites
+    // from the day the opcode landed until 2026-08-17, when the cross-CU merge --
+    // which is neither an optimizer pass nor reachable from a single-TU build --
+    // aborted a 2-TU sqlite build on four legs. The refusal did its job (a loud
+    // abort, not a silent dropped clobber list), but the census beside it was
+    // already wrong. A NEW copy site must be added to this list, and to
+    // `tests/opt/test_inline_asm_rebuild_carriage.cpp` + `tests/mir/
+    // test_mir_merge.cpp`, which drive each site ALONE.
+    // (`InlineAsmGoto` is a TERMINATOR, so the terminator refusal above already
+    // catches it at `addInst`; its dedicated builders are `addInlineAsmGoto` for
+    // the ORIGINAL emit and `cloneInlineAsmGoto` for every copy site. A copy site
+    // that omits its terminator arm entirely does not reach `addInst` at all --
+    // it hits its own switch default, which is why each cloner's default arm is
+    // also a fatal.)
     if (opcode == MirOpcode::Arg || opcode == MirOpcode::Const
-        || opcode == MirOpcode::GlobalAddr || opcode == MirOpcode::Invalid) {
+        || opcode == MirOpcode::GlobalAddr || opcode == MirOpcode::InlineAsm
+        || opcode == MirOpcode::Invalid) {
         std::fprintf(stderr,
                      "dss::MirBuilder fatal: addInst: opcode '%.*s' has a dedicated builder "
-                     "(addArg/addConst/addGlobalAddr); do not build it via addInst\n",
+                     "(addArg/addConst/addGlobalAddr/addInlineAsm); do not build it via "
+                     "addInst\n",
                      static_cast<int>(info.mnemonic.size()), info.mnemonic.data());
         std::abort();
     }
@@ -723,21 +809,227 @@ MirInstId MirBuilder::addArg(std::uint32_t ordinal, TypeId type,
     return appendInst_(pod, {}, /*terminates=*/false);
 }
 
-MirInstId MirBuilder::addReturnPiece(MirInstId call, std::uint32_t ordinal,
-                                     TypeId pieceType, MirInstFlags flags) {
+MirInstId MirBuilder::addReturnPiece(MirInstId producer, std::uint32_t ordinal,
+                                     TargetRegClass regClass, TypeId pieceType,
+                                     MirInstFlags flags) {
     if (!pieceType.valid()) requireValueType_("addReturnPiece");
-    if (!call.valid()) {
-        std::fputs("dss::MirBuilder fatal: addReturnPiece: call operand must be valid\n",
+    if (!producer.valid()) {
+        std::fputs("dss::MirBuilder fatal: addReturnPiece: producer operand must be valid\n",
                    stderr);
+        std::abort();
+    }
+    // The producer must be a multi-result opcode. A piece anchored to anything
+    // else has no result-register pool to be captured from, and the LIR-side
+    // look-ahead would leave it unconsumed -- which is fail-loud there, but this
+    // is where the mistake is actually made.
+    MirOpcode const pop = instArena_.at(producer).opcode;
+    if (pop != MirOpcode::Call && pop != MirOpcode::InlineAsm
+        && pop != MirOpcode::InlineAsmGoto) {
+        std::fprintf(stderr,
+                     "dss::MirBuilder fatal: addReturnPiece: producer MirInstId=%u is '%.*s'; "
+                     "a result piece may only be anchored to a multi-result producer "
+                     "(call / inlineasm / inlineasmgoto)\n",
+                     producer.v,
+                     static_cast<int>(mnemonic(pop).size()), mnemonic(pop).data());
+        std::abort();
+    }
+    // Plan 29 4.4.5: the ordinal and the CLASS it indexes are two facts and both
+    // are stored. An ordinal wide enough to collide with the class field would
+    // silently re-file the piece in another register pool -- refuse it.
+    if (ordinal > return_piece_payload::kOrdinalMax) {
+        std::fprintf(stderr,
+                     "dss::MirBuilder fatal: addReturnPiece: ordinal %u exceeds the "
+                     "encodable maximum %u\n",
+                     ordinal, return_piece_payload::kOrdinalMax);
+        std::abort();
+    }
+    // `None` is the default-constructed value of the enum, i.e. exactly what a
+    // caller that forgot to choose would pass. A piece with no pool is not a
+    // recoverable state -- it is the silent wrong-pool default this split exists
+    // to remove.
+    if (regClass == TargetRegClass::None) {
+        std::fprintf(stderr,
+                     "dss::MirBuilder fatal: addReturnPiece: result piece %u has register "
+                     "class 'none' -- the class selects which result-register pool the "
+                     "ordinal indexes and must be stated, never defaulted\n",
+                     ordinal);
         std::abort();
     }
     detail::MirInst pod;
     pod.opcode  = MirOpcode::ReturnPiece;
     pod.flags   = flags;
     pod.typeId  = pieceType;
-    pod.payload = ordinal;
-    MirInstId const operands[] = {call};
+    pod.payload = return_piece_payload::encode(
+        ordinal, static_cast<std::uint32_t>(regClass));
+    MirInstId const operands[] = {producer};
     return appendInst_(pod, operands, /*terminates=*/false);
+}
+
+std::uint32_t MirBuilder::asmDescriptorPoolAdd(MirAsmDescriptor descriptor) {
+    return asmDescriptorPool_.add(std::move(descriptor));
+}
+
+// Shared shape checks for the two asm builders: the descriptor's input list and
+// the instruction's operand list are the SAME list seen from two sides, so a
+// mismatch means a later consumer would bind `%N` to the wrong value.
+void MirBuilder::checkAsmOperandAlignment_(MirAsmDescriptor const& descriptor,
+                                           std::size_t operandCount,
+                                           char const* builder) const {
+    if (descriptor.inputs.size() != operandCount) {
+        std::fprintf(stderr,
+                     "dss::MirBuilder fatal: %s: descriptor declares %zu input(s) but %zu "
+                     "operand(s) were supplied\n",
+                     builder, descriptor.inputs.size(), operandCount);
+        std::abort();
+    }
+}
+
+// The `asm goto` half of the same idea: `labelSpellings` holds one entry per
+// LABEL and the successor list holds those labels plus the fall-through, so the
+// two sizes differ by exactly one. Checking it here — rather than trusting the
+// opcode row's `[2, ∞)` range — is what makes a clone that dropped an edge loud:
+// on a two-label goto the truncated set is still inside the range.
+void MirBuilder::checkAsmGotoLabelAlignment_(MirAsmDescriptor const& descriptor,
+                                             std::size_t successorCount,
+                                             char const* builder) const {
+    if (successorCount >= 1
+        && descriptor.labelSpellings.size() == successorCount - 1) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "dss::MirBuilder fatal: %s: descriptor declares %zu `asm goto` label(s) "
+                 "but %zu CFG successor(s) were supplied — the successors are the labels "
+                 "PLUS the fall-through edge, so the counts must differ by exactly one; a "
+                 "dropped fall-through deletes the code after the statement\n",
+                 builder, descriptor.labelSpellings.size(), successorCount);
+    std::abort();
+}
+
+MirInstId MirBuilder::addInlineAsm(MirAsmDescriptor descriptor,
+                                   std::span<MirInstId const> operands,
+                                   TypeId resultType, MirInstFlags flags) {
+    checkAsmOperandAlignment_(descriptor, operands.size(), "addInlineAsm");
+    // Result rule: output 0 IS the instruction's own value. No outputs means no
+    // result; one or more outputs means a result type is required. `R::Optional`
+    // cannot express that correlation, so it is checked here, where the
+    // descriptor is in hand.
+    if (descriptor.outputs.empty() && resultType.valid()) {
+        std::fputs("dss::MirBuilder fatal: addInlineAsm: a result type was supplied but the "
+                   "descriptor declares no outputs\n", stderr);
+        std::abort();
+    }
+    if (!descriptor.outputs.empty() && !resultType.valid()) {
+        std::fputs("dss::MirBuilder fatal: addInlineAsm: the descriptor declares outputs but "
+                   "no result type was supplied (output 0 IS this instruction's value)\n",
+                   stderr);
+        std::abort();
+    }
+    detail::MirInst pod;
+    pod.opcode  = MirOpcode::InlineAsm;
+    pod.flags   = flags;
+    pod.typeId  = resultType;
+    pod.payload = asmDescriptorPool_.add(std::move(descriptor));
+    return appendInst_(pod, operands, /*terminates=*/false);
+}
+
+MirBuilder::AsmGotoResult
+MirBuilder::addInlineAsmGoto(MirAsmDescriptor descriptor,
+                             std::span<MirInstId const> operands,
+                             std::span<MirBlockId const> labels,
+                             MirInstFlags flags) {
+    checkAsmOperandAlignment_(descriptor, operands.size(), "addInlineAsmGoto");
+    if (labels.empty()) {
+        std::fputs("dss::MirBuilder fatal: addInlineAsmGoto: an `asm goto` must name at "
+                   "least one label — the opcode row requires >= 2 CFG successors (at "
+                   "least one label plus the fall-through), and a label-less `asm goto` "
+                   "is not a terminator at all: it is an ordinary asm block carrying a "
+                   "qualifier, so route it to addInlineAsm\n", stderr);
+        std::abort();
+    }
+    // One spelling group per label — the descriptor and this call are the same
+    // label list seen from two sides. The `+ 1` is the fall-through edge minted
+    // below, so this call states the successor set BEFORE it is built.
+    checkAsmGotoLabelAlignment_(descriptor, labels.size() + 1, "addInlineAsmGoto");
+    // EVERY output of an `asm goto` is a successor-head piece, output 0 included:
+    // a terminator has nothing after it, so it cannot carry a result of its own.
+    // The opcode row says `R::None`; this is that rule stated where a caller can
+    // still act on it.
+    bool const hasOutputs = !descriptor.outputs.empty();
+
+    MirBlockId const asmBlock = openBlock_;
+    std::vector<AsmGotoEdge> edges;
+    edges.reserve(labels.size() + 1);
+    std::vector<MirBlockId> succs;
+    succs.reserve(labels.size() + 1);
+    // One edge per (onward target, is-it-the-fall-through) pair, applying the
+    // placement rule uniformly. `createBlock` reserves without opening, so the
+    // asm's own block stays open for the terminator below; the caller then opens
+    // each landing block and fills its head with the pieces. `finish()`'s
+    // per-block "filled + terminated" sweep turns a forgotten edge into an abort
+    // rather than a silently dead block.
+    auto addEdge = [&](MirBlockId onward, bool isFallthrough) {
+        if (!hasOutputs) {
+            edges.push_back(AsmGotoEdge{onward, onward, /*split=*/false, isFallthrough});
+            succs.push_back(onward);
+            return;
+        }
+        MirBlockId const landing = createBlock(StructCfMarker::Linear);
+        edges.push_back(AsmGotoEdge{landing, onward, /*split=*/true, isFallthrough});
+        succs.push_back(landing);
+    };
+    for (MirBlockId const label : labels) {
+        checkSameModule_(label.arenaTag, "asm-goto label");
+        addEdge(label, /*isFallthrough=*/false);
+    }
+    // ★★★ THE FALL-THROUGH EDGE, AND ITS BLOCK IS MINTED HERE. The source names
+    // no label for it — it is "the next statement" — so there is nothing to take
+    // from the caller, and taking one would let a label block or an already-
+    // sealed block arrive with no way for this builder to tell. Created last so
+    // the edge is LAST, which is what keeps every `succs[i] == label i` reader
+    // correct (see `MirOpcode::InlineAsmGoto`'s banner).
+    addEdge(createBlock(StructCfMarker::Linear), /*isFallthrough=*/true);
+    if (openBlock_ != asmBlock) {
+        std::fputs("dss::MirBuilder fatal: addInlineAsmGoto: creating the landing blocks "
+                   "changed the open block\n", stderr);
+        std::abort();
+    }
+
+    detail::MirInst pod;
+    pod.opcode  = MirOpcode::InlineAsmGoto;
+    pod.flags   = flags;
+    pod.typeId  = InvalidType;
+    pod.payload = asmDescriptorPool_.add(std::move(descriptor));
+    MirInstId const term = appendInst_(pod, operands, /*terminates=*/true);
+    recordSuccessors_(MirOpcode::InlineAsmGoto, succs);
+    return AsmGotoResult{term, std::move(edges)};
+}
+
+MirInstId MirBuilder::cloneInlineAsmGoto(MirAsmDescriptor descriptor,
+                                         std::span<MirInstId const> operands,
+                                         std::span<MirBlockId const> successors,
+                                         MirInstFlags flags) {
+    checkAsmOperandAlignment_(descriptor, operands.size(), "cloneInlineAsmGoto");
+    // ★★★ THE ARITY IS CHECKED AGAINST THE DESCRIPTOR THE CLONE CARRIES, because
+    // the opcode row alone CANNOT SEE THE DEFECT. `recordSuccessors_` below tests
+    // the count against `[2, ∞)`; a clone that dropped the fall-through edge of a
+    // two-label goto hands over 2 successors, passes that range, and the edge is
+    // gone with no diagnostic — the code after the asm loses its only predecessor
+    // and the unreachable prune deletes it. Every copy site maps `oldSucc` 1:1, so
+    // the count is preserved by construction TODAY; this is the guard that keeps
+    // it a checked invariant rather than a property of how four cloners happen to
+    // be spelled.
+    checkAsmGotoLabelAlignment_(descriptor, successors.size(), "cloneInlineAsmGoto");
+    for (MirBlockId const b : successors) checkSameModule_(b.arenaTag, "asm-goto successor");
+    detail::MirInst pod;
+    pod.opcode  = MirOpcode::InlineAsmGoto;
+    pod.flags   = flags;
+    pod.typeId  = InvalidType;
+    pod.payload = asmDescriptorPool_.add(std::move(descriptor));
+    MirInstId const id = appendInst_(pod, operands, /*terminates=*/true);
+    // recordSuccessors_ re-checks the arity against the opcode row as well, so a
+    // clone that dropped an edge fails here rather than in a backend pass.
+    recordSuccessors_(MirOpcode::InlineAsmGoto, successors);
+    return id;
 }
 
 MirInstId MirBuilder::addReadIndirectResult(TypeId pointerType, MirInstFlags flags) {
@@ -1106,6 +1398,7 @@ Mir MirBuilder::finish() && {
                std::move(instBlock_),
                std::move(operandPool_), std::move(phiPool_), std::move(succPool_),
                std::move(literalPool_),
+               std::move(asmDescriptorPool_),
                aliasingMode_,
                charTypesAliasAll_};
 }

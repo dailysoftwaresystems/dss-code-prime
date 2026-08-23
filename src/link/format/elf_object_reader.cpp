@@ -1,4 +1,5 @@
 #include "link/format/elf_object_reader.hpp"
+#include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
@@ -89,15 +90,23 @@ constexpr std::uint8_t kSttFile    = 4;
     }
 }
 
-// Is this target-schema reloc formula a FUNCTION CALL / BRANCH (as opposed to
-// a data-address computation)? The AGNOSTIC "extern is a function" signal:
-// aarch64 R_AARCH64_CALL26 / JUMP26 carry the `Aarch64Call26` formula (a call
-// with NO PLT-variant native id in the schema). Combined with the x86_64
-// PLT-variant native id (a `pltNativeId` row), this is what distinguishes an
-// extern FUNCTION from an extern DATA object without a hardcoded reloc number.
-[[nodiscard]] constexpr bool isCallBranchFormula(RelocFormulaKind k) noexcept {
-    return k == RelocFormulaKind::Aarch64Call26;
-}
+// ── THE "EXTERN IS A FUNCTION" SIGNAL IS DECLARED, NOT DERIVED ──────────
+//
+// This file used to carry an `isCallBranchFormula` helper that answered the
+// question from the TARGET row's arithmetic formula (`Aarch64Call26`). It is
+// GONE (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL), and it must not come back as a
+// fallback: a formula describes ARITHMETIC, and the question is about ROLE.
+// The proxy held on AArch64 only by accident -- that CPU's branch has its own
+// instruction encoding, so its formula happens to be branch-specific. It
+// carries no role wherever the branch shares its arithmetic with a data
+// reference, which on x86_64 is `S + A - P` for both. The role now comes from
+// the FORMAT row: `isCall` where the wire type is branch-only (aarch64's
+// R_AARCH64_CALL26), and `pltNativeId` where the format instead spells an
+// extern call with a distinct PLT-variant wire type (x86_64's R_X86_64_PLT32,
+// emitted INSTEAD of PC32 against an undefined extern). Both are collected
+// into `callSignalNativeIds` below; ELF x86_64 needs the second because its
+// R_X86_64_PC32 genuinely serves data references too and therefore must NOT
+// be declared `isCall`.
 
 // Overflow-safe [off, off+size) within [0, total) -- the c159-c161
 // `rangeExceedsBuffer` shape (subtraction, never `off + size` which
@@ -392,53 +401,26 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     //         FORMAT SCHEMA -- no hardcoded R_X86_64 numbers here -----
     //
     // `callSignalNativeIds` collects the native ids that mark an extern as a
-    // FUNCTION: the x86_64 PLT (call-through-stub) variant (`pltNativeId`) AND
-    // the native id of any row whose target-schema formula is a call/branch
-    // class (aarch64 CALL26, which has NO pltNativeId). This is the agnostic
-    // "is a function" signal for isData inference below -- the plain PC32 a
-    // DATA reference uses is deliberately NOT in this set.
-    std::unordered_map<std::uint32_t, RelocationKind> nativeToKind;
-    std::unordered_set<std::uint32_t> callSignalNativeIds;
-    auto mapNative = [&](std::uint32_t nid, RelocationKind kind)
-        -> std::optional<std::optional<AssembledModule>> {
-        // Duplicate-nativeId guard: a native id mapping to two DIFFERENT kinds
-        // is an ambiguous schema -- fail loud rather than let "last row wins"
-        // silently mis-decode. Returns a wrapped failure to propagate, or
-        // nullopt to continue.
-        auto const ins = nativeToKind.emplace(nid, kind);
-        if (!ins.second && ins.first->second.v != kind.v) {
-            return std::optional<std::optional<AssembledModule>>{
-                fail(DiagnosticCode::F_CorruptedBinary,
-                     "elf::readRelocatableObject: object format schema '"
-                     + std::string{objectFormatSchema.name()}
-                     + "' maps native reloc id " + std::to_string(nid)
-                     + " to two different RelocationKinds ("
-                     + std::to_string(ins.first->second.v) + " and "
-                     + std::to_string(kind.v) + ") -- ambiguous reverse map.")};
-        }
-        return std::nullopt;
-    };
-    for (auto const& r : objectFormatSchema.relocations()) {
-        // D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS: an EMISSION ALIAS
-        // shares its wire type with a real row and exists only so the emitter
-        // can reach that type through a different DSS kind (x86_64's DWARF FDE
-        // pointer vs the call-site rel32 — same R_X86_64_PC32, different
-        // implicit addend bias). The wire carries no bias, so there is nothing
-        // to decode differently; including it here would make the reverse map
-        // ambiguous and reject every object using that perfectly ordinary
-        // relocation. `validate()` guarantees the aliased row is present, so
-        // skipping this one never leaves the id unmapped.
-        if (r.emitOnly) continue;
-        if (auto f = mapNative(r.nativeId, r.kind); f.has_value()) return *f;
-        if (r.pltNativeId != 0u) {
-            if (auto f = mapNative(r.pltNativeId, r.kind); f.has_value()) return *f;
-            callSignalNativeIds.insert(r.pltNativeId);  // the PLT call-through-stub variant
-        }
-        if (auto const* tri = targetSchema.relocationInfo(r.kind);
-            tri != nullptr && isCallBranchFormula(tri->formulaKind)) {
-            callSignalNativeIds.insert(r.nativeId);      // a call/branch reloc (aarch64 CALL26)
-        }
+    // FUNCTION -- the UNION of the format's two declared call signals: the
+    // x86_64 PLT (call-through-stub) variant (`pltNativeId`) AND the native id
+    // of any row the format declares `"isCall": true` on (aarch64 CALL26,
+    // which has NO pltNativeId). Both are DECLARATIONS read from the schema,
+    // never inferred from the target's arithmetic (see the note above the byte
+    // helpers). The plain PC32 a DATA reference uses is deliberately in
+    // neither, which is exactly why elf64-x86_64 must not declare `isCall`.
+    //
+    // Built by `ObjectFormatSchema::relocationDecodeTable()` — the SCHEMA's
+    // own answer to "which rows decode, and which wire ids are call signals",
+    // not a loop this reader owns. The three object readers each carried a
+    // copy of that loop and two of them omitted the `emitOnly` exclusion this
+    // one had; the copy is gone from all three (see `RelocationDecodeTable`).
+    auto decode = objectFormatSchema.relocationDecodeTable();
+    if (!decode) {
+        return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: " + decode.error());
     }
+    auto const& nativeToKind         = decode->nativeToKind;
+    auto const& callSignalNativeIds  = decode->callSignalNativeIds;
 
     // -- (6) Reconstruct functions / data items / externs / symbols --
     AssembledModule mod;
@@ -458,6 +440,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // byte, with a residual addend. This is how gcc names string literals / jump
     // tables / local objects; without the redirect the merge cannot bind them.
     std::unordered_set<std::uint32_t> atomSymIdx;
+    // Every DEFINED symbol recorded WITHOUT an atom, staged for the shared
+    // coverage guard -- see `link/format/object_atom_coverage.hpp`.
+    std::vector<link::format::BodilessDefinedSymbol> bodilessDefined;
+    std::vector<std::uint32_t>                       bodilessSymIdx;
 
     auto sliceInBounds = [&](Shdr const& sec, std::uint64_t off, std::uint64_t len)
         -> bool {
@@ -509,6 +495,100 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
         return std::nullopt;  // non-ALLOC (debug/metadata) -- not a runtime body
     };
+
+    // -- (6.44) EQUAL-OFFSET ALIAS IDENTITY: one atom, several names ------
+    //
+    // D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS. Two defined symbols
+    // sharing an `st_value` are two NAMES for one body -- gcc's
+    // `__attribute__((alias("g")))` emits exactly that, the alias and its target
+    // carrying the same `st_value` AND the same `st_size`. Slicing one atom per
+    // symbol produced byte-identical twins over one span, and `findInterval`
+    // hands a relocation inside that span to exactly ONE of them, leaving the
+    // other's copy un-patched. The shared header owns the rule, the ranking and
+    // the argument for both (`resolveEqualOffsetAtomAliases`).
+    //
+    // ★★ WHY ELF NEEDS A PRE-PASS WHERE COFF AND MACH-O DO NOT. Those two build
+    // a per-section BOUNDARY SET first and slice from it, so the alias question
+    // is answered on a finished list. ELF slices during the symtab walk itself
+    // -- `st_size` makes every symbol self-describing -- so the question has to
+    // be answered BEFORE the walk, over the same symbols the walk will turn into
+    // atoms. `elfAtomStart` is that predicate, and it mirrors the walk's two
+    // atom-creating arms below (a sized STT_FUNC in a Text section; a sized
+    // OBJECT in a data-kind section). The two agreeing is not assumed: the
+    // post-walk check below fails loud if an alias's owner never materialised.
+    //
+    // ★ A ZERO-EXTENT SYMBOL IS NEVER A CANDIDATE, matching the shared header's
+    // marker rule. An ARM `$d`/`$x` mapping symbol sits at the exact offset of
+    // the function it precedes; folding it into that function's identity would
+    // put its name AHEAD of the real one in the id -> row lookup, and the
+    // emitted symbol would take the mapping symbol's name.
+    //
+    // ★ ELF IS THE ONLY READER THAT CAN HIT THE CONFLICTING-EXTENT REFUSAL,
+    // because it is the only one whose symbols DECLARE an extent -- see the
+    // resolver's "what still fails loud".
+    auto elfAtomStart =
+        [&](std::size_t i) -> std::optional<link::format::AtomStartCandidate> {
+        Sym const&         sy   = syms[i];
+        std::uint8_t const type = stType(sy.info);
+        if (type == kSttFile || type == kSttSection) return std::nullopt;
+        if (sy.shndx == kShnUndef || sy.shndx >= kShnLoReserve
+            || sy.shndx >= eShnum) {
+            return std::nullopt;
+        }
+        if (sy.size == 0) return std::nullopt;
+        Shdr const&                      sec = secs[sy.shndx];
+        std::optional<SectionKind> const rk  = resolveSectionKind(sec);
+        // Mirrors the walk's two atom-creating arms EXACTLY, including the arm
+        // that is a REFUSAL rather than an atom: a STT_FUNC outside a Text
+        // section is rejected by the walk, so calling it an atom start here
+        // would let the alias resolver's own refusal pre-empt the more specific
+        // one with the more useful message.
+        bool const isAtom =
+            (rk == SectionKind::Text)
+                ? (type == kSttFunc)
+                : (type != kSttFunc && rk.has_value()
+                   && dataSectionKindOf(*rk).has_value());
+        if (!isAtom) return std::nullopt;
+        return link::format::AtomStartCandidate{
+            /*sectionKey=*/sy.shndx, /*offset=*/sy.value,
+            /*declaredExtent=*/sy.size, /*symbolId=*/static_cast<std::uint32_t>(i),
+            /*binding=*/stbToBinding(stBind(sy.info)),
+            /*visibility=*/stvToVisibility(stVis(sy.other)),
+            /*name=*/sy.name, /*sectionName=*/sec.name};
+    };
+    std::unordered_map<std::uint32_t, std::uint32_t> atomOwnerBySym;
+    {
+        std::vector<link::format::AtomStartCandidate> candidates;
+        for (std::size_t i = 0; i < numSyms; ++i) {
+            if (auto c = elfAtomStart(i); c.has_value()) {
+                candidates.push_back(std::move(*c));
+            }
+        }
+        std::vector<std::uint32_t> owner;
+        if (!link::format::resolveEqualOffsetAtomAliases(
+                candidates, owner, "elf::readRelocatableObject", reporter)) {
+            return std::nullopt;   // the resolver reported, naming both symbols
+        }
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (owner[i] != candidates[i].symbolId) {
+                atomOwnerBySym.emplace(candidates[i].symbolId, owner[i]);
+            }
+        }
+    }
+    // The atom identity a symbol resolves to: itself unless it aliases another.
+    // Consulted at BOTH sites that need it -- the walk (does this symbol slice a
+    // body?) and the relocation pass (which atom does this target name?) --
+    // because a collapse without the target remap turns a silent miscompile into
+    // a spurious `K_SymbolUndefined`.
+    auto ownerOf = [&](std::uint32_t symIdx) -> std::uint32_t {
+        auto const it = atomOwnerBySym.find(symIdx);
+        return it == atomOwnerBySym.end() ? symIdx : it->second;
+    };
+    // Alias rows are appended AFTER the walk, never during it: every id -> row
+    // lookup over `AssembledModule::symbols` keeps the FIRST row for an id, so
+    // the canonical name must be recorded before any alias of it.
+    std::vector<ModuleSymbol> aliasRows;
+    std::vector<std::uint32_t> aliasOwners;
 
     for (std::size_t i = 0; i < numSyms; ++i) {
         Sym const& sy = syms[i];
@@ -582,6 +662,36 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                                                    sy.name, stbToBinding(stBind(sy.info)),
                                                    stvToVisibility(stVis(sy.other))});
         };
+        // Stage a BODILESS defined symbol for the shared coverage guard
+        // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM) --
+        // called at every site below that records a ModuleSymbol WITHOUT
+        // reconstructing an atom for it. Only a KIND-RESOLVED section is staged:
+        // a DWARF/metadata symbol reconstructs no body BY DESIGN and is not a
+        // dropped body. `st_size` is passed through, so the guard's own
+        // "zero extent is a MARKER, not a body" rule covers this reader's
+        // mapping symbols (`$d`/`$x`) and size-less text labels -- the SAME
+        // judgment the slicing arms below already make, expressed once.
+        //
+        // ⓘ ELF is the reader this defect does NOT affect: it slices any
+        // STT_FUNC with a non-empty extent regardless of BINDING, so a
+        // file-local function is an atom here. The staging exists so the guard
+        // is genuinely reader-agnostic rather than a COFF/Mach-O special case --
+        // and so a future ELF arm that starts demoting bodies cannot do it
+        // quietly.
+        auto stageBodiless = [&] {
+            if (sy.name.empty() || !rk.has_value()) return;
+            bodilessDefined.push_back(link::format::BodilessDefinedSymbol{
+                /*sectionKey=*/sy.shndx, /*sectionOffset=*/sy.value,
+                /*declaredSize=*/sy.size, /*name=*/sy.name,
+                /*sectionName=*/sec.name});
+            // ...and the symtab index alongside it, kept HERE rather than in
+            // the shared struct because it is ELF's own coordinate: the shared
+            // staging is deliberately nothing but `(sectionKey, byteOffset)`.
+            // The geometry fallback below returns indices into
+            // `bodilessDefined`, and turning one back into an atom needs the
+            // symbol it came from.
+            bodilessSymIdx.push_back(static_cast<std::uint32_t>(i));
+        };
 
         // A function MUST live in an executable section. A STT_FUNC anywhere
         // else is corrupt -- fail loud (never mis-slice code as data).
@@ -590,6 +700,21 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 "elf::readRelocatableObject: function symbol '" + sy.name
                 + "' lives in section '" + sec.name
                 + "' which does not resolve to an executable (Text) kind.");
+        }
+
+        // (6.44) THE ALIAS ARM: this symbol names a body another symbol at the
+        // same `st_value` already owns, so it slices NO atom -- it keeps its
+        // NAME and takes the owner's identity. Placed after the executable
+        // -section refusal so a mis-sectioned function is still named.
+        if (std::uint32_t const owner = ownerOf(static_cast<std::uint32_t>(i));
+            owner != static_cast<std::uint32_t>(i)) {
+            if (!sy.name.empty()) {
+                aliasRows.push_back(ModuleSymbol{SymbolId{owner}, sy.name,
+                                                 stbToBinding(stBind(sy.info)),
+                                                 stvToVisibility(stVis(sy.other))});
+            }
+            aliasOwners.push_back(owner);
+            continue;
         }
 
         if (rk == SectionKind::Text) {
@@ -616,6 +741,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     Interval{sy.value, sy.size, mod.functions.size()});
                 atomSymIdx.insert(static_cast<std::uint32_t>(i));
                 mod.functions.push_back(std::move(fn));
+            } else {
+                stageBodiless();   // no atom -- the guard decides (see above)
             }
             pushModuleSym();
             continue;
@@ -633,6 +760,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // an empty item and fail loud. ModuleSymbol only -- and NO
             // interval. (Agnostic: keyed on the zero extent, never the `$`
             // name.) Not a dropped body -- there are no bytes.
+            stageBodiless();       // st_size == 0 -- the guard skips it as a MARKER
             pushModuleSym();
             continue;
         }
@@ -689,16 +817,48 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                   "silently drop a code/data body. Add the section's kind (a "
                   "format schema row or a resolveSectionKind arm).");
         }
+        stageBodiless();   // self-gates on a RESOLVED kind (see above)
         pushModuleSym();
     }
 
+    // (6.44) Every canonical row is now recorded, so the aliases can follow:
+    // several names, one SymbolId, the owning name first.
+    //
+    // ⚠ AND THE OWNER MUST ACTUALLY HAVE MATERIALISED. `elfAtomStart` mirrors
+    // the walk's two atom-creating arms, and this is what stops that mirroring
+    // from being an assumption: if the pre-pass called something an atom start
+    // that the walk did not slice, an alias would have been folded onto an
+    // identity that owns no bytes -- silently, since the alias itself asked for
+    // nothing. Checked here rather than in the arm because the owner may sit
+    // LATER in symbol-table order than the alias that names it.
+    for (std::uint32_t owner : aliasOwners) {
+        if (!atomSymIdx.contains(owner)) {
+            return fail(DiagnosticCode::F_CorruptedBinary,
+                "elf::readRelocatableObject: symbol '" + syms[owner].name
+                + "' was chosen to own the atom at offset "
+                + std::to_string(syms[owner].value) + " of section #"
+                + std::to_string(syms[owner].shndx)
+                + " but the walk reconstructed no atom for it -- the alias "
+                  "pre-pass and the slicing arms disagree about what starts a "
+                  "body. This is the READER contradicting itself, not an object "
+                  "it cannot classify.");
+        }
+    }
+    for (auto& ms : aliasRows) mod.symbols.push_back(std::move(ms));
+
     // MEDIUM guard: overlapping STT_FUNC (st_value,st_size) ranges within one
     // section -- a relocation site inside the overlap would mis-route to
-    // whichever function `findInterval` returns first. Fail loud on a
-    // DIFFERENT-start intersection (a genuine nesting/partial overlap); EQUAL
-    // -start ranges (aliases -- a weak alias + its target at the same address)
-    // share the SAME item-relative offset, so routing to either is offset
-    // -correct and is allowed.
+    // whichever function `findInterval` returns first.
+    //
+    // ★ EQUAL-START PAIRS USED TO BE WAVED THROUGH HERE, on the reasoning that
+    // two aliases share an item-relative offset so routing to either is
+    // offset-correct. That reasoning was HALF the fact: it is true of the
+    // OFFSET and false of the RELOCATION, which reaches only the twin
+    // `findInterval` returns first and leaves the other un-patched. (6.44) now
+    // collapses an equal-start pair to one atom before the walk slices it, and
+    // refuses the pair outright when their declared extents disagree -- so an
+    // equal start can no longer arrive here at all, and the carve-out that let
+    // it pass is gone rather than left standing as an untrue permission.
     for (auto& [secIdx, ivs] : funcIntervalsBySec) {
         std::vector<Interval> sorted = ivs;
         std::sort(sorted.begin(), sorted.end(),
@@ -706,7 +866,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         for (std::size_t k = 1; k < sorted.size(); ++k) {
             Interval const& prev = sorted[k - 1];
             Interval const& cur = sorted[k];
-            if (cur.start != prev.start && cur.start < prev.start + prev.len) {
+            if (cur.start < prev.start + prev.len) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "elf::readRelocatableObject: overlapping STT_FUNC ranges in "
                     "section #" + std::to_string(secIdx) + " ([+"
@@ -716,6 +876,96 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     "overlap would mis-route. Overlapping/nested function "
                     "symbols are a deferred shape.");
             }
+        }
+    }
+
+    // -- (6.4) GEOMETRY FALLBACK: recover a body no ELF field could name ---
+    //
+    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM, operator
+    // ruling 2026-08-20: the fallback lands on ALL THREE readers. The shared
+    // header owns the inference and the argument for it
+    // (`uncoveredDefinedSymbolsThatStartAnAtom`) -- a symbol no reconstructed
+    // atom covers cannot be interior to one, so it starts a body, and promoting
+    // preserves its bytes where demoting drops them.
+    //
+    // ★★ ELF IS THE READER WHERE THIS FIRES LEAST, AND THE ONE SHAPE IT FIRES
+    // ON IS WORTH NAMING -- an unreachable branch would be the vacuous coverage
+    // this repo keeps finding. `st_size` means almost every defined symbol here
+    // already declares its own extent and is sliced by the arms above, and a
+    // ZERO-size symbol is a MARKER the shared rule skips. What is left is a
+    // symbol in a TEXT section with a NON-ZERO st_size that is not STT_FUNC:
+    // the `rk == Text` arm slices only `STT_FUNC && size > 0`, so an
+    // STT_NOTYPE / STT_OBJECT body in `.text` -- an assembler label given a
+    // `.size` but no `.type @function`, or a jump table emitted into `.text` as
+    // `@object` -- reaches `stageBodiless()` with real bytes and no atom. That
+    // used to be a refusal; it is recovered now, and the pin is
+    // `ElfSizedNoTypeTextBodyIsRecoveredByGeometry`.
+    //
+    // ★★ NO RE-SLICE, unlike COFF and Mach-O. Those two derive an atom's END
+    // from the NEXT boundary, so adding a boundary changes its neighbour and the
+    // section must be cut again. ELF derives it from `st_size`, so a promoted
+    // symbol's extent is a property of the symbol alone and no existing atom
+    // moves. That is why this sits AFTER the slicing loop here and BEFORE it
+    // there -- the same decision, applied in each format's own vocabulary.
+    //
+    // ⓘ BEFORE the gap-atom pass below, deliberately: a NAMED body must claim
+    // its bytes before the anonymous pass sweeps whatever is left, or a symbol
+    // the object does name would end up inside a nameless synthetic atom.
+    {
+        std::vector<link::format::ReconstructedAtomExtent> extents;
+        for (auto const* bySec : {&funcIntervalsBySec, &dataIntervalsBySec}) {
+            for (auto const& [secIdx, ivs] : *bySec) {
+                for (auto const& iv : ivs) {
+                    extents.push_back(link::format::ReconstructedAtomExtent{
+                        secIdx, iv.start, iv.len});
+                }
+            }
+        }
+        for (std::size_t idx :
+             link::format::uncoveredDefinedSymbolsThatStartAnAtom(bodilessDefined,
+                                                                  extents)) {
+            auto const&         c      = bodilessDefined[idx];
+            std::uint32_t const symIdx = bodilessSymIdx[idx];
+            Shdr const&         psec   = secs[c.sectionKey];
+            // Only a sized symbol reaches here (the shared rule skips a declared
+            // ZERO extent as a marker, and ELF stages `st_size` verbatim), so
+            // the extent is the symbol's own -- no next-boundary inference.
+            std::uint64_t const size = c.declaredSize.value_or(0u);
+            if (size == 0u || !sliceInBounds(psec, c.sectionOffset, size)) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: defined symbol '" + c.name
+                    + "' range [" + std::to_string(c.sectionOffset) + ", +"
+                    + std::to_string(size) + ") exceeds its section '"
+                    + psec.name + "' -- cannot recover it as a body.");
+            }
+            // A TEXT section is the only place this can land: a DATA symbol with
+            // a non-zero size was already sliced by the `dk` arm above, and an
+            // unresolved-kind section is never staged. Asserted rather than
+            // assumed, so a future staging site cannot widen this quietly into
+            // fabricating a function out of data.
+            std::optional<SectionKind> const prk = resolveSectionKind(psec);
+            if (prk != SectionKind::Text) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "elf::readRelocatableObject: defined symbol '" + c.name
+                    + "' was recovered by atom-coverage geometry in section '"
+                    + psec.name + "', which is not a Text kind -- a data body "
+                    "must be sliced by its own st_size in the symbol loop, not "
+                    "recovered here. "
+                    "D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM.");
+            }
+            std::size_t const bodyOff =
+                static_cast<std::size_t>(psec.offset + c.sectionOffset);
+            AssembledFunction fn;
+            fn.symbol = SymbolId{symIdx};
+            fn.bytes.assign(bytes.begin() + bodyOff,
+                            bytes.begin() + bodyOff + static_cast<std::size_t>(size));
+            funcIntervalsBySec[static_cast<std::uint16_t>(c.sectionKey)].push_back(
+                Interval{c.sectionOffset, size, mod.functions.size()});
+            atomSymIdx.insert(symIdx);
+            mod.functions.push_back(std::move(fn));
+            // NO second ModuleSymbol: `pushModuleSym()` already recorded this
+            // symbol on the way through the loop above, and a duplicate name in
+            // `mod.symbols` is a duplicate definition to the cross-CU resolve.
         }
     }
 
@@ -769,12 +1019,16 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         if (!dk.has_value() || isZeroFill(*dk)) continue;  // a DECLARED DATA (not Text/Bss) kind
         if (rangeExceedsBuffer(sec.offset, sec.size, bytes.size())) continue;  // belt
         // Covered = the named data atoms already reconstructed for this section
-        // (a fresh sorted copy -- `emitGap` appends to the live map vector).
-        std::vector<Interval> covered;
-        if (auto it = dataIntervalsBySec.find(si); it != dataIntervalsBySec.end())
-            covered = it->second;
-        std::sort(covered.begin(), covered.end(),
-                  [](Interval const& a, Interval const& b) { return a.start < b.start; });
+        // (a fresh COPY -- `emitGap` appends to the live map vector, and the
+        // shared helper must never see the gaps it is in the middle of
+        // producing).
+        std::vector<link::format::ReconstructedAtomExtent> covered;
+        if (auto it = dataIntervalsBySec.find(si); it != dataIntervalsBySec.end()) {
+            for (auto const& iv : it->second) {
+                covered.push_back(link::format::ReconstructedAtomExtent{
+                    si, iv.start, iv.len});
+            }
+        }
         auto emitGap = [&](std::uint64_t gapStart, std::uint64_t gapEnd) {
             if (gapEnd <= gapStart) return;
             AssembledData di;
@@ -788,12 +1042,38 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 Interval{gapStart, gapEnd - gapStart, mod.dataItems.size()});
             mod.dataItems.push_back(std::move(di));
         };
-        std::uint64_t cursor = 0;
-        for (auto const& iv : covered) {
-            if (iv.start > cursor) emitGap(cursor, iv.start);
-            cursor = std::max(cursor, iv.start + iv.len);
+        // WHICH bytes are unowned is the shared question -- see
+        // `unownedByteRangesOfSection`. It used to be a cursor walk written
+        // here; COFF needed the identical answer, and two copies of one rule is
+        // one rule that can disagree with itself.
+        for (auto const& gap : link::format::unownedByteRangesOfSection(
+                 si, sec.size, covered)) {
+            emitGap(gap.start, gap.start + gap.len);
         }
-        if (cursor < sec.size) emitGap(cursor, sec.size);
+    }
+
+    // -- (6.6) Coverage guard: no defined symbol's body was dropped -------
+    //
+    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM. Placed
+    // AFTER the gap-atom pass, not before it: a `.LC` string literal owned by no
+    // symbol becomes an atom there, and asking the coverage question before that
+    // would judge the reconstruction half-finished. The check itself is shared
+    // and format-neutral -- see `link/format/object_atom_coverage.hpp`.
+    {
+        std::vector<link::format::ReconstructedAtomExtent> extents;
+        for (auto const* bySec : {&funcIntervalsBySec, &dataIntervalsBySec}) {
+            for (auto const& [secIdx, ivs] : *bySec) {
+                for (auto const& iv : ivs) {
+                    extents.push_back(link::format::ReconstructedAtomExtent{
+                        secIdx, iv.start, iv.len});
+                }
+            }
+        }
+        if (!link::format::everyDefinedSymbolIsCoveredByAnAtom(
+                bodilessDefined, extents, "elf::readRelocatableObject",
+                reporter)) {
+            return std::nullopt;
+        }
     }
 
     // -- (7) Reconstruct relocations from every SHT_RELA section -----
@@ -908,10 +1188,21 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // (SHN_ABS/COMMON) target is untouched. A `.text` section-relative
             // reference (a jump-table entry -> a case block inside a function)
             // resolves to the containing FUNCTION at an interior offset.
-            SymbolId     relTarget = SymbolId{symIdx};
+            //
+            // (6.44) FIRST: a target naming an ALIAS binds to the atom that owns
+            // the body, because only the owner is a declared definition -- an id
+            // that owns no body is `K_SymbolUndefined` at the linker's compound
+            // index. The addend needs no adjustment: an alias shares its owner's
+            // `st_value` exactly, so the same S makes the same address. (The
+            // section-relative redirect below would reach the same atom by a
+            // longer route, computing a residual that works out to the same
+            // number -- doing it by identity says what is meant and keeps the
+            // three readers' handling of one shape identical.)
+            std::uint32_t const targetSym = ownerOf(symIdx);
+            SymbolId     relTarget = SymbolId{targetSym};
             std::int64_t relAddend = nativeAddend;
-            if (!atomSymIdx.contains(symIdx)) {
-                Sym const& tsym = syms[symIdx];
+            if (!atomSymIdx.contains(targetSym)) {
+                Sym const& tsym = syms[targetSym];
                 bool const sectionDefined = tsym.shndx != kShnUndef
                                          && tsym.shndx < kShnLoReserve
                                          && tsym.shndx < eShnum;
@@ -984,13 +1275,22 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             if (patchesText) mod.functions[iv->outIdx].relocations.push_back(rel);
             else             mod.dataItems[iv->outIdx].relocations.push_back(rel);
 
-            // isData inference: an extern reached through a CALL/BRANCH-class
-            // reloc (x86_64 PLT32, aarch64 CALL26) is a FUNCTION -- force
+            // isData inference: an extern reached through one of the format's
+            // DECLARED call signals -- x86_64 PLT32 (`pltNativeId`), aarch64
+            // CALL26 (`"isCall": true`) -- is a FUNCTION, so force
             // isData=false. A plain data-address reloc (PC32/abs64/GOT) leaves
             // the symtab-type seed intact (NOTYPE defaults to data). This is
             // the fix for the old "any non-PLT reloc => data" rule that
             // misclassified an address-taken extern function and all aarch64
             // extern calls.
+            //
+            // ⓘ NO EMPTY-SET REFUSAL HERE, and the asymmetry with the Mach-O
+            // reader is a real difference rather than an oversight: ELF's
+            // st_info carries an INDEPENDENT class hint (STT_FUNC/STT_OBJECT),
+            // so an ELF format with no declared call signal still classifies
+            // every typed extern correctly and only leaves STT_NOTYPE on its
+            // DATA seed. Mach-O's nlist_64 has no such field, which is why
+            // there the missing declaration is unrecoverable.
             if (auto ex = externBySym.find(symIdx); ex != externBySym.end()) {
                 if (callSignalNativeIds.contains(rType)) {
                     mod.externImports[ex->second].isData = false;

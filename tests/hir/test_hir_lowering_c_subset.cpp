@@ -6821,6 +6821,7 @@ TEST(HirLoweringCSubset, DeepNestedSwitchAnalyzesFlatOnNormalStack) {
         analyze(cu, DiagnosticBudget::libraryDefault(),
                 DataModel::Lp64, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, LongDoubleFormat::None,
+                /*target=*/nullptr,   // inline-asm P5: no asm here, no target needed
                 /*deepRecursionReserveBytes=*/kAnalyzeReserveBytes);
     EXPECT_FALSE(model.hasErrors())
         << "deep nested-switch analysis must complete cleanly on a bounded stack "

@@ -1,0 +1,79 @@
+{
+  "$comment": "D-LK-MACHO-ISDATA-NO-CALL-SIGNAL -- the corpus witness that an ARCHIVE MEMBER MAY CALL A LIBRARY FUNCTION, on FIVE legs including the one where it could not. THE SUBJECT IS THE `puts` CALL INSIDE `libcall.c`, not the archive pull: `staticlib_resolve_roundtrip` and `staticlib_file_local_atoms` already cover the pull and the file-local-atom half, and BOTH of their members are self-contained -- no member in the corpus called out of its own translation unit until this one. That gap is exactly where the defect lived. A relocatable object records an undefined symbol as a NAME and nothing else; Mach-O's nlist_64 has no STT_FUNC-style type hint, so the only thing that can tell an undefined `_puts` from an undefined `_environ` is the RELOCATION that reaches it. The reader used to read that off the TARGET row's arithmetic FORMULA, which is branch-specific on aarch64 only by accident (that CPU's branch has its own instruction encoding) and carries no role at all on x86_64, where `S + A - P` is the identical arithmetic for a call and for a PC-relative data reference. ✔MEASURED 2026-08-20 through the shipped CLI, BEFORE the reader changed: `--target x86_64:macho64-x86_64-darwin-staticlib` built the archive rc=0, and resolving it into a client rc=1 with `error[F_UnsupportedBinaryFormat] macho::readRelocatableObject: extern '_puts' is reached by a relocation, but Mach-O format 'macho64-x86_64-darwin' declares no call-branch-formula relocation`; the arm64 sibling compiled the identical two sources rc=0 twice. macho64-x86_64 therefore had NO WORKING STATIC-LIBRARY PATH AT ALL, and no corpus entry could see it. AFTER the fix the role is READ from the format row's `\"isCall\": true` declaration instead of inferred, and all five legs build. ✔MEASURED 2026-08-20 (shipped CLI, Windows host, both configurations): the `-staticlib` build and the `--resolve-library` exec link return rc=0 on pe64-x86_64, elf64-x86_64, elf64-aarch64, macho64-arm64 AND macho64-x86_64, and the pe64 executable runs `member` / exit 42 at debug and at release. Leg-by-leg RUN results are NOT recorded here -- whoever runs the legs writes them. WHY `expectedStdout` AND NOT ONLY THE EXIT CODE: 42 comes from `dss_lib_step`, which is DSS's own code and would still be 42 if the library call had been dropped on the floor. The printed line is the only assertion that the EXTERN CALL -- the thing this example exists for -- actually reached libc. RED-ON-DISABLE (INFERRED from the measurement above, not run as a mutant here): delete the `puts` call and the member has no undefined symbol at all, so the classification is never asked for and this example goes green against a reader that still guesses -- which is why the call is described in `libcall.c` as the test. THE `release` ARM: `dss_lib_step` carries a loop-carried accumulator and is deliberately NOT `static`, because at `--config=release` a file-local helper is inlined and DCE'd out of the archive entirely and this example's subject must survive BOTH configurations; `main.c` is deliberately thin (one extern declaration, one call, no locals, no arithmetic) so it offers the pipeline nothing of its own and the arm's difference is attributable to the MEMBER. SAFE TO ARM `mustDifferFromBaseline` ON EVERY DEPENDENCY, MEASURED BYTE-WISE (not by size) on this host: pe64-x86_64 862 -> 958, elf64-x86_64 1744 -> 1872, elf64-aarch64 1672 -> 1760, macho64-arm64 878 -> 950, macho64-x86_64 974 -> 1070 -- all five DIFFER, so no armed entry is a guaranteed red. Do not re-quote those byte counts as a pin: a COFF archive embeds the source stem, so the pe64 figure moves if the file is renamed; what is asserted is the DIFFERENCE, never the size.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "member\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "expectedStdout": "member\r\n",
+      "dependsOn": [
+        {
+          "sources": ["libcall.c"],
+          "spec": "x86_64:pe64-x86_64-windows-staticlib",
+          "artifact": "libcall.lib",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "dependsOn": [
+        {
+          "sources": ["libcall.c"],
+          "spec": "x86_64:elf64-x86_64-linux-staticlib",
+          "artifact": "libcall.a",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "dependsOn": [
+        {
+          "sources": ["libcall.c"],
+          "spec": "arm64:elf64-aarch64-linux-staticlib",
+          "artifact": "libcall.a",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "dependsOn": [
+        {
+          "sources": ["libcall.c"],
+          "spec": "arm64:macho64-arm64-darwin-staticlib",
+          "artifact": "libcall.a",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "dependsOn": [
+        {
+          "sources": ["libcall.c"],
+          "spec": "x86_64:macho64-x86_64-darwin-staticlib",
+          "artifact": "libcall.a",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

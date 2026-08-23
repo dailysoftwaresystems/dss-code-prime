@@ -1,5 +1,6 @@
 add_library(mir OBJECT
     mir.cpp
+    mir_asm_descriptor.cpp
     mir_dom.cpp
     mir_literal_pool.cpp
     mir_struct_markers.cpp

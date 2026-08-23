@@ -68,11 +68,20 @@
  *
  * RED-on-disable: remove the `__asm__` keyword / asmStmt rule (asm.lang.json) -> P0001
  * (`__asm__` lexes as an identifier again); remove any boundary rule from the tail
- * chain -> the corresponding line below becomes a parse error; a non-empty template
- * here -> S0057 (S_InlineAsmNonEmptyTemplate); putting a real OPERAND in any section
- * below -> S0062 (S_InlineAsmExtendedUnsupported). The barrier being DROPPED
- * (asmStmt mapped to Skip) is invisible to this exit-code test — that is pinned at
- * the MIR tier instead.
+ * chain -> the corresponding line below becomes a parse error. The barrier being
+ * DROPPED (asmStmt mapped to Skip) is invisible to this exit-code test — that is
+ * pinned at the MIR tier instead.
+ *
+ * ⚠ CORRECTED 2026-08-15. This list used to end with two more recipes — "a non-empty
+ * template here -> S0057" and "putting a real OPERAND in any section below -> S0062"
+ * — and inline-asm P5 closed BOTH, so they were deleted rather than left to rot. A
+ * non-empty template is now parsed by the target's own assembly dialect and lowered
+ * to real instructions; a real operand is captured, resolved against the target's
+ * register table and expanded. Neither diagnostic fires here any more, and a
+ * red-on-disable recipe that no longer reds is worse than none: it reads as coverage.
+ * What this example pins — the EMPTY template as an optimizer barrier, in every
+ * spelling — is unchanged. The extended form is witnessed by the sibling
+ * `c_inline_asm_extended`, which is red when the expansion has not happened.
  */
 
 static int g;

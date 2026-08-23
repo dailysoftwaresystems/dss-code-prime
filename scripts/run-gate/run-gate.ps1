@@ -1,0 +1,245 @@
+<#
+.SYNOPSIS
+    Run a gate command and REFUSE to report success without evidence it ran.
+
+.DESCRIPTION
+    PowerShell sibling of scripts/run-gate/run-gate.sh. Same contract, same exit codes.
+
+    ★★★ WHY THIS EXISTS: a gate reporting exit 0 that never executed has now
+    happened THREE times in this project's record, each by a different
+    mechanism and each caught only by a human reading the log:
+      1. a test suite printing `failed=0` while exiting 2 (weeks undetected);
+      2. a probe whose rc was read AFTER a pipe, reporting the pipe's status;
+      3. a `cd build-dbg && ctest ...` chain piped through tee/tail and
+         followed by an echo of PIPESTATUS -- the `cd` failed (the shell was
+         already there), no test ran, and the TRAILING echo succeeded, so the
+         whole chain exited 0.
+    Vigilance is the wrong mechanism for a recurring failure: occurrences (1)
+    and (2) each produced a resolution to be careful, and (3) happened anyway.
+
+    ★★ THE CONTRACT, BOTH HALVES LOAD-BEARING:
+      * rc is captured DIRECTLY from the command -- never after a pipe, never
+        from a following statement;
+      * rc == 0 is NOT sufficient. The output must ALSO match a caller-supplied
+        success witness. A command exiting 0 without producing evidence of work
+        is indistinguishable from one that never ran, so it is a FAILURE.
+
+    ⚠ WHY THIS SCRIPT REDIRECTS WITH `*>` RATHER THAN PIPING TO Out-File:
+    piping a native command's output would put a pipeline between the command
+    and the `$LASTEXITCODE` read -- which is occurrence (2) exactly, rebuilt
+    inside the tool written to prevent it. The redirection operator keeps the
+    native command last, so the exit code that is read is the one that matters.
+
+    ⚠ AND WHY IT IS A SIBLING AT ALL: this project ships every tool as a
+    .sh/.ps1 PAIR (check-anchor-registry, check-line-endings, check-orphan-tests,
+    ssh-arm64-vps, ssh-macos). A pair where only one side exists is a silent
+    harness bug of the same family the pair discipline exists to prevent -- the
+    Windows host is where this project's primary ctest leg runs, so a bash-only
+    gate wrapper is a gate wrapper that the main gate cannot use.
+
+.PARAMETER LogPath
+    File to receive the command's combined output. TRUNCATED, never appended --
+    a stale log is itself a way to "find" a witness this run never produced.
+
+.PARAMETER SuccessPattern
+    Regex that MUST appear in the output, e.g. '100% tests passed'.
+
+.PARAMETER Command
+    The executable to run.
+
+.PARAMETER CommandArgs
+    Remaining arguments, passed through verbatim.
+
+.EXAMPLE
+    scripts/run-gate/run-gate.ps1 build/ctest.log '100% tests passed' ctest --test-dir build/dbg --output-on-failure
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true, Position = 0)][string]$LogPath,
+    [Parameter(Mandatory = $true, Position = 1)][string]$SuccessPattern,
+    [Parameter(Mandatory = $true, Position = 2)][string]$Command,
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$CommandArgs
+)
+
+$ErrorActionPreference = 'Continue'
+
+# ── WHICH SHELL IS ACTUALLY RUNNING THIS, NAMED IN EVERY REFUSAL ────────────
+#
+# ★★ A GATE THAT REFUSES MUST SAY WHICH REFUSAL IT IS -- the mirror of the same
+# block in run-gate.sh, added in the same commit for the same reason.
+#
+# ✔MEASURED 2026-08-20, and the .ps1 half was the WORSE of the two: given a
+# command it cannot resolve, `& $Command` raises a TERMINATING error, so this
+# script died before its own footer, left a ZERO-BYTE log, printed a raw
+# PowerShell "is not recognized as a name of a cmdlet" on the caller's console
+# instead of into the log, and exited **1** -- the exit code this wrapper
+# reserves for "ran, but produced no witness". The .sh twin reports the same
+# condition as **127**. Same input, two different exit codes and one of them
+# actively misleading: that is precisely the divergence class this project keeps
+# paying for, inside the tool written to make gates trustworthy.
+#
+# ⇒ The command is RESOLVED FIRST, the refusal is written into the LOG as well
+# as to the console, and it exits 127 -- the .sh's number for "not found".
+#
+# ⓘ THIS NAMES, IT DOES NOT TRANSLATE. Rewriting a path into the other shell's
+# spelling would make this file a second path canonicaliser; see
+# scripts/check-path-identity. The refusal stands, it just stops being anonymous.
+# ⚠ THE POWERSHELL IDENTITY LEADS, THE HOST PROCESS TRAILS, and that order is a
+# measurement rather than a preference: ✔MEASURED 2026-08-20, the running
+# process path for pwsh 7.5.2 on this box is `C:\Program Files\dotnet\dotnet.exe`
+# (pwsh is a dotnet-hosted app), so a refusal that led with the process path
+# named something that is not a shell at all. `$PSHOME` is the one value that
+# always points at the PowerShell that is actually executing this file.
+function Get-RunGateShellIdentity {
+    $exe = try { [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
+           catch { '<unknown host process>' }
+    $plat = if ($PSVersionTable.Platform) { $PSVersionTable.Platform } else { 'Win32NT (Windows PowerShell)' }
+    return "PowerShell $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition) on $plat (PSHOME: $PSHOME; host process: $exe)"
+}
+# A path handed to this shell that begins with a POSIX root or a WSL mount --
+# reported, not repaired. Windows PowerShell cannot open '/mnt/c/...' any more
+# than a WSL bash can open 'C:\...'; it is the same defect seen from the other
+# side, which is why the twins carry the same check with the shapes swapped.
+function Test-RunGateForeignPath([string]$p) {
+    return ($p -match '^/')
+}
+
+# Truncate up front (see LogPath above).
+try {
+    Set-Content -LiteralPath $LogPath -Value $null -NoNewline -ErrorAction Stop
+} catch {
+    Write-Host "run-gate.ps1: FAIL - cannot create the log '$LogPath', so nothing was run."
+    Write-Host "  This refusal is about the LOG PATH, not about the gate command."
+    Write-Host "  shell   : $(Get-RunGateShellIdentity)"
+    Write-Host "  script  : $PSCommandPath"
+    Write-Host "  cwd     : $((Get-Location).Path)"
+    if (Test-RunGateForeignPath $LogPath) {
+        Write-Host "  [!] that log path is POSIX-ROOTED ('/...'), and the shell named above is the one"
+        Write-Host "      that has to open it. A Windows PowerShell has no '/mnt/c' and no '/tmp'; that"
+        Write-Host "      spelling belongs to a WSL/Linux shell. Hand this script a path THIS shell can"
+        Write-Host "      see; a repo-relative path works from either side."
+        Write-Host "      This script deliberately does NOT rewrite the path for you: one canonicaliser,"
+        Write-Host "      see scripts/check-path-identity."
+    } else {
+        Write-Host "  Check that the parent directory exists and is writable by this shell."
+    }
+    Write-Host "  reason  : $($_.Exception.Message)"
+    exit 2
+}
+
+if ($null -eq $CommandArgs) { $CommandArgs = @() }
+
+# ── DEFAULT TEST PARALLELISM (mirror of run-gate.sh; see the reasoning there) ──
+# This wrapper runs an ARBITRARY command, so it sets ctest's own env channel
+# rather than splicing `-j 8` into a caller's argv. An explicit `-j` still wins.
+# ✔MEASURED 2026-08-19 (ctest 4.3.2, 16C/32T), six example tests: no level
+# 9741 ms; CTEST_PARALLEL_LEVEL=8 2648 ms; explicit -j 8 2446 ms; env 8 with
+# -j 1 9669 ms. 8 rather than all cores is an operator instruction: the Windows
+# and WSL gate legs run concurrently here by design.
+# ★★ SCOPED TO THE CHILD, AND THE try/finally IS THE WHOLE POINT. A .ps1 runs
+# IN-PROCESS, so a bare assignment here outlives this script and every later
+# hand-run ctest in the caller's shell would be silently 8-way parallel with
+# nothing on screen saying so -- while the .sh twin's `export` dies with its own
+# process. ✔MEASURED by audit: the caller's CTEST_PARALLEL_LEVEL read empty
+# before the call and 8 after it. The twins' headers claim "same contract"; for
+# the environment that was false until this block.
+$__cplPrev = $env:CTEST_PARALLEL_LEVEL
+$__cplSet  = $false
+if (-not $env:CTEST_PARALLEL_LEVEL) {
+    $env:CTEST_PARALLEL_LEVEL = '8'
+    $__cplSet = $true
+}
+function Restore-CplDefault {
+    if ($script:__cplSet) {
+        if ($null -eq $script:__cplPrev) {
+            Remove-Item Env:\CTEST_PARALLEL_LEVEL -ErrorAction SilentlyContinue
+        } else {
+            $env:CTEST_PARALLEL_LEVEL = $script:__cplPrev
+        }
+        $script:__cplSet = $false
+    }
+}
+trap { Restore-CplDefault; break }
+
+# ★ RESOLVE argv[0] BEFORE RUNNING IT, so "not found" is its own named refusal
+# with the .sh's exit code and not a raw PowerShell error over an empty log.
+# See Get-RunGateShellIdentity above for the measurement. `Get-Command` resolves
+# an application, a cmdlet, a function and an explicit path alike, so this
+# rejects nothing the `&` below would have accepted.
+$resolved = Get-Command -Name $Command -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+if (-not $resolved) {
+    $notFound = @(
+        "run-gate.ps1: FAIL - the gate command was NOT FOUND, so it never ran (rc=127).",
+        "  command : $Command $($CommandArgs -join ' ')",
+        "  shell   : $(Get-RunGateShellIdentity)",
+        "  This is NOT 'the gate failed' and NOT 'the witness was missing' - the shell named",
+        "  above could not resolve argv[0] on ITS OWN PATH. 127 is the number run-gate.sh",
+        "  reports for the same condition; the twins must not disagree about an exit code.",
+        "  (log: $LogPath)"
+    )
+    # INTO THE LOG TOO. An empty log is the one artefact a reader cannot learn
+    # anything from, and it is what this arm used to leave behind.
+    Add-Content -LiteralPath $LogPath -Value ($notFound -join [Environment]::NewLine)
+    Restore-CplDefault
+    foreach ($l in $notFound) { Write-Host $l }
+    exit 127
+}
+
+# Redirect ALL streams to the log with `*>` so the native command stays last
+# and $LASTEXITCODE is its own, not a pipeline's.
+try {
+    & $Command @CommandArgs *> $LogPath
+    $rc = $LASTEXITCODE
+} finally {
+    Restore-CplDefault
+}
+if ($null -eq $rc) {
+    # A non-native command (cmdlet/function) leaves $LASTEXITCODE unset. Treat
+    # "no exit code at all" as absence of evidence, not as success.
+    $rc = 0
+}
+
+Add-Content -LiteralPath $LogPath -Value @"
+--- run-gate.ps1 ---
+command : $Command $($CommandArgs -join ' ')
+rc      : $rc
+"@
+
+function Show-Tail {
+    if (Test-Path -LiteralPath $LogPath) {
+        Get-Content -LiteralPath $LogPath -Tail 20 | ForEach-Object { Write-Host $_ }
+    }
+}
+
+if ($rc -eq 127) {
+    # The command WAS resolved above, so this 127 is the child's own -- which is
+    # the one thing the .sh twin cannot tell you, because a POSIX shell reserves
+    # 127 for "not found". Saying which it is here is not a divergence from the
+    # twin; it is the extra fact this side actually has.
+    Write-Host "run-gate.ps1: FAIL - the gate command exited 127 (log: $LogPath)."
+    Write-Host "  command : $Command $($CommandArgs -join ' ')"
+    Write-Host "  resolved: $(if ($resolved.Source) { $resolved.Source } else { $resolved.Name })"
+    Write-Host "  It was FOUND and it RAN - 127 is its own exit code here, not 'command not found'"
+    Write-Host "  (which this wrapper reports before starting anything, with the same 127)."
+    Show-Tail
+    exit $rc
+}
+
+if ($rc -ne 0) {
+    Write-Host "run-gate.ps1: FAIL - command exited $rc (log: $LogPath)"
+    Show-Tail
+    exit $rc
+}
+
+if (-not (Select-String -LiteralPath $LogPath -Pattern $SuccessPattern -Quiet)) {
+    Write-Host "run-gate.ps1: FAIL - command exited 0 but its output never matched the"
+    Write-Host "  success witness /$SuccessPattern/, so there is NO EVIDENCE it did any work."
+    Write-Host "  An exit code alone cannot distinguish 'passed' from 'never ran'."
+    Write-Host "  (log: $LogPath)"
+    Show-Tail
+    exit 1
+}
+
+Write-Host "run-gate.ps1: OK - rc=0 and the success witness /$SuccessPattern/ was present."
+exit 0

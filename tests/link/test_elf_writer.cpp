@@ -47,6 +47,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -270,6 +271,92 @@ TEST(ElfWriter, SymtabLocalDefinedFunctionLandsBeforeFirstNonLocal) {
     EXPECT_EQ(readU32LE(bytes, symtabShdr + 40), 4u);
     // sh_entsize = 24 (Elf64_Sym).
     EXPECT_EQ(readU64LE(bytes, symtabShdr + 56), 24u);
+}
+
+// ── D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB ─────────
+//
+// Since equal-offset defined symbols collapse to ONE atom with several names
+// (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS), `module.symbols` can
+// carry several rows for one `SymbolId`. `definedName`/`definedBinding` are
+// first-row-wins by design, so every later row used to be DROPPED from a
+// re-emitted object: DSS read a `.o` carrying two names and wrote one back.
+//
+// This is the shape gcc emits for `__attribute__((weak, alias("strong_fn")))`
+// — ✔MEASURED 2026-08-20 with gcc 13 on WSL: `.symtab` carries `strong_fn`
+// FUNC GLOBAL and `weak_alias` FUNC WEAK, both at st_value 0 with st_size 15.
+//
+// RED-ON-DISABLE: drop the alias pass → nsyms falls by one and `weak_alias`
+// is absent.
+TEST(ElfWriter, ObjectSymtabCarriesEveryAliasNameWithItsOwnBinding) {
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{10};
+    f.bytes  = {0x90, 0x90, 0xC3};
+    mod.functions.push_back(std::move(f));
+    // TWO rows for ONE SymbolId: the canonical (first row) and a WEAK alias.
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "strongfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "weakalias",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    std::uint64_t const shoff     = readU64LE(bytes, 40);
+    std::uint64_t const symtabShdr = shoff + 3 * 64;
+    std::uint64_t const symtabOff = readU64LE(bytes, symtabShdr + 24);
+    std::uint64_t const symtabSz  = readU64LE(bytes, symtabShdr + 32);
+    std::uint64_t const strtabOff =
+        readU64LE(bytes, shoff + 4 * 64 + 24);
+    ASSERT_EQ(symtabSz % 24u, 0u);
+    std::size_t const nsyms = static_cast<std::size_t>(symtabSz / 24u);
+
+    auto nameAt = [&](std::size_t i) {
+        std::uint32_t const nameOff =
+            readU32LE(bytes, symtabOff + i * 24);
+        std::string out;
+        for (std::size_t k = strtabOff + nameOff; bytes[k] != 0; ++k) {
+            out.push_back(static_cast<char>(bytes[k]));
+        }
+        return out;
+    };
+    std::optional<std::size_t> canonIdx;
+    std::optional<std::size_t> aliasIdx;
+    for (std::size_t i = 0; i < nsyms; ++i) {
+        if (nameAt(i) == "strongfn")  canonIdx = i;
+        if (nameAt(i) == "weakalias") aliasIdx = i;
+    }
+    ASSERT_TRUE(canonIdx.has_value());
+    ASSERT_TRUE(aliasIdx.has_value())
+        << "the alias NAME must reach the re-emitted .symtab - dropping it is "
+           "the defect this anchor names";
+
+    std::size_t const cOff = symtabOff + *canonIdx * 24;
+    std::size_t const aOff = symtabOff + *aliasIdx * 24;
+    // st_info: high nibble = binding, low = type. GLOBAL|FUNC = 0x12,
+    // WEAK|FUNC = 0x22.
+    EXPECT_EQ(bytes[cOff + 4], 0x12u) << "canonical stays GLOBAL FUNC";
+    EXPECT_EQ(bytes[aOff + 4], 0x22u)
+        << "the alias carries ITS OWN binding (WEAK), not the canonical's - "
+           "ELF says this per SYMBOL in st_info";
+    EXPECT_EQ(readU16LE(bytes, cOff + 6), readU16LE(bytes, aOff + 6))
+        << "same section";
+    EXPECT_EQ(readU64LE(bytes, cOff + 8), readU64LE(bytes, aOff + 8))
+        << "both names must resolve to ONE address";
+    EXPECT_EQ(readU64LE(bytes, cOff + 16), readU64LE(bytes, aOff + 16))
+        << "and to one extent - a zero-size alias invites a dead-strip";
+
+    // sh_info must still name the first non-LOCAL symbol. The alias is Weak,
+    // hence non-local, hence AFTER the snapshot: UNDEF + STT_SECTION = 2.
+    EXPECT_EQ(readU32LE(bytes, symtabShdr + 44), 2u)
+        << "an alias must not be emitted before sh_info is snapshotted, or the "
+           "section header lies about where the locals end";
+    EXPECT_GE(*aliasIdx, 2u);
 }
 
 // ── Function symbol carries the correct st_value ────────────────

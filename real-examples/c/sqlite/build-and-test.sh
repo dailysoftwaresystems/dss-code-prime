@@ -58,10 +58,18 @@
 #      headers — whatever version it has — + zlib, NO descriptor — D-FFI-SHIPPED-
 #      LIBS-OS-ONLY; portable C, shared by EVERY leg) and resolve EACH LEG'S OWN
 #      (tcl, z) library pair from the provider its catalogue entry declares
-#      (`host-system` | `ubuntu-ports-arm64` | `search-paths` | `pinned-archive`).
+#      (the closed set `harness_legs.py --library-providers` prints — this header
+#      does NOT re-type it, and the resolution loop's refusal does not either;
+#      which provider each leg declares is read from $LEG_CATALOGUE, not from
+#      here. A list copied into a comment is a list that drifts, and this one
+#      already had: it advertised `ubuntu-ports-arm64` for ten days after the
+#      resolver stopped accepting the name).
 #      A leg whose pair cannot be resolved on this machine records
 #      `skipped-build-input-missing` NAMING what was searched — the run continues,
-#      and the other legs are unaffected. `pinned-archive` is the GENERAL form:
+#      and the other legs are unaffected. A leg declaring a provider NO driver
+#      implements is a different fact and gets a different verdict: `poisoned`,
+#      the closed vocabulary's FAILURE class, per leg, run continues, exit != 0.
+#      `pinned-archive` is the GENERAL form:
 #      the leg declares digest-pinned third-party archives and the members to take,
 #      harness_legs.py `--acquire` fetches/verifies/extracts/slices them once for
 #      both drivers, and Step 7 stages the result BESIDE the artefact because such
@@ -108,8 +116,9 @@
 # Overridable via env: DSS_REPO_URL SQLITE_REPO_URL SRC_DIR SQLITE_DIR OUT_DIR
 #                      JOBS  DSS_TIER  DSS_LEGS  DSS_CONFOUNDS  DSS_TIER_EXCLUDES
 #                      DSS_MAX_RESUMES  DSS_SEGMENT_STALL  DSS_SEGMENT_TIMEOUT
-#                      ARM64_LIBDIR  DSS_TCL_VERSION  DSS_STRICT_ARM_VERDICTS
+#                      DSS_TCL_VERSION  DSS_STRICT_ARM_VERDICTS
 #                      DSS_BRANCH  DSS_COMMIT  DSS_ALLOW_FRESH_CLONE
+#                      DSS_ALLOW_NONRELEASE_COMPILER
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
@@ -333,6 +342,14 @@ DSS_KILL_SETTLE="${DSS_KILL_SETTLE:-20}"
 # Parsed and VALIDATED at Step 1 (cheap) rather than at Step 9 (hours later) —
 # an unreadable gate setting must stop the run before it costs anything.
 DSS_STRICT_ARM_VERDICTS="${DSS_STRICT_ARM_VERDICTS:-}"
+# DSS_ALLOW_NONRELEASE_COMPILER: proceed with a dss-code-prime whose own tree does
+# NOT say Release, instead of refusing at Step 5. It silences nothing — the run
+# then states the actual build type on the Step-5 banner and again in the Step-9
+# verdict, so a log from such a run cannot later be quoted as a controlled
+# measurement. PARITY with build-and-test.ps1, where the same variable governs the
+# same gate; see Step 5 for the defect that put a gate there at all.
+# Same three-state parse and the same Step-1 validation as the variable above.
+DSS_ALLOW_NONRELEASE_COMPILER="${DSS_ALLOW_NONRELEASE_COMPILER:-}"
 
 # ── host identification (OS + arch) ──────────────────────────────────────────
 # ★ IDENTITY ONLY. These two variables answer "what machine am I standing on",
@@ -379,7 +396,8 @@ esac
 # resolver (its names are a contract — see `emit_sh` in harness_legs.py); the
 # second is filled by this driver as the run proceeds.
 declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
-           LEG_RUN_MODE=() LEG_RUN_VERDICT=() LEG_RUN_DETAIL=() \
+           LEG_RUN_MODE=() LEG_RUN_FIDELITY=() LEG_RUN_SAME_ISA=() \
+           LEG_RUN_VERDICT=() LEG_RUN_DETAIL=() \
            LEG_LAUNCH=() LEG_LAUNCH_ENV=() \
            LEG_PATH_TRANSLATION=() LEG_PATH_TRANSLATOR=() LEG_ENV_TRANSFER=() \
            LEG_RUN_FILESYSTEM=() LEG_CONFOUNDS=() LEG_ABORT_CONFOUNDS=() \
@@ -673,7 +691,56 @@ git_tree_divergence() {         # git_tree_divergence <dir> -> N | "" when uncom
   # collapsing them would report an unmeasurable tree as pristine.
   [[ -n "$out" ]] || { printf '0'; return 0; }
   local -a lines=(); mapfile -t lines <<< "$out"
-  printf '%d' "${#lines[@]}"
+  local raw="${#lines[@]}"
+  # D-HARNESS-DIVERGENCE-COUNT-INFLATED-BY-CRLF: the raw count OVERSTATED divergence
+  # by ~40x on a Windows→Linux synced tree (✔MEASURED on the VPS: "2420 file(s)
+  # differ" against a true modified set of ~60; of the first 60, 24 were CR-only).
+  # A Windows working tree carries CRLF and no autocrlf normalization applies on the
+  # Linux side, so `status --porcelain` reports every synced file as modified.
+  # ★ WHY IT IS NOT COSMETIC: this warning exists to stop someone attributing a
+  # result to a commit it was not built from. A figure wrong by 40x trains the reader
+  # to ignore it, which disables the warning exactly when it is telling the truth.
+  # ⛔ NOT fixed by lowering the severity — the severity is right, the arithmetic was
+  # wrong. TRACKED files are re-counted ignoring a CR at end-of-line; UNTRACKED files
+  # are counted as-is, because a source file a stale HEAD never knew about is real
+  # divergence and is precisely what the rsync gate leaves behind.
+  # ⚠ The porcelain listing stays the ENUMERATION. Only the TRACKED-modification
+  # lines are re-tested; untracked entries are passed through exactly as `status`
+  # reported them. Rebuilding the whole count from `diff` + `ls-files` was tried and
+  # REJECTED: `status` reports an untracked DIRECTORY as one entry while `ls-files`
+  # expands it to every file inside, so that version changed the figure on trees with
+  # no CRLF at all (✔MEASURED on this repo: 210 → 214). A fix for a Windows→Linux
+  # artefact must be INERT on every other tree, or it is a second defect.
+  local semantic_tracked=""
+  semantic_tracked="$(git -C "$1" --no-optional-locks diff --ignore-cr-at-eol --name-only HEAD 2>/dev/null)" \
+    || semantic_tracked="$(git -C "$1" diff --ignore-cr-at-eol --name-only HEAD 2>/dev/null)" \
+    || { printf '%d' "$raw"; return 0; }
+  local semantic=0 line="" path="" xy=""
+  for line in "${lines[@]}"; do
+    [[ -n "$line" ]] || continue
+    xy="${line:0:2}"
+    path="${line:3}"
+    if [[ "$xy" == '??' ]]; then
+      semantic=$(( semantic + 1 ))          # untracked: real divergence, always counted
+      continue
+    fi
+    # A rename reads `R  old -> new`; the destination is what a CR test can match.
+    [[ "$path" != *' -> '* ]] || path="${path##* -> }"
+    path="${path%\"}"; path="${path#\"}"
+    if printf '%s\n' "$semantic_tracked" | grep -qxF -- "$path"; then
+      semantic=$(( semantic + 1 ))
+    fi
+  done
+  # ⚠ The excluded count is written to a FILE, not to a global: every caller invokes
+  # this inside `$( )`, which is a SUBSHELL, so an assignment here would be discarded
+  # and the note would silently read zero — a fix that reports "0 excluded" while
+  # excluding 2360 is worse than the inflated count it replaced. The path is optional;
+  # a caller that does not set it simply gets no side-channel.
+  if [[ -n "${GIT_TREE_DIVERGENCE_CRONLY_FILE:-}" ]]; then
+    printf '%d' "$(( raw > semantic ? raw - semantic : 0 ))" \
+      > "$GIT_TREE_DIVERGENCE_CRONLY_FILE" 2>/dev/null || true
+  fi
+  printf '%d' "$semantic"
 }
 dir_has_entries() {             # dir_has_entries <dir> -> true if it holds ANY entry
   # Shape (c) of the anchor: a populated directory that is NOT a checkout — exactly
@@ -692,15 +759,29 @@ dir_has_entries() {             # dir_has_entries <dir> -> true if it holds ANY 
 # the `status` walk (which re-hashes every file whose mtime the rsync changed) is
 # paid once, up front, instead of at the end of a multi-hour run.
 SRC_HEAD=""; SRC_HEAD_LONG=""; SRC_BRANCH=""; SRC_DIVERGE=""; SRC_DIVERGE_NOTE=""
+GIT_TREE_DIVERGENCE_CRONLY=0
 read_src_provenance() {         # read_src_provenance <dir>
   SRC_HEAD="$(git_head_short "$1")"
   SRC_HEAD_LONG="$(git -C "$1" rev-parse HEAD 2>/dev/null)" || SRC_HEAD_LONG=""
   SRC_BRANCH="$(git_head_branch "$1")"
+  GIT_TREE_DIVERGENCE_CRONLY=0
+  GIT_TREE_DIVERGENCE_CRONLY_FILE="$(mktemp 2>/dev/null || printf '')"
   SRC_DIVERGE="$(git_tree_divergence "$1")"
+  if [[ -n "$GIT_TREE_DIVERGENCE_CRONLY_FILE" && -s "$GIT_TREE_DIVERGENCE_CRONLY_FILE" ]]; then
+    GIT_TREE_DIVERGENCE_CRONLY="$(cat "$GIT_TREE_DIVERGENCE_CRONLY_FILE" 2>/dev/null || printf '0')"
+  fi
+  [[ -z "$GIT_TREE_DIVERGENCE_CRONLY_FILE" ]] || rm -f "$GIT_TREE_DIVERGENCE_CRONLY_FILE"
+  GIT_TREE_DIVERGENCE_CRONLY_FILE=""
+  local cr_note=""
+  # Stated explicitly, per the row: a reader comparing this against a raw
+  # `git status` must be told why the two disagree, or the smaller number reads as
+  # a bug in the harness rather than as the more honest figure.
+  [[ "${GIT_TREE_DIVERGENCE_CRONLY:-0}" == "0" ]] \
+    || cr_note="; $GIT_TREE_DIVERGENCE_CRONLY CR-only difference(s) excluded as non-semantic"
   if [[ -z "$SRC_DIVERGE" ]]; then
     SRC_DIVERGE_NOTE=" (divergence from HEAD UNVERIFIED — git status failed in $1)"
   elif [[ "$SRC_DIVERGE" != "0" ]]; then
-    SRC_DIVERGE_NOTE=" (+$SRC_DIVERGE file(s) differ from HEAD — the sources built are NOT exactly this commit)"
+    SRC_DIVERGE_NOTE=" (+$SRC_DIVERGE file(s) differ from HEAD — the sources built are NOT exactly this commit$cr_note)"
   else
     SRC_DIVERGE_NOTE=""
   fi
@@ -1298,7 +1379,68 @@ if [[ -n "${DSS_LEGS:-}" ]]; then
     done
   fi
 fi
+
+# >>> dss:run-fidelity-select >>>
+# DSS_RUN_FIDELITY: restrict this run to legs whose artefact executes at a given
+# FIDELITY. [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+#
+# ★ WHY THIS IS NOT DSS_LEGS WITH EXTRA STEPS. `DSS_LEGS=elf64-arm64` names a
+# LEG; the operator then has to know, per host, whether that leg reaches real
+# hardware here — which is exactly the host-keyed reasoning this harness exists to
+# remove from operators' heads. `DSS_RUN_FIDELITY=native,foreign-kernel` names the
+# EVIDENCE wanted and lets the resolver work out which legs supply it on THIS box,
+# so the same command means the same thing on the Mac, the VPS and this desktop.
+#
+# ★★ IT SELECTS THE RUN, NEVER THE BUILD. "CAN THIS HOST BUILD TARGET T" is always
+# yes and is not a host question (this module's header); only execution is
+# host-limited. A deselected leg is therefore still BUILT and still reported — it
+# is ledgered `not-selected-by-runner`, the same class DSS_LEGS uses, with a detail
+# naming the fidelity it actually has. Silence about a leg is a harness bug.
+#
+# ⚠ VALIDATED HERE, AT THE DOOR, not at first use: a typo'd fidelity would
+# otherwise match nothing and silently run zero legs, which reads exactly like a
+# host that can execute nothing.
+if [[ -n "${DSS_RUN_FIDELITY:-}" ]]; then
+  _fid_known="$(python3 "$LEG_RESOLVER" --run-fidelities)" \
+    || die "could not read the run-fidelity vocabulary from $(basename "$LEG_RESOLVER")"
+  declare -a _fid_want=() _fid_keep=() _fid_drop=()
+  # Split on comma OR whitespace, exactly as DSS_LEGS-style filters are typed.
+  IFS=', ' read -r -a _fid_want <<< "${DSS_RUN_FIDELITY}"
+  for _f in "${_fid_want[@]}"; do
+    [[ -z "$_f" ]] && continue
+    grep -qx -- "$_f" <<< "$_fid_known" \
+      || die "DSS_RUN_FIDELITY names '$_f', which is not a run fidelity this harness declares.
+      Known: $(tr '\n' ' ' <<< "$_fid_known")
+      A value nothing matches would silently select ZERO legs, which reads exactly
+      like a host that can execute nothing [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]."
+  done
+  for _l in "${LEG_ORDER[@]}"; do
+    _lf="${LEG_RUN_FIDELITY[$_l]:-}"
+    if [[ -n "$_lf" ]] && grep -qx -- "$_lf" <<< "$(printf '%s\n' "${_fid_want[@]}")"; then
+      _fid_keep+=("$_l")
+    else
+      _fid_drop+=("$_l")
+    fi
+  done
+  [[ ${#_fid_keep[@]} -gt 0 ]] || \
+    die "DSS_RUN_FIDELITY='${DSS_RUN_FIDELITY}' selected NO leg on this host.
+      Per-leg fidelity here: $(for _l in "${LEG_ORDER[@]}"; do printf '%s=%s ' "$_l" "${LEG_RUN_FIDELITY[$_l]:-<never runs>}"; done)
+      A run that covers nothing must stop, not report a clean sweep of zero legs."
+  LEG_ORDER=("${_fid_keep[@]}")
+  if [[ ${#_fid_drop[@]} -gt 0 ]]; then
+    warn "DSS_RUN_FIDELITY='${DSS_RUN_FIDELITY}' DESELECTED ${#_fid_drop[@]} leg(s) — this run does NOT cover them:"
+    for _l in "${_fid_drop[@]}"; do
+      LEG_VERDICT["$_l"]="not-selected-by-runner"
+      LEG_VERDICT_DETAIL["$_l"]="deselected by DSS_RUN_FIDELITY='${DSS_RUN_FIDELITY}' — this leg's run fidelity on this host is '${LEG_RUN_FIDELITY[$_l]:-<never runs here>}', so ${LEG_SPEC[$_l]} was NOT built and NOT verified by this run"
+      warn "      $_l (${LEG_SPEC[$_l]}) — fidelity '${LEG_RUN_FIDELITY[$_l]:-<never runs here>}', not built, not verified"
+    done
+  fi
+fi
+# <<< dss:run-fidelity-select <<<
 info "legs selected: ${LEG_ORDER[*]}   tier: $DSS_TIER"
+for _l in "${LEG_ORDER[@]}"; do
+  info "   $_l: run mode '${LEG_RUN_MODE[$_l]:-<unset>}', fidelity '${LEG_RUN_FIDELITY[$_l]:-<never runs here>}'"
+done
 
 # ── strict mode, parsed and VALIDATED now (never at Step 9) ──────────────────
 # Mirrors `readStrictArmVerdicts` in tests/test_support/arm_verdict_ledger.hpp,
@@ -1318,6 +1460,20 @@ case "${DSS_STRICT_ARM_VERDICTS}" in
 esac
 [[ "$STRICT_VERDICTS" -eq 0 ]] || \
   warn "DSS_STRICT_ARM_VERDICTS=1 — every ENVIRONMENTAL skip (a missing launcher, a missing declared build input) will FAIL this run."
+
+# Same three states, same refusal of a value that is neither, and validated here
+# rather than at Step 5 — Step 5 sits AFTER the sqlite clone + configure + stage,
+# so a typo found there costs the staging run instead of a second.
+ALLOW_NONRELEASE_DSS=0
+case "${DSS_ALLOW_NONRELEASE_COMPILER}" in
+  1|true|TRUE|yes)        ALLOW_NONRELEASE_DSS=1 ;;
+  ''|0|false|FALSE|no)    ALLOW_NONRELEASE_DSS=0 ;;
+  *) die "DSS_ALLOW_NONRELEASE_COMPILER='${DSS_ALLOW_NONRELEASE_COMPILER}' is not a value this harness recognises.
+      Accepted: 1 / true / TRUE / yes  (allow)  ·  0 / false / FALSE / no / empty (default: REFUSE).
+      Refused rather than read as 'off' even though 'off' is the SAFE direction here — a flag
+      whose typo means something is a flag nobody can read back out of a log. Same rule, same
+      spellings, as DSS_STRICT_ARM_VERDICTS directly above." ;;
+esac
 
 # ── WHAT EACH LAUNCHER NEEDS BEYOND ITS OWN argv[0] ─────────────────────────
 # >>> dss:launcher-prereq >>>
@@ -2635,10 +2791,125 @@ ensure_cmake() {
   info "cmake: $(cmake --version | sed -n '1p') (Kitware $ver)"
 }
 ensure_cmake
-( cd "$SRC_DIR" && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$JOBS" )
-DSS_BIN="$(find "$SRC_DIR/build" -type f -name dss-code-prime -perm -u+x -print -quit 2>/dev/null)"
-[[ -n "$DSS_BIN" && -x "$DSS_BIN" ]] || die "dss-code-prime binary not found under $SRC_DIR/build."
-pass "dss-code-prime built: $DSS_BIN"
+# ⚠ BUILD INTO A NAMED SUBDIRECTORY, NEVER INTO `build/` ITSELF. Operator rule
+# 2026-08-17: `build/` is the single ROOT and every build tree is a subdirectory
+# of it. Configuring into the root would make the root simultaneously a container
+# and a build tree — the exact ambiguity the rule exists to remove.
+_dss_bdir="$SRC_DIR/build/rel"
+( cd "$SRC_DIR" && cmake -B "$_dss_bdir" -DCMAKE_BUILD_TYPE=Release && cmake --build "$_dss_bdir" -j"$JOBS" )
+# ★★ SEARCH THE TREE WE JUST BUILT, NOT THE WHOLE ROOT. This was
+# `find "$SRC_DIR/build" … -print -quit`, taking the FIRST match — unambiguous
+# only while `build/` held exactly one build tree. The one-root layout makes that
+# ambiguous BY CONSTRUCTION: ✔MEASURED 2026-08-17 on the Mac, `build/bin` and
+# `build/mac/bin` BOTH matched and `-print -quit` resolved it by filesystem
+# enumeration order. It happened to pick the tree this step rebuilds; nothing
+# guaranteed it. Same class as a pin sampling `front()` of a discovered set.
+DSS_BIN="$(find "$_dss_bdir" -type f -name dss-code-prime -perm -u+x -print -quit 2>/dev/null)"
+# Widen to the whole root ONLY if the tree we built has none, and SAY SO — a
+# silent widening is how the ambiguity creeps back.
+if [[ -z "$DSS_BIN" ]]; then
+  DSS_BIN="$(find "$SRC_DIR/build" -type f -name dss-code-prime -perm -u+x -print -quit 2>/dev/null)"
+  [[ -n "$DSS_BIN" ]] && warn "no dss-code-prime under $_dss_bdir; widened to a root-wide search and took $DSS_BIN"
+fi
+[[ -n "$DSS_BIN" && -x "$DSS_BIN" ]] || die "dss-code-prime binary not found under $_dss_bdir (nor anywhere under $SRC_DIR/build)."
+
+# ★★ THE COMPILER'S OWN BUILD TYPE IS READ FROM THE TREE THAT PRODUCED IT, AND
+# PRINTED NEXT TO ITS PATH — even here, where the two lines above are what set it.
+# PARITY with build-and-test.ps1's Step 5, and the parity is the entire point:
+# that driver used to take the NEWEST binary under any root with no regard for how
+# it was built (on a developer box, always `build/dbg`), while this one builds
+# `-DCMAKE_BUILD_TYPE=Release` unconditionally. TWO DRIVERS, ONE CONTRACT, TWO
+# ANSWERS — and neither log ever named the variable, so the difference was
+# published as a property of the HOST
+# (D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX, ~8x) when it was -O0 against
+# -O3 (~2.1x once controlled). This side was RIGHT and still said nothing, which
+# is exactly what made the other side's silence unnoticeable.
+# ⚠ AND THIS SIDE IS NOT UNCONDITIONALLY RIGHT EITHER: the widened search above
+# reaches the WHOLE of $SRC_DIR/build, which holds other people's trees (build/dbg
+# is one), so what this step ends up holding is not guaranteed to be what the
+# cmake line asked for. The answer is READ, never inferred from the invocation
+# that precedes it and never from the directory's name.
+# Echoes TYPE on line 1 and PROVENANCE on line 2 — two lines rather than a
+# delimiter because both halves are free text that can contain anything.
+dss_build_type() {                      # <binary>
+  local bin="$1" dir="" cache="" btype="" cfgs="" gen="" rel="" part="" c="" hit=""
+  local -a parts=() cfglist=()
+  dir="$(cd "$(dirname "$bin")" 2>/dev/null && pwd)" || dir=""
+  # Walk UP to the build tree: the nearest ancestor holding a CMakeCache.txt.
+  while [[ -n "$dir" ]]; do
+    if [[ -f "$dir/CMakeCache.txt" ]]; then cache="$dir/CMakeCache.txt"; break; fi
+    [[ "$dir" == "/" ]] && break
+    dir="$(dirname "$dir")"
+  done
+  if [[ -z "$cache" ]]; then
+    printf '%s\n' '<unknown>' "NO CMakeCache.txt in any ancestor of $bin — nothing on this machine states how it was built"
+    return 0
+  fi
+  btype="$(sed -n 's/^CMAKE_BUILD_TYPE:[^=]*=//p'          "$cache" | sed -n 1p)"
+  cfgs="$( sed -n 's/^CMAKE_CONFIGURATION_TYPES:[^=]*=//p' "$cache" | sed -n 1p)"
+  gen="$(  sed -n 's/^CMAKE_GENERATOR:[^=]*=//p'           "$cache" | sed -n 1p)"
+  if [[ -n "$cfgs" ]]; then
+    # MULTI-config (Xcode is the one that reaches this on a POSIX host). The cache
+    # CANNOT answer: one tree holds every config and CMAKE_BUILD_TYPE is an entry
+    # the generator IGNORES, so `-DCMAKE_BUILD_TYPE=Release` + `--build --config
+    # Debug` leaves a cache saying Release over a Debug binary. What the generator
+    # DOES state is the config it built, written into the OUTPUT PATH — so the
+    # answer is the path component naming one of the configs the cache DECLARES.
+    # Two facts the tree states about itself, cross-checked; a component matching
+    # nothing declared is not an answer.
+    rel="${bin#"$dir"/}"
+    IFS='/' read -r -a parts   <<< "$rel"
+    IFS=';' read -r -a cfglist <<< "$cfgs"
+    for part in "${parts[@]}"; do
+      for c in "${cfglist[@]}"; do
+        # Case-INSENSITIVE, matching the .ps1 twin (-contains) and
+        # profile-compile-support.py (.lower()): CMake uppercases the build
+        # type to look up CMAKE_<LANG>_FLAGS_<CFG>, so `release` selects the
+        # identical flags as `Release` and a lowercase spelling is not a
+        # different answer.
+        if [[ -n "$c" && "${part,,}" == "${c,,}" ]]; then hit="$part"; fi   # DEEPEST wins
+      done
+    done
+    if [[ -n "$hit" ]]; then
+      printf '%s\n' "$hit" "the multi-config generator's own output subdirectory '$hit', cross-checked against CMAKE_CONFIGURATION_TYPES=$cfgs in $cache (generator '$gen')"
+    else
+      printf '%s\n' '<unknown>' "$cache is a MULTI-CONFIG tree (generator '$gen' declares CMAKE_CONFIGURATION_TYPES=$cfgs) and no component of '$rel' names one of them"
+    fi
+  elif [[ -n "$btype" ]]; then
+    printf '%s\n' "$btype" "CMAKE_BUILD_TYPE in $cache (single-config generator '$gen')"
+  else
+    # EMPTY is an answer, not a gap: it is CMake's default of no optimisation
+    # flags at all. Rounding it up to Release is the whole class of defect here.
+    printf '%s\n' '<none>' "$cache declares NO CMAKE_BUILD_TYPE (single-config generator '$gen') — CMake's default of no optimisation flags"
+  fi
+}
+_dss_bt="$(dss_build_type "$DSS_BIN")"
+DSS_BUILD_TYPE="$(printf '%s\n' "$_dss_bt"    | sed -n 1p)"
+DSS_BUILD_TYPE_SRC="$(printf '%s\n' "$_dss_bt" | sed -n 2p)"
+DSS_BUILD_TYPE_NOTE="  (compiler build type: $DSS_BUILD_TYPE)"
+info "compiler  : $DSS_BIN"
+info "build type: $DSS_BUILD_TYPE"
+info "  read from: $DSS_BUILD_TYPE_SRC"
+# Case-insensitive on purpose: CMake uppercases the build type to look up
+# CMAKE_<LANG>_FLAGS_<CFG>, so `-DCMAKE_BUILD_TYPE=release` selects the identical
+# flags as `Release` and refusing it would be this check failing on a spelling.
+if [[ "${DSS_BUILD_TYPE,,}" != "release" ]]; then
+  if [[ "$ALLOW_NONRELEASE_DSS" -eq 0 ]]; then
+    die "this run would be timed against a NON-RELEASE compiler, and it REFUSES rather than proceed quietly.
+      compiler   : $DSS_BIN
+      build type : $DSS_BUILD_TYPE
+      read from  : $DSS_BUILD_TYPE_SRC
+      A Debug dss-code-prime is -g, no -O and no NDEBUG: it compiles the same program correctly
+      and takes several times as long, and that difference lands in whatever this run is read for.
+      The .ps1 twin holds the identical gate, so a number from either driver is comparable only
+      because both of them state this.
+      Fix the tree ($_dss_bdir) — cmake -B '$_dss_bdir' -DCMAKE_BUILD_TYPE=Release — or set
+      DSS_ALLOW_NONRELEASE_COMPILER=1 to proceed with THIS binary, with every report line saying so."
+  fi
+  DSS_BUILD_TYPE_NOTE="  (compiler build type: $DSS_BUILD_TYPE — NOT Release, DSS_ALLOW_NONRELEASE_COMPILER=1)"
+  warn "DSS_ALLOW_NONRELEASE_COMPILER=1 — proceeding with a $DSS_BUILD_TYPE compiler. TIMINGS FROM THIS RUN ARE NOT COMPARABLE with build-and-test.ps1 or with any other run of this driver, which always times a Release compiler."
+fi
+pass "dss-code-prime built: $DSS_BIN  ($DSS_BUILD_TYPE)"
 
 # ── Step 6 — stage third-party headers + obtain per-leg libs ─────────────────
 step "6/9  Third-party headers (parsed agnostically) + per-leg tcl/zlib libraries"
@@ -3025,59 +3296,29 @@ host_system_tcl_names() {       # host_system_tcl_names <leg>  -> one candidate 
   } | LC_ALL=C awk 'NF && !seen[$0]++'
 }
 
-# arm64 libraries for the `ubuntu-ports-arm64` provider — Ubuntu ports .deb
-# extract, NO apt-source surgery: resolve the exact .deb from the ports Packages
-# index, then dpkg-deb -x and harvest the runtime .so. qemu resolves libc/libm from
-# the sysroot.
-# ★ NOT FATAL TO THE RUN. It used to `die`, which meant a host that cannot reach
-# ports.ubuntu.com (or has no dpkg-deb) lost EVERY leg over one leg's input. It is
-# now called in a SUBSHELL so a `die`/ERR inside it exits only that subshell: the
-# caller sees rc != 0, records `skipped-build-input-missing` for THAT leg, and the
-# other four carry on. The diagnostics still print — loudly — they just stop being
-# the whole run's obituary.
-ARM64_LIBDIR="${ARM64_LIBDIR:-$HOME/.cache/dss-code-prime/arm64libs}"
-ensure_arm64_libs() {
-  if [[ -e "$ARM64_LIBDIR/libtcl8.6.so.0" && -e "$ARM64_LIBDIR/libz.so.1" ]]; then
-    info "arm64 libs cached: $ARM64_LIBDIR ($(ls "$ARM64_LIBDIR" | tr '\n' ' '))"; return
-  fi
-  ensure_cmd curl curl; ensure_cmd dpkg-deb dpkg; ensure_cmd gzip gzip
-  mkdir -p "$ARM64_LIBDIR"
-  local work; work="$(mktemp -d)"
-  local codename; codename="$( . /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-noble}" )"
-  local baseurl="http://ports.ubuntu.com/ubuntu-ports"
-  local idx="$work/Packages"
-  info "arm64 libs: fetching ports index ($codename/main)"
-  curl -fsSL "$baseurl/dists/$codename/main/binary-arm64/Packages.gz" | gzip -d > "$idx" || die "cannot fetch ports arm64 Packages index for '$codename'."
-  local pkg rel
-  for pkg in libtcl8.6 zlib1g libtommath1; do
-    rel="$(awk -v p="$pkg" '$1=="Package:"{c=$2} $1=="Filename:"&&c==p{print $2; exit}' "$idx")"
-    [[ -n "$rel" ]] || { warn "arm64 $pkg not in ports index (skipping — may be optional)"; continue; }
-    info "  downloading $pkg:arm64"
-    curl -fsSL "$baseurl/$rel" -o "$work/$pkg.deb" || die "download failed: $pkg ($baseurl/$rel)"
-    dpkg-deb -x "$work/$pkg.deb" "$work/root"
-  done
-  find "$work/root" \( -name 'libtcl8.6.so*' -o -name 'libz.so*' -o -name 'libtommath.so*' \) \
-    -exec cp -Pa {} "$ARM64_LIBDIR/" \; 2>/dev/null || true
-  # ensure the DT_NEEDED soname link exists (tcl bakes libtcl8.6.so.0)
-  if [[ ! -e "$ARM64_LIBDIR/libtcl8.6.so.0" ]]; then
-    local rt; rt="$(find "$ARM64_LIBDIR" -name 'libtcl8.6.so*' | head -1)"
-    [[ -n "$rt" ]] && ln -sf "$(basename "$rt")" "$ARM64_LIBDIR/libtcl8.6.so.0"
-  fi
-  # a plain `.so` alias for --resolve-library introspection
-  [[ -e "$ARM64_LIBDIR/libtcl8.6.so" ]] || ln -sf "$(basename "$(find "$ARM64_LIBDIR" -name 'libtcl8.6.so.0' | head -1)")" "$ARM64_LIBDIR/libtcl8.6.so" 2>/dev/null || true
-  rm -rf "$work"
-  [[ -e "$ARM64_LIBDIR/libtcl8.6.so.0" ]] || die "arm64 libtcl8.6 not obtained under $ARM64_LIBDIR."
-  [[ -e "$ARM64_LIBDIR/libz.so.1"      ]] || die "arm64 libz not obtained under $ARM64_LIBDIR."
-  info "arm64 libs staged: $(ls "$ARM64_LIBDIR" | tr '\n' ' ')"
-}
+# ★ THE BESPOKE `ubuntu-ports-arm64` ACQUISITION USED TO LIVE HERE, AND IS GONE.
+# ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+# D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
+# It was ~45 lines of `curl` + `dpkg-deb` + soname-symlink repair, staged under
+# `$ARM64_LIBDIR`, serving ONE leg from THIS driver only — the .ps1 had no such
+# arm, which is the capability-pair gap that row was named for. TF-C123 moved the
+# elf64-arm64 leg onto the shared `pinned-archive` route below and the provider
+# stopped being declared; `LIBRARY_PROVIDERS` in $LEG_RESOLVER dropped the name,
+# so `--lint` now REFUSES any leg that declares it. The code, its `case` arm and
+# the `ARM64_LIBDIR` override outlived all of that from `3e86a187` (2026-08-10)
+# to 2026-08-20, and this file's
+# own refusal message went on advertising the name as KNOWN — pointing a reader
+# at a declaration the resolver rejects. Removed here, with the vocabulary below
+# now READ FROM the resolver so the two cannot drift again.
 
 # ── `pinned-archive` — the GENERAL, DECLARED library-acquisition route ───────
 # [D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER]
-# `ensure_arm64_libs` above is a whole acquisition mechanism — fetch, extract,
-# stage — that exists for ONE leg, in ONE driver, with the archive layout welded
-# into this file. `pinned-archive` is the same idea DECLARED: the archives, their
-# PINNED sha256, the members to take and the runtime identity to record all live
-# in $LEG_CATALOGUE, and the fetch/verify/extract/slice is implemented ONCE in
+# The retired mechanism described above was a whole acquisition route — fetch,
+# extract, stage — that existed for ONE leg, in ONE driver, with the archive
+# layout welded into this file. `pinned-archive` is the same idea DECLARED: the
+# archives, their PINNED sha256, the members to take and the runtime identity to
+# record all live in $LEG_CATALOGUE, and the fetch/verify/extract/slice is
+# implemented ONCE in
 # $LEG_RESOLVER (`--acquire`) so this driver and the .ps1 acquire identically
 # instead of each growing its own. That is what makes "any leg builds on any
 # host" true rather than aspirational: the macho legs used to declare
@@ -3089,8 +3330,8 @@ ensure_arm64_libs() {
 # acquire_leg_libs <leg> — the resolver's acquisition report, as JSON, on stdout.
 # Diagnostics go to STDERR (the caller redirects them to a log), so stdout is the
 # report and nothing else. Called from a COMMAND SUBSTITUTION, which is a
-# subshell — the same isolation `ensure_arm64_libs` gets from `( … )` and for the
-# same reason: a leg whose archive cannot be fetched, whose digest does not
+# subshell — deliberate isolation, for the same reason the retired bespoke route
+# had it: a leg whose archive cannot be fetched, whose digest does not
 # match, or whose declared member is absent costs THAT LEG a
 # `skipped-build-input-missing`, never the other four. rc is taken DIRECTLY off
 # the substitution, never through a pipe.
@@ -3137,6 +3378,50 @@ else:
     sys.stdout.write("%s\n" % report[what])' "$2" <<< "$1"
 }
 
+# ── A PROVIDER NO DRIVER IMPLEMENTS — THE VERDICT, DECIDED IN ONE PLACE ──────
+# [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+#
+# ★★ THE TWO DRIVERS USED TO ANSWER THIS CONDITION DIFFERENTLY, AND THE ARGUMENT
+# AGAINST THIS DRIVER'S ANSWER WAS DELETED WHILE THE ANSWER STAYED. Until 2026-08-20
+# the `*)` arm below called `die` — `exit 1`, from a TOP-LEVEL loop, so ONE leg
+# declaring an unimplemented provider cost the whole run and the other four legs
+# never reached a verdict. The .ps1's `default` arm returned a per-leg record and
+# carried on. The retired `ensure_arm64_libs` docblock had made exactly this
+# argument in its own words — "a host that cannot reach ports.ubuntu.com lost
+# EVERY leg over one leg's input" — and that paragraph was removed with the
+# function while the `die` two hundred lines below it survived.
+#
+# ★★★ AND THE FIX IS *NOT* `leg_marks_missing`. A leg declaring a provider NO
+# DRIVER IMPLEMENTS is a HARNESS/CATALOGUE defect, not an absent build input:
+# `skipped-build-input-missing` is an ENVIRONMENTAL skip, which only WARNS unless
+# DSS_STRICT_ARM_VERDICTS=1, so a bug would have been filed as a fact about the
+# machine and the run would have exited 0. `poisoned` is the closed vocabulary's
+# FAILURE class and it already means precisely this — "no artifact was exercised
+# and the reason is OURS". Both drivers ALREADY use it for the same shape one
+# level down: `unit_not_run` here, and `Set-LegVerdict`/`Set-UnitNotRun` in the
+# .ps1, record `poisoned` + "HARNESS DEFECT: …" when a driver meets a member of a
+# closed vocabulary it cannot classify. So no new verdict is minted; the existing
+# one is used where it already belongs, per leg, and the run CONTINUES to every
+# other leg — the harness must survive its own defects, not hide them.
+#
+# WHY THIS IS A FUNCTION AND WHY IT IS IN A `dss:` REGION. The verdict TOKEN and
+# the message are now one pure function of their arguments, mirrored in the .ps1,
+# so `harness_legs.py --check-regions` EXTRACTS BOTH COPIES FROM THE SHIPPED
+# DRIVERS, EXECUTES THEM ON IDENTICAL INPUT AND COMPARES THE ANSWERS. A pin that
+# only READ the two arms could not have caught the divergence that produced this
+# region — the tokens were both spelled correctly in their own file.
+#
+# ⚠ THE MESSAGE IS ASCII ON PURPOSE, for the reason MIRROR_CASES states for the
+# zero-progress sentinel: it is compared BYTE-FOR-BYTE between a bash string and
+# a PowerShell string that reach the battery through two different file readers,
+# and a non-ASCII character would put an encoding question inside the one value
+# the comparison rests on.
+# >>> dss:unknown-library-provider >>>  (region mirrored in build-and-test.ps1)
+unknown_library_provider_verdict() {   # <driver> <leg> <provider> <tcl-names> <z-names> <known> -> "<verdict>\t<detail>"
+  printf 'poisoned\t%s\n' "HARNESS DEFECT: leg '$2' declares library provider '$3', which $1 has no dispatch arm for, so this driver cannot obtain that leg's DECLARED inputs (tcl: $4 / z: $5). ACQUISITION IS NOT DRIVER-LOCAL - pinned-archive is performed by harness_legs.py --acquire, on every host - so NO declared provider should reach this arm; reaching it means the catalogue or LIBRARY_PROVIDERS grew a provider and this driver was not extended in the same change. Add the arm to BOTH drivers: a capability in one driver and not the other is this project's canonical silent harness bug. Known providers: $6 (printed by harness_legs.py --library-providers, never copied here)."
+}
+# <<< dss:unknown-library-provider <<<
+
 # ── resolve EVERY declared leg's build inputs ────────────────────────────────
 # ★ ONE VERDICT PER LEG, AND THE RUN CONTINUES. A leg whose DECLARED inputs are
 # absent from this machine is recorded `skipped-build-input-missing` — an
@@ -3160,6 +3445,21 @@ leg_marks_missing() {           # leg_marks_missing <leg> <what-is-lost> <why>
   LEG_VERDICT_DETAIL["$1"]="$3$extra"
   warn "[$1] BUILD INPUT MISSING — $2: $3"
 }
+# ★ THE SIBLING FOR THE OTHER KIND OF LOSS, AND THE DISTINCTION IS THE WHOLE
+# POINT. `leg_marks_missing` says "this machine could not supply a DECLARED
+# input" — environmental, warns by default. This one says "the harness itself
+# cannot do what the catalogue declares" — a FAILURE, reported under the closed
+# vocabulary's `poisoned`, which reds the run wherever it is recorded. Same
+# per-leg shape, same "the run continues" rule, deliberately different class:
+# filing a harness bug as an environment fact is how a bug ships green.
+# [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+leg_marks_harness_defect() {    # leg_marks_harness_defect <leg> <verdict> <detail>
+  LEG_VERDICT["$1"]="$2"
+  LEG_VERDICT_DETAIL["$1"]="$3"
+  warn "[$1] HARNESS DEFECT [$2] — $3"
+  warn "      This leg is NOT built and NOT run here. The other legs are unaffected and the run"
+  warn "      CONTINUES — but it CANNOT exit 0, because what failed is ours, not this machine's."
+}
 for leg in "${LEG_ORDER[@]}"; do
   provider="${LEG_LIB_PROVIDER[$leg]}"
   tcl_lib=""; z_lib=""; searched=""
@@ -3171,18 +3471,6 @@ for leg in "${LEG_ORDER[@]}"; do
       tcl_lib="$(find_first ${_tnames[@]+"${_tnames[@]}"})"
       z_lib="$(find_first ${_znames[@]+"${_znames[@]}"})"
       searched="provider 'host-system'; tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; roots: ${LIB_ROOTS[*]}"
-      ;;
-    ubuntu-ports-arm64)
-      # SUBSHELL on purpose — see ensure_arm64_libs. rc is taken DIRECTLY off the
-      # subshell, never through a pipe.
-      if ( ensure_arm64_libs ); then _ports_rc=0; else _ports_rc=$?; fi
-      declare -a _tnames=(); read -r -a _tnames <<< "${LEG_LIB_TCL_NAMES[$leg]}"
-      declare -a _znames=(); read -r -a _znames <<< "${LEG_LIB_Z_NAMES[$leg]}"
-      if [[ "$_ports_rc" -eq 0 ]]; then
-        tcl_lib="$(find_first_in "$ARM64_LIBDIR" -- ${_tnames[@]+"${_tnames[@]}"})"
-        z_lib="$(find_first_in "$ARM64_LIBDIR" -- ${_znames[@]+"${_znames[@]}"})"
-      fi
-      searched="provider 'ubuntu-ports-arm64' (rc=$_ports_rc); tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; staged under: $ARM64_LIBDIR"
       ;;
     search-paths)
       # Declared candidate DIRECTORIES, tried on EVERY host: a hit is used, a miss
@@ -3265,10 +3553,59 @@ for leg in "${LEG_ORDER[@]}"; do
       searched="provider 'pinned-archive' ($_acq_stage rc=$_acq_rc); tcl names tried: ${_tnames[*]:-<none>}; zlib names tried: ${_znames[*]:-<none>}; acquired under: ${_acq_dir:-<nothing acquired — see $_acq_log>}"
       ;;
     *)
-      die "[$leg] declares library provider '$provider', which this driver does not implement.
-      Known: host-system | ubuntu-ports-arm64 | search-paths | pinned-archive (see $LEG_CATALOGUE and
-      LIBRARY_PROVIDERS in $LEG_RESOLVER). A provider the driver silently ignored would
-      resolve to an empty library pair and read as a missing input — so it fails loud here."
+      # ★ THE KNOWN SET IS READ, NOT RE-TYPED. This message used to carry its own
+      # hard-coded copy of the vocabulary and DRIFTED: it advertised
+      # `ubuntu-ports-arm64` as known from 2026-08-10 to 2026-08-20, after LIBRARY_PROVIDERS
+      # dropped the name, so the one message whose whole job is to tell a reader
+      # what IS accepted was naming something `--lint` refuses. A list printed by
+      # the set's owner cannot disagree with the set.
+      # ★ WHAT ACTUALLY CARRIES THE DEGRADATION HERE, stated correctly because the
+      # previous wording named the wrong half — it credited the `|| echo`.
+      # ✔MEASURED 2026-08-20, both failure modes × pipefail on/off, by running the
+      # exact expression below in a subshell with each setting:
+      #                                          pipefail=on   pipefail=off
+      #   resolver CANNOT RUN (pipeline != 0)  -> `|| echo`    `${_known:-…}`
+      #   resolver exits 0 and prints NOTHING  -> `${_known:-…}` `${_known:-…}`
+      # ⇒ `${_known:-<…>}` is the load-bearing one: it covers three of the four
+      # cells and EVERY case where the resolver exits 0, whatever the shell's
+      # pipeline settings are. The `|| echo` covers exactly one cell and is live
+      # ONLY because this file runs under `set -Eeuo pipefail` — without it the
+      # pipeline's status is `tr`'s (0), the `||` never fires, and `_known` is
+      # empty. Keep both: they degrade different failures, and a diagnostic that
+      # dies computing its own text tells nobody anything.
+      _known="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" --library-providers 2>/dev/null | tr '\n' ' ' || echo '<resolver unavailable - read LIBRARY_PROVIDERS in it>')"
+      # ⚠ THE TRAILING SPACE IS STRIPPED, AND THAT IS A PARITY FIX RATHER THAN
+      # TIDINESS. `tr` turns the resolver's FINAL newline into a space too, so the
+      # sentence rendered `…search-paths  (printed by…` here and
+      # `…search-paths (printed by…` in the .ps1, whose `-join ' '` adds none.
+      # ✔MEASURED: with it stripped the two SHIPPED drivers now produce a
+      # BYTE-IDENTICAL detail for the same leg. The differential battery could
+      # NOT have caught this — there the list is an ARGUMENT, identical to both
+      # arms by construction — so the two drivers would have gone on saying
+      # subtly different things about the same defect.
+      # Parameter expansion, not a second tool: exactly one trailing space exists
+      # (one final newline), and this needs nothing that could differ on a BSD
+      # host — the portability rule D-HARNESS-SELFTEST-BSD-SED-PORTABILITY set.
+      _known="${_known% }"
+      # ONE LEG, NOT THE RUN. See the `dss:unknown-library-provider` region above
+      # for why this is `poisoned` and not `skipped-build-input-missing`, and why
+      # it is no longer a `die`.
+      #
+      # ⚠ A PLAIN ASSIGNMENT AND TWO EXPANSIONS, NEVER `read`. This file installs
+      # `trap 'die …' ERR` with `set -E`, so `read a b < <(…)` returning non-zero
+      # — which it does on any line without a trailing newline — would fire that
+      # trap and `die`, ending the whole run from inside the ONE arm whose entire
+      # purpose is not to. Parameter expansion cannot fail, so this shape has no
+      # such edge. A malformed (TAB-less) decision line would leave `_uv` holding
+      # the whole sentence, which the Step-9 ledger then reports as a verdict
+      # OUTSIDE the closed vocabulary — loud, named, and still only this leg.
+      _uvline="$(unknown_library_provider_verdict \
+        "$(basename "${BASH_SOURCE[0]}")" "$leg" "$provider" \
+        "${LEG_LIB_TCL_NAMES[$leg]}" "${LEG_LIB_Z_NAMES[$leg]}" \
+        "${_known:-<resolver printed nothing - read LIBRARY_PROVIDERS in it>}")"
+      _uv="${_uvline%%$'\t'*}"; _ud="${_uvline#*$'\t'}"
+      leg_marks_harness_defect "$leg" "$_uv" "$_ud"
+      continue
       ;;
   esac
   [[ -z "$tcl_lib" ]] || LEG_TCL_LIB_ANY["$leg"]="$tcl_lib"
@@ -4049,8 +4386,8 @@ run_leg() {                    # run_leg <leg> <bin> <args...>  — REPLACES thi
   eval "envs=(${LEG_LAUNCH_ENV[$leg]})"
   [[ ${#envs[@]} -eq 0 ]] || export "${envs[@]}"
   # The leg's OWN library directories, for the runtime loader. Only for a leg whose
-  # libraries the harness STAGED (`ubuntu-ports-arm64`, `search-paths`,
-  # `pinned-archive`): a `host-system` leg's libraries are, by definition, already
+  # libraries the harness STAGED (`search-paths`, `pinned-archive`): a
+  # `host-system` leg's libraries are, by definition, already
   # where this machine's loader looks, and prepending a system dir would be a
   # change with no purpose. Keyed on the leg's DECLARED provider, so a future
   # staged-library leg inherits it.
@@ -4178,6 +4515,16 @@ COMPILE_FAILS=0
 # ORACLE, in those terms, instead of inheriting a line about a binary it cannot
 # run. Empty means "none for this leg", which Step 9 prints as such.
 declare -A LEG_ORACLE=() LEG_ORACLE_CC=() LEG_ORACLE_TRIPLE=()
+# ★★ THE ORACLE'S *STATUS*, KEPT ON EVERY OUTCOME — the fact the old code threw
+# away. [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] `build-failed` is not
+# the same event as `no-reference-compiler`: the first means THE CONTROL RAN AND
+# AGREED WITH US, the second means there is no control at all. Collapsing them to
+# an empty LEG_ORACLE made a leg whose reference rejects the same TUs dss rejects
+# print "NO ORACLE", which reads as *the control is missing*. Only `built` and
+# `build-failed` let `--attribute-build` grant anything, and it is handed this
+# value verbatim rather than re-deriving it from whether a log file exists — a
+# log left behind by a previous run must never buy an amnesty this run did not.
+declare -A LEG_ORACLE_STATUS=() LEG_ORACLE_LOG=() LEG_BUILD_ATTRIBUTION=()
 # python3 was already ensured at Step 0b (the leg plan needs it far earlier than
 # the manifest does). Re-asserted here because this is where the manifest is
 # actually generated, and `ensure_cmd` on a present command costs nothing.
@@ -4649,6 +4996,11 @@ for leg in "${LEG_ORDER[@]}"; do
       --build-reference-oracle "$leg" --manifest "$manifest" \
       --oracle-dir "$outd" --oracle-log "$outd/reference-oracle.log" \
       2>"$outd/reference-oracle.stderr")" || _orc=$?
+  # THE STATUS IS RECORDED ON EVERY ARM, from the resolver's own JSON — never
+  # inferred from the rc here, which would be this driver re-deriving a fact the
+  # resolver already stated. [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION]
+  LEG_ORACLE_STATUS["$leg"]="$(printf '%s' "$_oracle_json" | sed -n -e 's/.*"status": "\([^"]*\)".*/\1/p')"
+  LEG_ORACLE_LOG["$leg"]="$outd/reference-oracle.log"
   if [[ "$_orc" -eq 0 ]]; then
     LEG_ORACLE["$leg"]="$(printf '%s' "$_oracle_json"  | sed -n -e 's/.*"path": "\([^"]*\)".*/\1/p')"
     LEG_ORACLE_CC["$leg"]="$(printf '%s' "$_oracle_json" | sed -n -e 's/.*"cc": "\([^"]*\)".*/\1/p')"
@@ -4656,6 +5008,13 @@ for leg in "${LEG_ORDER[@]}"; do
     info "[$leg] same-platform ORACLE built by ${LEG_ORACLE_CC[$leg]} (${LEG_ORACLE_TRIPLE[$leg]}) → ${LEG_ORACLE[$leg]}"
   else
     LEG_ORACLE["$leg"]=""
+    # ★ AND THE TWO NON-ZERO ARMS ARE NOT ONE EVENT. rc 3 means the control RAN
+    # and could not build the very sources dss is about to be handed — which is
+    # EVIDENCE, and the whole input to the per-TU attribution below. rc 4 means
+    # this host owns no compiler for this leg, which is evidence about nothing.
+    if [[ "$_orc" -eq 3 ]]; then
+      info "[$leg] the same-platform ORACLE also FAILED to build these sources — its diagnostics are the CONTROL for this leg's build (${LEG_ORACLE_LOG[$leg]})"
+    fi
     # The resolver's own words, never this driver's paraphrase of them.
     while IFS= read -r _ol; do [[ -z "$_ol" ]] || warn "[$leg] oracle: $_ol"; done \
       < "$outd/reference-oracle.stderr"
@@ -4689,6 +5048,37 @@ for leg in "${LEG_ORDER[@]}"; do
     if [[ $_rc -eq 3 ]]; then
       warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — first diagnostics ($log):"
       { grep -m3 -E 'error\[' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
+      # >>> dss:build-attribution >>>
+      # ★★★ WHOSE FAILURE IS THIS? Asked ONLY on rc 3 — the diagnostics arm — because
+      # it is the only one where there is anything to compare: the other arms produced
+      # no diagnostics at all. [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION]
+      # The DECISION is the resolver's, once, for both drivers; this block only
+      # prints what it returned and records it. `|| _arc=$?` is load-bearing under
+      # errexit for the same reason it is on the build call above.
+      _arc=0
+      _attr="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" \
+          --attribute-build "$leg" --compile-log "$log" \
+          --oracle-log "${LEG_ORACLE_LOG[$leg]:-}" \
+          --oracle-status "${LEG_ORACLE_STATUS[$leg]:-}" \
+          --manifest "$manifest" 2>"$outd/build-attribution.stderr")" || _arc=$?
+      if [[ $_arc -eq 0 || $_arc -eq 3 ]]; then
+        # ONE ACCOUNT, COMPOSED BY THE RESOLVER — the same transport the confound
+        # report uses, and the reason the two drivers cannot tell two stories about
+        # one build. Every TU is printed, upstream ones included: an upstream TU that
+        # vanished from the log would be indistinguishable from one that compiled.
+        while IFS= read -r _al; do [[ -z "$_al" ]] || info "$_al"; done \
+          <<< "$(printf '%s' "$_attr" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["report"]))' 2>/dev/null)"
+        LEG_BUILD_ATTRIBUTION["$leg"]="$(printf '%s' "$_attr" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%d of %d rejected TU(s) charged to DSS%s" % (len(d["chargedToDss"]), len(d["tus"]), "" if not d["chargedToDss"] else ": " + " ".join(t.rsplit("/",1)[-1] for t in d["chargedToDss"])))' 2>/dev/null)"
+        [[ -n "${LEG_BUILD_ATTRIBUTION[$leg]}" ]] \
+          && LEG_VERDICT_DETAIL["$leg"]="the fixture did not build for ${LEG_SPEC[$leg]} — ${LEG_BUILD_ATTRIBUTION[$leg]}.  See $log"
+      else
+        # A REFUSAL IS NOT AN ATTRIBUTION. The resolver could not decide, so nothing
+        # is excused and the leg keeps the un-attributed detail it already has.
+        while IFS= read -r _al; do [[ -z "$_al" ]] || warn "[$leg] attribution: $_al"; done \
+          < "$outd/build-attribution.stderr"
+        warn "[$leg] build attribution UNAVAILABLE (rc $_arc) — every diagnostic stays charged to dss, which is the safe direction"
+      fi
+      # <<< dss:build-attribution <<<
     elif [[ $_rc -eq 2 ]]; then
       warn "[$leg] build FAILED$(dss_bh_compile_time_suffix "$log") — the build log reports MORE THAN ONE artefact for $spec; see the diagnostic above and $log"
     elif [[ $_rc -eq 1 ]]; then
@@ -4802,6 +5192,21 @@ for leg in "${LEG_ORDER[@]}"; do
   # named verdict — not an inference from what kind of box this is.
   if [[ -z "${LEG_Z_LIB[$leg]:-}" ]]; then
     CLI_FAILS=$((CLI_FAILS + 1))
+    # ★ THE REASON IS THE LEG'S OWN, NOT AN ASSUMED ENVIRONMENT FACT. "No zlib"
+    # has two causes and they are not the same claim: this machine really has no
+    # copy of that target's zlib (environmental — the message below), or Step 6
+    # never got as far as looking because the leg's own resolution was a HARNESS
+    # DEFECT (a provider no driver implements). Printing the environmental
+    # sentence for the second one files our bug as a fact about the operator's
+    # box. The fixture verdict Step 6 recorded already distinguishes them, so it
+    # is READ rather than re-derived.
+    # [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+    if [[ "${LEG_VERDICT[$leg]:-}" == "poisoned" ]]; then
+      dss_bh_set_verdict "$leg" sqlite3 'poisoned' \
+        "${LEG_VERDICT_DETAIL[$leg]:-<no reason recorded>}  (the CLI links zlib too, so it is lost to the same defect.)"
+      warn "[$leg] CLI POISONED — $(dss_bh_get_detail "$leg" sqlite3)"
+      continue
+    fi
     dss_bh_set_verdict "$leg" sqlite3 'skipped-build-input-missing' \
       "no zlib could be resolved for this leg on this host, and the CLI links zlib (SQLITE_HAVE_ZLIB=1 reaches a live '#include <zlib.h>' in shell.c) — see Step 6."
     warn "[$leg] CLI build NOT ATTEMPTED [skipped-build-input-missing] — $(dss_bh_get_detail "$leg" sqlite3)"
@@ -6475,7 +6880,15 @@ for leg in "${LEG_ORDER[@]}"; do
   # By INDEX, so each abort is classified against ITS OWN segment log. Walking
   # the names alone would hand every abort the same (or no) diagnostic, which is
   # the location-keyed excusal this conjunction exists to end.
-  for _ai in ${!ABORTS[@]+"${!ABORTS[@]}"}; do
+  # ⚠ PLAIN `"${!ABORTS[@]}"`, NOT the `${arr[@]+"${arr[@]}"}` set -u guard:
+  # `${!VAR+word}` is INDIRECT EXPANSION, so the guarded form takes the array's
+  # VALUE as a variable NAME and dies with "invalid variable name". ✔MEASURED
+  # 2026-08-18 on bash 5.2.21 — and it only ever executes when ABORTS is
+  # NON-EMPTY, so it was invisible on every clean run and fired on exactly the
+  # run whose summary was needed (WSL host, pe64 leg, 4 Wine aborts), killing
+  # step 9/9 after every corpus result had already been produced.
+  # The plain form is already set -u-safe on an empty array in bash ≥ 4.4.
+  for _ai in "${!ABORTS[@]}"; do
     a="${ABORTS[$_ai]}"
     _acrc=0
     if [[ -z "${LEG_ABORT_CONFOUNDS[$leg]:-}" ]]; then
@@ -6626,7 +7039,7 @@ step "9/9  Results"
 # sqlite gets no divergence count on purpose: Steps 3-6 run configure/make INSIDE
 # that clone and generate sources there, so its working tree always differs from
 # HEAD by construction and a number would carry no information.
-printf '   compiler : %s @ %s%s\n' "$DSS_BIN" "$SRC_HEAD" "$SRC_DIVERGE_NOTE"
+printf '   compiler : %s @ %s%s%s\n' "$DSS_BIN" "$SRC_HEAD" "$SRC_DIVERGE_NOTE" "$DSS_BUILD_TYPE_NOTE"
 printf '   sqlite   : %s @ %s\n' "$SQLITE_DIR" "$(git_head_short "$SQLITE_DIR")"
 printf '   recipe   : %s TUs, %s defines (%s)\n' "${#TUS[@]}" "${#RECIPE_DEFS[@]}" "$RECIPE"
 printf '   cli recipe: %s TUs, %s defines (%s)\n' "${#CLI_TUS[@]}" "${#CLI_DEFS[@]}" "$CLI_RECIPE"
@@ -6688,7 +7101,17 @@ for leg in "${LEG_DECLARED[@]}"; do
              --reference-path "${REF_FIXTURE:-}" \
              --leg-oracle "${LEG_ORACLE[$leg]:-}" \
              --leg-oracle-cc "${LEG_ORACLE_CC[$leg]:-}" \
-             --leg-oracle-triple "${LEG_ORACLE_TRIPLE[$leg]:-}" 2>&1)
+             --leg-oracle-triple "${LEG_ORACLE_TRIPLE[$leg]:-}" \
+             --oracle-status "${LEG_ORACLE_STATUS[$leg]:-}" 2>&1)
+  # ★★ AND WHAT THE ORACLE WAS *FOR*, on the same shelf as the oracle line itself.
+  # [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] A build that failed and was
+  # ATTRIBUTED, whose attribution appears only in the per-leg build chatter 2,000
+  # lines up, is an attribution nobody reads — and the summary is the one part of
+  # this run that is always read. Printed only when there IS one: a leg that built
+  # has nothing to attribute and a blank line here would read as a missing answer.
+  if [[ -n "${LEG_BUILD_ATTRIBUTION[$leg]:-}" ]]; then
+    printf '   oracle   : %s build attribution: %s\n' "$leg" "${LEG_BUILD_ATTRIBUTION[$leg]}"
+  fi
 done
 printf '   tier     : %s.test   outputs: %s\n' "$DSS_TIER" "$OUT_DIR"
 if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then
@@ -6723,7 +7146,21 @@ for leg in "${LEG_DECLARED[@]}"; do
     # line can never be read as "the whole corpus ran".
     printf '   %-14s (%s): %scompiled%s   units: %s%s\n' "$leg" "$spec" "$C_GRN" "$C_RST" "${UNIT_VERDICT[$leg]:--}" "$EXCL_NOTE"
   elif [[ "${LEG_VERDICT[$leg]:-}" == "poisoned" ]]; then
-    printf '   %-14s (%s): %sCOMPILE FAILED%s   see %s/%s/compile.log\n' "$leg" "$spec" "$C_RED" "$C_RST" "$OUT_DIR" "$leg"
+    # ★ IT SAYS WHAT ACTUALLY HAPPENED, AND IT NAMES A LOG ONLY WHEN THERE IS ONE.
+    # This line used to read "COMPILE FAILED   see <out>/<leg>/compile.log" for
+    # EVERY poisoned leg — true for the leg whose compile really failed, and a
+    # double lie for a leg poisoned BEFORE any compile was attempted (a provider
+    # no driver implements, a missing include list): no compile was tried, and the
+    # log it sends the reader to does not exist. The .ps1 twin never had this
+    # shape; it prints the recorded verdict and detail, which is what this does
+    # now. [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+    _plog="$OUT_DIR/$leg/compile.log"
+    if [[ -f "$_plog" ]]; then
+      printf '   %-14s (%s): %sCOMPILE FAILED%s   see %s\n' "$leg" "$spec" "$C_RED" "$C_RST" "$_plog"
+    else
+      printf '   %-14s (%s): %sPOISONED%s [no compile was attempted] — %s\n' \
+        "$leg" "$spec" "$C_RED" "$C_RST" "${LEG_VERDICT_DETAIL[$leg]:-<no reason recorded>}"
+    fi
   else
     # ★ NOT BUILT — and it says WHY, by name. This line is the difference between
     # the old driver and this one: a leg that this host could not build or run used
@@ -6958,6 +7395,29 @@ if [[ "$UNIT_FAILS" -gt 0 ]]; then
   printf '\n%s%d leg(s) had genuine unit failures (non-confound) — the corpus is not green.%s\n' "$C_RED" "$UNIT_FAILS" "$C_RST"
   exit 1
 fi
+# ★★ A POISONED LEG REDS THE RUN, AND IT DOES SO FROM THE LEDGER — the .ps1's
+# `if ($vPoisoned -gt 0)` in one statement, which this driver did not have.
+# ✔MEASURED 2026-08-20: `LEDGER_FAILED` was computed and PRINTED and then read by
+# nothing, so every `poisoned` verdict in this file reddened the run only via a
+# SEPARATE counter its own site happened to bump (COMPILE_FAILS, STAGE_FAILS,
+# CLI_FAILS, …). This file's own comment beside LEDGER_FAILED already named that
+# as a correctness "that lived in another function and could be broken by adding
+# one verdict site" — and the very next cycle to add one would have shipped a
+# driver that printed `1 poisoned` and exited 0 while its twin exited 1 on the
+# same tree. The specific counters above stay: they come FIRST because each names
+# WHICH half broke, and this is the backstop that cannot be forgotten.
+# [D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT]
+if [[ "$LEDGER_FAILED" -gt 0 ]]; then
+  declare -a _poisoned_legs=()
+  for leg in "${LEG_DECLARED[@]}"; do
+    [[ "${LEG_VERDICT[$leg]:-}" != "poisoned" ]] || _poisoned_legs+=("$leg")
+  done
+  printf '\n%s%d leg(s) POISONED: %s%s\n' "$C_RED" "$LEDGER_FAILED" "${_poisoned_legs[*]}" "$C_RST"
+  printf 'Each one is named above with its reason. `poisoned` is the closed vocabulary'\''s FAILURE\n'
+  printf 'class — "no artifact was exercised and the reason is OURS" — so this run proved nothing\n'
+  printf 'about those targets and must not exit 0.\n'
+  exit 1
+fi
 if [[ ${#ENV_SKIPS[@]} -gt 0 && "$STRICT_VERDICTS" -eq 1 ]]; then exit 1; fi
 # ★ THE CLOSING CLAIM IS BOUNDED BY THE LEDGER. It used to read "every leg
 # compiled ... GREEN", which on the old driver meant "every leg this host happened
@@ -6969,6 +7429,10 @@ if [[ ${#ENV_SKIPS[@]} -gt 0 && "$STRICT_VERDICTS" -eq 1 ]]; then exit 1; fi
 # another function and could be broken by adding one verdict site (this cycle added
 # one). A closing line that hardcodes its own denominator is the same defect class
 # as the ledger accounting hole it sits next to.
+# ⓘ THAT FRAGILITY IS GONE AS OF 2026-08-20: `LEDGER_FAILED` now has its own
+# `exit 1` above, so a new `poisoned` site reds the run whether or not it
+# remembers to bump a counter. The sentence above is kept because it is the
+# reasoning that found it, not because the hazard is still live.
 # ★ A CAPABILITY GAP FAILS THE RUN, and it fails it HERE rather than mid-leg so
 #   the other legs still produce their verdicts — one stage defect must not cost
 #   us four legs' results. It is a HARNESS failure, never a DSS one: the compiler

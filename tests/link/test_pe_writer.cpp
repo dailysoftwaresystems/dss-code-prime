@@ -20,6 +20,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/format/coff_object_reader.hpp"   // the round-trip acceptance test
 #include "link/format/pe.hpp"
 #include "link/image_request.hpp"
 #include "link/linker.hpp"
@@ -320,51 +321,1078 @@ TEST(PeWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal) 
         << "static fn B is IMAGE_SYM_CLASS_STATIC (3), not EXTERNAL — the TF-C54 fix";
 }
 
-// ── D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined symbol fails loud ──
+// ── D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK DEFINITION IS A COMDAT ──
 //
-// The relocatable PE/COFF writer cannot faithfully emit a WEAK DEFINED symbol
-// (COFF weak-external — IMAGE_SYM_CLASS_WEAK_EXTERNAL + its aux record — is not
-// wired). Degrading it to IMAGE_SYM_CLASS_EXTERNAL would SILENTLY lose the
-// weak-override semantics, so the writer fails loud instead. RED-ON-DISABLE:
-// reverting the fail-loud arm makes the writer emit the weak fn as EXTERNAL (2)
-// with 0 errors — this pin (empty bytes + exactly one K_NoMatchingObjectFormat
-// citing the anchor) goes red. The ELF sibling (Weak → STB_WEAK, native) +
-// the PE/Mach-O EXEC arms (weak forced Global / merge-resolved) are unaffected.
-TEST(PeWriter, ObjectWeakDefinedFunctionFailsLoud) {
+// COFF has no per-symbol "weak" storage class for a DEFINITION.
+// IMAGE_SYM_CLASS_WEAK_EXTERNAL is a weak *REFERENCE* with a fallback: the
+// PE/COFF format requires such a symbol to have "EXTERNAL storage class, UNDEF
+// section number, and a value of zero" and an Auxiliary Format 3 record naming
+// the `sym2` to use instead. A weak DEFINITION is a section flagged
+// IMAGE_SCN_LNK_COMDAT whose section-definition auxiliary record (Auxiliary
+// Format 5) carries Selection = IMAGE_COMDAT_SELECT_ANY(2).
+//
+// These pins exist because the two shapes are easy to confuse and the confusion
+// is SILENT: an object written the wrong way links fine and reads back with the
+// wrong semantics. DSS's own COFF reader lifts Selection ANY to
+// `SymbolBinding::Weak`, so the round-trip pin below is the acceptance test.
+
+// Every diagnostic a reporter collected, for a failure message that names the
+// cause instead of only the count.
+[[nodiscard]] std::string diagSummary(DiagnosticReporter const& rep) {
+    std::string out;
+    for (auto const& d : rep.all()) {
+        out += "\n  [" + std::to_string(static_cast<int>(d.code)) + "] "
+               + d.actual;
+    }
+    return out.empty() ? std::string{"(no diagnostics)"} : out;
+}
+
+// The COFF wire offsets these pins walk. Named rather than spelled inline so a
+// reader can check them against the format document instead of counting bytes.
+constexpr std::size_t kCoffFileHeaderSize   = 20;
+constexpr std::size_t kCoffSectionHdrSize   = 40;
+constexpr std::size_t kCoffSymbolRecordSize = 18;
+constexpr std::size_t kSecHdrCharacteristicsOff = 36;
+constexpr std::size_t kSymValueOff        = 8;
+constexpr std::size_t kSymSectionNumberOff = 12;
+constexpr std::size_t kSymTypeOff          = 14;
+constexpr std::size_t kSymStorageClassOff  = 16;
+constexpr std::size_t kSymNumAuxOff        = 17;
+// Auxiliary Format 5 (Section Definitions).
+constexpr std::size_t kAuxLengthOff      = 0;   // Length[4]
+constexpr std::size_t kAuxNumRelocsOff   = 4;   // NumberOfRelocations[2]
+constexpr std::size_t kAuxSelectionOff   = 14;  // Selection[1]
+// Auxiliary Format 3 (Weak Externals): TagIndex[4] Characteristics[4]
+// Unused[10]. ✔VERIFIED against the Windows SDK's `IMAGE_AUX_SYMBOL_EX::Sym`,
+// which declares the same two DWORDs at the same offsets.
+constexpr std::size_t kAuxWeakTagIndexOff       = 0;
+constexpr std::size_t kAuxWeakCharacteristicsOff = 4;
+constexpr std::uint32_t kImageWeakExternSearchAlias = 3;
+constexpr std::uint32_t kImageScnLnkComdat        = 0x00001000u;
+constexpr std::uint8_t  kImageComdatSelectAny     = 2;
+constexpr std::uint8_t  kImageSymClassExternal    = 2;
+constexpr std::uint8_t  kImageSymClassStatic      = 3;
+constexpr std::uint8_t  kImageSymClassWeakExternal = 105;
+
+// One IMAGE_SECTION_HEADER's Characteristics, by 1-based COFF ordinal.
+[[nodiscard]] std::uint32_t sectionCharacteristics(
+    std::span<std::uint8_t const> bytes, std::int16_t ordinal) {
+    std::size_t const off = kCoffFileHeaderSize
+                            + static_cast<std::size_t>(ordinal - 1)
+                                  * kCoffSectionHdrSize;
+    return readU32LE(bytes, off + kSecHdrCharacteristicsOff);
+}
+
+// A symbol record's file offset, by SymbolTableIndex (aux records occupy
+// index slots, which is exactly what this arithmetic has to respect).
+[[nodiscard]] std::size_t symRecOff(std::span<std::uint8_t const> bytes,
+                                    std::uint32_t index) {
+    return readU32LE(bytes, 8) + static_cast<std::size_t>(index)
+                                     * kCoffSymbolRecordSize;
+}
+
+[[nodiscard]] std::string symInlineName(std::span<std::uint8_t const> bytes,
+                                        std::uint32_t index) {
+    std::size_t const off = symRecOff(bytes, index);
+    std::string s;
+    for (std::size_t i = 0; i < 8 && bytes[off + i] != 0; ++i) {
+        s.push_back(static_cast<char>(bytes[off + i]));
+    }
+    return s;
+}
+
+// A symbol's name whichever of the TWO COFF spellings it uses: inline in the
+// 8-byte field, or (first four bytes zero) an offset into the string table that
+// follows the symbol table. `symInlineName` above reads only the first form,
+// which is all the older pins need.
+[[nodiscard]] std::string symAnyName(std::span<std::uint8_t const> bytes,
+                                     std::uint32_t index) {
+    std::size_t const off = symRecOff(bytes, index);
+    if (readU32LE(bytes, off) != 0u) return symInlineName(bytes, index);
+    std::size_t p = readU32LE(bytes, 8)
+                    + static_cast<std::size_t>(readU32LE(bytes, 12))
+                          * kCoffSymbolRecordSize
+                    + readU32LE(bytes, off + 4);
+    std::string s;
+    while (p < bytes.size() && bytes[p] != 0) {
+        s.push_back(static_cast<char>(bytes[p++]));
+    }
+    return s;
+}
+
+// Every SYMBOL record's SymbolTableIndex, in file order, with the AUXILIARY
+// slots skipped -- the walk PE/COFF 5.5.6 describes when it says "the first
+// symbol that has the section value of the COMDAT section". An aux record
+// occupies an index slot but is NOT a symbol, so a walk that stepped by one
+// would read aux payload bytes as a symbol record.
+[[nodiscard]] std::vector<std::uint32_t> symbolIndices(
+    std::span<std::uint8_t const> bytes) {
+    std::vector<std::uint32_t> out;
+    std::uint32_t const n = readU32LE(bytes, 12);
+    for (std::uint32_t i = 0; i < n;
+         i += 1u + bytes[symRecOff(bytes, i) + kSymNumAuxOff]) {
+        out.push_back(i);
+    }
+    return out;
+}
+
+// The symbol records that bear `sectionNumber`, in file order. POSITION in this
+// list is the whole subject of the COMDAT ordering rule.
+[[nodiscard]] std::vector<std::uint32_t> symbolIndicesInSection(
+    std::span<std::uint8_t const> bytes, std::int16_t sectionNumber) {
+    std::vector<std::uint32_t> out;
+    for (std::uint32_t const i : symbolIndices(bytes)) {
+        if (readI16LE(bytes, symRecOff(bytes, i) + kSymSectionNumberOff)
+            == sectionNumber) {
+            out.push_back(i);
+        }
+    }
+    return out;
+}
+
+// The whole symbol table, one line per record, so an ordering failure reports
+// the ORDER it found rather than only the index that disagreed.
+[[nodiscard]] std::string symTableDump(std::span<std::uint8_t const> bytes) {
+    std::string out;
+    for (std::uint32_t const i : symbolIndices(bytes)) {
+        std::size_t const off = symRecOff(bytes, i);
+        out += "\n  [" + std::to_string(i) + "] " + symAnyName(bytes, i)
+               + "  sect="
+               + std::to_string(readI16LE(bytes, off + kSymSectionNumberOff))
+               + " class="
+               + std::to_string(
+                     static_cast<int>(bytes[off + kSymStorageClassOff]))
+               + " naux="
+               + std::to_string(static_cast<int>(bytes[off + kSymNumAuxOff]));
+    }
+    return out;
+}
+
+// A module with one STRONG and one WEAK defined function. The weak one is the
+// `__attribute__((weak))` shape c-subset.lang.json produces
+// (examples/c-subset/attributes_syntax's `weak_helper`); `definedBinding`
+// returns Weak for it.
+[[nodiscard]] AssembledModule strongPlusWeakFunctionModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction s;
+    s.symbol = SymbolId{10};
+    s.bytes  = {0xC3};
+    mod.functions.push_back(std::move(s));
+    AssembledFunction w;
+    w.symbol = SymbolId{11};
+    w.bytes  = {0x90, 0xC3};
+    mod.functions.push_back(std::move(w));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "strongfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "weakfn",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    return mod;
+}
+
+// The weak function's body goes into a COMDAT section of its OWN, and the
+// symbol table carries the section-definition symbol + its Auxiliary Format 5
+// record + the EXTERNAL COMDAT symbol, in that order.
+//
+// ✔MEASURED 2026-08-20 against BOTH reference encoders: cl.exe 14.51.36231 and
+// clang (--target=x86_64-pc-windows-msvc) each emit exactly this pair for a
+// `__declspec(selectany)` global — a plain-named second section flagged COMDAT,
+// a STATIC section symbol whose aux reads `selection 2 (pick any)`, then the
+// EXTERNAL name at Value 0.
+//
+// RED-ON-DISABLE: emit the weak definition into the shared `.text` as a plain
+// EXTERNAL record (the pre-fix silent degradation) → NumberOfSections falls to
+// 1, the aux record disappears and every assertion below reds.
+TEST(PeWriter, ObjectWeakDefinedFunctionEmitsOwnComdatSelectAnySection) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod = strongPlusWeakFunctionModule();
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    ASSERT_FALSE(bytes.empty());
+
+    ASSERT_EQ(readU16LE(bytes, 2), 2u)
+        << "the weak definition needs a section of its OWN: COMDAT selection is "
+           "a per-SECTION policy, so `.text` plus one COMDAT section";
+    // `.text` itself must NOT become a COMDAT — the strong function lives there
+    // and is not coalescible.
+    EXPECT_EQ(sectionCharacteristics(bytes, 1) & kImageScnLnkComdat, 0u)
+        << "the ordinary .text must not be flagged COMDAT";
+    EXPECT_EQ(sectionCharacteristics(bytes, 2) & kImageScnLnkComdat,
+              kImageScnLnkComdat)
+        << "the weak definition's own section must carry IMAGE_SCN_LNK_COMDAT";
+
+    ASSERT_EQ(readU32LE(bytes, 12), 4u)
+        << "strongfn, the COMDAT section symbol, its AUX SLOT, and weakfn - the "
+           "aux record occupies a symbol-table index slot";
+
+    // [0] the strong function, untouched by any of this.
+    EXPECT_EQ(symInlineName(bytes, 0), "strongfn");
+    EXPECT_EQ(bytes[symRecOff(bytes, 0) + kSymStorageClassOff],
+              kImageSymClassExternal);
+    EXPECT_EQ(readU16LE(bytes, symRecOff(bytes, 0) + kSymSectionNumberOff), 1u);
+
+    // [1] the COMDAT section's own symbol. The format requires it to be the
+    // FIRST symbol with that section number and to carry exactly one aux.
+    EXPECT_EQ(symInlineName(bytes, 1), ".text")
+        << "a section-definition symbol is NAMED for its section - DSS's own "
+           "reader recognises it by that name plus a following aux record";
+    EXPECT_EQ(bytes[symRecOff(bytes, 1) + kSymStorageClassOff],
+              kImageSymClassStatic);
+    EXPECT_EQ(readU16LE(bytes, symRecOff(bytes, 1) + kSymSectionNumberOff), 2u);
+    EXPECT_EQ(bytes[symRecOff(bytes, 1) + kSymNumAuxOff], 1u)
+        << "without the aux count the reader never looks at the Selection byte";
+
+    // [2] the Auxiliary Format 5 record: Length[4] NumberOfRelocations[2]
+    //     NumberOfLinenumbers[2] CheckSum[4] Number[2] Selection[1] Unused[3].
+    std::size_t const aux = symRecOff(bytes, 2);
+    EXPECT_EQ(readU32LE(bytes, aux + kAuxLengthOff), 2u)
+        << "Length duplicates the section's SizeOfRawData - the weak body is 2 bytes";
+    EXPECT_EQ(readU16LE(bytes, aux + kAuxNumRelocsOff), 0u);
+    EXPECT_EQ(bytes[aux + kAuxSelectionOff], kImageComdatSelectAny)
+        << "IMAGE_COMDAT_SELECT_ANY(2) is what 'several units may define this, "
+           "keep one' means - and what DSS's reader lifts back to Weak";
+
+    // [3] the COMDAT symbol itself.
+    EXPECT_EQ(symInlineName(bytes, 3), "weakfn");
+    EXPECT_EQ(bytes[symRecOff(bytes, 3) + kSymStorageClassOff],
+              kImageSymClassExternal)
+        << "the COMDAT symbol is EXTERNAL - the weakness lives on the SECTION";
+    EXPECT_EQ(readU16LE(bytes, symRecOff(bytes, 3) + kSymSectionNumberOff), 2u);
+    EXPECT_EQ(readU32LE(bytes, symRecOff(bytes, 3) + kSymValueOff), 0u)
+        << "a COMDAT section holds exactly one body, so its symbol sits at 0";
+    EXPECT_EQ(readU16LE(bytes, symRecOff(bytes, 3) + kSymTypeOff), 0x20u)
+        << "still a FUNCTION symbol";
+}
+
+// The same strong+weak pair, with the WEAK function carrying an interior BLOCK
+// LABEL (the `&&label` / dense-switch jump-table target shape). Its body is two
+// 4-byte blocks and the label names the second. A block label inside a weak
+// function belongs to that function's COMDAT section, so this is the module in
+// which TWO different appends name the COMDAT ordinal -- which is what makes
+// the PE/COFF 5.5.6 ordering rule observable at all. Nothing else in this file
+// pairs `blockSymbols` with a weak definition.
+[[nodiscard]] AssembledModule weakFunctionWithInteriorBlockLabelModule() {
+    AssembledModule mod = strongPlusWeakFunctionModule();
+    mod.functions[1].bytes = {0xC3, 0x90, 0x90, 0x90,     // block 0
+                              0xC3, 0x90, 0x90, 0x90};    // block 1 at 4
+    mod.functions[1].blockSymbols.push_back(
+        {SymbolId{77}, /*blockByteOffset=*/4u});
+    return mod;
+}
+
+// ★★ THE COMDAT SECTION SYMBOL MUST BE THE FIRST RECORD THAT NAMES ITS SECTION.
+//
+// PE/COFF 5.5.6: "The first symbol that has the section value of the COMDAT
+// section must be the section symbol... The second symbol is called 'the COMDAT
+// symbol' and is used by the linker in conjunction with the Selection field."
+// A consumer that follows that sentence reads the FIRST record bearing the
+// ordinal and takes ITS auxiliary as the section definition.
+//
+// The hazard is specific. A weak function's interior block labels name the
+// function's COMDAT section (they must -- naming `.text` would point the label
+// at a section its body is not in). Appended ahead of the group, such a label
+// becomes the first record bearing the ordinal and carries no auxiliary at all,
+// so the Selection byte is unreachable. ✔MEASURED 2026-08-21 on an object this
+// writer produced that way: dumpbin 14.51.36252 reads the section header as
+// `COMDAT; sym= sym_77` (the key became a per-module block label), and link.exe
+// 14.51.36252 REFUSES the object -- `fatal error LNK1162: expected aux symbol
+// for COMDAT section 0x2` -- from a single object with nothing else on the
+// command line. With the ordering correct, the same shapes read
+// `COMDAT; sym= weakfn` and link clean.
+//
+// ⚠ DSS'S OWN ROUND TRIP CANNOT WITNESS THIS, so a read-back assertion is not
+// an acceptable substitute -- it stayed GREEN over the object link.exe rejects.
+// `coff_object_reader` finds the section-definition symbol BY NAME plus a
+// following aux record and scans the WHOLE table for it, which reads the
+// Selection correctly from any position. The property lives in the POSITION, so
+// this pin reads the emitted bytes and asserts the position.
+//
+// RED-ON-DISABLE: move the "One group per WEAK DEFINITION" append in
+// `pe::encode`'s Obj arm back after the block-symbol walk -> `sym_77` becomes
+// the first record bearing SectionNumber 2 and the first assertions below fail.
+// (With the writer's own ordering tripwire intact that reordering fails loud
+// instead, which is the better half of the same protection.)
+TEST(PeWriter, ComdatSectionSymbolIsTheFirstRecordNamingItsSection) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod = weakFunctionWithInteriorBlockLabelModule();
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    ASSERT_FALSE(bytes.empty());
+
+    // `.text` is 1 and this module declares no data section, so the weak
+    // function's COMDAT is ordinal 2.
+    constexpr std::int16_t kComdatOrdinal = 2;
+    ASSERT_EQ(readU16LE(bytes, 2), 2u) << symTableDump(bytes);
+
+    auto const inComdat = symbolIndicesInSection(bytes, kComdatOrdinal);
+    ASSERT_EQ(inComdat.size(), 3u)
+        << "the section symbol, the COMDAT symbol and the interior block label "
+           "each name the COMDAT section"
+        << symTableDump(bytes);
+
+    // FIRST: the section symbol. Named for its section, STATIC, and carrying
+    // the one auxiliary record the Selection byte lives in.
+    EXPECT_EQ(symAnyName(bytes, inComdat[0]), ".text") << symTableDump(bytes);
+    EXPECT_EQ(bytes[symRecOff(bytes, inComdat[0]) + kSymStorageClassOff],
+              kImageSymClassStatic)
+        << symTableDump(bytes);
+    ASSERT_EQ(bytes[symRecOff(bytes, inComdat[0]) + kSymNumAuxOff], 1u)
+        << "the first record bearing the ordinal is where a conforming consumer "
+           "looks for the section definition; one with no auxiliary leaves the "
+           "Selection byte unreachable - link.exe answers LNK1162 and produces "
+           "no image at all"
+        << symTableDump(bytes);
+    EXPECT_EQ(bytes[symRecOff(bytes, inComdat[0] + 1u) + kAuxSelectionOff],
+              kImageComdatSelectAny)
+        << symTableDump(bytes);
+
+    // SECOND: the COMDAT symbol -- the name the Selection field coalesces on.
+    EXPECT_EQ(symAnyName(bytes, inComdat[1]), "weakfn") << symTableDump(bytes);
+    EXPECT_EQ(bytes[symRecOff(bytes, inComdat[1]) + kSymStorageClassOff],
+              kImageSymClassExternal)
+        << symTableDump(bytes);
+
+    // THIRD and after: ordinary members of the section. The block label is a
+    // LOCAL at its offset within the COMDAT, and must displace neither of the
+    // two records above.
+    EXPECT_EQ(symAnyName(bytes, inComdat[2]), "sym_77") << symTableDump(bytes);
+    EXPECT_EQ(bytes[symRecOff(bytes, inComdat[2]) + kSymStorageClassOff],
+              kImageSymClassStatic)
+        << symTableDump(bytes);
+    EXPECT_EQ(readU32LE(bytes, symRecOff(bytes, inComdat[2]) + kSymValueOff), 4u)
+        << "Value is the offset WITHIN the COMDAT section - a weak function's "
+           "body starts that section, so its funcTextStart is 0 and the label "
+           "sits at its blockByteOffset"
+        << symTableDump(bytes);
+}
+
+// ★★★ THE ACCEPTANCE TEST — the pin IMAGE_SYM_CLASS_WEAK_EXTERNAL would fail.
+//
+// The DSS writer emits a weak definition and DSS'S OWN COFF READER reads it
+// back as `SymbolBinding::Weak`. This is what makes the mechanism choice a
+// measurement rather than an opinion: the reader's COMDAT gate lifts Selection
+// ANY/SAME_SIZE/EXACT_MATCH to Weak, so an object written with WEAK_EXTERNAL
+// would come back with the real name UNDEFINED and the body under a synthetic
+// name — a round-trip break in a project that keeps a round-trip oracle.
+//
+// RED-ON-DISABLE: any degradation of the write side (plain EXTERNAL in `.text`,
+// or a COMDAT with NODUPLICATES(1)) makes the read-back Global, not Weak.
+TEST(PeWriter, ObjectWeakDefinitionRoundTripsBackToWeakThroughDssReader) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod = strongPlusWeakFunctionModule();
+    DiagnosticReporter wrep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u) << diagSummary(wrep);
+
+    DiagnosticReporter rrep;
+    auto back = pe::readRelocatableObject(bytes, *loaded.target,
+                                          *loaded.format, rrep);
+    ASSERT_TRUE(back.has_value()) << diagSummary(rrep);
+    ASSERT_EQ(rrep.errorCount(), 0u) << diagSummary(rrep);
+
+    auto bindingOf = [&](std::string const& name)
+        -> std::optional<SymbolBinding> {
+        for (auto const& s : back->symbols) {
+            if (s.name == name) return s.binding;
+        }
+        return std::nullopt;
+    };
+    auto const weak = bindingOf("weakfn");
+    ASSERT_TRUE(weak.has_value())
+        << "the weak definition's NAME must survive the round trip";
+    EXPECT_EQ(*weak, SymbolBinding::Weak)
+        << "COMDAT select-any must read back as Weak - this is the whole "
+           "reason the mechanism is COMDAT and not WEAK_EXTERNAL";
+    auto const strong = bindingOf("strongfn");
+    ASSERT_TRUE(strong.has_value());
+    EXPECT_EQ(*strong, SymbolBinding::Global)
+        << "the strong sibling must NOT be dragged weak by its neighbour";
+
+    // The bodies must survive intact and separately — a COMDAT section that
+    // swallowed the wrong bytes would still read back with the right binding.
+    auto bodyOf = [&](std::string const& name)
+        -> std::vector<std::uint8_t> {
+        for (auto const& f : back->functions) {
+            for (auto const& s : back->symbols) {
+                if (s.symbol == f.symbol && s.name == name) return f.bytes;
+            }
+        }
+        return {};
+    };
+    EXPECT_EQ(bodyOf("strongfn"), (std::vector<std::uint8_t>{0xC3}));
+    EXPECT_EQ(bodyOf("weakfn"), (std::vector<std::uint8_t>{0x90, 0xC3}));
+}
+
+// A weak DEFINITION and an undefined REFERENCE must not collapse into one
+// another. The 2026-08-05 correction to D-LK-OBJECT-WEAK-DEF-RELOCATABLE turns
+// exactly on this distinction, so it gets a pin of its own: the definition
+// names a REAL section and carries a COMDAT aux, the reference names UNDEF and
+// carries none, and NOTHING in the object uses storage class 105
+// (IMAGE_SYM_CLASS_WEAK_EXTERNAL), which is the encoding a weak definition
+// must never silently become.
+TEST(PeWriter, WeakDefinitionAndUndefinedReferenceEmitDifferentCoffShapes) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod = strongPlusWeakFunctionModule();
+    // Give the strong function a call to an undefined extern, so the object
+    // carries BOTH shapes at once.
+    mod.functions[0].bytes = {0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    mod.functions[0].relocations.push_back(
+        Relocation{/*offset=*/1u, /*target=*/SymbolId{99},
+                   /*kind=*/RelocationKind{1}, /*addend=*/0});
+    ExternImport ext;
+    ext.symbol      = SymbolId{99};
+    ext.mangledName = "extfn";
+    ext.isData      = false;
+    mod.externImports.push_back(std::move(ext));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+
+    std::uint32_t const numSyms = readU32LE(bytes, 12);
+    bool sawWeakDef = false;
+    bool sawUndefRef = false;
+    for (std::uint32_t i = 0; i < numSyms; ++i) {
+        std::size_t const off = symRecOff(bytes, i);
+        std::uint8_t const scl = bytes[off + kSymStorageClassOff];
+        EXPECT_NE(scl, kImageSymClassWeakExternal)
+            << "symbol index " << i << " uses IMAGE_SYM_CLASS_WEAK_EXTERNAL - "
+               "that class is a weak REFERENCE with a fallback alias, not a "
+               "weak DEFINITION, and emitting it here would make DSS's own "
+               "reader read the definition back with the wrong semantics";
+        std::string const name = symInlineName(bytes, i);
+        if (name == "weakfn") {
+            sawWeakDef = true;
+            EXPECT_NE(readU16LE(bytes, off + kSymSectionNumberOff), 0u)
+                << "a weak DEFINITION names a real section; UNDEF would make it "
+                   "a reference that defines nothing";
+            EXPECT_EQ(bytes[off + kSymNumAuxOff], 0u)
+                << "the COMDAT policy rides the SECTION symbol's aux, never the "
+                   "definition's own record";
+        }
+        if (name == "extfn") {
+            sawUndefRef = true;
+            EXPECT_EQ(readU16LE(bytes, off + kSymSectionNumberOff), 0u)
+                << "an undefined reference is UNDEF (SectionNumber 0)";
+            EXPECT_EQ(bytes[off + kSymNumAuxOff], 0u);
+        }
+        // i is a record index; an aux slot belongs to the record before it and
+        // must not be decoded as a record. Skip it.
+        if (bytes[off + kSymNumAuxOff] == 1u) ++i;
+    }
+    EXPECT_TRUE(sawWeakDef) << "the weak definition must be present by name";
+    EXPECT_TRUE(sawUndefRef) << "the undefined reference must be present by name";
+}
+
+// A relocation FROM inside a weak definition's body belongs to that COMDAT
+// SECTION'S OWN relocation table, at an offset relative to THAT section - not
+// to `.text`'s table at a `.text`-relative offset. A section's relocation table
+// is a property of the section, and link.exe reads each table through its own
+// header, so a record filed under the wrong section patches the wrong bytes of
+// a different contribution. The section-definition aux record duplicates the
+// count, and a stale duplicate of a header field reads as corruption.
+//
+// RED-ON-DISABLE: route the weak body's relocations back into `textRelocs`
+// (the shared table) -> .text's NumberOfRelocations reads 1 and the COMDAT's
+// reads 0, inverting both assertions.
+TEST(PeWriter, WeakDefinitionBodyRelocationsGoToItsOwnComdatRelocTable) {
     auto loaded = loadShipped();
     ASSERT_TRUE(loaded.target && loaded.format);
 
     AssembledModule mod;
-    mod.expectedFuncCount = 1;
-    AssembledFunction w;
-    w.symbol = SymbolId{10};
-    w.bytes  = {0xC3};
-    mod.functions.push_back(std::move(w));
-    // A WEAK, externally-visible defined function (the `__attribute__((weak))`
-    // shape c-subset.lang.json produces). `definedBinding` returns Weak.
-    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "weakfn",
+    mod.expectedFuncCount = 2;
+    AssembledFunction callee;
+    callee.symbol = SymbolId{10};
+    callee.bytes  = {0xC3};
+    mod.functions.push_back(std::move(callee));
+    AssembledFunction weak;      // the WEAK body, and it calls the strong one
+    weak.symbol = SymbolId{11};
+    weak.bytes  = {0x90, 0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    weak.relocations.push_back(
+        Relocation{/*offset=*/2u, /*target=*/SymbolId{10},
+                   /*kind=*/RelocationKind{1}, /*addend=*/0});
+    mod.functions.push_back(std::move(weak));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "strongfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "weakfn",
                                        SymbolBinding::Weak,
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
     auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    ASSERT_EQ(readU16LE(bytes, 2), 2u);
+
+    std::size_t const textHdr   = kCoffFileHeaderSize;
+    std::size_t const comdatHdr = kCoffFileHeaderSize + kCoffSectionHdrSize;
+    EXPECT_EQ(readU16LE(bytes, textHdr + 32), 0u)
+        << ".text owns no relocation here - the only reloc is inside the weak "
+           "body, which is not in .text";
+    ASSERT_EQ(readU16LE(bytes, comdatHdr + 32), 1u)
+        << "the COMDAT section owns its own body's relocation";
+
+    std::uint32_t const relocPtr = readU32LE(bytes, comdatHdr + 24);
+    EXPECT_EQ(readU32LE(bytes, relocPtr), 2u)
+        << "VirtualAddress is relative to the COMDAT SECTION (the call operand "
+           "sits at offset 2 of the weak body, which starts that section), not "
+           "to a shared .text";
+    EXPECT_EQ(symInlineName(bytes, readU32LE(bytes, relocPtr + 4)), "strongfn");
+
+    // The section-definition aux record duplicates the header's fields.
+    // Symbols: [0] strongfn, [1] .text section symbol, [2] its AUX, [3] weakfn.
+    std::size_t const aux = symRecOff(bytes, 2);
+    EXPECT_EQ(readU16LE(bytes, aux + kAuxNumRelocsOff), 1u)
+        << "the aux record's NumberOfRelocations must match its section header";
+    EXPECT_EQ(readU32LE(bytes, aux + kAuxLengthOff), 7u)
+        << "and its Length must match SizeOfRawData - the weak body is 7 bytes";
+    EXPECT_EQ(readU32LE(bytes, comdatHdr + 16), 7u);
+}
+
+// ★ A-3: THE RELOCATION MUST NAME THE COMDAT SYMBOL, NOT ITS AUX SLOT.
+//
+// "Both names are present and resolve to one address" passes even when the
+// symbol-table INDEX arithmetic is wrong, because the names really are there;
+// only the relocations point somewhere else. Aux records occupy index slots, so
+// the moment this writer emitted its first aux record every index minted after
+// it had to skip that slot. This pin is what catches an off-by-the-aux-slot:
+// it reads the emitted IMAGE_RELOCATION's SymbolTableIndex and demands the
+// record it lands on be the weak definition BY NAME.
+TEST(PeWriter, RelocationToAWeakDefinitionResolvesPastTheAuxSlot) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod = strongPlusWeakFunctionModule();
+    // The STRONG function calls the WEAK one, so the reloc target is the
+    // COMDAT symbol that sits immediately AFTER an aux slot.
+    mod.functions[0].bytes = {0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    mod.functions[0].relocations.push_back(
+        Relocation{/*offset=*/1u, /*target=*/SymbolId{11},
+                   /*kind=*/RelocationKind{1}, /*addend=*/0});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+
+    // `.text` (ordinal 1) owns the relocation.
+    std::size_t const secHdr = kCoffFileHeaderSize;
+    std::uint32_t const relocPtr = readU32LE(bytes, secHdr + 24);
+    std::uint16_t const relocCount = readU16LE(bytes, secHdr + 32);
+    ASSERT_EQ(relocCount, 1u) << ".text must carry exactly the one call reloc";
+    std::uint32_t const symIndex = readU32LE(bytes, relocPtr + 4);
+    EXPECT_EQ(symInlineName(bytes, symIndex), "weakfn")
+        << "the relocation's SymbolTableIndex must land on the COMDAT symbol. "
+           "Landing on the section symbol or its aux slot means the index "
+           "arithmetic did not count the aux record as a slot - a WELL-FORMED "
+           "object in which every later relocation names the wrong symbol";
+}
+
+// ── D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB, COFF arm ──
+//
+// Several names on one atom. Each extra name gets its own IMAGE_SYMBOL at the
+// SAME Value / SectionNumber / Type, and — the part that is easy to get wrong
+// — a relocation against the atom must still land on the CANONICAL record.
+// Aliases are not registered in the index map, so an alias emitted without the
+// counter advancing would shift every later record while the map kept the old
+// values: a well-formed object in which relocations name the wrong symbols.
+//
+// RED-ON-DISABLE: drop the alias append → NumberOfSymbols falls and `othername`
+// is absent; emit it without minting a slot → the relocation assertion reds.
+TEST(PeWriter, ObjectSymtabCarriesEveryAliasNameAndRelocKeepsTheCanonical) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction target;
+    target.symbol = SymbolId{10};
+    target.bytes  = {0x90, 0xC3};
+    mod.functions.push_back(std::move(target));
+    AssembledFunction caller;
+    caller.symbol = SymbolId{11};
+    caller.bytes  = {0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    caller.relocations.push_back(
+        Relocation{/*offset=*/1u, /*target=*/SymbolId{10},
+                   /*kind=*/RelocationKind{1}, /*addend=*/0});
+    mod.functions.push_back(std::move(caller));
+    // TWO rows for SymbolId 10: the canonical first, then an alias. COFF puts
+    // the coalescing policy on the SECTION, so an alias shares its canonical's
+    // policy - the bindings must therefore match (a differing one fails loud,
+    // see the sibling pin).
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "realname",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "othernam",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "callerfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+
+    std::uint32_t const numSyms = readU32LE(bytes, 12);
+    ASSERT_EQ(numSyms, 3u) << "canonical + alias + caller";
+    EXPECT_EQ(symInlineName(bytes, 0), "realname");
+    EXPECT_EQ(symInlineName(bytes, 1), "othernam")
+        << "the alias NAME must reach the re-emitted symbol table";
+    EXPECT_EQ(readU32LE(bytes, symRecOff(bytes, 1) + kSymValueOff),
+              readU32LE(bytes, symRecOff(bytes, 0) + kSymValueOff))
+        << "both names must resolve to ONE address";
+    EXPECT_EQ(readU16LE(bytes, symRecOff(bytes, 1) + kSymSectionNumberOff),
+              readU16LE(bytes, symRecOff(bytes, 0) + kSymSectionNumberOff));
+    EXPECT_EQ(readU16LE(bytes, symRecOff(bytes, 1) + kSymTypeOff), 0x20u)
+        << "an alias of a function is a function";
+
+    std::size_t const secHdr = kCoffFileHeaderSize;
+    std::uint32_t const relocPtr = readU32LE(bytes, secHdr + 24);
+    ASSERT_EQ(readU16LE(bytes, secHdr + 32), 1u);
+    EXPECT_EQ(symInlineName(bytes, readU32LE(bytes, relocPtr + 4)), "realname")
+        << "the relocation must still name the CANONICAL record. An alias that "
+           "shifted the table without advancing the index counter leaves every "
+           "later relocation pointing at a different symbol than the one it was "
+           "computed for";
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED — THE WRITER CONSULTS CONFIG.
+//
+// The four pins below are the WRITER half of the row (its config half lives in
+// `test_weak_definition_dialect.cpp`). They exist because the row's own reason
+// for not landing sooner was this: **a key the writer does not READ is worse
+// than no key** — it drifts silently and reads as authoritative. So the claim
+// under test is not "the key parses"; it is "the emitted bytes DEPEND on it".
+//
+// The four arms differ in exactly ONE JSON row, spliced into one otherwise
+// identical schema by `peObjSchemaJson`, so nothing else can explain a
+// divergence:
+//   * declared `comdat`  + a weak definition → ENCODES (and the COMDAT lands);
+//   * declared NOTHING   + a weak definition → REFUSES;
+//   * declared a dialect this walker cannot spell → REFUSES;
+//   * declared NOTHING   + NO weak definition → ENCODES (the anti-overreach
+//     arm: this must not have become a back-door "every pe format must declare
+//     `weakDefinition`" rule).
+// The first and last arms are what make the middle two evidence: without them a
+// refusal could be the fixture being invalid for some unrelated reason.
+// ═════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A minimal but COMPLETE pe `.obj` schema whose only variable is the
+// `weakDefinition` row. `weakDefinitionRow` is spliced verbatim and must end in
+// a comma when non-empty.
+[[nodiscard]] std::string peObjSchemaJson(char const* formatName,
+                                          char const* weakDefinitionRow) {
+    std::string json = R"({
+      "$comment": "Synthetic pe .obj schema for D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED. Complete except for the one row under test, so a refusal can only be about that row.",
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":")";
+    json += formatName;
+    json += R"(","kind":"pe"},
+      "pe": { "machine": 34404, "characteristics": 0 },
+      )";
+    json += weakDefinitionRow;
+    json += R"(
+      "sections": [
+        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}
+      ],
+      "relocations": [
+        {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
+        {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
+        {"name":"IMAGE_REL_AMD64_ADDR32","kind":3,"nativeId":2}
+      ]
+    })";
+    return json;
+}
+
+constexpr char const* kDeclaresComdat =
+    R"("weakDefinition": { "dialect": "comdat" },)";
+// A dialect that names a REAL encoder in this tree (ELF's `STB_WEAK`) which
+// THIS walker does not implement. That is the point: the refusal is about the
+// walker's reach, not about an unknown spelling — an unknown spelling never
+// gets past the loader (see `test_weak_definition_dialect.cpp`).
+constexpr char const* kDeclaresSymbolBinding =
+    R"("weakDefinition": { "dialect": "symbol-binding" },)";
+
+} // namespace
+
+TEST(PeWriter, ObjWeakDefinitionEncodesWhenTheFormatDeclaresComdat) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-weak-comdat", kDeclaresComdat), "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    AssembledModule mod = strongPlusWeakFunctionModule();
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    ASSERT_FALSE(bytes.empty());
+    // The declaration was honoured, not merely accepted: the weak body still
+    // gets its own COMDAT section.
+    ASSERT_EQ(readU16LE(bytes, 2), 2u) << ".text plus one COMDAT section";
+    EXPECT_EQ(sectionCharacteristics(bytes, 2) & kImageScnLnkComdat,
+              kImageScnLnkComdat);
+}
+
+TEST(PeWriter, ObjWeakDefinitionRefusedWhenTheFormatDeclaresNoDialect) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-weak-undeclared", ""), "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+    ASSERT_FALSE((*fmt)->weakDefinition().has_value());
+
+    AssembledModule mod = strongPlusWeakFunctionModule();
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, **target, **fmt, rep);
     EXPECT_TRUE(bytes.empty())
-        << "a weak defined symbol must emit no bytes (loud-fail path), never a "
-           "silently-degraded EXTERNAL record";
-    EXPECT_EQ(rep.errorCount(), 1u)
-        << "exactly one fail-loud diagnostic must fire for the weak def";
-    bool found = false;
+        << "an unanswered schema must produce NO object — emitting the body "
+           "under an assumed spelling is the silent path this refusal replaces";
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::K_FormatLacksWeakDefinitionDialect), 1u)
+        << diagSummary(rep);
+}
+
+TEST(PeWriter, ObjWeakDefinitionRefusedWhenTheDeclaredDialectIsNotThisWalkers) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-weak-wrong-dialect", kDeclaresSymbolBinding),
+        "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+    // The loader ACCEPTED it — the dialect is a real spelling. The refusal
+    // below is therefore the WALKER's, which is the half this row is about.
+    ASSERT_TRUE((*fmt)->weakDefinition().has_value());
+    EXPECT_EQ((*fmt)->weakDefinition()->dialect,
+              WeakDefinitionDialect::SymbolBinding);
+
+    AssembledModule mod = strongPlusWeakFunctionModule();
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "a weak body written under the wrong dialect is published as a "
+           "STRONG definition — the walker must refuse rather than re-spell it";
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::K_FormatLacksWeakDefinitionDialect), 1u)
+        << diagSummary(rep);
+    // The message must name BOTH dialects — the one declared and the one this
+    // walker spells — or the author cannot tell which half to fix. Both are
+    // RENDERED from the name table, so a renamed spelling moves the message
+    // with it instead of leaving a literal behind.
+    std::string const said = diagSummary(rep);
+    EXPECT_NE(said.find("'symbol-binding'"), std::string::npos) << said;
+    EXPECT_NE(said.find("'comdat'"), std::string::npos) << said;
+}
+
+TEST(PeWriter, ObjWithoutAWeakDefinitionNeedsNoDialectDeclaration) {
+    // ★ THE ANTI-OVERREACH ARM. The consultation is gated on the MODULE, not on
+    // the format: a schema that never meets a weak definition is never required
+    // to answer. Without this pin the refusal could quietly become "every pe
+    // `.obj` format must declare `weakDefinition`", which is the REQUIRED-key
+    // shape the row's own reasoning rejects — and it would red every
+    // hand-built pe schema in this tree rather than the one under test.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-no-weak", ""), "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    AssembledModule mod;                 // the SAME module minus the weak half
+    mod.expectedFuncCount = 1;
+    AssembledFunction s;
+    s.symbol = SymbolId{10};
+    s.bytes  = {0xC3};
+    mod.functions.push_back(std::move(s));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "strongfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, **target, **fmt, rep);
+    EXPECT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    EXPECT_FALSE(bytes.empty());
+    EXPECT_EQ(::dss::test_support::countCode(
+                  rep, DiagnosticCode::K_FormatLacksWeakDefinitionDialect), 0u)
+        << diagSummary(rep);
+}
+
+// ★★ A WEAK ALIAS OF A STRONG DEFINITION IS NOW EMITTED, THROUGH THE OTHER
+// COFF MECHANISM -- and this test REPLACES a refusal pin rather than weakening
+// one. What that pin protected was a SILENT BINDING CHANGE: an alias shipped as
+// a plain duplicate IMAGE_SYMBOL inherits the canonical's section, hence the
+// canonical's coalescing policy, and its weakness vanishes with no diagnostic.
+// That protection is unchanged and is what the assertions below check -- the
+// alias must NOT be a duplicate defined record. It must be the weak-external
+// form: UNDEF, Value 0, class 105, with an Auxiliary Format 3 record whose
+// TagIndex names the canonical (PE/COFF 5.5.3).
+//
+// The refusal itself survives for the shape that still has no encoding; see the
+// next test. ⓘ Operator ruling 2026-08-20 supersedes
+// [[D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE]]'s "do not build the writer",
+// whose premise was zero consumers plus a front-end blocker: the consumer is
+// RE-EMISSION of an object DSS read, which does not go through a front end.
+//
+// RED-ON-DISABLE: force the weak-external arm back to the fail-loud arm → this
+// reddens; force it to emit a plain duplicate record → the class/section
+// assertions redden while the "two names survive" ones stay green, which is
+// exactly the silent change the original pin existed to catch.
+TEST(PeWriter, WeakAliasOfAStrongDefinitionEmitsAWeakExternalRecord) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{10};
+    f.bytes  = {0x90, 0x90, 0xC3};
+    mod.functions.push_back(std::move(f));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "strongfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "weakalia",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(bytes.empty()) << diagSummary(rep);
+    EXPECT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+
+    // [0] the canonical: a DEFINED function in `.text`.
+    EXPECT_EQ(symInlineName(bytes, 0), "strongfn");
+    EXPECT_EQ(bytes[symRecOff(bytes, 0) + kSymStorageClassOff],
+              kImageSymClassExternal);
+    EXPECT_EQ(readU16LE(bytes, symRecOff(bytes, 0) + kSymSectionNumberOff), 1u);
+    EXPECT_EQ(bytes[symRecOff(bytes, 0) + kSymNumAuxOff], 0u);
+
+    // [1] the alias: the WEAK-EXTERNAL form. Every clause of 5.5.3's shape is
+    // asserted, because the record is only a weak external if all of them hold
+    // -- a class-105 record that is section-backed is not one, and a reader is
+    // entitled to refuse it.
+    EXPECT_EQ(symInlineName(bytes, 1), "weakalia");
+    EXPECT_EQ(bytes[symRecOff(bytes, 1) + kSymStorageClassOff],
+              kImageSymClassWeakExternal)
+        << "a duplicate EXTERNAL record here is the silent weak->strong change "
+           "the refusal this test replaces existed to prevent";
+    EXPECT_EQ(readU16LE(bytes, symRecOff(bytes, 1) + kSymSectionNumberOff), 0u)
+        << "5.5.3: a weak external has UNDEF section number -- it DEFINES nothing";
+    EXPECT_EQ(readU32LE(bytes, symRecOff(bytes, 1) + kSymValueOff), 0u)
+        << "5.5.3: ...and a value of zero";
+    EXPECT_EQ(readU16LE(bytes, symRecOff(bytes, 1) + kSymTypeOff), 0x20u)
+        << "the alias of a function is still typed a function";
+    ASSERT_EQ(bytes[symRecOff(bytes, 1) + kSymNumAuxOff], 1u)
+        << "without the auxiliary record the name defers to nothing";
+
+    // [2] the auxiliary record itself: TagIndex must name the CANONICAL's
+    // symbol-table index, not its position in any other list.
+    std::size_t const aux = symRecOff(bytes, 2);
+    EXPECT_EQ(readU32LE(bytes, aux + kAuxWeakTagIndexOff), 0u)
+        << "the default symbol is `strongfn` at symbol-table index 0";
+    EXPECT_EQ(readU32LE(bytes, aux + kAuxWeakCharacteristicsOff),
+              kImageWeakExternSearchAlias)
+        << "SEARCH_ALIAS(3) is the ONLY value a foreign linker resolves a "
+           "cross-object weak alias under. ✔MEASURED, one object per value with "
+           "the reference in another TU: 1 -> link.exe LNK2019, 2 -> LNK2019, "
+           "3 -> links and the binary runs 42. The semantic reading says 1 is "
+           "the conditional form and it is what gcc emits -- and it does not "
+           "work, because gcc never needs its own value to make the alias "
+           "reachable from outside the object";
+
+    // The relocation coordinate must not have shifted. The aux occupies a
+    // symbol-table INDEX, so a writer that minted one slot for a two-slot
+    // record rebinds every later relocation to the wrong symbol.
+    std::uint32_t const numberOfSymbols = readU32LE(bytes, 12);
+    EXPECT_EQ(numberOfSymbols, 3u)
+        << "canonical + weak external + its auxiliary = three index slots";
+}
+
+// The shape that STILL has no encoding, EXERCISED rather than read: an alias
+// that is STRONGER than its canonical. A weak external is by construction the
+// name that yields, so it cannot express a name that must not yield, and the
+// shared COMDAT section would drag the strong name into the weak canonical's
+// coalescing. The refusal is NARROWED, never deleted.
+//
+// RED-ON-DISABLE: widen the weak-external arm to any differing binding → this
+// object ships with 0 errors and the strong alias silently becomes overridable.
+TEST(PeWriter, AliasStrongerThanItsCanonicalStillFailsLoud) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{10};
+    f.bytes  = {0xC3};
+    mod.functions.push_back(std::move(f));
+    // The CANONICAL is the first row for the id, so this module's canonical is
+    // WEAK and its alias is GLOBAL -- the inverse of the representable case.
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "weakcano",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "strongal",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty())
+        << "an unrepresentable alias binding must emit NO bytes, never an alias "
+           "silently carrying the canonical's policy";
+    EXPECT_EQ(rep.errorCount(), 1u) << diagSummary(rep);
+    bool cited = false;
+    bool namesTheMechanism = false;
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat &&
-            d.actual.find("D-LK-OBJECT-WEAK-DEF-RELOCATABLE") !=
-                std::string::npos) {
-            found = true;
-            break;
+        if (d.actual.find("D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB")
+            != std::string::npos) {
+            cited = true;
+        }
+        if (d.actual.find("cannot express an alias that must NOT yield")
+            != std::string::npos) {
+            namesTheMechanism = true;
         }
     }
-    EXPECT_TRUE(found)
-        << "the diagnostic must cite D-LK-OBJECT-WEAK-DEF-RELOCATABLE (the "
-           "COFF weak-external deferral) for future-grep navigability";
+    EXPECT_TRUE(cited) << diagSummary(rep);
+    EXPECT_TRUE(namesTheMechanism)
+        << "the refusal must say WHY this shape and not the other one -- a "
+           "reader who has just seen a weak alias emitted needs the distinction: "
+        << diagSummary(rep);
+}
+
+// ★ THE ROUND TRIP, which is the acceptance test the anchor names: DSS writes a
+// weak-alias-of-strong object and DSS's OWN reader recovers BOTH names with
+// THEIR OWN bindings. The structural pins above prove the bytes; only this
+// proves the two halves agree about what those bytes mean.
+//
+// RED-ON-DISABLE: any of the reader's weak-external arm, the writer's
+// weak-external arm, or the aux TagIndex → this reddens.
+TEST(PeWriter, WeakAliasRoundTripsThroughDssOwnReader) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{10};
+    f.bytes  = {0x90, 0x90, 0xC3};
+    mod.functions.push_back(std::move(f));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "strongfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "weakalia",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(bytes.empty()) << diagSummary(rep);
+
+    DiagnosticReporter rrep;
+    auto back = pe::readRelocatableObject(bytes, *loaded.target, *loaded.format,
+                                          rrep);
+    ASSERT_TRUE(back.has_value()) << diagSummary(rrep);
+    EXPECT_EQ(rrep.errorCount(), 0u) << diagSummary(rrep);
+
+    // ASSERT PER NAME, not per count: "two symbols came back" is satisfied by
+    // two wrong ones.
+    ModuleSymbol const* canon = nullptr;
+    ModuleSymbol const* alias = nullptr;
+    for (auto const& s : back->symbols) {
+        if (s.name == "strongfn") canon = &s;
+        if (s.name == "weakalia") alias = &s;
+    }
+    ASSERT_NE(canon, nullptr) << "the canonical name must survive the round trip";
+    ASSERT_NE(alias, nullptr) << "the alias name must survive the round trip";
+    EXPECT_EQ(canon->binding, SymbolBinding::Global);
+    EXPECT_EQ(alias->binding, SymbolBinding::Weak)
+        << "an alias that reads back Global is an alias whose weakness the "
+           "round trip lost -- the whole point of the mechanism";
+    EXPECT_EQ(canon->symbol, alias->symbol)
+        << "both names address ONE body";
+
+    // And the body is still there under the canonical name, unsliced.
+    ASSERT_EQ(back->functions.size(), 1u)
+        << "one atom, two names -- never two byte-identical twins";
+    EXPECT_EQ(back->functions[0].bytes, (std::vector<std::uint8_t>{0x90, 0x90, 0xC3}));
+}
+
+// ★ THE ROUND TRIP THE ANCHOR'S CLOSING WORK ACTUALLY NAMES: read an aliased
+// object with the REAL reader, RE-EMIT it, and assert both names survive at one
+// address. The pins above build an `AssembledModule` by hand, which proves the
+// writer but not that the reader hands the writer a module with both names on
+// it - and the two halves are one mechanism. Driving the real reader is what
+// makes this a round trip rather than a test of a hand-typed stub.
+//
+// RED-ON-DISABLE: drop the alias emission → the FIRST re-emission already loses
+// the name, so the second read finds one name where there were two.
+TEST(PeWriter, AliasedObjectSurvivesReadThenReEmitThroughTheRealReader) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{10};
+    f.bytes  = {0x90, 0x90, 0xC3};
+    mod.functions.push_back(std::move(f));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "realname",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "othernam",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep1;
+    auto first = pe::encode(mod, *loaded.target, *loaded.format, rep1);
+    ASSERT_EQ(rep1.errorCount(), 0u) << diagSummary(rep1);
+
+    DiagnosticReporter rrep;
+    auto read = pe::readRelocatableObject(first, *loaded.target,
+                                          *loaded.format, rrep);
+    ASSERT_TRUE(read.has_value()) << diagSummary(rrep);
+    // The reader must hand back ONE atom carrying BOTH names - the equal-offset
+    // collapse (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS).
+    ASSERT_EQ(read->functions.size(), 1u)
+        << "two names at one address are ONE atom, not two";
+    int named = 0;
+    for (auto const& sym : read->symbols) {
+        if (sym.name == "realname" || sym.name == "othernam") ++named;
+    }
+    EXPECT_EQ(named, 2) << "both names must come back off the wire";
+
+    DiagnosticReporter rep2;
+    auto second = pe::encode(*read, *loaded.target, *loaded.format, rep2);
+    ASSERT_EQ(rep2.errorCount(), 0u) << diagSummary(rep2);
+    std::uint32_t const numSyms = readU32LE(second, 12);
+    std::optional<std::uint32_t> a;
+    std::optional<std::uint32_t> b;
+    for (std::uint32_t i = 0; i < numSyms; ++i) {
+        if (symInlineName(second, i) == "realname") a = i;
+        if (symInlineName(second, i) == "othernam") b = i;
+    }
+    ASSERT_TRUE(a.has_value());
+    ASSERT_TRUE(b.has_value())
+        << "the alias name must survive a full read/re-emit cycle - losing it "
+           "is exactly D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB";
+    EXPECT_EQ(readU32LE(second, symRecOff(second, *a) + kSymValueOff),
+              readU32LE(second, symRecOff(second, *b) + kSymValueOff))
+        << "and both must still resolve to ONE address";
 }
 
 // ── String table starts with 4-byte u32 size including itself ──
@@ -754,14 +1782,35 @@ TEST(PeWriter, ObjectStaticDataItemIsClassStaticNotExternal) {
         << "a static (Local) data item stays internal `sym_<id>`, not its real name";
     EXPECT_EQ(bytes[s1 + 16], 3u)   // IMAGE_SYM_CLASS_STATIC — THE FIX
         << "static data emits IMAGE_SYM_CLASS_STATIC (3), not the pre-fix EXTERNAL (2)";
+
+    // ★★ THE DERIVED-TYPE HALF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
+    // BLOCK-LABEL-NOT-ATOM, the DATA twin of the block-symbol pin in
+    // ObjJumpTableBlockSymbolIsStaticLocalDefinedNotUndefExtern. A COFF data
+    // symbol is `notype` whatever its linkage, and the reader relies on that:
+    // class STATIC + type 0 is the shape it must NOT promote to an atom. This
+    // also fixes the boundary of the reader fix in place -- stamping
+    // DTYPE_FUNCTION here would silently make every static data object an atom
+    // boundary in the wrong section kind. Both directions again.
+    EXPECT_EQ(readU16LE(bytes, s1 + 14), 0u)
+        << "a defined DATA symbol must carry derived type 0 (`notype`) -- "
+           "DTYPE_FUNCTION is functions-only, and the COFF reader classifies "
+           "atom boundaries on this field";
+    EXPECT_EQ(readU16LE(bytes, symPtr + 14), 0x20u)
+        << "...while the FUNCTION symbol at index 0 carries "
+           "IMAGE_SYM_DTYPE_FUNCTION (0x20) -- the field discriminates";
 }
 
-// D-LK-OBJECT-WEAK-DEF-RELOCATABLE: a WEAK defined DATA symbol fails loud — the
-// data-site twin of ObjectWeakDefinedFunctionFailsLoud. The data loop has its
-// OWN weak guard (pe.cpp); reverting it silently degrades a weak data def to
-// EXTERNAL with no diagnostic. RED-ON-DISABLE: revert the data-site guard →
-// non-empty bytes + errorCount 0 → this pin goes red.
-TEST(PeWriter, ObjectWeakDefinedDataFailsLoud) {
+// D-LK-OBJECT-WEAK-DEF-RELOCATABLE, the DATA twin. The data site is a separate
+// code path from the function site (a data body lives in a kind-selected
+// section, not `.text`), and it was the site an earlier design audit caught as
+// the omitted twin — so it gets its own pin rather than riding the function
+// one. Asserts the COMDAT shape AND the round trip, because either alone is
+// satisfiable by a half-emit: correct bytes with the wrong Selection reads back
+// Global, and the right binding over the wrong bytes is a silent miscompile.
+//
+// RED-ON-DISABLE: leave the weak item in the SHARED `.data` layout → one
+// section, no aux, and the read-back binding falls to Global.
+TEST(PeWriter, ObjectWeakDefinedDataEmitsOwnComdatAndRoundTrips) {
     auto loaded = loadShipped();
     ASSERT_TRUE(loaded.target && loaded.format);
 
@@ -772,6 +1821,17 @@ TEST(PeWriter, ObjectWeakDefinedDataFailsLoud) {
     fn.bytes  = {0xC3};
     mod.functions.push_back(std::move(fn));
     mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "anchor",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    // A STRONG data neighbour in the same kind: the shared `.data` section must
+    // still exist and must NOT be flagged COMDAT because of its weak sibling.
+    AssembledData s;
+    s.symbol    = SymbolId{9};
+    s.section   = DataSectionKind::Data;
+    s.bytes     = {9, 9, 9, 9};
+    s.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(s));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{9}, "strongdat",
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
     AssembledData d;
@@ -786,20 +1846,51 @@ TEST(PeWriter, ObjectWeakDefinedDataFailsLoud) {
 
     DiagnosticReporter rep;
     auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty())
-        << "a weak defined DATA symbol must emit no bytes (loud-fail path)";
-    EXPECT_EQ(rep.errorCount(), 1u)
-        << "exactly one fail-loud diagnostic must fire for the weak data def";
-    bool found = false;
-    for (auto const& dg : rep.all()) {
-        if (dg.code == DiagnosticCode::K_NoMatchingObjectFormat &&
-            dg.actual.find("D-LK-OBJECT-WEAK-DEF-RELOCATABLE") != std::string::npos) {
-            found = true;
-            break;
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    ASSERT_FALSE(bytes.empty());
+
+    // .text(1), .data(2), and the weak item's own COMDAT (3).
+    ASSERT_EQ(readU16LE(bytes, 2), 3u);
+    EXPECT_EQ(sectionCharacteristics(bytes, 2) & kImageScnLnkComdat, 0u)
+        << "the SHARED .data must not be flagged COMDAT - only the weak item's "
+           "own section is coalescible";
+    EXPECT_EQ(sectionCharacteristics(bytes, 3) & kImageScnLnkComdat,
+              kImageScnLnkComdat);
+    // The shared `.data` must hold ONLY the strong item — the weak one was
+    // taken out of it entirely, not merely renamed, so no hole is left behind.
+    std::size_t const dataHdr = kCoffFileHeaderSize + kCoffSectionHdrSize;
+    EXPECT_EQ(readU32LE(bytes, dataHdr + 16), 4u)
+        << "the weak item must contribute NO bytes and NO span to the shared "
+           "section; 8 here would mean it was laid out twice";
+
+    DiagnosticReporter rrep;
+    auto back = pe::readRelocatableObject(bytes, *loaded.target,
+                                          *loaded.format, rrep);
+    ASSERT_TRUE(back.has_value()) << diagSummary(rrep);
+    auto bindingOf = [&](std::string const& name)
+        -> std::optional<SymbolBinding> {
+        for (auto const& sym : back->symbols) {
+            if (sym.name == name) return sym.binding;
+        }
+        return std::nullopt;
+    };
+    EXPECT_EQ(bindingOf("weakdat").value_or(SymbolBinding::Global),
+              SymbolBinding::Weak)
+        << "a weak DATA definition must round-trip back to Weak";
+    EXPECT_EQ(bindingOf("strongdat").value_or(SymbolBinding::Weak),
+              SymbolBinding::Global);
+    for (auto const& item : back->dataItems) {
+        for (auto const& sym : back->symbols) {
+            if (sym.symbol != item.symbol) continue;
+            if (sym.name == "weakdat") {
+                EXPECT_EQ(item.bytes,
+                          (std::vector<std::uint8_t>{1, 2, 3, 4}));
+            } else if (sym.name == "strongdat") {
+                EXPECT_EQ(item.bytes,
+                          (std::vector<std::uint8_t>{9, 9, 9, 9}));
+            }
         }
     }
-    EXPECT_TRUE(found)
-        << "the diagnostic must cite D-LK-OBJECT-WEAK-DEF-RELOCATABLE at the data site";
 }
 
 // (2) A RelRoConst item carrying an abs64 reloc to a DEFINED function
@@ -934,6 +2025,25 @@ TEST(PeWriter, ObjJumpTableBlockSymbolIsStaticLocalDefinedNotUndefExtern) {
         << "block symbol lives in .text";
     EXPECT_EQ(readU32LE(bytes, s1 + 8), 4u)   // Value = text offset
         << "Value = funcTextStart + blockByteOffset (section-relative)";
+
+    // ★★ THE DERIVED-TYPE HALF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
+    // BLOCK-LABEL-NOT-ATOM. The storage class above says LOCAL and says nothing
+    // more: a file-local FUNCTION is class STATIC too. What separates them is
+    // IMAGE_SYMBOL.Type (+14) -- a function declares DTYPE_FUNCTION (0x20), a
+    // block label declares 0 -- and the COFF reader now classifies atom
+    // boundaries on exactly that field. Until this pin existed the property the
+    // reader depends on was UNASSERTED on the writer side: a writer that stamped
+    // 0x20 on block symbols would make every interior label an atom boundary and
+    // SPLIT the function containing it, and nothing here would have noticed.
+    // Both directions are pinned, because "all zero" is not a discriminator.
+    EXPECT_EQ(readU16LE(bytes, s1 + 14), 0u)
+        << "a synthetic block label must carry derived type 0 -- 0x20 would make "
+           "the reader treat an interior label as its own atom and split the "
+           "enclosing function";
+    EXPECT_EQ(readU16LE(bytes, symPtr + 14), 0x20u)
+        << "...while the FUNCTION symbol at index 0 carries "
+           "IMAGE_SYM_DTYPE_FUNCTION (0x20) -- the field is a real discriminator, "
+           "not uniformly zero";
 
     // The .data section's reloc resolves SymbolTableIndex to the block
     // local (index 1), and its Type is the JSON abs64 nativeId.

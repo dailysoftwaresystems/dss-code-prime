@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -79,10 +80,20 @@ struct PendingIncoming {
     }
 }
 
+// ONE spelling of this pass's name for EVERY diagnostic it can emit — the
+// carve-out Info and every `MirFunctionRebuilder` fatal
+// (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS). Pipeline spelling
+// (`kPassNameTable`, opt/optimizer.hpp).
+constexpr std::string_view kPassName = "Mem2Reg";
+
 class Mem2RegPolicy final : public MirRebuildPolicy {
 public:
     Mem2RegPolicy(Mir const& src, TypeInterner const& interner)
         : src_(src), interner_(interner) {}
+
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return kPassName;
+    }
 
     [[nodiscard]] std::size_t allocasPromoted()   const noexcept { return allocasPromoted_; }
     [[nodiscard]] std::size_t phisInserted()      const noexcept { return phisInserted_; }
@@ -823,7 +834,7 @@ Mem2RegResult runMem2Reg(Mir& mir, TypeInterner const& interner,
     Mem2RegResult result{};
     MirBuilder builder;
 
-    if (cloneGlobalsOrCarveOut(mir, builder, reporter, "Mem2Reg")
+    if (cloneGlobalsOrCarveOut(mir, builder, reporter, kPassName)
         == GlobalClonePrelude::CarvedOut) {
         result.ok = true;
         return result;

@@ -97,22 +97,62 @@ jobs:
         # legs whose `run-*` input is true land in the matrix, so no
         # runner is allocated for disabled legs (no more skipped-on-
         # startup macOS runs billed at premium rate).
+        # ★★★ THE TWO BUDGETS ARE PER-LEG, AND EVERY NUMBER IS A MEASUREMENT.
+        # `build_timeout_min` caps the Build step; `ctest_budget_min` is ctest's own
+        # `--stop-time` budget and the Test step's `timeout-minutes` is that plus ten.
+        #
+        # ⚠ THEY USED TO BE TWO GLOBAL CONSTANTS (45 and 50), AND BOTH WERE SET FROM
+        # THE LEGS THEY HAPPENED TO FIT. ✔MEASURED 2026-08-21 on run 32533052057, the
+        # FIRST run on this branch where the matrix actually executed (every earlier
+        # one stopped at `label-check`), every leg with a 100%-MISS ccache:
+        #
+        #     leg                       cold build   ctest      verdict
+        #     linux-gcc-release         19m22s       274.19s    green
+        #     linux-clang-asan          13m04s      >2999.79s   RED - hit the 50-min cap
+        #     macos-clang-release       12m53s       286.37s    green
+        #     linux-arm64-gcc-release   13m07s       178.58s    green
+        #     windows-msvc-release     >45m (killed) never ran  RED - hit the 45-min cap
+        #
+        # The asan leg is not hung and windows is not broken: asan is Debug + ASan +
+        # UBSan, ✔11,314 CPU-seconds against gcc-release's 935 (12x), and at
+        # `--parallel 4` that is 47 minutes of PERFECT packing against a 50-minute
+        # budget. Windows compiled 453 of 786 ninja edges in 45 minutes from a cold
+        # cache. Neither number was ever wrong about its own leg; one number for five
+        # legs was.
+        #
+        # ★ A BUDGET IS A CAP, NOT A RESERVATION. A leg that finishes early costs
+        # nothing, so the only thing a larger cap buys is a longer wait when something
+        # genuinely hangs — and the thing it prevents is a `timeout-minutes` kill,
+        # which is a SIGNAL kill that uploads no test log at all
+        # (D-CI-STEP-TIMEOUT-YIELDS-NO-TEST-LOG).
+        #
+        # ✔ `windows-msvc-release`'s ctest budget WAS the one number here not measured
+        # on its own leg. It is now: run 32585879580, the first Windows run ever to
+        # reach ctest, took **665.70 s** (10% of the 6600 s it had been given), so the
+        # budget is 50/60 like the other release legs — 4.5x headroom, in family with
+        # theirs. Its BUILD budget stays 120: that run had a 98.72%-hit ccache and
+        # built in 1m48s, while the COLD build is the one that was killed at 45 min.
+        # (D-CI-WINDOWS-CTEST-COST-IS-UNMEASURED, closed.)
+        #
+        # ⚠ AND THE ASAN BUDGET IS A CEILING THE CORPUS IS WALKING TOWARDS: 62% of
+        # those 11,314 CPU-seconds is the 1,231-entry example + integrated corpus, which
+        # grows every cycle (D-CI-ASAN-LEG-WALL-CLOCK-GROWS-WITH-THE-CORPUS).
         run: |
           legs='[]'
           if [ "${{ true }}" = "true" ]; then
-            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-gcc-release","os":"ubuntu-latest","cc":"gcc-13","cxx":"g++-13","build_type":"Release","sanitizers":""}]')
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-gcc-release","os":"ubuntu-latest","cc":"gcc-13","cxx":"g++-13","build_type":"Release","sanitizers":"","build_timeout_min":45,"ctest_budget_min":50,"ctest_step_timeout_min":60}]')
           fi
           if [ "${{ true }}" = "true" ]; then
-            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-clang-asan","os":"ubuntu-latest","cc":"clang-19","cxx":"clang++-19","build_type":"Debug","sanitizers":"address,undefined"}]')
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-clang-asan","os":"ubuntu-latest","cc":"clang-19","cxx":"clang++-19","build_type":"Debug","sanitizers":"address,undefined","build_timeout_min":45,"ctest_budget_min":110,"ctest_step_timeout_min":120}]')
           fi
           if [ "${{ true }}" = "true" ]; then
-            legs=$(echo "$legs" | jq -c '. + [{"name":"windows-msvc-release","os":"windows-latest","cc":"","cxx":"","build_type":"Release","sanitizers":""}]')
+            legs=$(echo "$legs" | jq -c '. + [{"name":"windows-msvc-release","os":"windows-latest","cc":"","cxx":"","build_type":"Release","sanitizers":"","build_timeout_min":120,"ctest_budget_min":50,"ctest_step_timeout_min":60}]')
           fi
           if [ "${{ true }}" = "true" ]; then
-            legs=$(echo "$legs" | jq -c '. + [{"name":"macos-clang-release","os":"macos-latest","cc":"","cxx":"","build_type":"Release","sanitizers":""}]')
+            legs=$(echo "$legs" | jq -c '. + [{"name":"macos-clang-release","os":"macos-latest","cc":"","cxx":"","build_type":"Release","sanitizers":"","build_timeout_min":45,"ctest_budget_min":50,"ctest_step_timeout_min":60}]')
           fi
           if [ "${{ true }}" = "true" ]; then
-            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-arm64-gcc-release","os":"ubuntu-24.04-arm","cc":"gcc-13","cxx":"g++-13","build_type":"Release","sanitizers":""}]')
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-arm64-gcc-release","os":"ubuntu-24.04-arm","cc":"gcc-13","cxx":"g++-13","build_type":"Release","sanitizers":"","build_timeout_min":45,"ctest_budget_min":50,"ctest_step_timeout_min":60}]')
           fi
           echo "matrix={\"include\":$legs}" >> "$GITHUB_OUTPUT"
           if [ "$legs" = "[]" ]; then
@@ -145,6 +185,18 @@ jobs:
       - uses: actions/checkout@v6
         with:
           token: ${{ steps.app-token.outputs.token }}
+
+      # DECLARED, NOT INHERITED. `DSS_BUILD_TESTS=ON` now runs
+      # `find_package(Python3 COMPONENTS Interpreter REQUIRED)` for the
+      # scripts_index_guard entry, which makes a Python interpreter a
+      # CONFIGURE-TIME requirement rather than a convenience. The runner images
+      # happen to ship one, so this job would pass without this step — which is
+      # exactly why it is here: a dependency that works by accident of the image
+      # breaks on the day the image changes, and the failure would surface as a
+      # CMake error in an unrelated-looking job.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
 
       - name: Configure Git for private dependencies
         run: git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/".insteadOf "git@github.com:"
@@ -338,7 +390,7 @@ jobs:
         env:
           CCACHE_SLOPPINESS: ${{ 'pch_defines,time_macros' }}
         run: cmake --build "${{ 'build' }}" --parallel
-        timeout-minutes: 45
+        timeout-minutes: ${{ matrix.build_timeout_min }}
 
       - name: Test
         working-directory: ${{ '.' }}/${{ 'build' }}
@@ -400,11 +452,12 @@ jobs:
         #   · a stop time already in the past wraps to TOMORROW (verified: ctest ran
         #     the test normally rather than stopping instantly), so a run straddling
         #     midnight is safe.
-        # BUDGET = 50, not 55: --stop-time stops ctest STARTING new tests, and one
-        # already running continues — the longest single test on this leg measured
-        # ~8 min, so 50 + 8 still lands inside the 60-min step.
+        # THE BUDGET IS PER-LEG (`matrix.ctest_budget_min`; the table and the
+        # measurements behind it are above the matrix builder). It sits ten minutes
+        # under the step's own timeout because --stop-time stops ctest STARTING new
+        # tests and one already running continues past it.
         run: |
-          BUDGET_MIN=50
+          BUDGET_MIN=${{ matrix.ctest_budget_min }}
           # ⚠ `|| true` ON BOTH, AND IT IS NOT DECORATION. GitHub runs this block as
           # `bash -e {0}`, under which a failing command substitution in an assignment
           # ABORTS THE SCRIPT — so a bare `NOW=$(date …)` on a runner with no usable
@@ -436,8 +489,43 @@ jobs:
             exit 1
           fi
           echo "ctest stop-time: $STOP (LOCAL, ${DELTA}s out) — ${BUDGET_MIN} min, inside this step's timeout-minutes"
+          # ★★ REPORT HOW MUCH OF THE BUDGET THE LEG ACTUALLY USED, AND WARN BEFORE IT
+          # RUNS OUT (D-CI-ASAN-LEG-WALL-CLOCK-GROWS-WITH-THE-CORPUS). A cap discovers a
+          # breach only by FAILING: ✔the asan leg reached 2999.79s of a 3000s budget on
+          # 2026-08-21 with nothing having said it was close, and 62% of its cost is the
+          # example + integrated corpus, which grows every cycle. A leg above 80% is a
+          # leg whose budget is about to need re-deriving, and this is the line that says
+          # so while the run is still green.
+          # ★ `$SECONDS` and NO PIPE, deliberately: `ctest | tee` would hand `$?` to tee
+          # (this block runs under `bash -e {0}`, where `pipefail` is NOT set), so a
+          # failing suite would report success. Timing the call is free; parsing its log
+          # is not worth an exit-status hazard.
+          _t0=$SECONDS
+          set +e
           ctest --stop-time "$STOP" ${{ '--output-on-failure --no-tests=error --parallel 4' }}
-        timeout-minutes: 60
+          _rc=$?
+          set -e
+          _used=$(( SECONDS - _t0 ))
+          _cap=$(( BUDGET_MIN * 60 ))
+          echo "ctest wall clock: ${_used}s of a ${_cap}s budget ($(( _used * 100 / _cap ))%)"
+          if [ "$_used" -gt $(( _cap * 8 / 10 )) ]; then
+            echo "::warning::This leg used ${_used}s of its ${_cap}s ctest budget (>80%). Re-derive matrix.ctest_budget_min for '${{ matrix.name }}' from this figure before it becomes a red (D-CI-ASAN-LEG-WALL-CLOCK-GROWS-WITH-THE-CORPUS)."
+          fi
+          exit $_rc
+        # Ten minutes above ctest's own budget: --stop-time stops ctest STARTING new
+        # tests, so one already running continues past it. The longest single test on
+        # the asan leg measured 513.57s, which fits inside that margin.
+        #
+        # ⚠⚠ THE +10 IS DONE IN THE MATRIX BUILDER, NOT HERE, AND THAT IS NOT STYLE:
+        # ✔MEASURED 2026-08-22 against GitHub's own validator, two minimal
+        # `workflow_dispatch` files pushed side by side — `timeout-minutes:
+        # ${{ matrix.t }}` is ACCEPTED and produces no run, while `timeout-minutes:
+        # ${{ matrix.t + 10 }}` is REJECTED: the workflow is refused as a whole, with a
+        # zero-job run whose name is the FILE PATH. That is how this file shipped broken
+        # for one commit (D-CI-STEP-TIMEOUT-MINUTES-REJECTS-AN-ARITHMETIC-EXPRESSION).
+        # ★ A plain field reference is the only expression form to use here; arithmetic
+        # belongs in the shell that builds the matrix, where it is ordinary code.
+        timeout-minutes: ${{ matrix.ctest_step_timeout_min }}
 
       - name: Upload test logs on failure
         if: ${{ failure() }}
@@ -520,6 +608,6 @@ jobs:
         with:
           python-version: "3.x"
       - name: Run unit tests
-        run: python tools/test_refresh_landing_log.py
+        run: python scripts/refresh_landing_log/test_refresh_landing_log.py
       - name: Check landing-log hash anchors
-        run: python tools/refresh_landing_log.py --check
+        run: python scripts/refresh_landing_log/refresh_landing_log.py --check

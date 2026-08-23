@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# PURPOSE: convert a CMake project into a DSS `.dss-project.json` manifest.
 # cmake-import — convert a CMake project into a DSS `.dss-project.json` manifest.
 #
 # Thin wrapper: it runs `cmake` with CMAKE_EXPORT_COMPILE_COMMANDS=ON, then

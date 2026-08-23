@@ -175,6 +175,51 @@ TEST(TargetDwarfNumbering, ATargetDeclaringNeitherHalfStillLoads) {
     EXPECT_FALSE((*r)->dwarfReturnAddressColumn().has_value());
 }
 
+// ── D-TARGET-ARG-POOLS-WITHOUT-DWARF-NUMBERS-CANNOT-BE-RELATED ─────────────
+//
+// Whether two arg pools share ONE cursor is DERIVED — `argPoolsShareACursor`
+// compares the `dwarfNumber` of their slot-0 registers, because that is the
+// only field that says "these two class names are two widths of one physical
+// file" (`hwEncoding` is a per-file register NUMBER and ✔MEASURED not to
+// discriminate: arm64 gpr×vr share all 32 values). The derivation is
+// fail-closed, so an absent number yields INDEPENDENT cursors — a safe answer,
+// but one nobody chose. A target that numbers its registers and then omits the
+// numbers on the pools that carry its ABI is refused.
+TEST(TargetDwarfNumbering, ArgPoolsThatCannotBeRelatedToEachOtherAreRejected) {
+    auto r = mutateShippedTargetSchemaDoc("x86_64", [](nlohmann::json& doc) {
+        // x86_64 declares both argGprs and argFprs, so the two pools exist and
+        // the question "are these one file or two?" is live. Strip the number
+        // from the FIRST integer arg register only — the numbering as a whole
+        // stays declared, which is what separates this from the opt-out case.
+        for (auto& reg : doc["registers"]) {
+            if (reg.value("name", std::string{}) == "rdi") reg.erase("dwarfNumber");
+        }
+    });
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(saysAny(r.error(), "cannot be related to")) << summarize(r.error());
+}
+
+// ⚠ THE COMPLEMENT, AND IT IS THE ARM THAT KEEPS THE ONE ABOVE HONEST: the
+// refusal must NOT fire on a target that declares no numbering at all. That is
+// the contract `ATargetDeclaringNeitherHalfStillLoads` states, and the first
+// draft of the check above broke it — the rule is "if you number your
+// registers, number the ones that carry ABI meaning", never "you must number
+// your registers". Without this arm the check could be widened back to the
+// broken form and only a different test file would notice.
+TEST(TargetDwarfNumbering, ArgPoolsNeedNoDwarfNumbersWhenTheTargetDeclaresNone) {
+    auto r = mutateShippedTargetSchemaDoc("x86_64", [](nlohmann::json& doc) {
+        doc["target"].erase("dwarfReturnAddressColumn");
+        for (auto& reg : doc["registers"]) { reg.erase("dwarfNumber"); }
+    });
+    ASSERT_TRUE(r.has_value()) << summarize(r.error());
+    // …and this target really does declare two arg pools, so the arm is not
+    // passing because the precondition was absent.
+    auto const* cc = (*r)->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    EXPECT_FALSE(cc->argGprs.empty());
+    EXPECT_FALSE(cc->argFprs.empty());
+}
+
 TEST(TargetDwarfNumbering, AnOutOfRangeDwarfNumberIsRejected) {
     auto r = mutateShippedTargetSchemaDoc("x86_64", [](nlohmann::json& doc) {
         doc["registers"][0]["dwarfNumber"] = -1;
@@ -189,14 +234,23 @@ namespace {
 
 // Point the named calling convention's `vaListLayout` at `strategy` and set
 // `key` on it. Returns the load result.
+//
+// ★ `value` defaults to the integer 48 (what every rejection case below used
+// when this helper hardcoded it), but is a parameter because the ACCEPTANCE
+// case needs a bool: `variadicUsesOverflowBase` is the only key valid for the
+// `homogeneous_pointer` strategy that no shipped layout already declares, and
+// feeding it a 48 would exercise a TYPE rejection instead of the key-scoping
+// acceptance the pin is for. The rejection cases are unaffected — the
+// cross-strategy gate fires on the key's NAME, before any value is read.
 [[nodiscard]] auto loadWithVaListKey(char const* target, char const* ccName,
-                                     char const* strategy, char const* key) {
+                                     char const* strategy, char const* key,
+                                     nlohmann::json value = 48) {
     return mutateShippedTargetSchemaDoc(
         target, [&](nlohmann::json& doc) {
             for (auto& cc : doc["callingConventions"]) {
                 if (cc.value("name", std::string{}) != ccName) continue;
                 cc["vaListLayout"]["strategy"] = strategy;
-                cc["vaListLayout"][key] = 48;
+                cc["vaListLayout"][key] = value;
             }
         });
 }
@@ -264,7 +318,32 @@ TEST(VaListStrategyKeys, AGenuineTypoSaysNoStrategyDeclaresIt) {
 TEST(VaListStrategyKeys, AKeyValidForTheDeclaredStrategyIsAccepted) {
     // The complementary arm — proving the gate is scoped to the CROSS-strategy
     // case and has not simply become "reject everything optional".
-    auto r = loadWithVaListKey("x86_64", "sysv_amd64", "sysv_register_save",
-                               "gpOffsetLimit");
+    //
+    // ⚠⚠ THIS PIN WAS VACUOUS AND SAID SO TO NO ONE (found 2026-08-14 by the
+    // byte-difference contract in `mutate_target_schema.hpp`, which threw here
+    // the moment it landed). It used to aim at
+    // `("x86_64", "sysv_amd64", "sysv_register_save", "gpOffsetLimit")` — and
+    // the shipped x86_64 `sysv_amd64` layout ALREADY declares
+    // `"strategy": "sysv_register_save"` AND `"gpOffsetLimit": 48`. The
+    // mutation wrote the two values that were already there, so the "mutant"
+    // was the shipped document byte-for-byte and this test asserted nothing
+    // beyond `ShippedTargetsStillLoad` above. Its name promised a key was
+    // ADDED; no key was ever added.
+    //
+    // ★ WHY `ms_x64`. A key that is valid for the declared strategy and NOT
+    // already present is the only shape that makes this pin mean what its name
+    // says, and there is exactly ONE in the shipped configs: every layout
+    // declares its complete key set EXCEPT x86_64's `ms_x64`, a
+    // `homogeneous_pointer` that omits `variadicUsesOverflowBase`. So this is
+    // now a genuine addition of an optional key onto its OWN strategy — the
+    // true mirror of the two rejection cases above, which put a key onto a
+    // strategy it does not belong to.
+    //
+    // ⚠ If a future shipped `ms_x64` starts declaring
+    // `variadicUsesOverflowBase: true`, this mutation becomes a no-op again —
+    // and the helper will THROW rather than let it pass quietly. That is the
+    // contract working, not a regression: re-aim the pin, never silence it.
+    auto r = loadWithVaListKey("x86_64", "ms_x64", "homogeneous_pointer",
+                               "variadicUsesOverflowBase", true);
     ASSERT_TRUE(r.has_value()) << summarize(r.error());
 }

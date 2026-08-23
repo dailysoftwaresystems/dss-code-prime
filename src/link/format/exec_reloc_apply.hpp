@@ -2,6 +2,7 @@
 
 #include "asm/asm.hpp"
 #include "core/cpp_invariants.hpp"  // arithmetic-right-shift assert (Aarch64AdrPrelPgHi21)
+#include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -107,6 +108,50 @@
 //       - X86_64_RELOC_GOT_LOAD → `__got` slot absolute VA.
 
 namespace dss::link::format {
+
+// ── The exit mechanisms a `.format.json` may actually declare ─────────────
+// D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET.
+//
+// `kExitMechanismTable` carries a `none` row the loader refuses explicitly
+// (`processExit.mechanism` rejects `ExitMechanism::None` after resolving it), so
+// the set an author may write is the table MINUS that sentinel — the same shape
+// `kSelectableObjectFormatKindNames` uses. The REMEDY below states that set, and
+// a remedy that names a stale set sends the reader to write config the loader
+// will then refuse; it is the same defect as a stale refusal, one step further
+// from the check.
+//
+// ⚠ `namesWhere<M>` CHECKS `M` at compile time — a third mechanism breaks THIS
+// BUILD rather than leaving the sentence quietly incomplete. That claim is only
+// true of the LITERAL `M` written below, and this call site spelled `M` as
+// `kExitMechanismTable.rows.size() - 1` until the fold that wrote this note.
+//
+// ★★ A COUNT DERIVED FROM THE TABLE THE PREDICATE WALKS IS `x == x`. `M` was
+// `rows.size() - 1` and the predicate rejects exactly the one `None` row, so the
+// accepted count is ALWAYS `rows.size() - 1`: the two sides move together and
+// the check can never fail. It is the same shape
+// D-LINK-MACHO-EXEC-BAND-GUARDS-WERE-TAUTOLOGIES-LABELLED-AS-MEASUREMENTS names
+// one tier down — a guard born unable to fire, carrying a comment that says it
+// fires. ✔MEASURED with `g++ -std=c++23 -fsyntax-only -Isrc` over a four-arm
+// probe (a 3-row and a 4-row copy of this exact table × the derived and literal
+// spellings of `M`): adding a fourth, SELECTABLE enumerator leaves the derived
+// spelling compiling clean, while the literal spelling stops the build with
+// `namesWhere<M>: M does not match the number of accepted rows`. So the literal
+// is what the ⚠ above describes, and the literal is what is written.
+// `linker.cpp`'s `kDeclarableExitMechanismNames` had it right all along.
+//
+// ⓘ It belongs beside the enum in `core/types/target_schema.hpp`; it is local
+// here only because that file was reserved to another lane this cycle. The SAME
+// projection is computed in TWO other places — `linker.cpp`
+// (`kDeclarableExitMechanismNames`, literal, agrees) and the object-format
+// loader's `kSelectableExitMechanismNames` (still derived, so still unable to
+// fire — reported, not silently edited from here). All are PROJECTIONS of the
+// one table, so none is a second owner of the spellings; what diverged was the
+// STRENGTH of the count check, which is a property of the call site.
+[[nodiscard]] constexpr bool isSelectableExitMechanism(ExitMechanism m) noexcept {
+    return m != ExitMechanism::None;
+}
+inline constexpr auto kSelectableExitMechanismNames =
+    namesWhere<2>(kExitMechanismTable, isSelectableExitMechanism);
 
 [[nodiscard]] inline bool applyExecRelocations(
     std::vector<std::uint8_t>&  text,
@@ -493,17 +538,21 @@ namespace dss::link::format {
         // correct normal path there — because by the time a walker
         // runs, `linker::link` has PREPENDED the `_start` trampoline
         // as functions[0]. What actually distinguishes normal from
-        // broken is the OVERRIDE: `entry_trampoline.cpp:732` sets
+        // broken is the OVERRIDE: `injectEntryTrampoline` sets
         // `module.imageEntryOverride = 0` as the LAST act of every
         // SUCCESSFUL injection (the one early return below the prepend
         // rolls the prepend back and returns false, so there is no
         // trampolined-but-override-less outcome), and the override
         // branch above returns before this point. So reaching HERE
         // means no trampoline was ever injected into this module.
-        // (This comment cited `:708` until the misnomer fix; that line
-        // is a comment about `expectedFuncCount` — VERIFIED by grepping
-        // `imageEntryOverride` in entry_trampoline.cpp: ONE assignment,
-        // at 732.)
+        // ⚠ This comment used to cite a LINE NUMBER in
+        // entry_trampoline.cpp, and before that a different one — which
+        // had already drifted onto a comment about `expectedFuncCount`
+        // and was corrected once before. Two line numbers, both wrong in turn, in
+        // a comment whose whole job is to point at ONE assignment: it is
+        // its own evidence for the project rule that a citation names a
+        // METHOD, never a line. `imageEntryOverride` is assigned in
+        // exactly ONE place in that file — grep the name, not a number.
         //
         // If the format declares `processExit`, it has CONTRACTED that
         // its image entry is a DSS-synthesized trampoline. An
@@ -623,7 +672,10 @@ namespace dss::link::format {
                    "never materialize arguments and never call any exit "
                    "mechanism, so the program would run off the end of "
                    "that function. REMEDY: add a 'processExit' block "
-                   "(mechanism 'syscall' or 'by-name-import') plus the "
+                   "(mechanism "
+                 + ::dss::detail::renderAllowedList(
+                       kSelectableExitMechanismNames, " or ")
+                 + ") plus the "
                    "paired 'entryCallingConvention' to this format's "
                    "schema, or build for a format that declares them. "
                    "This is a DSS policy about how DSS builds entries, "

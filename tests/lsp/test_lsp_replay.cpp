@@ -118,7 +118,7 @@ void runOneSession(fs::path const& inputPath) {
         tPtr->pushClientMessage(l);
     }
 
-    ASSERT_EQ(exitCode.wait_for(std::chrono::seconds(5)),
+    ASSERT_EQ(exitCode.wait_for(dss::test_support::kWaitBudget),
               std::future_status::ready);
     EXPECT_EQ(exitCode.get(), 0);
 

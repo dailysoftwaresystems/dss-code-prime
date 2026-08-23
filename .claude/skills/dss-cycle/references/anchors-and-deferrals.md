@@ -49,12 +49,12 @@ deferral is the rare exception that must earn its place, not the convenient way 
 |---|---|
 | Build | `cmake --build build` |
 | Full test suite | `ctest --test-dir build --output-on-failure` |
-| Anchor guard | `tools/check-anchor-registry.ps1` (or `tools/check-anchor-registry.sh`) |
+| Anchor guard | `scripts/check-anchor-registry/check-anchor-registry.ps1` (or `scripts/check-anchor-registry/check-anchor-registry.sh`) |
 | **Handoff — read at Step 0, rewritten at Step 8.1** | `.plans/_handoff.md` — ①where we are ②where we need to get ③priorities ④concurrent branches/PRs (rebase surface) ⑤timeline (accumulates) |
 | Open PRs / rebase surface | `gh pr list --state open` · `gh pr view <n> --json files` (Step 8.2) |
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0.1 |
 | Deferral registry | `.plans/_deferred-anchor-registry.md` |
-| Anchor balance gate | `python tools/check-anchor-balance.py` |
+| Anchor balance gate | `python scripts/check-anchor-balance/check-anchor-balance.py` |
 | Per-cycle plan | `/feature-dev:feature-dev` (Step 3) |
 | Plan-lock design audit | independent `dss-audit` lens on the plan, pre-build (Step 3.5) |
 | Per-cycle review (+ re-review the fold) | `/pr-review-toolkit:review-pr` ×N to a fixed point (Step 5) |

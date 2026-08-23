@@ -87,6 +87,11 @@ inline constexpr EnumNameTable<ObjectFormatKind, 6> kObjectFormatKindTable{{{
     { ObjectFormatKind::Spirv,   "spirv"   },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kObjectFormatKindTable);
+
 [[nodiscard]] constexpr std::string_view
 objectFormatKindName(ObjectFormatKind k) noexcept {
     return kObjectFormatKindTable.name(k);
@@ -166,6 +171,22 @@ static_assert([] {
 }(), "ObjectFormatKind ordinals must stay dense from 0 — a per-kind array "
      "sized by the name-table row count would otherwise index out of range");
 
+// The SELECTABLE spellings — every row a config author may actually write,
+// i.e. the table minus the reserved `unknown` sentinel. This is what a
+// diagnostic's "expected one of …" half must render.
+//
+// ⚠ IT IS NOT `keysOf(kObjectFormatKindTable.rows, …)`: that would advertise
+// `'unknown'` as an accepted value, which the sentinel note above spends a
+// paragraph explaining is the ONE spelling that passes the name lookup and
+// then silently matches nothing. The filter is the point.
+//
+// The `- 1` is the sentinel, and `namesWhere` CHECKS it: a second unselectable
+// enumerator, or a new selectable one, makes this initializer a compile error
+// rather than a list that quietly stops matching what the check accepts.
+inline constexpr auto kSelectableObjectFormatKindNames =
+    namesWhere<kObjectFormatKindCount - 1>(kObjectFormatKindTable,
+                                           isSelectableObjectFormatKind);
+
 // ── C-symbol decoration scheme (D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN) ──
 //
 // HOW this object format decorates a canonical C identifier to obtain the
@@ -224,39 +245,57 @@ enum class CSymbolDecorationScheme : std::uint8_t {
     LeadingUnderscore = 2,
 };
 
-// ★ HAND-ROLLED rather than an `EnumNameTable<E,N>`, and the deviation is the
-// whole point — read `objectFormatKindName`'s "★ THE SENTINEL SPELLS
+// ★ THE ARGUMENT THIS COMMENT USED TO MAKE WAS RIGHT, AND IT HAS BEEN ANSWERED
+// IN THE TEMPLATE. Read `objectFormatKindName`'s "★ THE SENTINEL SPELLS
 // CORRECTLY" note directly above before changing this. `EnumNameTable::name`
 // FALLS BACK TO `rows[0].second` for an unlisted value, so a table that omits
 // the sentinel would report the sentinel under the FIRST REAL SCHEME'S name
 // ("none") — the worst possible answer, since `none` is a legitimate scheme
 // and `validate()` would then see a populated field where none was declared.
-// Listing the sentinel with an empty name instead makes `fromName("")`
-// RESOLVE TO IT, re-opening the same hole from the other side. Neither shape
-// can express "this value has no spelling", so the switch is written out —
-// the `dataModelName` / `headerNameMatchingName` precedent, both of which are
-// hand-rolled for exactly this reason and are both consumed by `validate()`
-// through the `…Name(x).empty()` idiom this enables.
+// Listing the sentinel with an EMPTY name instead makes `fromName("")` RESOLVE
+// TO IT, re-opening the same hole from the other side.
+//
+// Neither shape could express "this value has no spelling" — so three enums
+// (this one, `dataModelName`, `headerNameMatchingName`) were each written out
+// as a switch, and each thereby became a SECOND OWNER of its spellings beside
+// its own `…FromName`. `EnumNameTable::nameOrEmpty` now expresses exactly that
+// missing case IN THE SHARED TEMPLATE: leave the sentinel out of the table, so
+// `fromName` cannot resolve it from any spelling, and ask `nameOrEmpty` on the
+// name side, so an unlisted value renders EMPTY. All three are converted, and
+// the `…Name(x).empty()` idiom `validate()` uses is unchanged.
+inline constexpr EnumNameTable<CSymbolDecorationScheme, 2>
+kCSymbolDecorationSchemeTable{{{
+    { CSymbolDecorationScheme::None,              "none"               },
+    { CSymbolDecorationScheme::LeadingUnderscore, "leading-underscore" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kCSymbolDecorationSchemeTable);
+
 [[nodiscard]] constexpr std::string_view
 cSymbolDecorationSchemeName(CSymbolDecorationScheme s) noexcept {
+    // The `-Werror=switch` backstop; it owns no spelling. A new scheme with no
+    // `case` fails the BUILD rather than becoming a value with no name.
     switch (s) {
-        case CSymbolDecorationScheme::Unspecified:       return {};
-        case CSymbolDecorationScheme::None:              return "none";
-        case CSymbolDecorationScheme::LeadingUnderscore: return "leading-underscore";
+        case CSymbolDecorationScheme::Unspecified:
+        case CSymbolDecorationScheme::None:
+        case CSymbolDecorationScheme::LeadingUnderscore:
+            break;
     }
-    return {};
+    return kCSymbolDecorationSchemeTable.nameOrEmpty(s);   // NOT .name()
 }
 
 // `Unspecified` deliberately has NO JSON spelling — a spellable "unspecified"
 // would let a typo look deliberate, and would let a format DECLARE the
 // invalid sentinel and pass the required-declaration rule while meaning
 // nothing. The empty string is rejected for the same reason: it is what a
-// `"scheme": ""` typo produces.
+// `"scheme": ""` typo produces — and leaving the sentinel OUT of the table is
+// what makes `fromName("")` refuse it rather than resolve to it.
 [[nodiscard]] constexpr std::optional<CSymbolDecorationScheme>
 cSymbolDecorationSchemeFromName(std::string_view s) noexcept {
-    if (s == "none")               return CSymbolDecorationScheme::None;
-    if (s == "leading-underscore") return CSymbolDecorationScheme::LeadingUnderscore;
-    return std::nullopt;
+    return kCSymbolDecorationSchemeTable.fromName(s);
 }
 
 // The format's C-symbol decoration block (`"cSymbolDecoration"` in
@@ -310,6 +349,11 @@ inline constexpr EnumNameTable<ExternCallDispatch, 2> kExternCallDispatchTable{{
     { ExternCallDispatch::IndirectSlot, "indirect-slot" },
     { ExternCallDispatch::DirectPlt,    "direct-plt"    },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kExternCallDispatchTable);
 
 [[nodiscard]] constexpr std::string_view
 externCallDispatchName(ExternCallDispatch d) noexcept {
@@ -381,6 +425,11 @@ inline constexpr EnumNameTable<DataImportBinding, 1> kDataImportBindingTable{{{
     { DataImportBinding::GotIndirect, "got-indirect" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kDataImportBindingTable);
+
 [[nodiscard]] constexpr std::string_view
 dataImportBindingName(DataImportBinding b) noexcept {
     return kDataImportBindingTable.name(b);
@@ -434,6 +483,11 @@ enum class ExternAddrBinding : std::uint8_t {
 inline constexpr EnumNameTable<ExternAddrBinding, 1> kExternAddrBindingTable{{{
     { ExternAddrBinding::Got, "got" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kExternAddrBindingTable);
 
 [[nodiscard]] constexpr std::string_view
 externAddrBindingName(ExternAddrBinding b) noexcept {
@@ -491,6 +545,11 @@ inline constexpr EnumNameTable<TlsAccessModel, 3> kTlsAccessModelTable{{{
     { TlsAccessModel::PeIndexed, "pe-indexed" },
     { TlsAccessModel::MachoTlv,  "macho-tlv"  },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kTlsAccessModelTable);
 
 [[nodiscard]] constexpr std::string_view
 tlsAccessModelName(TlsAccessModel m) noexcept {
@@ -595,6 +654,11 @@ inline constexpr EnumNameTable<LibrarySynthVehicle, 2> kLibrarySynthVehicleTable
     { LibrarySynthVehicle::Pthread, "pthread" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kLibrarySynthVehicleTable);
+
 [[nodiscard]] constexpr std::string_view
 librarySynthVehicleName(LibrarySynthVehicle v) noexcept {
     return kLibrarySynthVehicleTable.name(v);
@@ -669,6 +733,11 @@ inline constexpr EnumNameTable<RuntimeLibraryRole, 4> kRuntimeLibraryRoleTable{{
     { RuntimeLibraryRole::UnwindPersonality, "unwindPersonality" },
     { RuntimeLibraryRole::SystemPrimitives,  "systemPrimitives"  },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kRuntimeLibraryRoleTable);
 
 [[nodiscard]] constexpr std::string_view
 runtimeLibraryRoleName(RuntimeLibraryRole r) noexcept {
@@ -804,6 +873,11 @@ inline constexpr EnumNameTable<StackReserveVehicle, 1> kStackReserveVehicleTable
     { StackReserveVehicle::PeOptionalHeader, "pe-optional-header" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kStackReserveVehicleTable);
+
 [[nodiscard]] constexpr std::string_view
 stackReserveVehicleName(StackReserveVehicle v) noexcept {
     return kStackReserveVehicleTable.name(v);
@@ -876,6 +950,11 @@ kStackReserveUnsupportedReasonTable{{{
     { StackReserveUnsupportedReason::WalkerNotImplemented, "walker-not-implemented"},
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kStackReserveUnsupportedReasonTable);
+
 [[nodiscard]] constexpr std::string_view
 stackReserveUnsupportedReasonName(StackReserveUnsupportedReason r) noexcept {
     return kStackReserveUnsupportedReasonTable.name(r);
@@ -916,6 +995,11 @@ kStackReserveUnsupportedRemedyTable{{{
       "D-LK-MACHO-STACK-RESERVE-LC-MAIN." },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kStackReserveUnsupportedRemedyTable);
+
 [[nodiscard]] constexpr std::string_view
 stackReserveUnsupportedRemedy(StackReserveUnsupportedReason r) noexcept {
     return kStackReserveUnsupportedRemedyTable.name(r);
@@ -936,6 +1020,126 @@ struct DSS_EXPORT StackReserveControl {
     // A misaligned request is rejected rather than silently rounded — a
     // silent round is the knob-that-lies class.
     std::uint64_t granularityBytes = 0;
+};
+
+// ── Weak-DEFINITION dialect (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED) ─
+//
+// HOW this object format SPELLS a weak definition — a symbol several
+// translation units may define, of which the linker keeps one. A property of
+// the OBJECT FORMAT's symbol/section model, exactly like `ExternCallDispatch` /
+// `DataImportBinding` above, and keyed by the format for the same reason: the
+// SAME CPU target spells it one way under `pe64-x86_64-windows` and another
+// under `elf64-x86_64-linux`, so the rule cannot live on the target schema.
+//
+// ★★★ THIS IS A DIALECT ROW, NOT A CAPABILITY FLAG, AND THE DISTINCTION IS THE
+// WHOLE POINT (operator ruling 2026-08-20, which authorized the COFF weak
+// machinery: config gets ONE row — which weak-DEFINITION dialect the writer
+// emits — and explicitly NOT a `canExpressWeakAlias` capability flag). A
+// DIALECT row says *how* a format spells something it CAN express. A CAPABILITY
+// flag asserts it CANNOT. [[D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE]] is the
+// record of why the second shape is dangerous: **an implementation gap recorded
+// as a format incapability is a false fact in the place most likely to be
+// trusted later, and it does not reverse cleanly.** That row was closed the day
+// its "incapability" turned out to be an unbuilt writer.
+//
+// ★★ ONE PROPERTY PER FIELD — carried across from that same row, because it is
+// the half that outlived the decision. The SEMANTIC fact ("this format spells a
+// weak definition as COMDAT select-any") and any CAPABILITY fact ("DSS emits /
+// does not emit this record") are TWO statements needing TWO fields. Merged,
+// the declaration asserts something the writer then refuses, and the next
+// reader loses an hour deciding which one lied. `dialect` therefore states ONLY
+// the spelling. No capability field exists here, and none may be added to this
+// block: a capability is a separate declaration with a separate name.
+//
+// ★ AND THE KEY IS ONE THE WRITER CONSULTS. A key the writer does not READ is
+// worse than no key — it drifts silently and reads as authoritative — so the
+// declaration is asked for at the point a weak definition is actually encoded,
+// and a dialect the walker has no encoder for is REFUSED
+// (`K_FormatLacksWeakDefinitionDialect`), never silently re-spelled.
+//
+//   * `comdat` (PE/COFF): the duplicate-resolution policy lives on the
+//     SECTION. Each weak body gets a section of its own flagged
+//     IMAGE_SCN_LNK_COMDAT whose Selection byte is IMAGE_COMDAT_SELECT_ANY
+//     ("any section that defines the same COMDAT symbol can be linked; the
+//     rest are removed"). ✔The published PE/COFF format, "COMDAT Sections
+//     (Object Only)". NOT `IMAGE_SYM_CLASS_WEAK_EXTERNAL`, which is a weak
+//     REFERENCE with a fallback alias and serves the separate ALIAS path —
+//     see `pe.cpp`'s weak-definition block for the measured reference
+//     encodings that fix this choice.
+//   * `symbol-binding` (ELF): the weakness lives in the symbol's BINDING
+//     field — `STB_WEAK` in the high nibble of `st_info`. No section flag is
+//     involved (`elf.cpp`, `stbForBinding`).
+//   * `symbol-flag` (Mach-O): the weakness lives in a per-symbol FLAG bit
+//     ALONGSIDE an ordinary binding — `N_WEAK_DEF` (0x0080) in the nlist's
+//     `n_desc`, on a symbol that is otherwise `N_SECT|N_EXT` (`macho.cpp`).
+//
+// ★ WHY ALL THREE SHIP AS VOCABULARY, AND WHAT THAT DOES NOT CLAIM. Each names
+// an encoder that EXISTS in this tree today, so none is a verb shipped ahead of
+// its walker arm (the `StackReserveVehicle` discipline). What the vocabulary
+// does NOT claim is that every writer CONSULTS the declaration: only the COFF
+// object writer does today, and only the pe object/staticlib documents declare
+// the block, precisely so that no shipped document carries a key nobody reads.
+// Widening consultation to the ELF and Mach-O writers is
+// [[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]] — and
+// each format document gains the key IN THE SAME CHANGE as its writer's
+// consultation, never before it.
+enum class WeakDefinitionDialect : std::uint8_t {
+    // Zero is the INVALID sentinel and has NO JSON spelling — deliberately
+    // absent from the table below, so `weakDefinitionDialectFromName` cannot
+    // resolve it from ANY string (including `""`, which is what a
+    // `"dialect": ""` typo produces) and `nameOrEmpty` renders it EMPTY. A
+    // hand-built `WeakDefinition{}` is rejected by
+    // `ObjectFormatData::validate()` through the `…Name(x).empty()` idiom.
+    Unspecified   = 0,
+    Comdat        = 1,  // COFF: IMAGE_SCN_LNK_COMDAT + IMAGE_COMDAT_SELECT_ANY
+    SymbolBinding = 2,  // ELF: STB_WEAK in st_info
+    SymbolFlag    = 3,  // Mach-O: N_WEAK_DEF (0x0080) in n_desc
+};
+
+inline constexpr EnumNameTable<WeakDefinitionDialect, 3>
+kWeakDefinitionDialectTable{{{
+    { WeakDefinitionDialect::Comdat,        "comdat"         },
+    { WeakDefinitionDialect::SymbolBinding, "symbol-binding" },
+    { WeakDefinitionDialect::SymbolFlag,    "symbol-flag"    },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kWeakDefinitionDialectTable);
+
+[[nodiscard]] constexpr std::string_view
+weakDefinitionDialectName(WeakDefinitionDialect d) noexcept {
+    // The `-Werror=switch` backstop; it owns no spelling. A new dialect with
+    // no `case` fails the BUILD rather than becoming a value with no name.
+    // (The `cSymbolDecorationSchemeName` shape — read its docblock for why the
+    // sentinel is left OUT of the table and asked for through `nameOrEmpty`.)
+    switch (d) {
+        case WeakDefinitionDialect::Unspecified:
+        case WeakDefinitionDialect::Comdat:
+        case WeakDefinitionDialect::SymbolBinding:
+        case WeakDefinitionDialect::SymbolFlag:
+            break;
+    }
+    return kWeakDefinitionDialectTable.nameOrEmpty(d);   // NOT .name()
+}
+[[nodiscard]] constexpr std::optional<WeakDefinitionDialect>
+weakDefinitionDialectFromName(std::string_view s) noexcept {
+    return kWeakDefinitionDialectTable.fromName(s);
+}
+
+// The format's weak-definition block (`"weakDefinition"` in `.format.json`).
+// A BLOCK carrying one `dialect` verb rather than a bare scalar — the
+// `CSymbolDecoration` precedent, for its stated reason: a future dialect that
+// needs per-arm PARAMETERS gains a sibling key INSIDE this block instead of a
+// second root key only some formats may legally declare.
+//
+// Held in an `std::optional` on the schema, so PRESENCE is the declaration.
+// Absence is NOT an assertion that the format cannot express a weak definition
+// — that would be the capability flag this row exists to refuse. It is the
+// absence of an answer, and the writer says exactly that when it needs one.
+struct DSS_EXPORT WeakDefinition {
+    WeakDefinitionDialect dialect = WeakDefinitionDialect::Unspecified;
 };
 
 // THE single source of truth for the extern-call-site SHAPE selection

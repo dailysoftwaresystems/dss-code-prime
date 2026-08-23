@@ -4,6 +4,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
+#include "lir/lir_reg_constraints.hpp"
 
 #include <algorithm>
 #include <array>
@@ -464,6 +465,14 @@ rangeCrossesCall(LirLiveRange const& r,
 //     (operand becomes sign-extension of dividend; 100/0 = trap).
 // Outputs are not forbidden (the op reads the operand BEFORE
 // writing outputs; same-reg overlap is fine).
+//
+// ★ CHOKEPOINT (2026-08-15, D-LIR-PER-INST-REG-CONSTRAINTS): the union is no
+// longer built here. It comes from `effectiveForbiddenOrdinals`, which reads
+// BOTH carriers — the per-OPCODE `implicitRegisters` this comment describes
+// AND the per-INSTRUCTION pool an inline-asm statement fills. Before that,
+// this site (and the two others that built the same union by hand) read only
+// the opcode carrier, so a faithfully-carried per-instruction clobber set was
+// silently ignored by the only consumer that can act on it.
 struct ImplicitClobberAt {
     std::uint32_t              position;
     std::vector<std::uint16_t> forbiddenOrdinals;
@@ -478,25 +487,10 @@ collectImplicitClobberPositions(Lir const& lir, TargetSchema const& schema,
         std::uint32_t const n = lir.blockInstCount(b);
         for (std::uint32_t i = 0; i < n; ++i) {
             LirInstId const inst = lir.blockInstAt(b, i);
-            auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
-            if (info != nullptr
-             && info->implicitRegisters.has_value()) {
-                auto const& ir = *info->implicitRegisters;
-                if (!ir.inputOrdinals.empty()
-                 || !ir.clobberedOrdinals.empty()) {
-                    std::vector<std::uint16_t> forbidden;
-                    forbidden.reserve(ir.inputOrdinals.size()
-                                      + ir.clobberedOrdinals.size());
-                    for (auto const o : ir.inputOrdinals)     forbidden.push_back(o);
-                    for (auto const o : ir.clobberedOrdinals) {
-                        // dedup against inputs (idiv's RDX is both
-                        // input + clobbered)
-                        bool dup = false;
-                        for (auto const e : forbidden) if (e == o) { dup = true; break; }
-                        if (!dup) forbidden.push_back(o);
-                    }
-                    out.push_back({pos, std::move(forbidden)});
-                }
+            std::vector<std::uint16_t> forbidden =
+                effectiveForbiddenOrdinals(lir, schema, inst);
+            if (!forbidden.empty()) {
+                out.push_back({pos, std::move(forbidden)});
             }
             pos += 2u;
         }
@@ -1023,9 +1017,25 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
             // operands would silently drive the exclusion set and
             // misallocate r.vreg. Skip the exclusion when the
             // looked-up inst isn't this range's definer.
-            if (info != nullptr && info->requires2Address
+            if (info != nullptr && info->requires2Address.has_value()
                 && lir.instResult(producingInst) == r.vreg) {
                 auto const ops = lir.instOperands(producingInst);
+                // The COALESCE TARGET is the operand the schema ties
+                // the result to, not a literal 0
+                // (D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE).
+                //
+                // ⚠⚠ SKIPPING THE WRONG ONE IS A SILENT MISCOMPILE, NOT
+                // A MISSED OPTIMIZATION, and the direction is worth
+                // spelling out because it is not symmetric. Legalize
+                // runs AFTER this pass and inserts `mov result,
+                // operands[tied]` BEFORE the op — so `result` sharing a
+                // register with any UNTIED operand means that operand's
+                // value is destroyed by the copy before the op ever
+                // reads it. Excluding the tied operand instead would
+                // only cost a redundant move; failing to exclude an
+                // untied one costs correctness. Hence: skip exactly the
+                // index the schema names.
+                std::size_t const tied = *info->requires2Address;
                 // The 2026-06-02 HIGH-2 fixed-buffer overflow
                 // pre-check (`ops.size() > excludedStorage.size()
                 // + 1`) is gone with the growable scratch
@@ -1035,8 +1045,9 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                 // cannot truncate, so the fail-loud arm's job
                 // (never silently drop an exclusion) is satisfied
                 // by construction.
-                // Skip operand[0] (legitimate coalesce target).
-                for (std::size_t k = 1; k < ops.size(); ++k) {
+                // Skip the tied operand (legitimate coalesce target).
+                for (std::size_t k = 0; k < ops.size(); ++k) {
+                    if (k == tied) continue;
                     if (ops[k].kind != LirOperandKind::Reg) continue;
                     LirReg const opReg = ops[k].reg;
                     // Source reg may be already-physical (e.g. from
@@ -1092,27 +1103,19 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                 // div_op declare `result: none`; their SSA result is
                 // captured by a separate post-op mov, so result ==
                 // RAX is benign there).
-                if (info->implicitRegisters.has_value()) {
-                    auto const& ir = *info->implicitRegisters;
-                    // Dedup'd append; the growable scratch makes
-                    // this total for any declared union size — the
-                    // prior fixed-buffer regallocFatal arm is gone
-                    // (D-OPT-REGALLOC-EXCLUSION-BUFFER closure;
-                    // removal is sound because push_back can never
-                    // drop a declared ordinal).
-                    auto addForbidden = [&](std::uint16_t ord) {
-                        for (std::uint16_t const e : excludedScratch) {
-                            if (e == ord) return;
-                        }
-                        excludedScratch.push_back(ord);
-                    };
-                    for (auto const o : ir.inputOrdinals) {
-                        addForbidden(o);
-                    }
-                    for (auto const o : ir.clobberedOrdinals) {
-                        addForbidden(o);
-                    }
-                }
+                //
+                // ★ CHOKEPOINT (2026-08-15): reads BOTH constraint
+                // carriers via `effectiveForbiddenOrdinals`. The
+                // reasoning above is carrier-blind — the 2-addr
+                // legalize's `mov result, ops[0]` runs before the op
+                // reads its implicit registers whether the target
+                // JSON declared them or an inline-asm statement did.
+                // The dedup'd append remains total for any declared
+                // union size (D-OPT-REGALLOC-EXCLUSION-BUFFER
+                // closure): the scratch grows; nothing truncates.
+                appendEffectiveForbiddenOrdinals(lir, schema,
+                                                 producingInst,
+                                                 excludedScratch);
             }
         }
         // Augment exclusion with implicit-register clobbers from any

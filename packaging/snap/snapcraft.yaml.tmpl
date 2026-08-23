@@ -6,8 +6,17 @@
 # published — factor that into the first release (see packaging/README.md).
 #
 # NOTE (scaffold): building a multi-arch snap from prebuilt tarballs is fiddly.
-# This packages the linux-x64 tarball via the `dump` plugin; the arm64 arm and
-# proper lib bundling are left to finalize when snap is enabled.
+# This packages the linux-x64 tarball via the `dump` plugin; the arm64 arm is
+# left to finalize when snap is enabled.
+#
+# The tarball is a PREFIX TREE produced by `cmake --install` (bin/, lib/, share/)
+# — see cmake/DssInstall.cmake, the single owner of what ships. `dump` lays it
+# down verbatim, which is exactly what is needed: `dsscp` locates its config tree
+# by a path RELATIVE TO ITS OWN EXECUTABLE (../share/dss-code-prime/<version>/
+# dss-config) and its shared library by $ORIGIN/../lib, so nothing may be
+# rearranged. That is why the former `organize:` remap of the exe is GONE rather
+# than merely updated — moving the executable out from under share/ would leave a
+# compiler that cannot resolve `#include <stdio.h>`.
 name: @PKGNAME@
 base: core22
 version: '@VERSION@'
@@ -28,8 +37,6 @@ parts:
     plugin: dump
     source: @URL_LINUX_X64@
     source-type: tar
-    organize:
-      bin/dss/dsscp: bin/dsscp
 
 apps:
   dsscp:

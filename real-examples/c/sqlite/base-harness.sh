@@ -81,6 +81,43 @@
 [ -n "${DSS_BASE_HARNESS_SH:-}" ] && return 0
 DSS_BASE_HARNESS_SH=1
 
+# ── bash 4+ required (associative arrays), AND THE GATE LIVES HERE RATHER THAN
+#    IN EVERY SOURCER — macOS ships bash 3.2 and always will ─────────────────
+#
+# ★★★ THE REQUIREMENT IS THIS FILE'S, SO THE REFUSAL IS THIS FILE'S. The
+# functions `dss_bh_dedup_by_basename` and `dss_bh_set_verdict` use `declare -A`,
+# which bash 3.2 does not have. Three entry scripts (build-and-test.sh,
+# test-confound-scope.sh and test-driver-contracts.sh) each carry their own copy
+# of the version gate — and a FOURTH sourcer shipped without one:
+# `benchmark-speedtest1.sh` (added 2026-08-21) sources this file and would have
+# died on macOS at `declare: -A: invalid option`, an error naming a shell builtin,
+# raised by a file the caller never mentioned, stating no requirement at all.
+# ⇒ A precondition checked once per CALLER is a precondition a new caller can
+# forget. Checked HERE it cannot be, and every future sourcer inherits it.
+#
+# ⚠ THIS `exit`s RATHER THAN `return`s, DELIBERATELY. A `return 1` from a sourced
+# file is fatal only if the caller both runs under `set -e` and sources it outside
+# any condition context — a property of the CALLER, which is exactly the thing
+# just measured to be forgettable. `exit` is fatal whoever sources it.
+#
+# ★ NO RE-EXEC HERE, unlike the entry scripts: only an entry script knows its own
+# `$0` and `"$@"`, and re-execing on a caller's behalf mid-source would re-run
+# whatever it had already done. The entry scripts keep the re-exec; this is the
+# floor under it.
+#
+# TWIN PARITY, stated rather than assumed: `base-harness.ps1` needs NO analogue.
+# PowerShell hashtables carry no version floor, so there is nothing for a sibling
+# gate to declare — the requirement is a property of bash, not of this file's
+# CONTRACT, and the two twins still accept the same inputs and answer the same
+# questions.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  dss_bh_v="${BASH_VERSION:-unknown}"
+  echo "base-harness: this file needs bash 4+ (associative arrays); this shell is ${dss_bh_v}." >&2
+  echo "  On macOS /bin/bash is 3.2 and cannot run it: brew install bash, then re-run." >&2
+  echo "  An entry script should have re-execed under a newer bash before sourcing this file." >&2
+  exit 1
+fi
+
 # The version both drivers assert against. Bump it when a function's CONTRACT
 # changes so a driver paired with a stale copy fails loud instead of silently
 # losing a capability — the exact failure mode this file exists to end.

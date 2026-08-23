@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# PURPOSE: census `#pragma` usage across the corpus and hold the profile to its expected shape.
 # TF-C85 pragma census / TF-C86 (D-CSUBSET-STDARG-F001A) pairing retrofit — LAUNCHER ONLY.
 #
 # The census itself lives in `scripts/pragma-profile-census/pragma-profile-census.py`, once. This file finds a

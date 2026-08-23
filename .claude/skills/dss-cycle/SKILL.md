@@ -31,6 +31,12 @@ Multi-host matrix → `dss-cross-leg-test`.
 
 **Conventions authority:** the `dss-code-prime` skill wins on any conflict.
 
+## ★★★ THE GOAL IS TO *WORK* — one working reference makes the behaviour REQUIRED
+
+Operator ruling 2026-08-19: *"we must never crash on correct code, even if gcc fails, we must do it right. … If we have a reference that works, we must too (of course, with the implementation always following our project's best practices)."*
+
+**The test is the DISJUNCTION, not the consensus.** If ANY reference (gcc, clang, MSVC, …) compiles and runs a correct construct, DSS must too. A reference's FAILURE is therefore never evidence against DSS — when DSS accepts what one reference rejects and another accepts, DSS is **right**, and the divergence is a **NON-DSS CONFOUND** to attribute and record. **Never make DSS fail in order to match a failing reference.** This bounds the bidirectional rule: "accepting what no reference accepts is a defect" turns on **NO** — not one. The implementation still owes the full bar (agnostic, config-driven, best-long-term, fail-loud, strictly tested): "it works" is the requirement, not the excuse. ⚠ Probe references **separately** — "the reference" is not one voice, and P14 nearly narrowed a working header chain because only gcc's failure was on file and MSVC's success was not. Full case: `references/the-bar.md` §A.3b.
+
 ## The pause-and-ask gate — the most important behavioral rule
 
 The loop is autonomous for **execution** and escalates **decisions**. When any of these appears,
@@ -54,6 +60,34 @@ rationale in the owning plan this cycle so it is not re-litigated next invocatio
 
 The loop resumes only after the user answers. **While paused, do not start a different cycle.**
 
+### ★★★ A §B TRIGGER IS A PREDICATE, NOT A RITUAL (operator ruling 2026-08-17)
+
+A row pinned "§B — operator decision" is gated on a **stated reason**. If a lane MEASURES that
+reason to be FALSE, the §B **was never triggered** — discharging it is not closing a §B on the
+lane's own authority, it is discovering the gate does not apply.
+
+**The rule, and all three clauses are load-bearing:**
+- every §B row states its trigger as a **testable predicate**, not as a mood;
+- a lane MAY discharge a §B by **measuring the predicate false**, provided it records the
+  measurement **in the row** and **flags it in the cycle report** so the operator can veto;
+- an **INCONCLUSIVE** measurement escalates. **Silence is never a discharge.**
+
+✔The case that produced this ruling: `D-CSUBSET-INLINE-ASM-SPELLING` was pinned §B because bare
+`asm` "needs a new standard-mode axis". A lane measured that DSS already declares GNU mode in the
+reference compilers' own machine-readable spelling (defines `__GNUC__`/`__clang__`, does **not**
+define `__STRICT_ANSI__`) — so no axis exists or was added, and the predicate was false. It also
+measured that DSS was **accepting `int asm = 42;`**, which no reference compiler accepts in GNU
+mode: the pinned state was shipping an *invented extension*, not merely withholding a feature.
+Operator ruling: **keep it.** *"Reverting sound, measured, conformance-correcting work to
+re-present it as a brief would destroy value to satisfy a ritual."*
+
+⚠ **Without this rule the next lane's only options are an unauthorized close or a wrong revert** —
+which is why the procedural hole, not the keyword row, was the real deliverable of that cycle.
+⚠ Discharging a predicate does not discharge what the predicate did not cover. In that same case
+the references' acceptance genuinely IS conditional (under `__STRICT_ANSI__` they require
+`__asm__`), so a **trigger-gated** row was opened for the day a strict-conformance mode ships —
+the §B's original concern preserved and made testable, without holding the fix hostage to it.
+
 ## Workflow
 
 **Delegation is the default** — see the file map. The orchestrator judges; it should not be the one
@@ -76,11 +110,116 @@ hand-typing every edit or reading every subsystem.
    self-check; new engine mechanism → full independent review **and** a §B pause to the user.
 5. **Implement** — delegate in parallel by **disjoint file sets** (engine `.cpp/.hpp` vs
    `src/dss-config/**.json` vs `examples/` vs `tests/`), one agent per set, launched in one message.
-   Name each agent's owned and forbidden paths. Build the best long-term agnostic solution: extend
+   Name each agent's owned and forbidden paths. ★★ **At most FOUR reasoning agents live at once**
+   (operator instruction 2026-08-19) — more work than that runs in waves of four. Script execution
+   (builds, `ctest`, the guards, a remote leg) does **not** count against the cap; see
+   `references/delegation.md`. Build the best long-term agnostic solution: extend
    config vocabulary, never branch the engine on identity. Any new `D-*` cited in `src/` is
    registered in the same commit.
+   ★★ **THE ORCHESTRATOR IS A LANE TOO — ITS OWN EDITS OBEY THE SAME OWNERSHIP.**
+   `src/dss-config/**` is a FILE SET like any other, and a config document is an INPUT to
+   every lane's build. Editing one while a lane is running does not merely risk a merge
+   conflict — it changes what that lane's binaries MEAN between two runs.
+   ⚠ ✔MEASURED 2026-08-20 (cycle P22, `D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-
+   OWNERSHIP`): the orchestrator corrected a relocation `nativeId` while a lane was mid
+   red-on-disable run. A test's verdict flipped between two runs of the same binary, and the
+   lane reported a stale tree as a defect in its final report. **The damage is not the wasted
+   report — it is that a red-on-disable observation is the ONE measurement this project
+   treats as proof, and a config edit underneath one silently corrupts it.**
+   ⇒ Announce the orchestrator's own owned paths alongside the lanes'; hold a config edit
+   until the lanes that read it have reported, or hand it to a lane that owns it. Re-measure
+   anything a lane reported across such an edit before acting on it — and when a lane's
+   report and the tree disagree, suspect the SEQUENCING before suspecting the lane.
+   ★★ **A LANE THAT BUILDS GETS ITS OWN BUILD TREE.** File ownership is not enough, because
+   two lanes with disjoint FILE sets still collide in a shared `build/`: one relinks the DLL
+   while the other is mid-`ctest`. ⚠ ✔MEASURED 2026-08-20 (cycle P22): `0xc0000043`
+   (STATUS_SHARING_VIOLATION) mid-suite, plus a set of failures that appeared and vanished
+   between two runs of the same binary. **A gate result taken from a shared build tree is not
+   attributable to anything** — which makes it worthless exactly when it matters, during a
+   red-on-disable observation.
+   ⇒ Name the lane's build tree in its brief (`build/<lane>`), and clear it once green (the
+   one-root rule). `scripts/local-build/local-build.{sh,ps1} --tree <name>` takes one.
+   ★★ **AND A LANE THAT WRITES SCRATCH FILES GETS ITS OWN SCRATCH DIRECTORY.** The per-lane
+   BUILD tree isolates artifacts; it isolates neither the scratchpad nor the working tree.
+   ⚠ ✔MEASURED 2026-08-20 (cycle P23,
+   `D-CYCLE-LANE-SCRATCHPADS-ARE-SHARED-AND-LANES-CLOBBER-EACH-OTHER`):
+   four lanes were given one `scratchpad/<cycle>/` directory, one lane's
+   mutation harness was OVERWRITTEN by another lane's file of the same name mid-run, and the
+   next three red-on-disable cycles executed the WRONG SCRIPT with the first lane's arguments.
+   Nothing was corrupted only because that harness restored its subject from a `finally` and
+   verified the hash. ⇒ Name `scratchpad/<cycle>/<lane>/` in the brief.
+   ★★ **AN ANCHOR ID IS NEVER LINE-WRAPPED, AND THIS CLAUSE IS THE PROOF OF WHY.** The row
+   above was cited here for hours WITHOUT EXISTING, and the step-10 audit was the first thing
+   to notice — because the id was split across two lines, so neither the registry guard nor a
+   human's grep could match it. ✔MEASURED 2026-08-20: **17 of the 78** distinct `D-*` ids cited
+   on that cycle's added lines were wrapped; 16 were harmless only because the same id appears
+   unwrapped nearby. ★ **A wrapped id does not fail — it becomes INVISIBLE**, which is the one
+   failure mode a fail-loud project cannot detect by watching for a failure. Break the line
+   BEFORE the id or AFTER it, never inside it — the convention the harness scripts already
+   spell as `ANCHOR, ONE LINE, DO NOT WRAP`.
+   ⚠ **The same measurement carries a second, larger consequence: a WHOLE-TREE gate number
+   taken by any lane is not attributable to that lane**, because the source tree still holds
+   every other lane's uncommitted edits. A lane scopes its gate with `-R` to its own subjects
+   and treats a failure outside them as somebody else's until proven otherwise; the ONLY
+   attributable whole-tree number is the orchestrator's, after the fold.
+   ★★ **A BRIEF MAY STATE AN INTERFACE ONLY IF ITS AUTHOR HAS RUN IT** — the same standard as
+   §5's "a measurement is stated only with the instrument that produced it", one level up: an
+   invocation is a claim about the world, and writing one from memory is writing an
+   unmeasured fact into the place a lane trusts most. ⚠ ✔MEASURED 2026-08-20 (cycle P23): the
+   orchestrator's own common brief spelled `run-gate.sh -- ctest …`; the real interface is
+   `<log-path> <success-regex> <command> [args...]`. TWO lanes hit it, it refused
+   (fail-closed, correctly), and one left a file literally named `--` in the repo root. The
+   fix is one command: run the invocation once before pasting it into a brief.
+   ★★ **AND THE SAME STANDARD BINDS A MECHANISM, NOT ONLY AN INTERFACE: A BRIEF THAT NAMES THE
+   FIELD A DECISION READS, OR THE ROLE A VALUE CARRIES, IS MAKING A MEASUREMENT AND OWES AN
+   INSTRUMENT.** ⚠ ✔MEASURED 2026-08-20 (cycle P23,
+   `D-CYCLE-BRIEF-ROUTED-A-DECISION-ONTO-A-FIELD-THAT-DOES-NOT-DISCRIMINATE`): a brief told a lane
+   to route the COFF weak-external decision on the auxiliary record's `Characteristics` field. gcc
+   emits `Characteristics = 1` for **all four** weak shapes, so routing on it would have classified
+   every gcc weak DEFINITION as unresolvable — *precisely the defect the lane existed to fix*. The
+   field that discriminates is the record's own `TagIndex`. ★ **This is the same trap as
+   `D-LK-MACHO-ISDATA-NO-CALL-SIGNAL` (a relocation's arithmetic substituted for its role) and as
+   `D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE`'s revisit condition (a front-end feature substituted
+   for the existence of a caller). The trap is not any particular field — it is reaching for
+   whichever field sits nearest the decision and assuming it carries it.** Where a brief cannot
+   supply an instrument, it says *"unmeasured, verify first"* rather than stating the fact flat.
+   ★★ **AND THE LANE THAT REFUTES ITS BRIEF IS THE CONTROL LOOP WORKING, NOT A LANE GOING
+   OFF-BRIEF** — say so in the brief, so the lane knows a refutation is a deliverable.
+   ⚠ **AND THE FIRST WRITE-UP OF THIS RULE MISSTATED ITS OWN MEASUREMENT** — it said
+   that invocation exits 127 with an empty log. ✔RE-MEASURED: it exits **2**, with a named
+   refusal. The 127-and-empty-log shape is the DIFFERENT invocation `bash <C:/.../run-gate.sh>`,
+   where bash cannot open the SCRIPT (see below). Two failures that look alike were being
+   described as one, inside the rule that exists to stop exactly that.
+   ★★ **A BRIEF THAT ASSIGNS `tests/<dir>/` GRANTS THAT DIRECTORY'S `CMakeLists.txt` AS
+   APPEND-ONLY — AND SAYS SO.** A new `test_*.cpp` cannot RUN without a `dss_add_test` block, and
+   that file belongs to the directory rather than to any lane, so a brief that lists the test file
+   and not its registration leaves the lane a choice between not landing the test and editing an
+   unowned file. ⚠ ✔MEASURED 2026-08-20 (cycle P23,
+   `D-CYCLE-BRIEF-ASSIGNS-A-TEST-FILE-WITHOUT-ITS-BUILD-REGISTRATION`): four lanes added tests and
+   three shared `CMakeLists.txt` files were each edited by lanes that had not been given them.
+   Append-only edits merged cleanly; the damage came from ONE lane rewriting a whole file in CRLF,
+   reddening `line_endings_guard` for three other lanes' work and leaving a diff nobody could claim.
+   ⇒ **Append a block; never reorder, reformat, or rewrite the file whole.** Append-only is what
+   makes a shared file safe under concurrency, and it is also what makes a violation visible.
+   ★★ **A MESSAGE TO A LIVE LANE RE-STATES THAT LANE'S SUBJECT AND OWNED PATHS, IN ITS
+   OPENING LINES.** A lane handle is an opaque id; several lanes run at once; and a message from
+   the orchestrator carries the orchestrator's authority. ⚠ ✔MEASURED 2026-08-20 (cycle
+   P23, `D-CYCLE-A-LANE-MESSAGE-DELIVERED-TO-THE-WRONG-LANE`): an ownership-NARROWING message
+   — reassigning a file set and asserting *"your scope was always X"* — was delivered to
+   the wrong lane. Had it been obeyed, two lanes would have edited one file set and BOTH reports
+   would have become unattributable, which is the same damage class as editing a lane's config
+   underneath it. **It did no damage for exactly one reason: the recipient's BRIEF named its own
+   subject and listed those paths as FORBIDDEN**, so the instruction contradicted a written
+   boundary instead of arriving into a vacuum — and the lane refused it and answered with a
+   measurement (`git status --short` + `stat -c %y`) rather than a denial.
+   ★ The reusable half: **an instruction that names the recipient's scope can be REFUTED by the
+   recipient; one that only names the work cannot.** Redundancy in the addressing is what makes
+   mis-delivery detectable at the destination, which is the only place it can still be caught.
 6. **Review and fold** — `/pr-review-toolkit:review-pr`, plus the agnosticism pass and the CI-hazard
-   screen. **Re-review the fold** if folding changed logic; iterate to a fixed point. Passes that
+   screen. ★★ **If this cycle created or modified a `.sh`/`.ps1` pair, TWIN PARITY IS PART OF THIS
+   STEP** — same inputs, same properties, same flags, same exit codes, both siblings changed in this
+   commit. It is a review obligation because it is not decidable by a script; see the pairing section
+   below. **Re-review the fold** if folding changed logic; iterate to a fixed point. Passes that
    keep surfacing logic findings without converging are a pause signal — stop and report, do not grind.
 7. **Fail-loud gate** — the mechanical battery, including the anchor-balance gate.
 8. **Pin every deferral** discovered this cycle.
@@ -98,6 +237,55 @@ hand-typing every edit or reading every subsystem.
 
 ## Output contract
 
+★★★ **OPERATOR INSTRUCTION 2026-08-17 — SILENCE IS THE DEFAULT. EMIT NOTHING THE OPERATOR DOES NOT
+NEED IN ORDER TO PROCEED.** Verbatim: *"requires no output tokens unless what I need to know to
+proceed (failures, done/not done, final report, etc)"*.
+
+**The complete list of things worth emitting:**
+1. **A failure or a blocker** — something is red, refused, or cannot proceed. State it, with the
+   measurement, and what you are doing about it.
+2. **A pause gate** — a decision only the operator can make (§B, a pending definition, an unfired
+   trigger, a hard stop). This is the one case where length is justified: options, trade-offs,
+   recommendation.
+3. **Done / not done** — a step's terminal state, when the operator's next action depends on it.
+4. **The final report** — the output contract below.
+5. **A direct answer to a direct question.**
+
+⛔ **Everything else is noise, and the list of what NOT to emit is the useful half:** no progress
+narration ("lane X is running", "starting the build"), no interim summaries of work that is not
+finished, no restating a lane's report back, no explaining a finding that is already written into
+the registry row and the handoff — **the row IS the deliverable; a prose retelling is a second copy
+that will go stale**. Do not announce what you are about to do, then do it, then announce that you
+did it. Do not re-report a number the operator has already been given.
+⚠ **This does NOT license silent failure or thin measurement.** Rigor is unchanged: measure
+everything, anchor everything, write the registry rows and the handoff in full. The instruction is
+about the CHAT CHANNEL only — put the detail where it persists, not where it scrolls past.
+★ Test to apply before emitting: *does the operator have to do something differently because of
+this?* If no, it belongs in the row, not in the reply.
+
+★★★ **OPERATOR CORRECTION 2026-08-17, SECOND PASS — THE CATEGORY LIST WAS NOT ENOUGH, BECAUSE THE
+LEAK IS NOT *WHICH* ITEMS GET EMITTED, IT IS *HOW*.** Verbatim: *"silent mode is not working. You
+need to talk only things I need to know (forks, errors, final reports, etc.), not your own
+reasoning."* An emission can sit squarely in category 1 or 3 and still be almost entirely noise,
+because the fact arrives wrapped in the reasoning that produced it. **The fact is the payload; the
+reasoning is not.**
+
+**FORM, not just category — an allowed emission carries the fact and its measurement, and stops:**
+- ⛔ **No significance commentary.** Not *"that changes what delivered means"*, not *"this is worth
+  flagging"*, not *"the interesting part is…"*. State the fact; the operator ranks it.
+- ⛔ **No meta about the telling.** Not *"I'd rather say it now than at commit time"*, not *"stating
+  it plainly rather than burying it"*, not *"before I put it to you"*. Just say it.
+- ⛔ **No derivation.** The operator wants the conclusion and the number, not the path. *"886/886"*,
+  not the reasoning that made you re-run it.
+- ⛔ **No roads not taken.** What you considered and rejected belongs in the row, never in the reply.
+- ⛔ **No relaying a lane's report.** A lane's findings go into the registry and the handoff. Emit
+  only the part that changes the operator's next action, in your own one line.
+- ★ **Length is the tell.** A failure, a done/not-done, or an answer is **1–3 lines**. If it runs
+  longer and is not a §B pause gate, the excess is reasoning — cut it, do not compress it.
+
+⚠ **The one exception stays the §B pause gate**, which needs options, trade-offs and a
+recommendation. Everything else is a sentence or three.
+
 A one-line cycle summary — priority closed, anchors touched, test delta, commit hash — plus:
 
 ```
@@ -110,10 +298,143 @@ next: <one line, matching the top NEXT entry in .plans/_handoff.md>
 what the gate exists to make impossible to say. If the report and the handoff disagree about what
 comes next, fix the handoff: it is the one a future reader will find.
 
+## ★★★ USE THE SCRIPT THAT EXISTS — AND FIX IT RATHER THAN ROUTING AROUND IT
+
+**Operator instruction 2026-08-19, verbatim:** *"if a tool has a problem, fix before using again, not
+workaround an own tool. reusable tools exists to avoid bunch of problems like mangling or edge cases"*.
+
+- **Look in `references/scripts.md` first.** It indexes every script under `scripts/`, each with its
+  purpose. If one covers the job, invoke it — not "something like it" typed inline.
+- **A defect in one of them is FIXED in the cycle that hits it.** A workaround at the call site leaves
+  the defect for the next caller and forks the behaviour silently. This is a FIX, so by the 2026-08-15
+  ruling **no hard stop gates it**, whatever subsystem it lands in.
+- ⚠⚠ **AND `bash <script>` FROM A WINDOWS-NATIVE PARENT IS NOT THE BASH YOU MEAN.**
+  ✔MEASURED 2026-08-20 (cycle P23): from a Windows-native process, `bash` resolves to
+  `C:\WINDOWS\system32\bash.exe` — **WSL's** — which cannot open a `C:/...` path. Two
+  distinct failures follow and they look alike:
+  * `bash scripts/run-gate/run-gate.sh <C:/...log>` — the script RUNS and cannot write its
+    log; it now exits **2** with a named refusal that identifies the shell.
+  * `bash <C:/.../run-gate.sh>` — bash cannot open the SCRIPT, so **it never executes**.
+    Exit **127**, empty log, and **no edit inside any script can ever improve this shape**.
+    The only fix is at the CALL SITE: invoke it as a relative path from Git Bash, or run the
+    `.ps1` twin.
+  ★ Worth stating because the second shape reads as *"the gate refused"* when what happened
+  is *"the wrong bash ran"* — an instrument that misattributes is the failure this project
+  cares most about.
+- ⚠ **The reason is measured, not aesthetic.** These scripts hold this project's accumulated edge
+  cases: a `wsl.exe bash -c` with a variable that once became `rsync -a --delete / /` and reported
+  exit 0; quoted heredocs eating backslashes; unanchored rsync excludes that silently skipped a
+  changed `.cpp`; `command -v` lying over non-interactive ssh on macOS. Re-typing the pipeline inline
+  re-opens all of them at once.
+
+### ★★ MANDATORY: a script added, renamed, deleted, or REPURPOSED updates the reference
+
+In the **same commit**, exactly like `.plans/_handoff.md` — a reference that ships one commit late is
+a reference the next reader cannot trust. This is enforced rather than asked: each script declares its
+purpose once in a `PURPOSE:` line in its own header, both indexes (`scripts/README.md` and
+`references/scripts.md`) are generated from those declarations, and the `scripts_index_guard` ctest
+entry reds when the tree and the indexes disagree.
+
+```bash
+python scripts/check-scripts-index/check-scripts-index.py --write
+```
+
+⚠ A new script also inherits the repository's layout, and the guard checks it: one directory per
+script named for the script, every sibling implementation inside it (`scripts/<name>/<name>.{sh,ps1,py}`),
+assets alongside, and no script loose at the top or buried in a subdirectory.
+### `.sh`/`.ps1` pairing is a JUDGEMENT THE AUTHOR MAKES AND WRITES DOWN — never a gate
+
+**Operator ruling 2026-08-19:** *"some scripts are posix executed only, and don't have a .ps1 pair. so
+we must just enforce the dss cycle and dss code prime skills to always create the pair, except when the
+execution is posix only."*
+
+- **Create the `.ps1` twin whenever the capability must reach the Windows leg.** That leg is where this
+  project's primary ctest runs; a bash-only capability is one the main gate cannot use.
+- **Omit it — and say so in the header — when either holds:** the script is already cross-platform (a
+  `.py` runs on both hosts, so a twin would be a second implementation of something never split), or
+  execution is POSIX-ONLY BY NATURE (`wsl-leg` runs inside a WSL distro where PowerShell is not the
+  shell; `profile-compile` drives a POSIX toolchain over a carriage).
+- **Where a pair exists, the two must not drift — and that is checked IN THE REVIEW, at the moment the
+  script is written or changed.** Operator ruling 2026-08-19: *"the parity must be checked in the
+  review, before the commit, when the script is being created or modified. Not after and not a script
+  to it. After committed it must be already working."*
+  ⚠ **Not automatable, and the reason is not laziness:** a script can do literally anything, so
+  equivalence of two arbitrary programs is not a property a detector can decide. What a gate CAN see is
+  existence and metadata — which is why `scripts_index_guard` refuses a sibling whose `PURPOSE:`
+  contradicts its primary, and stops exactly there.
+  **What the reviewer owes when a `.sh`/`.ps1` pair is touched:** the two scan the same inputs, check
+  the same properties, accept the same flags, and return the same exit codes for the same conditions —
+  and a change to one landed in the other in the SAME commit. Pairing by EXISTENCE is not pairing by
+  BEHAVIOUR.
+
+⚠ **This is deliberately NOT enforced by a guard, and the reason is measured:** ✔11 of 21 script
+directories carry no `.ps1` and every one is correct. A gate cannot tell a deliberate POSIX-only script
+from a forgotten twin, so it would need an allowlist of eleven exceptions — the convention written twice,
+in the place least likely to be read, reddening honest work by default. The anchor that demanded such a
+gate was WITHDRAWN on that ruling.
+
+## ★★★ NEVER CITE A LINE NUMBER — CITE SOMETHING THE FILE CARRIES
+
+**Operator rule, 2026-08-19, verbatim:** *"we must never document line numbers, we must document
+method names, comment ids or defined anchors. everything that changes is unreliable. so it's just a
+matter of, when finding the path:line, replace the line number by a fixed reference."*
+
+Applies to **every** artifact a cycle writes — registry rows, the handoff, plans, skill references,
+commit messages, and code comments alike.
+
+```
+✗  src/mir/lowering.cpp  + a line number    <- moves the instant anything above it changes
+✓  src/mir/lowering.cpp — lowerCallArgs()
+✓  tests/CMakeLists.txt — the `no RUN_SERIAL` rationale block
+✓  [[D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES]]
+```
+
+**A symbol survives every edit above it; a line number survives none** — and the failure mode is the
+bad one: a citation that BREAKS gets noticed, while one that silently becomes WRONG still resolves,
+still reads as evidence, and now points at unrelated prose.
+
+⚠ **✔MEASURED twice inside one cycle (P17), which is why this is a rule and not advice.** Inserting a
+one-line header into eighteen scripts moved **16** plan citations off their subjects. The rows then
+written to RECORD that defect shipped **three more** wrong numbers of their own, each naming the
+first line of an explanatory comment instead of the code it explained. Independent audit caught both;
+no gate saw either.
+
+**Enforced** by `plan_citations_guard` (ctest) over `.plans/**` and `.claude/**` as a **ratchet** —
+the ~2365 pre-existing citations sit in a per-document inventory whose ceilings may only come
+**DOWN**. A new one reds immediately; converting one reds until its ceiling is lowered in the same
+commit, because unclaimed headroom is where the next one hides.
+
+```bash
+python scripts/check-plan-citations/check-plan-citations.py --write
+```
+
+⚠ **Green there means no NEW positional citation landed — never that the plans cite stably.** The
+inventory is DEBT: burn it down in whatever document you are already editing.
+
 ## Hard stops — always route through the pause gate
 
+★★★ **OPERATOR RULING 2026-08-15 — A HARD STOP GATES *OPENING A CAPABILITY*, NEVER *FIXING A DEFECT*.
+THERE IS NO HARD STOP ON FIXES, ANYWHERE, AT ALL.** Verbatim: *"please remove the hard stop on FIXES
+at all!"* If the work is repairing something already shipped that is wrong — a silent miscompile, a
+crash on legal input, a false rule, a conformance divergence, a guard that asserts nothing — it is a
+FIX, and **no hard stop applies to it** regardless of which subsystem it lands in. Fixes proceed
+autonomously under the ordinary bar.
+⚠ **Why this needed saying:** a hard stop is a scope guard against a cycle quietly starting a large
+new arc. Applied to a fix it inverts into the opposite of its purpose — it becomes a reason to leave
+known-broken shipped behaviour in place, which is precisely the deferral §A.7 forbids, wearing a
+governance rule as a disguise. ✔The case that produced this ruling: `hwtime.h` was blocked by
+`__inline__` handling, which touches the inliner; treating that as OPT7-gated would have parked a
+measured defect behind a rule written to stop *new pass development*.
+★ **The distinction to apply, and it is about the DELIVERABLE, not the file you edit:**
+*"does this make something CORRECT that is currently WRONG?"* → **FIX, no gate.**
+*"does this make DSS able to do something it has never done?"* → **capability, gate still applies.**
+Touching a gated subsystem's source does not by itself make it a capability; the OPT7 gate is about
+opening the inter-procedural *arc*, not about every line in `src/opt/`.
+
 - **OPT7 / inlining** (`G-406`, sub-anchor `D-OPT7-1`) — first inter-procedural pass, touches
-  linkage / DCE / cross-CU legality. A supervised cycle; **never open autonomously**.
+  linkage / DCE / cross-CU legality. A supervised cycle; **never open autonomously.**
+  ⇒ **Gated: opening the arc.** ⇒ **NOT gated: fixing a defect in inlining that already ships**,
+  per the ruling above.
 - **Trigger-gated anchors** — NOT a TODO. "Do not build until the trigger fires." If it has not
   fired, skip and report "trigger not fired". Backlog ordering is sequencing guidance, not a closure
   license.
@@ -140,8 +461,16 @@ never lowers the bar.
 - Read `references/anchors-and-deferrals.md` at step 8, and whenever pinning a deferral or judging
   whether an anchor is eligible.
 - Read `references/operator-discipline.md` when reporting or claiming anything — the bar applies to
-  the operator, not only to the code.
+  the operator, not only to the code, and it opens with the **never-cite-a-line-number** rule.
+- Read `references/scripts.md` **before writing any script, probe, or one-off shell pipeline** —
+  the index of every script this repository already ships, each with its purpose. Most of what a
+  cycle needs is already there, and re-typing it inline re-opens the edge cases it was taught
+  (`wsl.exe` quoting, heredocs eating backslashes, unanchored rsync excludes, ssh dropping PATH).
 - Read `references/worktrees.md` before any byte-changing measurement or agent worktree operation.
+- Read `references/build-layout.md` before creating ANY build tree (step 5) and before reporting a
+  cycle complete (step 11) — **one root `build/`, subdirectories for distinct builds, and lane builds
+  cleared once the gate covering them is green.** Operator instruction 2026-08-17; a surviving
+  `build/lane-*` blocks the completion report the same way the anchor-balance gate does.
 
 ## Failure modes this skill exists to prevent
 

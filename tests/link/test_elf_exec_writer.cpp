@@ -23,6 +23,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/format/elf.hpp"
+#include "link/format/elf_symtab_partition.hpp"
 #include "link/format/exec_data_section.hpp"   // TLS C1: addTlsSymbolOffsets pin
 #include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "link/linker.hpp"
@@ -31,12 +32,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -3706,4 +3709,741 @@ TEST(ElfExecWriter, VersionReadFromRealLibraryRoundTripsIntoVerneed) {
     std::uint16_t const vnaOther = readU16LE(bytes, aux + 6);
     EXPECT_GE(vnaOther, 2u);
     EXPECT_EQ(readU16LE(bytes, shOffset(bytes, vsymIdx) + 2), vnaOther);
+}
+
+// ── D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS ──────────────────
+//
+// THE red-on-disable pin: a FINAL IMAGE's `.symtab` must carry each function's
+// DECLARED name, and must keep `sym_<id>` for exactly the symbols that have no
+// declared name.
+//
+// ✔MEASURED, the defect this closes: gdb over a DSS-built ELF exec printed
+//   #0 sym_84 / #1 sym_89 / #2 sym_93
+// where the source says `static_helper` / `global_helper` / `main`, on BOTH
+// x86_64 and aarch64 — beside a CORRECT `.eh_frame`. The name column was the
+// only wrong part of the image: every st_value/st_size/st_info byte, and every
+// instruction, is unchanged by the fix (the same run after it reports the same
+// three addresses, now named).
+//
+// ★ WHY THIS LOOPS OVER BOTH IMAGE ARMS AND NOT JUST BOTH PORTS. The ELF walker
+// has TWO image symtab builders and BOTH hardcoded `sym_<id>`:
+// `encodeElfExecDynamic` (any module carrying an extern — which, because every
+// shipped exec/PIE format spells `processExit` as `by-name-import` for `exit`,
+// is EVERY REAL EXECUTABLE) and the shared static-ET_EXEC arm's `emitFuncSym`
+// (reachable with zero externs). Pinning one arm would have left the other free
+// to rot, and the LIVE one is the dynamic arm — the one a "minimal ET_EXEC"
+// test would never have reached.
+//
+// ★ EVERY CELL RUNS THROUGH A `void` CALLABLE so a failed ASSERT returns from
+// the BODY instead of aborting the whole matrix. A sibling cycle measured
+// exactly this vacuity: a `for (port : {x86, arm})` loop with a bare ASSERT
+// aborted at the x86_64 half and NEVER RAN the aarch64 half, where the mutant
+// failed silently — the safe arm masked the dangerous one.
+namespace {
+
+// Every `.symtab` name in an emitted image, in emission order. Returned as a
+// LIST and asserted by membership so the pin survives a legitimate reordering of
+// the symtab (which is not what it exists to police) while still failing on a
+// changed SPELLING (which is).
+[[nodiscard]] std::vector<std::string>
+imageSymtabNames(std::vector<std::uint8_t> const& bytes) {
+    std::vector<std::string> out;
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    if (symtabIdx < 0 || strtabIdx < 0) return out;
+    std::uint64_t const shoff  = readU64LE(bytes, 40);
+    std::uint64_t const symOff = readU64LE(bytes, shoff + symtabIdx * 64 + 24);
+    std::uint64_t const symSz  = readU64LE(bytes, shoff + symtabIdx * 64 + 32);
+    std::uint64_t const strOff = readU64LE(bytes, shoff + strtabIdx * 64 + 24);
+    for (std::uint64_t i = 0; i < symSz / 24; ++i) {
+        out.push_back(
+            readCStr(bytes, strOff + readU32LE(bytes, symOff + i * 24 + 0)));
+    }
+    return out;
+}
+
+struct ImagePortSpec {
+    char const*               label;
+    char const*               targetName;
+    char const*               formatName;
+    std::vector<std::uint8_t> retBytes;    // a lone return
+    std::vector<std::uint8_t> callBytes;   // call-extern + return
+    std::uint32_t             callOffset;  // the reloc patch site
+};
+
+} // namespace
+
+TEST(ElfImageSymbolNames,
+     ImageSymtabNamesEveryDeclaredFunctionOnBothPortsAndBothImageArms) {
+    // x86_64: `call rel32` (operand at +1) + RET.
+    // arm64:  `BL #0` (patch site at +0, 4-byte aligned) + RET.
+    // These byte strings are the ONLY per-port data here; every assertion below
+    // is identical for both, because the naming decision is made in
+    // format-neutral substrate (`ObjectSymbolNames::imageName`) that no target
+    // or format can reach into.
+    std::vector<ImagePortSpec> const ports{
+        {"x86_64", "x86_64", "elf64-x86_64-linux-exec",
+         {0xC3},
+         {0xE8, 0, 0, 0, 0, 0xC3},
+         1},
+        {"arm64", "arm64", "elf64-aarch64-linux-exec",
+         {0xC0, 0x03, 0x5F, 0xD6},
+         {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6},
+         0},
+    };
+
+    // ONE cell = one (port, image arm) pair. `void` on purpose — see above.
+    auto runCell = [](ImagePortSpec const& port, bool dynamicArm) -> void {
+        std::string const label =
+            std::string{port.label} + (dynamicArm ? " [dynamic image arm]"
+                                                  : " [static ET_EXEC arm]");
+        auto target = TargetSchema::loadShipped(port.targetName);
+        ASSERT_TRUE(target.has_value()) << label;
+        auto fmt = ObjectFormatSchema::loadShipped(port.formatName);
+        ASSERT_TRUE(fmt.has_value()) << label;
+
+        AssembledModule mod;
+        mod.expectedFuncCount = 3;
+
+        // fn #7 — a `static` (Local binding) function WITH a declared name. THE
+        // discriminating case: an image wants this name (it is a backtrace
+        // frame), while a relocatable `.o` must NOT expose it (a foreign linker
+        // keys by name, and two TUs' `helper`s would collide — D-LK-INTERNAL-
+        // LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION). Pre-fix: `sym_7`.
+        AssembledFunction f7;
+        f7.symbol = SymbolId{7};
+        f7.bytes  = dynamicArm ? port.callBytes : port.retBytes;
+        if (dynamicArm) {
+            Relocation rel;
+            rel.offset = port.callOffset;
+            rel.target = SymbolId{99};
+            rel.kind   = RelocationKind{1};   // call rel32 / call26
+            f7.relocations.push_back(rel);
+        }
+        mod.functions.push_back(std::move(f7));
+
+        // fn #8 — an externally-visible function with a declared name.
+        AssembledFunction f8;
+        f8.symbol = SymbolId{8};
+        f8.bytes  = port.retBytes;
+        mod.functions.push_back(std::move(f8));
+
+        // fn #9 — NO `ModuleSymbol` row at all: the shape of the linker-injected
+        // `_start` trampoline (minted SymbolId, no declared name). This one MUST
+        // keep `sym_9`; the fallback is the deliberate answer for a symbol that
+        // genuinely has no name, not an oversight.
+        AssembledFunction f9;
+        f9.symbol = SymbolId{9};
+        f9.bytes  = port.retBytes;
+        mod.functions.push_back(std::move(f9));
+
+        mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "img_static_fn",
+                                           SymbolBinding::Local,
+                                           SymbolVisibility::Default});
+        mod.symbols.push_back(ModuleSymbol{SymbolId{8}, "img_global_fn",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+
+        if (dynamicArm) {
+            mod.externImports.push_back(
+                ExternImport{SymbolId{99}, "printf", "libc.so.6"});
+        }
+
+        DiagnosticReporter rep;
+        auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
+        std::string diags;
+        for (auto const& d : rep.all()) diags += d.actual + "\n";
+        ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
+        ASSERT_FALSE(bytes.empty()) << label << "\n" << diags;
+
+        // The DYNAMIC cell must really reach the dynamic builder and the STATIC
+        // cell must really not — otherwise both cells could be silently
+        // exercising ONE builder and half the matrix would assert nothing about
+        // the arm it claims to cover.
+        EXPECT_EQ(findSectionByName(bytes, ".dynsym") >= 0, dynamicArm)
+            << label
+            << ": this cell did not reach the image arm it names, so its result "
+               "says nothing about that arm";
+
+        auto const names = imageSymtabNames(bytes);
+        ASSERT_FALSE(names.empty()) << label << ": no `.symtab` names read";
+        auto has = [&](std::string_view want) {
+            return std::find(names.begin(), names.end(), want) != names.end();
+        };
+
+        // THE FIX, both directions: the declared names are PRESENT...
+        EXPECT_TRUE(has("img_static_fn"))
+            << label
+            << ": a `static` function must appear under its DECLARED name in a "
+               "final image — this is the frame a debugger prints";
+        EXPECT_TRUE(has("img_global_fn"))
+            << label << ": an externally-visible function must keep its name";
+        // ...and the pre-fix synthetic spellings are GONE. These two are the
+        // red-on-disable discriminators: restore either hardcoded `"sym_" + id`
+        // and they fail, alongside the EXPECT_TRUEs above.
+        EXPECT_FALSE(has("sym_7"))
+            << label
+            << ": `sym_7` is the PRE-FIX spelling of `img_static_fn`; emitting "
+               "it means the image threw the declared name away again";
+        EXPECT_FALSE(has("sym_8"))
+            << label << ": `sym_8` is the PRE-FIX spelling of `img_global_fn`";
+
+        // The deliberate fallback survives, and is asserted rather than assumed:
+        // if this ever fails, a nameless symbol has acquired a name from
+        // somewhere it should not have.
+        EXPECT_TRUE(has("sym_9"))
+            << label
+            << ": a symbol with NO declared name (the injected entry "
+               "trampoline's shape) must keep the `sym_<id>` fallback";
+    };
+
+    for (auto const& port : ports) {
+        runCell(port, /*dynamicArm=*/false);
+        runCell(port, /*dynamicArm=*/true);
+    }
+}
+
+// ── D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB, IMAGE tier ────────
+//
+// The relocatable half of this anchor taught the three ET_REL writers to emit
+// every name bound to an atom. The FINAL IMAGE had the same gap, and there it
+// was strictly worse: an image's `.symtab` resolves nothing, so it exists ONLY
+// to be read by `nm`, `gdb`, profilers and crash reporters — and the ET_DYN
+// export set walks `module.symbols` DIRECTLY, so a `.so` carrying `strong_fn` +
+// `weak_alias` already showed both to `nm -D` while showing one to `nm`. The
+// image contradicted itself about how many names it had.
+//
+// This is the shape gcc emits for `__attribute__((weak, alias("strong_fn")))`,
+// and the shape all three object readers hand back for ANY equal-offset defined
+// pair (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS).
+//
+// ★ WHY THE `sh_info` HALF IS NOT DECORATION. ELF is the one format here with a
+// binding-driven ORDERING rule: every STB_LOCAL symbol must precede `sh_info`,
+// and the alias pass appends AFTER the ordered passes have run. A pin asserting
+// only "both names, one address" stays GREEN over a table whose header lies
+// about where the locals end — `readelf`, `ld` and `gdb` all mis-partition, and
+// DSS's own reader, which never consults `sh_info`, cannot see it. So the
+// partition is re-derived here from `st_info` and compared to the emitted
+// `sh_info`, rather than trusted.
+TEST(ElfImageSymbolNames,
+     ImageSymtabCarriesEveryAliasNameAtOneAddressOnBothPortsAndBothArms) {
+    struct AliasPortSpec {
+        char const*               label;
+        char const*               targetName;
+        char const*               formatName;
+        std::vector<std::uint8_t> retBytes;
+        std::vector<std::uint8_t> callBytes;
+        std::uint32_t             callOffset;
+    };
+    std::vector<AliasPortSpec> const ports{
+        {"x86_64", "x86_64", "elf64-x86_64-linux-exec",
+         {0xC3}, {0xE8, 0, 0, 0, 0, 0xC3}, 1},
+        {"arm64", "arm64", "elf64-aarch64-linux-exec",
+         {0xC0, 0x03, 0x5F, 0xD6},
+         {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6}, 0},
+    };
+
+    auto runCell = [](AliasPortSpec const& port, bool dynamicArm) -> void {
+        std::string const label =
+            std::string{port.label} + (dynamicArm ? " [dynamic image arm]"
+                                                  : " [static ET_EXEC arm]");
+        auto target = TargetSchema::loadShipped(port.targetName);
+        ASSERT_TRUE(target.has_value()) << label;
+        auto fmt = ObjectFormatSchema::loadShipped(port.formatName);
+        ASSERT_TRUE(fmt.has_value()) << label;
+
+        AssembledModule mod;
+        mod.expectedFuncCount = 2;
+
+        // fn #7 — ONE atom, TWO names. The extern call (dynamic cell only) is
+        // what routes the image through the dynamic walker.
+        AssembledFunction f7;
+        f7.symbol = SymbolId{7};
+        f7.bytes  = dynamicArm ? port.callBytes : port.retBytes;
+        if (dynamicArm) {
+            Relocation rel;
+            rel.offset = port.callOffset;
+            rel.target = SymbolId{99};
+            rel.kind   = RelocationKind{1};
+            f7.relocations.push_back(rel);
+        }
+        mod.functions.push_back(std::move(f7));
+
+        // fn #9 — no `ModuleSymbol` row at all (the injected trampoline's
+        // shape), so the cell also proves an alias-free symbol is unaffected.
+        AssembledFunction f9;
+        f9.symbol = SymbolId{9};
+        f9.bytes  = port.retBytes;
+        mod.functions.push_back(std::move(f9));
+
+        // TWO rows for ONE SymbolId: the canonical first (first-row-wins), then
+        // the WEAK alias. That order is part of the readers' contract.
+        mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "alias_strong_fn",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+        mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "alias_weak_fn",
+                                           SymbolBinding::Weak,
+                                           SymbolVisibility::Default});
+
+        if (dynamicArm) {
+            mod.externImports.push_back(
+                ExternImport{SymbolId{99}, "printf", "libc.so.6"});
+        }
+
+        DiagnosticReporter rep;
+        auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
+        std::string diags;
+        for (auto const& d : rep.all()) diags += d.actual + "\n";
+        ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
+        ASSERT_FALSE(bytes.empty()) << label << "\n" << diags;
+
+        // Each cell must really reach the arm it names, or half this matrix
+        // would be asserting twice about one walker.
+        EXPECT_EQ(findSectionByName(bytes, ".dynsym") >= 0, dynamicArm)
+            << label
+            << ": this cell did not reach the image arm it names, so its result "
+               "says nothing about that arm";
+
+        int const symtabIdx = findSectionByName(bytes, ".symtab");
+        int const strtabIdx = findSectionByName(bytes, ".strtab");
+        ASSERT_GE(symtabIdx, 0) << label;
+        ASSERT_GE(strtabIdx, 0) << label;
+        std::uint64_t const shoff = readU64LE(bytes, 40);
+        std::uint64_t const symtabShdr =
+            shoff + static_cast<std::uint64_t>(symtabIdx) * 64;
+        std::uint64_t const symOff = readU64LE(bytes, symtabShdr + 24);
+        std::uint64_t const symSz  = readU64LE(bytes, symtabShdr + 32);
+        std::uint64_t const strOff = readU64LE(
+            bytes, shoff + static_cast<std::uint64_t>(strtabIdx) * 64 + 24);
+        ASSERT_EQ(symSz % 24u, 0u) << label;
+        std::size_t const nsyms = static_cast<std::size_t>(symSz / 24u);
+
+        auto nameAt = [&](std::size_t i) {
+            return readCStr(bytes, strOff + readU32LE(bytes, symOff + i * 24));
+        };
+        auto infoAt = [&](std::size_t i) {
+            return bytes[static_cast<std::size_t>(symOff) + i * 24 + 4];
+        };
+        std::optional<std::size_t> canonIdx;
+        std::optional<std::size_t> aliasIdx;
+        for (std::size_t i = 0; i < nsyms; ++i) {
+            if (nameAt(i) == "alias_strong_fn") canonIdx = i;
+            if (nameAt(i) == "alias_weak_fn")   aliasIdx = i;
+        }
+        ASSERT_TRUE(canonIdx.has_value()) << label;
+        ASSERT_TRUE(aliasIdx.has_value())
+            << label
+            << ": the alias NAME must reach the FINAL IMAGE's `.symtab` — that "
+               "is the name `nm` and `gdb` print, and the .dynsym export set "
+               "already carries it";
+
+        std::size_t const cOff =
+            static_cast<std::size_t>(symOff) + *canonIdx * 24;
+        std::size_t const aOff =
+            static_cast<std::size_t>(symOff) + *aliasIdx * 24;
+        EXPECT_LT(*canonIdx, *aliasIdx)
+            << label << ": the canonical row must stay FIRST";
+        EXPECT_EQ(infoAt(*canonIdx), 0x12u)
+            << label << ": canonical stays STB_GLOBAL|STT_FUNC";
+        EXPECT_EQ(infoAt(*aliasIdx), 0x22u)
+            << label
+            << ": the alias carries ITS OWN binding (WEAK) — ELF says this per "
+               "SYMBOL in st_info, so a weak alias of a strong definition needs "
+               "nothing special";
+        EXPECT_EQ(readU16LE(bytes, cOff + 6), readU16LE(bytes, aOff + 6))
+            << label << ": same section";
+        EXPECT_EQ(readU64LE(bytes, cOff + 8), readU64LE(bytes, aOff + 8))
+            << label << ": both names must resolve to ONE address";
+        EXPECT_EQ(readU64LE(bytes, cOff + 16), readU64LE(bytes, aOff + 16))
+            << label
+            << ": and to one extent — a zero-size alias invites a dead-strip";
+        // The shared address is the real RUNTIME VA of fn #7 — `.text`'s own
+        // load address, since #7 is first in the section. Compared against the
+        // emitted `.text` sh_addr rather than a literal, and never merely
+        // against 0: an alias pair agreeing at 0 satisfies every equality above
+        // while naming nothing.
+        // D-LINK-ELF-STATIC-EXEC-SYMTAB-ST-VALUE-NOT-A-VA: the
+        // static ET_EXEC arm used to emit the raw `.text` OFFSET here (gABI
+        // 4.18 makes st_value a VIRTUAL ADDRESS in an executable or shared
+        // object, a section offset only in a relocatable file), so every
+        // function in such an image read as an address near zero to `nm`, `gdb`
+        // and every profiler. The dynamic arm never had it.
+        int const textIdx = findSectionByName(bytes, ".text");
+        ASSERT_GE(textIdx, 0) << label;
+        std::uint64_t const textAddr =
+            readU64LE(bytes, shoff + static_cast<std::uint64_t>(textIdx) * 64
+                                 + 16);
+        EXPECT_GT(textAddr, 0u)
+            << label << ": an image's `.text` must be mapped at a real VA";
+        EXPECT_EQ(readU64LE(bytes, cOff + 8), textAddr)
+            << label
+            << ": st_value must be the function's RUNTIME VA in a final image, "
+               "not its offset within `.text`";
+        EXPECT_EQ(readU64LE(bytes, cOff + 16),
+                  static_cast<std::uint64_t>(
+                      dynamicArm ? port.callBytes.size() : port.retBytes.size()))
+            << label << ": st_size must be the function's real extent";
+
+        // ── THE INDEX HALF: the emitted `sh_info` must still name the first
+        //    non-LOCAL symbol, re-derived here from `st_info` rather than
+        //    trusted. This is what reds if an alias is ever appended on the
+        //    wrong side of the boundary.
+        std::uint32_t const shInfo = readU32LE(bytes, symtabShdr + 44);
+        std::size_t observedFirstNonLocal = nsyms;
+        for (std::size_t i = 0; i < nsyms; ++i) {
+            if ((infoAt(i) >> 4) != 0u) {   // STB_LOCAL == 0
+                observedFirstNonLocal = i;
+                break;
+            }
+        }
+        EXPECT_EQ(static_cast<std::size_t>(shInfo), observedFirstNonLocal)
+            << label
+            << ": `.symtab.sh_info` must equal the index of the first non-LOCAL "
+               "symbol, or the section header lies about where the locals end";
+        for (std::size_t i = observedFirstNonLocal; i < nsyms; ++i) {
+            EXPECT_NE((infoAt(i) >> 4), 0u)
+                << label << ": symbol #" << i
+                << " is STB_LOCAL but sits AFTER sh_info — ELF requires every "
+                   "local to precede it";
+        }
+        EXPECT_GE(*aliasIdx, static_cast<std::size_t>(shInfo))
+            << label
+            << ": an externally-visible alias belongs to the GLOBAL region";
+
+        // ── `.dynsym` obeys the SAME boundary rule, and its sh_info was the
+        //    last hardcoded literal of this class in the file.
+        //
+        // ⚠ THE DERIVED COMPARISON ALONE CANNOT SEE THAT CHANGE. It checks the
+        // emitted `sh_info` against a boundary re-derived from the emitted
+        // `st_info` bytes — two sources, so not `x == x` — but `.dynsym` is built
+        // as STN_UNDEF (its one LOCAL entry) followed by imports and exports,
+        // every one of them non-local, so the derived boundary is 1 in EVERY
+        // shape this writer can produce. Restore the literal `1` the writer
+        // replaced and this comparison still passes. So the boundary is pinned
+        // the way the `.symtab` half already pins its own: by the ABSOLUTE
+        // values below, which say WHICH entries may be local at all rather than
+        // only that `sh_info` agrees with wherever the locals happen to end. The
+        // derivation's FAILURE arm — an entry appended on the wrong side — is
+        // unreachable from any module and is driven directly over hand-built
+        // tables in `ElfSymtabPartition.EveryBreachArmFiresAndNamesTheOffender`.
+        if (dynamicArm) {
+            int const dynsymIdx = findSectionByName(bytes, ".dynsym");
+            ASSERT_GE(dynsymIdx, 0) << label;
+            std::uint64_t const dynShdr =
+                shoff + static_cast<std::uint64_t>(dynsymIdx) * 64;
+            std::uint64_t const dynOff = readU64LE(bytes, dynShdr + 24);
+            std::uint64_t const dynSz  = readU64LE(bytes, dynShdr + 32);
+            ASSERT_EQ(dynSz % 24u, 0u) << label;
+            std::size_t const ndyn = static_cast<std::size_t>(dynSz / 24u);
+            ASSERT_GT(ndyn, 0u) << label;
+            std::size_t observedDynFirstNonLocal = ndyn;
+            for (std::size_t i = 0; i < ndyn; ++i) {
+                if ((bytes[static_cast<std::size_t>(dynOff) + i * 24 + 4] >> 4)
+                    != 0u) {
+                    observedDynFirstNonLocal = i;
+                    break;
+                }
+            }
+            EXPECT_EQ(static_cast<std::size_t>(readU32LE(bytes, dynShdr + 44)),
+                      observedDynFirstNonLocal)
+                << label
+                << ": `.dynsym.sh_info` must equal the index of its first "
+                   "non-LOCAL entry - ld.so reads it to find the first global, "
+                   "and a wrong boundary mis-resolves every symbol after it";
+            // ...and THESE are the half that discriminates the derivation from
+            // the literal it replaced. `.dynsym`'s only LOCAL entry is
+            // STN_UNDEF, so the boundary is exactly 1 — asserted as three
+            // separate facts, because "sh_info is 1" alone would also hold over
+            // a table whose entry #1 had quietly become local.
+            ASSERT_GE(ndyn, 2u)
+                << label
+                << ": the dynamic arm must carry STN_UNDEF plus at least the "
+                   "import this cell links against";
+            EXPECT_EQ(bytes[static_cast<std::size_t>(dynOff) + 4], 0x00u)
+                << label
+                << ": `.dynsym`[0] must be STN_UNDEF (LOCAL, NOTYPE) - it is "
+                   "the only entry allowed on the local side";
+            EXPECT_NE((bytes[static_cast<std::size_t>(dynOff) + 24 + 4] >> 4),
+                      0u)
+                << label
+                << ": `.dynsym`[1] must be non-LOCAL - a local here would mean "
+                   "an import or export reached the table with STB_LOCAL";
+            EXPECT_EQ(readU32LE(bytes, dynShdr + 44), 1u)
+                << label
+                << ": and the emitted `.dynsym.sh_info` is therefore exactly 1. "
+                   "Restoring the hardcoded literal this writer replaced is "
+                   "invisible to the derived comparison above, so the absolute "
+                   "value is what holds the boundary";
+        }
+        // ★ NOT a bare literal, and NOT redundant with the derived
+        // comparison above. That one proves `sh_info` agrees with wherever the
+        // locals happen to end; it stays green if an alias is emitted LOCAL,
+        // because the boundary simply moves with it. This one says WHICH
+        // symbols are allowed to be in the local region at all, by reading
+        // their types back out — so an extra local reds here and nowhere else.
+        ASSERT_GE(nsyms, 2u) << label;
+        EXPECT_EQ(infoAt(0), 0x00u)
+            << label << ": symbol #0 must be STN_UNDEF (LOCAL, NOTYPE)";
+        EXPECT_EQ(infoAt(1), 0x03u)
+            << label
+            << ": symbol #1 must be the .text STT_SECTION symbol (LOCAL|SECTION)";
+        // ...and it obeys the SAME gABI 4.18 rule as every other defined
+        // symbol in an image: st_value is a VIRTUAL ADDRESS, not a section
+        // offset. Leaving this one at 0 while the functions carried VAs is the
+        // half-done shape D-LINK-ELF-STATIC-EXEC-SYMTAB-ST-VALUE-NOT-A-VA
+        // named, and it survived that anchor's first fix on BOTH arms.
+        EXPECT_EQ(readU64LE(bytes, static_cast<std::size_t>(symOff) + 1 * 24 + 8),
+                  textAddr)
+            << label
+            << ": the `.text` section symbol's st_value must be the section's "
+               "load address in an image";
+        EXPECT_EQ(shInfo, 2u)
+            << label
+            << ": and those two are the ONLY locals in these images - a third "
+               "would mean the alias pass had run inside the LOCAL region";
+    };
+
+    for (auto const& port : ports) {
+        runCell(port, /*dynamicArm=*/false);
+        runCell(port, /*dynamicArm=*/true);
+    }
+}
+
+// ── EXERCISING THE REFUSAL ARM, NOT READING IT ─────────────────────────────
+//
+// `elfSymtabPartitionBreach` is the decision behind both ELF `.symtab`
+// refusals. No legitimate MODULE can drive it: `definedAliases` yields only
+// externally-visible rows, so every symbol the alias pass appends is non-local
+// by construction and the writer-level arm is a guard against a FUTURE edit,
+// not against an input. That is exactly the shape this project's standing
+// correction is about — *"EXERCISE the failure arm, don't read it"* — so the
+// decision was lifted out of `elf.cpp` into a header and is driven here
+// directly, over hand-built Elf64_Sym tables, on every arm it can take.
+namespace {
+
+// `count` Elf64_Sym records carrying only the binding that matters here.
+[[nodiscard]] std::vector<std::uint8_t>
+symtabWithBindings(std::vector<std::uint8_t> const& bindings) {
+    std::vector<std::uint8_t> out(bindings.size() * 24, 0u);
+    for (std::size_t i = 0; i < bindings.size(); ++i) {
+        out[i * 24 + 4] = static_cast<std::uint8_t>(bindings[i] << 4);
+    }
+    return out;
+}
+constexpr std::uint8_t kBindLocal  = 0;
+constexpr std::uint8_t kBindGlobal = 1;
+constexpr std::uint8_t kBindWeak   = 2;
+
+} // namespace
+
+TEST(ElfSymtabPartition, HoldsOnAWellFormedTable) {
+    auto const t = symtabWithBindings({kBindLocal, kBindLocal, kBindGlobal,
+                                       kBindWeak});
+    EXPECT_EQ(dss::link::format::elfSymtabPartitionBreach(t, 2), "")
+        << "locals first, sh_info at the boundary: nothing to report";
+    // The all-local and all-global ends of the range are legal too.
+    auto const allLocal = symtabWithBindings({kBindLocal, kBindLocal});
+    EXPECT_EQ(dss::link::format::elfSymtabPartitionBreach(allLocal, 2), "");
+    auto const allGlobal = symtabWithBindings({kBindGlobal, kBindGlobal});
+    EXPECT_EQ(dss::link::format::elfSymtabPartitionBreach(allGlobal, 0), "");
+    std::vector<std::uint8_t> const empty;
+    EXPECT_EQ(dss::link::format::elfSymtabPartitionBreach(empty, 0), "");
+}
+
+TEST(ElfSymtabPartition, EveryBreachArmFiresAndNamesTheOffender) {
+    // (1) a non-local BEFORE sh_info — what an alias emitted into the local
+    //     region would look like.
+    auto const early = symtabWithBindings({kBindLocal, kBindGlobal,
+                                           kBindGlobal});
+    std::string const b1 =
+        dss::link::format::elfSymtabPartitionBreach(early, 2);
+    EXPECT_NE(b1, "");
+    EXPECT_NE(b1.find("symbol #1"), std::string::npos) << b1;
+    EXPECT_NE(b1.find("non-LOCAL"), std::string::npos) << b1;
+    EXPECT_NE(b1.find("BEFORE sh_info"), std::string::npos) << b1;
+
+    // (2) a LOCAL after sh_info — what a Local-resolving alias appended by the
+    //     alias pass would look like. This is the arm mutant M7 drove through
+    //     the writer.
+    auto const late = symtabWithBindings({kBindLocal, kBindGlobal,
+                                          kBindLocal});
+    std::string const b2 = dss::link::format::elfSymtabPartitionBreach(late, 1);
+    EXPECT_NE(b2, "");
+    EXPECT_NE(b2.find("symbol #2"), std::string::npos) << b2;
+    EXPECT_NE(b2.find("STB_LOCAL"), std::string::npos) << b2;
+    EXPECT_NE(b2.find("AFTER sh_info"), std::string::npos) << b2;
+
+    // (3) sh_info naming an index the table does not contain.
+    auto const small = symtabWithBindings({kBindLocal, kBindGlobal});
+    std::string const b3 =
+        dss::link::format::elfSymtabPartitionBreach(small, 9);
+    EXPECT_NE(b3, "");
+    EXPECT_NE(b3.find("only 2 symbols"), std::string::npos) << b3;
+
+    // (4) a table that is not a whole number of records — a partial append.
+    std::vector<std::uint8_t> ragged(25, 0u);
+    std::string const b4 = dss::link::format::elfSymtabPartitionBreach(ragged, 0);
+    EXPECT_NE(b4, "");
+    EXPECT_NE(b4.find("Elf64_Sym"), std::string::npos) << b4;
+}
+
+// ── D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB — the DATA leg ─────
+//
+// `aliasSites` carries two symbol TYPES, and the pins covered only one. A data
+// global reaches the alias pass through `emitDataSyms` with `STT_OBJECT` and a
+// real section index, where a function arrives with `STT_FUNC` and `.text`; a
+// pass that got the type or the section from the wrong place would be invisible
+// to a function-only pin. ET_REL only — an image emits no data symbols here
+// (D-LINK-ELF-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB).
+TEST(ElfWriterAliasData, ObjectSymtabCarriesADataAliasAtItsOwnSectionAndOffset) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(fmt.has_value());
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{1};
+    f.bytes  = {0xC3};
+    mod.functions.push_back(std::move(f));
+
+    // A mutable data global, so it lands in `.data` rather than `.rodata` —
+    // the alias must follow it to whichever section it went to, not to a
+    // section the pass assumed.
+    AssembledData d;
+    d.symbol  = SymbolId{20};
+    d.section = DataSectionKind::Data;
+    d.bytes   = {0x2A, 0x00, 0x00, 0x00};
+    mod.dataItems.push_back(std::move(d));
+
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "fn_one",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{20}, "data_canonical",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{20}, "data_alias",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    std::string diags;
+    for (auto const& d2 : rep.all()) diags += d2.actual + "\n";
+    ASSERT_EQ(rep.errorCount(), 0u) << diags;
+    ASSERT_FALSE(bytes.empty()) << diags;
+
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    ASSERT_GE(symtabIdx, 0);
+    ASSERT_GE(strtabIdx, 0);
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    std::uint64_t const symtabShdr =
+        shoff + static_cast<std::uint64_t>(symtabIdx) * 64;
+    std::uint64_t const symOff = readU64LE(bytes, symtabShdr + 24);
+    std::uint64_t const symSz  = readU64LE(bytes, symtabShdr + 32);
+    std::uint64_t const strOff = readU64LE(
+        bytes, shoff + static_cast<std::uint64_t>(strtabIdx) * 64 + 24);
+    ASSERT_EQ(symSz % 24u, 0u);
+    std::size_t const nsyms = static_cast<std::size_t>(symSz / 24u);
+
+    auto nameAt = [&](std::size_t i) {
+        return readCStr(bytes, strOff + readU32LE(bytes, symOff + i * 24));
+    };
+    std::optional<std::size_t> canonIdx, aliasIdx;
+    for (std::size_t i = 0; i < nsyms; ++i) {
+        if (nameAt(i) == "data_canonical") canonIdx = i;
+        if (nameAt(i) == "data_alias")     aliasIdx = i;
+    }
+    ASSERT_TRUE(canonIdx.has_value());
+    ASSERT_TRUE(aliasIdx.has_value())
+        << "a DATA global's extra name must reach the re-emitted `.symtab` too "
+           "- the alias pass carries STT_OBJECT sites as well as STT_FUNC";
+
+    std::size_t const cOff = static_cast<std::size_t>(symOff) + *canonIdx * 24;
+    std::size_t const aOff = static_cast<std::size_t>(symOff) + *aliasIdx * 24;
+    // GLOBAL|OBJECT = 0x11, WEAK|OBJECT = 0x21. The TYPE is the half a
+    // function-only pin cannot see: emitting STT_FUNC here would still put both
+    // names at one address and still pass a names-and-address assertion.
+    EXPECT_EQ(bytes[cOff + 4], 0x11u) << "canonical data symbol: GLOBAL OBJECT";
+    EXPECT_EQ(bytes[aOff + 4], 0x21u)
+        << "the alias keeps ITS OWN binding and the OBJECT type of the site it "
+           "aliases, not STT_FUNC";
+    EXPECT_EQ(readU16LE(bytes, cOff + 6), readU16LE(bytes, aOff + 6))
+        << "the alias must name the same section the data item went to";
+    EXPECT_NE(readU16LE(bytes, aOff + 6), 1u)
+        << "and that section is NOT `.text` - a data alias that landed in the "
+           "text section would be at a meaningless offset";
+    EXPECT_EQ(readU64LE(bytes, cOff + 8), readU64LE(bytes, aOff + 8))
+        << "one section-relative offset";
+    EXPECT_EQ(readU64LE(bytes, cOff + 16), readU64LE(bytes, aOff + 16))
+        << "one extent";
+    EXPECT_EQ(readU64LE(bytes, cOff + 16), 4u) << "the item's real size";
+
+    std::uint32_t const shInfo = readU32LE(bytes, symtabShdr + 44);
+    EXPECT_GE(*aliasIdx, static_cast<std::size_t>(shInfo))
+        << "an externally-visible data alias belongs after sh_info";
+}
+
+// ── D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB — the REPEAT clause ─
+//
+// `definedAliases` promises each extra name DIFFERS from the ones already
+// emitted, because emitting one twice is a duplicate-symbol error at the
+// foreign linker. It used to compare each candidate against the CANONICAL row
+// only, never against the aliases it had already accepted — so `[A, B, B]`
+// produced `B` twice, the exact outcome the clause exists to prevent. No
+// shipped reader produces a repeated alias today; a guard that does not hold
+// the property it claims is the defect, and this is what holds it.
+TEST(ElfWriterAliasData, ARepeatedAliasNameIsEmittedExactlyOnce) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(fmt.has_value());
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{5};
+    f.bytes  = {0xC3};
+    mod.functions.push_back(std::move(f));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "dup_canon",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "dup_alias",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "dup_alias",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    ASSERT_GE(symtabIdx, 0);
+    ASSERT_GE(strtabIdx, 0);
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    std::uint64_t const symOff =
+        readU64LE(bytes, shoff + static_cast<std::uint64_t>(symtabIdx) * 64 + 24);
+    std::uint64_t const symSz =
+        readU64LE(bytes, shoff + static_cast<std::uint64_t>(symtabIdx) * 64 + 32);
+    std::uint64_t const strOff =
+        readU64LE(bytes, shoff + static_cast<std::uint64_t>(strtabIdx) * 64 + 24);
+
+    std::size_t occurrences = 0, canonical = 0;
+    for (std::uint64_t i = 0; i < symSz / 24; ++i) {
+        std::string const n =
+            readCStr(bytes, strOff + readU32LE(bytes, symOff + i * 24));
+        if (n == "dup_alias") ++occurrences;
+        if (n == "dup_canon") ++canonical;
+    }
+    EXPECT_EQ(canonical, 1u);
+    EXPECT_EQ(occurrences, 1u)
+        << "a repeated alias name must be emitted ONCE - two `.symtab` entries "
+           "under one name is `ld: multiple definition` at the foreign link, "
+           "which is what the 'name DIFFERS' clause promises to prevent";
 }

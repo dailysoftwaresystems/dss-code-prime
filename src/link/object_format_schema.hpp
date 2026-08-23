@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -23,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // `ObjectFormatSchema` (plan 14 §2.0 + LK4 substrate). JSON-configured
@@ -134,6 +136,44 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     // names an extern call — e.g. abs64/abs32 data relocs), and the emitter
     // uses `nativeId` unchanged.
     std::uint32_t  pltNativeId = 0;
+    // ── DECLARED CALL/BRANCH ROLE (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL) ──
+    //
+    // True iff this format's NATIVE relocation can only ever target executable
+    // code -- i.e. reaching an undefined extern through it PROVES the extern is
+    // a FUNCTION, not a data object. An object reader has no other way to
+    // classify an extern it meets only as a name.
+    //
+    // ★ WHY THIS IS DECLARED HERE AND NOT DERIVED FROM THE TARGET'S FORMULA.
+    //   The readers used to infer the role from `TargetRelocationInfo::formulaKind`,
+    //   testing for the aarch64 CALL26 formula. That is a proxy for the wrong
+    //   thing: a formula describes ARITHMETIC, not ROLE. It happens to be
+    //   branch-specific on AArch64 only because the branch instruction has its
+    //   own encoding. On x86_64 it fails BY CONSTRUCTION -- `S + A - P` is the
+    //   identical arithmetic for a call and for a PC-relative data reference,
+    //   so `linear` is the HONEST formula there and carries no role at all.
+    //   ✔MEASURED 2026-08-20: every macho64-x86_64 archive member that calls
+    //   any library function was unreadable for exactly this reason, while the
+    //   arm64 sibling read the same source cleanly.
+    //
+    // ★ WHY THE FORMAT ROW AND NOT THE TARGET ROW. A target document is
+    //   PER-CPU and shared across formats. `x86_64.target.json`'s `rel32` is
+    //   also ELF's R_X86_64_PC32, which genuinely serves data references too --
+    //   declaring a call role there would be a lie about ELF. The FORMAT is
+    //   where the ambiguity resolves, because the format is what picks the
+    //   native wire relocation: mach-o maps `rel32` to X86_64_RELOC_BRANCH,
+    //   which is branch-only, while ELF maps it to a wire type that is not.
+    //   ELF x86_64's own call signal is likewise format-side (`pltNativeId`).
+    //
+    // ⚠ FALSE on a row whose wire type is SHARED with a data use -- ELF
+    //   R_X86_64_PC32 is the shipped case (kind 5 `R_X86_64_PC32_UNBIASED`
+    //   shares its nativeId). Setting it there would re-commit the same
+    //   conflation in a new field.
+    //
+    // Declared on EVERY document that carries the relocation, including ones
+    // no reader consults, because it states what the relocation IS rather than
+    // what an artifact kind needs. A fact true in one document and absent from
+    // its sibling is how the sibling drifts.
+    bool           isCall = false;
     // ── EMISSION ALIAS (D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS) ──
     //
     // True iff this row shares its `nativeId` with another row and exists
@@ -156,6 +196,45 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     //   the reader's runtime discovery into a LOAD-TIME invariant (at most
     //   one non-alias row per nativeId).
     bool           emitOnly = false;
+};
+
+// ── THE DECODE SIDE OF `relocations[]`, BUILT ONCE ────────────────
+//
+// The two lookups every object READER needs, derived from the rows above by
+// `ObjectFormatSchema::relocationDecodeTable()` — the one place that knows
+// which rows a DECODER may see.
+//
+// ★ WHY THIS IS A SCHEMA METHOD AND NOT A LOOP INSIDE EACH READER. It WAS a
+// loop inside each reader, and two of the three got it wrong in the same way:
+// the ELF reader skips `emitOnly` rows, and the Mach-O and COFF readers did
+// not. That is the archetype this codebase already named for closed-key
+// vocabularies — a rule that must be REMEMBERED per site is a rule that holds
+// only where someone remembered it — and the site that forgets is never the
+// one being read at the time. The row's meaning is the SCHEMA's to know: it
+// declares `emitOnly`, `validate()` enforces what the flag promises, so the
+// schema is what answers "which rows decode".
+//
+// ⓘ THE MACH-O / COFF GAP WAS LATENT AND LOUD, NOT A MISCOMPILE — stated at
+//   that precision because overstating it would be its own defect. No shipped
+//   Mach-O or PE document declares `emitOnly` (✔MEASURED: 2 of the 24 shipped
+//   format documents do, both `elf64-x86_64-linux*`), so nothing decoded
+//   wrongly. Had one declared it, `validate()`'s unique-`kind` rule guarantees
+//   the alias carries a DIFFERENT kind from the row owning its wire id, so
+//   those readers would have hit the ambiguity refusal below and rejected
+//   EVERY object of that format. A correctness gap that fails loud, and a
+//   capability — one wire type, two emission semantics — silently unavailable
+//   to two of the three formats.
+struct DSS_EXPORT RelocationDecodeTable {
+    // Wire type → the DSS kind it decodes to. A FUNCTION by construction:
+    // emission aliases are excluded, and a residual collision is refused.
+    std::unordered_map<std::uint32_t, RelocationKind> nativeToKind;
+    // The wire types whose presence PROVES the extern they reach is a
+    // FUNCTION: every row the format declares `"isCall": true` on, plus every
+    // declared `pltNativeId` (a call-through-stub variant can only be a call).
+    // DECLARED by the schema, never inferred from the target's arithmetic
+    // formula — D-LK-MACHO-ISDATA-NO-CALL-SIGNAL. Legitimately EMPTY for a
+    // format that declares neither (every shipped PE document).
+    std::unordered_set<std::uint32_t> callSignalNativeIds;
 };
 
 // ── Per-section row (plan 14 D-LK4-2) ───────────────────────────
@@ -229,6 +308,11 @@ inline constexpr EnumNameTable<ElfObjectType, 3> kElfObjectTypeTable{{{
     { ElfObjectType::Exec, "exec" },
     { ElfObjectType::Dyn,  "dyn"  },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kElfObjectTypeTable);
 
 [[nodiscard]] constexpr std::string_view
 elfObjectTypeName(ElfObjectType t) noexcept {
@@ -334,6 +418,11 @@ inline constexpr EnumNameTable<PeObjectType, 3> kPeObjectTypeTable{{{
     { PeObjectType::Dll,  "dll"  },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kPeObjectTypeTable);
+
 [[nodiscard]] constexpr std::string_view
 peObjectTypeName(PeObjectType t) noexcept {
     return kPeObjectTypeTable.name(t);
@@ -425,6 +514,11 @@ inline constexpr EnumNameTable<MachOObjectType, 3> kMachOObjectTypeTable{{{
     { MachOObjectType::Dylib,   "dylib"   },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMachOObjectTypeTable);
+
 [[nodiscard]] constexpr std::string_view
 machoObjectTypeName(MachOObjectType t) noexcept {
     return kMachOObjectTypeTable.name(t);
@@ -446,8 +540,20 @@ struct DSS_EXPORT MachOIdentity {
                                      // MH_DYLIB (closes D-LK3-3).
     std::uint32_t flags = 0;         // MH_SUBSECTIONS_VIA_SYMBOLS=0x2000
                                      // / MH_PIE=0x200000 (mandatory for
-                                     //   modern macOS exec). Optional;
-                                     //   0 is legal for a minimal .o.
+                                     //   modern macOS exec). Optional in
+                                     //   the schema; carried VERBATIM into
+                                     //   mach_header_64.flags and read by
+                                     //   no writer code.
+                                     // ★ Every MH_OBJECT format DECLARES
+                                     //   0x2000 since 2026-08-20: it is the
+                                     //   header half of the pair (with
+                                     //   N_ALT_ENTRY in n_desc) that lets a
+                                     //   reader tell a file-local body from
+                                     //   an interior label — see
+                                     //   D-LINK-NONEXTERNAL-DEFINED-SYMBOL-
+                                     //   READ-AS-BLOCK-LABEL-NOT-ATOM and
+                                     //   the rationale in each object
+                                     //   format's `macho.$comment`.
 };
 
 // ── Mach-O image block (loaded when filetype is MH_EXECUTE or
@@ -528,10 +634,20 @@ kMachOCodeSignatureKindTable{{{
     { MachOCodeSignature::Kind::AdHoc, "adhoc" },
 }}};
 
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMachOCodeSignatureKindTable);
+
 inline constexpr EnumNameTable<MachOCodeSignature::HashAlgo, 1>
 kMachOCodeSignatureHashAlgoTable{{{
     { MachOCodeSignature::HashAlgo::Sha256, "sha256" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMachOCodeSignatureHashAlgoTable);
 
 [[nodiscard]] constexpr std::optional<MachOCodeSignature::Kind>
 machoCodeSignatureKindFromName(std::string_view s) noexcept {
@@ -676,6 +792,11 @@ kMachOBuildVersionPlatformTable{{{
     { MachOBuildVersion::Platform::VisionOsExclaveCore, "visionos-exclavecore"  },
     { MachOBuildVersion::Platform::VisionOsExclaveKit,  "visionos-exclavekit"   },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMachOBuildVersionPlatformTable);
 
 // The table's row count IS the vocabulary's size, so it must equal Apple's
 // contiguous 1..24 range. Without this an enumerator added without its row
@@ -875,6 +996,11 @@ inline constexpr EnumNameTable<ObjectFormatContainer, 2> kObjectFormatContainerT
     { ObjectFormatContainer::Single,  "single"  },
     { ObjectFormatContainer::Archive, "archive" },
 }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kObjectFormatContainerTable);
 
 [[nodiscard]] constexpr std::string_view
 objectFormatContainerName(ObjectFormatContainer c) noexcept {
@@ -1367,6 +1493,31 @@ struct DSS_EXPORT ObjectFormatData {
     // why each of the four verbs exists and what it tells the user to do.
     std::optional<StackReserveUnsupportedReason> stackReserveUnsupportedReason;
 
+    // ── D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the weak-DEFINITION
+    //    spelling this format uses (`"weakDefinition"` in the JSON) ────────
+    //
+    // WHICH dialect a weak definition is written in — a SEMANTIC fact about the
+    // format, never a capability flag. See `WeakDefinition` /
+    // `WeakDefinitionDialect` (core/types/object_format_kind.hpp) for the
+    // dialects, and for why this row may not grow a capability sibling.
+    //
+    // `std::nullopt` = this format has not ANSWERED the question. It is NOT the
+    // assertion "this format cannot express a weak definition" — that is the
+    // capability shape [[D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE]] is the
+    // record of, where an implementation gap got recorded as a property of the
+    // format and did not reverse cleanly. A walker that must encode a weak
+    // definition under a nullopt schema fails loud
+    // (`K_FormatLacksWeakDefinitionDialect`); a walker that never meets one
+    // never asks, so the key is not a back-door requirement on every schema.
+    //
+    // Declared today by the pe **object** and **staticlib** formats — the two
+    // whose walker arm (the COFF `.obj` writer) consults it. Deliberately NOT
+    // declared by ELF or Mach-O yet: their writers encode `STB_WEAK` /
+    // `N_WEAK_DEF` without asking, and a key nobody reads drifts silently while
+    // reading as authoritative, which is worse than no key at all
+    // ([[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]]).
+    std::optional<WeakDefinition> weakDefinition;
+
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
     //
     // Schema-declared set of `DataSectionKind` values the format's
@@ -1463,6 +1614,30 @@ public:
     ObjectFormatSchema& operator=(ObjectFormatSchema const&) = delete;
     ObjectFormatSchema(ObjectFormatSchema&&) noexcept        = default;
     ObjectFormatSchema& operator=(ObjectFormatSchema&&) noexcept = default;
+
+    // Lowercase 64-hex SHA-256 of the EXACT document bytes this schema was
+    // loaded from — the cache key for the runtime-object cache, which keys on
+    // the config documents a build actually loaded.
+    //
+    // WHY RETAINED RATHER THAN RECOMPUTED. Re-walking `src/dss-config/` from
+    // disk to hash it costs ~165 ms per invocation (MEASURED 2026-08-17: 86
+    // files, 2,078,133 bytes; I/O-dominated — walk+read 152–160 ms, hash only
+    // 9–13 ms), and would be paid on EVERY build. The loaders already hold the
+    // bytes; they read them, parse them, and discard them. Digesting them
+    // where they already are costs zero extra I/O and happens once per load
+    // (loads are memoized in-process), and retaining 32 bytes of digest
+    // instead of up to 440 KB of document is what makes retention free.
+    //
+    // ⚠ EMPTY MEANS UNKNOWN, NEVER "no content". A schema built through a path
+    // that does NOT go via `loadFromText` — the public `ObjectFormatData`
+    // constructor above, which tests use to inject data directly — has no
+    // document bytes to digest and leaves this EMPTY. That is deliberate: an
+    // empty digest is a DETECTABLE unknown a cache can refuse to key on,
+    // whereas a fabricated or stale one is a silent wrong key. Every file
+    // route (`loadShipped` → `loadFromFile` → `loadFromText`) is digested.
+    [[nodiscard]] std::string_view     contentDigest() const noexcept {
+        return contentDigest_;
+    }
 
     [[nodiscard]] ObjectFormatSchemaId id()      const noexcept { return d_.id; }
     [[nodiscard]] std::string_view     name()    const noexcept { return d_.name; }
@@ -1579,6 +1754,20 @@ public:
         if (it == d_.relocationNameIndex.end()) return nullptr;
         return &d_.relocations[it->second];
     }
+
+    // The DECODE-side view of `relocations()` — see `RelocationDecodeTable`.
+    // Every object reader builds its reverse map through this and nothing
+    // else, so the `emitOnly` exclusion and the call-signal union have ONE
+    // definition to read and to change.
+    //
+    // Returns the ambiguity as a MESSAGE rather than reporting it: the schema
+    // has no reporter, and each reader prefixes its own `<format>::read…`
+    // context so the diagnostic still names who was decoding. Unreachable for
+    // any document that passed `validate()` (which turns this into a LOAD-time
+    // invariant); it stays as the belt-and-suspenders catch for schema data
+    // constructed directly, which is how unit tests reach this code.
+    [[nodiscard]] std::expected<RelocationDecodeTable, std::string>
+    relocationDecodeTable() const;
 
     // Section accessors — the walker calls `sectionByKind(...)` to
     // resolve format-native name + sh_type / sh_flags / addralign
@@ -1887,6 +2076,18 @@ public:
         return d_.stackReserveUnsupportedReason;
     }
 
+    // D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the dialect this format
+    // spells a WEAK DEFINITION in, or `std::nullopt` if it has not answered.
+    // THE query a walker asks before encoding a weak body — a declared
+    // spelling, never a format identity — so a walker that has no encoder for
+    // the declared dialect refuses instead of re-spelling it as something
+    // whose meaning differs. Nullopt is the ABSENCE OF AN ANSWER, not the
+    // claim that this format cannot express one.
+    [[nodiscard]] std::optional<WeakDefinition>
+    weakDefinition() const noexcept {
+        return d_.weakDefinition;
+    }
+
     // ── D-LK2-RODATA producer-data-section capability gate ─────
     //
     // `acceptsDataSection(k)` is true iff this format's walker is
@@ -1924,6 +2125,11 @@ public:
                  std::string_view sourceLabel = "<inline>");
 
 private:
+    // Lowercase 64-hex SHA-256 of the document bytes — see `contentDigest()`.
+    // Written ONLY by `loadFromText` (a static member, so no friend is
+    // needed); every other construction path leaves it empty on purpose.
+    std::string contentDigest_;
+
     detail::ObjectFormatData d_;
 };
 

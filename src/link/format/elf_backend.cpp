@@ -28,15 +28,18 @@
 #include "link/format/object_format_backends.hpp"
 
 #include "core/substrate/diagnostic_collector.hpp"
+#include "core/types/config_key_vocabulary.hpp"  // detail::{keysOf,renderAllowedList}
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/elf.hpp"
 #include "link/object_format_schema.hpp"
 
 #include "link/object_format_identity_doc.hpp"
 
+#include <array>
 #include <cstdint>
 #include <format>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -46,6 +49,65 @@ namespace dss::link::format {
 namespace {
 
 char const* const kElfBlocks[] = { "elf" };
+
+// ── The three ELF header vocabularies that have no `EnumNameTable` ────────
+// D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET.
+//
+// `class`, `data` and `osabi` map a config spelling straight onto the psABI's
+// numeric field — there is no DSS enum in between, so the accepting if-chain WAS
+// the vocabulary and the refusal beside it RETYPED that vocabulary. Same class,
+// same failure, and it had already fired:
+//
+// ✔MEASURED 2026-08-20 by reading the `osabi` if-chain against its own message:
+// the chain accepted SEVEN spellings (`sysv`, `none`, `hpux`, `netbsd`, `gnu`,
+// `linux`, `freebsd`) and the message advertised SIX — `'linux'` was accepted by
+// the check and DENIED by the sentence, telling an author by name that a
+// spelling this loader takes is not allowed.
+//
+// A ROW TABLE, not an if-chain: the spelling and the wire value sit in one row,
+// the lookup walks it, and the message is `keysOf` + `renderAllowedList` over
+// the same rows — so the two cannot disagree. `ELFOSABI_*` deliberately keeps
+// its ALIASES (`sysv`/`none` → 0, `gnu`/`linux` → 3, the psABI's own alternate
+// spellings), and they now appear in the message because they are in the table.
+struct ElfHeaderVerb {
+    std::string_view name;
+    std::uint8_t     value;
+};
+
+constexpr std::array<ElfHeaderVerb, 2> kElfFileClassRows{{
+    {"elf32", 1},   // ELFCLASS32
+    {"elf64", 2},   // ELFCLASS64
+}};
+constexpr std::array<ElfHeaderVerb, 2> kElfDataEncodingRows{{
+    {"lsb", 1},     // ELFDATA2LSB
+    {"msb", 2},     // ELFDATA2MSB
+}};
+constexpr std::array<ElfHeaderVerb, 7> kElfOsAbiRows{{
+    {"sysv",    0}, {"none",    0},   // ELFOSABI_NONE / SYSV — psABI aliases
+    {"hpux",    1},                   // ELFOSABI_HPUX
+    {"netbsd",  2},                   // ELFOSABI_NETBSD
+    {"gnu",     3}, {"linux",   3},   // ELFOSABI_GNU / LINUX — psABI aliases
+    {"freebsd", 9},                   // ELFOSABI_FREEBSD
+}};
+
+[[nodiscard]] constexpr std::optional<std::uint8_t>
+elfHeaderVerbValue(std::span<ElfHeaderVerb const> rows, std::string_view s) {
+    for (auto const& r : rows) {
+        if (r.name == s) return r.value;
+    }
+    return std::nullopt;
+}
+
+// The accepted set, rendered. `keysOf` projects the ROW table onto its key
+// half — never a second literal list beside it.
+template <std::size_t N>
+[[nodiscard]] std::string
+elfHeaderVerbList(std::array<ElfHeaderVerb, N> const& rows,
+                  std::string_view sep = " / ") {
+    return ::dss::detail::renderAllowedList(
+        ::dss::detail::keysOf(rows, [](ElfHeaderVerb const& r) { return r.name; }),
+        sep);
+}
 
 class ElfBackend final : public ObjectFormatBackend {
 public:
@@ -151,30 +213,38 @@ public:
                 // class: "elf32" | "elf64" (ELFCLASS values from psABI).
                 if (e.contains("class") && e.at("class").is_string()) {
                     auto const c = e.at("class").get<std::string>();
-                    if      (c == "elf32") data.elf.fileClass = 1;
-                    else if (c == "elf64") data.elf.fileClass = 2;
-                    else coll.emit(DiagnosticCode::C_MalformedJson, "/elf/class",
-                                   "'class' must be 'elf32' or 'elf64'");
+                    if (auto const v = elfHeaderVerbValue(kElfFileClassRows, c)) {
+                        data.elf.fileClass = *v;
+                    } else {
+                        coll.emit(DiagnosticCode::C_MalformedJson, "/elf/class",
+                                  std::format("'class' must be {}",
+                                              elfHeaderVerbList(
+                                                  kElfFileClassRows, " or ")));
+                    }
                 }
                 // data: "lsb" | "msb".
                 if (e.contains("data") && e.at("data").is_string()) {
                     auto const d = e.at("data").get<std::string>();
-                    if      (d == "lsb") data.elf.dataEncoding = 1;
-                    else if (d == "msb") data.elf.dataEncoding = 2;
-                    else coll.emit(DiagnosticCode::C_MalformedJson, "/elf/data",
-                                   "'data' must be 'lsb' or 'msb'");
+                    if (auto const v =
+                            elfHeaderVerbValue(kElfDataEncodingRows, d)) {
+                        data.elf.dataEncoding = *v;
+                    } else {
+                        coll.emit(DiagnosticCode::C_MalformedJson, "/elf/data",
+                                  std::format("'data' must be {}",
+                                              elfHeaderVerbList(
+                                                  kElfDataEncodingRows, " or ")));
+                    }
                 }
                 // osabi: string name → numeric (ELFOSABI_*). Default 0 = SysV.
                 if (e.contains("osabi") && e.at("osabi").is_string()) {
                     auto const o = e.at("osabi").get<std::string>();
-                    if      (o == "sysv"     || o == "none") data.elf.osabi = 0;
-                    else if (o == "hpux"   ) data.elf.osabi = 1;
-                    else if (o == "netbsd" ) data.elf.osabi = 2;
-                    else if (o == "gnu"    || o == "linux") data.elf.osabi = 3;
-                    else if (o == "freebsd") data.elf.osabi = 9;
-                    else coll.emit(DiagnosticCode::C_MalformedJson, "/elf/osabi",
-                                   "'osabi' must be one of 'sysv' / 'gnu' / "
-                                   "'freebsd' / 'netbsd' / 'hpux' / 'none'");
+                    if (auto const v = elfHeaderVerbValue(kElfOsAbiRows, o)) {
+                        data.elf.osabi = *v;
+                    } else {
+                        coll.emit(DiagnosticCode::C_MalformedJson, "/elf/osabi",
+                                  std::format("'osabi' must be one of {}",
+                                              elfHeaderVerbList(kElfOsAbiRows)));
+                    }
                 }
                 std::uint16_t abiVerRaw = 0;
                 readU16("abiVersion", abiVerRaw, 255);
@@ -190,7 +260,10 @@ public:
                         data.elf.objectType = *tEnum;
                     } else {
                         coll.emit(DiagnosticCode::C_MalformedJson, "/elf/type",
-                                  "'type' must be 'rel' / 'exec' / 'dyn'");
+                                  std::format("'type' must be {}",
+                                              ::dss::detail::renderAllowedList(
+                                                  allNames(kElfObjectTypeTable),
+                                                  " / ")));
                     }
                 }
                 // `interpreter`: PT_INTERP path (dynamic linker name).

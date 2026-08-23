@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -20,9 +21,20 @@ namespace dss::opt::passes {
 
 namespace {
 
+// ONE spelling of this pass's name for EVERY diagnostic it can emit — the
+// carve-out Info and every `MirFunctionRebuilder` fatal
+// (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS). ★ THIS is the pass whose
+// anonymity cost a whole `DSS_OPT_TRACE` run last cycle: the abort text was
+// identical for all nine policies, and `SimplifyCfg` was the answer.
+constexpr std::string_view kPassName = "SimplifyCfg";
+
 class SimplifyCfgPolicy final : public MirRebuildPolicy {
 public:
     explicit SimplifyCfgPolicy(Mir const& src) : src_(src) {}
+
+    [[nodiscard]] std::string_view passName() const noexcept override {
+        return kPassName;
+    }
 
     [[nodiscard]] std::size_t branchesFolded() const noexcept {
         return branchesFolded_;
@@ -188,15 +200,19 @@ public:
         postFoldReachable_.clear();
     }
 
-    // Branch-folding emits a Br whose new id is structurally
-    // unrelated to the source CondBr's id. Recording the mapping
-    // in `rewrite_` would let a future consumer that looks up the
-    // CondBr's id (terminators have no SSA result today — but the
-    // map has no type discipline against it) silently retrieve a
-    // Br id with wrong shape. Following DCE's precedent.
-    [[nodiscard]] bool recordTerminatorInRewrite() const noexcept override {
-        return false;
-    }
+    // (No `recordTerminatorInRewrite` override — the hook is gone.) This policy
+    // used to answer `false`, reasoning that branch-folding emits a Br whose id
+    // is structurally unrelated to the source CondBr's, so recording the mapping
+    // could let a future consumer "silently retrieve a Br id with wrong shape".
+    // ✔MEASURED 2026-08-17: the premise behind that answer — "terminators have
+    // no SSA result today" — was already false. An `asm goto` with outputs
+    // places `ReturnPiece`s at its successors' heads, and each anchors to the
+    // `InlineAsmGoto` TERMINATOR through its operand; withholding the entry made
+    // THIS pass the one that `std::abort`ed a release compile of a program debug
+    // refuses cleanly (D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER).
+    // The folded-CondBr entry the comment worried about is in fact accurate (the
+    // new Br is what that terminator became) and unreachable (nothing anchors to
+    // a CondBr), so recording it costs nothing and withholding it cost a crash.
 
 private:
     Mir const& src_;
@@ -690,7 +706,7 @@ SimplifyCfgResult runSimplifyCfg(Mir& mir, TypeInterner const& /*interner*/,
     SimplifyCfgResult result{};
     MirBuilder builder;
 
-    if (cloneGlobalsOrCarveOut(mir, builder, reporter, "SimplifyCfg")
+    if (cloneGlobalsOrCarveOut(mir, builder, reporter, kPassName)
         == GlobalClonePrelude::CarvedOut) {
         result.ok = true;
         return result;

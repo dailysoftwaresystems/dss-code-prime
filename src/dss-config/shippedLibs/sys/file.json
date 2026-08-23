@@ -5,8 +5,8 @@
   "availableObjectFormats": ["macho"],
   "includes": ["fcntl.h"],
   "typedefs": [
-    { "name": "kauth_cred_t", "type": "ptr<struct \"ucred\" {}>" },
-    { "name": "posix_cred_t", "type": "ptr<struct \"posix_cred\" {}>" }
+    { "name": "kauth_cred_t", "type": "ptr<struct \"ucred\" opaque>" },
+    { "name": "posix_cred_t", "type": "ptr<struct \"posix_cred\" opaque>" }
   ],
   "constants": [
     { "name": "LOCK_SH", "value": 1, "type": "i32" },

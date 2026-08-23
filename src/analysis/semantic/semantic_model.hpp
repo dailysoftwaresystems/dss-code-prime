@@ -37,6 +37,13 @@
 
 namespace dss {
 
+// Inline-asm P5: the model carries a NON-OWNING pointer to the active target
+// (see `SemanticModel::target()`). Forward-declared rather than included: this
+// header is reached by the whole front end and `target_schema.hpp` is 3.4k
+// lines for one pointer — the trade `mir_asm_descriptor.hpp` makes for the same
+// type one tier down.
+class TargetSchema;
+
 // C 6.2.3 name spaces. C puts struct/union/enum TAGS (`struct Foo`) in a
 // namespace SEPARATE from ordinary identifiers (objects, functions, typedef
 // names, enumerators) — so `typedef struct Pair { … } Pair;` is legal (the
@@ -673,6 +680,23 @@ struct DSS_EXPORT ShippedExternSymbol {
     // IMPORT: a `#include`d descriptor's symbol is imported whether or not the TU
     // calls it), so every pre-existing row is byte-identical.
     bool eagerImport = true;
+    // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the CONFIG-ROOT-RELATIVE path of
+    // the shipped source file that provides this symbol's body on the active
+    // object format (`runtime/platform/pe/dirent.c`), or EMPTY for an ordinary
+    // import row.
+    //
+    // ★★ NON-EMPTY MAKES THIS ROW UNBOUND AND NON-EAGER, AND BOTH HALVES MATTER.
+    // UNBOUND (— `HirExternRecord.noLibraryBinding`) because there is no image to
+    // name: Windows exports `opendir` from nothing, so binding it to ANY library
+    // produces a binary the loader rejects at process start with 0xC0000139 and
+    // rc=0 from every compile stage (D-FFI-DESCRIPTOR-EAGER-IMPORT). NON-EAGER
+    // because the eager bit exists to keep an import the TU never referenced, and
+    // a body that is being COMPILED INTO THIS PROGRAM needs no import kept at all.
+    // The reference then resolves exactly where C23 5.1.1.2 phase 8 says it does
+    // — at the LINK tier, against the sibling CU the driver added to the build
+    // graph. That is the same route a plain `extern int f(void);` over a two-file
+    // `cc a.c b.c` already takes; no new binding rule was invented for this.
+    std::string shippedSourcePath;
 };
 
 // c86 + c156: the link identity of a goal-2 SUPPRESSED shipped descriptor
@@ -738,6 +762,21 @@ struct DSS_EXPORT SuppressedShippedSymbol {
     // The descriptor is the authority on which name the LIBRARY exports; a user
     // prototype restates the C signature, never the platform's link identity.
     std::string linkName;
+    // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the suppressed row's
+    // SHIPPED-SOURCE realization for the active object format — the
+    // CONFIG-ROOT-RELATIVE path of the file that provides this symbol's body
+    // (`runtime/platform/pe/dirent.c`), or EMPTY for an ordinary import row.
+    //
+    // ★ IT RIDES HERE FOR THE SAME REASON `recipeId` DOES, one axis over, and the
+    // failure it prevents is the same one TF-C112 measured. A suppressed row is
+    // the ONLY channel by which a descriptor symbol reaches the link WITHOUT
+    // passing through `SemanticModel::shippedExterns()`, so a property the
+    // injected path reads off a row must ride here too or it is silently dropped
+    // for exactly the declarations users write most. A user bare prototype of
+    // `opendir` over `#include <dirent.h>` that lost this would re-export the name
+    // as a RAW IMPORT — and no pe image exports `opendir`, so the binary would
+    // fail to LOAD at process start with rc=0 from every compile stage.
+    std::string shippedSourcePath;
 };
 
 class DSS_EXPORT SemanticModel {
@@ -760,7 +799,10 @@ public:
                   std::unordered_map<std::string, SuppressedShippedSymbol>
                                                          suppressedShippedLibraries,
                   DataModel                              dataModel,
-                  LongDoubleFormat                       longDoubleFormat) noexcept
+                  LongDoubleFormat                       longDoubleFormat,
+                  // Inline-asm P5: see `target()`. Last, and defaulted, because
+                  // every existing caller is target-less by construction.
+                  TargetSchema const*                    target = nullptr) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -776,7 +818,8 @@ public:
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
-          longDoubleFormat_(longDoubleFormat) {}
+          longDoubleFormat_(longDoubleFormat),
+          target_(target) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -928,6 +971,30 @@ public:
         return longDoubleFormat_;
     }
 
+    // Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): the ACTIVE TARGET this
+    // analysis ran under, or `nullptr` when none was in scope.
+    //
+    // ★★★ WHY A TARGET REACHES THE FRONT END AT ALL, WHICH LOOKS LIKE AN
+    // AGNOSTICISM BREAK AND IS THE OPPOSITE. A GNU asm constraint splits in two
+    // (`target_schema.hpp`'s `asmConstraints` facet states the split): the
+    // MODIFIERS are grammar the front end owns, and the LETTER is a MACHINE
+    // FACT — ✔MEASURED, `"=a"` is `%rax` on x86_64 and "impossible constraint
+    // in 'asm'" on AArch64. Resolving a letter therefore REQUIRES the target,
+    // and the only alternative to reading `.target.json` here is a letter table
+    // in C++ keyed on architecture — the break no grep catches until the second
+    // architecture's inline asm arrives. The analyzer still branches on NO
+    // target identity: it asks the schema a question and reports the answer.
+    // This is the `dataModel()` / `longDoubleFormat()` discipline — the model
+    // CARRIES what analysis ran under so the HIR lowering reads the SAME value
+    // and the two tiers cannot diverge.
+    //
+    // ⚠ `nullptr` IS A LEGITIMATE STATE, not a defect: the LSP, the FFI header
+    // parser and every direct-API unit test analyze with no target. It is NOT a
+    // licence to guess a letter's meaning — the target-dependent constraint and
+    // clobber checks simply do not run, and the tier that BINDS the operand
+    // (which cannot function without resolving the letter) fails loud there.
+    [[nodiscard]] TargetSchema const* target() const noexcept { return target_; }
+
 private:
     std::shared_ptr<CompilationUnit const> cu_;
     TypeLattice                            lattice_;
@@ -970,6 +1037,10 @@ private:
     // FC17.9(e): the analysis-time long-double axis (see `longDoubleFormat()`).
     LongDoubleFormat                                       longDoubleFormat_ =
         LongDoubleFormat::None;
+    // Inline-asm P5: the analysis-time target (see `target()`). A NON-OWNING
+    // pointer — the schema is owned by the driver and outlives the model, the
+    // same lifetime contract `analyze()`'s `aggregateLayout` already has.
+    TargetSchema const*                                    target_ = nullptr;
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

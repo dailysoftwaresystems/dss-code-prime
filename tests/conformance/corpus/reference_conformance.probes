@@ -964,7 +964,6 @@ int dss_counter_probe_b = __COUNTER__;
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap, and its SHAPE CHANGED in inline-asm P1 (2026-08-12) — the gap is still open, but no longer where this row used to say it was. ✘ THE OLD TEXT IS RETIRED AS FALSE: it read "DSS's /shapes/asmStmt admits an asm TEMPLATE only, so the operand-constraint form stops at the first `:`", which is no longer true of any build. ✔MEASURED on the real DSS binary: `asmStmt` now PARSES the full GNU extended form end to end — every qualifier (`volatile`/`inline`/`goto`, order-free), all four `:` sections including the fused `::`/`:::`/`::::` spellings maximal-munch produces, operand constraints, operand expressions, clobber strings and goto label lists — and the construct is REFUSED at the SEMANTIC tier by S_InlineAsmExtendedUnsupported (S0062), ONE diagnostic quoting the constraint strings it found, with the rest of the translation unit parsed normally. The old behaviour was a non-recovering parse cascade (53 diagnostics on sqlite's 10-line `src/hwtime.h`, scaling with FILE LENGTH); the count is now 1 and does not move with file length. ⚠ PARSING IS NOT SUPPORTING, which is why this stays a direction-A row: all four gnu oracles ACCEPT this probe and DSS still rejects it, because operand binding, clobber tracking and asm-goto control flow are not implemented — and accepting-and-ignoring the operands would be a silent miscompile (`"=r"(r)` says the statement WRITES r; a bare barrier would leave it untouched while clobbering a register the allocator believes live). Delete this row when phase P5 lands operand binding, not before. ⓘ What P1 DID close is the sibling family of EMPTY sections — `("" : )` / `("" :: )` / `("" ::: )` / `("" : ::)` and `asm inline` now compile and RUN under DSS exactly as under gcc (runnable witness: examples/c-subset/c_inline_asm), and the constraint-violating 4-section-without-`goto` form is refused by its own code S0063, matching gcc/clang/MSVC.
 @why GNU extended inline asm with operand constraints — the form real corpora use.
 @code
 int dss_inline_asm_probe(int n) { int r; __asm__ volatile("" : "=r"(r) : "r"(n)); return r; }
@@ -1212,10 +1211,58 @@ __complex float dss_complex_gnu_float2;
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@why `__asm__ __volatile__ ("")` — the GNU qualifier spelling INSIDE the inline-asm statement, which is the form real headers write. This is a SECOND-ORDER consequence of the `__volatile__` keyword row and it gets its own probe because it is a different GRAMMAR SLOT: `asmStmt`'s `{optional VolatileKeyword}`, not a declaration qualifier position. CLOSED 2026-08-12 as a side effect of D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS, which also closed the `__volatile__` half of D-CSUBSET-INLINE-ASM-SPELLING. ⚠ WHAT IS *NOT* CLOSED, stated here so the half-closure is never read as a whole one: bare `asm` is still deliberately absent (it is an ordinary identifier in standard C, so reserving it would take a name user code may have defined — that one genuinely needs a dialect opt-in), and the `:` OPERAND LIST is a separate open gap censused by a_inline_asm_gnu above (D-CSUBSET-INLINE-ASM-OPERANDS / D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED). sqlite's `src/hwtime.h:43` needs BOTH, so its `--scanstatus` build stays off; this row moved that file's failure from the spelling to the colon and nothing further. Only the EMPTY template is probed here — a non-empty one carries per-target instructions DSS cannot emit and is refused LOUD by design (D-CSUBSET-INLINE-ASM-TEXT).
+@why `__asm__ __volatile__ ("")` — the GNU qualifier spelling INSIDE the inline-asm statement, which is the form real headers write. This is a SECOND-ORDER consequence of the `__volatile__` keyword row and it gets its own probe because it is a different GRAMMAR SLOT: `asmStmt`'s `{optional VolatileKeyword}`, not a declaration qualifier position. CLOSED 2026-08-12 as a side effect of D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS, which also closed the `__volatile__` half of D-CSUBSET-INLINE-ASM-SPELLING. ⚠⚠ THIS @why CARRIED A "WHAT IS *NOT* CLOSED" PARAGRAPH AND ALL THREE OF ITS CLAIMS HAVE SINCE GONE FALSE — corrected 2026-08-17 rather than deleted, because the paragraph was itself written to stop a half-closure being read as a whole one and it is worth recording that the note rotted faster than the gaps did. It said (1) "bare `asm` is still deliberately absent (it is an ordinary identifier in standard C, so reserving it would take a name user code may have defined — that one genuinely needs a dialect opt-in)" — CLOSED 2026-08-17, see a_inline_asm_bare_spelling / a_asm_label_bare_spelling / a_asm_bare_is_reserved_in_gnu_mode below; the opt-in reasoning assumed DSS must serve both standard modes, and it serves one (GNU, which it declares by defining `__GNUC__`/`__clang__` and NOT `__STRICT_ANSI__` — measured). (2) "the `:` OPERAND LIST is a separate open gap" — CLOSED in cycle P5 (D-CSUBSET-INLINE-ASM-OPERANDS / D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED), which is why a_inline_asm_gnu above now carries no @acknowledged-gap. (3) "Only the EMPTY template is probed here — a non-empty one carries per-target instructions DSS cannot emit" — D-CSUBSET-INLINE-ASM-TEXT also closed in P5; a non-empty template now compiles, links and runs, which is exactly what the three probes below use. The `--scanstatus` sentence went with them: every blocker it named is closed, and whether to re-enable the flag is a live decision recorded in the handoff, not a fact this file may assert.
 @code
 int dss_asm_volatile_gnu_probe(int x) { __asm__ __volatile__ (""); return x; }
 int dss_asm_volatile_gnu_probe2(int x) { __asm__ __volatile (""); return x; }
+@end
+
+# ── D-CSUBSET-INLINE-ASM-SPELLING, closed 2026-08-17: the BARE `asm` spelling ──
+# THREE probes rather than one, and the third is the point. `AsmKeyword` has TWO
+# grammar consumers (the asmStmt keyword slot and the after-declarator asmLabel
+# rule), so a spelling that reached only one would look correct from either side
+# alone — that is the multi-site-contract trap, and it is why the statement and
+# the label get separate rows. The third probe is the direction NOBODY WAS
+# CHECKING: `asm` being a KEYWORD means it is no longer an IDENTIFIER, and until
+# 2026-08-17 DSS accepted `int asm = 7;` at rc=0 while every gnu oracle in GNU
+# mode rejects it. A one-sided pin would have let that regress in silence.
+# ★ ALL THREE ARE `@mode extended` AND THAT IS LOAD-BEARING, NOT DECORATIVE:
+# ✔MEASURED 2026-08-17 on gcc 13.3.0 / clang 18.1.3 / clang 19.1.1, the strict
+# arm INVERTS every one of them (`-std=c17 -pedantic-errors` rejects the
+# statement and the label and ACCEPTS `int asm = 7;`). Judging these strictly
+# would manufacture three false rows in both directions at once.
+
+@probe a_inline_asm_bare_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why Bare `asm` as an inline-asm STATEMENT — what gcc and clang accept by DEFAULT, since `-std=gnu*` is both compilers' default mode. The `__asm__` sibling (a_inline_asm_gnu) cannot witness this: it lives in C 7.1.3's implementation-reserved namespace and is therefore accepted in EVERY standard mode, so it is blind to the axis this probe measures. ✔MEASURED unanimous accept at `-std=gnu17` on gcc 13.3.0, clang 18.1.3 and clang 19.1.1.
+@code
+int dss_bare_asm_probe(int n) { int r; asm ("" : "=r"(r) : "r"(n)); return r; }
+@end
+
+@probe a_asm_label_bare_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why Bare `asm` in the OTHER position the keyword reaches — an asm LABEL after a declarator (the a_asm_label_gnu construct, in the bare spelling). Its own row because the two positions are different grammar slots reached through the same token kind, and a keyword row that landed in only one of them would leave this probe red while the statement probe went green. ✔MEASURED unanimous accept at `-std=gnu17` on gcc 13.3.0, clang 18.1.3 and clang 19.1.1.
+@code
+extern int dss_bare_asm_label_probe asm("dss_bare_external_name");
+@end
+
+@probe a_asm_bare_is_reserved_in_gnu_mode
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref reject
+@why ★ THE CONVERSE, AND THE HALF THE ROW NEVER PRICED. Reserving `asm` is not only about what becomes legal — it is about what STOPS being legal, and that direction had never been oracled. ✔MEASURED at `-std=gnu17`, gcc 13.3.0 / clang 18.1.3 / clang 19.1.1 unanimously REJECT `int asm = 7;` (`expected identifier or '('`), at file scope and in block scope alike; before 2026-08-17 DSS ACCEPTED it at rc=0, and also accepted `static int asm(int)`. So omitting the keyword row was never the neutral choice it was recorded as — it was a live divergence in this direction too. An AGREEMENT row, not a gap: DSS now rejects, the oracles reject, and it carries no @acknowledged-gap for the reason sanity_reject states — an acknowledgement here would need excusing by name, and a guard with a named exception is one edit from having two. ⚠ NOT NARROWED TO `gnu` OUT OF CONVENIENCE: MSVC has no bare-`asm` keyword and does accept `asm` as an identifier, so this is the same two-of-three shape the dunder-qualifier rows settled — the standing rule forbids accepting what NO reference compiler accepts, not what one declines. `@direction B` would have been the wrong encoding precisely because a B probe may not narrow its families.
+@code
+int asm = 7;
 @end
 
 @probe a_attribute_constructor_gnu

@@ -796,6 +796,92 @@ TEST(ShippedLibDescriptor, SymbolLinkNameMalformedShapesFailLoud) {
             ] } }] })JSON"));
 }
 
+// ── `$`-DOCUMENTATION KEYS, ON EVERY OBJECT AND NOT ONLY THE ROOT ─────────
+//
+// The repo-wide convention is that ANY config object may carry a `$`-prefixed
+// PROSE key. This loader used to honour it at exactly one place: the literal
+// `"$comment"`, hand-listed in the ROOT allow-list. Its own `rejectUnknownKeys`
+// applied no prefix predicate, so on every one of its other 18 objects a
+// documentation key was REFUSED as a typo — and even at the root, only the one
+// spelling worked (`$abiComment`, the shape shipped targets use, did not).
+//
+// That is a real refusal of a valid document, not a silent drop: the inverse
+// failure, and the exact "carve-out remembered per site" archetype the shared
+// `core/types/config_key_vocabulary.hpp` check exists to abolish. Both halves
+// are pinned here, because a fix to either alone would leave the other broken.
+//
+// ⚠ THE NEGATIVE ARM IS NOT OPTIONAL. "A `$` key is accepted" is also true of
+// a loader that accepts EVERY key, which is the failure this whole discriminator
+// exists to prevent — so each accept is paired with the same document carrying
+// a NON-`$` unknown key in the SAME position, which must still be refused.
+//
+// RED-ON-DISABLE: remove the `isDocumentationKey` skip in `dss::detail::
+// rejectUnknownKeys` and the accepting arms go red; remove the membership loop
+// and the refusing arms go red.
+TEST(ShippedLibDescriptor, DocumentationKeysAreAcceptedOnEveryObjectNotJustTheRoot) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    int caseNo = 0;
+    auto readsClean = [&](std::string const& body) -> bool {
+        auto const path =
+            writeTemp(dir, "doc" + std::to_string(caseNo++) + ".json", body);
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, "x86_64",
+                                             ObjectFormatKind::MachO);
+        return desc.has_value() && !rep.hasErrors();
+    };
+
+    // BASELINE: the same document with no extra keys at all, so every arm
+    // below is attributable to the key it adds and not to the fixture.
+    EXPECT_TRUE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32" }] })JSON"));
+
+    // ROOT — worked before only for the literal `"$comment"`.
+    EXPECT_TRUE(readsClean(R"JSON({ "$comment":"prose", "header":"x.h",
+        "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32" }] })JSON"));
+    // ROOT, a DIFFERENT `$` spelling — the prefix is the convention, not the
+    // one word. This arm failed before the shared check.
+    EXPECT_TRUE(readsClean(R"JSON({ "$abiComment":"prose", "header":"x.h",
+        "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32" }] })JSON"));
+    // ROOT negative control: a bare unknown key is still REFUSED.
+    EXPECT_FALSE(readsClean(R"JSON({ "comment":"prose", "header":"x.h",
+        "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32" }] })JSON"))
+        << "the `$` PREFIX is what makes a key prose — an ordinary `comment` "
+           "is a typo discriminator hit, and if this passes the discriminator "
+           "has been turned off rather than taught the convention";
+
+    // A NESTED object: a `symbols[]` row. Refused before.
+    EXPECT_TRUE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "$comment":"why this symbol exists",
+                     "name":"f","signature":"fn() -> i32" }] })JSON"));
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "note":"why this symbol exists",
+                     "name":"f","signature":"fn() -> i32" }] })JSON"))
+        << "a symbol row's key set is CLOSED — a misspelled role key there is "
+           "what D-FFI-DESCRIPTOR-EAGER-IMPORT reads";
+
+    // A DEEPLY nested object: a per-target `when` guard, two levels down.
+    EXPECT_TRUE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32",
+            "linkName": { "variants": [
+                { "$whenComment":"Darwin only",
+                  "when": { "arch":"x86_64", "format":"macho" },
+                  "value":"f$INODE64" } ] } }] })JSON"));
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"macho":"libSystem"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32",
+            "linkName": { "variants": [
+                { "whenComment":"Darwin only",
+                  "when": { "arch":"x86_64", "format":"macho" },
+                  "value":"f$INODE64" } ] } }] })JSON"))
+        << "the variant row stays closed — a typo'd `when`/`value` sibling is "
+           "how a rename silently stops applying";
+}
+
 // ★ THE REAL DESCRIPTORS, every renamed symbol at once — the pin that would have
 // caught the shipped bug. MEASURED ground truth (macOS 26.5.2, Apple clang
 // 21.0.0), and the control is EXHAUSTIVE rather than a sample: ONE generated TU
@@ -1143,7 +1229,7 @@ TEST(ShippedLibDescriptor, ClosureCycleTerminates) {
         "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
     })JSON");
     std::vector<fs::path> const systemDirs{dir.path()};
-    std::unordered_set<std::string> visited;
+    std::unordered_set<dss::core::PathIdentity> visited;
     std::vector<std::string> order;
     std::vector<std::string> unresolved;
     forEachDescriptorInClosure(
@@ -1157,6 +1243,154 @@ TEST(ShippedLibDescriptor, ClosureCycleTerminates) {
     EXPECT_EQ(order[0], "a");   // parent FIRST (the start)
     EXPECT_EQ(order[1], "b");   // then its include
     EXPECT_TRUE(unresolved.empty());
+}
+
+// ── THE CORPUS SWEEP'S OWN INVARIANTS ──────────────────────────────────────
+//
+// ★★★ `validateShippedIncludeClosure` shipped in cycle P7 with NO test, and the
+// two diagnostic codes it owns were therefore pinned by nothing. That was not
+// caught for a cycle because `scripts/check-diagnostic-codes/check-diagnostic-codes.py` stops at its
+// FIRST failing category, and a cross-branch reservation collision was firing
+// above it — so the uncovered-code report never printed. A gate that reports one
+// category at a time hides everything behind it.
+
+// ★★ THE VACUOUS-SWEEP REFUSAL, AND IT IS THE MOST IMPORTANT ARM HERE. A sweep
+// handed an EMPTY served-format set would iterate zero formats per descriptor and
+// pass every invariant TRIVIALLY — reporting a clean corpus because it checked
+// nothing. That is the false-green family this repo keeps closing, so the sweep
+// refuses rather than succeeds.
+TEST(ShippedLibDescriptor, CorpusSweepRefusesAVacuousRun) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    (void)writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h",
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+
+    DiagnosticReporter rep;
+    std::vector<ObjectFormatKind> const none;
+    EXPECT_FALSE(validateShippedIncludeClosure(dir.path(), none, rep))
+        << "a sweep with no served formats checked nothing and said so was fine";
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedCorpusInvariantBroken), 0u);
+}
+
+// Invariant (i): an edge that is ACTIVE on a format whose child declares it does
+// not exist there. The config promises a surface it also declares absent.
+TEST(ShippedLibDescriptor, CorpusSweepCatchesAnActiveEdgeToAnAbsentChild) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    // `a` is available everywhere and includes `b` UNCONDITIONALLY...
+    (void)writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h", "includes": ["b.h"],
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+    // ...but `b` declares it exists on elf ONLY, so on pe the edge is active and
+    // the child is absent.
+    (void)writeTemp(dir, "b.json", R"JSON({
+        "header": "b.h", "availableObjectFormats": ["elf"],
+        "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
+    })JSON");
+
+    DiagnosticReporter rep;
+    std::vector<ObjectFormatKind> const served{ObjectFormatKind::Elf,
+                                               ObjectFormatKind::Pe};
+    EXPECT_FALSE(validateShippedIncludeClosure(dir.path(), served, rep))
+        << "an edge active on pe reaching a child declared elf-only passed";
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedCorpusInvariantBroken), 0u);
+}
+
+// ★ THE CONTROL, because a refusal that fires on everything asserts nothing: the
+// SAME shape with the edge GATED by a `when` must pass clean.
+TEST(ShippedLibDescriptor, CorpusSweepAcceptsAGatedEdgeToAFormatLimitedChild) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    (void)writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h",
+        "includes": [ { "header": "b.h", "when": { "format": "elf" } } ],
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+    (void)writeTemp(dir, "b.json", R"JSON({
+        "header": "b.h", "availableObjectFormats": ["elf"],
+        "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ]
+    })JSON");
+
+    DiagnosticReporter rep;
+    std::vector<ObjectFormatKind> const served{ObjectFormatKind::Elf,
+                                               ObjectFormatKind::Pe};
+    EXPECT_TRUE(validateShippedIncludeClosure(dir.path(), served, rep))
+        << "a correctly gated edge was refused, so the invariant above would "
+           "fire on legitimate config and the corpus would be pressured to "
+           "weaken it";
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedCorpusInvariantBroken), 0u);
+}
+
+// ── THE `impliedSurface` SATISFACTION HALF ─────────────────────────────────
+//
+// D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE: a predefined macro that
+// claims a shipped surface must have one. It is an ASSERTION, never a
+// suppression — withdrawing the macro quietly would flip `#ifdef` branches under
+// the user with no diagnostic, which is the same quiet wrongness the mechanism
+// exists to end.
+TEST(ShippedLibDescriptor, PredefinedMacroClaimingAnAbsentHeaderIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    (void)writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h",
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+
+    PredefinedMacroDef m;
+    m.name       = "__PROBE_IDENTITY__";
+    m.value      = "1";
+    m.declaredAt = "/preprocess/predefinedMacros/0";
+    ShippedSurfaceClaim claim;
+    claim.header = "nowhere.h";
+    claim.names  = {"af"};
+    ImpliedSurface surface;
+    surface.kind    = ImpliedSurfaceKind::Surface;
+    surface.headers = {claim};
+    m.impliedSurface = surface;
+
+    DiagnosticReporter rep;
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::vector<PredefinedMacroDef> const macros{m};
+    EXPECT_FALSE(validateShippedSurfaceRequirements(
+        macros, "probe.lang.json /preprocess/predefinedMacros", systemDirs,
+        ObjectFormatKind::Elf, rep))
+        << "a macro claiming a header that resolves to nothing was accepted";
+    EXPECT_GT(dss::test_support::countCode(
+                  rep, DiagnosticCode::C_UnbackedPredefinedMacro), 0u);
+}
+
+// ★ ITS CONTROL: the same macro whose claim IS backed must pass, or the check
+// above is just "refuse every claim".
+TEST(ShippedLibDescriptor, PredefinedMacroWithABackedSurfaceIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    (void)writeTemp(dir, "a.json", R"JSON({
+        "header": "a.h",
+        "symbols": [ { "name": "af", "signature": "fn() -> i32" } ]
+    })JSON");
+
+    PredefinedMacroDef m;
+    m.name       = "__PROBE_IDENTITY__";
+    m.value      = "1";
+    m.declaredAt = "/preprocess/predefinedMacros/0";
+    ShippedSurfaceClaim claim;
+    claim.header = "a.h";
+    claim.names  = {"af"};
+    ImpliedSurface surface;
+    surface.kind    = ImpliedSurfaceKind::Surface;
+    surface.headers = {claim};
+    m.impliedSurface = surface;
+
+    DiagnosticReporter rep;
+    std::vector<fs::path> const systemDirs{dir.path()};
+    std::vector<PredefinedMacroDef> const macros{m};
+    EXPECT_TRUE(validateShippedSurfaceRequirements(
+        macros, "probe.lang.json /preprocess/predefinedMacros", systemDirs,
+        ObjectFormatKind::Elf, rep))
+        << "a macro whose claimed header and name both exist was refused";
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::C_UnbackedPredefinedMacro), 0u);
 }
 
 // (b') DIAMOND (a→b, a→c, b→d, c→d): the shared leaf `d` is visited ONCE, and every
@@ -1179,7 +1413,7 @@ TEST(ShippedLibDescriptor, ClosureDiamondVisitsSharedLeafOnce) {
         "header": "dd.h", "symbols": [ { "name": "df", "signature": "fn() -> i32" } ]
     })JSON");
     std::vector<fs::path> const systemDirs{dir.path()};
-    std::unordered_set<std::string> visited;
+    std::unordered_set<dss::core::PathIdentity> visited;
     std::vector<std::string> order;
     forEachDescriptorInClosure(
         aPath, systemDirs, kDefaultHeaderNameMatching, visited,
@@ -1215,7 +1449,7 @@ TEST(ShippedLibDescriptor, ClosureUnresolvedIncludeIsReported) {
         "symbols": [ { "name": "f", "signature": "fn() -> i32" } ]
     })JSON");
     std::vector<fs::path> const systemDirs{dir.path()};
-    std::unordered_set<std::string> visited;
+    std::unordered_set<dss::core::PathIdentity> visited;
     std::vector<std::string> order;
     std::vector<std::string> unresolved;
     forEachDescriptorInClosure(
@@ -6104,10 +6338,26 @@ TEST(ShippedLibDescriptor, RealUnistdJsonFsctlMachoOnly) {
     ASSERT_NE(sym, nullptr) << "fsctl must still decode on elf";
     EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
                                                ObjectFormatKind::Elf));
-    auto const* close_ = findDarwinBsdSymbol(e, "close");
-    ASSERT_NE(close_, nullptr) << "positive control: close must be present";
-    EXPECT_TRUE(close_->availableObjectFormats.empty())
-        << "positive control: close ships with no per-symbol set";
+    // Positive control: a row with NO per-symbol availability set really does
+    // read as "every format", so the exclusions above are discriminating rather
+    // than trivially true.
+    //
+    // ⚠ THE CONTROL MOVED OFF `close`, AND WHY IT HAD TO IS THE POINT. Every
+    // `unistd.json` symbol row is now explicitly gated, and MUST be: the header
+    // opened on pe, where an ungated POSIX row would declare an extern the
+    // runtime does not export and break the binary's LOAD under the
+    // eager-import law. `lseek` is NOT a control (it is gated too) — so the
+    // control is the descriptor-level fact instead, asserted on the row this
+    // test already read: `fsctl` carries a set, and the set is EXACTLY [macho].
+    // That keeps the control's job (prove `availableObjectFormats` is being
+    // READ, not ignored) without needing an ungated row that this descriptor
+    // no longer has, and it is STRONGER than the old one, which only proved a
+    // field was absent.
+    EXPECT_EQ(sym->availableObjectFormats,
+              (std::vector<std::string>{"macho"}))
+        << "positive control: the availability set is READ, and reads exactly "
+           "what the descriptor declares — an empty or ignored set would make "
+           "the elf exclusion above pass for the wrong reason";
 }
 
 // D-LK-SQLITE-MACHO-UNDEFINED-LIBSYSTEM-SYMBOLS — the five Darwin filesystem/
@@ -6175,10 +6425,23 @@ TEST(ShippedLibDescriptor, RealUnistdJsonDarwinFsSysctlMachoOnly) {
                        "sysctlbyname, and declaring it there would plant an "
                        "undefined import (DSS eager-imports every shipped extern)";
     }
-    auto const* closeCtl = findDarwinBsdSymbol(e, "close");
-    ASSERT_NE(closeCtl, nullptr) << "positive control: close must be present";
-    EXPECT_TRUE(closeCtl->availableObjectFormats.empty())
-        << "positive control: close ships with no per-symbol set";
+    // Positive control — see the twin in `RealUnistdJsonFsctlMachoOnly` for why
+    // it is no longer `close`: every `unistd.json` symbol row is now explicitly
+    // gated (the header opened on pe, where an ungated POSIX row would break
+    // the binary's LOAD). The control is therefore the POSITIVE half of the
+    // same read: each of the five rows excluded from elf above must carry the
+    // set that excludes it, spelled exactly, so the exclusions cannot be
+    // passing because the set was ignored.
+    for (auto const* name : {"flock", "statfs", "fstatfs", "sysctl",
+                             "sysctlbyname"}) {
+        auto const* sym = findDarwinBsdSymbol(e, name);
+        ASSERT_NE(sym, nullptr) << name << " must still decode on elf";
+        EXPECT_EQ(sym->availableObjectFormats,
+                  (std::vector<std::string>{"macho"}))
+            << "positive control: " << name << "'s availability set is READ "
+               "and reads exactly [macho] — an ignored set would make the elf "
+               "exclusion above pass for the wrong reason";
+    }
 }
 
 TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {

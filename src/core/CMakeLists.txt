@@ -3,6 +3,7 @@ add_library(core OBJECT
 
     # ── substrate/ — host/OS utilities (the first non-header-only one) ──
     substrate/large_stack_call.cpp
+    substrate/path_identity.cpp
     substrate/phase_timers.cpp
     substrate/process_spawn.cpp
     substrate/thread_pool.cpp

@@ -19,10 +19,13 @@
 // before deleting any symbol. Substrate already on MirFunc + MirGlobal.
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/extern_import.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
+
+#include <span>
 
 #include <array>
 #include <cstddef>
@@ -31,6 +34,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace dss::opt {
@@ -120,8 +124,150 @@ inline constexpr std::uint32_t kDefaultInlineThreshold = 50;
 // range; `<cstdint>` keeps it GCC-portable).
 inline constexpr std::uint32_t kMaxInlineThreshold = 100000;
 
-// A pipeline is an ordered list of passes to run on each MIR
-// function. Loaded from `src/dss-config/pipelines/*.pipeline.json`
+// ── The pipeline schedule tree (P10 operator ruling, 2026-08-18) ──────
+//
+// A pipeline document's `passes` array is a RECURSIVE SCHEDULE TREE the
+// engine interprets depth-first, left-to-right. THREE node kinds,
+// CLOSED — nothing else exists, by ruling:
+//
+//   Leaf      `"PassName"`                              one pass invocation
+//   Repeat    {"repeat":  {"count": N, "passes":[…]}}   bounded unroll —
+//             exactly N body traversals, NO convergence check, ever
+//   Fixpoint  {"fixpoint": {"max":  N, "passes":[…]}}   the pre-tree
+//             whole-pipeline `maxIterations` semantics VERBATIM (rerun
+//             until a traversal mutates nothing, at most N), scoped to
+//             any sub-sequence
+//
+// NO seq node (a combinator's `children` vector IS the sequence — the
+// array is the sequence), NO conditionals (a `when:` would smuggle
+// `if(arch)` back through config — forbidden), NO per-step pass params,
+// NO parallel node. Unknown node kinds / unknown keys fail loud at load
+// (X_PipelineMalformed, D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD).
+//
+// FLAT STAYS VALID: `passes: ["A","B"]` + top-level `maxIterations: N`
+// desugars at load to ONE top-level Fixpoint{N, [A, B]} — the loop nest
+// (iteration × passes) maps 1:1 onto the pre-tree engine's, so every
+// observable (invocation order, counters, `iter=` trace bytes) is
+// preserved exactly. ONE SPELLING PER DOCUMENT: a document using ANY
+// structural node (repeat/fixpoint) REFUSES top-level `maxIterations`.
+//
+// Every loaded document NORMALIZES to a root Fixpoint{N ≥ 1, […]} —
+// N = the flat document's `maxIterations`, or 1 for a structural
+// document — with one deliberate collapse: a document whose entire
+// `passes` is ONE `fixpoint` node uses THAT node as the root, so a
+// structural `fixpoint{max:4, [9 passes]}` desugars to EXACTLY the flat
+// `passes` + `maxIterations: 4` twin's schedule (identical tree,
+// identical counters, depth-1 `iter=` trace).
+//
+// Members are public + assignable (`OptPipeline` must stay
+// move-assignable — compile_pipeline rebinds a loaded pipeline by
+// move), but a built tree is IMMUTABLE BY CONVENTION: nothing outside
+// the loader and the factories below ever writes it; the engine only
+// reads.
+struct OptPipelineNode {
+    enum class Kind : std::uint8_t { Leaf, Repeat, Fixpoint };
+
+    // The default-constructed node is the EMPTY SCHEDULE — a Fixpoint
+    // over no passes. It computes ZERO pass invocations, and
+    // `optimize()` refuses it, exactly as the pre-tree `OptPipeline{}`
+    // (empty `passes` list) was refused. Use [Identity] for an explicit
+    // no-op.
+    Kind                        kind = Kind::Fixpoint;
+    PassId                      passId = PassId::Identity;  // Leaf only
+    std::uint32_t               count = 1;                  // Repeat/Fixpoint bound
+    std::vector<OptPipelineNode> children;                  // Repeat/Fixpoint body
+
+    [[nodiscard]] static OptPipelineNode leaf(PassId id) {
+        OptPipelineNode n;
+        n.kind = Kind::Leaf;
+        n.passId = id;
+        n.count = 1;
+        return n;
+    }
+    [[nodiscard]] static OptPipelineNode
+    repeat(std::uint32_t count_, std::vector<OptPipelineNode> body) {
+        OptPipelineNode n;
+        n.kind = Kind::Repeat;
+        n.count = count_;
+        n.children = std::move(body);
+        return n;
+    }
+    [[nodiscard]] static OptPipelineNode
+    fixpoint(std::uint32_t max_, std::vector<OptPipelineNode> body) {
+        OptPipelineNode n;
+        n.kind = Kind::Fixpoint;
+        n.count = max_;
+        n.children = std::move(body);
+        return n;
+    }
+
+    // Structural identity — the loader's flat-vs-structural
+    // desugaring pin compares loaded trees with this.
+    bool operator==(OptPipelineNode const&) const = default;
+};
+
+// Leaf-sequence helper: {A, B, C} → [leaf(A), leaf(B), leaf(C)].
+[[nodiscard]] inline std::vector<OptPipelineNode>
+optPipelineLeaves(std::vector<PassId> ids) {
+    std::vector<OptPipelineNode> out;
+    out.reserve(ids.size());
+    for (auto id : ids) out.push_back(OptPipelineNode::leaf(id));
+    return out;
+}
+
+// Substrate bound on EVERY repeat `count` / fixpoint `max` (and the
+// flat document's top-level `maxIterations`) — the loader rejects
+// values outside [1, kMaxPipelineIterations]. The pre-tree whole-
+// pipeline bound, unchanged: 0 is a silent no-op trap; 32 is large
+// enough for any realistic mutually-enabling cluster (ConstFold +
+// SimplifyCfg + DCE converge in O(log #blocks) in practice).
+inline constexpr std::uint8_t kMaxPipelineIterations = 32;
+
+// LOAD-TIME BUDGETS (fail-loud, all X_PipelineMalformed at load):
+// nesting depth — the number of combinator (repeat/fixpoint) nodes on
+// the longest root-to-leaf chain, COUNTING the normalized root —
+// ≤ kMaxPipelineDepth; and total worst-case unrolled invocations
+// ≤ kMaxPipelineInvocations, computed by the ONE shared static cost
+// function below so the loader and the engine's entry guard can never
+// disagree about what a schedule runs. Empty `passes` bodies are
+// rejected at parse, BEFORE cost evaluation (existing empty-pipeline
+// discipline).
+inline constexpr std::uint8_t  kMaxPipelineDepth       = 8;
+inline constexpr std::uint16_t kMaxPipelineInvocations = 4096;
+
+// The ONE shared static cost function: worst-case pass invocations.
+// Leaf = 1, sequence = Σ, Repeat{n,b} = n·cost(b), Fixpoint{m,b} =
+// m·cost(b) — with the fixpoint max:0 → one-traversal clamp applied
+// HERE too (the interpreter runs exactly one traversal on max:0), so
+// cost(schedule) is precisely what the engine would run at the cap.
+// Saturates just above the budget so chained multiplies can never
+// overflow regardless of how pathological a programmatic tree is.
+[[nodiscard]] inline std::uint64_t
+optPipelineCost(OptPipelineNode const& n) {
+    switch (n.kind) {
+    case OptPipelineNode::Kind::Leaf:
+        return 1;
+    case OptPipelineNode::Kind::Repeat:
+    case OptPipelineNode::Kind::Fixpoint: {
+        std::uint64_t const eff =
+            (n.kind == OptPipelineNode::Kind::Fixpoint && n.count == 0)
+                ? std::uint64_t{1}
+                : n.count;
+        std::uint64_t body = 0;
+        for (auto const& c : n.children) {
+            body += optPipelineCost(c);
+            if (body > kMaxPipelineInvocations) return kMaxPipelineInvocations + 1;
+        }
+        std::uint64_t const total = body * eff;
+        return total > kMaxPipelineInvocations ? kMaxPipelineInvocations + 1
+                                               : total;
+    }
+    }
+    return 0;
+}
+
+// A pipeline is a SCHEDULE TREE of passes to run on each MIR function.
+// Loaded from `src/dss-config/pipelines/*.pipeline.json`
 // (D-OPT1-PIPELINE-FROM-CONFIG) or constructed inline by tests +
 // the examples_runner's differential-verify arm
 // (D-OPT1-DIFFERENTIAL-VERIFY-RUNNER).
@@ -131,23 +277,20 @@ inline constexpr std::uint32_t kMaxInlineThreshold = 100000;
 // source json::value. Owned (not view) — pipeline outlives its
 // source json::value without lifetime audit.
 struct OptPipeline {
-    std::string         name;
-    std::vector<PassId> passes;
-    // Pipeline-level fixed-point loop (D-OPT-FIXED-POINT-LOOP +
-    // D-OPT1-PASS-RUN-MAX-ITER): the engine reruns the entire
-    // `passes` sequence up to `maxIterations` times or until a full
-    // iteration produces zero `passesMutated`. Default = 1 (single
-    // pass, the historical behavior). Set higher in pipelines that
-    // include mutually-enabling passes (e.g. ConstFold + SimplifyCfg
-    // + Dce — ConstFold folds `if (5<3)` to `if (false)`, SimplifyCfg
-    // folds the CondBr AND prunes the dead arm its own fold disconnects
-    // (post-fold reachability — the rebuild emits no orphan block), then
-    // DCE sweeps the now-dead instructions, potentially exposing more
-    // ConstFold opportunities). The loader rejects 0 (silent
-    // no-op trap) and caps at 32 (an upper bound large enough for
-    // any realistic mutually-enabling cluster — anything more is
-    // either a non-converging pass or a pathological input).
-    std::uint8_t        maxIterations = 1;
+    std::string       name;
+    // P10 stage topology (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE): optional
+    // NAME of the pipeline document that runs at the UNIT (per-CU) stage
+    // instead of this one — read by `optimizeModule`'s stage routing, at
+    // the Unit site only. EMPTY = this document runs at both stages (the
+    // pre-P10 behavior; what `debug` ships). A NAME, never an embedded
+    // schedule: the grammar owns schedules, this key owns only topology.
+    // The Program stage ignores it — the link-time schedule is always
+    // the config's own document.
+    std::string       unitPipelineName;
+    // The schedule tree (see OptPipelineNode). After any load or
+    // flat() construction the root is a Fixpoint — uniform interpreter
+    // entry, uniform `iter=` numbering.
+    OptPipelineNode   schedule;
     // Inline COST MODEL (OPT7 cycle 28) — a size-based bloat bound. The
     // §2.9 legality gate inlines a callee ONLY IF its instruction-count
     // is `<= inlineThreshold`; a callee larger than this is conservatively
@@ -175,16 +318,42 @@ struct OptPipeline {
     // branch in the engine), so `release.pipeline.json` can opt into verify-each
     // on demand when hunting a release-only miscompile.
     bool                verifyEveryPass = true;
-};
 
-// Substrate bound on `OptPipeline::maxIterations` — the loader
-// rejects values outside [1, kMaxPipelineIterations]. 32 fits in
-// uint8_t comfortably and is large enough for any realistic
-// mutually-enabling cluster (ConstFold + SimplifyCfg + DCE converge
-// in O(log #blocks) in practice). Width chosen for invariant
-// expression: a u16 admits 0 and 33..65535 — silent traps the
-// loader's runtime check has to catch.
-inline constexpr std::uint8_t kMaxPipelineIterations = 32;
+    OptPipeline() = default;
+    OptPipeline(OptPipeline const&) = default;
+    OptPipeline(OptPipeline&&) = default;
+    OptPipeline& operator=(OptPipeline const&) = default;
+    OptPipeline& operator=(OptPipeline&&) = default;
+
+    // The FLAT factory — the pre-tree construction shape (name, pass
+    // list, whole-pipeline iteration bound). Desugars to
+    // Fixpoint{maxIterations, [passes…]}: the loop nest (iteration ×
+    // passes) maps 1:1 onto the pre-tree engine's, so a flat() build
+    // behaves observably identically to the old aggregate build.
+    // maxIterations 0 is NOT rejected here (programmatic construction)
+    // — the engine clamps it to ONE traversal exactly as the pre-tree
+    // engine did; the LOADER rejects it at load time.
+    [[nodiscard]] static OptPipeline
+    flat(std::string name_, std::vector<PassId> passes_,
+         std::uint8_t maxIterations = 1) {
+        OptPipeline p;
+        p.name = std::move(name_);
+        p.schedule = OptPipelineNode::fixpoint(
+            maxIterations, optPipelineLeaves(std::move(passes_)));
+        return p;
+    }
+
+    // Construction compatibility with the pre-tree aggregate shapes —
+    // every existing `OptPipeline{"name", {passes…}[, maxIterations]}`
+    // call site keeps compiling and desugars through flat() (ONE
+    // desugaring path; the compatibility ctors add no second meaning).
+    OptPipeline(std::string name_, std::vector<PassId> passes_)
+        : OptPipeline(flat(std::move(name_), std::move(passes_), 1)) {}
+    OptPipeline(std::string name_, std::vector<PassId> passes_,
+                std::uint8_t maxIterations_)
+        : OptPipeline(flat(std::move(name_), std::move(passes_),
+                           maxIterations_)) {}
+};
 
 // `LoadResult<T>` mirrors `TargetSchema::LoadResult` / `ObjectFormatSchema::LoadResult`.
 // Same 7-step loader shape across all config tiers.
@@ -212,10 +381,13 @@ loadPipelineFromText(std::string_view jsonText,
 
 // Structured optimizer result. `ok` is the equivalent of the old
 // `bool` return. `passesRun` + `passesMutated` are CUMULATIVE across
-// all iterations of the pipeline-level fixed-point loop (a pipeline
-// with `maxIterations=4` and 7 passes that runs 3 iterations reports
-// `passesRun = 21`). `fixedPointReached` is true iff a full iteration
-// produced zero `passesMutated` (mutually-enabling cluster converged).
+// the whole schedule tree — every node's invocations accumulate into
+// the same call-global counters (a pipeline with a fixpoint{max:4}
+// over 7 passes that runs 3 iterations reports `passesRun = 21`).
+// `fixedPointReached` is true iff EVERY executed fixpoint node
+// converged before its cap (a full traversal produced zero new
+// `passesMutated`); for the single-root schedules every loaded or
+// flat()-built pipeline has, this is exactly the pre-tree rule.
 // Default = `false` so an early-return path (verifier failure,
 // substrate-contract violation) doesn't masquerade as "converged."
 //
@@ -252,10 +424,26 @@ struct OptResult {
 // (D-OPT1-VERIFY-AFTER-EVERY-PASS) for the interner-gated rule set
 // (CondBr-is-Bool, Return-matches-FnSig, Arg-in-range, no-Extension-
 // types). Without it, `checkTypeInvariants` is silently skipped.
+// `externImports` is the module's extern declaration table — the SAME vector the
+// LOWER half moves into MIR→LIR. It is read for exactly one thing: the
+// unconditional inline-definition strip epilogue
+// (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED, C99 6.7.4p7). A
+// function whose SymbolId also appears here is an inline definition — a body the
+// module carries so the inliner may use it, and which must NEVER be emitted —
+// and the epilogue removes it after the pipeline has had its chance to inline it.
+//
+// ⚠ DEFAULTS TO EMPTY, AND THE DEFAULT IS "STRIP NOTHING". That is right for
+// every hand-built MIR fixture (a module with no extern table cannot contain the
+// function/extern pair by construction), and it is safe rather than merely
+// convenient: an omitted table leaves the module exactly as the pipeline left it.
+// The real front end always passes its table, so the only way to reach an
+// unstripped inline definition is to build one by hand and then not declare it.
 [[nodiscard]] DSS_EXPORT OptResult optimize(Mir& mir,
                                             TargetSchema const& target,
                                             TypeInterner const& interner,
                                             OptPipeline const& pipeline,
-                                            DiagnosticReporter& reporter);
+                                            DiagnosticReporter& reporter,
+                                            std::span<ExternImport const>
+                                                externImports = {});
 
 } // namespace dss::opt

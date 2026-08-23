@@ -17,17 +17,36 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 
 namespace dss::sem_test {
 
+// ⚠ THROWS, NEVER `abort()` — D-TEST-SEMANTIC-FIXTURE-ABORTS-THE-WHOLE-BINARY,
+// fixed 2026-08-17. It used to `ADD_FAILURE()` and then `std::abort()`, which
+// kills the whole test PROCESS: every sibling test in that executable loses its
+// verdict and the harness cannot even report which unit failed. ✔MEASURED that
+// this is not hypothetical — a config-mutating pin in this very directory drove
+// `loadShipped` to a legitimate refusal and the binary died with
+// `0xc0000409` mid-suite, taking nine passing tests' results with it and
+// reporting the cause as an exception code rather than as the load error it was.
+// The project already made this exact correction one layer down and recorded the
+// reason: `test_support/repo_root.hpp` — "`std::abort()` kills the whole test
+// BINARY ... `repoRoot()` throws instead (GoogleTest reports a throw as a
+// failure of that ONE test)". Same fault, same fix, same rationale.
+// ★ The diagnostics are carried IN the message: a load refusal that says only
+// "failed" sends the reader to guess which key broke.
 [[nodiscard]] inline std::shared_ptr<GrammarSchema const> loadShippedSchema(std::string_view name) {
     auto loaded = GrammarSchema::loadShipped(name);
     if (!loaded) {
-        ADD_FAILURE() << "loadShipped(\"" << name << "\") failed";
-        std::abort();
+        std::string why;
+        for (auto const& d : loaded.error()) {
+            why += "\n  "; why += d.path; why += ": "; why += d.message;
+        }
+        throw std::runtime_error("loadShipped(\"" + std::string{name}
+                                 + "\") failed:" + why);
     }
     return *loaded;
 }

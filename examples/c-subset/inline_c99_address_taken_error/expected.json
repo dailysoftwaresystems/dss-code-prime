@@ -1,0 +1,18 @@
+{
+  "$comment": "D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED — THE BOUNDARY OF THE C99 6.7.4p7 CAPABILITY: the inliner may satisfy a CALL to an inline definition, never its ADDRESS. 6.7.4p7 licenses the inline definition as 'an alternative to an external definition, which a translator may use to implement any CALL to the function in the same translation unit'; a call is the whole licence, so `&pick` still names the external definition this TU does not provide and the link must fail loud. ★ THIS IS THE ARM THAT WOULD HAVE GONE SILENTLY WRONG IF THE FIX HAD BEEN BUILT THE OTHER WAY: the body IS now lowered into MIR so the optimizer can inline from it, and had it been given a symbol and emitted, `g` would point at a local copy and this program would LINK — at -O0 as well, which no reference compiler does. It does not link, because the body is never emitted: the optimizer's strip epilogue removes it unconditionally and only the ExternFunction declaration reaches the link tier. ✔MEASURED on gcc 13.3.0, clang 18.1.3 and clang 19 on this exact file: `undefined reference to 'pick'` at BOTH -O0 and -O2 on all three; DSS reports K_SymbolUndefined at both --config=debug and --config=release. ⚠ ONLY THE DEBUG HALF IS PINNED HERE and that is a harness property, not a choice: an expectDiagnostics example runs its BASELINE arm only (`runErrorTarget` declares no optimized arm), so the release half rests on the CLI measurement. Worth saying out loud, because the two arms fail identically and it would be easy to read this file as covering both.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "K_SymbolUndefined",
+      "line": 1,
+      "col": 1,
+      "positioned": false
+    }
+  ]
+}

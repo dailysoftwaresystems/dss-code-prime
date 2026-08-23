@@ -28,9 +28,14 @@ function Warn($m) { "      WARN: $m" }
 # host's "OK (N assertions)". This file now has a skippable block of its own, so it
 # inherits the same hazard and the same cure.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN.
-$TotalAssertions = 97     # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
+$TotalAssertions = 111    # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
                           # + 5 structural + 8 staged sqlite_cfg.h (5 this driver, 3 .sh pairing)
                           # + 6 launcher argv form (4 structural + 2 behavioural, python-gated)
+                          # + 6 BOTH-DRIVERS pairing for the BUILD-ATTRIBUTION
+                          #   region: the marker, the --attribute-build call and
+                          #   the --oracle-status it hands over, each asserted on
+                          #   BOTH drivers
+                          #   [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION]
                           # + 28 BOTH-DRIVERS pairing: the launcher-prerequisite
                           #   gate (and that it precedes Step 7b), the MEASURED
                           #   --cli-target/--reference-target, the
@@ -487,6 +492,37 @@ Check "the .ps1 marks the launcher-prerequisite region" ($ps1Txt -match 'dss:lau
 Check "the .sh marks it too"                            ($shTxt  -match 'dss:launcher-prereq')
 Check "the .ps1 marks the smoke-target-identity region" ($ps1Txt -match 'dss:smoke-targets')
 Check "the .sh marks it too"                            ($shTxt  -match 'dss:smoke-targets')
+# [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION] Same discipline, third
+# region. ★★ A driver that never asks "whose failure is this?" charges an upstream
+# defect to dss on its side alone — and the missing side is INVISIBLE, because a
+# leg poisoned for the wrong reason still looks poisoned.
+Check "the .ps1 marks the build-attribution region"     ($ps1Txt -match 'dss:build-attribution')
+Check "the .sh marks it too"                            ($shTxt  -match 'dss:build-attribution')
+Check "the .ps1 ASKS whose build failure it is"         ($ps1Code -match '--attribute-build')
+Check "the .sh asks it too"                             ($shCode  -match '--attribute-build')
+# ★ AND BOTH HAND OVER THE ORACLE'S STATUS, not just its log: a log left behind by
+# a PREVIOUS run must never buy an amnesty this run did not earn, which is why the
+# resolver refuses to default the flag.
+Check "the .ps1 supplies the oracle STATUS"             ($ps1Code -match '--oracle-status')
+# [D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE] The bare option
+# name above is ALREADY satisfied by the attribution call. The oracle REPORT is
+# a second reader of the same fact and the one a human reads, so it is asserted
+# by the whole argument as each call spells it -- escaped, because these needles
+# are full of regex metacharacters.
+Check "the .ps1 hands the oracle STATUS to its oracle REPORT" ($ps1Code -match [regex]::Escape("'--oracle-status', `"`$(if (`$lr) { `$lr.OracleStatus })`")"))
+Check "the .sh hands the oracle STATUS to its oracle REPORT" ($shCode -match [regex]::Escape('--oracle-status "${LEG_ORACLE_STATUS[$leg]:-}" 2>&1)'))
+Check "the .sh supplies it too"                         ($shCode  -match '--oracle-status')
+# [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
+# ★★ AN OPERATOR SWITCH HONOURED BY ONE DRIVER AND IGNORED BY THE OTHER is the
+# worst shape available: the ignoring side runs legs the operator excluded and
+# reports them as COVERED — a false claim of coverage, not a missing one.
+Check "the .ps1 marks the run-fidelity selector region" ($ps1Txt -match 'dss:run-fidelity-select')
+Check "the .sh marks it too"                            ($shTxt  -match 'dss:run-fidelity-select')
+Check "the .ps1 honours DSS_RUN_FIDELITY"               ($ps1Code -match 'DSS_RUN_FIDELITY')
+Check "the .sh honours it too"                          ($shCode  -match 'DSS_RUN_FIDELITY')
+# Validated against the RESOLVER's vocabulary, never a list re-typed in a driver.
+Check "the .ps1 validates it against --run-fidelities"  ($ps1Code -match '--run-fidelities')
+Check "the .sh validates it too"                        ($shCode  -match '--run-fidelities')
 Check "the .ps1 runs --check-launcher"        ($ps1Code -match '--check-launcher')
 Check "the .sh runs it too"                   ($shCode  -match '--check-launcher')
 Check "...the .ps1 names the new verdict"     ($ps1Code -match 'skipped-launcher-prerequisite-missing')
