@@ -1032,8 +1032,8 @@ TEST(LK10EntrySliceC, RunnableBinaryExitFortyTwo) {
 //   * linker.cpp gated trampoline injection on
 //     `processExit().has_value()` — the SAME predicate the trampoline
 //     emitter's own fail-loud tests (`injectEntryTrampoline`'s opening
-//     `!peOpt.has_value()` refusal, entry_trampoline.cpp:219-229 today;
-//     grep the predicate, not the line) — so the emitter's check was
+//     `!peOpt.has_value()` refusal in entry_trampoline.cpp, cited by
+//     PREDICATE and never by line) — so the emitter's check was
 //     DEAD CODE BY CONSTRUCTION and a `false` simply skipped the whole
 //     block in silence;
 //   * exec_reloc_apply.hpp's `resolveEntryFnIdx` answered
@@ -1616,7 +1616,7 @@ TEST(EntryGateFold, ControlSameFormatWithProcessExitLinksAndTrampolines) {
         injected, **target, format, rep2));
     EXPECT_EQ(rep2.errorCount(), 0u);
     ASSERT_TRUE(injected.imageEntryOverride.has_value())
-        << "THE witness the walker gate keys on (entry_trampoline.cpp:732 "
+        << "THE witness the walker gate keys on (`injectEntryTrampoline` "
            "sets it on EVERY injection)";
     EXPECT_EQ(*injected.imageEntryOverride, 0u)
         << "the trampoline sits at functions[0] — value 0, PRESENT, which "

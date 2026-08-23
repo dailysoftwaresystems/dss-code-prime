@@ -295,9 +295,9 @@ TEST(FfiAbiCatalog, DiagnosticCodeNameRoundTripFAbiCcRegistersInconsistent) {
 // ── D-FF3-Coherence: defense-in-depth at FF3 boundary ─────────
 //
 // `TargetSchemaData::validate()` already rejects cc rows with
-// unresolvable register names at JSON load (target_schema.cpp:875-923).
+// unresolvable register names at JSON load.
 // But `TargetSchema`'s ctor is PUBLIC + skips validate (see
-// target_schema.hpp:1042) — any caller bypassing the JSON loader
+// its declaration in target_schema.hpp) — any caller bypassing the JSON loader
 // (test fixtures, future `.dsslir` preamble, fuzz harnesses,
 // binary-cache reloads) can construct a schema with a paste-error
 // cc. The FF3-tier defensive pass below catches the surface at

@@ -1100,9 +1100,50 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             isExt ? SymbolBinding::Global : SymbolBinding::Local;
 
         if (s.sectNum == kSymUndefined) {
-            // An UNDEFINED symbol -> an extern import. A nameless slot carries
-            // no import identity.
-            if (s.name.empty()) continue;
+            // An UNDEFINED symbol -> an extern import.
+            //
+            // ★ A NAMELESS UNDEF RECORD IS REFUSED, NOT SKIPPED --
+            // D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED. This arm read
+            // `if (s.name.empty()) continue;` under the comment "a nameless slot
+            // carries no import identity", which is TRUE and is not a reason to
+            // drop it: the record still occupies a `NumberOfSymbols` slot, so a
+            // relocation can name it BY INDEX, and every gate that would catch
+            // such a relocation lets it through -- the bound check passes
+            // (the index is real), the aux-slot check passes (it is not an aux),
+            // and `rel.target = SymbolId{ownerOf(symIdx)}` then names a SymbolId
+            // this reader never produced. ✔MEASURED by reading the relocation
+            // loop's own conclusion at (6.44): "an id that owns no body is
+            // `K_SymbolUndefined` at the linker's compound index". So the drop
+            // does not vanish; it re-emerges at MERGE time as an unresolved
+            // symbol with NO NAME TO PRINT, attributed to whoever merged the
+            // object rather than to the malformed record that caused it.
+            //
+            // ⚠ THE DECISION, AND IT IS THE ONE THIS ARM'S TWIN ALREADY TOOK.
+            // PE/COFF 5.4.2 makes an UNDEF record with Value 0 "a reference to
+            // an external symbol defined elsewhere" -- a reference resolved BY
+            // NAME, so a nameless one refers to nothing any object could
+            // satisfy. It is a malformed record, not a shape with a meaning DSS
+            // is failing to model. The identical skip in the WEAK_EXTERNAL arm
+            // above became a refusal for exactly this hazard, and refusing here
+            // too is what makes the reader's treatment of the two UNIFORM
+            // instead of accidental. ✔MEASURED before changing it: the
+            // `CoffForeignObjectNative` probes over real cl.exe / clang-cl
+            // objects (including a `/Gy` object and a multi-member `.lib`) stay
+            // green, i.e. no real producer emits this shape -- so the blast
+            // radius on objects DSS did not write is measured, not assumed.
+            if (s.name.empty()) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: symbol #" + std::to_string(i)
+                    + " has SectionNumber UNDEF and an EMPTY name. PE/COFF "
+                      "5.4.2 makes an UNDEF record a reference resolved BY "
+                      "NAME, so a nameless one names nothing any object can "
+                      "satisfy -- and dropping it silently leaves any "
+                      "relocation naming this record BY INDEX pointing at a "
+                      "symbol the reader never produced, which surfaces as an "
+                      "unresolved symbol against the wrong object long after "
+                      "the malformed record that caused it. "
+                      "D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED.");
+            }
             // ⚠ EXCEPT WHEN IT IS A COMMON SYMBOL, WHICH IS A DEFINITION.
             // PE/COFF 5.4.2: an EXTERNAL record with SectionNumber UNDEF(0) and
             // a NON-ZERO Value is a COMMON symbol, and the Value is its SIZE in

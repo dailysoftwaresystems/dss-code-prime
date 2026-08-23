@@ -120,39 +120,26 @@ namespace dss::link::format {
 // will then refuse; it is the same defect as a stale refusal, one step further
 // from the check.
 //
-// ⚠ `namesWhere<M>` CHECKS `M` at compile time — a third mechanism breaks THIS
-// BUILD rather than leaving the sentence quietly incomplete. That claim is only
-// true of the LITERAL `M` written below, and this call site spelled `M` as
-// `kExitMechanismTable.rows.size() - 1` until the fold that wrote this note.
+// ★★ THE PROJECTION IS NO LONGER DECLARED HERE — IT MOVED BESIDE THE ENUM, IN
+// `core/types/target_schema.hpp`, WHICH THIS HEADER ALREADY INCLUDES. This TU
+// held one of FOUR copies of the same projection (the other three: `linker.cpp`
+// as `kDeclarableExitMechanismNames`, `object_format_schema_json.cpp`, and the
+// projection pin in `tests/link/`), each with its own predicate and its own
+// count. `namesWhere<M>` only checks the count the CALL SITE writes, so four
+// copies meant four independent decisions about how strong the check is — and
+// two of them had spelled `M` as `kExitMechanismTable.rows.size() - 1`, which is
+// `x == x` because both sides are computed from the one table the predicate
+// walks (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY, the same
+// shape D-LINK-MACHO-EXEC-BAND-GUARDS-WERE-TAUTOLOGIES-LABELLED-AS-MEASUREMENTS
+// names one tier down).
 //
-// ★★ A COUNT DERIVED FROM THE TABLE THE PREDICATE WALKS IS `x == x`. `M` was
-// `rows.size() - 1` and the predicate rejects exactly the one `None` row, so the
-// accepted count is ALWAYS `rows.size() - 1`: the two sides move together and
-// the check can never fail. It is the same shape
-// D-LINK-MACHO-EXEC-BAND-GUARDS-WERE-TAUTOLOGIES-LABELLED-AS-MEASUREMENTS names
-// one tier down — a guard born unable to fire, carrying a comment that says it
-// fires. ✔MEASURED with `g++ -std=c++23 -fsyntax-only -Isrc` over a four-arm
-// probe (a 3-row and a 4-row copy of this exact table × the derived and literal
-// spellings of `M`): adding a fourth, SELECTABLE enumerator leaves the derived
-// spelling compiling clean, while the literal spelling stops the build with
-// `namesWhere<M>: M does not match the number of accepted rows`. So the literal
-// is what the ⚠ above describes, and the literal is what is written.
-// `linker.cpp`'s `kDeclarableExitMechanismNames` had it right all along.
-//
-// ⓘ It belongs beside the enum in `core/types/target_schema.hpp`; it is local
-// here only because that file was reserved to another lane this cycle. The SAME
-// projection is computed in TWO other places — `linker.cpp`
-// (`kDeclarableExitMechanismNames`, literal, agrees) and the object-format
-// loader's `kSelectableExitMechanismNames` (still derived, so still unable to
-// fire — reported, not silently edited from here). All are PROJECTIONS of the
-// one table, so none is a second owner of the spellings; what diverged was the
-// STRENGTH of the count check, which is a property of the call site.
-[[nodiscard]] constexpr bool isSelectableExitMechanism(ExitMechanism m) noexcept {
-    return m != ExitMechanism::None;
-}
-inline constexpr auto kSelectableExitMechanismNames =
-    namesWhere<2>(kExitMechanismTable, isSelectableExitMechanism);
-
+// ⚠ The literal count this file carried was NOT by itself the fix, and saying so
+// was the second half of the defect: ✔MEASURED with `g++ -std=c++23
+// -fsyntax-only` over a nine-arm probe, the literal reds on a new SELECTABLE
+// enumerator and stays SILENT on a second UNSELECTABLE one — precisely the case
+// the derived spelling did catch. The canonical definition therefore carries the
+// literal AND a `static_assert` on the rejected-row count; the write-up lives
+// there.
 [[nodiscard]] inline bool applyExecRelocations(
     std::vector<std::uint8_t>&  text,
     AssembledModule const&      module,

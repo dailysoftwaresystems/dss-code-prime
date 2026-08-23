@@ -127,7 +127,19 @@ public:
     [[nodiscard]] std::size_t  nodeCount() const noexcept { return arena_.size(); }
 
     // ── canonicalizing builders ──
-    // primitive: a leaf kind (Bool/I*/U*/F*/Char/Byte/Void) — no operands/scalars.
+    // primitive: a LEAF kind — no operands, no scalars, no name. `kind` MUST
+    // satisfy `isPrimitiveTypeKind` (core_type.hpp), and the builder REFUSES
+    // anything else loudly rather than interning a malformed record — a
+    // fieldless "struct", an element-less "complex" — that would fail at some
+    // later consumer instead of at the call that made it
+    // (D-LATTICE-PRIMITIVE-BUILDER-ACCEPTS-A-NON-PRIMITIVE-KIND).
+    //
+    // ⚠ THE SET IS CITED, NOT LISTED. This comment used to read "a leaf kind
+    // (Bool/I*/U*/F*/Char/Byte/Void)" — a prose retype of the predicate's
+    // membership, and it was already a name SHORT (`NullptrT` is a leaf kind
+    // and `primitive` builds it). A second owner of a closed set drifts, and a
+    // reader who takes the prose instead of the predicate reaches for the wrong
+    // builder. One owner: `isPrimitiveTypeKind`.
     TypeId primitive(TypeKind kind);
     // D-LANG-TYPE-IDENTITY-VOCABULARY: a NAMED primitive — the same leaf kind
     // carrying a language-declared VOCABULARY tag. Identity comes from the

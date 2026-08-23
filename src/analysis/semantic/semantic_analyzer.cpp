@@ -4584,8 +4584,9 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // present, the array type is an incomplete type"): the bound is ABSENT
             // (every present-bound arm returned above) and this declaration declares
             // a TYPE, not an object — `typedef int T[];`. MEASURED as sqlite's
-            // blocker: `$SDK/usr/include/mach/vm_region.h:355` defines
-            // `VM_PAGE_INFO_MAX` as an EMPTY object-like macro, so `:357` expands to
+            // blocker: `$SDK/usr/include/mach/vm_region.h` defines
+            // `VM_PAGE_INFO_MAX` as an EMPTY object-like macro, so the
+            // `vm_page_info_data_t` typedef just below it expands to
             // `typedef int vm_page_info_data_t[];`.
             //   ★ WHY `typeAliasRow` AND NOT `allowFlexibleArray`. Reusing the FAM
             // flag was tried and MEASURED WRONG: it is tested ABOVE the VLA arm (a
@@ -4606,7 +4607,7 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         }
         // D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18 zero-length arrays): a
         // TRAILING `uint64_t ns_threadids[0];` member — MEASURED at
-        // $SDK/usr/include/sys/mount.h:366 (`struct netfs_status`, which sqlite
+        // $SDK/usr/include/sys/mount.h's `struct netfs_status` (which sqlite
         // reaches) — is the GNU spelling of a flexible array member, and that is
         // exactly how it is admitted: a bound folding to EXACTLY 0 on a row that
         // admits a FAM routes into the SAME `incompleteArray` the absent-length
@@ -5390,8 +5391,8 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
     // type must merge (`struct _mz_t` reached through a forward declaration and
     // through its completion); one spelling of two types must not.
     // MEASURED WITNESS: sqlite's mem1.c on macOS reaches `malloc_zone_t` twice —
-    // `$SDK/usr/include/malloc/_malloc_type.h:79` typedefs the forward-declared
-    // tag, `malloc/malloc.h:246` typedefs the SAME tag at its completion. Legal
+    // `$SDK/usr/include/malloc/_malloc_type.h` typedefs the forward-declared
+    // tag, `malloc/malloc.h` typedefs the SAME tag at its completion. Legal
     // C11, and the last S0002 on the arm64-macho sqlite leg.
     bool const typedefRepeat = bothDefinitions && sameCategory
                                && category(priorRec) == DeclarationKind::Type;
@@ -7304,8 +7305,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // gate every `noreturn` written on a member would be read
                         // by `specifierPrefixNamesNoreturn` and then discarded in
                         // silence. The shipped witness is Tcl 9's `TclStubs`
-                        // (`tclDecls.h:1893/:2024/:2185`, the `TCL_NORETURN1`
-                        // macro), whose members are POINTERS to noreturn functions.
+                        // (its three `TclStubs` members declared with the
+                        // `TCL_NORETURN1` macro), which are POINTERS to noreturn functions.
                         //
                         // ★ IT IS THE C SEMANTICS, NOT AN ACCOMMODATION. GNU binds
                         // `noreturn` to the FUNCTION TYPE, so on a pointer
@@ -7770,8 +7771,9 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 //   • layout params ABSENT ⇒ STAY SILENT, emit nothing.
                                 //     ★ This deliberately DIVERGES from the alignas
                                 //     precedent (which fails loud when it cannot compute
-                                //     an alignment). `src/lsp/lsp_server.cpp:429` calls
-                                //     `dss::analyze(cu)` with NO layout params, so
+                                //     an alignment). `LspServer::enqueueParse_`
+                                //     (`src/lsp/lsp_server.cpp`) calls `dss::analyze(cu)`
+                                //     with NO layout params, so
                                 //     failing loud here would put a red squiggle under
                                 //     every real SDK typedef in the editor while the
                                 //     very same source compiles clean from the CLI.
@@ -9435,7 +9437,7 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
 //
 // ★ WHY THE VALUES AND NOT THE SOURCE TEXT. MEASURED on sqlite's `src/mem1.c`:
 // its three S0029 come from ONE macro (`xnu_static_assert_struct_size`,
-// $SDK/usr/include/mach/port.h:100, `_Static_assert(sizeof(name) ==
+// $SDK/usr/include/mach/port.h, `_Static_assert(sizeof(name) ==
 // expected_size, "struct changed size unexpectedly")`) instantiated ~25× in
 // `mach/message.h`. All three therefore share ONE span, ONE condition source
 // text and ONE author string — appending the condition's TEXT would have
@@ -10691,7 +10693,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // ★ WHY THE CHECKS LIVE AT THIS TIER AT ALL, rather than letting the grammar
     // stop at `)`. It used to: the first `:` produced P_UnexpectedToken and the
     // parser never recovered — MEASURED 53 diagnostics for the single `rdtsc`
-    // statement in sqlite's `src/hwtime.h:43`, burying every later error in the
+    // statement in sqlite's `src/hwtime.h`, burying every later error in the
     // file. A construct the compiler cannot support should cost exactly one
     // message.
     //
@@ -13639,7 +13641,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
 
         // D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY — THE UNIFICATION POINT.
         //
-        // MEASURED (arm64-macho, sqlite `os_unix.c:7731` `conchModTime =
+        // MEASURED (arm64-macho, sqlite `os_unix.c` `conchModTime =
         // buf.st_mtimespec;` → `error[S0003] S_TypeMismatch`): a descriptor
         // struct's member type is PRE-INTERNED when its descriptor loads, so
         // `sys/stat.json`'s `st_mtimespec` is baked to the DESCRIPTOR's
@@ -15000,6 +15002,31 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             s.reporter.report(std::move(d));
         }
     }
+
+    // ★★★ [[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]] — CONVERT THIS
+    // TIER'S POSITIONS OUT OF SYNTHESIZED PREPROCESSOR COORDINATES BEFORE THE
+    // MODEL IS PUBLISHED.
+    //
+    // Every `S_*` diagnostic above is positioned from the tree it was found in
+    // (`tree.source().id()` + `tree.span(node)`). When that tree went through
+    // the C preprocessor, `source()` is the SYNTHESIZED buffer — one text made
+    // of the built-in predefine prologue, one line per `--define`, every spliced
+    // header, and then the main file — so the offsets belong to no file the user
+    // can open. The parse tier is remapped at parse time inside `UnitBuilder`;
+    // this tier runs after that builder is gone, which is exactly why the hole
+    // survived. ✔MEASURED through the CLI before this line existed: an
+    // undeclared identifier on source line 2 reported line 4 under two
+    // `--define`s and line 6 on a target whose predefines add two prologue
+    // lines, and an error inside an `#include`d header was attributed to the
+    // MAIN file — with the column correct and the file NAME plausible in both,
+    // because the synth buffer is constructed with the main source's name.
+    //
+    // Placed at the analyzer's SINGLE exit, on the CU's own bridge, so it covers
+    // every caller of `analyze` — the compile driver, the LSP, the FFI header
+    // parser, and every direct-API test — rather than one of them. A no-op for a
+    // CU with no preprocessed tree, and idempotent, so a caller that also remaps
+    // downstream is not a second policy.
+    cu->remapPreprocessedPositions(s.reporter);
 
     return SemanticModel{
         std::move(cu),

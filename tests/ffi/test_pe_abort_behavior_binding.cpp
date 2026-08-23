@@ -101,9 +101,9 @@ namespace {
 //
 // Spelled once, here, because every pin below and the corpus example must agree
 // on them. All four MEASURED against the real SDK + the real DLL:
-//   * signature verbatim from Windows Kits 10.0.26100.0 ucrt/stdlib.h:67-70,
+//   * signature verbatim from Windows Kits 10.0.26100.0 ucrt/stdlib.h,
 //     `unsigned int __cdecl _set_abort_behavior(unsigned int, unsigned int)`;
-//   * the two constants are unsuffixed hex `int` literals at ucrt/stdlib.h:63-65
+//   * the two constants are unsuffixed hex `int` literals at ucrt/stdlib.h
 //     — hence `i32` MIRRORING THE SDK even though the parameters are unsigned;
 //   * `_set_abort_behavior` is exported by ucrtbase.dll 10.0.26100.8875 at PE
 //     ordinal 1771 (objdump's 0-based name-table INDEX 1770 + OrdinalBase 1) and
@@ -373,7 +373,7 @@ nlohmann::json const kNoRows = nlohmann::json::array();
             findings.emplace_back(
                 std::string{want.name} + " = " + std::to_string(got)
                 + ", expected " + std::to_string(want.value)
-                + " (MEASURED against ucrt/stdlib.h:63-65 by five independent "
+                + " (MEASURED against ucrt/stdlib.h by five independent "
                   "instruments, byte-identical across all four installed SDKs).");
         }
         auto const ty = body.find("type");

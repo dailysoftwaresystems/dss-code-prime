@@ -2968,3 +2968,92 @@ TEST(CoffWeakExternalNative, RealMingwWeakDataDefinitionBindsToItsRealName) {
     EXPECT_EQ(d->bytes[0], 7u) << "the weak datum's initialiser, little-endian";
 #endif
 }
+
+// ── (h) A NAMELESS UNDEF RECORD: REFUSED, NOT DROPPED ────────────────────────
+//    D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED.
+//
+// The twin of `NamelessWeakExternalFailsLoudRatherThanBeingDropped` above, and
+// it was left alone when that one landed BECAUSE it is a decision rather than a
+// fix: unlike the weak external it carries no aux relation, and its skip was
+// DOCUMENTED as deliberate ("a nameless slot carries no import identity").
+//
+// ★★ THE DECISION IS REFUSAL, AND THE MEASUREMENT THAT SETTLES IT IS THE INDEX.
+// The record still occupies a `NumberOfSymbols` slot, so a relocation can name
+// it BY INDEX, and every gate that would catch such a relocation lets it
+// through: the bound check passes (the index is real), the aux-slot check
+// passes (it is not an aux), and `rel.target = SymbolId{ownerOf(symIdx)}` then
+// names a SymbolId this reader never produced. ✔MEASURED by reading the
+// relocation loop's own conclusion at (6.44) -- "an id that owns no body is
+// `K_SymbolUndefined` at the linker's compound index". So the drop does not
+// vanish; it re-emerges at MERGE time as an unresolved symbol with NO NAME TO
+// PRINT, attributed to whoever merged the object rather than to the malformed
+// record that caused it.
+//
+// ★ AND THE RECORD IS MALFORMED, NOT UNMODELED. PE/COFF 5.4.2 makes an UNDEF
+// record with Value 0 "a reference to an external symbol defined elsewhere" --
+// a reference resolved BY NAME. A nameless one names nothing any object could
+// satisfy, so there is no meaning DSS is declining to model; there is only a
+// record that cannot be represented, which the bar says must refuse by name.
+//
+// ⚠ BLAST RADIUS MEASURED BEFORE CHANGING IT, because it lands on objects DSS
+// did not write: the `CoffForeignObjectNative` witnesses over real cl.exe /
+// clang-cl objects (a `/GS-` object, a `/Gy` object, a multi-member `.lib`, and
+// the mingw-gcc probes) stay green, i.e. no real producer emits this shape.
+TEST(CoffObjectReader, NamelessUndefExternFailsLoudRatherThanBeingDropped) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         // UNDEF(0), EXTERNAL, Value 0 -- an import -- with NO NAME.
+         BSym{"", 0, 0, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value())
+        << "a nameless UNDEF record must be refused, not skipped -- its slot is "
+           "still addressable by a relocation";
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
+    EXPECT_TRUE(sawDetail(rep, "EMPTY name"));
+    EXPECT_TRUE(sawDetail(rep, "BY INDEX"))
+        << "the diagnostic must name the HAZARD, not merely the malformation -- "
+           "the next reader has to know why a skip was not good enough";
+    EXPECT_TRUE(sawDetail(rep, "D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED"));
+}
+
+// The same arm serves class-STATIC records, and it must: `roleForStorageClass`
+// resolves both EXTERNAL and STATIC before the UNDEF test, so a nameless STATIC
+// record with SectionNumber 0 reaches exactly the same line and occupies
+// exactly the same addressable slot.
+TEST(CoffObjectReader, NamelessUndefStaticRecordIsRefusedByTheSameArm) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"", 0, 0, 0, kClassStatic, std::nullopt, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    EXPECT_FALSE(got.has_value());
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
+    EXPECT_TRUE(sawDetail(rep, "D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED"));
+}
+
+// ANTI-SUBSUMPTION, and it is the arm that keeps the refusal NARROW. A NAMED
+// UNDEF extern -- the shape every real object is full of -- must still read
+// green and still become an import. Without this, a reader that had started
+// refusing every UNDEF record would satisfy both arms above.
+TEST(CoffObjectReader, ANamedUndefExternStillReadsGreenAsAnImport) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".text", kScnText, std::vector<std::uint8_t>(0x10, 0x90u), {}}},
+        {BSym{"fn", 0, 1, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt},
+         BSym{"puts", 0, 0, kDtypeFunction, kClassExternal, std::nullopt, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errs=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_TRUE(hasExternNamed(*got, "puts"))
+        << "the named UNDEF record is still an extern import -- the refusal is "
+           "about the MISSING NAME, not about UNDEF records";
+}

@@ -208,8 +208,47 @@ computeFrameLayout(LirFuncAllocation const& alloc,
                    // bound. Sourced from MIR (types) via SymbolId-keyed metadata.
                    std::uint32_t maxLocalAlign,
                    DiagnosticReporter& reporter) {
-    std::uint32_t const slotWidth = std::max(widthForClass(schema, LirRegClass::GPR),
-                                             widthForClass(schema, LirRegClass::FPR));
+    // ── D-LIR-FRAME-SLOT-STRIDE-ENUMERATES-CLASSES-INSTEAD-OF-DERIVING ──────
+    //
+    // ★★★ THE STRIDE MUST COVER THE WIDEST THING STORED IN A SLOT, AND IT USED
+    // TO NAME TWO CLASSES BY HAND. `max(GPR, FPR)` is a two-member enumeration
+    // of a register-class vocabulary with more than two members — the same
+    // shape of mistake as the two-way arg-pool rule
+    // ([[D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR]]),
+    // and it was LIVE. ✔MEASURED 2026-08-23 (cycle P28) on the shipped arm64
+    // release pipeline, two `"w"` (VR-class) inline-asm outputs in one
+    // function, `aarch64-linux-gnu-objdump -d`:
+    //     sub sp, sp, #0x20          <- a 32-byte frame
+    //     ldur q0, [sp, #16]         <- spill slot 0, SIXTEEN bytes read
+    //     ldur q1, [sp, #24]         <- spill slot 1, at stride EIGHT
+    // The two slots OVERLAP by 8 bytes and the second reads 8 bytes PAST the
+    // top of the frame (AAPCS64 declares no red zone), at rc=0 with no
+    // diagnostic. arm64's `vr` registers are `widthBytes` 16 while its `gpr`
+    // and `fpr` are both 8, so the hand-listed pair answered 8.
+    //
+    // ★ THE FIX IS TO DERIVE, NOT TO ADD `VR` TO THE LIST — a third named
+    // class would be the same defect with a longer list. The stride is raised
+    // to cover every class that ACTUALLY occupies one of the two uniform-
+    // stride areas this layout sizes: the saved-register area and the spill
+    // area. A class no value of this function puts in a slot cannot make the
+    // frame bigger.
+    //
+    // ⚠ `max(GPR, FPR)` IS KEPT AS A FLOOR, DELIBERATELY, AND IT IS NOT DEAD
+    // WEIGHT. It is (a) the historical stride, so every function that does not
+    // spill a wide value keeps a BYTE-IDENTICAL frame — this fix has zero
+    // blast radius on the corpus — and (b) load-bearing for the LOCAL-alloca
+    // area, which shares this stride and needs it ≥ every C scalar's alignment
+    // (see `allocaSlotCount`'s note below). Deriving downward from the
+    // occupied classes alone would shrink x86_64's stride from 16 to 8 in
+    // every function without an FPR spill and re-open that.
+    std::vector<LirRegClass> occupants;
+    occupants.reserve(savedRegs.size() + 1u);
+    for (auto const& r : savedRegs) occupants.push_back(r.regClass());
+    for (auto const& a : alloc.assignments) {
+        if (a.vreg.id == 0 || !a.isSpilled()) continue;
+        occupants.push_back(a.vreg.regClass());
+    }
+    std::uint32_t const slotWidth = frameSlotStride(schema, occupants);
     if (slotWidth == 0) {
         report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
                DiagnosticSeverity::Error,
@@ -1488,6 +1527,38 @@ void maybeMov(LirBuilder& b, std::uint16_t movOp, LirReg dest, LirReg src) {
 }
 
 } // namespace
+
+// ── THE FRAME SLOT STRIDE (contract: `lir_callconv.hpp`) ────────────────────
+//
+// D-LIR-FRAME-SLOT-STRIDE-ENUMERATES-CLASSES-INSTEAD-OF-DERIVING. Published
+// rather than left inline in `computeFrameLayout`, for the reason
+// [[D-LIR-RETURN-REG-REFUSAL-IS-UNREACHABLE-FROM-THE-TEST-TIER]] recorded: an
+// expression no tier can call is one whose mutant reddens nothing.
+//
+// ⚠ THE FLOOR IS PART OF THE ANSWER, NOT A HEDGE. `max(GPR, FPR)` was the
+// stride every frame in the corpus was laid out with, and the LOCAL-alloca area
+// shares it (`allocaSlotCount`), where it must stay ≥ every C scalar's
+// alignment. Deriving from the occupant classes ALONE would shrink x86_64 from
+// 16 to 8 in any function without an FPR spill — a change to every frame, and
+// an alignment regression, in the name of a fix. So the derivation only ever
+// RAISES.
+std::uint32_t frameSlotStride(TargetSchema const&          schema,
+                              std::span<LirRegClass const> occupants) noexcept {
+    auto widest = [&](LirRegClass cls) {
+        std::uint32_t w = 0;
+        for (auto const& info : schema.registers()) {
+            if (static_cast<LirRegClass>(info.regClass) != cls) continue;
+            w = std::max(w, static_cast<std::uint32_t>(info.widthBytes));
+        }
+        return w;
+    };
+    std::uint32_t stride = std::max(widest(LirRegClass::GPR),
+                                    widest(LirRegClass::FPR));
+    for (LirRegClass const cls : occupants) {
+        stride = std::max(stride, widest(cls));
+    }
+    return stride;
+}
 
 // ── THE ARG-PASSING POOL LOOKUP (rows + spellings: `lir_callconv.hpp`) ───────
 //

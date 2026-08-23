@@ -1579,6 +1579,97 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             }
         }
 
+        // ── D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE ──
+        //
+        // ★★★ THE OTHER WAY A CONFIG DESCRIBES ONE PHYSICAL REGISTER TWICE,
+        // AND `subOf` DOES NOT COVER IT. The rule above
+        // (D-TARGET-CC-NAMES-SUB-REGISTER) refuses a cc that names a register
+        // DECLARED as a narrower view of another. But a target may equally
+        // declare TWO INDEPENDENT ROWS — neither `subOf` the other — that are
+        // two WIDTHS of one physical register file. ✔MEASURED on arm64: `d0`
+        // (class fpr, widthBytes 8) and `v0` (class vr, widthBytes 16) share
+        // `dwarfNumber` 64, and so do all 32 pairs; ✔x86_64 has none.
+        //
+        // ★ `dwarfNumber` IS THE FIELD, AND `hwEncoding` IS NOT — the same
+        // determination `lir_callconv::argPoolsShareACursor` rests on
+        // ([[D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR]]).
+        // ✔MEASURED over both shipped targets: `hwEncoding` is a per-file
+        // register NUMBER, so arm64 `gpr × vr` share all 32 values and x86_64
+        // `fpr × gpr` share 16 — a rule reading it would refuse the integer
+        // and vector files on both targets, which is a different wrong answer
+        // reached from the same direction. DWARF numbers the PHYSICAL
+        // register, which is precisely the question being asked.
+        //
+        // ⚠⚠ WHY THIS IS A LOAD-TIME REFUSAL AND NOT A CAPABILITY. The
+        // allocator does not model aliased views: `lir_regalloc::buildFreeLists`
+        // partitions the allocatable set BY CLASS, so two rows of different
+        // classes over one physical register become two independently
+        // handed-out registers. ✔MEASURED 2026-08-23 (cycle P28) by building
+        // the naive fix as a mutant — `absorb(cc.argVrs)` added to
+        // `buildFreeLists` and `lir_rewrite::collectAllocatable` — and reading
+        // the arm64 release disassembly of a function with 30 live `double`s
+        // and one `"w"` (VR-class) inline-asm output: `d7` carries BOTH the
+        // VR value and the ordinary `double` `a24`, at rc=0 with no
+        // diagnostic. One physical register, two live values, silently.
+        //
+        // ★★★ WHAT LIFTS THIS RULE — and it is a cycle, not a config edit:
+        // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]], the
+        // sub-register-aware allocator arc. Until that lands, a config that
+        // would require it is refused HERE, where the config is judged,
+        // rather than compiling into a wrong register. This block is also the
+        // TRIPWIRE for that arc: it names the anchor in its own message, and
+        // it fires on BOTH shapes of the naive fix — naming `v0..v31` in
+        // `callerSaved` (a JSON edit) and adding `argVrs` to
+        // `kAllocatablePoolLists` (an engine edit), because the set it judges
+        // IS the set the engine absorbs.
+        {
+            // dwarfNumber → (register index, the list it was found in). Only
+            // registers reachable through `kAllocatablePoolLists` are entered,
+            // because only those become allocatable; a pair that is merely
+            // DECLARED (arm64's `argVrs` v0..v7 against `argFprs` d0..d7) is
+            // an ABI-placement statement and stays legal — that aliasing is
+            // modelled, deliberately, by the shared arg cursor.
+            std::unordered_map<std::uint16_t, std::pair<std::size_t, std::size_t>>
+                byDwarf;
+            for (std::size_t li = 0; li < kAllocatablePoolLists.size(); ++li) {
+                for (auto const& ref : cc.*(kAllocatablePoolLists[li])) {
+                    auto const it = registerIndex.find(ref);
+                    if (it == registerIndex.end()) continue;  // checkRefs owns this
+                    auto const& reg = registers[it->second];
+                    if (!reg.dwarfNumber.has_value()) continue;
+                    auto const [slot, inserted] =
+                        byDwarf.try_emplace(*reg.dwarfNumber,
+                                            std::pair{it->second, li});
+                    if (inserted) continue;
+                    auto const& first = registers[slot->second.first];
+                    if (first.regClass == reg.regClass) continue;  // same view twice
+                    fail(std::format("/callingConventions/{}/{}", i,
+                                     kAllocatablePoolListNames[li]),
+                         std::format(
+                             "callingConvention '{}': registers '{}' (class "
+                             "'{}', in {}) and '{}' (class '{}', in {}) both "
+                             "carry dwarfNumber {}, so they are two WIDTHS of "
+                             "one physical register — and both are reachable "
+                             "as allocatable. The register allocator "
+                             "partitions the allocatable set BY CLASS and does "
+                             "not model aliased views, so it would hand that "
+                             "one machine register to two live values at once "
+                             "(a silent wrong-register answer, not a "
+                             "diagnostic). Declare only ONE view of a physical "
+                             "register in a convention's allocatable lists; "
+                             "making both allocatable needs a sub-register-"
+                             "aware allocator, which is "
+                             "D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS "
+                             "and is a cycle rather than a config edit",
+                             cc.name, first.name,
+                             targetRegClassName(first.regClass),
+                             kAllocatablePoolListNames[slot->second.second],
+                             reg.name, targetRegClassName(reg.regClass),
+                             kAllocatablePoolListNames[li], *reg.dwarfNumber));
+                }
+            }
+        }
+
         // Link register (AAPCS64-shape). When declared, must resolve to
         // a GPR-class register — ML7 will spill it in the prologue.
         // The loader pre-resolved name → ordinal atomically, so this

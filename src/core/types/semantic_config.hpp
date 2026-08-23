@@ -105,6 +105,29 @@ enum class NameMatchMode : std::uint8_t {
     LastIdentifier,
 };
 
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// `semantics.references[].nameMatch` and `semantics.declarations[].nameMatch`.
+// The pair was owned by a `parseNameMatch` lambda in the grammar loader — an
+// inline `name == "self" / "lastIdentifier"` chain, invisible to the
+// retyped-set census because it is not spelled `…FromName(std::string_view)` —
+// with TWO refusals, at two different JSON paths, restating the pair. `Self` is
+// row 0, matching `ReferenceRule::nameMatch`'s own default.
+inline constexpr EnumNameTable<NameMatchMode, 2> kNameMatchModeTable{{{
+    { NameMatchMode::Self,           "self"           },
+    { NameMatchMode::LastIdentifier, "lastIdentifier" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kNameMatchModeTable);
+
+[[nodiscard]] constexpr std::string_view
+nameMatchModeName(NameMatchMode m) noexcept {
+    return kNameMatchModeTable.name(m);
+}
+[[nodiscard]] constexpr std::optional<NameMatchMode>
+nameMatchModeFromName(std::string_view s) noexcept {
+    return kNameMatchModeTable.fromName(s);
+}
+
 // A kind-discriminator facet: lets a single declaration shape decide its
 // effective `kind` at analysis time by inspecting a child sub-rule. Used
 // by grammars (like c-subset's `topLevelDecl`) that factor the common
@@ -1676,6 +1699,29 @@ enum class ShiftResultRule : std::uint8_t {
     CommonType   = 2,   // symmetric — result = the usual-arithmetic common type
 };
 
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// `semantics.arithmeticConversions.shiftResult`. Previously an inline
+// `verb == "promotedLeft" / "commonType"` chain in the grammar loader with the
+// pair retyped in the refusal beside it. ⚠ This enum has NO zero enumerator, so
+// a default-constructed `ShiftResultRule` is not a listed value; `PromotedLeft`
+// is row 0, which is also `ArithmeticConversions::shiftResult`'s declared
+// default, so `name()`'s fall-back renders the rule such a value behaves as.
+inline constexpr EnumNameTable<ShiftResultRule, 2> kShiftResultRuleTable{{{
+    { ShiftResultRule::PromotedLeft, "promotedLeft" },
+    { ShiftResultRule::CommonType,   "commonType"   },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kShiftResultRuleTable);
+
+[[nodiscard]] constexpr std::string_view
+shiftResultRuleName(ShiftResultRule r) noexcept {
+    return kShiftResultRuleTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<ShiftResultRule>
+shiftResultRuleFromName(std::string_view s) noexcept {
+    return kShiftResultRuleTable.fromName(s);
+}
+
 struct DSS_EXPORT ArithmeticConversions {
     DataModelTypeRef              minRankType;          // e.g. "int"
     std::vector<DataModelTypeRef> alsoPromote;          // e.g. ["char", "bool"]
@@ -1699,6 +1745,34 @@ enum class TypeConstructor : std::uint8_t {
     Optional,
     Slice,
 };
+
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// `semantics.typeShapes[].constructor`. Previously a `parseConstructor` lambda
+// in the grammar loader — an inline five-way `==` chain — with all five names
+// retyped in the refusal beside it. ★ The five names here are the CONSTRUCTOR
+// vocabulary and are deliberately NOT the MIR/HIR text tier's type keywords
+// (`ptr`, `ref`, `nullable`, …): those spell a `TypeKind` in a printed IR, a
+// different vocabulary that happens to overlap on three words. Merging them
+// would make one table answer two questions. `Pointer` is row 0, matching
+// `TypeShapeRule::constructor`'s own default.
+inline constexpr EnumNameTable<TypeConstructor, 5> kTypeConstructorTable{{{
+    { TypeConstructor::Pointer,   "pointer"   },
+    { TypeConstructor::Reference, "reference" },
+    { TypeConstructor::Nullable,  "nullable"  },
+    { TypeConstructor::Optional,  "optional"  },
+    { TypeConstructor::Slice,     "slice"     },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kTypeConstructorTable);
+
+[[nodiscard]] constexpr std::string_view
+typeConstructorName(TypeConstructor c) noexcept {
+    return kTypeConstructorTable.name(c);
+}
+[[nodiscard]] constexpr std::optional<TypeConstructor>
+typeConstructorFromName(std::string_view s) noexcept {
+    return kTypeConstructorTable.fromName(s);
+}
 
 struct DSS_EXPORT TypeShapeRule {
     RuleId          rule{};
@@ -1856,17 +1930,17 @@ enum class AttributeEffect : std::uint8_t {
     // creation/copy/rebuild/serialize path, because (TF-C81's MEASURED finding) a
     // half-landed flag and no flag are indistinguishable in the output.
     //
-    // PROVENANCE: sqlite `src/wal.c:932` `# define SQLITE_NO_TSAN
-    // __attribute__((no_sanitize_thread))`, guarded at `:931` on the CLANG-IDENTITY
+    // PROVENANCE: sqlite `src/wal.c` `# define SQLITE_NO_TSAN
+    // __attribute__((no_sanitize_thread))`, guarded on the CLANG-IDENTITY
     // predefine together with `!defined(SQLITE_NO_TSAN)` — a guard DSS honestly opens,
     // because it ships that identity predefine from `c-subset.lang.json`. Two use
-    // sites, both `static <attr> T f(…)`: `wal.c:942` `walIndexWriteHdr` and
-    // `wal.c:2590` `walIndexTryHdr`.
+    // sites in `wal.c`, both `static <attr> T f(…)`: `walIndexWriteHdr` and
+    // `walIndexTryHdr`.
     //
     // ★ The identity predefine is named DESCRIPTIVELY here, never spelled: TF-C92's
     // gate caught the literal spelling on these two lines via the TF-C83 guard
     // `Preprocessor.TFC83IdentityMacroNamesAreNotInEngineCpp`
-    // (tests/analysis/preprocess/test_preprocessor.cpp:2873), which enforces that
+    // (tests/analysis/preprocess/test_preprocessor.cpp), which enforces that
     // identity macro spellings live ONLY in config. A provenance COMMENT is not an
     // engine identity branch, but the guard is deliberately spelling-based rather
     // than semantic — it cannot tell a comment from a `if (name == …)`, and that
@@ -2786,7 +2860,7 @@ struct DSS_EXPORT SemanticConfig {
         // `#ifdef __APPLE__ / #ifdef __LP64__` override, defines
         // TCL_WIDE_INT_IS_LONG, and so declares `Tcl_WideInt` = `long`, while
         // `sqlite3_int64` is `long long`. sqlite's own
-        // `ext/session/test_session.c:1744`
+        // `ext/session/test_session.c`'s
         // `Tcl_GetWideIntFromObj(interp, objv[4], &iVal)` therefore passes
         // `long long*` to a `long*` parameter on macOS and NOWHERE ELSE. ✔MEASURED
         // on Apple clang 21.0.0 against every macOS SDK on the operator's machine

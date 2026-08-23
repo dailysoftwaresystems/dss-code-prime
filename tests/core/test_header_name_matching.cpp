@@ -331,7 +331,7 @@ TEST(HeaderNameMatching, PolicyAppliesToEveryPathComponent) {
 
 // The `<stem>.json` rewrite is CASE-PRESERVING byte slicing; the policy then
 // answers the case question. This is the exact shape of the sqlite CLI blocker:
-// `sqlite3.c:67322` writes `#include <Windows.h>` and DSS ships `windows.json`.
+// `sqlite3.c` writes `#include <Windows.h>` and DSS ships `windows.json`.
 TEST(HeaderNameMatching, SystemDescriptorStemRewriteHonoursPolicy) {
     ScratchDir scratch{Location::Temp, "header_case_desc"};
     fs::path const dir = scratch.path();

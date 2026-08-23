@@ -71,7 +71,8 @@ enum class AbiResolveErrorKind : std::uint8_t {
 // (D-FF3-Coherence: previously retired 2026-06-01 on the premise
 // that `TargetSchemaData::validate()` already closes this surface
 // at JSON load. That premise was FALSE: `TargetSchema`'s ctor is
-// public (target_schema.hpp:1042) and performs zero validation —
+// public (`TargetSchema`'s converting ctor in target_schema.hpp) and
+// performs zero validation —
 // any caller bypassing the JSON loader (test fixture, .dsslir
 // preamble round-trip, fuzz harness, future binary-cache reload)
 // can construct a schema carrying a paste-error cc that FF3 must

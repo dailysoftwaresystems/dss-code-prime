@@ -152,7 +152,7 @@ struct DSS_EXPORT NumberStyle {
 }
 
 // Trivially-copyable / size posture asserts. Mirror the
-// `ExprWrapperRules` style in `grammar_schema.hpp:90` so a future
+// `ExprWrapperRules` asserts in `grammar_schema.hpp` so a future
 // refactor can't silently fatten the POD subset (NumberEmitKind is
 // copied through the tokenizer's hot path).
 static_assert(std::is_trivially_copyable_v<NumberEmitKind>,

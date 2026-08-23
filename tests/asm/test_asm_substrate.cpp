@@ -199,7 +199,7 @@ TEST(AsmSubstrate, ShippedExecFormatsRodataSectionPerWalkerArm) {
     // `encodeExecDynamic` with NO diagnostic and the caller reports
     // the generic `K_ImageEmpty` ("the walker returned success with no
     // output"), because the `hasConst && secConst == nullptr` guard at
-    // src/link/format/macho.cpp:2753 is a bare `return {}` while its
+    // src/link/format/macho.cpp is a bare `return {}` while its
     // `hasData`/`hasBss` siblings ten lines below each emit a
     // `K_NoMatchingObjectFormat` naming the missing row. This
     // assertion cannot fix that walker asymmetry (it is a src/link

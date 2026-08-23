@@ -66,6 +66,36 @@ struct DSS_EXPORT ShippedDescriptorRef {
     BufferId              buffer;  // the buffer the include directive was found in
 };
 
+// ★★★ ONE PREPROCESSED TREE'S COORDINATE BRIDGE — the CU-lifetime carrier of
+// the fact that this tree's `source()` is a SYNTHESIZED buffer whose offsets
+// belong to no file the user can open.
+//
+// WHY IT LIVES ON THE FINISHED CU AND NOT ONLY ON THE BUILDER SIDECAR
+// ([[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]]). The preprocessor's
+// line-map remap used to die with `UnitBuilder`, so exactly one tier could use
+// it: the PARSE tier, which is the only one that runs while the builder is
+// still alive. Every LATER tier re-derives its positions from the same trees
+// (`tree.source().id()` + `tree.span(node)`) and therefore re-mints SYNTH
+// coordinates — and it lands SILENTLY, because the synth buffer is constructed
+// with the main source's NAME, so the rendering shows a plausible file with a
+// shifted line. ✔MEASURED through the CLI: a semantic `S0001` on source line 2
+// printed line 4 under two `--define`s (one prologue line each) and line 6 on a
+// target contributing two predefine lines, and an ASM-tier `A0008` did the same
+// — while an error inside an `#include`d header printed the MAIN file's name.
+// Carrying the bridge on the CU is what lets any tier ask the question.
+struct DSS_EXPORT PreprocessedPositionMap {
+    // The SYNTHESIZED buffer this tree was parsed from. Recorded ONLY when
+    // `remap` is known to be able to move a position off it (the preprocessor
+    // produced a non-empty line map), so "still names this buffer after the
+    // remap ran" is an exact internal-invariant violation and not a shrug.
+    BufferId synth;
+    // The preprocessor's `makeRemap()` closure — self-gating on `synth`, so
+    // running EVERY tree's remap over EVERY position is a no-op for the ones
+    // that do not belong to it. That is what makes the CU-level application
+    // order-free and idempotent.
+    std::function<void(BufferId&, SourceSpan&)> remap;
+};
+
 // Single CompilationUnit. Move-only, single-use (built by UnitBuilder::finish,
 // consumed by phase #8). Artifact-profile-agnostic (D8): the profile lives
 // on CompilationContext (06-artifact-profile-plan AP3), not here.
@@ -91,7 +121,13 @@ public:
                         pragmaPackMaps = {},
                     // TF-C85: index-parallel to `trees` — see `pragmaNoOptimizeFor`.
                     std::vector<std::unordered_set<std::uint32_t>>
-                        pragmaNoOptimizeSets = {});
+                        pragmaNoOptimizeSets = {},
+                    // One entry per PREPROCESSED tree (NOT index-parallel — a
+                    // tree that never went through the preprocessor has no
+                    // synth buffer and contributes nothing). See
+                    // `remapPreprocessedPositions`.
+                    std::vector<PreprocessedPositionMap>
+                        preprocessedPositionMaps = {});
 
     ~CompilationUnit();  // out-of-line; mirrors Tree's discipline.
 
@@ -203,6 +239,39 @@ public:
     [[nodiscard]] std::unordered_set<std::uint32_t> const&
     pragmaNoOptimizeFor(std::size_t treeIndex) const noexcept;
 
+    // ★★★ REWRITE ONE (buffer, span) OUT OF THIS CU'S SYNTHESIZED PREPROCESSOR
+    // COORDINATES ONTO THE ORIGIN FILE IT CAME FROM.
+    // ([[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]])
+    //
+    // A no-op for a position that names no synth buffer of this CU, and for a CU
+    // whose files were never preprocessed (no maps at all) — so a caller never
+    // has to ASK whether the remap applies, which is the property that makes it
+    // safe to put at a chokepoint every tier passes through. Idempotent: once a
+    // position has been moved onto its origin it no longer names a synth buffer,
+    // so a second application changes nothing.
+    //
+    // ⚠ FAILS LOUD rather than leaving a coordinate no file can explain: if the
+    // position still names one of this CU's recorded synth buffers after every
+    // remap has run, the line-map could not resolve an offset it was recorded as
+    // covering — an internal invariant violation, not a user error. Refusing is
+    // the point: a SILENTLY wrong line is exactly the defect this closes.
+    void remapPreprocessedPosition(BufferId& buffer, SourceSpan& span) const;
+
+    // The same rewrite over every diagnostic a reporter has accumulated —
+    // primary AND related locations (`DiagnosticReporter::remapBuffers` applies
+    // the closure to both). This is the form the tiers use: the semantic
+    // analyzer runs it over its own reporter before publishing the model, and
+    // the driver runs it over the per-target scratch on the way out of a
+    // compile, so no tier has to remember the coordinate system it is in.
+    void remapPreprocessedPositions(DiagnosticReporter& reporter) const;
+
+    // TRUE when `buffer` is one of this CU's SYNTHESIZED preprocessor buffers —
+    // i.e. a position naming it is in coordinates NO user file has. The
+    // discriminator behind the refusal above, exposed so a test can assert the
+    // before/after states directly rather than inferring them from rendering.
+    [[nodiscard]] bool
+    isSynthesizedPreprocessorBuffer(BufferId buffer) const noexcept;
+
 private:
     CompilationUnitId                    id_;
     std::shared_ptr<GrammarSchema const> schema_;
@@ -217,6 +286,10 @@ private:
     std::vector<std::unordered_map<std::uint32_t, std::uint32_t>> pragmaPackMaps_;
     // TF-C85: index-parallel to `trees_`, on the same by-construction terms.
     std::vector<std::unordered_set<std::uint32_t>> pragmaNoOptimizeSets_;
+    // One entry per PREPROCESSED tree — deliberately NOT index-parallel, because
+    // the question every consumer asks is "does this POSITION belong to a synth
+    // buffer", which is answered by scanning the maps, never by a tree index.
+    std::vector<PreprocessedPositionMap> preprocessedPositionMaps_;
 };
 
 // Single-use builder for CompilationUnit. Non-copyable + non-movable, same
@@ -430,8 +503,9 @@ private:
         std::vector<AmbiguousTypeNameCandidate> candidates;
         std::vector<std::string>                globalTypeNames;
         // The tree's own global TYPE bindings with their name-token spans —
-        // the oracle's self-definition guard (D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-
-        // NAME): a candidate whose (name, span) matches one of THIS tree's
+        // the oracle's self-definition guard
+        // (D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME):
+        // a candidate whose (name, span) matches one of THIS tree's
         // bindings is a typedef's own defining occurrence (C 6.2.1p7) and is
         // not seeded for that tree's reparse.
         std::vector<std::pair<std::string, SourceSpan>> globalTypeBindings;
@@ -446,6 +520,12 @@ private:
         // diagnostics. Empty/null when the file was not preprocessed.
         std::vector<Token>                              ppTokens;
         std::function<void(BufferId&, SourceSpan&)>     ppRemap;
+        // The SYNTHESIZED buffer's id, recorded ONLY when the preprocessor
+        // produced a line map that can actually move a position off it (a
+        // non-empty map with at least one real origin). Invalid otherwise —
+        // which keeps the CU's refusal EXACT: it fires only where the remap was
+        // known to be able to act and did not. See `PreprocessedPositionMap`.
+        BufferId                                        ppSynthBuffer;
         // TF-C82 (D-PP-PRAGMA-REGISTRY): synth byte offset of an emitted token ->
         // the `#pragma pack` member-alignment cap in effect when the preprocessor
         // emitted it. EMPTY for a tree that was not preprocessed, and for every

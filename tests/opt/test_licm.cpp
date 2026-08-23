@@ -1272,17 +1272,18 @@ TEST(Licm, VolatileBinaryOpNotHoisted) {
     EXPECT_EQ(r.instructionsHoisted, 0u);
 }
 
-// Load-specific Volatile guard (licm.cpp:326). The sibling
-// `VolatileBinaryOpNotHoisted` exercises only an `Add`, leaving the Load-
+// Load-specific Volatile guard (the `MirInstFlags::Volatile` `continue` in
+// licm.cpp). The sibling `VolatileBinaryOpNotHoisted` exercises only an
+// `Add`, leaving the Load-
 // admission path — which sits AFTER the Volatile `continue` — unpinned. This
 // fixture is byte-identical to `InvariantLoadHoisted` (a clean pointer defined
 // OUTSIDE the loop, empty body, NO aliasing Store → that test hoists the Load,
 // instructionsHoisted == 1) EXCEPT the loop-body Load carries
 // MirInstFlags::Volatile. The single-bit delta isolates the Volatile `continue`
-// at licm.cpp:326, which runs BEFORE the Load alias-admission gate: with it,
+// at licm.cpp, which runs BEFORE the Load alias-admission gate: with it,
 // instructionsHoisted == 0 and the volatile Load stays physically in the body.
 // RED-ON-DISABLE: neutralize the `if (has(...Volatile)) continue;` at
-// licm.cpp:326 → the volatile Load hoists → instructionsHoisted == 1.
+// licm.cpp → the volatile Load hoists → instructionsHoisted == 1.
 TEST(Licm, VolatileLoadInOtherwiseHoistableLoopNotHoisted) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
@@ -1326,7 +1327,7 @@ TEST(Licm, VolatileLoadInOtherwiseHoistableLoopNotHoisted) {
     EXPECT_TRUE(r.ok);
     EXPECT_EQ(r.instructionsHoisted, 0u)
         << "a Volatile Load must NOT be hoisted even though its pointer is loop-"
-           "invariant and no aliasing Store sits in the body — licm.cpp:326's "
+           "invariant and no aliasing Store sits in the body — licm.cpp's "
            "Volatile `continue` runs before the Load alias-admission gate";
 
     // The volatile Load must remain PHYSICALLY in the loop (LoopHeader)

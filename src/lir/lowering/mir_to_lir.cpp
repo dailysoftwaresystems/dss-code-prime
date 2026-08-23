@@ -1336,6 +1336,54 @@ struct Lowerer {
                 context));
     }
 
+    // ── D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND ───────────────────────────────
+    //
+    // The copy that materialises ONE inline-asm operand into (or out of) its
+    // bound register. Placed beside `classOp`/`reportMissingClassOp` on
+    // purpose: those two exist to kill "the silent class-blind miscompile", and
+    // the inline-asm lowering was the site that bypassed them — resolving one
+    // module-wide `MnemonicSlot::Mov` per BLOCK and using it for every operand
+    // whatever class it bound. See the call site in `expandInlineAsm` for the
+    // two measured disassemblies.
+    [[nodiscard]] std::optional<LirInstId>
+    emitAsmOperandMove(MirInstId at, LirReg dest, LirReg src,
+                       std::string_view role, std::size_t gnuIndex,
+                       std::string_view constraint) {
+        // ⚠ A CROSS-FILE MOVE IS A DIFFERENT MACHINE OPERATION FROM A COPY
+        // WITHIN A FILE, and `registerClassOps` binds one move PER class. There
+        // is no slot to ask, so this refuses rather than picking one of the two
+        // classes and encoding the register NUMBER into the wrong file.
+        if (dest.regClass() != src.regClass()) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "inline asm (MIR inst {}): {} {} (constraint \"{}\") binds "
+                    "register class '{}', but the value it carries lives in "
+                    "class '{}'. Moving between two register FILES is a "
+                    "distinct machine operation from a copy within one (arm64 "
+                    "spells it `fmov x0, d0`, x86_64 `movq %xmm0, %rax`), and "
+                    "no target declares it — `registerClassOps` binds one move "
+                    "PER class. Emitting that class's move would encode the "
+                    "register NUMBER in the wrong file and read an unrelated "
+                    "register, which is a silent wrong answer rather than a "
+                    "diagnostic. Bind this operand with a constraint whose "
+                    "class matches the value, or route the value through "
+                    "memory (D-TARGET-NO-CROSS-CLASS-MOVE-VERB)",
+                    at.v, role, gnuIndex, constraint,
+                    lirRegClassName(dest.regClass()),
+                    lirRegClassName(src.regClass())));
+            return std::nullopt;
+        }
+        auto const op = classOp(dest.regClass(), RegClassOp::Move);
+        if (!op.has_value()) {
+            reportMissingClassOp(dest.regClass(), RegClassOp::Move,
+                                 "inline asm operand materialisation");
+            return std::nullopt;
+        }
+        std::array<LirOperand, 1> const pin{LirOperand::makeReg(src)};
+        return emitInst(*op, dest, pin);
+    }
+
     // Map a MIR `TypeId` to the LIR register class that holds its
     // values. F16/F32/F64/F80/F128 → FPR; Vector/Matrix → VR (SIMD);
     // integer/bool/pointer → GPR; default for aggregates (Struct/
@@ -2738,6 +2786,30 @@ struct Lowerer {
         // this vreg), not on the whole expansion.
         bool          earlyClobber = false;
         std::string   constraint;      // verbatim, for diagnostics
+        // What the template WRITES around `reg`. `Reg` — the default and the
+        // only value a class-bound or register-bound letter ever takes — means
+        // the register itself; `MemBase` means the dialect's memory form with
+        // `reg` as the base (`(%rdi)` / `[x0]`), because `reg` then holds the
+        // operand's ADDRESS rather than its value. Carried rather than derived
+        // from the constraint TEXT: the letter is `.target.json` vocabulary and
+        // a `constraint == "m"` test here would be a target check spelled as a
+        // string compare.
+        OperandKindFilter operandKind = OperandKindFilter::Reg;
+        // ★★★ THE `ImmInt` FORM'S PAYLOAD, AND IT IS A **VALUE** WHERE EVERY
+        // OTHER FORM CARRIES A REGISTER (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED).
+        // `"i"` binds no register at all — the number is written INTO the
+        // instruction — so on such a binding `reg` is deliberately
+        // `InvalidLirReg` and `cls` is `None`, and this pair is what the
+        // template actually denotes.
+        // ⚠ THE BOOL IS LOAD-BEARING FOR THE `operandKindResolved` REASON: `0`
+        // is a perfectly ordinary immediate, so a zero-initialized `immediate`
+        // reads back as a plausible measurement. `hasImmediate` is the only
+        // field that cannot be mistaken for one — and the two together are what
+        // let the engine's own refusal say "the caller bound this to the
+        // immediate form and then handed it no value" rather than encoding a
+        // silent zero.
+        bool          hasImmediate = false;
+        std::int64_t  immediate    = 0;
     };
 
     // A spelling list as a diagnostic reads it: `'%0', '%[out]'`. An operand
@@ -2777,9 +2849,15 @@ struct Lowerer {
         return lirInstWidthBits(widthFlagsForType(ty));
     }
 
+    // `valueInst` is the MIR value bound to this operand, and it is INVALID on
+    // an output by construction: an output is read back through a `ReturnPiece`,
+    // not through an operand. Only the `ImmInt` arm consults it — it is the one
+    // form whose payload is a VALUE rather than a register, and the value is
+    // exactly the `Const` `hir_to_mir` emitted for it.
     [[nodiscard]] bool
     bindAsmOperand(MirAsmOperand const& o, MirInstId at, std::size_t gnuIndex,
-                   std::string_view role, TypeId valueType, AsmBound& out) {
+                   std::string_view role, TypeId valueType, MirInstId valueInst,
+                   AsmBound& out) {
         out.spellings  = o.spellings;
         out.widthBits  = asmWidthBitsForType(valueType);
         out.constraint = o.constraint;
@@ -2792,6 +2870,141 @@ struct Lowerer {
         // the whole-descriptor pass below is where that relation is checked and
         // realised — before ANYTHING is emitted, so an unrepresentable shape
         // still refuses rather than reaching a template.
+        // ★★★ A MEMORY-FORM OPERAND HAS NO REGISTER CLASS AND MUST NOT BE ASKED
+        // FOR ONE — THE **ADDRESS** IS WHAT GETS A REGISTER
+        // (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED). `"m"` binds
+        // an operand FORM, so `o.regClass` is meaningless on this entry and the
+        // `None` refusal below would fire on a letter both shipped targets
+        // declare. The value `hir_to_mir` handed us is the operand's ADDRESS, so
+        // the class comes from the SAME `regClassForType` map every other
+        // pointer-valued LIR operand uses — config-driven, no letter and no
+        // architecture named here.
+        // ⚠ THE KIND TRAVELS TO THE ENGINE (`AsmBound::operandKind` →
+        // `AsmOperandBinding::operandKind`), because "which register" and "what
+        // does the template WRITE around it" are two facts: the engine turns a
+        // memory binding into the dialect's own addressing form, which is why
+        // `(%rdi)` and `[x0]` need no arm here.
+        if (o.operandKindResolved) {
+            out.operandKind =
+                static_cast<OperandKindFilter>(o.operandKind);
+            if (out.operandKind != OperandKindFilter::MemBase
+                && out.operandKind != OperandKindFilter::ImmInt) {
+                // Unreachable from C today — `hir_to_mir` refuses every other
+                // form by name — but this tier has direct-API producers that
+                // never run it (the LSP, the FFI header parser, hand-built
+                // descriptors in the test suite), so it refuses rather than
+                // falling through to a register binding it was never given.
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format("inline asm (MIR inst {}): {} {} (constraint "
+                                "\"{}\") binds the operand form '{}', which this "
+                                "tier realizes only for '{}' and '{}'",
+                                at.v, role, gnuIndex, o.constraint,
+                                operandKindFilterName(out.operandKind),
+                                operandKindFilterName(
+                                    OperandKindFilter::MemBase),
+                                operandKindFilterName(
+                                    OperandKindFilter::ImmInt)));
+                return false;
+            }
+            // ★★★ THE IMMEDIATE FORM BINDS **NO REGISTER**, SO IT TAKES NO
+            // REGISTER CLASS, NO VREG AND NO MATERIALISING `mov`
+            // (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED). The value is
+            // written into the instruction the template names, so `reg` stays
+            // `InvalidLirReg` on purpose: anything else would hand the engine a
+            // register that is not what `%N` denotes, and the engine would
+            // faithfully emit it.
+            // ★ THE VALUE COMES OUT OF THE MIR `Const` `hir_to_mir` EMITTED,
+            // through `constIntegerValue` — the SAME reader a const-disp `Gep`
+            // already uses for exactly this question. No private payload rides
+            // the descriptor, so there is nothing for a rebuild to drop.
+            if (out.operandKind == OperandKindFilter::ImmInt) {
+                if (!o.fixedRegister.empty() || o.tiedOutput.has_value()) {
+                    // A constant cannot also be a pinned register, and it cannot
+                    // be the read half of a read-write operand (there is nothing
+                    // to write back INTO a constant). Either combination came
+                    // from a hand-built descriptor, and honouring half of it
+                    // would be a guess.
+                    dss::report(reporter,
+                        DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                        DiagnosticSeverity::Error,
+                        std::format("inline asm (MIR inst {}): {} {} (constraint "
+                                    "\"{}\") binds the '{}' form and also {} — a "
+                                    "compile-time constant occupies no register "
+                                    "and is no operand's write-back partner",
+                                    at.v, role, gnuIndex, o.constraint,
+                                    operandKindFilterName(
+                                        OperandKindFilter::ImmInt),
+                                    o.fixedRegister.empty()
+                                        ? std::string{"ties an output"}
+                                        : std::format("pins register '{}'",
+                                                      o.fixedRegister)));
+                    return false;
+                }
+                // ⚠ VALIDITY IS ASKED FIRST, AND IT IS NOT DEFENSIVE NOISE: an
+                // OUTPUT has no operand at all (`InvalidMirInst` by
+                // construction), and `mir.instOpcode` on an invalid id ABORTS
+                // the process. `hir_to_mir` refuses an immediate-form output
+                // with gcc's own diagnosis, so a descriptor carrying one came
+                // from a producer that never ran it — which owes a diagnostic,
+                // never a process kill.
+                auto const value = valueInst.valid()
+                                       ? constIntegerValue(valueInst)
+                                       : std::nullopt;
+                if (!value.has_value()) {
+                    // ⚠ THE REFUSAL NAMES WHAT IS ACTUALLY WRONG. A C source
+                    // reaching here is already refused by `hir_to_mir`
+                    // ("requires an INTEGER CONSTANT EXPRESSION"), which is the
+                    // tier that can still see the expression; what lands here
+                    // is a descriptor whose immediate operand was wired to a
+                    // value that is not a `Const` at all — a producer defect,
+                    // and one that would otherwise encode whatever
+                    // `constIntegerValue`'s failure default happened to be.
+                    dss::report(reporter,
+                        DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                        DiagnosticSeverity::Error,
+                        std::format("inline asm (MIR inst {}): {} {} (constraint "
+                                    "\"{}\") binds the '{}' form, but the MIR "
+                                    "value wired to it is not an integer `Const` "
+                                    "— an immediate operand IS its value, so "
+                                    "there is nothing to encode",
+                                    at.v, role, gnuIndex, o.constraint,
+                                    operandKindFilterName(
+                                        OperandKindFilter::ImmInt)));
+                    return false;
+                }
+                out.cls          = LirRegClass::None;
+                out.reg          = InvalidLirReg;
+                out.pinned       = false;
+                out.earlyClobber = false;
+                out.hasImmediate = true;
+                out.immediate    = *value;
+                return true;
+            }
+            if (!o.fixedRegister.empty()) {
+                // A letter cannot bind a form AND pin a register: `binds` names
+                // one arm. A descriptor carrying both came from a producer that
+                // built it by hand, and honouring either half would be a guess.
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format("inline asm (MIR inst {}): {} {} (constraint "
+                                "\"{}\") binds an operand form AND pins register "
+                                "'{}' — a constraint letter binds exactly one of "
+                                "the three arms",
+                                at.v, role, gnuIndex, o.constraint,
+                                o.fixedRegister));
+                return false;
+            }
+            out.cls    = regClassForType(valueType);
+            out.reg    = lir.newVReg(out.cls);
+            out.pinned = false;
+            // `&` is an OUTPUT promise and the memory form has no output arm
+            // here (`hir_to_mir` refuses `"=m"`), so there is nothing to stamp.
+            out.earlyClobber = false;
+            return true;
+        }
         LirRegClass const cls = static_cast<LirRegClass>(o.regClass);
         if (cls == LirRegClass::None) {
             dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
@@ -3090,9 +3303,11 @@ struct Lowerer {
     // mid-compile-minted `<inline asm>` buffer — they name the BYTE inside the
     // template but never the source statement, so a file with three `__asm__`
     // blocks cannot tell which one is being refused. ✔MEASURED, gcc 13.3 and
-    // clang 18: BOTH references make the C statement primary (clang: `gt.c:3:13:
-    // error: …` then `<inline asm>:1:2: note: instantiated into assembly here`;
-    // gcc: `gt.c:3: Error: …` with the text echoed) — neither has
+    // clang 18, on a 3-line C file whose `__asm__` names a bogus mnemonic: BOTH
+    // references make the C statement primary (clang prints the C statement's
+    // `<file>:<line>:<col>: error: …` then an `<inline asm>` `note: instantiated
+    // into assembly here`; gcc prints the C statement's `<file>:<line>: Error: …`
+    // with the text echoed) — neither has
     // template-primary. The fragment locus is DEMOTED to a related note, never
     // dropped; text-only refusals (no locus at all today) gain the primary.
     //
@@ -3225,13 +3440,16 @@ struct Lowerer {
                         id.v, k, desc.outputs[k].constraint));
                 return false;
             }
-            if (!bindAsmOperand(desc.outputs[k], id, k, "output", ty, outs[k]))
+            // An OUTPUT is read back through its `ReturnPiece`, so it has no MIR
+            // operand — `InvalidMirInst` is the honest answer, not a placeholder.
+            if (!bindAsmOperand(desc.outputs[k], id, k, "output", ty,
+                                InvalidMirInst, outs[k]))
                 return false;
         }
         for (std::size_t j = 0; j < desc.inputs.size(); ++j) {
             if (!bindAsmOperand(desc.inputs[j], id, desc.outputs.size() + j,
                                 "input", mir.instType(operands[j]),
-                                ins[j])) {
+                                operands[j], ins[j])) {
                 return false;
             }
         }
@@ -3313,29 +3531,50 @@ struct Lowerer {
                                 || !c.outputNames.empty()
                                 || !c.clobberedNames.empty();
 
-        // The move used for the input materialisation and the output captures.
-        // Resolved only when the block actually needs one, so a target that
-        // declares no `mov` still compiles an asm block that needs none — an
-        // operand-less `__asm__("nop")` asks nothing of the target's move.
-        // ⚠ THE INPUT HALF IS "ANY INPUT AT ALL", NOT "ANY PINNED INPUT".
-        // EVERY input is materialised into its bound register (see the loop in
-        // step 4), so gating on `pinned` here left `movOp` DISENGAGED on the
-        // path that dereferences it: the plain `"r"` input crashed the builder
-        // with `LirBuilder::addInst: Invalid opcode` out of a `*movOp` on an
-        // empty optional. It stayed invisible while unpinned inputs were being
-        // skipped entirely — the same omission hid both halves.
-        bool const needMoves =
-            !ins.empty()
-            || std::any_of(outs.begin(), outs.end(),
-                           [](AsmBound const& b) { return b.pinned; });
-        std::optional<std::uint16_t> movOp;
-        if (needMoves) {
-            movOp = opcode(MnemonicSlot::Mov);
-            if (!movOp.has_value()) {
-                reportMissingOpcode(MnemonicSlot::Mov, "inline asm register pin");
-                return false;
-            }
-        }
+        // ── D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND ──────────────────────────
+        //
+        // ★★★ THE COPY THAT MATERIALISES AN OPERAND IS PER-REGISTER-CLASS, AND
+        // IT USED TO BE ONE MODULE-WIDE `MnemonicSlot::Mov` FOR THE WHOLE
+        // BLOCK. That was a LIVE SILENT MISCOMPILE on BOTH shipped targets, and
+        // the comment on `classOp` — "falling back to the GPR handle (the
+        // silent class-blind miscompile this table kills)" — described exactly
+        // what this site was doing while the table sat unused two hundred lines
+        // away.
+        //
+        // ✔MEASURED 2026-08-23 (cycle P28) at the CLI, `--config=release`,
+        // rc=0 and no diagnostic in every arm:
+        //   arm64, `double y = x; __asm__("nop" : "+r"(y));`
+        //     DSS:  fmov d15, d0  /  mov x29, x15  /  nop  /  mov x0, x29
+        //     gcc:  fmov x0,  d0  /  nop           /  fmov d0, x0
+        //     `mov x29, x15` reads the INTEGER register 15 while the value is
+        //     in d15 — a different physical register. The function returns
+        //     whatever x15 held.
+        //   x86_64, `double y = v; __asm__("nop" : "+x"(y));`
+        //     DSS:  movaps %xmm0,%xmm13 / mov %r13,%r13 / nop / movaps %xmm13,%xmm0
+        //     The operand's own register is xmm13 and the copy into it is the
+        //     INTEGER mov on register number 13 — a no-op on r13. The template
+        //     reads a register nothing ever wrote.
+        //
+        // ★ THE FIX REUSES THE VERB THAT ALREADY EXISTS: `classOp(cls,
+        // RegClassOp::Move)`, the same lookup every ordinary copy in this file
+        // makes. Resolved PER COPY rather than once per block, because one asm
+        // block may bind operands of several classes and a single handle cannot
+        // be right for all of them.
+        //
+        // ⚠ AND A CROSS-CLASS COPY IS REFUSED RATHER THAN APPROXIMATED. When
+        // the constraint's class differs from the VALUE's class the machine
+        // needs a cross-FILE move (`fmov x0, d0` / `movq %xmm0, %rax`), which is
+        // neither class's `move` and which no target declares. gcc compiles that
+        // template, so this is a CONFORMANCE GAP with a working reference — it
+        // is anchored at D-TARGET-NO-CROSS-CLASS-MOVE-VERB, whose trigger is
+        // this very template. Refusing is what the bar requires in the
+        // meantime: the alternative measured above is a wrong register, quietly.
+        auto emitOperandMove =
+            [this, id](LirReg dest, LirReg src, std::string_view role,
+                       std::size_t gnuIndex,
+                       std::string_view constraint) -> std::optional<LirInstId> {
+            return emitAsmOperandMove(id, dest, src, role, gnuIndex, constraint);
+        };
 
         // ── 3. parse the template on the RIGHT SURFACE ──
         //
@@ -3395,10 +3634,30 @@ struct Lowerer {
         // hold a different class than the constraint asks for, and a direct
         // bind would silently hand the template the wrong register file.
         for (std::size_t j = 0; j < ins.size(); ++j) {
+            // ★★★ AN IMMEDIATE-BOUND INPUT IS **NOT** MATERIALISED, AND THE SKIP
+            // IS THE MECHANISM RATHER THAN AN OPTIMIZATION
+            // (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED). It has no bound
+            // register to move a value into (`reg` is `InvalidLirReg` by
+            // construction — see `bindAsmOperand`'s `ImmInt` arm), so
+            // `emitOperandMove` would be asked to define an invalid vreg. The
+            // value reaches the template through the BINDING below, which is
+            // where an immediate has always lived in this pipeline: the
+            // `[Reg, ImmInt]` encoding variants both shipped targets declare are
+            // the same ones a `.s`-written `add x0, x0, #5` elects.
+            // ⚠ `regForValue` IS DELIBERATELY NOT CALLED EITHER. `lowerConst`
+            // skips materialising a constant whose sole use is this operand
+            // (`constFoldsIntoAsmImmediate`), so asking for a register here
+            // would fail loud on the undefined vreg — which is exactly the
+            // fold-site-disagreement alarm that mechanism exists to raise.
+            if (ins[j].hasImmediate) continue;
             std::optional<LirReg> const src = regForValue(operands[j]);
             if (!src.has_value()) return false;
-            std::array<LirOperand, 1> const pin{LirOperand::makeReg(*src)};
-            emitInst(*movOp, ins[j].reg, pin);
+            // Same early-out shape as the `regForValue` line above: this runs
+            // BEFORE any capture block is opened, so there is none to seal.
+            if (!emitOperandMove(ins[j].reg, *src, "input", j,
+                                 ins[j].constraint).has_value()) {
+                return false;
+            }
         }
 
         // ★★★ ONE BINDING ROW PER **SPELLING**, ALL ROWS OF ONE OPERAND POINTING
@@ -3414,7 +3673,9 @@ struct Lowerer {
         bindings.reserve(outs.size() + ins.size());
         auto bindOperand = [&bindings](AsmBound const& b) {
             for (auto const& s : b.spellings) {
-                bindings.push_back({s, b.reg, b.cls, b.widthBits});
+                bindings.push_back({s, b.reg, b.cls, b.widthBits,
+                                    b.operandKind, b.hasImmediate,
+                                    b.immediate});
             }
         };
         for (auto const& b : outs) bindOperand(b);
@@ -3546,9 +3807,15 @@ struct Lowerer {
             for (std::size_t k = 0; k < outs.size(); ++k) {
                 if (!outs[k].pinned) continue;
                 LirReg const dest = lir.newVReg(outs[k].cls);
-                std::array<LirOperand, 1> const cap{
-                    LirOperand::makeReg(outs[k].reg)};
-                emitInst(*movOp, dest, cap);
+                // Same class on both sides by construction (`bindAsmOperand`
+                // takes `out.cls` from the pinned register itself), so this
+                // copy can only ever fail on a target that declares no `move`
+                // for that class — which `emitOperandMove` names.
+                if (!emitOperandMove(dest, outs[k].reg, "output", k,
+                                     outs[k].constraint).has_value()) {
+                    sealOrphanedAsmCaptureBlocks(captureBlocks);
+                    return false;
+                }
                 outs[k].reg = dest;  // the VALUE now lives in the vreg, not the pin
             }
         }
@@ -3570,7 +3837,7 @@ struct Lowerer {
 
         // ── 5b. `asm goto` only: seal the block and place the edge captures ──
         if (isGoto
-            && !sealAsmGotoEdges(succs, outs, captureBlocks, movOp,
+            && !sealAsmGotoEdges(id, succs, outs, captureBlocks,
                                  constraintHandle)) {
             sealOrphanedAsmCaptureBlocks(captureBlocks);
             return false;
@@ -3727,10 +3994,10 @@ struct Lowerer {
     // hence `LirBuilder::openBlockIsTerminated`, whose docblock records the same
     // reasoning from the builder's side.
     [[nodiscard]] bool
-    sealAsmGotoEdges(std::span<MirBlockId const> succs,
+    sealAsmGotoEdges(MirInstId at,
+                     std::span<MirBlockId const> succs,
                      std::vector<AsmBound>& outs,
                      std::vector<LirBlockId> const& captureBlocks,
-                     std::optional<std::uint16_t> movOp,
                      std::optional<std::uint32_t> constraintHandle) {
         // The `lowerSehTryBegin` pattern: the opcode this edge needs, asked for
         // by slot and refused by name. Checked BEFORE anything is emitted, so a
@@ -3747,27 +4014,26 @@ struct Lowerer {
         // linear scan over live ranges already handles (`firstDef` takes the
         // minimum — the same widening a `"+r"` operand's two defs produce).
         std::vector<LirReg> captureDest(outs.size(), InvalidLirReg);
-        bool anyPinned = false;
         for (std::size_t k = 0; k < outs.size(); ++k) {
             if (!outs[k].pinned) continue;
             captureDest[k] = lir.newVReg(outs[k].cls);
-            anyPinned      = true;
         }
-        if (anyPinned && !movOp.has_value()) {
-            // Unreachable from `expandInlineAsm` (`needMoves` is true whenever an
-            // output is pinned), so reaching it is a defect in THIS file rather
-            // than in the target — which is exactly when a silent pass costs most.
-            reportMissingOpcode(MnemonicSlot::Mov, "MIR InlineAsmGoto edge capture");
-            return false;
-        }
+        // D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND: the edge captures are the SAME
+        // copy the in-block capture loop emits, so they go through the SAME
+        // per-class lookup. The old `movOp.has_value()` pre-check is gone with
+        // the module-wide handle it guarded: a target that declares no move for
+        // this operand's class is now named by `emitAsmOperandMove`, per
+        // operand, instead of being reported as a missing universal `Mov`.
+        bool captureOk = true;
         auto emitCaptures = [&] {
             for (std::size_t k = 0; k < outs.size(); ++k) {
                 if (!outs[k].pinned) continue;
-                std::array<LirOperand, 1> const cap{
-                    LirOperand::makeReg(outs[k].reg)};
-                LirInstId const li = emitInst(*movOp, captureDest[k], cap);
+                auto const li = emitAsmOperandMove(at, captureDest[k],
+                                                   outs[k].reg, "output", k,
+                                                   outs[k].constraint);
+                if (!li.has_value()) { captureOk = false; return; }
                 if (constraintHandle.has_value()) {
-                    lir.setInstRegConstraints(li, *constraintHandle);
+                    lir.setInstRegConstraints(*li, *constraintHandle);
                 }
             }
         };
@@ -3775,12 +4041,14 @@ struct Lowerer {
         // ── the fall-through edge ──
         if (!lir.openBlockIsTerminated()) {
             emitCaptures();
+            if (!captureOk) return false;
             emitBr(*jmpOp, lirSucc(succs.back()));
         }
         // ── each label edge's capture block ──
         for (std::size_t j = 0; j < captureBlocks.size(); ++j) {
             lir.beginBlock(captureBlocks[j]);
             emitCaptures();
+            if (!captureOk) return false;
             emitBr(*jmpOp, lirSucc(succs[j]));
         }
         // The VALUE now lives in the vreg rather than in the pin, on every path.
@@ -4311,6 +4579,16 @@ struct Lowerer {
         // dead const on BOTH the positive member-offset `ADD` and the negative
         // `p[-N]` `SUB`. Mirrors the `foldedGlobalAddrs_` skip in `lowerGlobalAddr`.
         if (constDispFoldsIntoGep(id)) {
+            foldedConstDisps_.insert(id.v);
+            return;
+        }
+        // D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED: the same skip for a
+        // constant whose sole use is an inline-asm operand bound to the `ImmInt`
+        // form. `expandInlineAsm` reads it with `constIntegerValue` and writes it
+        // into the template's instruction, so the register would be a dead
+        // write; the same `foldedConstDisps_` record keeps a stray `regForValue`
+        // loud rather than silent.
+        if (constFoldsIntoAsmImmediate(id)) {
             foldedConstDisps_.insert(id.v);
             return;
         }
@@ -6913,6 +7191,57 @@ struct Lowerer {
         // immediate; a ≥3-operand (multi-index) Gep does not, and operand 0 is
         // always the base pointer (never this Const).
         return userOps.size() == 2 && userOps[1].v == constId.v;
+    }
+
+    // ★★★ THE SAME QUESTION FOR AN INLINE-ASM IMMEDIATE OPERAND
+    // (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED): would this `Const`'s value
+    // be written straight INTO the instruction the template names, making its
+    // register materialization dead? True iff it is single-use and its sole user
+    // is an asm block whose descriptor binds the input at that operand index to
+    // the `ImmInt` form.
+    //
+    // ★★ IT IS THE `constDispFoldsIntoGep` MECHANISM, NOT A NEW ONE, and the
+    // parallel is exact: a value the consumer reads with `constIntegerValue`
+    // rather than `regForValue` has no register, so materialising one emits a
+    // `mov` nothing reads. Recording the skip in `foldedConstDisps_` keeps the
+    // alarm too — a stray `regForValue` on a folded value fails LOUD on the
+    // undefined vreg instead of silently handing the template a register.
+    //
+    // ⚠ THE FORM IS READ FROM THE DESCRIPTOR, NEVER GUESSED FROM THE OPERAND'S
+    // SHAPE. "It is a Const used by an asm block" is NOT the predicate: an
+    // ordinary `"r"(7)` input is exactly that, and it genuinely needs its
+    // register. Only the descriptor knows which arm the constraint letter bound.
+    // ⚠ NO RANGE GATE HERE, and that is deliberate: `hir_to_mir` already refuses
+    // an out-of-`imm32` immediate by name, and `bindAsmOperand` refuses a
+    // non-`Const` operand — so a value reaching this predicate is one the asm
+    // path has already committed to encoding. A second range test would be a
+    // second owner of the form's width.
+    [[nodiscard]] bool constFoldsIntoAsmImmediate(MirInstId constId) const {
+        if (mir.instOpcode(constId) != MirOpcode::Const) return false;
+        auto const it = mirValueUses_.find(constId.v);
+        if (it == mirValueUses_.end() || it->second.count != 1) return false;
+        MirInstId const user = it->second.user;
+        if (mir.instOpcode(user) != MirOpcode::InlineAsm
+            && mir.instOpcode(user) != MirOpcode::InlineAsmGoto) {
+            return false;
+        }
+        MirAsmDescriptor const& desc = mir.asmDescriptor(user);
+        auto const userOps = mir.instOperands(user);
+        // `MirAsmDescriptor::inputs` is aligned 1:1 with the instruction's MIR
+        // operands (the descriptor's own contract), so the operand's POSITION is
+        // the descriptor entry to ask. A descriptor and an operand list that
+        // disagree about their length is a producer defect `expandInlineAsm`
+        // diagnoses; here it simply means "not proven folded", so the constant
+        // materializes normally and nothing is lost.
+        for (std::size_t j = 0; j < userOps.size(); ++j) {
+            if (userOps[j].v != constId.v) continue;
+            if (j >= desc.inputs.size()) return false;
+            MirAsmOperand const& o = desc.inputs[j];
+            return o.operandKindResolved
+                   && static_cast<OperandKindFilter>(o.operandKind)
+                          == OperandKindFilter::ImmInt;
+        }
+        return false;
     }
 
     // ── cycle 3e: aggregate ops (memory-flattening lowering) ─────────

@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <span>
 #include <string>
@@ -275,6 +276,36 @@ returnRegisterForClass(TargetSchema const&            schema,
 // floating-point OR SHORT VECTOR argument to `v[NSRN]` — ONE counter across
 // what this codebase calls FPR (the d-views) and VR (the v-views). Two rows,
 // one cursor. `argPoolsShareACursor` below is why that is DERIVED, not declared.
+// ── D-LIR-FRAME-SLOT-STRIDE-ENUMERATES-CLASSES-INSTEAD-OF-DERIVING ─────────
+//
+// The uniform byte stride of the frame's saved-register area and spill area.
+// `occupants` is the set of register classes that actually put a value in one
+// of those areas in the function being laid out; the answer is the widest
+// register any of them declares, never below the historic `max(GPR, FPR)`
+// floor (which the LOCAL-alloca area shares and which must stay ≥ every C
+// scalar's alignment).
+//
+// ★ PUBLISHED RATHER THAN PRIVATE, and for the reason
+// [[D-LIR-RETURN-REG-REFUSAL-IS-UNREACHABLE-FROM-THE-TEST-TIER]] recorded: a
+// derivation no tier can observe is a derivation whose mutant reddens nothing.
+// The defect this replaced — `max(widthForClass(GPR), widthForClass(FPR))`
+// written inline — was a two-member enumeration of a longer vocabulary, and it
+// produced an 8-byte stride for arm64's 16-byte `vr` class: two spill slots
+// that OVERLAPPED by 8 bytes, the second reading past the top of the frame.
+[[nodiscard]] DSS_EXPORT std::uint32_t
+frameSlotStride(TargetSchema const& schema,
+                std::span<LirRegClass const> occupants) noexcept;
+
+// Convenience for call sites (and pins) that name the occupant classes
+// literally. Same function, same floor — a second overload, never a second
+// derivation.
+[[nodiscard]] inline std::uint32_t
+frameSlotStrideForClasses(TargetSchema const& schema,
+                          std::initializer_list<LirRegClass> occupants) noexcept {
+    return frameSlotStride(schema, std::span<LirRegClass const>{
+                                       occupants.begin(), occupants.size()});
+}
+
 struct ArgPoolRow {
     LirRegClass                                        cls;
     std::vector<std::string> TargetCallingConvention::* pool;
@@ -483,7 +514,15 @@ struct DSS_EXPORT FrameLayout {
     // `vaListLayout` (size = vaListLayout.regSaveAreaBytes()). Zero everywhere else
     // — backward-compatible with every non-variadic frame.
     std::uint32_t       vaRegSaveAreaSize = 0;
-    std::uint32_t       slotSize          = 0;  // uniform per-class spill-slot width (bytes; = max(GPR width, FPR width))
+    // Uniform per-class spill-slot width in bytes. DERIVED by `frameSlotStride`
+    // from the classes that actually occupy a slot in this function, floored at
+    // the historic GPR/FPR width — never the two-member `max` it used to be.
+    // ⚠ That old spelling is the defect
+    // D-LIR-FRAME-SLOT-STRIDE-ENUMERATES-CLASSES-INSTEAD-OF-DERIVING records:
+    // arm64's `vr` is 16 bytes, so it sized two 16-byte slots 8 bytes apart and
+    // the second read past the top of the frame. This comment still described
+    // it after the fix; the P28 step-10 audit caught that.
+    std::uint32_t       slotSize          = 0;
     std::uint32_t       outgoingSlotSize  = 0;  // outgoing-arg slot width (bytes; = pointer width = GPR width)
     // c114 (D-WIN64-PDATA-XDATA-UNWIND): the cc's guard-page stack-probe
     // stride (bytes; 0 = no probing — Linux/macOS/arm64). A downstream

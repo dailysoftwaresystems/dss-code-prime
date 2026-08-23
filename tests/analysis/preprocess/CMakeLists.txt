@@ -7,3 +7,16 @@ dss_add_test(NAME analysis/preprocess/test_preprocessor
 # file shadows <version> on case-insensitive filesystems.)
 target_include_directories(dss_analysis_preprocess_test_preprocessor
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# [[D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH]]: the
+# includer-directory derivation, pinned on the BARE source-name form. A separate
+# binary rather than more cases in test_preprocessor.cpp because every test in
+# it moves the process cwd (the defect is only observable when the header is IN
+# the working directory), and that is a property of the whole file, not of one
+# case — keeping it out of the 10k-line neighbour keeps the cwd move from being
+# something a future case there acquires by accident.
+dss_add_test(NAME analysis/preprocess/test_include_bare_relative_includer_dir
+             SOURCES test_include_bare_relative_includer_dir.cpp)
+target_include_directories(
+    dss_analysis_preprocess_test_include_bare_relative_includer_dir
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests)

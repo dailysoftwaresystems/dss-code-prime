@@ -129,7 +129,7 @@ loadArm64DarwinExecFormat() {
     // D-LK10-ENTRY 2.13 gate 6 (`resolveEntryFnIdx`, exec_reloc_apply.hpp):
     // a format declaring `processExit` — as macho64-arm64-darwin-exec does
     // — CONTRACTS that its image entry is the `_start` trampoline, and only
-    // `linker::link` injects one (entry_trampoline.cpp:732 — the file's
+    // `linker::link` injects one (`injectEntryTrampoline` — the file's
     // ONLY assignment to that field — sets this override on every
     // successful injection). Every pin built on this fixture drives
     // `macho::encode` DIRECTLY, so no trampoline exists: state that the

@@ -232,7 +232,6 @@ UNCOVERED_BASELINE = frozenset({
     "I_ArgPositionDuplicate",
     "I_BitIntWidthInconsistent",
     "I_VlaStackRestorePairing",
-    "L_CcRegLookupFailed",
     "A_FunctionEncodeAborted",
     "K_ImageWriteCloseFailed",
     "K_CrossCuImageEmitDeferred",
@@ -672,4 +671,21 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # ★★ THE NO-ARGUMENT FORM VERIFIES THE TREE **AND** PROVES THE GATE CAN FAIL.
+    # D-GATE-DIAGNOSTIC-CODE-ALLOCATOR-HAS-NO-CTEST-ENTRY, 2026-08-23. This gate had
+    # no ctest entry and no CI step: it ran only when a human remembered it -- and
+    # the whole reason it exists is that "a lane allocates an ordinal and nothing
+    # mechanical notices". Registering it was half the fix; the other half is here,
+    # because `main()` runs `self_test()` ONLY under `--self-test` and the ctest
+    # entry passes no flag. ✔MEASURED 2026-08-22 on `enum_name_table_guard`: exactly
+    # that shape left its ctest form verifying the tree and proving nothing for a
+    # day, while a comment beside it claimed otherwise
+    # (D-GATE-ENUM-NAME-TABLE-CTEST-FORM-NEVER-SELF-TESTED). ⇒ the self-test now runs
+    # on every invocation that does not already ask for something narrower, and BOTH
+    # statuses are honoured -- `rc or rc_self`, so neither half can hide the other.
+    if len(sys.argv) > 1:
+        sys.exit(main())
+    _rc = main()
+    print()
+    _rc_self = self_test()
+    sys.exit(_rc or _rc_self)

@@ -240,12 +240,86 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextMarkerTable));
     return kMirTextMarkerTable.name(m);
 }
 
+// ── D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: the TYPE-keyword position ────
+//
+// The STRUCTURAL keywords `parseType` dispatches on, beside the primitive names
+// `kMirTextPrimTable` already owns. `unknown type 'foo'` named neither set, which
+// is the same silence the flag / attribute / for-clause arms in the sibling
+// `hir_text.cpp` were carrying.
+//
+// ⚠ THE SET, NOT THE DISPATCH. Unlike the keyword ladders in `hir_text.cpp`, this
+// one is NOT converted into a `switch` over the table: the arms are structurally
+// unlike each other (a wrap-1 keyword, a two-field `arr<T,N>`, a quoted-name
+// composite, a signature), several share a body by design, and one — `unsigned` —
+// is a PREFIX rather than a head keyword. A table used only for the SET keeps one
+// owner of the spellings without reshaping a production this format's whole type
+// grammar goes through. What replaces `-Werror=switch` here is a FEED-BACK PIN:
+// every spelling this list advertises is driven back through `parseType` and must
+// not come back as `unknown type`, so the list cannot advertise a keyword the
+// ladder does not handle, nor go stale when one is added without it.
+inline constexpr std::array<std::string_view, 16> kMirTextTypeKeywords{
+    "invalid", "ptr", "ref", "nullable", "optional", "slice", "complex",
+    "arr", "tuple", "struct", "union", "enum", "fn", "_BitInt", "unsigned",
+    "ext",
+};
+DSS_CHECK_KEY_VOCABULARY(kMirTextTypeKeywords);
+
+// The accepted set at a type position: the primitive names plus the structural
+// keywords, projected off both owners.
+[[nodiscard]] std::string typeKeywordsAccepted() {
+    std::string out{detail::renderAllowedList(allNames(kMirTextPrimTable))};
+    out += ", ";
+    out += detail::renderAllowedList(kMirTextTypeKeywords);
+    return out;
+}
+
+// D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS: the
+// `byvaluestackarg` payload's EXHAUST CLASS, spelled by name in both directions.
+//
+// ★ THE ROWS ARE THE `kByValueStackArgExhaust*` CONSTANTS THEMSELVES, not a
+// private re-listing: the table is keyed on the `std::uint8_t` those constants
+// already are, so this file mints no vocabulary of its own and cannot drift from
+// `mir_opcode.hpp`. Spelling the class by NAME rather than as the raw 2-bit
+// ordinal is the same rule this file applies to the enum underlying kind and the
+// literal core, and it has the same reason: the field is 2 bits wide but only
+// THREE of its four values are allocated, so an ordinal spelling lets the
+// unallocated `3` round-trip as if it meant something.
+inline constexpr EnumNameTable<std::uint8_t, 3> kMirTextExhaustTable{{{
+    { kByValueStackArgExhaustNone, "none" },
+    { kByValueStackArgExhaustGpr,  "gpr"  },
+    { kByValueStackArgExhaustFpr,  "fpr"  },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMirTextExhaustTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kMirTextExhaustTable));
+
 [[nodiscard]] std::optional<MirOpcode> opcodeFromMnemonic(std::string_view s) noexcept {
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(MirOpcode::Count_); ++i) {
         auto const op = static_cast<MirOpcode>(i);
         if (opcodeInfo(op).mnemonic == s) return op;
     }
     return std::nullopt;
+}
+
+// The accepted set for a mnemonic position, projected off the SAME walk
+// `opcodeFromMnemonic` performs. The `.dssir` twin of `hir_text.cpp`'s
+// `coreOpAccepted`, and minting nothing: `mir_opcode.hpp`'s `opcodeInfo` already
+// owns every mnemonic, so a table here would be the second owner this row exists
+// to remove (D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET).
+//
+// ⓘ Built on demand: it is reached only on a refusal, and materializing every
+// mnemonic on every parse to serve a diagnostic that usually never fires is the
+// wrong trade.
+[[nodiscard]] std::string opcodeMnemonicsAccepted() {
+    std::vector<std::string_view> names;
+    names.reserve(static_cast<std::size_t>(MirOpcode::Count_));
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(MirOpcode::Count_); ++i) {
+        names.push_back(opcodeInfo(static_cast<MirOpcode>(i)).mnemonic);
+    }
+    return detail::renderAllowedList(names);
 }
 
 // CallConv name mapping previously hand-rolled here (and in
@@ -287,7 +361,20 @@ private:
     std::vector<std::uint32_t> symOrder_;            // declaration-order list
     std::unordered_map<std::uint32_t, bool> symSet_; // dedup set
 
-    void report(std::string what, DiagnosticSeverity sev = DiagnosticSeverity::Warning) {
+    // ★★ THE SEVERITY IS A REQUIRED ARGUMENT, and it used to default to Warning
+    // here while the sibling `hir_text.cpp` helper defaulted to Error — so the
+    // SAME class of writer-side drop (a value this format cannot spell, whose
+    // text therefore will not read back) was loud in one text tier and a warning
+    // in the other, on two files that describe themselves as twins
+    // (D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS).
+    //
+    // ⓘ The fix is to DELETE the default rather than to pick one, because the two
+    // severities are both right for different sites: a value that cannot be
+    // rendered is an Error (the emitted text is not readable), while a caller who
+    // supplied no interner has chosen a lossy dump and is told so once, at
+    // Warning. A default makes that choice by omission, which is how the two
+    // tiers came to disagree without either one deciding anything.
+    void report(std::string what, DiagnosticSeverity sev) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::I_TextMalformed;
         d.severity = sev;
@@ -335,7 +422,13 @@ private:
         if (!t.valid()) { out_ += "invalid"; return; }
         if (ctx_.interner == nullptr) {
             if (!internerWarned_) {
-                report("no TypeInterner supplied; types render as '?'",
+                // Warning, and the sibling `hir_text.cpp` site says Warning for the
+                // same reason: this is not a property of the MODULE, it is the
+                // caller's choice of a type-less dump. ⚠ The text it produces is
+                // NOT re-parseable — `parseType` refuses `?` by name — which is
+                // what `mir_text.hpp`'s context note now says out loud.
+                report("no TypeInterner supplied; types render as '?', and text "
+                       "containing '?' is refused on the way back in",
                        DiagnosticSeverity::Warning);
                 internerWarned_ = true;
             }
@@ -401,7 +494,8 @@ private:
                             "enum '{}' has an underlying TypeKind (ordinal {}) this "
                             "format has no spelling for; the underlying type is NOT "
                             "rendered and the text will read back as the default",
-                            in.name(t), sc[0]));
+                            in.name(t), sc[0]),
+                            DiagnosticSeverity::Error);
                     } else {
                         out_ += " : ";
                         out_ += n;
@@ -423,16 +517,46 @@ private:
                 }
                 return;
             }
+            // ★★ WRITE-ONLY SPELLING, MADE LOUD RATHER THAN LEFT AS A WARNING
+            // (D-MIR-TEXT-TYPE-GRAMMAR-HAS-WRITE-ONLY-SPELLINGS — the type-grammar
+            // half of the same class the instruction grammar carried: four
+            // spellings `appendType` rendered that `parseType` had no keyword for).
+            // `parseType` has no `ext` keyword and never will without a
+            // `TypeRegistry` to resolve the extension kind against — which this
+            // reader does not take. So this arm emits text this reader cannot
+            // read; that is an Error about the MODULE (an Extension type reached
+            // MIR at all), not a note about the dump.
             case TypeKind::Extension: {
                 report("MIR carries a TypeKind::Extension type — the HIR→MIR "
-                       "boundary should have resolved it", DiagnosticSeverity::Warning);
+                       "boundary should have resolved it; `ext` has no spelling "
+                       "this reader accepts, so the text will not read back",
+                       DiagnosticSeverity::Error);
                 out_ += "ext "; out_ += quote(in.name(t));
+                return;
+            }
+            // C23 `_BitInt(N)` (D-CSUBSET-BITINT). ★ THE SPELLING IS THE HIR
+            // TIER'S, DELIBERATELY: MIR already shares that tier's `bitint`
+            // LITERAL syntax on the stated grounds that two syntaxes for one
+            // serialization is two owners, and the TYPE is the same fact one
+            // level up. Before this arm existed a `_BitInt` type fell into
+            // `default:`, where `primName(BitInt)` is empty (the table
+            // deliberately carries no row for it) and the writer emitted `?` —
+            // i.e. a MIR module holding a bit-precise type could be dumped but
+            // never read back.
+            case TypeKind::BitInt: {
+                if (!in.bitIntIsSigned(t)) out_ += "unsigned ";
+                out_ += std::format("_BitInt({})", in.bitIntWidth(t));
                 return;
             }
             default: {
                 std::string_view const p = primName(in.kind(t));
                 if (!p.empty()) out_ += p;
-                else { report("unprintable type kind"); out_ += '?'; }
+                else {
+                    // Error, not Warning: `?` is not a type this reader accepts,
+                    // so the text this produces cannot be read back.
+                    report("unprintable type kind", DiagnosticSeverity::Error);
+                    out_ += '?';
+                }
                 return;
             }
         }
@@ -519,7 +643,8 @@ private:
         report(std::format(
             "literal core TypeKind ordinal {} has no spelling in this format; "
             "rendered as '?', which the reader REFUSES — accepted: {}",
-            static_cast<std::uint32_t>(lv.core), literalCoreAccepted()));
+            static_cast<std::uint32_t>(lv.core), literalCoreAccepted()),
+            DiagnosticSeverity::Error);
         out_ += '?';
     }
 
@@ -805,6 +930,65 @@ private:
                 out_ += " <asm-descriptor-unspelled>";
                 break;
             }
+            // ★★★ THESE TWO ARMS USED TO LIVE INSIDE `default:` AS `if (op == …)`
+            // TESTS, AND THE PLACEMENT WAS THE DEFECT.
+            //
+            // The reader's `default:` is the exact inverse of the writer's
+            // `default:` — operands in parens, then an optional `payload <n>`.
+            // Two opcodes rendered a DIFFERENT tail from inside that arm, so
+            // the writer's generic case and the reader's generic case stopped
+            // being inverses of each other while still looking like a matched
+            // pair. Hoisted to real `case` arms, the invariant is visible: an
+            // opcode is handled by paired EXPLICIT arms on both sides, or by the
+            // paired GENERIC arms on both sides, and never by one of each
+            // (D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS).
+            //
+            // D-CSUBSET-COMPUTED-GOTO: the `blockaddress` payload is the target
+            // BLOCK id — rendered as `%b{}` because a raw integer reads as a
+            // meaningless value and breaks the block-relative reading.
+            case MirOpcode::BlockAddress: {
+                out_ += std::format(" %b{}", mir_.instPayload(id));
+                break;
+            }
+            // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the payload
+            // PACKS the byte size (low 30 bits) + the exhaust class (high 2) —
+            // print the unpacked fields, not the raw integer (which reads as a
+            // ~2.1e9 garbage value when an exhaust bit is set).
+            //
+            // ⚠ THE EXHAUST CLASS IS SPELLED BY NAME. It was the raw 2-bit
+            // ordinal, and the field has FOUR representable values of which only
+            // three are allocated — so `exhaust 3` was a legal-looking spelling
+            // for a class that does not exist, on both sides. The name comes off
+            // `kMirTextExhaustTable`, whose rows ARE the `mir_opcode.hpp`
+            // constants.
+            case MirOpcode::ByValueStackArg: {
+                auto operands = mir_.instOperands(id);
+                if (!operands.empty()) {
+                    out_ += " (";
+                    bool first = true;
+                    for (MirInstId const op2 : operands) {
+                        if (!first) out_ += ", ";
+                        out_ += std::format("%v{}", op2.v);
+                        first = false;
+                    }
+                    out_ += ')';
+                }
+                std::uint32_t const payload = mir_.instPayload(id);
+                auto const cls = static_cast<std::uint8_t>(
+                    (payload >> kByValueStackArgExhaustShift) & 0x3u);
+                std::string_view const clsName = kMirTextExhaustTable.nameOrEmpty(cls);
+                if (clsName.empty()) {
+                    report(std::format(
+                        "byvaluestackarg carries exhaust class {}, which is not one "
+                        "of the allocated classes — accepted: {}", cls,
+                        detail::renderAllowedList(allNames(kMirTextExhaustTable))),
+                        DiagnosticSeverity::Error);
+                }
+                out_ += std::format(" size {} exhaust {}",
+                                    payload & kByValueStackArgSizeMask,
+                                    clsName.empty() ? std::string_view{"?"} : clsName);
+                break;
+            }
             default: {
                 // Generic: render all operands.
                 auto operands = mir_.instOperands(id);
@@ -823,21 +1007,7 @@ private:
                 // the raw payload integer if non-zero and not already
                 // covered).
                 std::uint32_t const payload = mir_.instPayload(id);
-                if (op == MirOpcode::BlockAddress) {
-                    // D-CSUBSET-COMPUTED-GOTO: the payload is the target BLOCK id —
-                    // render it as `%b{}` (a raw integer would read as a meaningless
-                    // value and break the block-relative reading).
-                    out_ += std::format(" %b{}", payload);
-                } else if (op == MirOpcode::ByValueStackArg) {
-                    // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the payload
-                    // PACKS the byte size (low 30 bits) + the exhaust class (high 2) —
-                    // print the unpacked fields, not the raw integer (which reads as a
-                    // ~2.1e9 garbage value when an exhaust bit is set).
-                    out_ += std::format(
-                        " size {} exhaust {}",
-                        payload & kByValueStackArgSizeMask,
-                        (payload >> kByValueStackArgExhaustShift) & 0x3u);
-                } else if (payload != 0
+                if (payload != 0
                  && op != MirOpcode::ExtractValue
                  && op != MirOpcode::InsertValue) {
                     out_ += std::format(" payload {}", payload);
@@ -992,6 +1162,14 @@ public:
 
     [[nodiscard]] std::size_t pos() const noexcept { return pos_; }
     void setPos(std::size_t p) noexcept { pos_ = p; }
+
+    // The raw source. ⓘ ONE caller needs it, and it needs it because the
+    // question it asks is about LINES rather than about tokens: `parseInstruction`
+    // refuses an instruction whose line still holds unconsumed text, which is the
+    // class guard for a writer arm out-running its reader arm. A token stream
+    // cannot answer "is this on the same line", and reconstructing line structure
+    // by re-lexing would be a second lexer.
+    [[nodiscard]] std::string_view text() const noexcept { return text_; }
 
 private:
     void skipWhitespaceAndComments() {
@@ -1258,6 +1436,20 @@ private:
     [[nodiscard]] TypeId parseType() {
         Tok t = lex_.take();
         if (t.kind != TokKind::Ident) {
+            // ⚠ `?` IS THE WRITER'S OWN MARK AND IS REFUSED BY NAME. `appendType`
+            // emits it when no `TypeInterner` was supplied (or for a kind it has
+            // no spelling for), so a `?` here is this compiler's own output coming
+            // back, not an author's typo — and the two need different sentences,
+            // for the same reason `hir_text.cpp`'s unspelled-aggregate marker is
+            // refused by name rather than as an unknown tag.
+            if (t.kind == TokKind::Unknown && t.text == "?") {
+                emitMalformed(
+                    "'?' is the emitter's mark for a type it could not render — "
+                    "either no TypeInterner was supplied to emitMir, or the kind "
+                    "has no spelling in this format. The type was NOT serialized, "
+                    "so this text cannot be read back into the module it came from");
+                return InvalidType;
+            }
             emitMalformed(std::format("expected type, got '{}'", t.text));
             return InvalidType;
         }
@@ -1266,7 +1458,15 @@ private:
             return interner_.primitive(*k);
         }
         if (t.text == "ptr" || t.text == "ref" || t.text == "nullable"
-         || t.text == "optional" || t.text == "slice") {
+         || t.text == "optional" || t.text == "slice"
+         // C99 `_Complex` (D-CSUBSET-COMPLEX). ⚠ FOUND IN PASSING AND IT IS THE
+         // SAME DEFECT THE ROW NAMES, one tier over: `appendType` has rendered
+         // `complex<elem>` since the complex arm landed and this reader had no
+         // keyword for it, so every MIR module carrying a complex slot — which is
+         // every one that survives `_Complex` lowering, the arm's own comment says
+         // a complex slot IS a `Ptr<complex<elem>>` — emitted text that came back
+         // as `unknown type 'complex'`.
+         || t.text == "complex") {
             if (!expect(TokKind::LAngle)) return InvalidType;
             TypeId const inner = parseType();
             (void)expect(TokKind::RAngle);
@@ -1275,6 +1475,33 @@ private:
             if (t.text == "nullable") return interner_.nullable(inner);
             if (t.text == "optional") return interner_.optional(inner);
             if (t.text == "slice")    return interner_.slice(inner);
+            if (t.text == "complex")  return interner_.complex(inner);
+        }
+        // C23 `_BitInt(N)` / `unsigned _BitInt(N)` — the inverse of `appendType`'s
+        // arm, and the HIR tier's spelling (this format already shares that tier's
+        // `bitint` LITERAL syntax on the stated grounds that one serialization
+        // must not have two syntaxes).
+        if (t.text == "unsigned" || t.text == "_BitInt") {
+            bool const isSigned = (t.text != "unsigned");
+            if (!isSigned && !expectIdent("_BitInt")) return InvalidType;
+            if (!expect(TokKind::LParen)) return InvalidType;
+            Tok const w = lex_.take();
+            auto const width = parseNumber<std::int64_t>(w.text, "_BitInt width");
+            (void)expect(TokKind::RParen);
+            return interner_.bitInt(width, isSigned);
+        }
+        // `ext "Name"` is WRITE-ONLY BY CONSTRUCTION and says so. Resolving an
+        // extension kind needs a `TypeRegistry`, which `parseMir` does not take;
+        // the writer already reports the module-level defect (an Extension type
+        // reached MIR at all) at Error severity. Refusing by name here means an
+        // author reading the text is told WHY, instead of `unknown type 'ext'`.
+        if (t.text == "ext") {
+            emitMalformed(
+                "'ext' names a TypeKind::Extension type, which this reader cannot "
+                "resolve: an extension kind is identified against a TypeRegistry "
+                "and parseMir takes none. An Extension type reaching MIR is itself "
+                "a defect — the HIR→MIR boundary should have resolved it");
+            return InvalidType;
         }
         if (t.text == "arr") {
             if (!expect(TokKind::LAngle)) return InvalidType;
@@ -1388,7 +1615,9 @@ private:
             }
             return interner_.fnSig(params, ret, cc);
         }
-        emitMalformed(std::format("unknown type '{}'", t.text));
+        // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: this named nothing at all.
+        emitMalformed(std::format("unknown type '{}' — accepted: {}", t.text,
+                                  typeKeywordsAccepted()));
         return InvalidType;
     }
 
@@ -1493,6 +1722,23 @@ private:
         if (!expect(TokKind::Colon)) return;
         TypeId const ty = parseType();
         if (!expect(TokKind::Eq)) return;
+        // ★★★ A REFUSAL THAT CRASHES IS NOT A REFUSAL — the rule this file states
+        // three times already, at the arm it had not reached.
+        //
+        // ✔MEASURED 2026-08-23 on `global %2 : bogus = zero`:
+        //   `dss::MirBuilder fatal: addGlobal: type TypeId must be valid`
+        // and exit 0xC0000409. `parseType` had ALREADY refused `bogus` by name and
+        // set `errors_`, so `finalize()` would have discarded the module — but
+        // `finalize()` never runs, because every arm below hands the invalid
+        // `TypeId` straight to a builder that aborts on it. The guard protected
+        // the last step of a walk that dies several steps earlier, which is
+        // exactly what `resolveBlockRef`'s note above says about its own
+        // predecessor (D-MIR-TEXT-INVALID-TYPE-REACHES-A-BUILDER-THAT-ABORTS).
+        //
+        // ⓘ No second diagnostic: `parseType` named the offending spelling and
+        // this adds nothing an author does not already have. Returning here skips
+        // the initializer, which is what a global with no type has anyway.
+        if (!ty.valid()) return;
         Tok pk = lex_.peek();
         if (pk.kind == TokKind::Ident && pk.text == "zero") {
             lex_.take();
@@ -1593,6 +1839,18 @@ private:
                 break;
             }
         }
+        // ★★★ THE SAME ABORT-INSTEAD-OF-REFUSAL AS `parseGlobal`, one construct
+        // over. ✔MEASURED 2026-08-23 on `function %1 : bogus { … }`:
+        //   `dss::MirBuilder fatal: addFunction: signature TypeId must be valid (FnSig)`
+        // and exit 0xC0000409, from nothing more exotic than an unknown type name
+        // (D-MIR-TEXT-INVALID-TYPE-REACHES-A-BUILDER-THAT-ABORTS).
+        //
+        // ★ RECOVERY IS A BALANCED-BRACE SKIP, not a bare `return`. The body is
+        // still in the token stream, and leaving it there would feed `block %bN {`
+        // lines to the MODULE loop, which would refuse each of them in turn —
+        // burying the one diagnostic that matters under a cascade about a
+        // construct that is perfectly well formed.
+        if (!sig.valid()) { skipBracedBody(); return; }
         MirFuncId const f =
             builder_.addFunction(sig, SymbolId{sym}, binding, visibility, noInline,
                                  alwaysInline,    // TF-C81
@@ -1626,6 +1884,21 @@ private:
             parseBlock();
         }
         (void)expect(TokKind::RBrace);
+    }
+
+    // Consume a `{ … }` body without interpreting it, brace-balanced. The
+    // recovery step for a construct whose HEADER was refused: the body is
+    // well-formed text about a construct that no longer exists, and every token
+    // of it would otherwise be re-offered to an outer loop that has no arm for it.
+    void skipBracedBody() {
+        if (lex_.peek().kind != TokKind::LBrace) return;
+        int depth = 0;
+        while (true) {
+            Tok const t = lex_.take();
+            if (t.kind == TokKind::End) return;
+            if (t.kind == TokKind::LBrace) ++depth;
+            else if (t.kind == TokKind::RBrace) { if (--depth == 0) return; }
+        }
     }
 
     // First-pass scan: walk the function body tokens and CREATE every
@@ -1798,6 +2071,7 @@ private:
         //   `%vN = opcode : type (operands)`
         //   `terminator [operands]` (br/condbr/switch/return/unreachable)
         Tok first = lex_.peek();
+        std::size_t const lineStart = first.off;
         std::uint32_t resultSlot = 0;
         if (first.kind == TokKind::Percent) {
             resultSlot = parsePercentValue();
@@ -1817,7 +2091,12 @@ private:
         }
         auto opOpt = opcodeFromMnemonic(mnemonic);
         if (!opOpt.has_value()) {
-            emitMalformed(std::format("unknown opcode '{}'", mnemonic));
+            // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: the `.dssir` twin of
+            // `hir_text.cpp`'s `parseOp` arm — the accepted set comes off the same
+            // `opcodeInfo` walk the lookup just failed, so it cannot be narrower,
+            // wider or staler than the check above it.
+            emitMalformed(std::format("unknown opcode '{}' — accepted: {}",
+                                      mnemonic, opcodeMnemonicsAccepted()));
             return;
         }
         MirOpcode const op = *opOpt;
@@ -2002,6 +2281,105 @@ private:
                 builder_.addUnreachable();
                 break;
             }
+            // ★★★ D-CSUBSET-COMPUTED-GOTO: `indirectbr %v<addr> { %b…, %b… }`.
+            //
+            // ✔MEASURED 2026-08-23: with no arm here this fell into `default:`,
+            // which read ZERO operands and called `MirBuilder::addInst` — whose
+            // FIRST guard refuses a TERMINATOR through the non-terminator entry
+            // point. The process ABORTED with
+            //   `dss::MirBuilder fatal: addInst: opcode 'indirectbr' is a
+            //    terminator; use the terminator API (addBr/addCondBr/addSwitch/
+            //    addReturn/addUnreachable)`
+            // and exit 0xC0000409.
+            //
+            // ⚠ AND THE ORDER OF THE FIXES MATTERED, which is the part no arity
+            // table could have told anyone. In text the WRITER produces, a
+            // `blockaddress` always precedes the `indirectbr` that consumes it, so
+            // the reader desynced on THAT instruction's unconsumed ` %bN` tail and
+            // the recovery re-tokenized the `indirectbr` line into `%`, `v1`, `{`…
+            // — the mnemonic was never looked up and the abort was unreachable
+            // from writer output. Fixing `blockaddress` alone would have PROMOTED a
+            // recoverable refusal into a process abort.
+            case MirOpcode::IndirectBr: {
+                std::uint32_t const addrSlot = parsePercentValue();
+                MirInstId const addr = resolveValue(addrSlot);
+                if (!expect(TokKind::LBrace)) return;
+                std::vector<MirBlockId> targets;
+                while (true) {
+                    Tok pk = lex_.peek();
+                    if (pk.kind == TokKind::RBrace || pk.kind == TokKind::End) break;
+                    if (!targets.empty()) (void)expect(TokKind::Comma);
+                    targets.push_back(resolveBlockRef(parsePercentValue()));
+                }
+                (void)expect(TokKind::RBrace);
+                // `opcodeInfo(IndirectBr)` requires at least one successor, and
+                // `addIndirectBr` is where that would be discovered — by an abort.
+                // Refuse here instead: the same discipline the switch-default arm
+                // above states, for the same reason.
+                if (targets.empty()) {
+                    emitMalformed(std::format(
+                        "indirectbr on %v{} lists no target blocks; a computed goto "
+                        "carries the full address-taken successor set, which is "
+                        "never empty", addrSlot));
+                    break;
+                }
+                if (errors_) break;
+                builder_.addIndirectBr(addr, targets);
+                break;
+            }
+            // D-CSUBSET-COMPUTED-GOTO: `%vN = blockaddress : <ptr> %b<target>`.
+            // The payload IS the target block, so it goes through
+            // `addBlockAddress` (and `resolveBlockRef`, which handles the forward
+            // reference every computed goto has). The generic arm read no payload
+            // at all and built a `blockaddress` naming block 0 — a DIFFERENT
+            // block, silently — before choking on the leftover `%bN`.
+            case MirOpcode::BlockAddress: {
+                std::uint32_t const slot = parsePercentValue();
+                MirBlockId const target = resolveBlockRef(slot);
+                MirInstId const id = builder_.addBlockAddress(target, resultType);
+                if (resultSlot != 0) valueMap_[resultSlot] = id;
+                break;
+            }
+            // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS:
+            // `%vN = byvaluestackarg : <ptr> (%vK) size <bytes> exhaust <class>`.
+            // Both payload fields were dropped by the generic arm (it looks only
+            // for the literal keyword `payload`), and the words `size 24 exhaust
+            // gpr` were then re-tokenized as the next instruction.
+            case MirOpcode::ByValueStackArg: {
+                std::vector<MirInstId> operands;
+                if (lex_.peek().kind == TokKind::LParen) {
+                    lex_.take();
+                    while (true) {
+                        Tok pk = lex_.peek();
+                        if (pk.kind == TokKind::RParen || pk.kind == TokKind::End) break;
+                        if (!operands.empty()) (void)expect(TokKind::Comma);
+                        operands.push_back(resolveValue(parsePercentValue()));
+                    }
+                    (void)expect(TokKind::RParen);
+                }
+                if (!expectIdent("size")) return;
+                Tok const szTok = lex_.take();
+                std::uint32_t const bytes = parseNumber<std::uint32_t>(
+                    szTok.text, "byvaluestackarg byte size");
+                if (bytes > kByValueStackArgSizeMask) {
+                    emitMalformed(std::format(
+                        "byvaluestackarg size {} does not fit the {}-bit size field",
+                        bytes, 32 - kByValueStackArgExhaustShift));
+                }
+                if (!expectIdent("exhaust")) return;
+                Tok const clsTok = lex_.take();
+                std::uint8_t const cls = orUnknownName(
+                    kMirTextExhaustTable, clsTok.text, "byvaluestackarg exhaust class",
+                    kByValueStackArgExhaustNone);
+                if (errors_) break;
+                MirInstId const id = builder_.addInst(
+                    op, operands, resultType,
+                    (bytes & kByValueStackArgSizeMask)
+                        | (static_cast<std::uint32_t>(cls)
+                           << kByValueStackArgExhaustShift));
+                if (resultSlot != 0) valueMap_[resultSlot] = id;
+                break;
+            }
             case MirOpcode::SehTryBegin: {
                 // c115 SEH: `seh_try_begin <region> %b<try> %b<filter>`.
                 Tok rTok = lex_.take();
@@ -2057,6 +2435,46 @@ private:
                 break;
             }
         }
+        refuseUnconsumedOperandTail(mnemonic, lineStart);
+    }
+
+    // ★★★ THE CLASS GUARD FOR
+    // D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS.
+    //
+    // Three opcodes were fixed by giving each a reader arm, and three fixes leave
+    // the CLASS open: the next opcode whose writer arm renders an operand or
+    // payload tail its reader arm does not consume reopens it, with the same
+    // signature — a SUCCESSFUL parse of a WRONG instruction, followed some tokens
+    // later by a diagnostic about a line that was never the problem.
+    //
+    // This asks the one question that separates the two: after an instruction's
+    // arm has run, is there anything left on its line? The emitter writes exactly
+    // one instruction per line, so anything still there was rendered by a writer
+    // arm and dropped by a reader arm. The refusal QUOTES the leftover, because
+    // the diagnostic an author actually got before this existed named the NEXT
+    // construct.
+    //
+    // ⓘ A closing `}` is excluded: it ends the block, the function or the module,
+    // and hand-written text is allowed to put it on the instruction's line. Any
+    // other same-line token is refused — which makes "one instruction per line"
+    // a stated rule of the grammar rather than an accident of the emitter.
+    void refuseUnconsumedOperandTail(std::string_view mnemonic, std::size_t lineStart) {
+        Tok const nx = lex_.peek();
+        if (nx.kind == TokKind::End || nx.kind == TokKind::RBrace) return;
+        std::string_view const src = lex_.text();
+        if (nx.off > src.size() || lineStart > nx.off) return;
+        std::string_view const between = src.substr(lineStart, nx.off - lineStart);
+        if (between.find('\n') != std::string_view::npos) return;
+        // The leftover is whatever remains of the line from the next token on.
+        std::string_view rest = src.substr(nx.off);
+        if (auto const nl = rest.find('\n'); nl != std::string_view::npos) {
+            rest = rest.substr(0, nl);
+        }
+        emitMalformed(std::format(
+            "instruction '{}' left unparsed text on its line: '{}' — this reader "
+            "consumed every operand and payload field it knows about and the "
+            "writer rendered more, so the two directions of this format disagree "
+            "about this opcode", mnemonic, rest));
     }
 
     [[nodiscard]] std::unique_ptr<MirParseResult> finalize() {

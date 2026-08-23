@@ -139,11 +139,52 @@ resolveInDir(std::filesystem::path const& dir, std::string_view relName,
 findInDirs(std::string_view filename, std::span<std::filesystem::path const> dirs,
            HeaderNameMatching matching);
 
+// The DIRECTORY a quote-include resolves against, derived from the NAME of the
+// source buffer that CONTAINS the directive. THE ONE derivation: every tier
+// that needs an includer directory calls this, so none of them can re-derive it
+// differently (the import resolver's directive walk, the preprocessor's
+// SynthBuilder scan, its `MacroExpander` includer dir, and its `#embed` origin
+// lookup all did, identically and identically wrongly).
+//
+// ── AN EMPTY PARENT IS THE PROCESS WORKING DIRECTORY, NOT "NO DIRECTORY" ────
+//
+// D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH
+//
+// `fs::path{"main.c"}.parent_path()` is the EMPTY path, and every one of those
+// four sites handed that empty path straight to a resolver whose self-dir arm
+// is guarded by `if (!includingDir.empty())`. So `dss --compile main.c` -- the
+// form a user types most -- SKIPPED the includer-directory arm entirely and
+// reported `quote include not found` for a header sitting right beside the
+// source, while `./main.c`, `sub/main.c` and an absolute path all resolved it.
+// ✔MEASURED through the CLI, one variable changed per arm; gcc resolves the
+// bare form, so by the reference-compilers rule the behaviour is REQUIRED.
+//
+// A name with no directory component names a file in the process working
+// directory, so that is what this returns: `.`, spelled relatively on purpose.
+// `fs::current_path()` would be equally "correct" and is the wrong answer --
+// it would make every header resolved through the self-dir arm carry an
+// ABSOLUTE path into `__FILE__`, into diagnostics and into the line-map, so the
+// bare form would stop agreeing with the `./main.c` form it is supposed to be
+// identical to. `.` makes them byte-identical (`.\h28.h` either way).
+//
+// An EMPTY `sourceName` is the one input that still yields an empty path, and
+// that arm is the reason this is a derivation rather than a `.` substitution
+// inside the resolvers: a buffer with no name at all has no including FILE, and
+// "there is no including file" must stay distinguishable from "the including
+// file lives in the working directory". Pushing the substitution down into
+// `resolveIncludePath`/`resolveQuote` would collapse the two, and would need
+// the same edit in both -- two copies of one rule, free to drift.
+[[nodiscard]] DSS_EXPORT std::filesystem::path
+includingDirectoryOf(std::string_view sourceName);
+
 // QUOTE-form (`#include "h"` / `__has_include("h")`) resolution: try the
 // including file's own directory FIRST, then each of `includeDirs`. Mirrors C's
 // quote-include search order (C 6.10.2p3). An absolute name resolves directly.
-// `includingDir` may be empty (no self-dir prepend then). This is the SHARED
-// quote search used by both the import resolver and `__has_include`.
+// `includingDir` may be empty (no self-dir prepend then) -- that is the "no
+// including FILE" case and NOT "the includer has no directory component", which
+// `includingDirectoryOf` above resolves to `.` before it ever reaches here.
+// This is the SHARED quote search used by both the import resolver and
+// `__has_include`.
 [[nodiscard]] DSS_EXPORT HeaderSearchResult
 resolveIncludePath(std::string_view filename,
                    std::filesystem::path const&                includingDir,

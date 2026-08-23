@@ -72,15 +72,15 @@ collectAllocatable(TargetSchema const& schema, std::uint16_t ccIndex,
                            static_cast<unsigned>(ccIndex)));
         return false;
     }
-    auto absorb = [&](std::vector<std::string> const& names) {
-        for (auto const& n : names) outAllocatable.insert(n);
-    };
-    absorb(cc->callerSaved);
-    absorb(cc->calleeSaved);
-    absorb(cc->argGprs);
-    absorb(cc->argFprs);
-    absorb(cc->returnGprs);
-    absorb(cc->returnFprs);
+    // D-TARGET-ALLOCATABLE-POOL-LIST-SET-HAS-NO-OWNER: the SAME published
+    // table `lir_regalloc::buildFreeLists` reads. This function and that one
+    // must agree on which registers exist for allocation — a register one
+    // treats as reserved while the other harvests it as spill scratch is a
+    // silent wrong-register answer that nothing compares. They no longer
+    // "agree"; they read one object (target_schema.hpp).
+    for (auto const list : kAllocatablePoolLists) {
+        for (auto const& n : cc->*list) outAllocatable.insert(n);
+    }
     outCallerSet.reserve(cc->callerSaved.size());
     for (auto const& n : cc->callerSaved) outCallerSet.insert(n);
     return true;

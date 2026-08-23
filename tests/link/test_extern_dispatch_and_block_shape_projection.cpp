@@ -60,6 +60,7 @@
 #include "mir/mir_opcode.hpp"
 
 #include "repo_root.hpp"
+#include "vocabulary_message_probe.hpp"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -123,28 +124,16 @@ constexpr char const* kPeExecFormat  = "pe64-x86_64-windows-exec";
     return s.empty() ? std::string{"<no diagnostics>"} : s;
 }
 
-// Every `'…'`-quoted token in a message. The shared renderer quotes each
-// spelling, so this is how a test reads back WHAT THE MESSAGE CLAIMS — as
-// opposed to re-deriving it from the table, which would make the comparison
-// circular and green by construction.
-//
-// ⚠ IT PAIRS APOSTROPHES, so a possessive `'` in the prose would scramble every
-// token after it. That is a constraint on the MESSAGES, not a weakness here:
-// a sentence advertising a quoted set is written without a possessive, and the
-// two sites that had one were reworded when these pins landed.
-[[nodiscard]] std::vector<std::string> quotedTokens(std::string const& msg) {
-    std::vector<std::string> out;
-    std::size_t              i = 0;
-    while (true) {
-        auto const open = msg.find('\'', i);
-        if (open == std::string::npos) break;
-        auto const close = msg.find('\'', open + 1);
-        if (close == std::string::npos) break;
-        out.push_back(msg.substr(open + 1, close - open - 1));
-        i = close + 1;
-    }
-    return out;
-}
+// ★ `quotedTokens` used to be a file-local copy here. Its BODY was
+// byte-identical to the one three `tests/core` files had already merged, but its
+// comment carried the apostrophe-pairing constraint that none of the others
+// recorded — so the merge moved that paragraph INTO the shared owner rather than
+// losing it, exactly as every earlier merge in this class kept the more
+// informative form. One owner now:
+// `tests/test_support/vocabulary_message_probe.hpp`, json-free and reachable
+// from every suite; see
+// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED.
+using ::dss::test_support::quotedTokens;
 
 [[nodiscard]] bool contains(std::span<std::string_view const> names,
                             std::string_view                  needle) {
@@ -523,7 +512,7 @@ void runExternGateProbe(ExternGateProbe&                       probe,
     constexpr std::uint32_t kCallerSym = 101u;
 
     auto const i32  = probe.interner.primitive(dss::TypeKind::I32);
-    auto const ptrT = probe.interner.primitive(dss::TypeKind::Ptr);
+    auto const ptrT = probe.interner.pointer(probe.interner.primitive(dss::TypeKind::Void));
     auto const sig  = probe.interner.fnSig(std::span<dss::TypeId const>{}, i32,
                                            dss::CallConv::CcMS64);
 

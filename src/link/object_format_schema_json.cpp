@@ -90,6 +90,40 @@ template <typename Names>
     return detail::renderAllowedList(names, sep);
 }
 
+// ── D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS ─────
+//
+// "Does THIS backend's walker spell THIS dialect?" — the `weakDefinition`
+// analog of the `stackReserveVehicles()` membership test further down, and a
+// named function rather than an inline loop because THREE call sites ask it:
+// the check itself, the diagnostic's search for whichever backend DOES spell
+// the declared dialect, and the diagnostic's rendering of what this one writes.
+[[nodiscard]] bool
+backendSpellsWeakDialect(link::ObjectFormatBackend const* backend,
+                         WeakDefinitionDialect            dialect) noexcept {
+    if (backend == nullptr) return false;
+    for (WeakDefinitionDialect d : backend->weakDefinitionDialects()) {
+        if (d == dialect) return true;
+    }
+    return false;
+}
+
+// The dialects a backend's walker writes, rendered for a diagnostic. A backend
+// that writes NONE renders a sentence, not an empty list: "…writes: ." reads as
+// a truncated message and tells the config author nothing.
+[[nodiscard]] std::string
+backendWeakDialectList(link::ObjectFormatBackend const* backend) {
+    std::vector<std::string_view> names;
+    if (backend != nullptr) {
+        for (WeakDefinitionDialect d : backend->weakDefinitionDialects()) {
+            names.push_back(weakDefinitionDialectName(d));
+        }
+    }
+    if (names.empty()) {
+        return "none - that walker writes no weak definition in any spelling";
+    }
+    return allowedList(names, ", ");
+}
+
 // ── the vocabularies whose accepted set is "the table MINUS its sentinel" ──
 //
 // Three verbs in this loader carry a `none` row that a `.format.json` may not
@@ -97,36 +131,21 @@ template <typename Names>
 // explicitly. Their messages must therefore render a FILTERED projection, the
 // same shape `kSelectableObjectFormatKindNames` uses for the format kind.
 //
-// ⚠ `namesWhere<M>` CHECKS `M` at compile time, so a new enumerator (or a
-// second unselectable one) breaks the BUILD here rather than leaving a sentence
-// that quietly stops matching what the check accepts.
+// ★★ THEY ARE NOT DECLARED HERE ANY MORE — THEY LIVE BESIDE THEIR ENUMS.
+// `kSelectableRuntimeLibraryRoleNames` is in `core/types/object_format_kind.hpp`
+// beside `kRuntimeLibraryRoleTable`; `kSelectableExitMechanismNames` and
+// `kSelectableArgsMechanismNames` are in `core/types/target_schema.hpp` beside
+// theirs. This TU had its own copy of each, and the copies were the defect:
+// `namesWhere<M>` only checks a count the CALL SITE writes, so a per-reader
+// copy makes the strength of the check a per-reader decision — and all three
+// local copies had spelled `M` as `rows.size() - 1`, which is `x == x` and
+// could never fail (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
+// The `ExitMechanism` projection alone had FOUR owners across the tree.
 //
-// ⓘ These belong beside their enums, next to `kSelectableObjectFormatKindNames`
-// in `core/types/object_format_kind.hpp` / `core/types/target_schema.hpp`. They
-// are local to this TU only because that file set was owned by another lane
-// this cycle; the projection is computed either way, so no second owner of the
-// SPELLINGS exists in the meantime.
-[[nodiscard]] constexpr bool
-isSelectableRuntimeLibraryRole(RuntimeLibraryRole r) noexcept {
-    return r != RuntimeLibraryRole::None;
-}
-inline constexpr auto kSelectableRuntimeLibraryRoleNames =
-    namesWhere<kRuntimeLibraryRoleTable.rows.size() - 1>(
-        kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
-
-[[nodiscard]] constexpr bool isSelectableExitMechanism(ExitMechanism m) noexcept {
-    return m != ExitMechanism::None;
-}
-inline constexpr auto kSelectableExitMechanismNames =
-    namesWhere<kExitMechanismTable.rows.size() - 1>(kExitMechanismTable,
-                                                    isSelectableExitMechanism);
-
-[[nodiscard]] constexpr bool isSelectableArgsMechanism(ArgsMechanism m) noexcept {
-    return m != ArgsMechanism::None;
-}
-inline constexpr auto kSelectableArgsMechanismNames =
-    namesWhere<kArgsMechanismTable.rows.size() - 1>(kArgsMechanismTable,
-                                                    isSelectableArgsMechanism);
+// ⚠ Consuming the shared definition is NOT the same as retyping the set: these
+// are the one array each vocabulary owns, and a refusal below renders it. What
+// this TU must never do is hand-list the spellings
+// (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
 
 // ── The typo-discriminator adapter for THIS loader ────────────────────────
 //
@@ -1827,16 +1846,22 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // implementation gap got written down as a property of the format and did
     // not reverse cleanly.
     //
-    // ★ NO CROSS-CHECK AGAINST THE RESOLVED BACKEND HERE, and the omission is
-    // deliberate rather than forgotten. The `stackReserveControl.vehicle` rule
-    // a few blocks up CAN ask "does anyone implement this, and is it you?"
-    // because `ObjectFormatBackend` exposes `stackReserveVehicles()`. There is
-    // no `weakDefinitionDialects()` to ask, so the consultation lives where the
-    // encoder does — the walker refuses a dialect it cannot spell at the moment
-    // it must spell one. Lifting it to load time is
-    // [[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]];
-    // inventing a second, hand-maintained table of (dialect → owning format)
-    // here would be exactly the `kVehicleKinds` pattern TF-C125 deleted.
+    // ★★ THE CROSS-CHECK AGAINST THE RESOLVED BACKEND, ADDED BY
+    // [[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]].
+    // This block used to carry a comment explaining why there was NO such
+    // check: `ObjectFormatBackend` exposed `stackReserveVehicles()` but no
+    // `weakDefinitionDialects()`, so the only consultation possible was the
+    // walker's own, at the moment it must spell one. It has one now, and the
+    // asymmetry is gone — the two config vocabularies whose rows NAME AN
+    // ENCODER are now checked the same way, by asking the backend that
+    // implements it rather than by a table that names an owner (the
+    // `kVehicleKinds` pattern TF-C125 deleted).
+    //
+    // The walker-side refusal is NOT replaced by this. They catch different
+    // things: this one catches a MIS-DECLARED document at load, months before
+    // any module carries a weak symbol; the walker's catches a schema built
+    // in memory through the validation-free `ObjectFormatSchema{
+    // ObjectFormatData}` constructor, which never passes this tier at all.
     if (doc.contains("weakDefinition")) {
         auto const& wd = doc.at("weakDefinition");
         if (!wd.is_object()) {
@@ -1883,6 +1908,50 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                               allNames(
                                                   kWeakDefinitionDialectTable),
                                               ", ")));
+                } else if (!backendSpellsWeakDialect(backend, *dv)) {
+                    // "Does anyone implement this dialect, and is it you?" —
+                    // membership, never first-implementer-wins, so two backends
+                    // could legitimately share a dialect without this rule
+                    // silently picking one of them. (Today each of the three is
+                    // written by exactly one walker; the rule does not depend
+                    // on that staying true.)
+                    link::ObjectFormatBackend const* implementer = nullptr;
+                    for (auto const* candidate :
+                             link::objectFormatBackendTable()) {
+                        if (backendSpellsWeakDialect(candidate, *dv)) {
+                            implementer = candidate;
+                            break;
+                        }
+                    }
+                    // The null arm is a SENTENCE, not a placeholder name — an
+                    // earlier draft rendered it as "the '<no walker spells it>'
+                    // walker", which a config author reads as a walker actually
+                    // called that. ✔It was caught by looking at the real output
+                    // (mutant M2 makes every backend answer "none", so both
+                    // otherwise-unreachable renderings show up at once).
+                    std::string const spelledBy =
+                        implementer != nullptr
+                            ? std::format("is spelled by the '{}' walker",
+                                          implementer->configName())
+                            : std::string{"is spelled by NO walker in this "
+                                          "build"};
+                    coll.emit(
+                        DiagnosticCode::C_MalformedJson,
+                        "/weakDefinition/dialect",
+                        std::format(
+                            "weakDefinition dialect '{}' {}, but this schema "
+                            "declares kind '{}'. The '{}' walker would REFUSE "
+                            "the first weak definition it met under this "
+                            "declaration, which is a link that fails long "
+                            "after the config that broke it was written. Fix "
+                            "the dialect or the format.kind. Dialects '{}' "
+                            "writes: {}. "
+                            "D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-"
+                            "AND-MACHO-WRITERS.",
+                            weakDefinitionDialectName(*dv), spelledBy,
+                            backend->configName(), backend->configName(),
+                            backend->configName(),
+                            backendWeakDialectList(backend)));
                 } else {
                     data.weakDefinition = WeakDefinition{*dv};
                 }

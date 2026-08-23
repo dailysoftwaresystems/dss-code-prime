@@ -33,7 +33,7 @@ __attribute__((__no_sanitize_thread__)) int a_dunder = 5;
 __attribute__((noinline)) int m1, m2, m3;
 
 /* ── NEGATIVE CONTROL 1: the FUNCTION position, where these attributes BELONG.
- * Silent — and this is the shape sqlite actually writes (wal.c:942, :2590). ── */
+ * Silent — and this is the shape sqlite actually writes (wal.c). ── */
 __attribute__((noinline))           static int f_noinline(int k) { return k + 1; }
 __attribute__((no_sanitize_thread)) static int f_nosan(int k)    { return k + 2; }
 

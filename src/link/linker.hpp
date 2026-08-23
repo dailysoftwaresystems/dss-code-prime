@@ -102,7 +102,7 @@ struct DSS_EXPORT LinkedImage {
     // and leaves it false. Load-bearing: a FAILED link can reach the same
     // `resolvedFuncCount == expectedFuncCount == 0` count state as a genuinely
     // EMPTY module (an undefined-extern reject early-returns with BOTH counts 0
-    // — linker.cpp:610-611, before `expectedFuncCount` is even set), so the
+    // — `linker::link` returns before `expectedFuncCount` is even set), so the
     // count check alone cannot tell success from failure.
     bool                      linkedCleanly = false;
 

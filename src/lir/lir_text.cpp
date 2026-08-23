@@ -1,6 +1,8 @@
 #include "lir/lir_text.hpp"
 
+#include "core/types/config_key_vocabulary.hpp"  // renderAllowedList (the `core` refusal projects its table)
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/enum_name_table.hpp"  // allNames — the `core` tag's ONE owner is kTypeKindNameTable
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "lir/lir_literal_pool.hpp"
@@ -28,92 +30,39 @@ namespace dss {
 
 namespace {
 
-[[nodiscard]] std::optional<TypeKind>
-typeKindFromName(std::string_view s) noexcept;
-
-// TypeKind round-trip tag emitted on every literal-pool entry. The
-// pool can't infer the tag from the variant arm alone (e.g. `Char` vs
-// `U32` both live in `uint64_t`), so the tag is the disambiguator.
-[[nodiscard]] std::string_view typeKindName(TypeKind k) noexcept {
-    switch (k) {
-        case TypeKind::Bool:      return "Bool";
-        case TypeKind::I8:        return "I8";
-        case TypeKind::I16:       return "I16";
-        case TypeKind::I32:       return "I32";
-        case TypeKind::I64:       return "I64";
-        case TypeKind::I128:      return "I128";
-        case TypeKind::U8:        return "U8";
-        case TypeKind::U16:       return "U16";
-        case TypeKind::U32:       return "U32";
-        case TypeKind::U64:       return "U64";
-        case TypeKind::U128:      return "U128";
-        case TypeKind::F16:       return "F16";
-        case TypeKind::F32:       return "F32";
-        case TypeKind::F64:       return "F64";
-        case TypeKind::F80:       return "F80";
-        case TypeKind::F128:      return "F128";
-        case TypeKind::Char:      return "Char";
-        case TypeKind::Byte:      return "Byte";
-        case TypeKind::Void:      return "Void";
-        case TypeKind::Struct:    return "Struct";
-        case TypeKind::Union:     return "Union";
-        case TypeKind::Tuple:     return "Tuple";
-        case TypeKind::Array:     return "Array";
-        case TypeKind::Slice:     return "Slice";
-        case TypeKind::Enum:      return "Enum";
-        case TypeKind::Vector:    return "Vector";
-        case TypeKind::Matrix:    return "Matrix";
-        case TypeKind::Ptr:       return "Ptr";
-        case TypeKind::Ref:       return "Ref";
-        case TypeKind::FnPtr:     return "FnPtr";
-        case TypeKind::Nullable:  return "Nullable";
-        case TypeKind::Optional:  return "Optional";
-        case TypeKind::FnSig:     return "FnSig";
-        case TypeKind::Param:     return "Param";
-        case TypeKind::Bind:      return "Bind";
-        case TypeKind::Extension: return "Extension";
-        // FC17.9(d) qualifier skin + C23 nullptr_t (D-CSUBSET-QUAL-BITSET /
-        // D-CSUBSET-NULLPTR). Both enumerators were appended to `TypeKind`
-        // WITHOUT an arm here, so both fell to the trailing `"?"` sentinel.
-        // MEASURED consequence before this fix: the emitter wrote `core ?`,
-        // `?` lexes as an `Unknown` token (not an `Ident`), and the pool
-        // parser's token-kind guard rejected it — "expected TypeKind name
-        // after 'core', got '?'". So the `.dsslir` text of ANY module holding
-        // a VolatileQual- or NullptrT-tagged pool entry was simply
-        // UNPARSEABLE: loud, but a hole in a format whose whole contract is
-        // lossless round-trip.
-        // ⚠ That token-kind guard is the ONLY thing that kept it loud. `"?"`
-        // is un-injective by construction — `typeKindFromName` walks THIS
-        // function, so it maps `"?"` back to whichever kind renders it FIRST
-        // (VolatileQual), and a NullptrT entry would have silently become a
-        // VolatileQual one had `?` ever lexed as an identifier. Naming every
-        // kind removes the sentinel from the valid-kind image entirely rather
-        // than relying on that. Names match the sibling table in
-        // `type_lattice/type_reintern.cpp`, which never drifted.
-        case TypeKind::VolatileQual: return "VolatileQual";
-        case TypeKind::NullptrT:     return "NullptrT";
-        case TypeKind::BitInt:    return "BitInt";
-        case TypeKind::Complex:   return "Complex";   // D-CSUBSET-COMPLEX (round-trip tag)
-        case TypeKind::Count_:    break;
-    }
-    // Out-of-range-ordinal backstop ONLY (and the `-Wreturn-type` / MSVC C4715
-    // satisfier — an enum switch is not exhaustive for control-flow purposes).
-    // Every real enumerator returns its own name above, so `"?"` is no longer
-    // mintable from a valid kind and `typeKindFromName("?")` now correctly
-    // yields nullopt → the parser's loud `I_TextUnknownName`.
-    return "?";
-}
-
-// Inverse of `typeKindName` — reads the `core <Kind>` suffix tag from
-// `.dsslir` text. Walks the enum once; the linear scan is fine for the
-// modest core-kind count and avoids maintaining a parallel string map.
-[[nodiscard]] std::optional<TypeKind>
-typeKindFromName(std::string_view s) noexcept {
-    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(TypeKind::Count_); ++i) {
-        auto const k = static_cast<TypeKind>(i);
-        if (typeKindName(k) == s) return k;
-    }
-    return std::nullopt;
+// ── The `.dsslir` literal-pool TypeKind tag — ONE OWNER, in the header ──────
+//
+// D-TYPEKIND-PASCALCASE-SPELLINGS-HAVE-TWO-OWNERS. This was a forty-arm
+// exhaustive switch retyping the PascalCase `TypeKind` spellings, and
+// `type_lattice/type_reintern.cpp` held a second one. The spellings now live in
+// `kTypeKindNameTable` beside the enum (`type_lattice/core_type.hpp`); this file
+// projects through it and owns no spelling at all.
+//
+// ⚠ THE COMMENT THAT USED TO SIT HERE CERTIFIED THE DRIFT AWAY. It read *"Names
+// match the sibling table in `type_lattice/type_reintern.cpp`, which never
+// drifted"* — a claim about another file, placed exactly where it would stop the
+// next reader from checking, and ✔MEASURED FALSE on the day the row was written:
+// the two disagreed on `Count_` (`"?"` here, `"Count_"` there). It is deleted
+// rather than corrected, because the property it asserted is now structural.
+//
+// The tag exists because the pool cannot infer it from the variant arm alone
+// (`Char` and `U32` both live in `uint64_t`), so the tag is the disambiguator.
+//
+// ★ `"?"` IS THIS MEDIUM'S "NO SPELLING", NOT A NAME. `Count_` is unlisted in
+// the table by construction (it is the cardinality sentinel, not a type), so
+// `nameOrEmpty` answers EMPTY for it and for any out-of-range ordinal — and
+// emitting nothing would silently shift the next token into the tag's place.
+// `?` does not lex as an `Ident`, so the pool parser's token-kind guard refuses
+// it loudly ("expected TypeKind name after 'core'"), and it resolves through no
+// row, so `typeKindFromName("?")` is nullopt rather than aliasing onto whichever
+// kind rendered it first. That aliasing is not hypothetical: `VolatileQual` and
+// `NullptrT` were both appended to `TypeKind` with no arm in the old switch and
+// shared this sentinel for their whole lifetime — only the token-kind guard kept
+// it loud. The table's totality static_assert now makes that state a COMPILE
+// ERROR instead of relying on the guard.
+[[nodiscard]] std::string_view typeKindTag(TypeKind k) noexcept {
+    auto const name = typeKindNameOrEmpty(k);
+    return name.empty() ? std::string_view{"?"} : name;
 }
 
 // Render a symbol id as `%<v>` always, optionally followed by ` "name"`
@@ -216,7 +165,7 @@ renderLiteralValue(LirLiteralValue const& v) {
             }
         },
         v.value);
-    body.append(std::format(" core {}", typeKindName(v.core)));
+    body.append(std::format(" core {}", typeKindTag(v.core)));
     return body;
 }
 
@@ -1356,8 +1305,18 @@ private:
         if (auto k = typeKindFromName(coreT.text); k.has_value()) {
             lv.core = *k;
         } else {
+            // The refusal STATES its accepted set, projected off the one table
+            // the reader above resolves through, so the sentence cannot be
+            // narrower, wider or staler than the lookup
+            // (D-TYPEKIND-PASCALCASE-SPELLINGS-HAVE-TWO-OWNERS). It named none
+            // before, which is the state that let two kinds share the `?` tag
+            // unnoticed: an author who wrote a misspelled kind learned only
+            // that it was wrong, never what was available.
             emit(DiagnosticCode::I_TextUnknownName,
-                 std::format("unknown TypeKind '{}'", coreT.text));
+                 std::format("unknown TypeKind '{}' (expected one of {})",
+                             coreT.text,
+                             detail::renderAllowedList(
+                                 allNames(kTypeKindNameTable))));
         }
         return lv;
     }

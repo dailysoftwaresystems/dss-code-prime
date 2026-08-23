@@ -10,6 +10,7 @@
 #include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/object_symbol_names.hpp"
 #include "link/format/string_table.hpp"
+#include "link/format/weak_definition_gate.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -897,68 +898,25 @@ encode(AssembledModule const&    module,
     // CONSULTS the declaration. That is the whole point of the row: a key the
     // writer does not READ is worse than no key, because it drifts silently
     // while reading as authoritative. The COMDAT select-any encoding below is
-    // unchanged; what changed is that emitting it is now conditional on the
-    // format having SAID so.
+    // unchanged; what changed is that emitting it is conditional on the format
+    // having SAID so.
     //
-    // ★ GATED ON THE MODULE, NOT ON THE FORMAT. The question is only asked when
-    // a weak definition is actually present, so a pe `.obj` schema that never
-    // meets one is never required to answer — this must not become a back-door
-    // "every format must declare `weakDefinition`" rule, which would be the
-    // required-key shape the row's own reasoning rejects.
-    //
-    // ★ TWO REFUSALS, NOT ONE, because their remediations differ: an
-    // UNANSWERED schema needs the block added, while a schema that answered
-    // with a dialect this walker has no encoder for needs the DECLARATION
-    // fixed (or that walker built). Both are loud: re-spelling a weak
-    // definition under whatever encoder happens to be at hand publishes it as
-    // a STRONG definition, which changes what the final link does with a
-    // duplicate — a silent semantic change, not a cosmetic one.
-    bool moduleHasWeakDefinition = false;
-    for (auto const& fn : module.functions) {
-        if (isWeakDefinition(fn.symbol)) { moduleHasWeakDefinition = true; break; }
-    }
-    if (!moduleHasWeakDefinition) {
-        for (auto const& d : module.dataItems) {
-            // Anonymous items carry no ModuleSymbol row and so can never be
-            // weak — the same reason the index walk below skips them.
-            if (d.symbol == SymbolId{}) continue;
-            if (isWeakDefinition(d.symbol)) { moduleHasWeakDefinition = true; break; }
-        }
-    }
-    if (moduleHasWeakDefinition) {
-        auto const declaredWeak = fmt.weakDefinition();
-        if (!declaredWeak.has_value()) {
-            emit(reporter, DiagnosticCode::K_FormatLacksWeakDefinitionDialect,
-                 std::format(
-                     "pe::encode (Obj): this module defines a WEAK symbol, but "
-                     "format '{}' declares no 'weakDefinition' block, so it has "
-                     "not said HOW a weak definition is spelled. Declare "
-                     "'weakDefinition': {{ \"dialect\": \"{}\" }} — emitting "
-                     "the body under an assumed spelling would publish it as a "
-                     "STRONG definition on any format whose dialect differs. "
-                     "D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED.",
-                     fmt.name(),
-                     weakDefinitionDialectName(WeakDefinitionDialect::Comdat)));
-            return {};
-        }
-        if (declaredWeak->dialect != WeakDefinitionDialect::Comdat) {
-            emit(reporter, DiagnosticCode::K_FormatLacksWeakDefinitionDialect,
-                 std::format(
-                     "pe::encode (Obj): format '{}' declares weakDefinition "
-                     "dialect '{}', but this walker spells a weak definition "
-                     "only as '{}' (a per-body IMAGE_SCN_LNK_COMDAT section "
-                     "with Selection = IMAGE_COMDAT_SELECT_ANY). The "
-                     "definition is refused rather than re-spelled: a weak "
-                     "body written under the wrong dialect is published as a "
-                     "STRONG definition. Fix the declaration, or land the "
-                     "encoder for '{}'. "
-                     "D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED.",
-                     fmt.name(),
-                     weakDefinitionDialectName(declaredWeak->dialect),
-                     weakDefinitionDialectName(WeakDefinitionDialect::Comdat),
-                     weakDefinitionDialectName(declaredWeak->dialect)));
-            return {};
-        }
+    // ★★ THE SCAN-AND-ASK IS NOW THE SHARED GATE
+    // (`link/format/weak_definition_gate.hpp`), NOT A COPY LIVING HERE.
+    // D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS taught
+    // `elf::encode` and `macho::encode` to ask the same question; leaving this
+    // walker's hand-rolled version in place would have made three copies of one
+    // decision, which is the drift `definedNDesc` and `stbForBinding` are each
+    // one function to avoid. The gate keeps both properties this block had —
+    // it is GATED ON THE MODULE so a schema that never meets a weak definition
+    // is never required to answer, and it issues TWO refusals because an
+    // UNANSWERED schema and a WRONG-DIALECT schema need different fixes — and
+    // adds one this copy lacked: it also sees a WEAK ALIAS of a STRONG
+    // definition, which `definedBinding` alone reports as Global.
+    if (!link::format::requireWeakDefinitionDialect(
+            module, fmt, WeakDefinitionDialect::Comdat, "pe::encode (Obj)",
+            reporter)) {
+        return {};
     }
 
     // `dataItems` indices whose symbol is a weak definition, ascending.

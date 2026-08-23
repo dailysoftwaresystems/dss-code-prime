@@ -153,7 +153,7 @@ add_subdirectory(conformance)
 # already exists — the `linux-clang-asan` leg of pipeline-pr.yml (Debug,
 # `-fsanitize=address,undefined`, full ctest under `ASAN_OPTIONS=abort_on_error=1`)
 # and MEASURED at 5/5 red on the broken tree. That leg is gated on the PR
-# carrying the `Run Pipes` label (pipeline-pr.yml:89), which is why the gate
+# carrying the `Run Pipes` label (pipeline-pr.yml), which is why the gate
 # never saw this. This arm narrows the hole; it does not close it.
 #
 # ON FAILURE: the arm prints `Note: Randomizing tests' orders with a seed of
@@ -174,7 +174,7 @@ add_subdirectory(conformance)
 # executable's real path (with `.exe` on Windows), so this runs as-is on macOS,
 # Linux and Windows CI. Note it names NO interpreter, and that is the
 # surrounding convention followed rather than broken: the sibling script-backed
-# entries at ../CMakeLists.txt:228-241 must dispatch `bash` vs
+# entries in ../CMakeLists.txt must dispatch `bash` vs
 # `powershell -File` precisely because their command is a SCRIPT. This command is
 # a binary; there is nothing to interpret.
 #

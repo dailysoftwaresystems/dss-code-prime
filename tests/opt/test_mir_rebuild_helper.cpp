@@ -317,7 +317,7 @@ TEST(MirRebuildHelper, IdentityRoundTripPreservesGlobalAddrLoadStoreReturn) {
 // substrate). The OTHER two copy sites have their own standalone loops, pinned
 // separately: DCE (`DceConst.PreservesGlobalConstness`) + merge
 // (`MirMerge.MergePreservesGlobalConstness`). RED-ON-DISABLE: drop the
-// `…globalIsConst(g)` argument at mir_rebuild_helper.cpp:54 / :96 (let it default to
+// `…globalIsConst(g)` argument at mir_rebuild_helper.cpp (let it default to
 // false) → the const global's `isConst` flips to false and the `EXPECT_TRUE` fails.
 // TF-C78 (D-CSUBSET-NOINLINE): ★ THE LOAD-BEARING PROPAGATION PIN.
 //

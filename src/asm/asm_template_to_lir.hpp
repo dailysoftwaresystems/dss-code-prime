@@ -225,11 +225,27 @@ struct DSS_EXPORT AsmDecodedOperand {
 struct DSS_EXPORT AsmResolvedRegister {
     LirReg        reg       = InvalidLirReg;
     LirRegClass   regClass  = LirRegClass::None;
+    // What the caller's binding says this register DENOTES — see
+    // `AsmOperandBinding::operandKind`. A physical register spelling written in
+    // the assembly text itself always denotes the register (`Reg`); only a
+    // template PLACEHOLDER can carry another form, because only the embedding
+    // language has a constraint letter to bind one with.
+    OperandKindFilter operandKind = OperandKindFilter::Reg;
     // The width the SPELLING states (`%eax` → 32, `x0` → 64). The instruction
     // width is derived from it exactly as it always was — a narrow spelling is
     // the only thing that says a 32-bit operation was meant on a dialect that
     // writes no mnemonic suffix.
     std::uint32_t widthBits = 0;
+    // ★ THE `ImmInt` PAYLOAD, RELAYED FROM `AsmOperandBinding` UNCHANGED. A
+    // physical register spelling written in the assembly TEXT can never carry
+    // one (it denotes a register, and `resolvePhysicalRegister` leaves these at
+    // their defaults); only a template placeholder can, because only the
+    // embedding language has a constraint letter to bind a form with.
+    // ⚠ RELAYED THROUGH THE **SAME** LOOKUP THE REGISTER TAKES, rather than
+    // through a second `resolveImmediate` virtual. Two lookups over one binding
+    // table is two chances to disagree about which row a spelling matched.
+    bool          hasImmediate = false;
+    std::int64_t  value        = 0;
 };
 
 // The three answers a register lookup can give, and they are three rather than
@@ -237,7 +253,7 @@ struct DSS_EXPORT AsmResolvedRegister {
 // spelling names no register", and collapsing them would either double-report
 // or replace a precise refusal (a broken `subOf` chain) with a vague one.
 // ★ THE SHAPE IS THE SUBSTRATE'S OWN, NOT A NEW IDEA:
-// `AngleIncludeResolution` (`core/types/include_path_resolve.hpp:221-224`)
+// `AngleIncludeResolution` (`core/types/include_path_resolve.hpp`)
 // already separates found / not-found / already-reported for exactly this
 // reason, and states it in the same words — *"Reported, never resolved; kept
 // DISTINCT because different tiers own the report"*. Grepped before minting
@@ -287,6 +303,44 @@ struct DSS_EXPORT AsmOperandBinding {
     LirReg        reg       = InvalidLirReg;
     LirRegClass   regClass  = LirRegClass::None;
     std::uint32_t widthBits = 0;
+    // ★★★ WHAT THE TEMPLATE WRITES **AROUND** `reg`, AND IT IS THE EMBEDDING
+    // LANGUAGE'S ANSWER, NOT THE ENGINE'S. A constraint letter binds one of
+    // three things (`TargetAsmConstraint::binds`), and the third arm binds an
+    // operand FORM: `"m"` → `membase`. On such a binding `reg` holds the
+    // operand's ADDRESS, and the operand the template denotes is the MEMORY at
+    // that address — `(%rdi)` under one dialect, `[x0]` under another.
+    //
+    // ★★ THE VERB IS THE SUBSTRATE'S OWN. `OperandKindFilter` is the closed set
+    // the encoding-variant guards already speak, and its `LirOperandKind`
+    // partner (`filterToLirKind`) is what this engine already emits for a
+    // `.s`-written memory operand — so a memory-bound placeholder joins the
+    // EXISTING `appendMemory` path with no new role, no new operand kind and no
+    // asm-private mechanism.
+    //
+    // ⚠ `Reg` IS THE DEFAULT AND IT IS THE HONEST ONE: every class-bound
+    // (`"r"`, `"x"`) and register-bound (`"=a"`) letter denotes the register
+    // itself, which is what every binding meant before the form arm existed.
+    OperandKindFilter operandKind = OperandKindFilter::Reg;
+    // ★★★ THE `ImmInt` FORM'S PAYLOAD — A **VALUE**, WHERE EVERY OTHER FORM
+    // CARRIES A REGISTER (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED). `"i"`
+    // binds no register at all: the number is written into the instruction, so
+    // on such a binding `reg` is `InvalidLirReg` and `regClass` is `None`, and
+    // this pair is what `%N` denotes.
+    //
+    // ★★ THE ENGINE STILL HOLDS NO OPINION ABOUT THE LETTER OR THE SIGIL. The
+    // caller has already PROVEN the value a compile-time constant (that is a
+    // property of the embedding LANGUAGE — C's integer constant expression —
+    // which this engine cannot evaluate), and how the number is PRINTED is the
+    // dialect's grammar (`$7` under one, `7` under another). This engine only
+    // turns the binding into the `Immediate` role the decoder already has.
+    //
+    // ⚠ THE BOOL IS LOAD-BEARING: `0` is an ordinary immediate, so a
+    // zero-initialized `value` reads back as a plausible measurement.
+    // `hasImmediate` is the only field that cannot, which is what lets
+    // `decodePlaceholder` refuse "bound to the immediate form and handed no
+    // value" instead of silently encoding zero.
+    bool          hasImmediate = false;
+    std::int64_t  value        = 0;
 };
 
 // ★★★ ONE `asm goto` LABEL TARGET, AS THE EMBEDDING LANGUAGE BOUND IT (GNU

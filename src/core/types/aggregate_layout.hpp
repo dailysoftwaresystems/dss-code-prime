@@ -217,12 +217,30 @@ isSelectableBitFieldStrategy(BitFieldStrategy s) noexcept {
 }
 
 // The spellings a site that refuses the sentinel accepts — the table minus
-// `none`. `namesWhere<M>` CHECKS `M`: a new strategy, or a second unselectable
-// enumerator, makes this initializer a COMPILE ERROR rather than a list that
-// quietly stops matching what the check takes.
+// `none`. A new strategy, or a second unselectable enumerator, makes this
+// initializer a COMPILE ERROR rather than a list that quietly stops matching
+// what the check takes — but ONLY because of the two lines below TOGETHER.
+//
+// ⚠⚠ THE COUNT USED TO BE `kBitFieldStrategyTable.rows.size() - 1`, AND THAT
+// SPELLING COULD NOT FAIL. D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY.
+// `namesWhere<M>` compares `M` against the rows the predicate ACCEPTS; deriving
+// `M` from the same table the predicate walks makes both sides move together,
+// so a fourth strategy compiled clean while the sentence above claimed it would
+// not. ✔MEASURED with `g++ -std=c++23 -fsyntax-only` over a nine-arm probe
+// (written out at `kSelectableExitMechanismNames` in `core/types/target_schema.hpp`):
+// the literal count reds on a new SELECTABLE enumerator and NOT on a second
+// UNSELECTABLE one, which is the case the derived form did catch — so the
+// literal alone moves the blind spot rather than closing it, and the
+// `static_assert` pinning the REJECTED-row count is what makes the claim true
+// in both directions.
 inline constexpr auto kSelectableBitFieldStrategyNames =
-    namesWhere<kBitFieldStrategyTable.rows.size() - 1>(
-        kBitFieldStrategyTable, isSelectableBitFieldStrategy);
+    namesWhere<2>(kBitFieldStrategyTable, isSelectableBitFieldStrategy);
+static_assert(kBitFieldStrategyTable.rows.size()
+                  == kSelectableBitFieldStrategyNames.size() + 1,
+              "kBitFieldStrategyTable must have exactly ONE unselectable row "
+              "(the 'none' sentinel) — a second one leaves `namesWhere`'s "
+              "literal count matching while the `.format.json` refusal silently "
+              "stops naming the set the check accepts");
 
 [[nodiscard]] constexpr std::string_view
 bitFieldStrategyName(BitFieldStrategy s) noexcept {

@@ -646,8 +646,8 @@ TEST(MachOCodeSignPlaceholder, ShippedX86DarwinExecEmitsAdHocSignature) {
 // MEASURED 2026-08-05. `macho::encode`'s dispatch gate routes a
 // codesign request to the dynamic arm by testing
 // `machoImage().codeSignatureSize != 0` ONLY
-// (src/link/format/macho.cpp:751), and `encodeExec`'s defensive
-// invariant belt re-tests the SAME field only (:1853). Neither looks at
+// (src/link/format/macho.cpp), and `encodeExec`'s defensive
+// invariant belt re-tests the SAME field only. Neither looks at
 // `image.codeSignature`. So a zero-extern module against a schema whose
 // ONLY signature request is the ad-hoc block takes the static arm,
 // which emits no __LINKEDIT and no LC_CODE_SIGNATURE — the request is

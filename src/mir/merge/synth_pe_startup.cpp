@@ -379,8 +379,9 @@ bool realizeEntryShape(Mir&                              mir,
     }
     // argc = *__p___argc();  argv = *__p___argv();
     // EXACTLY ONE dereference each — the accessors return the ADDRESS of the
-    // CRT's state (`ucrt/stdlib.h:1144-1145`: `int*` and `char***`), which is
-    // why a second load would read the first element instead of the vector.
+    // CRT's state (`ucrt/stdlib.h`'s `__p___argc` / `__p___argv`: `int*` and
+    // `char***`), which is why a second load would read the first element
+    // instead of the vector.
     MirInstId argc{};
     MirInstId argv{};
     {

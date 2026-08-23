@@ -533,6 +533,46 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                     // format that can carry it and one that
                                     // cannot, and the second must fail loud.
                                     ImageRequest const&    imageRequest) {
+    // ★★★ [[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]] — EVERY DIAGNOSTIC
+    // THIS COMPILE PRODUCES LEAVES IN ORIGIN COORDINATES, WHATEVER TIER MADE IT
+    // AND WHICHEVER EXIT IT LEAVES BY.
+    //
+    // Below this line run the semantic tier, CST→HIR, HIR→MIR, the optimizer,
+    // MIR→LIR, the assembly engine and the linker. Each positions its
+    // diagnostics from a CU tree, and when that tree was preprocessed those are
+    // SYNTHESIZED coordinates — a line shifted by the built-in predefine
+    // prologue plus one line per `--define`, and, for anything inside an
+    // `#include`d header, the MAIN file's name. The semantic tier converts its
+    // own on the way out of `analyze`; this guard is what makes the guarantee
+    // hold for the tiers that have no single exit of their own. ✔MEASURED
+    // through the CLI: an ASM-tier `A0008` showed BOTH shapes (line +2 under two
+    // `--define`s, and a header-origin refusal attributed to the main file), so
+    // a semantic-only fix would have been a slice of the defect, not the defect.
+    //
+    // A DESTRUCTOR and not a line before each `return`: this function has many
+    // exits, several of them early refusals, and "remember to convert on the way
+    // out" is the kind of obligation that is satisfied on the day it is written
+    // and broken by the next exit anybody adds. The conversion is a no-op for a
+    // CU with no preprocessed tree, and idempotent, so the semantic tier's own
+    // earlier call is not a competing policy.
+    class LeaveInOriginCoordinates {
+    public:
+        LeaveInOriginCoordinates(std::span<CompilationUnit const> units,
+                                 DiagnosticReporter&              rep) noexcept
+            : cus_{units}, reporter_{&rep} {}
+        LeaveInOriginCoordinates(LeaveInOriginCoordinates const&)            = delete;
+        LeaveInOriginCoordinates& operator=(LeaveInOriginCoordinates const&) = delete;
+        ~LeaveInOriginCoordinates() {
+            for (CompilationUnit const& cu : cus_) {
+                cu.remapPreprocessedPositions(*reporter_);
+            }
+        }
+    private:
+        std::span<CompilationUnit const> cus_;
+        DiagnosticReporter*              reporter_;
+    };
+    LeaveInOriginCoordinates const leaveInOriginCoordinates{cus, reporter};
+
     auto parsed = TargetSpec::parse(targetSpecStr);
     if (!parsed) {
         emitDriver(reporter, DiagnosticCode::D_InvalidTargetSpec,

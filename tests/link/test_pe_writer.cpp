@@ -1071,33 +1071,38 @@ TEST(PeWriter, ObjWeakDefinitionRefusedWhenTheFormatDeclaresNoDialect) {
         << diagSummary(rep);
 }
 
-TEST(PeWriter, ObjWeakDefinitionRefusedWhenTheDeclaredDialectIsNotThisWalkers) {
-    auto target = TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(target.has_value());
-    auto fmt = ObjectFormatSchema::loadFromText(
+// ★★ THIS ARM MOVED ONE TIER EARLIER IN CYCLE P28, AND THE TEST FOLLOWED THE
+// BEHAVIOUR RATHER THAN BEING DELETED FOR FAILING.
+// D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS gave
+// `ObjectFormatBackend` a `weakDefinitionDialects()` accessor, so the LOADER can
+// now ask "does anyone spell this dialect, and is it you?" — the same question
+// `stackReserveControl.vehicle` has asked since TF-C125. A pe document
+// declaring the ELF dialect therefore no longer LOADS, which is strictly better
+// than reaching the walker: the mistake is caught at its source instead of at
+// the first weak definition, which may be months later and on another machine.
+//
+// ⚠ WHAT THIS TEST USED TO ASSERT — that the loader ACCEPTS the wrong dialect
+// and the WALKER refuses it — is now false at the first half and unreachable at
+// the second through any JSON path. The walker's arm is NOT dead (a schema
+// built through the validation-free `ObjectFormatSchema{ObjectFormatData}`
+// constructor bypasses this tier entirely) and it is exercised directly, on the
+// shared gate every walker now calls, by
+// `WeakDefinitionDialect.TheGateRefusesADialectTheWalkerCannotSpell` in
+// `test_weak_definition_dialect.cpp`.
+TEST(PeWriter, ObjWeakDefinitionWithAForeignDialectIsRefusedAtLoad) {
+    auto const r = ObjectFormatSchema::loadFromText(
         peObjSchemaJson("pe-obj-weak-wrong-dialect", kDeclaresSymbolBinding),
         "synthetic");
-    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
-    // The loader ACCEPTED it — the dialect is a real spelling. The refusal
-    // below is therefore the WALKER's, which is the half this row is about.
-    ASSERT_TRUE((*fmt)->weakDefinition().has_value());
-    EXPECT_EQ((*fmt)->weakDefinition()->dialect,
-              WeakDefinitionDialect::SymbolBinding);
-
-    AssembledModule mod = strongPlusWeakFunctionModule();
-    DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty())
-        << "a weak body written under the wrong dialect is published as a "
-           "STRONG definition — the walker must refuse rather than re-spell it";
-    EXPECT_EQ(::dss::test_support::countCode(
-                  rep, DiagnosticCode::K_FormatLacksWeakDefinitionDialect), 1u)
-        << diagSummary(rep);
+    ASSERT_FALSE(r.has_value())
+        << "a pe document declaring the ELF dialect must be refused at LOAD — "
+           "the COFF walker would refuse the first weak definition it met, and "
+           "config that can only ever fail should not load";
+    EXPECT_EQ(countAtPath(r, "/weakDefinition/dialect"), 1u) << rejectSummary(r);
     // The message must name BOTH dialects — the one declared and the one this
-    // walker spells — or the author cannot tell which half to fix. Both are
-    // RENDERED from the name table, so a renamed spelling moves the message
-    // with it instead of leaving a literal behind.
-    std::string const said = diagSummary(rep);
+    // format's walker spells — or the author cannot tell which half to fix.
+    // Both are RENDERED from the name table, so a renamed spelling moves the
+    // message with it instead of leaving a literal behind.
+    std::string const said = rejectSummary(r);
     EXPECT_NE(said.find("'symbol-binding'"), std::string::npos) << said;
     EXPECT_NE(said.find("'comdat'"), std::string::npos) << said;
 }

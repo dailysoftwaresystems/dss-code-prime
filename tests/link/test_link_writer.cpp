@@ -318,7 +318,7 @@ TEST(LinkWriter, EndToEndAssembleLinkWriteToDisk) {
     // pipeline — the latter requires ML7 callconv lowering of
     // the virtual `arg` pseudo-op to mov-from-arg-register
     // sequences that the x86_64 assembler can encode. `ret` IS
-    // declared at `x86_64.target.json:206` (opcode 0xC3); `arg`
+    // declared at `x86_64.target.json` (opcode 0xC3); `arg`
     // is intentionally a virtual op without an encoding block
     // (line 22 of the same JSON documents this). The c-subset →
     // ELF link chain is exercised end-to-end at LK10 cycle 2

@@ -1886,7 +1886,7 @@ TEST(TargetSchema, TFC74Arm64PredefinedMacrosExactSet) {
                   // across every triple including the big-endian control.
                   // ★ __BIG_ENDIAN__ MUST NOT APPEAR IN THIS LIST — MEASURED, it
                   // is defined only on a big-endian triple (aarch64_be-linux-gnu),
-                  // and Apple's libkern/OSByteOrder.h:165 tests it BEFORE the
+                  // and Apple's libkern/OSByteOrder.h tests it BEFORE the
                   // little-endian arm, so a stray row silently selects
                   // byte-swapping macros. This exact-set comparison is what keeps
                   // it out.

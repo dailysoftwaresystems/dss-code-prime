@@ -39,7 +39,7 @@ target_include_directories(dss_examples_runner
 # is the reason both sites survived review: a CONSUMER `REUSE_FROM` call is NOT a
 # no-op when CMAKE_DISABLE_PRECOMPILE_HEADERS is set — it warns, once per emission,
 # per target. Only the PRODUCER form (`target_precompile_headers(... PRIVATE ...)`,
-# src/CMakeLists.txt:51) is genuinely silent, and that asymmetry is what made the
+# src/CMakeLists.txt) is genuinely silent, and that asymmetry is what made the
 # claim look true. MEASURED on this tree: the two sites together emitted 633
 # CMake warnings per Debug configure, and they were 633 of 633 — i.e. this single
 # message WAS the entire warning channel, so any real CMake warning was invisible.

@@ -183,7 +183,7 @@ TEST(LirRewrite, ExhaustedClassEmitsLoudFailureNotSilentClobber) {
             // formerly built is HANDLED by the reservation, so the loud-
             // failure path is now reached via the wide-call operand
             // explosion instead — the one exhaustion reserve-K cannot fix.)
-            TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+            TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
             MirInstId const callee = mb.addGlobalAddr(SymbolId{2}, ptrT);
             std::vector<MirInstId> callOps;
             callOps.reserve(args.size() + 1);

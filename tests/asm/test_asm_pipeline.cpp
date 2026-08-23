@@ -144,7 +144,7 @@ TEST(AsmPipeline, SourceMapByteOffsetsMonotonic) {
 }
 
 TEST(AsmPipeline, LirToMirSizeMismatchEmitsDiagnostic) {
-    // Pin A_LirToMirSizeMismatch (asm.cpp:139). Mis-sized lirToMir
+    // Pin A_LirToMirSizeMismatch (asm.cpp). Mis-sized lirToMir
     // is exactly the silent-UB case the substrate gate exists for —
     // shorter span and the encoder would read past the end once the
     // walkers stamp per-byte-range entries. The substrate fails loud

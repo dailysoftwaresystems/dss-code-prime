@@ -70,6 +70,22 @@ constexpr StackReserveVehicle kPeVehicles[] = {
     StackReserveVehicle::PeOptionalHeader,
 };
 
+// D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS. The weak-
+// definition spellings THIS backend's walker writes. One row: `pe.cpp`'s COFF
+// `.obj` arm gives each weak body a section of its OWN flagged
+// IMAGE_SCN_LNK_COMDAT with Selection = IMAGE_COMDAT_SELECT_ANY. NOT
+// `IMAGE_SYM_CLASS_WEAK_EXTERNAL`, which is a weak REFERENCE with a fallback
+// alias (PE/COFF 5.5.3) and defines nothing — see `pe.cpp`'s weak-definition
+// block for the measured reference encodings that fix this choice.
+//
+// ⚠ AS WITH `kPeVehicles`, THE CAPABILITY IS NOT UNIFORM ACROSS THIS
+// BACKEND'S FORMATS: `pe64-x86_64-windows` and `-staticlib` declare the
+// dialect, `-exec` and `-dll` declare none, because the image arm emits no
+// COMDAT. This span answers only "can this walker spell it".
+constexpr WeakDefinitionDialect kPeWeakDialects[] = {
+    WeakDefinitionDialect::Comdat,
+};
+
 class PeBackend final : public ObjectFormatBackend {
 public:
     [[nodiscard]] std::string_view configName() const noexcept override {
@@ -86,6 +102,10 @@ public:
     rejectedRootFieldsReason() const noexcept override { return {}; }
     [[nodiscard]] std::span<StackReserveVehicle const>
     stackReserveVehicles() const noexcept override { return kPeVehicles; }
+    [[nodiscard]] std::span<WeakDefinitionDialect const>
+    weakDefinitionDialects() const noexcept override {
+        return kPeWeakDialects;
+    }
 
     [[nodiscard]] bool
     isImageFlavor(detail::ObjectFormatData const& d) const noexcept override {

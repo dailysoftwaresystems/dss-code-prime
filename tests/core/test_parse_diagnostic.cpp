@@ -202,7 +202,7 @@ TEST(DiagnosticCode, DependsOnBandContinuationAfterTheSuppressSlot) {
         // so must KEEP the value in some contiguity run, not merely move it to
         // a lone `EXPECT_EQ` that the next allocation can silently step past.
         // ⚠ One of its two emit sites IS in the dependency resolver
-        // (`dependency_resolver.cpp:947`), so the topic boundary was never as
+        // (`dependency_resolver.cpp`), so the topic boundary was never as
         // clean as the test name suggests.
         {DiagnosticCode::D_LanguageTargetIsaMismatch,          0xD02A, "D002A"},
     };

@@ -883,6 +883,15 @@ struct SynthBuilder {
             return r;
         };
         if (fs::path{filename}.is_absolute()) return tryDir({});
+        // EMPTY means "there is no including FILE", NOT "the includer has no
+        // directory component" — a name like `main.c` arrives here as `.`,
+        // because `includingDirectoryOf` already made that substitution
+        // (D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH).
+        // ⚠ Do NOT try to fix a missed self-dir search by deleting this test:
+        // MEASURED, `descend` on an EMPTY base returns NotFound down both
+        // matching arms (`fs::directory_iterator{fs::path{}}` fails with "Not a
+        // directory"), so dropping the guard changes no answer at all — it only
+        // hides where the real derivation has to happen.
         if (!includingDir.empty()) {
             HeaderSearchResult r = tryDir(includingDir);
             if (r.status != HeaderSearchStatus::NotFound) return r;
@@ -1616,7 +1625,12 @@ struct SynthBuilder {
 
         // C21: start PAST the non-emitted value prefix (load-bearing invariant 2).
         std::size_t copiedUpTo = prefixLen;
-        fs::path const includingDir = fs::path{source->name()}.parent_path();
+        // D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH:
+        // the SHARED derivation, never a local `parent_path()`. A bare
+        // `dss --compile main.c` gives this buffer the name `main.c`, whose
+        // parent is the EMPTY path, and an empty includer dir turns off the
+        // self-dir arm of `resolveQuote` below.
+        fs::path const includingDir = includingDirectoryOf(source->name());
 
         auto isHash = [&](Token const& t) {
             return hashKind.valid() && t.schemaKind == hashKind;
@@ -2885,7 +2899,7 @@ private:
         // a literal's close delimiter is a significant token of its own, so when
         // the operand ends in a literal the join already ends PAST the delimiter.
         // Previously the closer belonged to no token at all and
-        // `#warning "Unsupported compiler detected"` (sys/cdefs.h:81, the shape
+        // `#warning "Unsupported compiler detected"` (the `sys/cdefs.h` shape
         // that motivated `#warning`) reported one byte short, violating C23
         // 6.10.5p1/6.10.6's "include the pp-tokens" on the case that matters most;
         // `#error please include <stdio.h>` lost its `>` the same way, because the
@@ -3150,7 +3164,7 @@ private:
     // prefix.
     //
     // The BUILT forms are exactly the ones MEASURED reachable in the sqlite
-    // corpus (`ext/misc/totype.c:440` and `:505`, one each):
+    // corpus (the two `#pragma optimize` directives in `ext/misc/totype.c`):
     //     optimize ( "" , off )   -> open a no-optimize region
     //     optimize ( "" , on )    -> close it
     // The EMPTY option string is MSVC's "all optimizations". A NON-EMPTY one
@@ -3880,7 +3894,12 @@ private:
         if (lineMap_ != nullptr && !lineMap_->empty()) {
             LineMap::Resolved const r = lineMap_->resolve(dirSpan.start());
             if (r.origin != nullptr) {
-                return fs::path{std::string{r.origin->name()}}.parent_path();
+                // The SHARED derivation
+                // (D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH):
+                // an origin named without a directory component resolves its
+                // `#embed` against the working directory, exactly as a quote
+                // `#include` in the same file does.
+                return includingDirectoryOf(r.origin->name());
             }
         }
         return includingDir_;
@@ -6561,7 +6580,11 @@ PreprocessResult preprocessRun(
                            prefixLen,     &result.lineMap,
                            headerNameMatching,
                            includeDirs,   systemDirs,   activeFormat,
-                           fs::path{mainSource->name()}.parent_path(),
+                           // The SHARED derivation — see
+                           // `includingDirectoryOf`. `__has_include("h")` must
+                           // give the SAME answer the `#include` above does, so
+                           // it must derive its includer dir the same way.
+                           includingDirectoryOf(mainSource->name()),
                            merged.effective};
     std::vector<Token> finalTokens;
     {

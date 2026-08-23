@@ -13,6 +13,8 @@
 #include "core/types/config_key_vocabulary.hpp" // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY (TF-C74: shared with the target loader)
 #include "core/types/config_path_walk.hpp"     // findShippedConfig — the ONE shipped-config discovery precedence, reused by `languageReferences` (plan 29)
 #include "core/types/data_model.hpp"           // dataModelFromName + kDataModelTable (FC3 c1 coreByDataModel keys)
+#include "core/types/enum_name_table.hpp"       // namesWhere — the `core` subset is a FILTERED PROJECTION, not a third list
+#include "core/types/type_lattice/core_type.hpp" // kTypeKindNameTable / isPrimitiveTypeKind — the TypeKind spellings' ONE owner
 #include "core/types/entry_shape.hpp"          // kDeclarableEntryParamShapeNames / kEntryMaterializationTable (entryFunctions rows)
 #include "core/types/predefined_macro_json.hpp" // parsePredefinedMacroArray (TF-C74: shared with the target loader)
 #include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
@@ -76,8 +78,8 @@ std::optional<ScopeKind> parseScopeName(std::string_view name) {
 
 // Core-kind NAME → TypeKind, for the JSON `core` / `elementCore` fields (the
 // scalar subset that names a value's element type — no aggregate/pointer kinds).
-// The single source of truth for the name↔kind mapping in this loader; the
-// `semantics` block's local `parseCore` delegates here so the two never drift.
+// The single source of truth for what this loader ACCEPTS; the `semantics`
+// block's local `parseCore` delegates here so the two never drift.
 //
 // ★★★ D-TEXT-TIER-READERS-KEEP-HAND-WRITTEN-FROMNAME-IF-CHAINS. This was a
 // 21-arm if-chain, and being the only copy of the spellings made it LOOK like a
@@ -86,58 +88,61 @@ std::optional<ScopeKind> parseScopeName(std::string_view name) {
 // `(expected one of Bool/I*/U*/F*/Char/Byte/Void)` — ✔MEASURED WRONG in two
 // ways at once. It omitted `NullptrT`, a spelling the chain ACCEPTS; and
 // `I*`/`U*`/`F*` name no spelling at all, so an author cannot tell from it that
-// `I24` is refused and `I128` is taken. A table is enumerable, so every one of
-// the seven now renders the real set and none of them can drift again.
+// `I24` is refused and `I128` is taken. A projection is enumerable, so every one
+// of the seven renders the real set and none of them can drift again.
 //
-// ⚠ These are the CONFIG spellings (`"core": "I32"` in a `.lang.json`), which is
-// why the table lives here and not beside `TypeKind`: `lir_text.cpp` spells the
-// same enum in PascalCase for `.dsslir` and covers the aggregate kinds this
-// subset must NOT accept, so the two sets are genuinely different vocabularies
-// over one enum and merging them would teach this loader `Struct`.
-inline constexpr EnumNameTable<TypeKind, 20> kGrammarCoreTypeTable{{{
-    { TypeKind::Bool, "Bool" },
-    { TypeKind::I8,   "I8"   },
-    { TypeKind::I16,  "I16"  },
-    { TypeKind::I32,  "I32"  },
-    { TypeKind::I64,  "I64"  },
-    { TypeKind::I128, "I128" },
-    { TypeKind::U8,   "U8"   },
-    { TypeKind::U16,  "U16"  },
-    { TypeKind::U32,  "U32"  },
-    { TypeKind::U64,  "U64"  },
-    { TypeKind::U128, "U128" },
-    { TypeKind::F16,  "F16"  },
-    { TypeKind::F32,  "F32"  },
-    { TypeKind::F64,  "F64"  },
-    { TypeKind::F80,  "F80"  },   // x87 80-bit (D-CSUBSET-LONG-DOUBLE)
-    { TypeKind::F128, "F128" },
-    { TypeKind::Char, "Char" },
-    { TypeKind::Byte, "Byte" },
-    { TypeKind::Void, "Void" },
-    { TypeKind::NullptrT, "NullptrT" },  // C23 nullptr_t (D-CSUBSET-NULLPTR)
-    // ⚠ NOTHING BEYOND THIS POINT. The rows are exactly the twenty spellings the
-    // replaced if-chain accepted — no row was added while converting. `BitInt`,
-    // `Complex` and every aggregate kind are absent BY CONSTRUCTION: a `core`
-    // field names a fixed-width scalar the interner can build with
-    // `primitive(k)`, and a row for a kind that needs an operand (a width, an
-    // element type) would let a document declare a `core` the interner cannot
-    // realize — accepted at load, fatal downstream.
-}}};
+// ★★★ AND IT IS NO LONGER A THIRD HAND-LIST OF THE SPELLINGS
+// (D-TYPEKIND-PASCALCASE-SPELLINGS-HAVE-TWO-OWNERS). It was a twenty-row
+// `EnumNameTable<TypeKind, 20>` written out here, deliberately, on the argument
+// that *"the two sets are genuinely different vocabularies over one enum and
+// merging them would teach this loader `Struct`"*. The premise was right and the
+// conclusion did not follow: the SUBSET is this loader's property, the SPELLINGS
+// are the enum's, and a FILTERED PROJECTION keeps both. ✔MEASURED before
+// merging: all twenty spellings were byte-identical to `lir_text.cpp`'s, and the
+// twenty kinds were the same twenty — in the same order — as
+// `type_reintern.cpp`'s `isPrimitiveKind`, which is the very predicate the old
+// comment used to DEFINE the subset ("a fixed-width scalar the interner can
+// build with `primitive(k)`"). So the filter states that definition instead of
+// re-enumerating its consequences, and `Struct` stays out because
+// `isPrimitiveTypeKind` says so, not because somebody remembered not to type it.
+//
+// ⚠ THE `20` IS CHECKED, NOT DECORATIVE. `namesWhere<M>` refuses a count
+// mismatch at COMPILE TIME, so a new `TypeKind` that `isPrimitiveTypeKind`
+// accepts fails the build right here until this loader's accepted set is
+// re-decided — the guarantee the old hand-list could not give, since a new
+// primitive kind simply never appeared in it.
+// ⚠ AND THE `20` ALONE IS BLIND IN THE OTHER DIRECTION, which is
+// D-CORE-NAMESWHERE-LITERAL-COUNT-IS-BLIND-TO-A-SECOND-SENTINEL: `namesWhere`
+// compares its count only against the ACCEPTED total, so a kind moving OUT of
+// `isPrimitiveTypeKind` — a second rejected row — leaves `20` matching and this
+// sentence quietly narrower than it says. The companion assert relates the
+// table's own row total to this projection's literal, two numbers with
+// different owners, and is what makes the guard bidirectional.
+static_assert(kTypeKindNameTable.rows.size() == 20u + 20u,
+              "kTypeKindNameTable must split 20 primitive / 20 non-primitive; "
+              "if that moved, kGrammarCoreTypeNames' 20 is now a narrower "
+              "promise than the sentence it renders");
+inline constexpr std::array<std::string_view, 20> kGrammarCoreTypeNames =
+    namesWhere<20>(kTypeKindNameTable,
+                   [](TypeKind k) { return isPrimitiveTypeKind(k); });
+DSS_CHECK_KEY_VOCABULARY(kGrammarCoreTypeNames);
 
-// Well-formedness of the table itself: no empty spelling, no duplicate
-// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
-// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
-DSS_CHECK_ENUM_NAME_TABLE(kGrammarCoreTypeTable);
-DSS_CHECK_KEY_VOCABULARY(allNames(kGrammarCoreTypeTable));
-
-// The rendered accepted set, built ONCE off the table. Every `core`/`elementCore`
-// refusal in this file appends it, so there is no second copy to go stale.
+// The rendered accepted set, built ONCE off the projection. Every
+// `core`/`elementCore` refusal in this file appends it, so there is no second
+// copy to go stale.
 inline std::string coreTypeAllowedList() {
-    return renderAllowedList(allNames(kGrammarCoreTypeTable), "/");
+    return renderAllowedList(kGrammarCoreTypeNames, "/");
 }
 
+// ⚠ BOTH HALVES OF THE FILTER, or the projection would be advertising only.
+// `kTypeKindNameTable.fromName` resolves every one of the FORTY lattice
+// spellings — a bare delegation would accept `"Struct"` while the sentence above
+// promises twenty names. The predicate is applied here too, so what the loader
+// accepts and what the refusal advertises are the same set by construction.
 std::optional<TypeKind> coreTypeFromName(std::string_view name) {
-    return kGrammarCoreTypeTable.fromName(name);
+    auto const k = typeKindFromName(name);
+    if (!k || !isPrimitiveTypeKind(*k)) return std::nullopt;
+    return k;
 }
 
 // The composite-kind accepted set, built ONCE off `kCompositeKindTable`
@@ -285,21 +290,28 @@ void parseModeFields(json const& m,
     if (!m.at("modeOp").is_string()) {
         c.emit(DiagnosticCode::C_ConflictingField,
                std::format("{}/modeOp", entryPath),
-               "'modeOp' must be a string ('pushMode' | 'popMode' | 'replaceMode')");
+               std::format("'modeOp' must be a string, one of {}",
+                           renderAllowedList(kDeclarableModeOpNames, " | ")));
         return;
     }
     const auto opStr = m.at("modeOp").get<std::string>();
-    ModeOp op = ModeOp::None;
-    if      (opStr == "pushMode")    op = ModeOp::PushMode;
-    else if (opStr == "popMode")     op = ModeOp::PopMode;
-    else if (opStr == "replaceMode") op = ModeOp::ReplaceMode;
-    else {
+    // ONE owner decides — `kModeOpTable` (lexer_mode.hpp, beside the enum) —
+    // and BOTH sentences render from it, so a fifth op reaches the parse and
+    // both messages with no edit here (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN).
+    // `none` is the SENTINEL: `modeOpFromName` resolves the spelling and this
+    // arm refuses it, because a lexeme with no mode effect declares no `modeOp`
+    // at all — behaviour identical to the chain this replaced, which had no
+    // `"none"` arm. The accepted set therefore renders `kDeclarableModeOpNames`
+    // (the table minus the sentinel), never `allNames`.
+    auto const parsedOp = modeOpFromName(opStr);
+    if (!parsedOp.has_value() || !isDeclarableModeOp(*parsedOp)) {
         c.emit(DiagnosticCode::C_ConflictingField,
                std::format("{}/modeOp", entryPath),
-               std::format("unknown modeOp '{}' (expected 'pushMode' | 'popMode' | 'replaceMode')",
-                           opStr));
+               std::format("unknown modeOp '{}' (expected {})", opStr,
+                           renderAllowedList(kDeclarableModeOpNames, " | ")));
         return;
     }
+    ModeOp const op = *parsedOp;
 
     LexerModeId arg{};
     if (hasArg) {
@@ -376,18 +388,24 @@ std::optional<StringStyle> parseStringStyle(json const& obj,
     if (!obj.contains("escapeKind") || !obj.at("escapeKind").is_string()) {
         c.emit(DiagnosticCode::C_InvalidStringStyle,
                std::format("{}/escapeKind", path),
-               "'escapeKind' is required and must be a string "
-               "('char' | 'doubled-delimiter' | 'none')");
+               std::format("'escapeKind' is required and must be a string, one of {}",
+                           renderAllowedList(allNames(kEscapeKindTable), " | ")));
         return std::nullopt;
     }
     const auto ek = obj.at("escapeKind").get<std::string>();
-    if      (ek == "none")              s.escapeKind = EscapeKind::None;
-    else if (ek == "char")              s.escapeKind = EscapeKind::Char;
-    else if (ek == "doubled-delimiter") s.escapeKind = EscapeKind::DoubledDelimiter;
-    else {
+    // ONE owner — `kEscapeKindTable` (string_style.hpp). Every enumerator is
+    // declarable, so the accepted set is the whole table. ★ The unknown-value
+    // arm now NAMES that set: it previously said only "unknown escapeKind 'x'",
+    // which is the weaker cousin of the retype — fail-loud but telling the
+    // author nothing about what IS allowed
+    // (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN).
+    if (auto const parsed = escapeKindFromName(ek)) {
+        s.escapeKind = *parsed;
+    } else {
         c.emit(DiagnosticCode::C_InvalidStringStyle,
                std::format("{}/escapeKind", path),
-               std::format("unknown escapeKind '{}'", ek));
+               std::format("unknown escapeKind '{}' (expected {})", ek,
+                           renderAllowedList(allNames(kEscapeKindTable), " | ")));
         return std::nullopt;
     }
 
@@ -611,17 +629,64 @@ bool present(json const& j, std::string_view key, Collector& c, std::string cons
     return true;
 }
 
-NodeFlags parseFlagList(json const& arr) {
+// ── `flags` — ONE OWNER, AND IT NOW REFUSES ──────────────────────────────
+//
+// ⚠ D-CONFIG-GRAMMAR-LOADER-FLAG-LIST-SILENTLY-DROPS-AN-UNKNOWN-SPELLING.
+// This was an inline `==` chain owning four spellings whose `else` arm read
+// *"unknown → ignore (forward-compatibility with future flags)"*. That is the
+// silent-drop this loader refuses everywhere else, by name: a misspelled
+// `"EmtpySpace"` left the token NOT flagged as trivia, so the parser saw
+// whitespace as grammar and failed somewhere else entirely, with nothing
+// pointing at the typo. ✔MEASURED over the shipped corpus: 34 `flags` entries,
+// every one of them `EmptySpace`, so the forward-compatibility the comment
+// bought was never spent — and it could not be, because the config tree ships
+// WITH the binary and version skew already fails loud in `config_path_walk`.
+//
+// The vocabulary is `kNodeFlagConfigNames`, declared right here because these
+// are the CONFIG spellings of `NodeFlags` and `tree_node.hpp` has no other
+// reader of them; the refusal renders it through the shared `renderAllowedList`
+// so the sentence cannot drift from the check.
+constexpr std::array<std::pair<std::string_view, NodeFlags>, 4> kNodeFlagRows{{
+    {"EmptySpace", NodeFlags::EmptySpace},
+    {"Missing",    NodeFlags::Missing},
+    {"Synthetic",  NodeFlags::Synthetic},
+    {"HasError",   NodeFlags::HasError},
+}};
+constexpr auto kNodeFlagConfigNames =
+    keysOf(kNodeFlagRows, [](auto const& r) { return r.first; });
+DSS_CHECK_KEY_VOCABULARY(kNodeFlagConfigNames);
+
+NodeFlags parseFlagList(json const& arr, std::string const& path, Collector& c) {
     NodeFlags out = NodeFlags::None;
-    if (!arr.is_array()) return out;
-    for (auto const& f : arr) {
-        if (!f.is_string()) continue;
-        const auto s = f.get<std::string>();
-        if      (s == "EmptySpace") out |= NodeFlags::EmptySpace;
-        else if (s == "Missing")    out |= NodeFlags::Missing;
-        else if (s == "Synthetic")  out |= NodeFlags::Synthetic;
-        else if (s == "HasError")   out |= NodeFlags::HasError;
-        // unknown → ignore (forward-compatibility with future flags)
+    if (!arr.is_array()) {
+        c.emit(DiagnosticCode::C_ConflictingField, path,
+               std::format("'flags' must be an array of {}",
+                           renderAllowedList(kNodeFlagConfigNames)));
+        return out;
+    }
+    for (std::size_t i = 0; i < arr.size(); ++i) {
+        auto const entryPath = std::format("{}/{}", path, i);
+        if (!arr[i].is_string()) {
+            c.emit(DiagnosticCode::C_ConflictingField, entryPath,
+                   std::format("each 'flags' entry must be a string, one of {}",
+                               renderAllowedList(kNodeFlagConfigNames)));
+            continue;
+        }
+        const auto s = arr[i].get<std::string>();
+        bool       known = false;
+        for (auto const& [name, bit] : kNodeFlagRows) {
+            if (s != name) continue;
+            out |= bit;
+            known = true;
+            break;
+        }
+        if (!known) {
+            c.emit(DiagnosticCode::C_ConflictingField, entryPath,
+                   std::format("unknown node flag '{}' (expected {}) — a "
+                               "silently-ignored flag leaves the behaviour it "
+                               "names switched off with no diagnostic",
+                               s, renderAllowedList(kNodeFlagConfigNames)));
+        }
     }
     return out;
 }
@@ -1288,23 +1353,27 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
                     || !guard.at("polarity").is_string()) {
                     coll.emit(DiagnosticCode::C_MissingField,
                               guardPath + "/polarity",
-                              "'commitRequiresTypeName.polarity' is required in "
-                              "the object form and must be 'preferType' or "
-                              "'requireKnownType'");
+                              std::format("'commitRequiresTypeName.polarity' is "
+                                          "required in the object form and must "
+                                          "be one of {}",
+                                          renderAllowedList(
+                                              allNames(kTypeNameCommitPolarityTable),
+                                              " | ")));
                     gOk = false;
                 } else {
+                    // ONE owner — `kTypeNameCommitPolarityTable`
+                    // (compiled_shape.hpp) — and both sentences render from it.
                     auto const p = guard.at("polarity").get<std::string>();
-                    if (p == "preferType") {
-                        polarity = TypeNameCommitPolarity::PreferType;
-                    } else if (p == "requireKnownType") {
-                        polarity =
-                            TypeNameCommitPolarity::RequireKnownType;
+                    if (auto const parsed = typeNameCommitPolarityFromName(p)) {
+                        polarity = *parsed;
                     } else {
                         coll.emit(DiagnosticCode::C_UnknownShape,
                                   guardPath + "/polarity",
-                                  std::format("unknown polarity '{}' (expected "
-                                              "'preferType' or "
-                                              "'requireKnownType')", p));
+                                  std::format("unknown polarity '{}' (expected {})",
+                                              p,
+                                              renderAllowedList(
+                                                  allNames(kTypeNameCommitPolarityTable),
+                                                  " | ")));
                         gOk = false;
                     }
                 }
@@ -2157,7 +2226,8 @@ templateModeUnmintedFirstKinds(GrammarSchemaData const& data,
         }
 
         if (m.contains("flags")) {
-            lm.flagsApplied = parseFlagList(m.at("flags"));
+            lm.flagsApplied = parseFlagList(m.at("flags"),
+                                            std::format("{}/flags", entryPath), coll);
         }
         if (isEmptySpace(lm.flagsApplied)) {
             data.emptySpaceTokens.insert(lm.id.v);
@@ -2955,8 +3025,9 @@ struct LanguageReferenceBinding {
 // ⚠ MEASURED HAZARD THIS PLACEMENT AVOIDS: injecting shapes AFTER the Pass-A
 // intern loop makes `data.rules->find(name)` return `RuleId{}` (v == 0) for
 // every merged rule, and `RuleInterner` has no diagnostic for a find-miss
-// (interner.hpp:84-87) — every merged rule would collapse onto slot 0 and the
-// load would report NOTHING. Keep the merge upstream of interning.
+// (`Interner::find` returns an invalid `Id`) — every merged rule would
+// collapse onto slot 0 and the load would report NOTHING. Keep the merge
+// upstream of interning.
 void mergeLanguageReferences(
         json& doc, std::string_view hostLabel, Collector& coll,
         std::vector<LanguageReferenceBinding>& outRefs,
@@ -3019,7 +3090,7 @@ void mergeLanguageReferences(
         // ── resolve + read the referenced document ──
         // ★★ ONE RESOLUTION RULE FOR THE WHOLE PROJECT — the SAME
         // `findShippedConfig({name, "sources", ".lang.json", …})` that
-        // `GrammarSchema::loadShipped` uses (grammar_schema.cpp:158): same
+        // `GrammarSchema::loadShipped` uses: same
         // `DSS_CONFIG_ROOT`-then-cwd-walk precedence, same path-like-name
         // rejection, same namespace. A referenced document is not a second
         // class of file; it is a language document that a host happens to
@@ -4269,14 +4340,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     if (doc.contains("reservedWordPolicy")) {
         if (!doc.at("reservedWordPolicy").is_string()) {
             coll.emit(DiagnosticCode::C_MissingField, "/reservedWordPolicy",
-                      "'reservedWordPolicy' must be a string ('strict' or 'contextual')");
+                      std::format("'reservedWordPolicy' must be a string, one of {}",
+                                  renderAllowedList(allNames(kReservedWordPolicyTable), " | ")));
         } else {
+            // ONE owner — `kReservedWordPolicyTable` (grammar_schema.hpp,
+            // beside the enum) — and both sentences render from it.
             const auto v = doc.at("reservedWordPolicy").get<std::string>();
-            if      (v == "strict")     data.reservedWordPolicy = ReservedWordPolicy::Strict;
-            else if (v == "contextual") data.reservedWordPolicy = ReservedWordPolicy::Contextual;
-            else {
+            if (auto const parsed = reservedWordPolicyFromName(v)) {
+                data.reservedWordPolicy = *parsed;
+            } else {
                 coll.emit(DiagnosticCode::C_MissingField, "/reservedWordPolicy",
-                          std::format("unknown reservedWordPolicy '{}' (expected 'strict' or 'contextual')", v));
+                          std::format("unknown reservedWordPolicy '{}' (expected {})", v,
+                                      renderAllowedList(allNames(kReservedWordPolicyTable), " | ")));
             }
         }
     }
@@ -4608,7 +4683,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // chars as EmptySpace so the AST cursor skips them
                     // wholesale (closes v2-gap-catalog row 3 cleanly).
                     if (dt.contains("flags")) {
-                        spec.flags = parseFlagList(dt.at("flags"));
+                        spec.flags = parseFlagList(
+                            dt.at("flags"),
+                            std::format("{}/defaultToken/flags", modePath), coll);
                     }
                     // Optional `coalesce` flag (default false): emit ONE
                     // in-grammar token for the whole body instead of one per
@@ -4711,17 +4788,25 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 if (!ua.is_string()) {
                     coll.emit(DiagnosticCode::C_ConflictingField,
                               std::format("{}/unterminatedAs", modePath),
-                              "'unterminatedAs' must be a string");
+                              std::format("'unterminatedAs' must be a string, one of {}",
+                                          renderAllowedList(
+                                              allNames(kUnterminatedFlavorTable))));
                 } else {
+                    // ONE owner — `kUnterminatedFlavorTable` (lexer_mode.hpp,
+                    // beside the enum). The set it renders is quoted by the
+                    // SHARED renderer; the escaped-double-quote spelling this
+                    // replaced was a per-site choice that made the sentence a
+                    // second owner.
                     const auto v = ua.get<std::string>();
-                    if      (v == "string")  flavor = UnterminatedFlavor::String;
-                    else if (v == "comment") flavor = UnterminatedFlavor::Comment;
-                    else if (v == "generic") flavor = UnterminatedFlavor::Generic;
-                    else {
+                    if (auto const parsed = unterminatedFlavorFromName(v)) {
+                        flavor = *parsed;
+                    } else {
                         coll.emit(DiagnosticCode::C_ConflictingField,
                                   std::format("{}/unterminatedAs", modePath),
                                   std::format("unknown 'unterminatedAs' value '{}' — "
-                                              "expected one of \"string\", \"comment\", \"generic\"", v));
+                                              "expected one of {}", v,
+                                              renderAllowedList(
+                                                  allNames(kUnterminatedFlavorTable))));
                     }
                 }
             }
@@ -4939,20 +5024,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
                 const auto precedence = g.at("precedence").get<std::int32_t>();
 
+                // ── ONE OWNER EACH (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+                //
+                // `kOperatorAssocTable` / `kOperatorArityTable`
+                // (operator_table.hpp, beside their enums). Both refusals here
+                // rendered their sets UNQUOTED (`left|right|none`), so no
+                // census arm could see either site while both were full
+                // second owners — and `operator_table.hpp`'s own
+                // `operatorAssocName`/`operatorArityName` answered the same
+                // question in a THIRD spelling (`Left`, `Postfix`) that no
+                // config file may contain. One table now serves the parse, the
+                // refusals and the render.
                 OperatorAssoc assoc = OperatorAssoc::None;
                 if (g.contains("associativity")) {
                     if (!g.at("associativity").is_string()) {
                         coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
-                                  "'associativity' must be a string");
+                                  std::format("'associativity' must be a string, one of {}",
+                                              renderAllowedList(allNames(kOperatorAssocTable), "|")));
                         continue;
                     }
                     const auto a = g.at("associativity").get<std::string>();
-                    if      (a == "left")  assoc = OperatorAssoc::Left;
-                    else if (a == "right") assoc = OperatorAssoc::Right;
-                    else if (a == "none")  assoc = OperatorAssoc::None;
-                    else {
+                    if (auto const parsed = operatorAssocFromName(a)) {
+                        assoc = *parsed;
+                    } else {
                         coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
-                                  std::format("unknown associativity '{}' (expected left|right|none)", a));
+                                  std::format("unknown associativity '{}' (expected {})", a,
+                                              renderAllowedList(allNames(kOperatorAssocTable), "|")));
                         continue;
                     }
                 }
@@ -4961,17 +5058,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 if (g.contains("arity")) {
                     if (!g.at("arity").is_string()) {
                         coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
-                                  "'arity' must be a string");
+                                  std::format("'arity' must be a string, one of {}",
+                                              renderAllowedList(allNames(kOperatorArityTable), "|")));
                         continue;
                     }
                     const auto a = g.at("arity").get<std::string>();
-                    if      (a == "infix")   arity = OperatorArity::Infix;
-                    else if (a == "prefix")  arity = OperatorArity::Prefix;
-                    else if (a == "postfix") arity = OperatorArity::Postfix;
-                    else if (a == "ternary") arity = OperatorArity::Ternary;
-                    else {
+                    if (auto const parsed = operatorArityFromName(a)) {
+                        arity = *parsed;
+                    } else {
                         coll.emit(DiagnosticCode::C_InvalidPrecedenceTable, gPath,
-                                  std::format("unknown arity '{}' (expected infix|prefix|postfix|ternary)", a));
+                                  std::format("unknown arity '{}' (expected {})", a,
+                                              renderAllowedList(allNames(kOperatorArityTable), "|")));
                         continue;
                     }
                 }
@@ -5373,19 +5470,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 paramsOk = false;
                                 continue;
                             }
+                            // ONE owner — `kTypeParamKindTable`
+                            // (type_lattice/core_type.hpp, beside the enum).
                             const auto kindStr = param.at("kind").get<std::string>();
-                            TypeParamKind pk{};
-                            if (kindStr == "Integer") {
-                                pk = TypeParamKind::Integer;
-                            } else if (kindStr == "Type") {
-                                pk = TypeParamKind::Type;
-                            } else {
+                            auto const parsedKind = typeParamKindFromName(kindStr);
+                            if (!parsedKind.has_value()) {
                                 coll.emit(DiagnosticCode::C_TypeExtensionParamMismatch, ppath,
-                                          std::format("unknown parameter kind '{}' (expected "
-                                                      "'Integer' or 'Type')", kindStr));
+                                          std::format("unknown parameter kind '{}' (expected {})",
+                                                      kindStr,
+                                                      renderAllowedList(
+                                                          allNames(kTypeParamKindTable))));
                                 paramsOk = false;
                                 continue;
                             }
+                            TypeParamKind const pk = *parsedKind;
                             desc.parameters.push_back(
                                 TypeParam{param.at("name").get<std::string>(), pk});
                         }
@@ -6477,8 +6575,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                       "'imports' must be an object");
         } else if (!imp.contains("strategy") || !imp.at("strategy").is_string()) {
             coll.emit(DiagnosticCode::C_InvalidImports, "/imports/strategy",
-                      "'imports.strategy' is required and must be a string "
-                      "('none', 'include-following', or 'name-matching')");
+                      std::format("'imports.strategy' is required and must be a "
+                                  "string, one of {}",
+                                  renderAllowedList(allNames(kImportStrategyTable))));
         } else {
             // Read a required-by-strategy string field. Missing → C_MissingField;
             // present-but-wrong-type → C_InvalidImports; empty string → treated
@@ -6521,10 +6620,33 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
             ImportConfig cfg;
             const auto strategyStr = imp.at("strategy").get<std::string>();
-            if (strategyStr == "none") {
-                cfg.strategy = ImportStrategy::None;
-            } else if (strategyStr == "include-following") {
-                cfg.strategy = ImportStrategy::IncludeFollowing;
+            // ── ONE OWNER, AND THE TABLE IS THE DISPATCH KEY ────────────────
+            //
+            // `kImportStrategyTable` (import_config.hpp) resolves the spelling;
+            // the work below is selected by a `switch` over the ENUM, not by a
+            // second run of `==` over the strings. That is the half that makes
+            // this more than tidiness: a row added to the table with no arm here
+            // is a `-Werror=switch` / C4062 BUILD FAILURE, where the `else if`
+            // cascade it replaced would have accepted the new strategy and then
+            // silently done nothing for it — a config key that loads clean and
+            // has no effect (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN).
+            auto const parsedStrategy = importStrategyFromName(strategyStr);
+            if (parsedStrategy.has_value()) {
+                cfg.strategy = *parsedStrategy;
+            } else {
+                coll.emit(DiagnosticCode::C_InvalidImports, "/imports/strategy",
+                          std::format("unknown import strategy '{}' (expected {})",
+                                      strategyStr,
+                                      renderAllowedList(allNames(kImportStrategyTable))));
+                // `cfg.strategy` stays at its `None` default, so the dispatch
+                // below takes the do-nothing arm and no required-field cascade
+                // follows the one real diagnostic — the behaviour of the `else`
+                // arm this replaced.
+            }
+            switch (cfg.strategy) {
+            case ImportStrategy::None:
+                break;
+            case ImportStrategy::IncludeFollowing: {
                 readField("directiveRule", cfg.directiveRule);
                 readField("pathToken",     cfg.pathToken);
                 checkRule (cfg.directiveRule, "directiveRule");
@@ -6545,8 +6667,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         checkToken(cfg.systemPathToken, "systemPathToken");
                     }
                 }
-            } else if (strategyStr == "name-matching") {
-                cfg.strategy = ImportStrategy::NameMatching;
+                break;
+            }
+            case ImportStrategy::NameMatching: {
                 readField("nameRule",       cfg.nameRule);
                 readField("definitionRule", cfg.definitionRule);
                 readField("nameToken",      cfg.nameToken);
@@ -6580,10 +6703,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                               "unknown shape '{}'", i, cfg.referenceParents[i]));
                     }
                 }
-            } else {
-                coll.emit(DiagnosticCode::C_InvalidImports, "/imports/strategy",
-                          std::format("unknown import strategy '{}' (expected 'none', "
-                                      "'include-following', or 'name-matching')", strategyStr));
+                break;
+            }
             }
 
             if (imp.contains("caseSensitive")) {
@@ -7545,19 +7666,25 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 return renderAllowedList(allNames(kDeclarationKindTable), " | ");
             };
 
-            auto const parseConstructor = [](std::string_view name) -> std::optional<TypeConstructor> {
-                if (name == "pointer")   return TypeConstructor::Pointer;
-                if (name == "reference") return TypeConstructor::Reference;
-                if (name == "nullable")  return TypeConstructor::Nullable;
-                if (name == "optional")  return TypeConstructor::Optional;
-                if (name == "slice")     return TypeConstructor::Slice;
-                return std::nullopt;
+            // ── TWO VOCABULARIES, TWO TABLES, NO LOCAL CHAINS ──────────────
+            //
+            // These were `parseConstructor` and `parseNameMatch`: adjacent
+            // lambdas, each an inline `==` chain owning a closed set, with the
+            // sets retyped in three refusals between them. Both now project
+            // `kTypeConstructorTable` / `kNameMatchModeTable`
+            // (`semantic_config.hpp`, beside their enums) —
+            // D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN.
+            //
+            // ⚠ These two lambdas are also the pair that broke the census's
+            // first grouping rule: three lines apart and both naming their
+            // parameter `name`, a proximity window fused their five and two
+            // spellings into one seven-name vocabulary that exists nowhere.
+            // They stay two, which is what the enums say.
+            auto const constructorAllowedList = [] {
+                return renderAllowedList(allNames(kTypeConstructorTable));
             };
-
-            auto const parseNameMatch = [](std::string_view name) -> std::optional<NameMatchMode> {
-                if (name == "self")           return NameMatchMode::Self;
-                if (name == "lastIdentifier") return NameMatchMode::LastIdentifier;
-                return std::nullopt;
+            auto const nameMatchAllowedList = [] {
+                return renderAllowedList(allNames(kNameMatchModeTable), " or ");
             };
 
             // Shared "required, non-negative, in-range, integer" reader for
@@ -8814,14 +8941,25 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                   "mis-interning a future composite type",
                                                   compositeKindAllowedList()));
                                 } else if (!fc.at("compositeKind").is_string()) {
-                                    // ⚠ THIS IS THE ARM THAT HAD DRIFTED. It read
-                                    // "must be a string 'struct' or 'union'" while
-                                    // the parse below accepted `enum` too — so a
-                                    // schema author who wrote a NON-STRING here was
-                                    // told by name that a spelling this very loader
-                                    // takes is not allowed. Its two sibling arms
-                                    // named all three, which is how one sentence
-                                    // goes stale unnoticed: nothing compares them.
+                                    // ⚠ THIS IS THE ARM THAT HAD DRIFTED: it named
+                                    // two of the three spellings the parse below
+                                    // accepts, so a schema author who wrote a
+                                    // NON-STRING here was told by name that a
+                                    // spelling this very loader takes is not
+                                    // allowed. Its two sibling arms named all
+                                    // three, which is how one sentence goes stale
+                                    // unnoticed: nothing compares them.
+                                    //
+                                    // ⚠ THE MISSING SPELLING IS DELIBERATELY NOT
+                                    // QUOTED HERE. A comment that reproduces the
+                                    // stale sentence verbatim is itself a copy of
+                                    // the vocabulary — it was the LAST hit the
+                                    // retyped-set census reported in this file
+                                    // after the fix landed, matching against
+                                    // another tier's chain. The history lives in
+                                    // `kCompositeKindTable`'s header, which sits
+                                    // beside the rows and cannot go stale
+                                    // independently of them.
                                     coll.emit(DiagnosticCode::C_InvalidSemantics,
                                               path + "/fieldChildren/compositeKind",
                                               std::format("'compositeKind' must be a string, "
@@ -9507,15 +9645,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             if (!entry.at("nameMatch").is_string()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/nameMatch",
-                                          "'nameMatch' must be a string");
+                                          std::format("'nameMatch' must be a string, {}",
+                                                      nameMatchAllowedList()));
                             } else {
-                                auto m = parseNameMatch(entry.at("nameMatch").get<std::string>());
+                                auto m = nameMatchModeFromName(
+                                    entry.at("nameMatch").get<std::string>());
                                 if (!m) {
                                     coll.emit(DiagnosticCode::C_InvalidSemantics,
                                               path + "/nameMatch",
-                                              std::format("unknown nameMatch '{}' (expected "
-                                                          "'self' or 'lastIdentifier')",
-                                                          entry.at("nameMatch").get<std::string>()));
+                                              std::format("unknown nameMatch '{}' (expected {})",
+                                                          entry.at("nameMatch").get<std::string>(),
+                                                          nameMatchAllowedList()));
                                 } else {
                                     rule.nameMatch = *m;
                                 }
@@ -9820,15 +9960,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             if (!entry.at("nameMatch").is_string()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/nameMatch",
-                                          "'nameMatch' must be a string");
+                                          std::format("'nameMatch' must be a string, {}",
+                                                      nameMatchAllowedList()));
                             } else {
-                                auto m = parseNameMatch(entry.at("nameMatch").get<std::string>());
+                                auto m = nameMatchModeFromName(
+                                    entry.at("nameMatch").get<std::string>());
                                 if (!m) {
                                     coll.emit(DiagnosticCode::C_InvalidSemantics,
                                               path + "/nameMatch",
-                                              std::format("unknown nameMatch '{}' (expected "
-                                                          "'self' or 'lastIdentifier')",
-                                                          entry.at("nameMatch").get<std::string>()));
+                                              std::format("unknown nameMatch '{}' (expected {})",
+                                                          entry.at("nameMatch").get<std::string>(),
+                                                          nameMatchAllowedList()));
                                 } else {
                                     rule.nameMatch = *m;
                                 }
@@ -10240,7 +10382,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         if (!entry.contains("constructor") || !entry.at("constructor").is_string()) {
                             coll.emit(DiagnosticCode::C_MissingField, path + "/constructor",
-                                      "'constructor' is required and must be a string");
+                                      std::format("'constructor' is required and must be a "
+                                                  "string, one of {}",
+                                                  constructorAllowedList()));
                             continue;
                         }
                         TypeShapeRule rule;
@@ -10252,13 +10396,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         rule.rule = data.rules->find(rule.ruleName);
-                        auto c = parseConstructor(entry.at("constructor").get<std::string>());
+                        auto c = typeConstructorFromName(
+                            entry.at("constructor").get<std::string>());
                         if (!c) {
                             coll.emit(DiagnosticCode::C_InvalidSemantics, path + "/constructor",
-                                      std::format("unknown type constructor '{}' (expected "
-                                                  "'pointer', 'reference', 'nullable', "
-                                                  "'optional', or 'slice')",
-                                                  entry.at("constructor").get<std::string>()));
+                                      std::format("unknown type constructor '{}' (expected {})",
+                                                  entry.at("constructor").get<std::string>(),
+                                                  constructorAllowedList()));
                             continue;
                         }
                         rule.constructor = *c;
@@ -11302,26 +11446,33 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // block written before this field keeps C's behavior. An
                     // unknown spelling fails loud (never a silent default).
                     if (obj.contains("shiftResult")) {
+                        // ONE owner — `kShiftResultRuleTable`
+                        // (semantic_config.hpp, beside the enum) — and both
+                        // sentences render from it.
+                        auto const shiftResultAllowed = [] {
+                            return renderAllowedList(allNames(kShiftResultRuleTable),
+                                                     " or ");
+                        };
                         if (!obj.at("shiftResult").is_string()) {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       "/semantics/arithmeticConversions/"
                                       "shiftResult",
-                                      "'shiftResult' must be a string (closed verb)");
+                                      std::format("'shiftResult' must be a string "
+                                                  "(closed verb) — expected {}",
+                                                  shiftResultAllowed()));
                             ok = false;
                         } else {
                             auto const verb =
                                 obj.at("shiftResult").get<std::string>();
-                            if (verb == "promotedLeft") {
-                                ac.shiftResult = ShiftResultRule::PromotedLeft;
-                            } else if (verb == "commonType") {
-                                ac.shiftResult = ShiftResultRule::CommonType;
+                            if (auto const parsed = shiftResultRuleFromName(verb)) {
+                                ac.shiftResult = *parsed;
                             } else {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           "/semantics/arithmeticConversions/"
                                           "shiftResult",
                                           std::format("unknown 'shiftResult' verb "
-                                                      "'{}' — expected 'promotedLeft' "
-                                                      "or 'commonType'", verb));
+                                                      "'{}' — expected {}", verb,
+                                                      shiftResultAllowed()));
                                 ok = false;
                             }
                         }
@@ -11438,15 +11589,34 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         if (roleOk) out = std::move(rule);
                     };
-                    // The closed ROLE set, DERIVED FROM THE DISPATCH below — the
-                    // refusal is hoisted out of the `else` arm so the table and
-                    // the dispatch cannot drift apart silently: adding a role to
-                    // one without the other is now either an unreachable table
-                    // entry or a refused-but-dispatched key, and both are
-                    // visible here rather than spread over two constructs.
-                    static constexpr std::array<std::string_view, 3>
-                        kSynthesizedTypeRoles{"sizeof", "alignof",
-                                              "pointerDifference"};
+                    // ── THE TABLE IS THE DISPATCH KEY ──────────────────────
+                    //
+                    // ★★ THE COMMENT THIS REPLACED CLAIMED the name array and
+                    // the `if (key == …)` cascade below "cannot drift apart
+                    // silently … both are visible here". That is a statement
+                    // about PROXIMITY, and proximity guarantees nothing: a
+                    // fourth role added to the array and not to the cascade
+                    // would have been ACCEPTED by `checkKeysAgainst` and then
+                    // silently DROPPED — a declared role that loads clean, ends
+                    // up unset, and leaves every consumer on the anonymous core
+                    // this block exists to replace. Two owners of one fact,
+                    // where one of them is a router
+                    // (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN).
+                    //
+                    // Pairing each role name with the MEMBER it fills makes the
+                    // ONE table both the vocabulary and the dispatch: a row
+                    // cannot be added without naming its slot, and the key set
+                    // is PROJECTED from it by `keysOf` rather than retyped.
+                    using RoleSlot = SynthesizedTypeRule SemanticConfig::*;
+                    static constexpr std::array<std::pair<std::string_view, RoleSlot>, 3>
+                        kSynthesizedTypeRoleRows{{
+                            {"sizeof",            &SemanticConfig::sizeofResultType},
+                            {"alignof",           &SemanticConfig::alignofResultType},
+                            {"pointerDifference", &SemanticConfig::pointerDifferenceType},
+                        }};
+                    static constexpr auto kSynthesizedTypeRoles =
+                        keysOf(kSynthesizedTypeRoleRows,
+                               [](auto const& r) { return r.first; });
                     DSS_CHECK_KEY_VOCABULARY(kSynthesizedTypeRoles);
                     (void)checkKeysAgainst(
                         obj, kSynthesizedTypeRoles,
@@ -11456,9 +11626,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         "each key names a closed engine ROLE, not a type name");
                     for (auto const& [key, _] : obj.items()) {
                         if (isDocumentationKey(key)) continue;
-                        if (key == "sizeof")                 readRole(key, cfg.sizeofResultType);
-                        else if (key == "alignof")           readRole(key, cfg.alignofResultType);
-                        else if (key == "pointerDifference") readRole(key, cfg.pointerDifferenceType);
+                        for (auto const& [roleName, slot] : kSynthesizedTypeRoleRows) {
+                            if (key != roleName) continue;
+                            readRole(key, cfg.*slot);
+                            break;
+                        }
                     }
                 }
             }
@@ -12398,7 +12570,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT).
                         // That correctly extends the unknown-key loop below —
                         // but note what `DSS_CHECK_KEY_VOCABULARY` does and does
-                        // NOT do: MEASURED at `config_key_vocabulary.hpp:92-97`,
+                        // NOT do: MEASURED at `isWellFormedKeyVocabulary`,
                         // it is a `static_assert` on ARRAY WELL-FORMEDNESS only
                         // (no empty / duplicate entries, count matches the
                         // declared size). It says nothing whatsoever about a
@@ -14372,21 +14544,29 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     if (!sj.is_object() || !sj.contains("lower")
                                         || !sj.at("lower").is_string()) {
                                         coll.emit(DiagnosticCode::C_InvalidHirLowering, sPath,
-                                                  "each childGathering slot needs a string 'lower'");
+                                                  std::format("each childGathering slot needs a "
+                                                              "string 'lower' — one of {}",
+                                                              renderAllowedList(
+                                                                  allNames(kChildLowerTable), "/")));
                                         continue;
                                     }
                                     ChildSlotSpec slot;
-                                    {   // map the `lower` verb string → ChildLower (closed set)
+                                    {   // map the `lower` verb string → ChildLower (closed set).
+                                        // ONE owner — `kChildLowerTable`
+                                        // (hir_lowering_config.hpp, beside the enum). The
+                                        // refusal this replaced rendered its five names
+                                        // UNQUOTED, which is why no census setting could see
+                                        // this site at all; the quoting now comes from the
+                                        // shared renderer and is not a per-site choice.
                                         auto const lv = sj.at("lower").get<std::string>();
-                                        if      (lv == "expr")     slot.lower = ChildLower::Expr;
-                                        else if (lv == "flatExpr") slot.lower = ChildLower::FlatExpr;
-                                        else if (lv == "ext")      slot.lower = ChildLower::Ext;
-                                        else if (lv == "ref")      slot.lower = ChildLower::Ref;
-                                        else if (lv == "varDecl")  slot.lower = ChildLower::VarDecl;
-                                        else {
+                                        if (auto const parsed = childLowerFromName(lv)) {
+                                            slot.lower = *parsed;
+                                        } else {
                                             coll.emit(DiagnosticCode::C_InvalidHirLowering, sPath + "/lower",
                                                       std::format("unknown childGathering lower verb '{}' "
-                                                                  "(expected expr/flatExpr/ext/ref/varDecl)", lv));
+                                                                  "(expected {})", lv,
+                                                                  renderAllowedList(
+                                                                      allNames(kChildLowerTable), "/")));
                                             continue;
                                         }
                                     }

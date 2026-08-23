@@ -600,7 +600,7 @@ TEST(AsmTemplateToLir, TemplateAndStandaloneAgreeByteForByte) {
 // NO producer anywhere outside `src/asm/` (`grep -rn cntvct src/ --include=*.cpp
 // --include=*.hpp` returns exactly one hit, a comment), and
 // `semantic_analyzer.cpp` REFUSES every GNU inline-asm statement carrying a
-// payload or a qualifier at the SEMANTIC tier — sqlite's `src/hwtime.h:43`
+// payload or a qualifier at the SEMANTIC tier — sqlite's `src/hwtime.h`
 // parses and is then rejected with one precise diagnostic
 // (D-CSUBSET-INLINE-ASM-TEXT is open, and emitting real asm text is a codegen
 // question P1 does not touch). So C cannot reach the counter read today, and a

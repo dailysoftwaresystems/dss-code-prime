@@ -18,7 +18,7 @@
 //     `<Windows.h>` rc=1 error[F001A];
 //   * the SAME tree via /mnt/c DrvFs (case-insensitive): BOTH rc=0.
 // Two failure directions came out of that, and the second is the worse:
-//   1. WRONG REJECT — `sqlite3.c:67322`'s `#include <Windows.h>` (capital W,
+//   1. WRONG REJECT — `sqlite3.c`'s `#include <Windows.h>` (capital W,
 //      live whenever `SQLITE_USE_SEH` is on, which DSS's pe64 `_MSC_VER`
 //      predefine turns on) cannot be compiled for a WINDOWS target from a
 //      case-sensitive host.

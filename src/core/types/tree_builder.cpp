@@ -271,7 +271,7 @@ void TreeBuilder::propagateHasError_(NodeId start) noexcept {
     // ancestor isn't truncated; its flag is). Result: a failed
     // speculative branch that pushed an Error leaf would corrupt the
     // committed work's HasError flag chain. The frame-close OR-reduce
-    // loop in `closeTopFrame_` (around tree_builder.cpp:472-474)
+    // loop in `closeTopFrame_`
     // correctly OR-reduces HasError from EACH frame's children into
     // the closing parent ONLY when the frame commits — work that
     // rolls back never reaches its close, so its Error leaves never

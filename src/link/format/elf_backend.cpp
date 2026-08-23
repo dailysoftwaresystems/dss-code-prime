@@ -50,6 +50,14 @@ namespace {
 
 char const* const kElfBlocks[] = { "elf" };
 
+// D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS. The weak-
+// definition spellings THIS backend's walker writes. One row: `elf.cpp` spells
+// a weak definition as STB_WEAK and nothing else, so an ELF document declaring
+// `comdat` or `symbol-flag` is refused at LOAD rather than at emit.
+constexpr WeakDefinitionDialect kElfWeakDialects[] = {
+    WeakDefinitionDialect::SymbolBinding,
+};
+
 // ── The three ELF header vocabularies that have no `EnumNameTable` ────────
 // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET.
 //
@@ -130,6 +138,16 @@ public:
         // vehicle is what makes a stack-reserve request against an ELF format
         // fail loud instead of being written into a field nothing reads.
         return {};
+    }
+    [[nodiscard]] std::span<WeakDefinitionDialect const>
+    weakDefinitionDialects() const noexcept override {
+        // ELF puts the weakness in the SYMBOL's binding field — STB_WEAK in
+        // the high nibble of `st_info`, written by `elf.cpp`'s
+        // `stbForBinding`. No section flag and no per-symbol side flag is
+        // involved, which is exactly what distinguishes this dialect from the
+        // other two. The row is
+        // D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS.
+        return kElfWeakDialects;
     }
 
     [[nodiscard]] bool

@@ -4043,9 +4043,9 @@ TEST(ShippedLibDescriptor, MacroVariantNoMatchNotInjected) {
 // ⇒ `selected == false` ⇒ the typedef is not injected — the `off64_t` mechanism).
 //
 // ✔MEASURED availability, per name, against three reference header sets rather
-// than asserted: musl (emsdk sysroot sys/types.h:63-69) and bionic (Android NDK
-// sysroot sys/types.h:54,136-139) declare the first seven; mingw-w64 x86_64
-// sys/types.h declares NONE of the nine; the macOS SDK sys/types.h:84-128
+// than asserted: musl (emsdk sysroot sys/types.h) and bionic (Android NDK
+// sysroot sys/types.h) declare the first seven; mingw-w64 x86_64
+// sys/types.h declares NONE of the nine; the macOS SDK sys/types.h
 // declares all nine. So the split pinned here is elf+macho for the seven,
 // macho-ONLY for `fixpt_t`/`segsz_t` (absent from BOTH linux libcs), and NONE on
 // pe.
@@ -4312,7 +4312,7 @@ TEST(ShippedLibDescriptor, RealSysTimeItimervalByNameComposite) {
 }
 
 // REAL <sys/stat.h> macho `st_mtimespec` — the second by-name consumer
-// (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME). sqlite os_unix.c:7731 assigns the WHOLE
+// (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME). sqlite os_unix.c assigns the WHOLE
 // member (`conchModTime = buf.st_mtimespec;`), so it must be a by-value composite,
 // and it OVERLAYS the flat st_mtim_sec/st_mtim_nsec pair the st_mtime macro still
 // maps onto — hence the c107 explicit-offset channel for this variant.
@@ -5729,12 +5729,12 @@ TEST(ShippedLibDescriptor, TypedefDataModelVariantSelectsAndFailsLoud) {
 // ── TF-C92: the real <sys/ioctl.h> request-ENCODING macros, per format ────────
 //
 // sqlite/src/os_unix.c uses this header's macros at TWO measured sites — macho
-// os_unix.c:2986 `_IOWR('z', 23, struct ByteRangeLockPB2)` (consumed at :3013 by
-// `fsctl`), and elf os_unix.c:392-396 `_IO` x4 + `_IOR` x1 under `#ifdef
+// os_unix.c `_IOWR('z', 23, struct ByteRangeLockPB2)` (consumed by
+// `fsctl`), and elf os_unix.c `_IO` x4 + `_IOR` x1 under `#ifdef
 // __linux__`. Because an angle include resolves to DESCRIPTORS ONLY (the real
 // <sys/ioccom.h> text is never read), a missing row let `_IOWR` reach the parser
 // as a call whose 3rd argument is a TYPE-NAME: `error[P0009] … got 'struct'` at
-// os_unix.c:2986:56 — MEASURED as the sole diagnostic in that TU, and MEASURED to
+// that `_IOWR` use — MEASURED as the sole diagnostic in that TU, and MEASURED to
 // come back the instant the `_IOWR` row (or just its macho variant) is removed.
 //
 // The two OSes disagree on the DIRECTION FIELD ENTIRELY — Darwin gives each
@@ -6121,7 +6121,7 @@ TEST(ShippedLibDescriptor, RealStdlibJsonMallocZoneMachoOnly) {
         DarwinBsdClusterRead m;
         ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
                                                      ObjectFormatKind::MachO, m));
-        // malloc/malloc.h:390 `malloc_zone_t *malloc_default_zone(void)`
+        // malloc/malloc.h `malloc_zone_t *malloc_default_zone(void)`
         expectMachoOnlyFn(m, "malloc_default_zone", K::Ptr, {}, {}, K::Void);
         // :394 `malloc_zone_t *malloc_create_zone(vm_size_t, unsigned)` —
         // vm_size_t is 8-byte unsigned, `unsigned flags` is u32.
@@ -6321,10 +6321,10 @@ TEST(ShippedLibDescriptor, RealUnistdJsonFsctlMachoOnly) {
         DarwinBsdClusterRead m;
         ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
                                                      ObjectFormatKind::MachO, m));
-        // SDK unistd.h:785 `int fsctl(const char *, unsigned long, void *,
+        // SDK unistd.h `int fsctl(const char *, unsigned long, void *,
         // unsigned int)` — the FULL 4-param shape must decode: the u64 request
         // param is the one the sys/ioctl.json _IOWR encoding widens into at
-        // sqlite os_unix.c:3013, so a truncated/reordered decode here would
+        // sqlite os_unix.c, so a truncated/reordered decode here would
         // corrupt that call's request value silently.
         expectMachoOnlyFn(m, "fsctl", K::I32,
                           {K::Ptr, K::U64, K::Ptr, K::U32},
@@ -6384,19 +6384,19 @@ TEST(ShippedLibDescriptor, RealUnistdJsonDarwinFsSysctlMachoOnly) {
         DarwinBsdClusterRead m;
         ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
                                                      ObjectFormatKind::MachO, m));
-        // SDK sys/fcntl.h:616 `int flock(int, int)` — NOT sys/file.h, whose
+        // SDK sys/fcntl.h `int flock(int, int)` — NOT sys/file.h, whose
         // __BEGIN_DECLS block is EMPTY (it only re-includes sys/fcntl.h).
         expectMachoOnlyFn(m, "flock", K::I32, {K::I32, K::I32},
                           {std::nullopt, std::nullopt});
-        // SDK sys/mount.h:460/:442. `struct statfs *` keeps the fsctl/futimes
+        // SDK sys/mount.h. `struct statfs *` keeps the fsctl/futimes
         // opaque ptr<void> spelling — no consumer needs its layout, and the
         // real type still reaches mem1.c/os_unix.c through the SDK header.
         expectMachoOnlyFn(m, "statfs", K::I32, {K::Ptr, K::Ptr},
                           {K::Char, K::Void});
         expectMachoOnlyFn(m, "fstatfs", K::I32, {K::I32, K::Ptr},
                           {std::nullopt, K::Void});
-        // SDK sys/sysctl.h:800 `int sysctl(int *, u_int, void *, size_t *,
-        // void *, size_t)` — u_int is 4-byte unsigned (sys/_types/_u_int.h:30),
+        // SDK sys/sysctl.h `int sysctl(int *, u_int, void *, size_t *,
+        // void *, size_t)` — u_int is 4-byte unsigned (sys/_types/_u_int.h),
         // size_t/size_t* are 8-byte unsigned on every macho64 format (all eight
         // declare dataModel LP64), which is exactly why the row may ship a FLAT
         // signature with no signatureByDataModel.
@@ -6404,7 +6404,7 @@ TEST(ShippedLibDescriptor, RealUnistdJsonDarwinFsSysctlMachoOnly) {
                           {K::Ptr, K::U32, K::Ptr, K::Ptr, K::Ptr, K::U64},
                           {K::I32, std::nullopt, K::Void, K::U64, K::Void,
                            std::nullopt});
-        // SDK sys/sysctl.h:802 — same tail, name-keyed head.
+        // SDK sys/sysctl.h — same tail, name-keyed head.
         expectMachoOnlyFn(m, "sysctlbyname", K::I32,
                           {K::Ptr, K::Ptr, K::Ptr, K::Ptr, K::U64},
                           {K::Char, K::Void, K::U64, K::Void, std::nullopt});
@@ -6457,8 +6457,8 @@ TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {
     };
 
     // ── macho (both arches): uuid_t PRESENT as Array of U8, length 16 ──
-    // `typedef unsigned char __darwin_uuid_t[16]` (SDK sys/_types.h:89) — the
-    // 16 is load-bearing: sqlite os_unix.c:7607 asserts PROXY_HOSTIDLEN ==
+    // `typedef unsigned char __darwin_uuid_t[16]` (SDK sys/_types.h) — the
+    // 16 is load-bearing: sqlite os_unix.c asserts PROXY_HOSTIDLEN ==
     // sizeof(uuid_t), and the shipped_bsd_random_futimes_uuid_macho corpus
     // exit arithmetic IS sizeof(uuid_t).
     for (std::string_view arch : {"x86_64", "arm64"}) {
@@ -6501,7 +6501,7 @@ TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {
 // D-FFI-DARWIN-SYSCTL-CONSTANTS-EMPTY — the DECLARED numbers of the Darwin
 // sysctl MIB constants, and the COMPLETENESS of the two domains they form.
 //
-// sqlite src/test1.c:9100-9104 addresses hw.availcpu / hw.ncpu by MIB ARRAY
+// sqlite src/test1.c addresses hw.availcpu / hw.ncpu by MIB ARRAY
 // (`nm[0] = CTL_HW; nm[1] = HW_AVAILCPU;`), which is why CTL_HW / HW_NCPU /
 // HW_AVAILCPU had to ship at all; the other 36 rows are here because a PARTIAL
 // constant domain is the trap sys/file.json's LOCK_* comment names — a name
@@ -6572,7 +6572,7 @@ TEST(ShippedLibDescriptor, RealSysSysctlJsonMibConstantDomains) {
         // failure says WHY the row exists rather than only that a number moved.
         for (auto const* n : {"CTL_HW", "HW_NCPU", "HW_AVAILCPU"})
             ASSERT_NE(find(n), nullptr)
-                << n << " is referenced by sqlite src/test1.c:9100-9104 — "
+                << n << " is referenced by sqlite src/test1.c — "
                         "without it the macho testfixture does not compile "
                         "(error[S0001], MEASURED)";
 
@@ -6711,7 +6711,7 @@ TEST(ShippedLibDescriptor, RealTimeAndSysStatShareOneTimespecTypeId) {
     ASSERT_NE(mtimespec, nullptr) << "the macho variant must carry st_mtimespec";
     EXPECT_EQ(mtimespec->type, fromTime->typeId)
         << "`stat.st_mtimespec` must denote the SAME timespec `struct timespec "
-           "x;` resolves to — this is the assignment sqlite os_unix.c:7731 makes";
+           "x;` resolves to — this is the assignment sqlite os_unix.c makes";
 
     // Positive control: the shared type is the real 16-byte {i64,i64}, so the
     // EQ above cannot pass vacuously on two invalid/empty ids.

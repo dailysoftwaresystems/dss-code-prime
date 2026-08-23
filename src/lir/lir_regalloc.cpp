@@ -85,16 +85,20 @@ buildFreeLists(TargetSchema const&            schema,
                std::optional<std::uint16_t> reservedFramePointer = std::nullopt) {
     FreeListsByClass out{};
 
+    // D-TARGET-ALLOCATABLE-POOL-LIST-SET-HAS-NO-OWNER: the six cc lists that
+    // make a register allocatable used to be spelled out HERE and again in
+    // `lir_rewrite::collectAllocatable`, two hand-kept copies of one set. They
+    // now read the same published table, `kAllocatablePoolLists`
+    // (target_schema.hpp), which is also what `TargetSchemaData::validate()`
+    // judges — so the set the allocator absorbs and the set the loader
+    // validates are the same object rather than two lists that agree today.
+    // ⚠ `argVrs`/`returnVrs` are DELIBERATELY not in that table; adding them
+    // is refused at LOAD on any target whose vector and float views alias
+    // (D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE).
     std::unordered_set<std::string_view> allocatable;
-    auto absorb = [&](std::vector<std::string> const& names) {
-        for (auto const& n : names) allocatable.insert(n);
-    };
-    absorb(cc.callerSaved);
-    absorb(cc.calleeSaved);
-    absorb(cc.argGprs);
-    absorb(cc.argFprs);
-    absorb(cc.returnGprs);
-    absorb(cc.returnFprs);
+    for (auto const list : kAllocatablePoolLists) {
+        for (auto const& n : cc.*list) allocatable.insert(n);
+    }
 
     std::unordered_set<std::string_view> callerSet;
     callerSet.reserve(cc.callerSaved.size());

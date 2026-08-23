@@ -177,6 +177,34 @@ public:
     [[nodiscard]] virtual std::span<StackReserveVehicle const>
     stackReserveVehicles() const noexcept = 0;
 
+    // The `weakDefinition.dialect` values this backend's WALKER actually
+    // SPELLS. The `stackReserveVehicles()` shape, asked of the other config
+    // vocabulary whose rows name an encoder: the loader asks *"does anyone
+    // implement this dialect, and is it you?"*, so a document declaring a
+    // dialect no walker writes — or one written by a DIFFERENT backend — is
+    // refused at LOAD instead of at the first weak definition, which may be
+    // months later and on a machine nobody is watching. Empty for every
+    // backend whose walker spells none.
+    //
+    // ★★ WHY THIS EXISTS ONLY NOW, AND NOT WHEN THE KEY LANDED.
+    // D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED shipped with exactly ONE
+    // consulting writer, and a load-time coherence check with one row to check
+    // is a mechanism built ahead of its second consumer — the thing the bar
+    // forbids in the other direction. The second, third, fourth and fifth
+    // consumers arrive in the SAME change as this accessor
+    // (D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS),
+    // which is the precondition that row wrote down for itself.
+    //
+    // ★ AND IT IS A CAPABILITY QUERY, NOT AN IDENTITY QUERY, in the sense the
+    // header note above makes load-bearing: `weakDefinitionDialects()` is a
+    // property of the WALKER, and the per-FORMAT question ("did THIS document
+    // declare a block?") stays on the schema. Both halves are needed and they
+    // are not the same question — the pe object document declares `comdat`
+    // while `pe64-x86_64-windows-exec` declares nothing, and both resolve to
+    // the same backend.
+    [[nodiscard]] virtual std::span<WeakDefinitionDialect const>
+    weakDefinitionDialects() const noexcept = 0;
+
     // ── Capability predicates (NEVER identity predicates) ───────────────
 
     // Does this schema describe a LOAD-TIME-BOUND image (ELF ET_EXEC/ET_DYN,

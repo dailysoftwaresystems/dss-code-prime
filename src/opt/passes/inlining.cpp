@@ -354,8 +354,9 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // never spilled the varargs) → `ap` reads garbage. This is the universal "a
             // variadic function that calls va_start is not inlinable" rule. (These three
             // leaves ALSO triple as lir_callconv's "this function called va_start"
-            // prologue-spill signal — see mir_opcode.hpp:103,148 — so their PRESENCE is
-            // exactly the frame-binding condition; a degenerate variadic that never calls
+            // prologue-spill signal — see `VaRegSaveAreaAddr`'s note in mir_opcode.hpp —
+            // so their PRESENCE is exactly the frame-binding condition; a
+            // degenerate variadic that never calls
             // va_start has no such leaf and stays inlinable, which is safe.) Fail-SAFE
             // (forgoes the optimization, never miscompiles); reachable under the shipped
             // release.pipeline.json (which runs Inlining) — a REAL silent-miscompile fix,

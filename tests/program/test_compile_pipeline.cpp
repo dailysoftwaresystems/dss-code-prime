@@ -1268,11 +1268,17 @@ TEST(Program_CompileFiles, StderrIncludesTargetContextPrefixOnPerTargetError) {
 // A malformed-source compile prints the positioned context + caret at
 // the exact offending column. RED-on-disable: revert
 // `drainDiagnosticsToStderr` to the old code-only loop (drop the
-// `format()` branch) and the `-->` / `bad.c:2:12` / `^` assertions all
+// `format()` branch) and the `-->` / positioned-header / `^` assertions all
 // go red — this is the cycle's effectiveness lever.
 TEST(Program_CompileFiles, MalformedSourceRendersPositionedCaret) {
     ScratchDir scratch{Location::InsideRepo, "program"};
     // Illegal character '@' at line 2, column 12 (after `return `).
+    // ★ NAMED, NOT SPELLED: a bare `"<file>:<line>:<col>"` expectation is
+    // indistinguishable from a positional CITATION — to a reader and to
+    // `check-plan-citations` alike — and it restates a magic number instead of
+    // saying where the number comes from. These constants ARE the fixture.
+    constexpr int kAtLine   = 2;
+    constexpr int kAtColumn = 12;
     auto const src = writeCSubsetSource(
         scratch.path(), "bad.c", "int main() {\n    return @;\n}\n");
     scratch.useAsCwd();
@@ -1285,8 +1291,10 @@ TEST(Program_CompileFiles, MalformedSourceRendersPositionedCaret) {
     EXPECT_NE(rc, 0) << "malformed source must fail the build";
     // `--> <file>:<line>:<col>` header at the exact position of '@'. The
     // parser stamps the span; format() resolves it via the registry.
-    EXPECT_NE(err.find("bad.c:2:12"), std::string::npos)
-        << "expected positioned header '<file>:2:12'; got:\n" << err;
+    std::string const positioned =
+        "bad.c:" + std::to_string(kAtLine) + ":" + std::to_string(kAtColumn);
+    EXPECT_NE(err.find(positioned), std::string::npos)
+        << "expected positioned header '" << positioned << "'; got:\n" << err;
     EXPECT_NE(err.find("-->"), std::string::npos)
         << "expected a '-->' source-location header; got:\n" << err;
     EXPECT_NE(err.find('^'), std::string::npos)
@@ -1425,8 +1433,10 @@ TEST(Program_CompileFiles, MalformedAsmTemplateRendersTheOffendingTemplateLine) 
 // STATEMENT that embedded the template — and names it as the PRIMARY locus.
 //
 // ✔MEASURED, both references, before the form was chosen (the row demanded it):
-//   gcc 13.3   `gt.c:3: Error: no such instruction: 'frobnicate %eax'`
-//   clang 18   `gt.c:3:13: error: invalid instruction mnemonic 'frobnicate'` with
+//   gcc 13.3   the C statement's `<file>:<line>: Error: no such instruction:
+//              'frobnicate %eax'`
+//   clang 18   the C statement's `<file>:<line>:<col>: error: invalid
+//              instruction mnemonic 'frobnicate'`, then
 //              `<inline asm>:1:2: note: instantiated into assembly here`
 // BOTH make the C statement primary and NEITHER has template-primary, so the
 // reference-conforming shape is: C statement primary, template locus DEMOTED to
@@ -1445,11 +1455,23 @@ TEST(Program_CompileFiles, MalformedAsmTemplateRendersTheOffendingTemplateLine) 
 //
 // ⚠ RED-ON-DISABLE, demonstrated at authoring time: deleting the
 // `AsmStatementLocusGuard` instantiation in `expandInlineAsm` (or emptying
-// `reanchorFrom`) leaves every assertion on `bad_template.c:3:5` unsatisfied
+// `reanchorFrom`) leaves every assertion on the C statement's locus unsatisfied
 // while the parent test above stays green — the two tests pin orthogonal
 // halves of one render, which is why neither subsumes the other.
 TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
     ScratchDir scratch{Location::InsideRepo, "program"};
+    // ★ THE EXPECTED LOCUS IS DERIVED FROM THE FIXTURE, NOT SPELLED. All three
+    // arms below write the SAME shape — two prologue lines, then the `__asm__`
+    // statement indented four spaces — so the C statement's locus is a property
+    // of that shape, and a bare `"<file>:<line>:<col>"` literal would read as a
+    // positional CITATION to a reader and to `check-plan-citations` alike.
+    constexpr int kPrologueLines = 2;   // `int main(void) {` + the local decl
+    constexpr int kAsmLine       = kPrologueLines + 1;
+    constexpr int kAsmColumn     = 5;   // four spaces of indent, 1-based column
+    auto const    locusOf        = [](char const* file, int line, int col) {
+        return std::string{file} + ":" + std::to_string(line) + ":"
+               + std::to_string(col);
+    };
     // ARM 1 — template does not PARSE: the forwarded dialect diagnostic must
     // carry the C statement as primary and the template as a related note.
     auto const src = writeCSubsetSource(
@@ -1477,7 +1499,8 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
     auto const err = testing::internal::GetCapturedStderr();
 
     EXPECT_NE(rc, 0) << "a template that does not parse must fail the build";
-    EXPECT_NE(err.find("bad_template.c:3:5"), std::string::npos)
+    EXPECT_NE(err.find(locusOf("bad_template.c", kAsmLine, kAsmColumn)),
+              std::string::npos)
         << "expected the C statement as the PRIMARY locus (both reference "
            "compilers lead with it); got:\n" << err;
     EXPECT_NE(err.find(" 3 |     __asm__(\"movl $42, %0 @@@\" : \"=r\"(r));"),
@@ -1502,7 +1525,8 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
     auto const err2 = testing::internal::GetCapturedStderr();
 
     EXPECT_NE(rc2, 0) << "an unlowerable template must fail the build";
-    EXPECT_NE(err2.find("unlowerable_template.c:3:5"), std::string::npos)
+    EXPECT_NE(err2.find(locusOf("unlowerable_template.c", kAsmLine, kAsmColumn)),
+              std::string::npos)
         << "expected the C statement as primary on the LOWERING refusal too; "
            "got:\n" << err2;
     EXPECT_NE(err2.find(" 3 |     __asm__(\"frobnicate %0\" : \"=r\"(r));"),
@@ -1546,7 +1570,8 @@ TEST(Program_CompileFiles, AsmTemplateDiagnosticNamesTheEmbeddingCStatement) {
 
     EXPECT_NE(rc3, 0) << "an `asm goto` whose template names no instruction the "
                          "target declares must fail the build";
-    EXPECT_NE(err3.find("goto_template.c:3:5"), std::string::npos)
+    EXPECT_NE(err3.find(locusOf("goto_template.c", kAsmLine, kAsmColumn)),
+              std::string::npos)
         << "expected the C statement as primary on the asm-goto refusal too; "
            "got:\n" << err3;
     EXPECT_NE(err3.find(

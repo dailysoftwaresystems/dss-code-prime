@@ -2588,7 +2588,7 @@ TEST(GrammarSchema, AttributeEffectEmptyNameStringReportsInvalid) {
 // `appliesTo` names the entity kinds an attribute may appertain to, and the
 // semantic tier's ONE shared decl-kind gate walks it. Its VALUE therefore needs
 // real validation — `DSS_CHECK_KEY_VOCABULARY` does NOT provide any: MEASURED at
-// `config_key_vocabulary.hpp:92-97`, it is a `static_assert` on array
+// `isWellFormedKeyVocabulary`, it is a `static_assert` on array
 // WELL-FORMEDNESS only (no empty/duplicate KEY NAMES) and says nothing about a
 // key's contents. Growing `kEffectRowKeys` 2 → 3 correctly extends the
 // unknown-KEY loop; everything below is about the VALUE.

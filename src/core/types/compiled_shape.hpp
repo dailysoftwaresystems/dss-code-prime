@@ -1,11 +1,14 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"  // EnumNameTable (kTypeNameCommitPolarityTable)
 #include "core/types/rule_id.hpp"
 #include "core/types/strong_ids.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -43,6 +46,28 @@ enum class TypeNameCommitPolarity : std::uint8_t {
     PreferType,
     RequireKnownType,
 };
+
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// `shapes[].commitRequiresTypeName.polarity`, whose two spellings were owned by
+// an inline `p == "preferType" / "requireKnownType"` chain in the grammar
+// loader with TWO sentences beside it restating them. `PreferType` is row 0,
+// matching the loader's own default for the object form.
+inline constexpr EnumNameTable<TypeNameCommitPolarity, 2>
+    kTypeNameCommitPolarityTable{{{
+        { TypeNameCommitPolarity::PreferType,       "preferType"       },
+        { TypeNameCommitPolarity::RequireKnownType, "requireKnownType" },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kTypeNameCommitPolarityTable);
+
+[[nodiscard]] constexpr std::string_view
+typeNameCommitPolarityName(TypeNameCommitPolarity p) noexcept {
+    return kTypeNameCommitPolarityTable.name(p);
+}
+[[nodiscard]] constexpr std::optional<TypeNameCommitPolarity>
+typeNameCommitPolarityFromName(std::string_view s) noexcept {
+    return kTypeNameCommitPolarityTable.fromName(s);
+}
 
 namespace detail {
 

@@ -51,7 +51,7 @@ enum class HeaderReadErrorKind : std::uint8_t {
 // errors that have no node-level locus (FileOpenFailed / EmptyImportLibrary /
 // GrammarLoadFailed) leave this default-constructed —
 // `at.isAbsent() == true`, the canonical "no source location" value per
-// `hir/attributes/source_span.hpp:30-60`. No `std::optional` wrapper —
+// `HirSourceLoc` in `hir/attributes/source_span.hpp`. No `std::optional` wrapper —
 // `HirSourceLoc{}` is already the documented absent sentinel (post-fold #7
 // type-design T1 fold: one absence representation, not two; post-fold #9
 // type-design Q1 anchor: `HirSourceLoc::absent()` is the canonical spelling

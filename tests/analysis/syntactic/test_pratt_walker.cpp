@@ -750,7 +750,7 @@ TEST(PrattWalker, MinPrecedenceFloorLeavesLowerOpsUnconsumed) {
 // postfixExpr. This test isolates the AltChoice→RuleLeaf scan path
 // (rather than going through `returnStmt` which carries surrounding
 // machinery) so a regression reverting the `isExprRule` check at
-// `parser.cpp:992` surfaces with a single failing pin.
+// `parser.cpp` surfaces with a single failing pin.
 TEST(PrattWalker, AltChoiceScanRoutesExprRuleThroughWalker) {
     // Tiny synthetic grammar with an `alt` whose ONLY branch is
     // RuleLeaf(expression). The dispatch's AltChoice path scans

@@ -74,28 +74,28 @@ CENSUS_NN_POP
  *    These are the three prefixes TF-C82's macOS-only census could not see. ─ */
 #if defined(_WIN32)
 
-/* sqlite `src/msvc.h:19-33` — MEASURED 15 lines x 112 TUs = 1680 hits. */
+/* sqlite `src/msvc.h` — MEASURED 15 lines x 112 TUs = 1680 hits. */
 #pragma warning(disable : 4054)
 #pragma warning(disable : 4055)
 #pragma warning(disable : 4100)
 #pragma warning(disable : 4127)
 #pragma warning(disable : 4706)
 
-/* sqlite `src/mutex_w32.c:40,41,64` — the push/disable/pop trio. */
+/* sqlite `src/mutex_w32.c` — the push/disable/pop trio. */
 #pragma warning(push)
 #pragma warning(disable : 4324)
 #pragma warning(pop)
 
-/* sqlite `ext/misc/totype.c:504` — the `default : N` shape. */
+/* sqlite `ext/misc/totype.c` — the `default : N` shape. */
 #pragma warning(default : 4748)
 
-/* sqlite `src/sqliteInt.h:312-315` — MEASURED 4 lines x 112 TUs = 448 hits. */
+/* sqlite `src/sqliteInt.h` — MEASURED 4 lines x 112 TUs = 448 hits. */
 #pragma intrinsic(_byteswap_ushort)
 #pragma intrinsic(_byteswap_ulong)
 #pragma intrinsic(_byteswap_uint64)
 #pragma intrinsic(_ReadWriteBarrier)
 
-/* sqlite `ext/misc/totype.c:440,505` — the region. `msvc_no_optimize_marker` is
+/* sqlite `ext/misc/totype.c` — the `#pragma optimize` region. `msvc_no_optimize_marker` is
  * what the non-vacuity twin looks up: it must be STAMPED on the pe leg, proving
  * this arm was reached rather than skipped. */
 #pragma optimize("", off)

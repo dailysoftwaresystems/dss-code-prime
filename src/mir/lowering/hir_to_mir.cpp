@@ -6016,10 +6016,30 @@ struct Lowerer {
         // aggregate-valued Ternary/SeqExpr carriers above are
         // D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR; the compound-literal carrier
         // is the ConstructAggregate arm — D-CSUBSET-BITFIELD-RVALUE-RUNTIME).
+        // ★★★ THE KIND IS NAMED, NOT NUMBERED
+        // (D-MIR-LVALUE-REFUSAL-RENDERS-A-RAW-ORDINAL-NOT-A-NAME). This message
+        // said `lvalue kind ordinal 30 …` — ✔MEASURED reachable from ordinary C
+        // via `__asm__(… : "=r"(1+2))`, so a user reads it — and `30` cost the
+        // reader a trip into `hir_node.hpp` with a counting finger. `HirKind` is
+        // a CLOSED set with a spelling table (`kHirKindTable`), so it is
+        // projected through that table exactly as every other closed-set message
+        // is; the ordinal is kept ALONGSIDE the name because it is the only
+        // thing a `--dump`/bug-report reader can compare against a build whose
+        // enum has since moved.
+        // ⚠ THE EMPTY CASE IS HANDLED RATHER THAN PRINTED. `nameOrEmpty` returns
+        // `""` for a value with no spelling (`Count_`, a registry-minted
+        // extension id that reached a `HirKind` slot, a corrupted node); a
+        // renderer that pasted it would produce `lvalue kind '' …`, which reads
+        // as a compiler that lost the answer rather than one that says the value
+        // is outside the vocabulary.
+        std::string_view const kindName = hirKindName(k);
         unsupported(node, std::format(
-            "lvalue kind ordinal {} not supported by this lowering "
+            "lvalue kind {} (ordinal {}) not supported by this lowering "
             "(only Ref-to-addressable-local, Deref, MemberAccess, Index, "
             "compound-literal ConstructAggregate, aggregate Ternary/SeqExpr)",
+            kindName.empty()
+                ? std::string{"outside the core HirKind vocabulary"}
+                : std::format("'{}'", kindName),
             static_cast<unsigned>(k)));
         return InvalidMirInst;
     }
@@ -9329,6 +9349,71 @@ struct Lowerer {
     // missing one operand is worse than no descriptor: it would hand the allocator a
     // clobber promise for a block whose inputs it cannot see. This mirrors
     // `cst_to_hir.cpp`'s own rule at the tier above.
+    // ★★★ DOES THIS OPERAND'S LETTER BIND THE **MEMORY** FORM? Asked of the
+    // FORM the target declared, never of the letter's spelling: the letter is
+    // `.target.json` vocabulary and a tier that tested `constraint == "m"`
+    // would be an `if (target == …)` wearing a string comparison — the next
+    // target to spell its memory constraint differently would silently miscompile.
+    // `OperandKindFilter::MemBase` is the substrate's own addressing verb (its
+    // `LirOperandKind` partner is what the assembly engine emits), so this
+    // predicate mints nothing.
+    [[nodiscard]] static bool asmOperandBindsMemoryForm(
+        HirInlineAsmOperand const& o) noexcept {
+        return o.operandKindResolved
+               && o.operandKind
+                      == static_cast<std::uint8_t>(OperandKindFilter::MemBase);
+    }
+
+    // ★★★ AND THE **IMMEDIATE** FORM, ASKED THE SAME WAY AND FOR THE SAME
+    // REASON (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED). Both shipped
+    // targets declare `{ "letter": "i", "binds": "operandKind", "operandKind":
+    // "imm32" }`, and `imm32` is the JSON spelling of `OperandKindFilter::ImmInt`
+    // — the SAME closed vocabulary the encoding-variant guards already speak. A
+    // predicate written as `constraint == "i"` would be a target check wearing a
+    // string compare: the next target to spell its immediate constraint
+    // differently (or to bind `i` to something else, which is a machine fact
+    // only its `.target.json` may state) would silently take the wrong arm.
+    // ⇒ NO CONSTRAINT LETTER IS NAMED ANYWHERE IN THIS FILE.
+    [[nodiscard]] static bool asmOperandBindsImmediateForm(
+        HirInlineAsmOperand const& o) noexcept {
+        return o.operandKindResolved
+               && o.operandKind
+                      == static_cast<std::uint8_t>(OperandKindFilter::ImmInt);
+    }
+
+    // ★★ THE CONST-EVAL ENVIRONMENT AN `imm32` OPERAND IS PROVEN IN, and it is
+    // the `classifyGlobals` environment minus the symbol resolver rather than a
+    // new policy. ✔MEASURED, gcc 13.3.0 on BOTH shipped targets: `"i"(7)`,
+    // `"i"(1+2)`, `"i"(K)` for `enum { K = 9 }` and `"i"(sizeof(int))` all
+    // compile (`nop $7 / $3 / $9 / $4`, and the bare-number twins on aarch64), so
+    // the accepted set is C's INTEGER CONSTANT EXPRESSION and the two type-query
+    // folds are part of it. An enum constant is already a literal by this tier
+    // (cst_to_hir's `constant_symbol_fold`), which is why no `resolveConstSymbol`
+    // is needed here and why supplying an empty one would be a lie about scope.
+    // ⚠ `refuseOnOverflow` KEEPS ITS STRICT DEFAULT — unlike the globals
+    // consumer, which relaxes it because a wrapping initializer is
+    // runtime-equivalent. There is no runtime here: the value is baked into an
+    // instruction, so a folded overflow would silently encode a number the
+    // source never wrote.
+    [[nodiscard]] EvalEnvironment asmImmediateEvalEnvironment() {
+        EvalEnvironment env;
+        env.resolveTypeSize = [this](TypeId t) -> std::optional<std::uint64_t> {
+            if (!config.aggregateLayoutLoaded) return std::nullopt;
+            auto const layout = computeLayout(t, interner, config.aggregateLayout,
+                                              config.dataModel);
+            if (!layout) return std::nullopt;
+            return layout->size;
+        };
+        env.resolveTypeAlign = [this](TypeId t) -> std::optional<std::uint64_t> {
+            if (!config.aggregateLayoutLoaded) return std::nullopt;
+            auto const layout = computeLayout(t, interner, config.aggregateLayout,
+                                              config.dataModel);
+            if (!layout) return std::nullopt;
+            return layout->align.bytes();
+        };
+        return env;
+    }
+
     [[nodiscard]] bool lowerInlineAsm(HirNodeId node) {
         std::uint32_t const handle = hir.payload(node);
 
@@ -9446,14 +9531,199 @@ struct Lowerer {
             }
         }
 
+        // ★★★ THE PROVEN VALUE BEHIND EVERY `imm32`-FORM OPERAND, INDEXED BY
+        // OPERAND (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED). An immediate
+        // binds NO register, so unlike every other operand form there is nothing
+        // for the allocator to carry the operand in — the VALUE itself has to
+        // travel. It is proven HERE, in the loop that emits nothing, because
+        // this lowering's standing rule is that a refusal never leaves a
+        // half-built statement behind; the `Const` that carries it is emitted in
+        // the value loop below, in operand order, like every other input.
+        // ⚠ `HirLiteralValue` RATHER THAN AN `int64` — the arm and the `core`
+        // hint travel through `toMirLiteral` unchanged, so the MIR literal is
+        // the one the const-eval engine actually produced instead of a
+        // re-typed copy of it.
+        std::vector<std::optional<HirLiteralValue>>
+            immediateValues(src.operands.size());
         for (std::size_t i = 0; i < src.operands.size(); ++i) {
             HirInlineAsmOperand const& o = src.operands[i];
-            if (!o.regClassResolved) {
+            // ★★★ THE QUESTION IS "DID THE LETTER RESOLVE TO **ANYTHING**", NOT
+            // "IS THERE A REGISTER CLASS", AND THE DIFFERENCE WAS A REFUSAL
+            // WHOSE STATED REASON WAS FALSE
+            // (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED).
+            // `TargetAsmConstraint::binds` has THREE arms and a letter on the
+            // third — `"m"` → `membase`, `"i"` → `imm32` — deliberately selects
+            // no register class: a memory operand needs none, because the
+            // ADDRESS is what gets a register. Testing `regClassResolved` alone
+            // therefore refused letters BOTH shipped targets declare, and told
+            // the reader the letter "was never bound to a processor", sending
+            // them to fix a config that was already correct.
+            // ✔MEASURED at the CLI on a clean HEAD worktree, debug AND release,
+            // x86_64 AND arm64: `__asm__("nop %1" : "=r"(r) : "m"(*p))` and the
+            // same statement with `"i"(7)` were both refused with exactly that
+            // message. gcc 13.3.0 compiles both on both targets
+            // (`nop (%rdi)` / `nop [x0]`, `nop $7` / `nop 7`).
+            // ⚠ A REFUSAL WHOSE REASON IS FALSE IS WORSE THAN NO REFUSAL: it is
+            // a correct diagnosis of the wrong subsystem, and it is exactly as
+            // loud as a true one.
+            if (!o.regClassResolved && !o.operandKindResolved) {
                 unsupported(node, std::format(
-                    "inline-asm operand {} (constraint \"{}\") has no resolved "
-                    "register class — the constraint letter was never bound to a "
-                    "processor, and choosing one here would pick a register bank the "
-                    "source did not ask for (D-CSUBSET-INLINE-ASM-OPERANDS)",
+                    "inline-asm operand {} (constraint \"{}\") resolved to "
+                    "nothing — the constraint letter is not declared by this "
+                    "target (`asmConstraints`), or no target was in scope when "
+                    "the statement was analyzed, and choosing a binding here "
+                    "would pick a register bank or an operand form the source "
+                    "did not ask for (D-CSUBSET-INLINE-ASM-OPERANDS)",
+                    i, o.constraint.raw));
+                return false;
+            }
+            // ★★ WHICH FORMS THE PIPELINE REALIZES IS STATED HERE, AND EVERY
+            // OTHER ONE IS REFUSED **BY NAME**. `membase` is realized end to end
+            // (the operand's ADDRESS is materialized into a register and the
+            // assembly engine writes the dialect's memory form around it) and so
+            // is `imm32` (the operand's proven compile-time VALUE travels to the
+            // engine, which writes the dialect's immediate form).
+            // ⚠ THIS IS THE `Q` / `x` / `y` DISCIPLINE THE TWO `.target.json`
+            // FILES ALREADY APPLY TO LETTERS THEY CANNOT DESCRIBE EXACTLY: a
+            // form this pipeline cannot realize is refused loudly and by name,
+            // never approximated. NO SHIPPED TARGET DECLARES A LETTER ON ANY
+            // OTHER FORM today, so this arm is unreachable from C and is kept
+            // for the direct-API producers that never run the front end at all —
+            // and because the alternative to refusing is picking a form the
+            // source did not ask for.
+            // ⛔ THE SET IS RENDERED FROM `OperandKindFilter`, NOT RETYPED: the
+            // message names the two realized forms through
+            // `operandKindFilterName`, so a form that becomes realized cannot
+            // leave a sentence behind claiming it is not.
+            if (o.operandKindResolved
+                && !asmOperandBindsMemoryForm(o)
+                && !asmOperandBindsImmediateForm(o)) {
+                unsupported(node, std::format(
+                    "inline-asm operand {} (constraint \"{}\") binds the operand "
+                    "form '{}', which this pipeline does not realize — the "
+                    "letter IS declared by this target and the refusal is about "
+                    "the FORM, not the letter (the realized forms are '{}', the "
+                    "memory at a register, and '{}', a compile-time constant) "
+                    "(D-CSUBSET-INLINE-ASM-OPERANDS)",
+                    i, o.constraint.raw,
+                    operandKindFilterName(
+                        static_cast<OperandKindFilter>(o.operandKind)),
+                    operandKindFilterName(OperandKindFilter::MemBase),
+                    operandKindFilterName(OperandKindFilter::ImmInt)));
+                return false;
+            }
+            // ★★★ AN IMMEDIATE IN THE **OUTPUT** SECTION HAS NOWHERE TO BE
+            // WRITTEN, AND BOTH REFERENCES SAY SO. ✔MEASURED, gcc 13.3.0 on x86_64
+            // AND aarch64: `__asm__("nop %0" : "=i"(r))` is
+            // `error: output number 0 not directly addressable`. An output is
+            // realized as a `ReturnPiece` plus a store-back through the lvalue's
+            // address; a constant is not a location, so there is no register to
+            // capture and no object to store into. Lowering it as if it were an
+            // input would accept a statement that promises a write and performs
+            // none — refusing what the reference toolchain refuses is as much
+            // conformance as accepting what it accepts.
+            if (asmOperandBindsImmediateForm(o) && i < src.outputCount) {
+                unsupported(node, std::format(
+                    "inline-asm operand {} (constraint \"{}\") binds the "
+                    "compile-time-constant form '{}' in the OUTPUT section — a "
+                    "constant is a value, not a location, so there is nothing "
+                    "for the statement to write to (gcc 13.3.0 refuses the same "
+                    "shape on both shipped targets: \"output number {} not "
+                    "directly addressable\") (D-CSUBSET-INLINE-ASM-OPERANDS)",
+                    i, o.constraint.raw,
+                    operandKindFilterName(OperandKindFilter::ImmInt), i));
+                return false;
+            }
+            // ★★★ AND THIS IS THE HALF THAT MAY NOT BE SKIMPED: THE OPERAND IS
+            // **PROVEN** A COMPILE-TIME CONSTANT, NEVER ASSUMED ONE. A `"i"`
+            // operand fed a runtime value has no honest lowering — there is no
+            // register in the binding to carry it and no instruction slot to put
+            // it in — so the only alternatives to refusing are materializing a
+            // register the template will not read (a silent wrong answer) or
+            // encoding whatever happened to be foldable. ✔MEASURED, gcc 13.3.0,
+            // BOTH shipped targets, at `-O0` AND `-O2` (so it is not an
+            // optimizer artefact): `__asm__("nop %1" : "=r"(r) : "i"(x))` for a
+            // parameter `x` is `error: impossible constraint in 'asm'`. DSS
+            // matches the STRICTNESS; the wording is this pipeline's own, and it
+            // names the operand and the form so the reader knows which of the
+            // two facts to change.
+            // ⚠ THE PROOF RUNS ON THE HIR EXPRESSION, NOT ON WHAT THE LOWERING
+            // HAPPENS TO EMIT. "Lower it and see whether a `Const` came out" is
+            // the tempting spelling and it is a DIFFERENT predicate: it asks
+            // whether this build's folding reached the value, so an expression
+            // C calls constant would be refused or accepted according to
+            // optimizer strength rather than according to the language.
+            if (asmOperandBindsImmediateForm(o)) {
+                EvalEnvironment env = asmImmediateEvalEnvironment();
+                ConstEvalResult const r =
+                    evaluateConstant(hir, interner, literals, kids[i], env);
+                std::optional<std::int64_t> value;
+                if (r.value.has_value()) {
+                    if (auto const* iv =
+                            std::get_if<std::int64_t>(&r.value->value)) {
+                        value = *iv;
+                    } else if (auto const* uv =
+                                   std::get_if<std::uint64_t>(&r.value->value)) {
+                        value = static_cast<std::int64_t>(*uv);
+                    }
+                }
+                if (!value.has_value()) {
+                    unsupported(node, std::format(
+                        "inline-asm operand {} (constraint \"{}\") binds the "
+                        "form '{}', which requires an INTEGER CONSTANT "
+                        "EXPRESSION — this operand is not one, so there is no "
+                        "value to encode into the instruction and no register "
+                        "the constraint asked for to carry it at run time "
+                        "(gcc 13.3.0 refuses the same shape on both shipped "
+                        "targets: \"impossible constraint in 'asm'\") "
+                        "(D-CSUBSET-INLINE-ASM-OPERANDS)",
+                        i, o.constraint.raw,
+                        operandKindFilterName(OperandKindFilter::ImmInt)));
+                    return false;
+                }
+                // ★ THE RANGE IS THE **FORM'S**, AND IT IS CHECKED AT THE TIER
+                // THAT KNOWS THE FORM'S NAME. `imm32` is the JSON spelling of
+                // `OperandKindFilter::ImmInt`, whose LIR carrier is a 32-bit
+                // immediate slot (`LirOperand::makeImmInt32`); a value outside
+                // it does not satisfy the constraint the source wrote. Refusing
+                // here rather than three tiers down is what lets the message say
+                // WHICH operand of WHICH statement, and it leaves the target's
+                // own narrower encoding guards (aarch64's `immMax: 4095` and its
+                // shifted-pair fallback) to do their own job through the
+                // ordinary opcode election.
+                if (*value < std::numeric_limits<std::int32_t>::min()
+                    || *value > std::numeric_limits<std::int32_t>::max()) {
+                    unsupported(node, std::format(
+                        "inline-asm operand {} (constraint \"{}\") is the "
+                        "compile-time constant {}, which does not fit the '{}' "
+                        "form this target bound the letter to — the constraint "
+                        "names a 32-bit immediate and this value needs more "
+                        "(D-CSUBSET-INLINE-ASM-OPERANDS)",
+                        i, o.constraint.raw, *value,
+                        operandKindFilterName(OperandKindFilter::ImmInt)));
+                    return false;
+                }
+                immediateValues[i] = *r.value;
+            }
+            // ★ AND THE **OUTPUT** HALF OF THE MEMORY FORM IS A DIFFERENT
+            // MECHANISM, NOT A DIFFERENT CASE. An `"=r"` output is realized as a
+            // `ReturnPiece` plus a store-back through the lvalue's address; an
+            // `"=m"` output has no register to capture and no piece to anchor —
+            // the template writes the memory itself, so the whole piece/
+            // store-back carriage below is not merely unnecessary but wrong. It
+            // is refused rather than lowered as if it were the input form,
+            // which would silently drop every write the template performed.
+            // ✔MEASURED: gcc 13.3.0 compiles `"=m"` on both shipped targets, so
+            // this too is a recorded gap with a live reference
+            // (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED).
+            if (asmOperandBindsMemoryForm(o) && i < src.outputCount) {
+                unsupported(node, std::format(
+                    "inline-asm operand {} (constraint \"{}\") binds the memory "
+                    "form in the OUTPUT section — the template writes that "
+                    "memory itself, so there is no register to capture and no "
+                    "result piece to anchor, and lowering it like an input form "
+                    "would silently discard every write the template performed "
+                    "(D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED)",
                     i, o.constraint.raw));
                 return false;
             }
@@ -9463,6 +9733,11 @@ struct Lowerer {
             mo.fixedRegister  = o.fixedRegister;
             mo.isReadWrite    = o.constraint.isReadWrite;
             mo.isEarlyClobber = o.constraint.earlyClobber;
+            // The form arm travels beside the class arm; exactly one is live,
+            // and the consumer switches rather than guessing (the `regClass`
+            // field's own docblock states the exclusivity).
+            mo.operandKindResolved = o.operandKindResolved;
+            mo.operandKind         = o.operandKind;
             // ★★★ THE SPELLINGS TRAVEL; NO TIER BELOW MINTS ONE. The front end
             // built them from the language's own declared template lexemes, and
             // the numbering they encode CANNOT be recomputed here: an index
@@ -9567,7 +9842,45 @@ struct Lowerer {
         std::vector<MirInstId> inputs;
         inputs.reserve(src.operands.size() - src.outputCount + tiedReads.size());
         for (std::size_t j = src.outputCount; j < src.operands.size(); ++j) {
-            MirInstId const v = lowerExpr(kids[j]);
+            // ★★★ A MEMORY-FORM INPUT IS **ADDRESSED**, NOT READ, AND THAT IS THE
+            // WHOLE DIFFERENCE BETWEEN `"m"` AND `"r"`. `"r"(*p)` hands the
+            // template the VALUE at `p`; `"m"(*p)` hands it the OBJECT, and the
+            // machine names an object by its address. ✔MEASURED, gcc 13.3.0:
+            // `int f(int *p){ int r; __asm__("nop %1" : "=r"(r) : "m"(*p)); … }`
+            // emits `nop (%rdi)` on x86_64 and `nop [x0]` on aarch64 — in both
+            // the register holds `p`, the ADDRESS, and the template dereferences
+            // it. Lowering `lowerExpr` here instead would put the LOADED VALUE in
+            // that register, so `(%rdi)` would dereference the loaded int as a
+            // pointer: a silent miscompile with no diagnostic anywhere, and one
+            // that only shows up as a wild read at run time.
+            // ⚠ `lowerLvalueAddress` IS THE SAME FUNNEL THE OUTPUT LOOP ABOVE
+            // USES for `"=r"`'s store-back target — one evaluation, one address —
+            // rather than a second address-taking path minted for this arm.
+            // ★★★ AN IMMEDIATE OPERAND TRAVELS AS A MIR `Const`, WHICH IS THE
+            // PIPELINE'S OWN VERB FOR "A VALUE THAT IS KNOWN NOW"
+            // (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED). It is emitted as
+            // an ordinary operand rather than stashed on the descriptor for one
+            // structural reason stated by `MirAsmDescriptor::inputs` itself:
+            // that list is ALIGNED 1:1 WITH THE INSTRUCTION'S MIR OPERANDS, and
+            // an entry with no operand would shift every later input's value by
+            // one with nothing to notice it. So the immediate keeps its slot,
+            // and the tier that binds it reads the constant back out of the
+            // `Const` (`constIntegerValue`, the same reader a const-disp `Gep`
+            // already uses) instead of being handed a private payload.
+            // ★ `lowerExpr(kids[j])` WOULD ALSO PRODUCE A CONSTANT HERE FOR A
+            // LITERAL, AND THAT IS NOT THE SAME THING. The value below is the
+            // one the const-eval engine PROVED above — the proof and the
+            // encoded number are the same measurement, so the two cannot
+            // disagree about what the source wrote.
+            MirInstId v;
+            if (immediateValues[j].has_value()) {
+                v = mir.addConst(toMirLiteral(*immediateValues[j]),
+                                 hir.typeId(kids[j]));
+            } else if (asmOperandBindsMemoryForm(src.operands[j])) {
+                v = lowerLvalueAddress(kids[j]);
+            } else {
+                v = lowerExpr(kids[j]);
+            }
             if (!v.valid()) return false;
             inputs.push_back(v);
         }
@@ -12195,7 +12508,7 @@ struct Lowerer {
     //   Ref(global|function)          → {sym, 0}   (the F5/c67 base arm)
     //   Index(arrayPath, constIdx)    → {sym, off + constIdx * elementStride}
     //   MemberAccess(recordPath, .f)  → {sym, off + fieldByteOffset(record, f)}
-    // Canonical sqlite shape (sqlite3.c:24077): `const unsigned char
+    // Canonical sqlite shape (sqlite3.c): `const unsigned char
     // *sqlite3aLTb = &sqlite3UpperToLower[256-OP_Ne];` — an ADDRESS CONSTANT
     // (C 6.6p9): gcc emits `.quad sqlite3UpperToLower+203` (an abs64 reloc
     // with an addend), never a runtime store. c67's encoder already threads

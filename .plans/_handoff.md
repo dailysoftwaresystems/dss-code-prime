@@ -9,8 +9,8 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-22 — cycles **P14 … P27**. ★★★ **P27: THE P26 BUDGETS WORKED, AND WHAT THEY UNCOVERED WAS TWO TESTS THAT HAD NEVER RUN HERE.** macOS is GREEN in CI (the bash 3.2 repair holds) and both remaining legs now REACH AND FINISH ctest — asan at **68%** of its budget, Windows at **10%**, its first completed ctest ever (**665.70 s**, which CLOSES [[D-CI-WINDOWS-CTEST-COST-IS-UNMEASURED]] and re-derives that budget to 50/60). What remained was one test each. ★★ **Both are an instrument that was CORRECT about its subject and WRONG about its environment:** a hard-coded **2-second** LSP wait sized on an idle machine (✔622 ms idle, ✔**1912 ms** under 3x contention on a faithfully rebuilt sanitizer binary — 88 ms from the deadline), and `shutil.which("bash")` on `windows-latest` answering **WSL's** bash on a runner with no distribution, reddening 26 differential assertions where nothing was wrong. Neither was findable on the machine that wrote it. Balance **1036 → 1036, net ±0** (two born closed, one closed, one opened and sized). Earlier: ★★★ **P26 FIXED THREE RED CI LEGS, AND THE macOS ONE WAS A GUARD THAT HAD NEVER RUN.** `anchor_registry_guard` died inside its OWN self-test on `macos-latest`: bash 3.2 does not recursively parse a command substitution, so the `)` closing a `case` PATTERN ends the `$( … )` early and the arm expands to LITERAL TEXT — the anchor registry had therefore never been checked on that host. ★★★ The portable finding is that **`bash -n` IS BLIND TO IT** (✔the probe parses clean on 3.2 and fails only when the substitution is EXPANDED), so the obvious instrument cannot see the class at all; a static guard can, and `shell_portability_guard` (34 arms) reds on the tree exactly as it stood at `3ce4e336`. ✔**16 of 17 bash-4 constructs are unsupported on 3.2 and SIX leave the exit status at ZERO** — `declare -A` fails and the name then behaves as an INDEXED array, so every key subscripts to 0. ⚠ It also caught a defect P25 shipped (`benchmark-speedtest1.sh` sourcing an ungated `base-harness.sh`) and one nobody had: `enum_name_table_guard`'s ctest form **never self-tested** while its comment said it did. The other two legs were ONE defect — two GLOBAL budgets (45/50) set from the legs they happened to fit; they are per-leg matrix fields now, and the Test step warns above 80% so the next breach is announced while the run is still GREEN. Balance **1034 → 1036** — nine rows written, **seven BORN CLOSED** and two 🔵 DISCLOSED pre-existing, so the gate counts *opened 2 (created 0, disclosed 2)* and both are exempt; both are flagged for operator veto. ⚠ **Two of the seven were found AFTER the first push, by things no local check could see:** the macOS leg caught the new guard scanning the git INDEX instead of the tree, and GitHub REFUSED THE WORKFLOW OUTRIGHT over an arithmetic `timeout-minutes` expression that YAML, the official schema and every local check called valid. Earlier: ★★★ **P25 CLOSED THE BRANCH'S ONLY 🔴 HIGH — A LIVE SILENT MISCOMPILE IN ARGUMENT PLACEMENT.** A two-way pool rule over a three-member register-class vocabulary filed every `VR` argument into the INTEGER pool; ✔MEASURED at the disassembly, the mutant emits `ldur q0` **over an already-placed argument** at rc=0 with no diagnostic, the fix emits `ldur q2` (AAPCS64 NSRN 2), and gcc agrees. ★★★ The portable finding is that **the pool TABLE alone fixed nothing — the reproduction recompiled byte-identical** — because the decision lives in a CURSOR WALK that existed in **six** hand-kept copies, two of them carrying comments promising to stay in step by hand. One object owns it now. ⚠ **Two claims I wrote were refuted by reading the thing they were about**, both recorded in §0.000000000000000000000000000 rather than dropped: the `"w"` view-selection premise (the config's own measurement was right and the whole schema migration was reverted) and a row I had opened hours earlier in the same cycle. Balance **1033 → 1033, net ±0**. Earlier: ★★★ **P24 SPLIT `integrated_tests` INTO 616 ctest ENTRIES — 677.97 s in ONE entry became 83.81 s over many, 8.1×, and every example now reports its own pass/fail.** Operator-instructed, and the ruling that shaped it is the portable part: **a UNIVERSAL claim is per-example; an EXISTENCE claim is about the corpus and stays one.** Balance **1034 → 1033, net −1** — the burn-down after P23. Earlier: ★★★ **P23 SHIPPED WEAK DEFINITIONS *AND* WEAK ALIASES ON PE/COFF AND MACH-O, FINISHED THE RETYPED-CLOSED-SET CLASS, AND CLOSED THE pe64 ACQUISITION ROW ON A MEASUREMENT NOBODY HAD EVER TAKEN.** All four queued rows closed plus three more. ⚠ **The BALANCE went the other way and the number is said plainly: OPEN 1018 → 1033, closed 7, opened 22 (21 created + 1 disclosed pre-existing), net +14 created-over-closed, and 55 further rows BORN CLOSED** — because a step-10 independent audit, six fold lanes and a four-leg gate found twenty-nine further defects, and an operator ruling authorized shipping the positive balance with every one of them queued as the next cycle's first work. Two operator rulings, neither to be re-litigated: a weak DEFINITION in COFF is **COMDAT select-any**, not `WEAK_EXTERNAL` (*"an implementation gap and a format incapability are different facts"*); and `WEAK_EXTERNAL` IS right for a weak **alias**, built reader-first. ⚠ The brief that ordered the second routed the decision onto `Characteristics`, and ✔gcc emits **1 for all four weak shapes** — the discriminator is the aux record’s `TagIndex`. Earlier: ★★★ **P22 MADE A `static` HELPER LINK OUT OF AN ARCHIVE ON EVERY LEG** — pe64 and macho64 readers were classifying a non-external defined symbol as a bodyless block label, so its bytes never entered the image. Earlier: ★★★ **P21 CLOSED THE `dependsOn` OPTIMIZER GAP — AND THE MANIFEST EDIT THE ROW ASKED FOR WOULD HAVE ASSERTED NOTHING.** Both corpus runners built the prerequisite library at the BASELINE configuration in every arm, so a `release` arm linked an optimized exec against a DEBUG archive; both are fixed, all 12 `dependsOn` entries are armed, and macho64-arm64 + elf64-aarch64 are verified BY EXECUTION on real hardware. Two findings the queue never named: `static` in an archived TU **cannot be linked on pe64 or macho64** (opened HIGH, fail-loud half landed, classification is P22), and **six of the eight `ExamplesCorpusLint` tests had no ctest entry** — three dark since P5b — found only by planting mutants to watch new pins fail. Earlier: **P20 MADE `asm goto` WORK — and the row it closed was not the whole defect.** `%l[name]`, `%lN` and `%[name]` all bind now, and the corpus example RUNS 42 on pe64, elf64-x86_64 and aarch64 at debug AND release. ⚠ The part the row never named: **the MIR CFG had no FALL-THROUGH edge for `asm goto`**, so the code after the statement was pruned — a silent miscompile that could not ship only because the LIR tier refused the statement first. Earlier:  **P19 withdrew the SECOND pairing anchor and repaired three citations that had gone false.** `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` demanded an equivalence DETECTOR for `.sh`/`.ps1` twins; twin parity is now a REVIEW obligation, checked when the script is written or changed. Earlier:  **P18 WITHDREW an anchor rather than closing it by building what it asked for**: `D-GATE-SCRIPT-PS1-PAIRING-UNCHECKED` demanded a guard that every `.sh` have a `.ps1`, and ✔11 of 21 script directories correctly have none. The rule moved into the two skills as a judgement the author makes and writes down. Earlier:  **P17 is an operator-inserted cycle**: `tools/` was merged into `scripts/` under the one-directory-per-script convention, every script now declares a `PURPOSE:` line, and two generated indexes (`scripts/README.md` + the `/dss-cycle` skill's `references/scripts.md`) are held to the tree by a new `scripts_index_guard`. It also closed a gate that had been running **one test at a time on every host**. Earlier:  **P14 OVERTURNED its own premise**: there is no pe64 miscompile. The `scanstatus2-5.1` abort is an UPSTREAM sqlite portability bug (`sprintf("ptr:%p")` vs Tcl's `format "ptr:0x%llx"`), proven by a discriminating pair on the one crashing binary. P14 also opened `D-FFI-PE-DIRECT-H-TRANSITIVELY-EXPOSES-THE-WIN32-SURFACE`, and **P15 WITHDREW it — its central claim was false** (see §0.000000000000000). What survives is the operator ruling it triggered, now **bar §A.3b**: *the goal is to WORK; one working reference makes the behaviour REQUIRED*, ✔witnessed by `cl` compiling the construct rc=0 clean. P13/P12/P11 below.
-**Branch:** `feature/c23-conformance-burndown-3` · **HEAD:** this commit (Cycle P21). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ The P14 WIP chain `8f1b3963`→`08989144` is pushed and its commit MESSAGES assert a miscompile that does not exist — read this file, not those subjects.
+**Last updated:** 2026-08-23 — cycles **P14 … P28**. ★★★ **P28: THE GATE THAT COULD NOT OPEN, TWO LIVE SILENT MISCOMPILES NOBODY WENT LOOKING FOR, AND A HIGH DEFECT THAT SHIPPED BEHIND A GREEN 1539-TEST SUITE.** Thirteen lanes; balance **1036 → 1022, net −14** (closed 22, opened 8 — 6 created, 2 disclosed, 7 bookkeeping-only and net-neutral). ★★ **The operator ruling that reshaped it:** *"BUILD THE 128-BIT VR OPERAND. It is not gated — it is the GATE-OPENER, and treating it as an external precondition is what was turning a sequencing gate into a permanent one."* ✔MEASURED and it was right, with a mechanism attached: the row's trigger was **already TRUE and had been since `"w"` was declared**, and **the row's own stated instrument could never have observed it** — *assert the build does NOT emit `R_SpilledDueToPressure`* cannot become true until the fix lands, so it restated the remedy instead of detecting the trigger. A tripwire that can actually flip now exists, and operator Condition 4's marker — required 2026-08-21 and never built — is in `src/` and `tests/`. ★★ **Staging step 2 is UNREACHABLE, measured:** *"unaliased"* is a property of the SOURCE CONSTRUCT while the aliasing that breaks it is a property of the TARGET'S REGISTER FILE — all 32 arm64 d-views are already allocatable and every v-view aliases one — so steps 2 and 4 are one step, and the naive fix reproduced the double-count (`d7` carrying two live values at rc=0). ★★★ **TWO LIVE SILENT MISCOMPILES, neither on any queue:** the inline-asm operand move was CLASS-BLIND on both shipped targets (arm64 `mov x29, x15` reading integer 15 while the value sat in **d15**; x86_64 `mov %r13,%r13`, a no-op), and the frame-slot stride enumerated two classes instead of deriving, overlapping two 16-byte slots by 8 and reading past the top of the frame. ★★ **The branch's HIGH row closed** — and its scope was measured too narrow TWICE: the ASM/LIR tier carried both shapes too, and its *"zero shift on elf with no `--define`s"* caveat holds only for a SPLICE-FREE TU, so **every quote-including TU was shifted on every target**. ★★★ **AND A HIGH USER-FACING DEFECT SHIPPED BEHIND A GREEN 1539-TEST GATE:** `dss --compile main.c` could not find `#include "sibling.h"` beside it while `./main.c` could — an empty `parent_path()` read as *"no directory"* when it means the PROCESS WORKING DIRECTORY, in four copies of one derivation. ✔**The reason it survived: both example runners always hand `--compile` an ABSOLUTE path, so 3 of the 4 argument shapes a user can type are exercised by nothing in the corpus.** ⚠⚠ **And the step-10 audit paid for itself in one hour:** it returned MUST-NOT-COMMIT on three blockers, and running one of the four UNREGISTERED guard scripts by hand found **three lanes had each added a `std::abort()` to a test fixture**, breaching a ratchet, past a 1557/1557 green suite — because the only instrument that could see it was a script nothing ran. Four guards are registered now, including the balance guard's own self-test.
+**Branch:** `feature/c23-conformance-burndown-4` · **HEAD:** this commit (Cycle P28), branched clean from `main` at `cf27fe8b`. ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`.
 
 ---
 
@@ -266,7 +266,39 @@ commit that lands it, and never delete a ticked row.
       ([[D-CI-WINDOWS-CTEST-COST-IS-UNMEASURED]], answered by the first Windows ctest run that ever
       happened) and one OPENED and sized rather than absorbed, net ±0. Both defects were instruments that were correct about their subject and
       wrong about their environment.
-- [ ] **P28+ — THE REST OF WHAT P21 AND P22 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
+- [x] **P28 — THE REST OF THE P25 BATCH, plus the branch's HIGH row, plus the operator's VR ruling. ✅ DONE 2026-08-23.**
+      Thirteen lanes. Balance **1036 → 1022, net −14** (closed 22, opened 8 — 6 created, 2 disclosed,
+      7 bookkeeping-only). Detail in §0.0000000000000000000000000000000.
+      ★★ The pick had to resolve a **contradiction inside this very queue**: the entry below made
+      `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS` P26's mandatory first item, while the
+      entry above it said ⛔ MUST-NOT-BE-PICKED. Re-derived from the REGISTRY, reported rather than
+      chosen — and the **operator then ruled the gate itself was the error**.
+      ⚠ Two rows the operator's ruling settled are recorded so they are not re-litigated: the ⛔ stays
+      on the ALLOCATOR (not the operand), and its trigger is now known to have been **TRUE all along**
+      with an instrument that could not see it.
+- [ ] **P29 — THE ROWS P28 OPENED, FIRST, per the standing order refined 2026-08-20.** Re-derive each
+      from the REGISTRY at the pick; this list is a pointer, not a verdict.
+      1. **`D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP`** — ✔**239 wrap sites
+         across 126 governed files**, each a REGISTERED id split across a line break and therefore
+         invisible to every grep AND to `check-anchor-balance`. ★ Its own remedy is ORDERED: **build
+         the detector as a ratcheted arm FIRST, then un-wrap in a quiet tree.** P28 reversed that
+         order and then added a 240th instance, which the step-10 audit caught.
+      2. **`D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED`** — ⚠ its gate was **WITHDRAWN** by the
+         P28 audit fold: gcc compiles `"=m"` on both shipped targets, so bar §A.3b makes it
+         **REQUIRED**, and a required capability with no blocker is queued work, not a trigger.
+      3. **`D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH`** — the reason a HIGH
+         user-facing defect shipped behind a green 1539-test gate. ⚠ The audit judged its blocker
+         OVERSIZED: it blocks on the maximal fix (moving the cwd for ~580 examples) and never costed
+         the additive one (ONE example exercising the bare-relative form).
+      4. **`D-TEST-WALL-CLOCK-LITERAL-INVENTORY-IS-DEBT`** (48 literals, 11 files) and
+         **`D-PLANS-GATED-ROWS-NAME-NO-OPENER`** (59 rows) — both ratcheted burn-downs.
+      ⛔ **NOT PICKABLE, said rather than silently skipped:** `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS`
+      (⛔ MUST-NOT-BUILD; **its witness now EXISTS** — the mutant-N1 disassembly — so the operator's
+      §3 step 4 condition is met and the arc awaits their word), `D-TARGET-NO-CROSS-CLASS-MOVE-VERB`
+      and `D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN` (both **§B**, and the
+      lane that found the first recommends deciding them **together with the allocator arc**, since
+      an aliasing-aware allocator needs the same verb).
+- [ ] **P29+ — THE REST OF WHAT P21 AND P22 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
       /loop using /dss-cycle each iteration to address ALL anchors found in _handoff §0."* Re-derive each pick
       from the REGISTRY, never from this list.
 - [x] **OPERATOR CALL — ✅ FILED 2026-08-19: <https://sqlite.org/bugs/forumpost/97cd29ca44624113c73b30f5d2504729e6ffc5c5ebcba137078ea1a868cd97c9>.**
@@ -373,6 +405,141 @@ second pattern beside the one P23 built and pinned.**
   `examples/*/*/expected.json` (**613** examples, hoisted to the root `CMakeLists.txt` in P24); a
   `"[=+]?w"` constraint search over `.c/.h/.s/.S/.json` under `examples/` returns **0 files**, and the
   same search over the sqlite real-example tree returns **0**. No corpus example exercises `"w"`.
+
+---
+
+## 0.0000000000000000000000000000000 ★★★ CYCLE P28 — THE GATE THAT COULD NOT OPEN, TWO LIVE SILENT MISCOMPILES NOBODY WENT LOOKING FOR, AND A HIGH DEFECT THAT SHIPPED BEHIND A GREEN 1539-TEST SUITE
+
+**Operator argument 2026-08-23:** *"let's resume the cycle per the handoff. we're on a clean branch
+from main."* The pick was re-derived from the REGISTRY rather than from the queue list, and the
+queue turned out to **contradict itself**: one entry made
+`D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS` P26's mandatory first item (operator
+Condition 3), while the entry directly above it said ⛔ MUST-NOT-BE-PICKED. The registry row —
+written later the same day — governed, and the cycle reported the conflict rather than choosing.
+
+### ★★★ THE OPERATOR RULING THAT RESHAPED THE CYCLE, AND THE MEASUREMENT THAT PROVED IT RIGHT
+
+> **BUILD THE 128-BIT VR OPERAND. It is not gated — it is the GATE-OPENER, and treating it as an
+> external precondition is what was turning a sequencing gate into a permanent one.**
+> The ⛔ is on the CONSUMER (the allocator), never on the PRODUCER (the operand).
+> **The trigger does not fire on its own. We fire it.**
+
+✔**MEASURED, and it confirms the diagnosis with a mechanism attached:** the row's trigger —
+*"a source construct can form a 128-bit operand that reaches the allocator as a VR-class value"* —
+was **ALREADY TRUE, and was true before the row was written**. `long double y; __asm__("nop":"=w"(y));`
+on arm64 reports `R_SpilledDueToPressure … spilled 1 vreg(s)`: a 128-bit value, VR class, a
+**virtual** register in the allocator's own report.
+★★★ **AND THE ROW'S OWN INSTRUMENT COULD NEVER HAVE SAID SO.** It prescribed *"assert the build
+does NOT emit `R_SpilledDueToPressure`"* — which cannot become true until the free list is
+non-empty, **which IS the fix**. That is a restatement of the remedy, not a detector. ⇒ **the gate
+had been open the whole time and nothing could see it.** A tripwire that can actually flip now
+lives in `lir/test_lir_aliased_view_allocability` arm (A), and Condition 4's marker — required
+2026-08-21 and never built — now exists in `src/` and `tests/` rather than only in `.plans/`.
+
+★★ **THE STAGING'S STEP 2 IS UNREACHABLE, AND THE OPERATOR ASKED TO BE TOLD.** *"Accept `"w"` for
+the simple unaliased case; it should go green WITHOUT the allocator."* ✔MEASURED: **no.** arm64
+declares **32** cross-class `dwarfNumber` collisions (d↔v, 64..95) and **all 32 d-views are already
+allocatable**, so every V register aliases an allocatable one. **"Unaliased" is a property of the
+SOURCE CONSTRUCT; the aliasing that breaks this is a property of the TARGET'S REGISTER FILE.** The
+naive fix was built as a mutant and the double-count reproduced: `fadd d14, d7, d14` for the `"w"`
+value and `fadd d14, d14, d7` for an ordinary `double` — **one physical register, two live values,
+rc=0, no diagnostic.** ⇒ steps 2 and 4 are one step, and that failing case is the allocator arc's
+witness, in hand.
+
+### ★★★ TWO LIVE SILENT MISCOMPILES, NEITHER ON ANY QUEUE, BOTH FOUND ON THE WAY
+
+* **`D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND`** — the inline-asm lowering resolved ONE module-wide
+  integer `Mov` per asm block and used it for EVERY operand whatever class it bound. ✔arm64:
+  `fmov d15, d0` / **`mov x29, x15`** — reads integer register 15 while the value is in **d15**.
+  ✔x86_64: **`mov %r13,%r13`** — the copy into the operand's own xmm13 is the integer mov on r13, a
+  no-op, so the template reads a register nothing ever wrote. Both rc=0, no diagnostic, reachable
+  from ordinary C with no flag. ★ **The comment on `classOp` described this exact failure while the
+  table sat unused** — a comment recording the FULL fact while the code used HALF of it.
+* **`D-LIR-FRAME-SLOT-STRIDE-ENUMERATES-CLASSES-INSTEAD-OF-DERIVING`** — the frame stride was
+  `max(GPR, FPR)`, a two-member enumeration of a longer vocabulary. arm64's `vr` is 16 bytes.
+  ✔Two 16-byte slots **overlapped by 8 bytes** and the second read **8 bytes past the top of the
+  frame** (`redZoneBytes` 0 ⇒ the caller's stack). ★ Zero blast radius proven on the corpus rather
+  than argued: the sqlite3 amalgamation is **byte-identical** across the fix.
+
+### ★★★ THE BRANCH'S HIGH ROW CLOSED — AND ITS SCOPE WAS MEASURED TOO NARROW TWICE
+
+`D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED`. The remap died with `UnitBuilder`, so the PARSE
+tier was the only tier alive to use it. ✔Reproduced exactly at HEAD, then closed on all **5 legs**.
+Two under-callings the row did not know:
+* the **ASM/LIR tier carried both shapes too** — a semantic-only fix would have been a slice;
+* the row's caveat *"on an elf leg with no `--define`s the shift is ZERO"* holds only for a
+  **splice-free** TU: an elf, zero-define case was shifted **+2 by the spliced header's own lines**.
+  ⇒ the shift is (target prologue) + (one per `--define`) + (lines spliced above), i.e. **every
+  quote-including TU was shifted on every target.**
+★ It also discharged FC18's blocker as a side effect: ✔the corpus golden pins `1:1-1:13` and the
+CLI on pe64 now prints `1:1` — the two instruments AGREE, so FC18 may pin positions without the
+caveat that a corpus would certify green a CLI printing shifted ones.
+
+### ★★★ A HIGH DEFECT SHIPPED BEHIND A GREEN 1539-TEST GATE, AND THE REASON IS THE FINDING
+
+`D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH` — `dss --compile main.c`
+could not find `#include "sibling.h"` beside it, while `./main.c`, `sub/main.c` and an absolute
+path all could; ✔gcc resolves the bare form on both hosts. Root cause: an **empty `parent_path()`
+read as "no directory" when it means the PROCESS WORKING DIRECTORY**, in **four** copies of one
+derivation. ★ The guard that skipped the arm **was load-bearing when written and protects nothing
+today** — so it was KEPT as the contract for *"there is no including file"*, with the reasoning
+written down, rather than deleted as the obvious culprit.
+★★★ **AND THE REASON IT SURVIVED A GREEN SUITE:** ✔both example runners always hand `--compile` an
+**ABSOLUTE** path, so **3 of the 4 source-argument shapes a user can type are exercised by nothing
+in the corpus** (`D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH`, opened with a
+named blocker: it moves the compile cwd for ~580 examples).
+
+### THE GUARD LANE — INCLUDING THE ONE THAT JUDGES THIS CYCLE
+
+* `D-GATE-BALANCE-EXEMPTS-A-DISCLOSED-OPENING-BUT-NOT-A-BOOKKEEPING-CLOSURE` — the mirror exists and
+  is **net-neutral by construction**: the OPEN population drops, the cycle is credited with nothing.
+  ✔`is_closed()` is BYTE-IDENTICAL, so every row carrying no new marker produces the number it
+  produced before. Two corrections to the row's own method were measured: the walk-back test must
+  read the CLOSING-WORK cell, and must NOT read the whole status cell (mean 1,881 chars, max
+  39,753, so `HALF`/`RESIDUAL` occur by accident).
+* `D-GATE-A-GATED-ROW-MUST-NAME-ITS-OPENER` — the operator's §4 rule, built. ★★ **The census changed
+  the predicate:** ✔the ⛔ glyph LEADS only SIX status cells and five of those are REFUTED-DESIGN /
+  NEGATIVE RESULT, which can never have an opener; the rows the ruling is about **declare themselves
+  in words** (94 rows, 62 open, 59 nameless). ⚠ And the arm's first shipping **flagged the census row
+  that recorded its own finding** — a description of a class classified as a member of it, the third
+  instance of that shape in one cycle. `is_gated` now excludes a row stating its trigger has ALREADY
+  FIRED. ✔The obvious alternative was measured and rejected: windowing the declaration drops the
+  gated population **63 → 37** and loses 26 genuine gates, because in the registry shape that cell is
+  the **Trigger column** — a trigger description legitimately fills it, while a closure verdict leads
+  it. **Same cell, two conventions.**
+* `D-TEST-A-NEW-WALL-CLOCK-LITERAL-IN-A-TEST-IS-UNGUARDED` — ★★★ **the row's three named shapes would
+  have measured GREEN over the whole live population.** ✔`wait_for(`/`wait_until(`/`now() + ` account
+  for FIVE sites, all already routed; the single idiom `runBinary(exe, chrono::milliseconds{5000})`
+  accounts for **TWENTY-SIX**. So the guard refuses the COMPLEMENT: a chrono literal is a wall-clock
+  literal unless it is a sleep.
+
+### THE LINKER LANE — AND A DOCUMENT COUNT THAT WAS WRONG IN THE BRIEF
+
+`D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS` closed with the accessor taken
+in the same change (its stated precondition — a second consuming writer — arriving *in* it).
+⚠ The design audit predicted **20 of 24** documents; ✔the measured answer is **16**, because the
+Mach-O IMAGE arms encode no weak definition at all and declaring it there would have created the
+very key-nobody-reads the parent row exists to prevent. ★ The lane went one step past its brief and
+folded all three walkers onto ONE shared gate — which **fixed a live hole in the pe copy**: it
+consulted `definedBinding` only, first-row-wins, so a weak ALIAS of a strong definition (what gcc
+emits for `__attribute__((weak, alias(...)))`) passed the gate UNASKED while the alias pass still
+put a weak definition on the wire.
+`D-LK-COFF-NAMELESS-UNDEF-EXTERN-SILENTLY-DROPPED` — decision TAKEN, not escalated, because the bar
+decides it once by-index reachability is measured: a dropped nameless record still occupies a
+`NumberOfSymbols` slot, so a relocation names a SymbolId the reader never produced, and it re-emerges
+at MERGE time as an unresolved symbol **with no name to print**. ✔Blast radius measured first — five
+real `cl.exe`/`lib.exe` witnesses RAN (15,914 ms) and stayed green.
+
+### THE CYCLE'S OWN MACHINERY BROKE, AND IT IS ANCHORED
+
+`D-CYCLE-LANE-CTEST-PARALLELISM-IS-UNBOUNDED-IN-AGGREGATE` — the isolation rules divided the files,
+the build trees and the scratchpads, and **nobody divided the machine**. ✔Four lanes each inheriting
+P17's `-j 8` gave 32 concurrent test processes; example tests went **~6 s → ~200 s** and a lane
+**abandoned a 639-test gate it had already earned**. ⚠⚠ **The first sizing written for the fix was
+itself wrong within minutes:** `cores / N` on a 32-core host IS four-lanes-at-`-j 8` — the rule as
+first written would not have prevented the failure it was written for. **A ctest ENTRY IS NOT A JOB**
+(616 entries each spawning a CLI; builds compete too), so the budget starts at `cores / (2N)` and the
+signal to watch is per-test wall clock against its baseline, not CPU%.
 
 ---
 

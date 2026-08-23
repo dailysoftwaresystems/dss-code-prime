@@ -69,3 +69,26 @@ dss_add_test(NAME lir/test_lir_return_pool_projection
 # was measured not to cover.
 dss_add_test(NAME lir/test_lir_arg_cursor_projection
              SOURCES test_lir_arg_cursor_projection.cpp)
+
+# D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE +
+# D-TARGET-ALLOCATABLE-POOL-LIST-SET-HAS-NO-OWNER: the TRIPWIRE for
+# D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS. Asserts the trigger is
+# still false, states the d/v aliasing as an ABI fact rather than deriving it,
+# and drives the load-time refusal through mutate_target_schema.hpp.
+dss_add_test(NAME lir/test_lir_aliased_view_allocability
+             SOURCES test_lir_aliased_view_allocability.cpp)
+target_link_libraries(dss_lir_test_lir_aliased_view_allocability
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LIR-FRAME-SLOT-STRIDE-ENUMERATES-CLASSES-INSTEAD-OF-DERIVING: the frame's
+# uniform slot stride must cover the widest class that OCCUPIES a slot, not the
+# two classes an inline `max(GPR, FPR)` happened to name.
+dss_add_test(NAME lir/test_lir_frame_slot_stride
+             SOURCES test_lir_frame_slot_stride.cpp)
+
+# D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND + D-TARGET-NO-CROSS-CLASS-MOVE-VERB: the
+# inline-asm operand materialisation used ONE module-wide integer `mov` for
+# every operand whatever class it bound — a live silent miscompile on both
+# shipped targets. Drives the REAL c-subset -> HIR -> MIR -> LIR lowering.
+dss_add_test(NAME lir/test_lir_asm_operand_move_class
+             SOURCES test_lir_asm_operand_move_class.cpp)

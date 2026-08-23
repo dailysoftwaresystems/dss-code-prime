@@ -147,6 +147,15 @@ public:
     }
     [[nodiscard]] std::span<StackReserveVehicle const>
     stackReserveVehicles() const noexcept override { return {}; }
+    [[nodiscard]] std::span<WeakDefinitionDialect const>
+    weakDefinitionDialects() const noexcept override {
+        // SPIR-V has no coalescing symbol model and this walker writes no weak
+        // definition in any spelling. Claiming none is what makes a SPIR-V
+        // document declaring `weakDefinition` fail loud at LOAD, instead of
+        // carrying a key nobody reads. The row is
+        // D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS.
+        return {};
+    }
 
     // Not a native image, not a program the OS starts, and not an `ar`
     // member — SPIR-V has no such shapes. `allowsUndefinedImports` is

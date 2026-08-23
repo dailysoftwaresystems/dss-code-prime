@@ -5,90 +5,43 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace dss {
 
 namespace {
 
-// Human-readable name for a TypeKind, for the fail-loud abort message. Covers
-// every enumerator so an abort always names the offending kind precisely.
-[[nodiscard]] char const* typeKindName(TypeKind k) noexcept {
-    switch (k) {
-        case TypeKind::Bool:      return "Bool";
-        case TypeKind::I8:        return "I8";
-        case TypeKind::I16:       return "I16";
-        case TypeKind::I32:       return "I32";
-        case TypeKind::I64:       return "I64";
-        case TypeKind::I128:      return "I128";
-        case TypeKind::U8:        return "U8";
-        case TypeKind::U16:       return "U16";
-        case TypeKind::U32:       return "U32";
-        case TypeKind::U64:       return "U64";
-        case TypeKind::U128:      return "U128";
-        case TypeKind::F16:       return "F16";
-        case TypeKind::F32:       return "F32";
-        case TypeKind::F64:       return "F64";
-        case TypeKind::F80:       return "F80";
-        case TypeKind::F128:      return "F128";
-        case TypeKind::Char:      return "Char";
-        case TypeKind::Byte:      return "Byte";
-        case TypeKind::Void:      return "Void";
-        case TypeKind::Struct:    return "Struct";
-        case TypeKind::Union:     return "Union";
-        case TypeKind::Tuple:     return "Tuple";
-        case TypeKind::Array:     return "Array";
-        case TypeKind::Slice:     return "Slice";
-        case TypeKind::Enum:      return "Enum";
-        case TypeKind::Vector:    return "Vector";
-        case TypeKind::Matrix:    return "Matrix";
-        case TypeKind::Ptr:       return "Ptr";
-        case TypeKind::Ref:       return "Ref";
-        case TypeKind::FnPtr:     return "FnPtr";
-        case TypeKind::Nullable:  return "Nullable";
-        case TypeKind::Optional:  return "Optional";
-        case TypeKind::FnSig:     return "FnSig";
-        case TypeKind::Param:     return "Param";
-        case TypeKind::Bind:      return "Bind";
-        case TypeKind::Extension: return "Extension";
-        case TypeKind::VolatileQual: return "VolatileQual";
-        case TypeKind::NullptrT:  return "NullptrT";
-        case TypeKind::BitInt:    return "BitInt";
-        case TypeKind::Complex:   return "Complex";
-        case TypeKind::Count_:    return "Count_";
-    }
-    return "<unknown>";
-}
-
+// ── The abort-message name — ONE OWNER, in the header ───────────────────────
+//
+// D-TYPEKIND-PASCALCASE-SPELLINGS-HAVE-TWO-OWNERS. This was a forty-one-arm
+// exhaustive switch retyping the PascalCase `TypeKind` spellings, and
+// `lir/lir_text.cpp` held a second one. The spellings now live in
+// `kTypeKindNameTable` beside the enum; this file owns none of them.
+//
+// ★ THE FORTY-FIRST ARM WAS THE DRIFT. This copy answered `Count_` with
+// `"Count_"` while the other answered `"?"` — ✔MEASURED as the one row the two
+// owners disagreed on. `Count_` is now unlisted in the table (it is the
+// cardinality sentinel, not a type), so it has NO spelling, and this site says
+// so with the ORDINAL rather than with a name: `<unnamed kind #40>` is strictly
+// more informative than either old answer, it covers an out-of-range ordinal
+// with the same sentence, and it stops implying that `Count_` is a kind a
+// `TypeRecord` could carry. The `Count_` abort below already names the sentinel
+// in its own words, so nothing is lost.
 [[noreturn]] void reinternFatal(TypeKind k, char const* why) {
+    auto const        name  = typeKindNameOrEmpty(k);
+    std::string const shown = name.empty()
+        ? std::format("<unnamed kind #{}>", static_cast<std::uint32_t>(k))
+        : std::string{name};
     std::fputs("dss::reinternType fatal: TypeKind ", stderr);
-    std::fputs(typeKindName(k), stderr);
+    std::fputs(shown.c_str(), stderr);
     std::fputs(" ", stderr);
     std::fputs(why, stderr);
     std::fputc('\n', stderr);
     std::abort();
-}
-
-// Is this primitive a leaf rebuildable purely from its kind (no operands /
-// scalars / name)? Every primitive in the [Bool, Void] range qualifies.
-[[nodiscard]] bool isPrimitiveKind(TypeKind k) noexcept {
-    switch (k) {
-        case TypeKind::Bool:
-        case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32:
-        case TypeKind::I64: case TypeKind::I128:
-        case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
-        case TypeKind::U64: case TypeKind::U128:
-        case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
-        case TypeKind::F80: case TypeKind::F128:
-        case TypeKind::Char: case TypeKind::Byte: case TypeKind::Void:
-        // C23 nullptr_t: an operand-less scalar kind — reinterns via the
-        // `dst.primitive(kind)` arm (mirrored in the rebuild switch below).
-        case TypeKind::NullptrT:
-            return true;
-        default:
-            return false;
-    }
 }
 
 } // namespace
@@ -349,7 +302,7 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         reinternFatal(kind, "produced no host TypeId (unhandled kind — add a "
                             "case to reinternType)");
     }
-    if (isPrimitiveKind(kind) && !ops.empty()) {
+    if (isPrimitiveTypeKind(kind) && !ops.empty()) {
         // A primitive must have no operands; if one ever does, the encoding
         // assumption above is wrong — fail loud rather than silently ignore it.
         reinternFatal(kind, "is a primitive but carried operands");

@@ -114,7 +114,7 @@ isWideInt(TypeInterner const& interner, TypeId id) noexcept;
 // The width in bits of a WIDE integer: the interned width for a `_BitInt(N>64)`,
 // 128 for I128/U128. FAILS LOUD (abort) for anything else — every call site is
 // downstream of an `isWideInt` gate, so a non-wide argument is a broken invariant,
-// never user input. This mirrors `TypeInterner::bitIntWidth` (type_lattice.cpp:832)
+// never user input. This mirrors `TypeInterner::bitIntWidth` (type_lattice.cpp)
 // exactly, which is the point: a facade site the TF-C94 sweep MISSED still aborts
 // on a 128-bit value rather than silently sizing a limb loop from a guess.
 [[nodiscard]] DSS_EXPORT std::int64_t
@@ -123,7 +123,7 @@ wideIntWidthBits(TypeInterner const& interner, TypeId id);
 // The signedness of a WIDE integer: the interned flag for a `_BitInt(N>64)`, `true`
 // for I128, `false` for U128. FAILS LOUD (abort) for anything else — same contract
 // and same reasoning as `wideIntWidthBits`, mirroring `TypeInterner::bitIntIsSigned`
-// (type_lattice.cpp:839). Signedness drives every limb sign-fill, the top-limb mask,
+// (type_lattice.cpp). Signedness drives every limb sign-fill, the top-limb mask,
 // and the ordered-compare's top-limb arm, so a guessed answer is wrong BYTES.
 [[nodiscard]] DSS_EXPORT bool
 wideIntIsSigned(TypeInterner const& interner, TypeId id);
@@ -145,10 +145,13 @@ isComplex(TypeInterner const& interner, TypeId id) noexcept;
 // guards (an aggregate/wide value reaching a bare-SSA position) funnel through here
 // so coverage is BY CONSTRUCTION (§A.5), not by enumerating edits. A pure type-shape
 // query — no target/format/language identity (the agnostic bar).
-// ⚠ TF-C94: this function has a `default:` arm and this TU is NOT under
-// `-Werror=switch` (MEASURED: in src/core only types/parse_diagnostic.cpp is —
-// src/core/CMakeLists.txt:98-104) — a missed kind is a SILENT `return false`, not a
-// build error. Any new memory-resident kind must be added here BY HAND.
+// ⚠ TF-C94: this function has a `default:` arm, so `-Werror=switch` / C4062
+// cannot see a missed kind here — those are the NO-`default` flavor. ✔RE-MEASURED
+// 2026-08-23: the flag is now PROJECT-WIDE (the root `CMakeLists.txt`), not the
+// src/core-only opt-in this note used to name, and the conclusion is unchanged
+// because the `default:` arm is what defeats it. A missed kind is a SILENT
+// `return false`, not a build error. Any new memory-resident kind must be added
+// here BY HAND.
 [[nodiscard]] DSS_EXPORT bool
 isMemoryResidentType(TypeInterner const& interner, TypeId id) noexcept;
 

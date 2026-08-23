@@ -45,11 +45,16 @@ using dss::report;
 // "'syscall' or 'by-name-import'" and the table's non-sentinel rows are exactly
 // {"syscall", "by-name-import"} — so this one had NOT yet drifted. The
 // conversion buys the future, not a repair.
-// The `2` is checked by `namesWhere` in a constant-evaluated context, so a third
-// mechanism breaks THIS initializer rather than silently shortening the message.
-constexpr auto kDeclarableExitMechanismNames =
-    namesWhere<2>(kExitMechanismTable,
-                  [](ExitMechanism m) { return m != ExitMechanism::None; });
+//
+// ★★ IT IS NO LONGER COMPUTED HERE. This file's `kDeclarableExitMechanismNames`
+// was one of FOUR copies of one projection, and a per-copy `namesWhere<M>` makes
+// the STRENGTH of the count check a per-reader decision: two of the four had
+// spelled `M` as `kExitMechanismTable.rows.size() - 1`, which cannot fail
+// (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY). The one
+// definition now lives beside the enum in `core/types/target_schema.hpp` as
+// `kSelectableExitMechanismNames`, with the literal count AND a `static_assert`
+// on the rejected-row count — the write-up and the nine-arm measurement are
+// there. "Declarable" and "selectable" were two names for the same set.
 
 // D-LK4-3 — build the collision-proof compound-key symbol index for one module.
 // Every function / data item / extern import is keyed by `(module.cuId, SymbolId)`
@@ -1305,7 +1310,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
                      "rather than jumped to). REMEDY: add a "
                      "'processExit' block (mechanism "
                    + dss::detail::renderAllowedList(
-                         kDeclarableExitMechanismNames, " or ")
+                         kSelectableExitMechanismNames, " or ")
                    + ") plus the paired "
                      "'entryCallingConvention' to this format's schema, or "
                      "build for a format that declares them. The refusal is "

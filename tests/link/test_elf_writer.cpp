@@ -652,7 +652,7 @@ TEST(ElfWriter, GotExternAddrValueEmitsAdrGotPageAndLd64GotLo12OnAarch64) {
     // (its sole use is the Return → not a callee, not a foldable load → the
     // value-form GOT arm is reached).
     TypeInterner interner{CompilationUnitId{1}};
-    TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+    TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
     TypeId const sig  = interner.fnSig(std::span<TypeId const>{}, ptrT,
                                        CallConv::CcAAPCS64);
     SymbolId const kCaller{10};

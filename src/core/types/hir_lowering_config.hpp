@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"           // EnumNameTable (kChildLowerTable)
 #include "core/types/object_format_kind.hpp"        // ObjectFormatKind (per-format element core)
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind (LiteralPrefixEntry.elementCore)
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -59,6 +61,33 @@ enum class ChildLower : std::uint8_t {
     Ref,       // a name reference (core Ref, or refExtensionKind leaf) to the resolved name
     VarDecl,   // lowerVarLike (core VarDecl, reusing the semantics declaration)
 };
+
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// `hirLowering…childGathering[].lower`. Previously an inline
+// `lv == "expr" / "flatExpr" / "ext" / "ref" / "varDecl"` chain in the grammar
+// loader whose refusal rendered the set UNQUOTED — `(expected
+// expr/flatExpr/ext/ref/varDecl)` — which is the shape no quoted census arm can
+// see (D-CONFIG-CLOSED-SET-RENDERED-UNQUOTED-IS-INVISIBLE-TO-EVERY-CENSUS): the
+// site reported ZERO hits at every `--min-tokens` while being a full five-name
+// second owner. `Expr` is row 0, matching `ChildSlotSpec::lower`'s own default.
+inline constexpr EnumNameTable<ChildLower, 5> kChildLowerTable{{{
+    { ChildLower::Expr,     "expr"     },
+    { ChildLower::FlatExpr, "flatExpr" },
+    { ChildLower::Ext,      "ext"      },
+    { ChildLower::Ref,      "ref"      },
+    { ChildLower::VarDecl,  "varDecl"  },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kChildLowerTable);
+
+[[nodiscard]] constexpr std::string_view
+childLowerName(ChildLower l) noexcept {
+    return kChildLowerTable.name(l);
+}
+[[nodiscard]] constexpr std::optional<ChildLower>
+childLowerFromName(std::string_view s) noexcept {
+    return kChildLowerTable.fromName(s);
+}
 
 struct DSS_EXPORT ChildSlotSpec {
     RuleId      matchRule{};      std::string matchRuleName;  // sub-rule to find (xor classifier)

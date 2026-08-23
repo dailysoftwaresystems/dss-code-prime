@@ -9,6 +9,7 @@
 #include "core/types/number_style.hpp"
 #include "core/types/operator_table.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/enum_name_table.hpp"  // EnumNameTable (kReservedWordPolicyTable)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/assembly_config.hpp"
@@ -242,6 +243,27 @@ enum class ReservedWordPolicy : std::uint8_t {
     Strict,
     Contextual,
 };
+
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// The document-level `reservedWordPolicy` key, previously owned by an inline
+// `v == "strict" / "contextual"` chain in the grammar loader with two sentences
+// beside it restating the pair. `Strict` is row 0, matching the default a
+// document without the key gets.
+inline constexpr EnumNameTable<ReservedWordPolicy, 2> kReservedWordPolicyTable{{{
+    { ReservedWordPolicy::Strict,     "strict"     },
+    { ReservedWordPolicy::Contextual, "contextual" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kReservedWordPolicyTable);
+
+[[nodiscard]] constexpr std::string_view
+reservedWordPolicyName(ReservedWordPolicy p) noexcept {
+    return kReservedWordPolicyTable.name(p);
+}
+[[nodiscard]] constexpr std::optional<ReservedWordPolicy>
+reservedWordPolicyFromName(std::string_view s) noexcept {
+    return kReservedWordPolicyTable.fromName(s);
+}
 
 // Standard C++23 fallible result. Error channel is the full list of
 // diagnostics collected before bailing — the loader keeps walking to

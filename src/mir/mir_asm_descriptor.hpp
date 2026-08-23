@@ -58,6 +58,28 @@ struct MirAsmOperand {
     // register table — this tier never enumerates register names). Empty ⇒ the
     // allocator picks within `regClass`.
     std::string    fixedRegister;
+
+    // ★★★ THE THIRD BINDING ARM: THE OPERAND **FORM**, for a letter that binds
+    // one (`"m"` → `membase`, `"i"` → `imm32`). `regClass` above is meaningless
+    // on such an operand and asking it for one is the defect this pair closes —
+    // a memory operand requires NO register class, because the ADDRESS is what
+    // gets a register (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED).
+    // The two arms are mutually exclusive: `TargetAsmConstraint::binds` names
+    // exactly one, so `operandKindResolved` and a meaningful `regClass` are
+    // never both live on one entry.
+    //
+    // ⚠ THE BOOL IS LOAD-BEARING FOR THE REASON THE `optional` PAYLOADS ARE ONE
+    // TIER UP: `OperandKindFilter::Reg` is 0, so a default-constructed operand
+    // would otherwise read back as "binds a register form" — a plausible wrong
+    // answer rather than a loud one.
+    //
+    // Raw `OperandKindFilter` value, for the reason `TargetRegClass` is declared
+    // opaquely above: this header is reached by every `mir.hpp` consumer and
+    // must not pull in the 3.4k-line target schema. A TU that names an
+    // enumerator includes `target_schema.hpp` itself, as it already must.
+    bool           operandKindResolved = false;
+    std::uint8_t   operandKind         = 0;
+
     // `"+r"` — this operand is read AND written: one input tied to one output.
     // Recorded on BOTH halves of a lowered `+` operand, because both entries
     // describe the SAME source operand and both are quoted by diagnostics.
@@ -138,8 +160,10 @@ struct DSS_EXPORT MirAsmDescriptor {
     // which names the byte INSIDE the template but never the source statement
     // that embedded it — so a reader with three `__asm__` blocks in one file
     // cannot tell which one is being refused. ✔MEASURED, both references:
-    // gcc 13.3 reports `gt.c:3: Error: no such instruction: …` and clang 18
-    // reports `gt.c:3:13: error: …` with a `note: instantiated into assembly
+    // on a 3-line C file whose `__asm__` names a bogus mnemonic, gcc 13.3
+    // reports the C statement's `<file>:<line>: Error: no such instruction: …`
+    // and clang 18 reports its `<file>:<line>:<col>: error: …` with a
+    // `note: instantiated into assembly
     // here` block — BOTH make the C statement the primary locus, neither has
     // template-primary. HIR→MIR is the last tier that can see the statement's
     // span (MIR→LIR has no source map), so the locus travels on the descriptor

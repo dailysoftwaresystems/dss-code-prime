@@ -93,3 +93,21 @@ target_include_directories(dss_analysis_semantic_test_inline_asm_template_sigil_
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_link_libraries(dss_analysis_semantic_test_inline_asm_template_sigil_agreement
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED: the FRONT-END half of
+# the three-armed constraint binding. `AsmConstraintBinding::OperandKind` — the
+# arm `"m"` and `"i"` land on — used to resolve to nothing, which is
+# byte-identical to "the letter is not declared", so a declared letter was
+# refused three tiers down with a reason that was false. Lives beside
+# `test_inline_asm_capture` (the P5 capture pins) because it asks the same
+# question one step later: not "what did the source write", but "what did the
+# TARGET say the letter binds". It runs the real CST->HIR lowering with a
+# shipped target in scope, which is the only configuration in which the
+# resolution runs at all.
+dss_add_test(NAME analysis/semantic/test_inline_asm_operand_kind_binding
+             SOURCES test_inline_asm_operand_kind_binding.cpp)
+# Shares `semantic_test_fixture.hpp` with the suites above, so it needs the
+# tests/ include root for the same reason they do (NOT the repo root -- its
+# `VERSION` file shadows `<version>` on case-insensitive filesystems).
+target_include_directories(dss_analysis_semantic_test_inline_asm_operand_kind_binding
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

@@ -4,6 +4,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/enum_name_table.hpp"  // EnumNameTable / allNames — the ONE owner of each text spelling set
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/semantic_config.hpp"  // BuiltinLowering / kBuiltinLoweringTable — the `builtincall` payload's closed set
 #include "core/types/source_span.hpp"
 #include "core/types/target_schema.hpp"  // callConvName / kCallConvTable
 #include "core/types/type_lattice/core_type.hpp"
@@ -20,6 +21,7 @@
 #include "hir/hir_verifier.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <format>
 #include <optional>
@@ -118,6 +120,250 @@ namespace {
 // in ONE direction, with both halves compiling and the suite green.
 inline constexpr std::string_view kHirTextUnspelledAggregateTag = "unspelled_aggregate";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET — the keyword vocabularies
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ★★★ THESE FIVE TABLES ARE MINTED FROM THE PARSE ARMS, and that is the reason
+// this row could not be closed the way its sibling was.
+// `D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET` is about a
+// message that DRIFTED from a table it was supposed to project; here there was
+// no table at all. Every one of these arms was already FAIL-LOUD — it refused an
+// unknown spelling — and every one of them named NO ACCEPTED SET, so an author
+// with a typo learned that their word was wrong and never what this reader would
+// have taken.
+//
+// ⚠ THE TABLE IS THE DISPATCH KEY, NOT A LIST BESIDE IT. Each `if (kw == "…")`
+// ladder became a `switch` over the table's enum, so `-Werror=switch` refuses a
+// new row that nobody dispatched and the row is the ONLY place the spelling is
+// written. A list beside a ladder would have been a second owner on day one —
+// the exact shape cycle P23 measured three times, where a shipped message
+// disagreed with the parse code it described.
+//
+// ⓘ `HirTextAttrKind`, `HirTextForClause`, `HirTextExprKw` and `HirTextStmtKw`
+// are TEXT-SURFACE vocabularies with no pipeline verb behind them: they name
+// productions of this grammar (an `@`-attribute kind, a `for` clause role, the
+// keyword that opens a node line). Where a pipeline verb DOES exist the table is
+// keyed on it directly — `kHirTextFlagTable` on `HirFlags`, the six attribute
+// tables on `FfiLinkage`/`ShaderStage`/… — and `parseOp` projects `HirOpKind`
+// through `opName`, minting nothing.
+
+// The node-flag spellings, read by BOTH directions: `parseFlags` resolves a name
+// through it and `flagsStr` renders through it. Before this, the writer's `add()`
+// ladder and the reader's `if/else` ladder were two independent copies of one
+// four-word vocabulary.
+inline constexpr EnumNameTable<HirFlags, 4> kHirTextFlagTable{{{
+    { HirFlags::HasError,     "err"    },
+    { HirFlags::Synthetic,    "syn"    },
+    { HirFlags::ShaderUsable, "shader" },
+    { HirFlags::HostUsable,   "host"   },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextFlagTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextFlagTable));
+
+// The `@`-attribute kinds. One row per side-table `applyAttrs` can populate.
+enum class HirTextAttrKind : std::uint8_t { Loc, Ffi, Shader, Transpile, Diag };
+inline constexpr EnumNameTable<HirTextAttrKind, 5> kHirTextAttrKindTable{{{
+    { HirTextAttrKind::Loc,       "loc"       },
+    { HirTextAttrKind::Ffi,       "ffi"       },
+    { HirTextAttrKind::Shader,    "shader"    },
+    { HirTextAttrKind::Transpile, "transpile" },
+    { HirTextAttrKind::Diag,      "diag"      },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextAttrKindTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextAttrKindTable));
+
+// The `for { … }` clause roles.
+enum class HirTextForClause : std::uint8_t { Init, Cond, Update, Body };
+inline constexpr EnumNameTable<HirTextForClause, 4> kHirTextForClauseTable{{{
+    { HirTextForClause::Init,   "init"   },
+    { HirTextForClause::Cond,   "cond"   },
+    { HirTextForClause::Update, "update" },
+    { HirTextForClause::Body,   "body"   },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextForClauseTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextForClauseTable));
+
+// The keyword that OPENS an expression node line. One row per `parseExprInner`
+// arm, and it is also what `parseNode` routes on.
+//
+// ★★★ THIS TABLE REPLACED A THIRD COPY OF THE SET, AND THE THIRD COPY WAS
+// ALREADY WRONG. `parseExprInner`'s `if` ladder listed ten keywords, its
+// `kTypedExprs` array listed thirteen more, and `isExprKeyword` — the ROUTER that
+// decides whether a line is an expression at all — retyped TWENTY of the
+// twenty-three. ✔MEASURED 2026-08-23: the three it omitted are `va_start`,
+// `va_arg` and `va_end`, all three of which `emitNodeLine` writes via
+// `typedCall`. So a `.dsshir` containing a variadic-access node routed to
+// `parseStmtInner` and came back `unknown statement` — a write-only spelling of
+// exactly the class D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS
+// names, produced by the retyped-set defect
+// D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET names. One table, and the router,
+// the dispatch and the refusal all read it.
+//
+// ⚠⚠ AND IT WAS STILL SHORT BY TWO AFTER THAT FIX. ✔MEASURED 2026-08-23:
+// `emitExpr` wrote `builtincall` and `labeladdr`, and NEITHER string appeared
+// anywhere else in this file — the writer produced text the reader refused, the
+// same write-only shape the `va_*` repair had just closed for three siblings.
+// Adding the two rows is the smaller half of the fix; the larger half is that
+// the writer no longer spells anything itself (see `exprKwForKind`), so a
+// spelling with no row here is now UNWRITABLE rather than merely untested.
+enum class HirTextExprKw : std::uint8_t {
+    Lit, Ref, Call, Intrinsic, BuiltinCall, BinOp, UnOp, Member, Swizzle,
+    TypeRef, Seq, Cast, Index, Construct, Ternary, LogicalAnd, LogicalOr,
+    SizeOf, AlignOf, AddressOf, Deref, LabelAddr, VaStart, VaArg, VaEnd,
+
+    Count_  // keep last — counts the members; deliberately UNLISTED below
+};
+inline constexpr EnumNameTable<HirTextExprKw, 25> kHirTextExprKwTable{{{
+    { HirTextExprKw::Lit,        "lit"         },
+    { HirTextExprKw::Ref,        "ref"         },
+    { HirTextExprKw::Call,       "call"        },
+    { HirTextExprKw::Intrinsic,  "intrinsic"   },
+    { HirTextExprKw::BuiltinCall,"builtincall" },
+    { HirTextExprKw::BinOp,      "binop"       },
+    { HirTextExprKw::UnOp,       "unop"        },
+    { HirTextExprKw::Member,     "member"      },
+    { HirTextExprKw::Swizzle,    "swizzle"     },
+    { HirTextExprKw::TypeRef,    "typeref"     },
+    { HirTextExprKw::Seq,        "seq"         },
+    { HirTextExprKw::Cast,       "cast"        },
+    { HirTextExprKw::Index,      "index"       },
+    { HirTextExprKw::Construct,  "construct"   },
+    { HirTextExprKw::Ternary,    "ternary"     },
+    { HirTextExprKw::LogicalAnd, "logical_and" },
+    { HirTextExprKw::LogicalOr,  "logical_or"  },
+    { HirTextExprKw::SizeOf,     "sizeof"      },
+    { HirTextExprKw::AlignOf,    "alignof"     },
+    { HirTextExprKw::AddressOf,  "addressof"   },
+    { HirTextExprKw::Deref,      "deref"       },
+    { HirTextExprKw::LabelAddr,  "labeladdr"   },
+    { HirTextExprKw::VaStart,    "va_start"    },
+    { HirTextExprKw::VaArg,      "va_arg"      },
+    { HirTextExprKw::VaEnd,      "va_end"      },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextExprKwTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextExprKwTable));
+
+// ★★★ THE COMPLETENESS CHECK WELL-FORMEDNESS CANNOT GIVE, and it is the reason
+// `Count_` exists on an enum that is otherwise a pure spelling set.
+// `DSS_CHECK_ENUM_NAME_TABLE` proves the rows are non-empty and pairwise
+// distinct; it cannot prove there are ENOUGH of them, because the row count is
+// the hand-written template argument. An enumerator added without a row leaves
+// `EnumNameTable::name()` on its row-0 fallback — so the writer would spell a
+// brand-new node `lit`, the reader would faithfully read `lit`, and the round
+// trip would be byte-identical for the WRONG NODE. The pair of asserts pins the
+// two halves: the rows cover ordinals `[0, Count_)`, and there are exactly
+// `Count_` of them.
+// (The same argument `kHirKindTable` makes one file over, arrived at from the
+// serialization side rather than the diagnostic side.)
+static_assert(kHirTextExprKwTable.rows.size()
+                  == static_cast<std::size_t>(HirTextExprKw::Count_),
+              "kHirTextExprKwTable must carry exactly one row per keyword");
+static_assert([] {
+    for (std::size_t i = 0; i < static_cast<std::size_t>(HirTextExprKw::Count_); ++i)
+        if (kHirTextExprKwTable.nameOrEmpty(static_cast<HirTextExprKw>(i)).empty())
+            return false;
+    return true;
+}(), "every HirTextExprKw ordinal must have a row (Count_ stays unlisted)");
+
+// The keyword that OPENS a statement / declaration node line — everything
+// `parseNode` does NOT route to `parseExprInner`. Same treatment, same reason:
+// the ladder's final `malformed` named no accepted set at all.
+enum class HirTextStmtKw : std::uint8_t {
+    Block, If, SehTry, While, Do, For, Switch, Case, Default, Label, Goto,
+    Break, Continue, Return, Unreachable, InlineAsm, Assign, Expr, Var, Global,
+    Param, Function, ExternFunction, ExternGlobal, ImportGroup, TypeDecl,
+    ExtNode, Error,
+
+    Count_  // keep last — counts the members; deliberately UNLISTED below
+};
+inline constexpr EnumNameTable<HirTextStmtKw, 28> kHirTextStmtKwTable{{{
+    { HirTextStmtKw::Block,          "block"            },
+    { HirTextStmtKw::If,             "if"               },
+    { HirTextStmtKw::SehTry,         "seh_try"          },
+    { HirTextStmtKw::While,          "while"            },
+    { HirTextStmtKw::Do,             "do"               },
+    { HirTextStmtKw::For,            "for"              },
+    { HirTextStmtKw::Switch,         "switch"           },
+    { HirTextStmtKw::Case,           "case"             },
+    { HirTextStmtKw::Default,        "default"          },
+    { HirTextStmtKw::Label,          "label"            },
+    { HirTextStmtKw::Goto,           "goto"             },
+    { HirTextStmtKw::Break,          "break"            },
+    { HirTextStmtKw::Continue,       "continue"         },
+    { HirTextStmtKw::Return,         "return"           },
+    { HirTextStmtKw::Unreachable,    "unreachable"      },
+    { HirTextStmtKw::InlineAsm,      "inline_asm"       },
+    { HirTextStmtKw::Assign,         "assign"           },
+    { HirTextStmtKw::Expr,           "expr"             },
+    { HirTextStmtKw::Var,            "var"              },
+    { HirTextStmtKw::Global,         "global"           },
+    { HirTextStmtKw::Param,          "param"            },
+    { HirTextStmtKw::Function,       "function"         },
+    { HirTextStmtKw::ExternFunction, "extern_function"  },
+    { HirTextStmtKw::ExternGlobal,   "extern_global"    },
+    { HirTextStmtKw::ImportGroup,    "import_group"     },
+    { HirTextStmtKw::TypeDecl,       "type_decl"        },
+    { HirTextStmtKw::ExtNode,        "ext_node"         },
+    { HirTextStmtKw::Error,          "error"            },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextStmtKwTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextStmtKwTable));
+// The statement half of the same completeness argument — see the expression
+// table's note for why the two asserts are not redundant with each other.
+static_assert(kHirTextStmtKwTable.rows.size()
+                  == static_cast<std::size_t>(HirTextStmtKw::Count_),
+              "kHirTextStmtKwTable must carry exactly one row per keyword");
+static_assert([] {
+    for (std::size_t i = 0; i < static_cast<std::size_t>(HirTextStmtKw::Count_); ++i)
+        if (kHirTextStmtKwTable.nameOrEmpty(static_cast<HirTextStmtKw>(i)).empty())
+            return false;
+    return true;
+}(), "every HirTextStmtKw ordinal must have a row (Count_ stays unlisted)");
+
+// ── D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: the TYPE-keyword position ────
+//
+// The STRUCTURAL keywords `parseType` dispatches on, beside the primitive names
+// `kHirTextPrimTable` already owns. `unknown type 'foo'` named neither.
+//
+// ⚠⚠ AND THIS ONE IS ON A SHIPPED PATH, which is why it is a SET and not a
+// dispatch conversion. ✔MEASURED 2026-08-23: `parseTypeFromText` drives this
+// production from 9 call sites — 7 in `ffi/shipped_lib_descriptor.cpp`, 2 in
+// `analysis/semantic/semantic_analyzer.cpp` — decoding FFI-descriptor and
+// builtin-signature type strings. The arms are structurally unlike each other,
+// several share a body, `unsigned` is a PREFIX rather than a head keyword, and
+// the caller-supplied `namedTypes_` bindings are a deliberate LAST resort after
+// every keyword. Reshaping that ladder to buy `-Werror=switch` would trade a
+// message-quality gain for a change in the shipped decoder's control flow.
+//
+// ★ WHAT REPLACES THE COMPILE-TIME PAIRING GUARD: a FEED-BACK PIN. Every
+// spelling this list advertises is driven back through `parseTypeFromText` and
+// must not come back as `unknown type`, so the list cannot advertise a keyword
+// the ladder does not handle, and cannot go stale when one is added without it.
+// ⚠ `opaque` and `packed` are NOT here, and the feed-back pin is what said so.
+// The first draft of this list carried `opaque`; `EveryAdvertisedHirTypeKeywordIs// RecognizedByTheReader` reddened immediately, because `opaque` is a MODIFIER
+// inside `struct "N" opaque`, not a head keyword — advertising it would have
+// told an FFI-descriptor author to write a type this decoder refuses. That is the
+// exact drift this row is about, caught inside one cycle of writing the list.
+inline constexpr std::array<std::string_view, 21> kHirTextTypeKeywords{
+    "invalid", "ptr", "ref", "nullable", "optional", "slice", "complex",
+    "volatile", "atomic", "fnptr", "vec", "mat", "arr", "tuple", "struct",
+    "union", "enum", "fn", "ext", "_BitInt", "unsigned",
+};
+DSS_CHECK_KEY_VOCABULARY(kHirTextTypeKeywords);
+
+
+// ★★ `diagnosticCodeName`'s answer for an ordinal its switch has no arm for.
+//
+// That switch (`parse_diagnostic.cpp`) has NO `default:` and covers every
+// enumerator, so `-Werror=switch` — on for this whole build — makes it grow an
+// arm with EVERY new code. That is what turns this one string into an
+// "is this ordinal allocated" predicate rather than a second list to maintain,
+// and it is the same source `scripts/check-diagnostic-codes/check-diagnostic-codes.py`
+// reads for the allocation gate: the enum itself
+// (D-MIR-TEXT-DIAG-CODE-CAST-IS-UNVALIDATED).
+inline constexpr std::string_view kUnallocatedDiagnosticCodeName = "Unknown";
+
 // The `.dsshir` bare-keyword type spellings. A deliberate SUBSET of `TypeKind`:
 // the aggregate / pointer / function kinds have their own bracketed syntax
 // (`ptr<T>`, `arr<T,N>`, `fn(...) -> T`) and are never spelled as a keyword, so
@@ -165,12 +411,85 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextPrimTable));
     return kHirTextPrimTable.fromName(s);
 }
 
+// The LITERAL-CORE position, which is a wider set than the type-keyword position.
+//
+// ★ THE TWIN OF `kMirTextLiteralCoreTable`, ROW FOR ROW AND SPELLING FOR
+// SPELLING. A literal's `core` may be a STRUCTURAL kind — `hir_literal_pool.hpp`
+// states the contract: `core` ∈ {Struct, Union, Array} is the aggregate arm — and
+// `kHirTextPrimTable` deliberately omits those, because a row there would make
+// the bare keyword `struct` resolve as a prim and swallow the `"Name" { … }` that
+// the TYPE grammar expects after it. So this position needs its own table rather
+// than rows added over there, exactly as the MIR tier concluded.
+//
+// ⚠ Reached ONLY from the aggregate literal's per-field core
+// (D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM); a top-level literal's core
+// is recomputed from its type annotation by `literalCoreFor` and never spelled.
+inline constexpr EnumNameTable<TypeKind, 6> kHirTextLiteralCoreTable{{{
+    { TypeKind::Struct, "struct" },
+    { TypeKind::Union,  "union"  },
+    { TypeKind::Array,  "array"  },
+    { TypeKind::Ptr,    "ptr"    },
+    { TypeKind::Ref,    "ref"    },
+    { TypeKind::Enum,   "enum"   },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kHirTextLiteralCoreTable);
+DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextLiteralCoreTable));
+
+// ⚠ `nameOrEmpty` on BOTH tables, never `name`: neither lists an invalid
+// sentinel, so the row-0 fall-back would render an unspelled kind as `bool` /
+// `struct` — a wrong answer that reads as a legitimate declaration.
+[[nodiscard]] std::string_view literalCoreName(TypeKind k) noexcept {
+    std::string_view const p = kHirTextPrimTable.nameOrEmpty(k);
+    return p.empty() ? kHirTextLiteralCoreTable.nameOrEmpty(k) : p;
+}
+
+[[nodiscard]] std::optional<TypeKind> literalCoreFromName(std::string_view s) noexcept {
+    if (auto const k = kHirTextPrimTable.fromName(s); k.has_value()) return k;
+    return kHirTextLiteralCoreTable.fromName(s);
+}
+
+// The accepted set for that position, projected off BOTH owning tables so the
+// sentence cannot be narrower, wider or staler than the lookup above it.
+[[nodiscard]] std::string literalCoreAccepted() {
+    std::string out{detail::renderAllowedList(allNames(kHirTextPrimTable))};
+    out += ", ";
+    out += detail::renderAllowedList(allNames(kHirTextLiteralCoreTable));
+    return out;
+}
+
+// The accepted set at a type position: the primitive names plus the structural
+// keywords, projected off both owners.
+[[nodiscard]] std::string typeKeywordsAccepted() {
+    std::string out{detail::renderAllowedList(allNames(kHirTextPrimTable))};
+    out += ", ";
+    out += detail::renderAllowedList(kHirTextTypeKeywords);
+    return out;
+}
+
 [[nodiscard]] std::optional<HirOpKind> coreOpFromName(std::string_view s) noexcept {
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(HirOpKind::Count_); ++i) {
         auto const op = static_cast<HirOpKind>(i);
         if (opName(op) == s) return op;
     }
     return std::nullopt;
+}
+
+// The accepted set for `parseOp`, projected off the SAME walk `coreOpFromName`
+// performs — `opName` over `[0, HirOpKind::Count_)`. No table is minted here and
+// none could be: `hir_op.hpp` already owns the spellings, and a copy of them at
+// this tier would be the second owner this row exists to remove
+// (D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET).
+//
+// ⓘ Built on demand rather than as a constant: it is reached only on a refusal,
+// and materializing every core-operator spelling on every parse to serve a
+// diagnostic that usually never fires is the wrong trade.
+[[nodiscard]] std::string coreOpAccepted() {
+    std::vector<std::string_view> names;
+    names.reserve(static_cast<std::size_t>(HirOpKind::Count_));
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(HirOpKind::Count_); ++i) {
+        names.push_back(opName(static_cast<HirOpKind>(i)));
+    }
+    return detail::renderAllowedList(names);
 }
 
 // The six ATTRIBUTE vocabularies. Each table lists its `None`/`Default`
@@ -330,20 +649,104 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextRecoveryTable));
     return kHirTextRecoveryTable.name(r);
 }
 
-[[nodiscard]] bool isExprKind(HirKind k) noexcept {
+// ── D-HIR-TEXT-WRITER-SPELLS-KEYWORDS-THE-READER-HAS-NO-ROW-FOR ─────────────
+//
+// ★★★ THE ONE BINDING BETWEEN A CORE `HirKind` AND THE `.dsshir` KEYWORD THAT
+// SPELLS IT, AND EVERY DIRECTION READS IT. The writer projects a kind to its
+// spelling through this (it never writes a keyword string of its own any more),
+// the ROUTER below is DEFINED as "this kind has a spelling here", and the reader
+// dispatches on the same `HirTextExprKw` through a `default:`-less switch. So
+// the loop closes at COMPILE TIME in all three places:
+//   a spelling ⇒ an enumerator ⇒ a table row ⇒ a reader arm.
+//
+// ⚠⚠ THAT LOOP WAS OPEN, AND IT HAD LEAKED THREE TIMES IN ONE FILE.
+// ✔MEASURED 2026-08-23: the writer emitted `builtincall` and `labeladdr`, which
+// appeared NOWHERE else — `emitHir` produced text `parseHir` refused by name.
+// A sibling repair the same day had closed the identical hole for `va_start` /
+// `va_arg` / `va_end` by adding table rows, which fixed those three spellings
+// and left the MECHANISM that produced them untouched: the writer still spelled
+// its own keywords, so the next node kind could re-open it. It re-opened
+// immediately in a THIRD place — the router below listed neither `LabelAddressOf`
+// NOR the three `va_*` kinds it had just taught the reader, so a variadic node
+// in statement position was routed to the statement writer and degraded to
+// `error` with a diagnostic that blamed the node rather than the router.
+//
+// ★ NO `default:`, DELIBERATELY. `-Werror=switch` (on for this whole build) is
+// what makes a NEW `HirKind` stop the build here until its author says whether
+// it is an expression and, if so, which keyword spells it. That is the pairing
+// the `default:`-carrying writer switches could not have: an unhandled kind
+// rendered `error` at RUN time, which is a silently smaller program.
+[[nodiscard]] constexpr std::optional<HirTextExprKw>
+exprKwForKind(HirKind k) noexcept {
     switch (k) {
-        case HirKind::Literal: case HirKind::Ref: case HirKind::Call:
-        case HirKind::IntrinsicCall: case HirKind::BuiltinCall:
-        case HirKind::BinaryOp: case HirKind::UnaryOp:
-        case HirKind::Cast: case HirKind::MemberAccess: case HirKind::Index:
-        case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
-        case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
-        case HirKind::AlignOf:
-        case HirKind::AddressOf: case HirKind::Deref: case HirKind::SeqExpr:
-        case HirKind::TypeRef:
-            return true;
-        default: return false;
+        case HirKind::Literal:            return HirTextExprKw::Lit;
+        case HirKind::Ref:                return HirTextExprKw::Ref;
+        case HirKind::Call:               return HirTextExprKw::Call;
+        case HirKind::IntrinsicCall:      return HirTextExprKw::Intrinsic;
+        case HirKind::BuiltinCall:        return HirTextExprKw::BuiltinCall;
+        case HirKind::BinaryOp:           return HirTextExprKw::BinOp;
+        case HirKind::UnaryOp:            return HirTextExprKw::UnOp;
+        case HirKind::MemberAccess:       return HirTextExprKw::Member;
+        case HirKind::Swizzle:            return HirTextExprKw::Swizzle;
+        case HirKind::TypeRef:            return HirTextExprKw::TypeRef;
+        case HirKind::SeqExpr:            return HirTextExprKw::Seq;
+        case HirKind::Cast:               return HirTextExprKw::Cast;
+        case HirKind::Index:              return HirTextExprKw::Index;
+        case HirKind::ConstructAggregate: return HirTextExprKw::Construct;
+        case HirKind::Ternary:            return HirTextExprKw::Ternary;
+        case HirKind::LogicalAnd:         return HirTextExprKw::LogicalAnd;
+        case HirKind::LogicalOr:          return HirTextExprKw::LogicalOr;
+        case HirKind::SizeOf:             return HirTextExprKw::SizeOf;
+        case HirKind::AlignOf:            return HirTextExprKw::AlignOf;
+        case HirKind::AddressOf:          return HirTextExprKw::AddressOf;
+        case HirKind::Deref:              return HirTextExprKw::Deref;
+        case HirKind::LabelAddressOf:     return HirTextExprKw::LabelAddr;
+        case HirKind::VaStart:            return HirTextExprKw::VaStart;
+        case HirKind::VaArg:              return HirTextExprKw::VaArg;
+        case HirKind::VaEnd:              return HirTextExprKw::VaEnd;
+
+        // ── everything that is NOT written in expression position ──
+        // `Error` and `Extension` are the deliberate subtlety: they DO render
+        // inline inside an expression, but their keywords (`error` / `ext_node`)
+        // are STATEMENT keywords with an inline form, owned by the statement
+        // table. Pairing them here would advertise two owners for one spelling.
+        case HirKind::Module:      case HirKind::Function:
+        case HirKind::Global:      case HirKind::TypeDecl:
+        case HirKind::ExternFunction: case HirKind::ExternGlobal:
+        case HirKind::ImportGroup: case HirKind::Block:
+        case HirKind::IfStmt:      case HirKind::WhileStmt:
+        case HirKind::DoWhileStmt: case HirKind::ForStmt:
+        case HirKind::SwitchStmt:  case HirKind::CaseArm:
+        case HirKind::BreakStmt:   case HirKind::ContinueStmt:
+        case HirKind::ReturnStmt:  case HirKind::ExprStmt:
+        case HirKind::VarDecl:     case HirKind::AssignStmt:
+        case HirKind::GotoStmt:    case HirKind::LabelStmt:
+        case HirKind::IndirectGotoStmt: case HirKind::SehTryExcept:
+        case HirKind::InlineAsm:   case HirKind::Unreachable:
+        case HirKind::Error:       case HirKind::Extension:
+        case HirKind::Count_:
+            return std::nullopt;
     }
+    return std::nullopt;
+}
+
+// The writer's router, and no longer a hand-retyped second copy of the set
+// above: a kind is written in expression position EXACTLY WHEN this file can
+// spell it as one. The two cannot disagree because there is only one list.
+[[nodiscard]] bool isExprKind(HirKind k) noexcept {
+    return exprKwForKind(k).has_value();
+}
+
+// The statement half of the same discipline. There is deliberately NO
+// `HirKind`→keyword function on this side: two kinds spell two keywords each —
+// a `VarDecl` is `var` or `param` by POSITION, a `CaseArm` is `case` or
+// `default` by CONTENT — so a kind-keyed map would have to pick one and be
+// wrong at the other site. What this projection still buys is the property the
+// finding was about: every statement keyword the writer emits is a ROW of the
+// table the reader dispatches on, so a write-only spelling cannot be typed here
+// either.
+[[nodiscard]] constexpr std::string_view stmtKw(HirTextStmtKw k) noexcept {
+    return kHirTextStmtKwTable.name(k);
 }
 
 // Does this node carry a symbol id in its payload? (Used by the symbol pre-pass.)
@@ -390,7 +793,7 @@ public:
         if (hir_.kind(root) != HirKind::Module) {
             // The grammar's top level is a module; a non-Module root can't be
             // spelled. Fail loud-but-recoverable (a diagnostic, not an abort).
-            report("root node is not a Module — cannot serialize");
+            report("root node is not a Module — cannot serialize", DiagnosticSeverity::Error);
             out_ += "module \"\" {\n}\n";
             return std::move(out_);
         }
@@ -421,7 +824,18 @@ private:
     // re-parsed — the output is not round-trippable, so `reporter.hasErrors()`
     // must report it. The lone documented exception (a deliberately-absent
     // interner, the `?`-types degraded mode) passes Warning explicitly.
-    void report(std::string detail, DiagnosticSeverity sev = DiagnosticSeverity::Error) {
+    // ★★ THE SEVERITY IS A REQUIRED ARGUMENT. It defaulted to Error here while
+    // the sibling `mir_text.cpp` helper defaulted to Warning, so the SAME class of
+    // writer-side drop was loud in one text tier and a warning in the other, on
+    // two files that describe themselves as twins
+    // (D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS).
+    //
+    // ⓘ Deleting the default rather than picking one: both severities are right
+    // for different sites. A value this format cannot render is an Error (the text
+    // will not read back); a lossy dump the CALLER asked for by supplying no
+    // interner is a Warning, said once. A default makes that choice by omission,
+    // which is how the two tiers came to disagree without either one deciding.
+    void report(std::string detail, DiagnosticSeverity sev) {
         ParseDiagnostic d;
         d.code = DiagnosticCode::H_TextMalformed;
         d.severity = sev;
@@ -448,15 +862,22 @@ private:
 
     [[nodiscard]] std::string indent(int n) const { return std::string(static_cast<std::size_t>(n) * 2, ' '); }
 
+    // ⓘ RENDERS THROUGH `kHirTextFlagTable`, the same rows `parseFlags` resolves
+    // against. This was a four-line `add("err")` ladder and its reader was a
+    // four-line `if (n == "err")` ladder — two independent copies of one
+    // vocabulary, which is the shape this file has been converting throughout
+    // (D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET). The declaration ORDER of the
+    // table is the emission order, so existing text is byte-unchanged.
     [[nodiscard]] std::string flagsStr(HirFlags f) const {
         if (!any(f)) return {};
         std::string out = " [";
         bool first = true;
-        auto add = [&](char const* n) { if (!first) out += ','; out += n; first = false; };
-        if (has(f, HirFlags::HasError))     add("err");
-        if (has(f, HirFlags::Synthetic))    add("syn");
-        if (has(f, HirFlags::ShaderUsable)) add("shader");
-        if (has(f, HirFlags::HostUsable))   add("host");
+        for (auto const& [bit, name] : kHirTextFlagTable.rows) {
+            if (!has(f, bit)) continue;
+            if (!first) out += ',';
+            out += name;
+            first = false;
+        }
         out += ']';
         return out;
     }
@@ -471,7 +892,9 @@ private:
         if (!t.valid()) { out_ += "invalid"; return; }
         if (ctx_.interner == nullptr) {
             if (!internerWarned_) {
-                report("no TypeInterner supplied; types render as '?'", DiagnosticSeverity::Warning);
+                report("no TypeInterner supplied; types render as '?', and text containing "
+                       "'?' is refused on the way back in",
+                       DiagnosticSeverity::Warning);
                 internerWarned_ = true;
             }
             out_ += '?';
@@ -618,7 +1041,7 @@ private:
                             "enum '{}' has an underlying TypeKind (ordinal {}) this "
                             "format has no keyword for; the underlying type is NOT "
                             "rendered and the text reads back as the I32 default",
-                            in.name(t), sc[0]));
+                            in.name(t), sc[0]), DiagnosticSeverity::Error);
                     } else {
                         out_ += " : ";
                         out_ += n;
@@ -663,7 +1086,8 @@ private:
             }
             default: { // primitives (and any unexpected kind)
                 std::string_view const p = primName(in.kind(t));
-                if (!p.empty()) out_ += p; else { report("unprintable type kind"); out_ += '?'; }
+                if (!p.empty()) out_ += p;
+                else { report("unprintable type kind", DiagnosticSeverity::Error); out_ += '?'; }
                 // D-LANG-TYPE-IDENTITY-VOCABULARY: emit the vocabulary tag when the
                 // primitive carries one, so the text round-trip preserves IDENTITY
                 // and not merely representation. Anonymous primitives (every core
@@ -778,9 +1202,10 @@ private:
         HirFlags const f = hir_.flags(id);
         switch (hir_.kind(id)) {
             case HirKind::Module:
-                report("nested Module is not representable"); out_ += "error\n"; return;
+                report("nested Module is not representable", DiagnosticSeverity::Error);
+                out_ += stmtKw(HirTextStmtKw::Error); out_ += '\n'; return;
             case HirKind::Function: {
-                out_ += "function"; out_ += flagsStr(f);
+                out_ += stmtKw(HirTextStmtKw::Function); out_ += flagsStr(f);
                 out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
                 appendType(hir_.functionSignature(id));
                 out_ += " {\n";
@@ -790,7 +1215,7 @@ private:
                 return;
             }
             case HirKind::ExternFunction: {
-                out_ += "extern_function"; out_ += flagsStr(f);
+                out_ += stmtKw(HirTextStmtKw::ExternFunction); out_ += flagsStr(f);
                 out_ += std::format(" %{}", handleOf(hir_.payload(id)));
                 if (hir_.externFunctionSignature(id).valid()) { out_ += " : "; appendType(hir_.externFunctionSignature(id)); }
                 out_ += " {\n";
@@ -799,7 +1224,7 @@ private:
                 return;
             }
             case HirKind::Global: {
-                out_ += "global"; out_ += flagsStr(f);
+                out_ += stmtKw(HirTextStmtKw::Global); out_ += flagsStr(f);
                 out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
                 appendType(hir_.globalType(id));
                 if (auto init = hir_.globalInit(id)) { out_ += " = "; emitExpr(*init); }
@@ -807,28 +1232,28 @@ private:
                 return;
             }
             case HirKind::TypeDecl:
-                out_ += "type_decl"; out_ += flagsStr(f);
+                out_ += stmtKw(HirTextStmtKw::TypeDecl); out_ += flagsStr(f);
                 out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
                 appendType(hir_.typeDeclType(id)); out_ += '\n';
                 return;
             case HirKind::ExternGlobal:
-                out_ += "extern_global"; out_ += flagsStr(f);
+                out_ += stmtKw(HirTextStmtKw::ExternGlobal); out_ += flagsStr(f);
                 out_ += std::format(" %{}", handleOf(hir_.payload(id)));
                 if (hir_.externGlobalType(id).valid()) { out_ += " : "; appendType(hir_.externGlobalType(id)); }
                 out_ += '\n';
                 return;
             case HirKind::ImportGroup:
-                out_ += "import_group"; out_ += flagsStr(f); out_ += " {\n";
+                out_ += stmtKw(HirTextStmtKw::ImportGroup); out_ += flagsStr(f); out_ += " {\n";
                 for (HirNodeId m : hir_.importGroupMembers(id)) emitNodeLine(m, ind + 1);
                 out_ += indent(ind); out_ += "}\n";
                 return;
             case HirKind::Block:
-                out_ += "block"; out_ += flagsStr(f); out_ += " {\n";
+                out_ += stmtKw(HirTextStmtKw::Block); out_ += flagsStr(f); out_ += " {\n";
                 for (HirNodeId s : hir_.children(id)) emitNodeLine(s, ind + 1);
                 out_ += indent(ind); out_ += "}\n";
                 return;
             case HirKind::IfStmt: {
-                out_ += "if"; out_ += flagsStr(f); out_ += " (";
+                out_ += stmtKw(HirTextStmtKw::If); out_ += flagsStr(f); out_ += " (";
                 emitExpr(hir_.ifCondition(id)); out_ += ")\n";
                 emitNodeLine(hir_.ifThen(id), ind + 1);
                 if (auto e = hir_.ifElse(id)) { out_ += indent(ind); out_ += "else\n"; emitNodeLine(*e, ind + 1); }
@@ -836,24 +1261,24 @@ private:
             }
             case HirKind::SehTryExcept:
                 // c115 SEH: `seh_try` <tryBody> `seh_except (` filter `)` <handler>.
-                out_ += "seh_try"; out_ += flagsStr(f); out_ += '\n';
+                out_ += stmtKw(HirTextStmtKw::SehTry); out_ += flagsStr(f); out_ += '\n';
                 emitNodeLine(hir_.sehTryBody(id), ind + 1);
                 out_ += indent(ind); out_ += "seh_except (";
                 emitExpr(hir_.sehTryFilter(id)); out_ += ")\n";
                 emitNodeLine(hir_.sehTryHandler(id), ind + 1);
                 return;
             case HirKind::WhileStmt:
-                out_ += "while"; out_ += flagsStr(f); out_ += " (";
+                out_ += stmtKw(HirTextStmtKw::While); out_ += flagsStr(f); out_ += " (";
                 emitExpr(*hir_.loopCondition(id)); out_ += ")\n";
                 emitNodeLine(hir_.loopBody(id), ind + 1);
                 return;
             case HirKind::DoWhileStmt:
-                out_ += "do"; out_ += flagsStr(f); out_ += "\n";
+                out_ += stmtKw(HirTextStmtKw::Do); out_ += flagsStr(f); out_ += "\n";
                 emitNodeLine(hir_.loopBody(id), ind + 1);
                 out_ += indent(ind); out_ += "while ("; emitExpr(*hir_.loopCondition(id)); out_ += ")\n";
                 return;
             case HirKind::ForStmt: {
-                out_ += "for"; out_ += flagsStr(f); out_ += " {\n";
+                out_ += stmtKw(HirTextStmtKw::For); out_ += flagsStr(f); out_ += " {\n";
                 if (auto i = hir_.forInit(id))   { out_ += indent(ind + 1); out_ += "init:\n";   emitNodeLine(*i, ind + 2); }
                 if (auto c = hir_.loopCondition(id)) { out_ += indent(ind + 1); out_ += "cond:\n"; emitNodeLine(*c, ind + 2); }
                 if (auto u = hir_.forUpdate(id)) { out_ += indent(ind + 1); out_ += "update:\n"; emitNodeLine(*u, ind + 2); }
@@ -865,7 +1290,7 @@ private:
                 // c60 (Design I-A): `switch (disc) { body: <block> case v L<ord> ...
                 // default L<ord> }`. The body Block carries the case/default markers
                 // inline; the dispatch arms map each case value to its marker ordinal.
-                out_ += "switch"; out_ += flagsStr(f); out_ += " (";
+                out_ += stmtKw(HirTextStmtKw::Switch); out_ += flagsStr(f); out_ += " (";
                 emitExpr(hir_.switchDiscriminant(id)); out_ += ") {\n";
                 out_ += indent(ind + 1); out_ += "body:\n";
                 emitNodeLine(hir_.switchBody(id), ind + 2);
@@ -874,52 +1299,82 @@ private:
                 return;
             }
             case HirKind::BreakStmt: {
-                out_ += "break"; out_ += flagsStr(f);
+                out_ += stmtKw(HirTextStmtKw::Break); out_ += flagsStr(f);
                 if (hir_.branchDepth(id) != 0) out_ += std::format(" {}", hir_.branchDepth(id));
                 out_ += '\n'; return;
             }
             case HirKind::ContinueStmt: {
-                out_ += "continue"; out_ += flagsStr(f);
+                out_ += stmtKw(HirTextStmtKw::Continue); out_ += flagsStr(f);
                 if (hir_.branchDepth(id) != 0) out_ += std::format(" {}", hir_.branchDepth(id));
                 out_ += '\n'; return;
             }
             case HirKind::ReturnStmt:
-                out_ += "return"; out_ += flagsStr(f);
+                out_ += stmtKw(HirTextStmtKw::Return); out_ += flagsStr(f);
                 if (auto v = hir_.returnValue(id)) { out_ += ' '; emitExpr(*v); }
                 out_ += '\n'; return;
             case HirKind::ExprStmt:
-                out_ += "expr"; out_ += flagsStr(f); out_ += ' '; emitExpr(hir_.exprStmtExpr(id)); out_ += '\n';
+                out_ += stmtKw(HirTextStmtKw::Expr); out_ += flagsStr(f); out_ += ' '; emitExpr(hir_.exprStmtExpr(id)); out_ += '\n';
                 return;
             case HirKind::VarDecl:
-                out_ += "var"; out_ += flagsStr(f);
+                out_ += stmtKw(HirTextStmtKw::Var); out_ += flagsStr(f);
                 out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
                 appendType(hir_.varDeclType(id));
                 if (auto init = hir_.varDeclInit(id)) { out_ += " = "; emitExpr(*init); }
                 out_ += '\n'; return;
             case HirKind::AssignStmt:
-                out_ += "assign"; out_ += flagsStr(f); out_ += ' ';
+                out_ += stmtKw(HirTextStmtKw::Assign); out_ += flagsStr(f); out_ += ' ';
                 emitExpr(hir_.assignTarget(id)); out_ += " = "; emitExpr(hir_.assignValue(id)); out_ += '\n';
                 return;
             case HirKind::Unreachable:
-                out_ += "unreachable"; out_ += flagsStr(f); out_ += '\n'; return;
+                out_ += stmtKw(HirTextStmtKw::Unreachable); out_ += flagsStr(f); out_ += '\n'; return;
             case HirKind::GotoStmt:
-                out_ += "goto"; out_ += flagsStr(f);
+                out_ += stmtKw(HirTextStmtKw::Goto); out_ += flagsStr(f);
                 out_ += std::format(" L{}", hir_.labelOrdinal(id)); out_ += '\n'; return;
             case HirKind::LabelStmt:
-                out_ += "label"; out_ += flagsStr(f);
+                out_ += stmtKw(HirTextStmtKw::Label); out_ += flagsStr(f);
                 out_ += std::format(" L{}:\n", hir_.labelOrdinal(id));
                 emitNodeLine(hir_.labelBody(id), ind + 1);
                 return;
             case HirKind::IndirectGotoStmt:
-                out_ += "goto"; out_ += flagsStr(f); out_ += " *";
+                out_ += stmtKw(HirTextStmtKw::Goto); out_ += flagsStr(f); out_ += " *";
                 emitExpr(hir_.indirectGotoTarget(id)); out_ += '\n'; return;
             case HirKind::InlineAsm:
                 emitInlineAsm(id, f); return;
             case HirKind::Error: case HirKind::Extension:
                 emitExtOrError(id, /*inlineForm=*/false, ind); out_ += '\n'; return;
-            default:
-                report("unexpected node kind in statement position"); out_ += "error\n"; return;
+
+            // ── every EXPRESSION kind, plus the two arms that render elsewhere ──
+            // ★ `emitNodeLine` routes expression kinds to `emitExpr` before this
+            // switch runs, and `CaseArm` renders through `emitCaseArm` from its
+            // SwitchStmt parent, so reaching any of these is a mis-route rather
+            // than an unhandled node. They are listed rather than left to a
+            // `default:` for the reason the expression switch lists its
+            // complement: a `default:` absorbs a NEW `HirKind` in silence and
+            // degrades it to `error`, and `-Werror=switch` is the only thing that
+            // makes the two directions grow together.
+            case HirKind::Literal:     case HirKind::Ref:
+            case HirKind::Call:        case HirKind::IntrinsicCall:
+            case HirKind::BuiltinCall: case HirKind::BinaryOp:
+            case HirKind::UnaryOp:     case HirKind::Cast:
+            case HirKind::MemberAccess: case HirKind::Index:
+            case HirKind::Swizzle:     case HirKind::ConstructAggregate:
+            case HirKind::Ternary:     case HirKind::LogicalAnd:
+            case HirKind::LogicalOr:   case HirKind::SizeOf:
+            case HirKind::AlignOf:     case HirKind::AddressOf:
+            case HirKind::Deref:       case HirKind::SeqExpr:
+            case HirKind::LabelAddressOf: case HirKind::VaStart:
+            case HirKind::VaArg:       case HirKind::VaEnd:
+            case HirKind::TypeRef:     case HirKind::CaseArm:
+            case HirKind::Count_:
+                report(std::format("unexpected node kind '{}' in statement position",
+                                   hirKindName(hir_.kind(id))),
+                       DiagnosticSeverity::Error);
+                out_ += stmtKw(HirTextStmtKw::Error); out_ += '\n'; return;
         }
+        // Unreachable: the switch above is total over `HirKind`.
+        report("statement node carries a kind outside the core enum",
+               DiagnosticSeverity::Error);
+        out_ += stmtKw(HirTextStmtKw::Error); out_ += '\n';
     }
 
     // -- inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS) -----------------------
@@ -934,7 +1389,7 @@ private:
     //                          [clobbers ( "r" , ... )]
     //                          [labels ( <label> , ... )] }]
     //   <opnd>  := "constraint" [ [name] ] [<spells>] [class <N>] [pin "reg"]
-    //              -> <expr>
+    //              [operand_kind <name>] -> <expr>
     //   <label> := L<n> [<spells>]
     //   <spells>:= spells ( "%0" , ... )
     //
@@ -958,13 +1413,14 @@ private:
     // DIFFERENT PROGRAM.
     void emitInlineAsm(HirNodeId id, HirFlags f) {
         std::uint32_t const handle = hir_.payload(id);
-        out_ += "inline_asm";
+        out_ += stmtKw(HirTextStmtKw::InlineAsm);
         out_ += flagsStr(f);
         if (handle == kNoInlineAsmDescriptor) { out_ += '\n'; return; }
         if (ctx_.inlineAsmPool == nullptr || !ctx_.inlineAsmPool->contains(handle)) {
             report("inline-asm descriptor handle does not resolve against the "
                    "supplied pool - rendering the opaque handle form; the "
-                   "operands, clobbers and labels are NOT in this output");
+                   "operands, clobbers and labels are NOT in this output",
+                   DiagnosticSeverity::Error);
             out_ += std::format(" #{}\n", handle);
             return;
         }
@@ -1026,6 +1482,51 @@ private:
                 if (!op.fixedRegister.empty()) {
                     out_ += " pin "; out_ += quote(op.fixedRegister);
                 }
+                // ── D-HIR-TEXT-INLINE-ASM-OPERAND-KIND-DROPPED-IN-TRANSIT ──
+                //
+                // ★★★ THE THIRD ARM OF THE RESOLUTION, AND IT MUST TRAVEL OR THE
+                // ROUND TRIP RE-CREATES THE VERY DEFECT THE PIPELINE JUST FIXED.
+                // A constraint letter binds one of THREE things
+                // (`TargetAsmConstraint::binds`), and the two lines above carry
+                // only two of them. A form-bound letter — `"m"` → `membase`,
+                // `"i"` → `imm32` — sets `operandKindResolved` and NOTHING else,
+                // so a descriptor written without this clause reads back with
+                // `!regClassResolved && !operandKindResolved`: byte-identical to
+                // *"no target was in scope"*. `hir_to_mir` then refuses the
+                // operand saying the letter *"was never bound to a processor"* —
+                // a refusal whose stated reason is FALSE, which sends the reader
+                // to fix a config that is already correct. That is
+                // D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED,
+                // reproduced one tier over by a serialization gap.
+                //
+                // ★ SPELLED BY NAME, NOT BY ORDINAL, and that is a deliberate
+                // departure from the `class {}` line above it. `OperandKindFilter`
+                // is an OPEN-ENDED enum by its own docblock (*"future Imm8/Imm16/
+                // Imm64 join as distinct filters"*), so an inserted enumerator
+                // silently retargets every ordinal a stored `.dsshir` ever wrote,
+                // and an out-of-range ordinal has no failure arm at all. A name
+                // has one, and it is the table the whole pipeline already reads
+                // (`kOperandKindFilterTable`) — no new vocabulary.
+                // ⚠ `nameOrEmpty`, never `name()`: `OperandKindFilter::Reg` is 0,
+                // so `name()`'s row-0 fallback would render an out-of-range value
+                // as `reg` — the plausible wrong answer instead of the loud one.
+                if (op.operandKindResolved) {
+                    auto const kind = static_cast<OperandKindFilter>(op.operandKind);
+                    std::string_view const spelling =
+                        kOperandKindFilterTable.nameOrEmpty(kind);
+                    if (spelling.empty()) {
+                        report(std::format(
+                                   "inline-asm operand carries operand-kind ordinal "
+                                   "{}, which no `OperandKindFilter` row spells - it "
+                                   "cannot be written to `.dsshir`; accepted: {}",
+                                   op.operandKind,
+                                   detail::renderAllowedList(
+                                       allNames(kOperandKindFilterTable))),
+                               DiagnosticSeverity::Error);
+                    } else {
+                        out_ += " operand_kind "; out_ += spelling;
+                    }
+                }
                 out_ += " -> ";
                 // The operand's VALUE is child i - the descriptor and the child
                 // list are index-aligned by construction, and `HirVerifier`'s
@@ -1033,8 +1534,8 @@ private:
                 if (i < kids.size()) { emitExpr(kids[i]); }
                 else {
                     report("inline-asm descriptor declares more operands than the "
-                           "node has children");
-                    out_ += "error";
+                           "node has children", DiagnosticSeverity::Error);
+                    out_ += stmtKw(HirTextStmtKw::Error);
                 }
             }
             out_ += " )";
@@ -1062,7 +1563,7 @@ private:
             if (d.labelOrdinals.size() != d.labelSpellings.size()) {
                 report("inline-asm descriptor carries a different number of "
                        "`asm goto` label ordinals and spelling groups - the two "
-                       "are index-aligned by contract");
+                       "are index-aligned by contract", DiagnosticSeverity::Error);
             }
             out_ += " labels (";
             for (std::size_t i = 0; i < n; ++i) {
@@ -1082,7 +1583,7 @@ private:
     void emitParam(HirNodeId id, int ind) {
         emitAttrsBlock(id, ind);
         out_ += indent(ind);
-        out_ += "param"; out_ += flagsStr(hir_.flags(id));
+        out_ += stmtKw(HirTextStmtKw::Param); out_ += flagsStr(hir_.flags(id));
         out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
         appendType(hir_.varDeclType(id));
         if (auto init = hir_.varDeclInit(id)) { out_ += " = "; emitExpr(*init); }
@@ -1096,9 +1597,9 @@ private:
         emitAttrsBlock(id, ind);
         out_ += indent(ind);
         if (hir_.caseArmIsDefault(id)) {
-            out_ += "default"; out_ += flagsStr(hir_.flags(id));
+            out_ += stmtKw(HirTextStmtKw::Default); out_ += flagsStr(hir_.flags(id));
         } else {
-            out_ += "case"; out_ += flagsStr(hir_.flags(id)); out_ += ' ';
+            out_ += stmtKw(HirTextStmtKw::Case); out_ += flagsStr(hir_.flags(id)); out_ += ' ';
             emitExpr(*hir_.caseArmValue(id));
         }
         out_ += std::format(" L{}\n", hir_.caseArmLabelOrdinal(id));
@@ -1112,10 +1613,11 @@ private:
             std::string_view name = "?";
             std::uint32_t const p = hir_.payload(id);
             if (p >= kFirstHirExtensionKind) name = hir_.registry().descriptor(HirKindId{p}).name();
-            else report("Extension node payload is not an extension kind id");
-            out_ += "ext_node"; out_ += flagsStr(f); out_ += ' '; out_ += quote(name);
+            else report("Extension node payload is not an extension kind id",
+                        DiagnosticSeverity::Error);
+            out_ += stmtKw(HirTextStmtKw::ExtNode); out_ += flagsStr(f); out_ += ' '; out_ += quote(name);
         } else {
-            out_ += "error"; out_ += flagsStr(f);
+            out_ += stmtKw(HirTextStmtKw::Error); out_ += flagsStr(f);
         }
         if (hir_.typeId(id).valid()) { out_ += " : "; appendType(hir_.typeId(id)); }
         auto kids = hir_.children(id);
@@ -1138,14 +1640,30 @@ private:
             for (HirNodeId k : kids) { if (!first) out_ += ", "; emitExpr(k); first = false; }
             out_ += ')';
         };
-        auto header = [&](char const* kw) { out_ += kw; out_ += flagsStr(f); };
-        auto typed = [&](char const* kw) { header(kw); out_ += " : "; appendType(hir_.typeId(id)); };
-        // The `kw : type (operands...)` family — must mirror the parser's
-        // kTypedExprs table so the two sides can't drift.
-        auto typedCall = [&](char const* kw) { typed(kw); out_ += ' '; operands(hir_.children(id)); };
+        // ★★★ THE KEYWORD IS NOT A PARAMETER ANY MORE — IT IS PROJECTED FROM THE
+        // NODE'S OWN KIND through `exprKwForKind`, so no arm can write a spelling
+        // that is not this format's spelling for the kind it is rendering, and no
+        // arm can write a spelling the reader has no row for. That is the whole
+        // repair for `builtincall` / `labeladdr`: adding the two rows fixed two
+        // spellings, and taking the string away from the writer is what stops the
+        // next one being born. `header` therefore takes NOTHING.
+        // ⚠ A kind with no pairing REPORTS rather than emitting a blank keyword —
+        // an empty spelling would render `" : i64"`, which reads as a syntax
+        // error at some later reader instead of a defect here.
+        auto header = [&]() {
+            if (auto const kw = exprKwForKind(hir_.kind(id)))
+                out_ += kHirTextExprKwTable.name(*kw);
+            else
+                report("expression node kind has no `.dsshir` keyword", DiagnosticSeverity::Error);
+            out_ += flagsStr(f);
+        };
+        auto typed = [&]() { header(); out_ += " : "; appendType(hir_.typeId(id)); };
+        // The `kw : type (operands...)` family — the parser's mirror is its
+        // `typedCall` arm; the two now share the spelling table, not a convention.
+        auto typedCall = [&]() { typed(); out_ += ' '; operands(hir_.children(id)); };
         switch (hir_.kind(id)) {
             case HirKind::Literal: {
-                header("lit"); out_ += ' ';
+                header(); out_ += ' ';
                 std::uint32_t const idx = hir_.payload(id);
                 // Inline the VALUE when a pool is supplied (faithful round-trip);
                 // else the bare index form (value-less, for pool-less modules).
@@ -1157,58 +1675,60 @@ private:
                     // silently dropping the value into the index fallback.
                     if (ctx_.literalPool)
                         report(std::format("literal #{} is out of range of the pool (size {})",
-                                           idx, ctx_.literalPool->size()));
+                                           idx, ctx_.literalPool->size()),
+                               DiagnosticSeverity::Error);
                     out_ += std::format("#{}", idx);
                 }
                 out_ += " : "; appendType(hir_.typeId(id)); return;
             }
             case HirKind::Ref:
-                header("ref"); out_ += std::format(" %{} : ", handleOf(hir_.payload(id))); appendType(hir_.typeId(id)); return;
+                header(); out_ += std::format(" %{} : ", handleOf(hir_.payload(id))); appendType(hir_.typeId(id)); return;
             case HirKind::IntrinsicCall: {
-                header("intrinsic"); out_ += ' ';
+                header(); out_ += ' ';
                 std::uint32_t const p = hir_.payload(id);
                 if (hir_.intrinsicRegistry().contains(HirIntrinsicId{p}))
                     out_ += quote(hir_.intrinsicRegistry().descriptor(HirIntrinsicId{p}).name());
-                else { report("IntrinsicCall payload is not a registered intrinsic"); out_ += "\"?\""; }
+                else { report("IntrinsicCall payload is not a registered intrinsic",
+                              DiagnosticSeverity::Error); out_ += "\"?\""; }
                 out_ += " : "; appendType(hir_.typeId(id)); out_ += ' '; operands(hir_.children(id)); return;
             }
             case HirKind::BuiltinCall: {
                 // c103 (D-CSUBSET-INTRINSIC-UMULH): `builtincall #<lowering> : <type>
                 // (<operands>)` — the BuiltinLowering payload prints numerically.
-                header("builtincall"); out_ += ' ';
+                header(); out_ += ' ';
                 out_ += std::format("#{}", hir_.payload(id));
                 out_ += " : "; appendType(hir_.typeId(id)); out_ += ' ';
                 operands(hir_.children(id)); return;
             }
             case HirKind::BinaryOp: case HirKind::UnaryOp: {
-                header(hir_.kind(id) == HirKind::BinaryOp ? "binop" : "unop");
+                header();
                 out_ += ' '; appendOpName(hir_.payload(id));
                 out_ += " : "; appendType(hir_.typeId(id)); out_ += ' '; operands(hir_.children(id)); return;
             }
             case HirKind::MemberAccess:
-                header("member"); out_ += std::format(" #{} : ", hir_.payload(id)); appendType(hir_.typeId(id));
+                header(); out_ += std::format(" #{} : ", hir_.payload(id)); appendType(hir_.typeId(id));
                 out_ += ' '; operands(hir_.children(id)); return;
             case HirKind::Swizzle:
-                header("swizzle"); out_ += std::format(" #{} : ", hir_.payload(id)); appendType(hir_.typeId(id));
+                header(); out_ += std::format(" #{} : ", hir_.payload(id)); appendType(hir_.typeId(id));
                 out_ += ' '; operands(hir_.children(id)); return;
-            case HirKind::Call:               typedCall("call"); return;
-            case HirKind::Cast:               typedCall("cast"); return;
-            case HirKind::Index:              typedCall("index"); return;
-            case HirKind::ConstructAggregate: typedCall("construct"); return;
-            case HirKind::Ternary:            typedCall("ternary"); return;
-            case HirKind::LogicalAnd:         typedCall("logical_and"); return;
-            case HirKind::LogicalOr:          typedCall("logical_or"); return;
-            case HirKind::SizeOf:             typedCall("sizeof"); return;
-            case HirKind::AlignOf:            typedCall("alignof"); return;
-            case HirKind::VaStart:            typedCall("va_start"); return;
-            case HirKind::VaArg:              typedCall("va_arg"); return;
-            case HirKind::VaEnd:              typedCall("va_end"); return;
-            case HirKind::AddressOf:          typedCall("addressof"); return;
-            case HirKind::Deref:              typedCall("deref"); return;
+            case HirKind::Call:               typedCall(); return;
+            case HirKind::Cast:               typedCall(); return;
+            case HirKind::Index:              typedCall(); return;
+            case HirKind::ConstructAggregate: typedCall(); return;
+            case HirKind::Ternary:            typedCall(); return;
+            case HirKind::LogicalAnd:         typedCall(); return;
+            case HirKind::LogicalOr:          typedCall(); return;
+            case HirKind::SizeOf:             typedCall(); return;
+            case HirKind::AlignOf:            typedCall(); return;
+            case HirKind::VaStart:            typedCall(); return;
+            case HirKind::VaArg:              typedCall(); return;
+            case HirKind::VaEnd:              typedCall(); return;
+            case HirKind::AddressOf:          typedCall(); return;
+            case HirKind::Deref:              typedCall(); return;
             case HirKind::LabelAddressOf:
                 // D-CSUBSET-COMPUTED-GOTO: `&&label` leaf — render the target label
                 // ordinal + type (no operands), mirroring goto/label's `L{ord}` form.
-                header("labeladdr");
+                header();
                 out_ += std::format(" L{} : ", hir_.labelAddressOrdinal(id));
                 appendType(hir_.typeId(id)); return;
             case HirKind::SeqExpr: {
@@ -1216,16 +1736,46 @@ private:
                 // statement children render as normal statement lines; the
                 // result (last child) is the yielded value. Mirrors the
                 // inline-brace form `error`/`ext_node` use.
-                typed("seq"); out_ += " {\n";
+                typed(); out_ += " {\n";
                 for (HirNodeId s : hir_.seqExprStmts(id)) emitNodeLine(s, 1);
                 out_ += indent(1); out_ += "yield "; emitExpr(hir_.seqExprResult(id));
                 out_ += "\n}"; return;
             }
-            case HirKind::TypeRef:    typed("typeref"); return;
+            case HirKind::TypeRef:    typed(); return;
             case HirKind::Error: case HirKind::Extension:
                 emitExtOrError(id, /*inlineForm=*/true, 0); return;
-            default: report("unexpected node kind in expression position"); out_ += "error"; return;
+
+            // ── NOT an expression: reached only when a caller mis-routes ──
+            // ★ SPELLED OUT RATHER THAN LEFT TO `default:`, and that is the
+            // second half of the pairing `exprKwForKind` starts. A `default:`
+            // here absorbs a NEW `HirKind` silently and renders it `error` — a
+            // smaller program with a diagnostic that blames the node instead of
+            // this switch. Without one, `-Werror=switch` stops the build until
+            // the new kind is classified.
+            case HirKind::Module:      case HirKind::Function:
+            case HirKind::Global:      case HirKind::TypeDecl:
+            case HirKind::ExternFunction: case HirKind::ExternGlobal:
+            case HirKind::ImportGroup: case HirKind::Block:
+            case HirKind::IfStmt:      case HirKind::WhileStmt:
+            case HirKind::DoWhileStmt: case HirKind::ForStmt:
+            case HirKind::SwitchStmt:  case HirKind::CaseArm:
+            case HirKind::BreakStmt:   case HirKind::ContinueStmt:
+            case HirKind::ReturnStmt:  case HirKind::ExprStmt:
+            case HirKind::VarDecl:     case HirKind::AssignStmt:
+            case HirKind::GotoStmt:    case HirKind::LabelStmt:
+            case HirKind::IndirectGotoStmt: case HirKind::SehTryExcept:
+            case HirKind::InlineAsm:   case HirKind::Unreachable:
+            case HirKind::Count_:
+                report(std::format("unexpected node kind '{}' in expression position",
+                                   hirKindName(hir_.kind(id))),
+                       DiagnosticSeverity::Error);
+                out_ += stmtKw(HirTextStmtKw::Error); return;
         }
+        // Unreachable: the switch above is total over `HirKind` and an extension
+        // node arrives as `HirKind::Extension`, which has an arm.
+        report("expression node carries a kind outside the core enum",
+               DiagnosticSeverity::Error);
+        out_ += stmtKw(HirTextStmtKw::Error);
     }
 
     // A pool literal's inline value, tagged by variant arm so the parser
@@ -1278,26 +1828,80 @@ private:
             out_ += std::format("wfloat {} {} {}", bits, p.hi, p.lo);
             return;
         }
-        // ★★★ THE ARM THAT FALLS OFF THE END, AND IT WAS SILENT. Nine of
-        // `HirLiteralValue`'s TEN variant arms are spelled above; the tenth —
-        // `HirAggregateValue`, the D5.3 folded struct/union/array constant — has no
-        // spelling in this format, and with no final arm here it rendered NOTHING:
-        // `lit ` followed straight by the type annotation, the whole constant
-        // dropped, no diagnostic on either side. The MIR tier spells its aggregate
-        // arm (`agg { … }`) and this one does not, so the two text tiers of one
-        // compiler disagree about what is serializable
+        // ★★★ THE ARM THAT USED TO FALL OFF THE END. Nine of `HirLiteralValue`'s
+        // TEN variant arms were spelled above; the tenth — `HirAggregateValue`,
+        // the D5.3 folded struct/union/array constant — had no spelling at all,
+        // and with no final arm here it rendered NOTHING: `lit ` followed straight
+        // by the type annotation, the whole constant dropped, no diagnostic on
+        // either side. Cycle P23 made that LOUD (a named marker the reader refused
+        // by name); what was still missing was the CAPABILITY
         // (D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM).
         //
-        // ★ ONE TOKEN AND IDENTIFIER-SHAPED, for the reason the MIR emitter's
+        // ★★ THE SPELLING IS THE MIR TIER'S, `agg { … }`, AND THAT IS THE WHOLE
+        // POINT OF THE ROW. The two text tiers of one compiler disagreeing about
+        // what is serializable was the defect; inventing a second syntax for the
+        // same folded constant would have kept the disagreement and merely made it
+        // symmetrical. `mir_text.cpp`'s `appendLiteral` already writes `agg {`,
+        // comma-separated fields, `}` — and its comment for the shared `bitint`
+        // arm states the rule this follows: the two pools hold the SAME host
+        // value, so a second syntax for it would be a second owner of one
+        // serialization.
+        //
+        // ⚠ EACH FIELD CARRIES ITS OWN `: <core>`, WHICH THE TOP-LEVEL VALUE DOES
+        // NOT. A top-level literal's `core` is RECOMPUTED by the reader from the
+        // node's type annotation (`literalCoreFor`), and a nested field has no type
+        // annotation — there is nothing to recompute it from. Without the per-field
+        // core every element of a folded aggregate would come back `Void`: a
+        // round trip that is byte-stable on re-emit and LOSSY in the pool, which
+        // is the failure mode hardest to see from the text alone.
+        if (auto const* agg = std::get_if<HirAggregateValue>(&v.value)) {
+            out_ += "agg {";
+            bool first = true;
+            for (HirLiteralValue const& f : agg->fields) {
+                if (!first) out_ += ", ";
+                appendLiteralValue(f);
+                out_ += " : ";
+                // ⚠ `literalCoreName`, NOT `primName`: a NESTED aggregate field's
+                // own core is `Struct`/`Union`/`Array`, which the type-keyword
+                // table deliberately omits. ✔MEASURED while writing the nesting
+                // pin — a `primName`-only writer rendered the inner aggregate's
+                // core as `?` and the round trip refused its own output.
+                std::string_view const core = literalCoreName(f.core);
+                if (core.empty()) {
+                    // Same discipline as the enum-underlying arm: name the kind
+                    // that has no spelling rather than emitting a plausible one.
+                    report(std::format(
+                        "aggregate literal field has core TypeKind ordinal {}, "
+                        "which this format has no spelling for; rendered as '?', "
+                        "which the reader REFUSES — accepted: {}",
+                        static_cast<std::uint32_t>(f.core), literalCoreAccepted()),
+                        DiagnosticSeverity::Error);
+                    out_ += '?';
+                } else {
+                    out_ += core;
+                }
+                first = false;
+            }
+            out_ += '}';
+            return;
+        }
+        // ★ THE MARKER STAYS, AND IT IS NOT DEAD CODE. Every arm above returns, so
+        // reaching here means `HirLiteralValue` grew an arm this writer does not
+        // spell. The `static_assert` below FAILS THE BUILD on exactly that, so this
+        // is the runtime backstop for the window in which someone silences the
+        // assert by bumping the count without writing the arm — which is the one
+        // edit that turns a compile error back into a silent drop.
+        //
+        // ONE TOKEN AND IDENTIFIER-SHAPED, for the reason the MIR emitter's
         // `<asm-descriptor-unspelled>` marker states FROM MEASUREMENT: the parser's
         // recovery re-tokenizes what follows a refusal, and prose in the output can
         // hand it a real keyword. Identifier-shaped (not `<…>`, which this lexer
         // splits into seven tokens) so it arrives at `parseLiteralValue`'s tag
         // dispatch as ONE token and is refused THERE, by name, with the reason.
         report(std::format(
-            "this format has no spelling for an aggregate literal value (a folded "
-            "struct/union/array constant); rendered as '{}', which the reader "
-            "REFUSES", kHirTextUnspelledAggregateTag));
+            "this format has no spelling for this literal value; rendered as '{}', "
+            "which the reader REFUSES", kHirTextUnspelledAggregateTag),
+            DiagnosticSeverity::Error);
         out_ += kHirTextUnspelledAggregateTag;
     }
 
@@ -1731,17 +2335,57 @@ private:
             TypeKind const k = (bits == 128) ? TypeKind::F128 : TypeKind::F80;
             v.value = WideFloatValue::fromPacked(lo, hi, k);
         }
+        else if (tag == "agg") {
+            // D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM: the inverse of
+            // `appendLiteralValue`'s aggregate arm, and the SAME syntax
+            // `mir_text.cpp`'s `parseLiteral` reads — `agg { <field>, … }`, each
+            // field a tagged value followed by `: <core>`.
+            //
+            // ⚠ THE PER-FIELD `: <core>` IS PARSED HERE AND NOWHERE ELSE. The
+            // top-level `literalCoreFor` recomputation works off the node's type
+            // annotation, which a nested field does not have; dropping the core
+            // here would make every element of a folded aggregate come back
+            // `Void` while the re-emitted text still matched byte for byte.
+            expect(Tk::LBrace, "'{'");
+            HirAggregateValue agg;
+            while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+                if (!agg.fields.empty() && !accept(Tk::Comma)) break;
+                if (peekIs(Tk::RBrace)) break;
+                HirLiteralValue f = parseLiteralValue();
+                expect(Tk::Colon, "':'");
+                std::string const core = takeIdent();
+                // Resolved through BOTH owning tables, and refused by name with
+                // the union as the accepted set — the twin of `mir_text.cpp`'s
+                // `literalCoreFromName` / `literalCoreAccepted` pair.
+                if (auto const k = literalCoreFromName(core); k.has_value()) {
+                    f.core = *k;
+                } else {
+                    malformed(std::format(
+                        "unknown aggregate literal field core '{}' — accepted: {}",
+                        core, literalCoreAccepted()));
+                }
+                agg.fields.push_back(std::move(f));
+            }
+            expect(Tk::RBrace, "'}'");
+            v.value = std::move(agg);
+        }
         else if (tag == kHirTextUnspelledAggregateTag) {
-            // The writer's own marker for a value it could not serialize (a D5.3
-            // folded struct/union/array constant). Refused BY NAME with the reason,
-            // rather than falling into the generic "unknown tag" arm: the author of
-            // this text did not typo a tag, they hit a stated limit of the format,
-            // and a reader that cannot tell those apart sends them looking for a
-            // spelling error that is not there.
+            // The writer's own marker for a value it could not serialize. Refused
+            // BY NAME with the reason, rather than falling into the generic
+            // "unknown tag" arm: the author of this text did not typo a tag, they
+            // hit a stated limit of the format, and a reader that cannot tell those
+            // apart sends them looking for a spelling error that is not there.
+            //
+            // ⓘ It no longer means "aggregate" — the aggregate arm above has a real
+            // spelling now. It means the writer met a `HirLiteralValue` arm it does
+            // not render, which is a defect in the WRITER rather than a limit of
+            // the format, and the sentence says so.
             malformed(std::format(
-                "'{}' marks an aggregate literal the .dsshir writer had no spelling "
-                "for — the value was NOT serialized, so this text cannot be read "
-                "back into the module it came from",
+                "'{}' marks a literal value the .dsshir writer had no spelling for "
+                "— the value was NOT serialized, so this text cannot be read back "
+                "into the module it came from. Every arm of HirLiteralValue is "
+                "supposed to have a spelling; reaching this marker means one was "
+                "added to the variant without one",
                 kHirTextUnspelledAggregateTag));
         }
         else malformed(std::format("unknown literal value tag '{}'", tag));
@@ -1894,33 +2538,52 @@ private:
     }
 
     // ── flags / attrs ──────────────────────────────────────────────────────
+    // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: `unknown flag 'foo'` told an
+    // author their word was wrong and never what the four accepted words are.
+    // Resolved through `kHirTextFlagTable`, which `flagsStr` also renders from,
+    // so the refusal's list and the writer's spellings are the same rows.
+    //
+    // ⓘ `HirFlags::None` as the miss value is inert by construction: `|=` of the
+    // zero bit changes nothing, and `orMalformed` has already set the parse's
+    // error state, so no flag is silently invented.
     [[nodiscard]] HirFlags parseFlags() {
         HirFlags f = HirFlags::None;
         if (!accept(Tk::LBrack)) return f;
         while (!peekIs(Tk::RBrack) && !peekIs(Tk::Eof)) {
             std::string n = takeIdent();
-            if (n == "err") f |= HirFlags::HasError;
-            else if (n == "syn") f |= HirFlags::Synthetic;
-            else if (n == "shader") f |= HirFlags::ShaderUsable;
-            else if (n == "host") f |= HirFlags::HostUsable;
-            else malformed(std::format("unknown flag '{}'", n));
+            f |= orMalformed(kHirTextFlagTable, n, "node flag", HirFlags::None);
             if (!accept(Tk::Comma)) break;
         }
         expect(Tk::RBrack, "']'");
         return f;
     }
 
+    // The `@`-attribute dispatch, keyed on `kHirTextAttrKindTable` so the refusal
+    // names the accepted set and `-Werror=switch` refuses a table row nobody
+    // handles. ⓘ `skipToRParen` still runs on a miss — the parse is collect-all
+    // and the unrecognized attribute's body has to be stepped over — but the
+    // decision to skip it is now made by a lookup failure rather than by falling
+    // off the end of a ladder.
     [[nodiscard]] PendingAttrs parseAttrs() {
         PendingAttrs a;
         while (accept(Tk::At)) {
             std::string kind = takeIdent();
             expect(Tk::LParen, "'('");
-            if (kind == "loc") a.loc = parseLoc();
-            else if (kind == "ffi") a.ffi = parseFfi();
-            else if (kind == "shader") a.shader = parseShader();
-            else if (kind == "transpile") a.transpile = parseTranspile();
-            else if (kind == "diag") parseDiag(a);
-            else { malformed(std::format("unknown attribute '@{}'", kind)); skipToRParen(); }
+            auto const which = kHirTextAttrKindTable.fromName(kind);
+            if (!which.has_value()) {
+                malformed(std::format(
+                    "unknown attribute '@{}' — accepted: {}", kind,
+                    detail::renderAllowedList(allNames(kHirTextAttrKindTable))));
+                skipToRParen();
+            } else {
+                switch (*which) {
+                    case HirTextAttrKind::Loc:       a.loc = parseLoc();             break;
+                    case HirTextAttrKind::Ffi:       a.ffi = parseFfi();             break;
+                    case HirTextAttrKind::Shader:    a.shader = parseShader();       break;
+                    case HirTextAttrKind::Transpile: a.transpile = parseTranspile(); break;
+                    case HirTextAttrKind::Diag:      parseDiag(a);                   break;
+                }
+            }
             expect(Tk::RParen, "')'");
         }
         return a;
@@ -1984,7 +2647,46 @@ private:
     void parseDiag(PendingAttrs& a) {
         DiagnosticInfo info;
         for (;;) {
-            if (acceptKeyword("code")) info.code = static_cast<DiagnosticCode>(static_cast<std::uint16_t>(takeInt()));
+            // ★★★ THE CAST USED TO BE THE WHOLE OF IT: an arbitrary integer went
+            // straight to `DiagnosticCode` with no validation whatsoever, so a
+            // `.dsshir` could name `@diag(code 47000)` and the parse SUCCEEDED
+            // with a code that has never been allocated
+            // (D-MIR-TEXT-DIAG-CODE-CAST-IS-UNVALIDATED).
+            //
+            // ★ `DiagnosticCode` is a single flat ordinal space whose every value
+            // is an OPERATOR-VISIBLE published identity — it renders as
+            // `error[D0029]`, it appears in docs and in `expected.json` fixtures —
+            // which is exactly why it has an allocation gate
+            // (`scripts/check-diagnostic-codes/check-diagnostic-codes.py`). This
+            // cast walked straight past that gate, and the value it minted would
+            // render under `diagnosticCodePrefix`'s letter for the high nibble as
+            // if it were a real code.
+            //
+            // ⚠ THE REFUSAL RESOLVES THROUGH THE SAME SOURCE THE GATE READS. The
+            // gate reads the ENUM rather than a hand-maintained list, on the
+            // stated grounds that anything asking a human to keep a second list in
+            // sync has the failure mode it exists to catch. `diagnosticCodeName`
+            // is that enum projected through a `default:`-less switch, so
+            // `-Werror=switch` keeps it total and the two cannot disagree.
+            if (acceptKeyword("code")) {
+                std::uint64_t const raw = takeInt();
+                auto const code = static_cast<DiagnosticCode>(
+                    static_cast<std::uint16_t>(raw));
+                if (raw > 0xFFFFu) {
+                    malformed(std::format(
+                        "diagnostic code {} does not fit DiagnosticCode's 16-bit "
+                        "ordinal space", raw));
+                } else if (diagnosticCodeName(code) == kUnallocatedDiagnosticCodeName) {
+                    malformed(std::format(
+                        "diagnostic code {} (0x{:04X}) has never been allocated — a "
+                        "DiagnosticCode is a published identity (it renders as "
+                        "'{}'), so a code this build does not define cannot be "
+                        "named here",
+                        raw, raw, diagnosticCodePrefix(code)));
+                } else {
+                    info.code = code;
+                }
+            }
             else if (acceptKeyword("recovery")) { std::string n = takeIdent(); info.recovery = orMalformed(kHirTextRecoveryTable, n, "diag recovery", HirRecovery::None); }
             else if (acceptKeyword("origin")) { a.diagHasOrigin = true; a.diagOriginPre = static_cast<std::uint32_t>(takeInt()); }
             else if (acceptKeyword("detail")) info.detail = takeStr();
@@ -2008,13 +2710,14 @@ private:
     // is force-skipped so collect-all parsing can never spin.
     [[nodiscard]] std::uint32_t cursorOff() const { return lex_.peek().off; }
 
+    // ⚠ THIS WAS A HAND-RETYPED COPY OF THE EXPRESSION KEYWORD SET, AND IT WAS
+    // ALREADY SHORT BY THREE. It listed twenty of the twenty-three keywords
+    // `parseExprInner` handles, omitting `va_start` / `va_arg` / `va_end` — all
+    // three of which the writer emits — so a `.dsshir` carrying a variadic-access
+    // node was routed to `parseStmtInner` and refused as an unknown statement. The
+    // router now asks the same table the dispatch and the refusal read.
     [[nodiscard]] static bool isExprKeyword(std::string_view kw) {
-        return kw == "lit" || kw == "ref" || kw == "call" || kw == "intrinsic"
-            || kw == "binop" || kw == "unop" || kw == "cast" || kw == "member"
-            || kw == "index" || kw == "swizzle" || kw == "construct" || kw == "ternary"
-            || kw == "logical_and" || kw == "logical_or" || kw == "sizeof"
-            || kw == "alignof"
-            || kw == "addressof" || kw == "deref" || kw == "seq" || kw == "typeref";
+        return kHirTextExprKwTable.fromName(kw).has_value();
     }
 
     // Parse any node (decl/stmt/expr/wildcard). Handles attrs + pre-order index.
@@ -2063,73 +2766,170 @@ private:
     HirNodeId parseExprInner() {
         std::string kw = takeIdent();
         HirFlags flags = parseFlags();
-        if (kw == "lit") {
-            if (accept(Tk::Hash)) {   // bare index form: `lit #N : type` (no pool)
-                std::uint32_t const i = static_cast<std::uint32_t>(takeInt());
-                TypeId t = parseTypeAnnot();
-                return builder_.makeLiteral(t, i, flags);
-            }
-            // value form: `lit <tagged-value> : type` — rebuild the pool entry.
-            HirLiteralValue v = parseLiteralValue();
+        auto const which = kHirTextExprKwTable.fromName(kw);
+        if (!which.has_value()) {
+            // ⓘ UNREACHABLE THROUGH `parseNode`, AND DELIBERATELY KEPT. The router
+            // (`isExprKeyword`) and this dispatch now consult the SAME table, so a
+            // keyword that got here resolved there — which is the property that
+            // fixed the `va_*` routing hole in the first place. It stays because
+            // `parseExprInner` is a production, not a private helper of one
+            // caller, and a production that can be reached with an unknown keyword
+            // must say what it accepts rather than fall through building an Error
+            // node in silence (D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET).
+            malformed(std::format("unknown expression '{}' — accepted: {}", kw,
+                                  detail::renderAllowedList(allNames(kHirTextExprKwTable))));
+            return builder_.addLeaf(HirKind::Error, InvalidType, 0, flags);
+        }
+        // The `kw : type (operands...)` family — mirror of the emitter's
+        // `typedCall`. Payload is always 0; arity is enforced later by the
+        // verifier.
+        auto typedCall = [&](HirKind kind) {
             TypeId t = parseTypeAnnot();
-            v.core = literalCoreFor(t, v);
-            std::uint32_t const idx = pLiterals_.add(std::move(v));
-            return builder_.makeLiteral(t, idx, flags);
-        }
-        if (kw == "ref") { std::uint32_t h = parseSymHandle(); TypeId t = parseTypeAnnot();
-            return builder_.makeRef(t, h, flags); }
-        if (kw == "call") { TypeId t = parseTypeAnnot(); auto kids = parseParenOperands();
-            if (kids.empty()) { malformed("call needs a callee"); return builder_.addLeaf(HirKind::Error, t, 0, flags); }
-            HirNodeId callee = kids.front();
-            std::vector<HirNodeId> args(kids.begin() + 1, kids.end());
-            return builder_.makeCall(callee, args, t, flags); }
-        if (kw == "intrinsic") { std::string name = takeStr(); TypeId t = parseTypeAnnot();
-            auto kids = parseParenOperands();
-            auto it = intrinsicByName_.find(name);
-            std::uint32_t iid = 0;
-            if (it != intrinsicByName_.end()) iid = it->second.v;
-            else unknownName(std::format("intrinsic \"{}\" not declared", name));
-            return builder_.makeIntrinsicCall(iid, kids, t, flags); }
-        if (kw == "binop" || kw == "unop") {
-            std::uint32_t payload = 0; (void)parseOp(payload);
-            TypeId t = parseTypeAnnot(); auto kids = parseParenOperands();
-            return builder_.addParent(kw == "binop" ? HirKind::BinaryOp : HirKind::UnaryOp, kids, t, payload, flags);
-        }
-        if (kw == "member") { expect(Tk::Hash, "'#'"); std::uint32_t fi = static_cast<std::uint32_t>(takeInt());
-            TypeId t = parseTypeAnnot(); auto k = parseParenOperands();
-            return builder_.addParent(HirKind::MemberAccess, k, t, fi, flags); }
-        if (kw == "swizzle") { expect(Tk::Hash, "'#'"); std::uint32_t m = static_cast<std::uint32_t>(takeInt());
-            TypeId t = parseTypeAnnot(); auto k = parseParenOperands();
-            return builder_.addParent(HirKind::Swizzle, k, t, m, flags); }
-        if (kw == "typeref") { TypeId t = parseTypeAnnot(); return builder_.makeTypeRef(t, flags); }
-        if (kw == "seq") {
-            // seq : type { <stmt-lines> yield <resultExpr> }
-            TypeId t = parseTypeAnnot();
-            expect(Tk::LBrace, "'{'");
-            std::vector<HirNodeId> stmts;
-            while (!peekKeyword("yield") && !peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
-                std::uint32_t const off = cursorOff();
-                stmts.push_back(parseNode());
-                if (cursorOff() == off) lex_.take();   // progress guard
-            }
-            if (!acceptKeyword("yield")) malformed("seq body needs a 'yield <expr>'");
-            HirNodeId result = parseNode();
-            expect(Tk::RBrace, "'}'");
-            return builder_.makeSeqExpr(stmts, result, t, flags);
-        }
-        // The `kw : type (operands...)` family — mirror of the emitter's typedCall
-        // list. Payload is always 0; arity is enforced later by the verifier.
-        static constexpr std::pair<std::string_view, HirKind> kTypedExprs[] = {
-            {"cast", HirKind::Cast}, {"index", HirKind::Index},
-            {"construct", HirKind::ConstructAggregate}, {"ternary", HirKind::Ternary},
-            {"logical_and", HirKind::LogicalAnd}, {"logical_or", HirKind::LogicalOr},
-            {"sizeof", HirKind::SizeOf}, {"alignof", HirKind::AlignOf},
-            {"addressof", HirKind::AddressOf}, {"deref", HirKind::Deref},
-            {"va_start", HirKind::VaStart}, {"va_arg", HirKind::VaArg}, {"va_end", HirKind::VaEnd},
+            auto ops = parseParenOperands();
+            return builder_.addParent(kind, ops, t, 0, flags);
         };
-        for (auto const& [k, kind] : kTypedExprs)
-            if (kw == k) { TypeId t = parseTypeAnnot(); auto ops = parseParenOperands();
-                return builder_.addParent(kind, ops, t, 0, flags); }
+        // ⓘ `-Werror=switch` IS THE PAIRING GUARD. A row added to
+        // `kHirTextExprKwTable` with no arm here fails the build, which is the
+        // property the three-way `if`-ladder + array + router arrangement could
+        // not have: adding a keyword to one of them and not the others compiled
+        // fine and shipped a spelling that only worked in one direction.
+        switch (*which) {
+            case HirTextExprKw::Lit: {
+                if (accept(Tk::Hash)) {   // bare index form: `lit #N : type` (no pool)
+                    std::uint32_t const i = static_cast<std::uint32_t>(takeInt());
+                    TypeId t = parseTypeAnnot();
+                    return builder_.makeLiteral(t, i, flags);
+                }
+                // value form: `lit <tagged-value> : type` — rebuild the pool entry.
+                HirLiteralValue v = parseLiteralValue();
+                TypeId t = parseTypeAnnot();
+                v.core = literalCoreFor(t, v);
+                std::uint32_t const idx = pLiterals_.add(std::move(v));
+                return builder_.makeLiteral(t, idx, flags);
+            }
+            case HirTextExprKw::Ref: {
+                std::uint32_t h = parseSymHandle(); TypeId t = parseTypeAnnot();
+                return builder_.makeRef(t, h, flags);
+            }
+            case HirTextExprKw::Call: {
+                TypeId t = parseTypeAnnot(); auto kids = parseParenOperands();
+                if (kids.empty()) { malformed("call needs a callee"); return builder_.addLeaf(HirKind::Error, t, 0, flags); }
+                HirNodeId callee = kids.front();
+                std::vector<HirNodeId> args(kids.begin() + 1, kids.end());
+                return builder_.makeCall(callee, args, t, flags);
+            }
+            case HirTextExprKw::BuiltinCall: {
+                // c103 (D-CSUBSET-INTRINSIC-UMULH): `builtincall #<lowering> :
+                // <type> (<operands>)` — the mirror of the writer's arm. The
+                // writer had one and this did not, so `emitHir` produced text
+                // `parseHir` refused by name
+                // (D-HIR-TEXT-WRITER-SPELLS-KEYWORDS-THE-READER-HAS-NO-ROW-FOR).
+                //
+                // ★ THE ORDINAL IS VALIDATED, NOT CAST. `BuiltinLowering` is a
+                // closed set whose members are named by CONFIG (`grammar_schema_
+                // json.cpp` resolves `"lowering"` through the same table), so an
+                // ordinal outside it is not a lowering at all — and `hir_to_mir`
+                // maps the payload straight onto a `MirOpcode`. The same argument
+                // this file already makes for `@diag(code N)`
+                // (D-MIR-TEXT-DIAG-CODE-CAST-IS-UNVALIDATED), applied to the
+                // other unvalidated ordinal in the format.
+                // ⚠ `None` (0) is DELIBERATELY unlisted in that table — it is the
+                // "no lowering" sentinel — so it renders empty here and is
+                // refused, which is right: a `BuiltinCall` node exists precisely
+                // because the builtin HAS a lowering.
+                expect(Tk::Hash, "'#' before a builtincall lowering ordinal");
+                std::uint64_t const raw = takeInt();
+                TypeId t = parseTypeAnnot();
+                auto kids = parseParenOperands();
+                if (raw > 0xFFFFu
+                    || builtinLoweringName(
+                           static_cast<BuiltinLowering>(
+                               static_cast<std::uint16_t>(raw))).empty()) {
+                    malformed(std::format(
+                        "builtincall lowering ordinal {} names no BuiltinLowering "
+                        "this build defines - accepted: {}", raw,
+                        detail::renderAllowedList(allNames(kBuiltinLoweringTable))));
+                    return builder_.addLeaf(HirKind::Error, t, 0, flags);
+                }
+                return builder_.addParent(HirKind::BuiltinCall, kids, t,
+                                          static_cast<std::uint32_t>(raw), flags);
+            }
+            case HirTextExprKw::LabelAddr: {
+                // D-CSUBSET-COMPUTED-GOTO: `labeladdr L<n> : <type>` — a LEAF
+                // whose payload is the target label's per-function ordinal, the
+                // same namespace `goto`/`label` use, read by the same
+                // `parseLabelOrdinal` production so the three cannot disagree.
+                std::uint32_t const ord = parseLabelOrdinal();
+                TypeId t = parseTypeAnnot();
+                return builder_.makeLabelAddressOf(ord, t, flags);
+            }
+            case HirTextExprKw::Intrinsic: {
+                std::string name = takeStr(); TypeId t = parseTypeAnnot();
+                auto kids = parseParenOperands();
+                auto it = intrinsicByName_.find(name);
+                std::uint32_t iid = 0;
+                if (it != intrinsicByName_.end()) iid = it->second.v;
+                else unknownName(std::format("intrinsic \"{}\" not declared", name));
+                return builder_.makeIntrinsicCall(iid, kids, t, flags);
+            }
+            case HirTextExprKw::BinOp:
+            case HirTextExprKw::UnOp: {
+                std::uint32_t payload = 0; (void)parseOp(payload);
+                TypeId t = parseTypeAnnot(); auto kids = parseParenOperands();
+                return builder_.addParent(
+                    (*which == HirTextExprKw::BinOp) ? HirKind::BinaryOp : HirKind::UnaryOp,
+                    kids, t, payload, flags);
+            }
+            case HirTextExprKw::Member: {
+                expect(Tk::Hash, "'#'"); std::uint32_t fi = static_cast<std::uint32_t>(takeInt());
+                TypeId t = parseTypeAnnot(); auto k = parseParenOperands();
+                return builder_.addParent(HirKind::MemberAccess, k, t, fi, flags);
+            }
+            case HirTextExprKw::Swizzle: {
+                expect(Tk::Hash, "'#'"); std::uint32_t m = static_cast<std::uint32_t>(takeInt());
+                TypeId t = parseTypeAnnot(); auto k = parseParenOperands();
+                return builder_.addParent(HirKind::Swizzle, k, t, m, flags);
+            }
+            case HirTextExprKw::TypeRef: {
+                TypeId t = parseTypeAnnot(); return builder_.makeTypeRef(t, flags);
+            }
+            case HirTextExprKw::Seq: {
+                // seq : type { <stmt-lines> yield <resultExpr> }
+                TypeId t = parseTypeAnnot();
+                expect(Tk::LBrace, "'{'");
+                std::vector<HirNodeId> stmts;
+                while (!peekKeyword("yield") && !peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+                    std::uint32_t const off = cursorOff();
+                    stmts.push_back(parseNode());
+                    if (cursorOff() == off) lex_.take();   // progress guard
+                }
+                if (!acceptKeyword("yield")) malformed("seq body needs a 'yield <expr>'");
+                HirNodeId result = parseNode();
+                expect(Tk::RBrace, "'}'");
+                return builder_.makeSeqExpr(stmts, result, t, flags);
+            }
+            case HirTextExprKw::Cast:       return typedCall(HirKind::Cast);
+            case HirTextExprKw::Index:      return typedCall(HirKind::Index);
+            case HirTextExprKw::Construct:  return typedCall(HirKind::ConstructAggregate);
+            case HirTextExprKw::Ternary:    return typedCall(HirKind::Ternary);
+            case HirTextExprKw::LogicalAnd: return typedCall(HirKind::LogicalAnd);
+            case HirTextExprKw::LogicalOr:  return typedCall(HirKind::LogicalOr);
+            case HirTextExprKw::SizeOf:     return typedCall(HirKind::SizeOf);
+            case HirTextExprKw::AlignOf:    return typedCall(HirKind::AlignOf);
+            case HirTextExprKw::AddressOf:  return typedCall(HirKind::AddressOf);
+            case HirTextExprKw::Deref:      return typedCall(HirKind::Deref);
+            case HirTextExprKw::VaStart:    return typedCall(HirKind::VaStart);
+            case HirTextExprKw::VaArg:      return typedCall(HirKind::VaArg);
+            case HirTextExprKw::VaEnd:      return typedCall(HirKind::VaEnd);
+            // The row-count sentinel. It is UNLISTED in the table, so `fromName`
+            // cannot produce it and this arm cannot be reached from any input —
+            // it exists because `-Werror=switch` is the pairing guard, and a
+            // `default:` bought to silence one sentinel would disable that guard
+            // for every real keyword added afterwards.
+            case HirTextExprKw::Count_: break;
+        }
+        // Unreachable: `-Werror=switch` proves the switch is total over the enum,
+        // and `fromName` cannot return a value outside it.
         malformed(std::format("unknown expression '{}'", kw));
         return builder_.addLeaf(HirKind::Error, InvalidType, 0, flags);
     }
@@ -2145,7 +2945,14 @@ private:
         }
         std::string name = takeIdent();
         if (auto op = coreOpFromName(name)) payload = encodeOp(*op);
-        else { malformed(std::format("unknown operator '{}'", name)); payload = 0; }
+        else {
+            // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: the accepted set comes
+            // off the same `opName` walk the lookup just failed, so it cannot be
+            // narrower, wider or staler than the check above it.
+            malformed(std::format("unknown operator '{}' — accepted: {}", name,
+                                  coreOpAccepted()));
+            payload = 0;
+        }
     }
 
     // ── statements / decls / wildcards ────────────────────────────────────────
@@ -2153,107 +2960,149 @@ private:
         if (!peekIs(Tk::Ident)) { malformed("expected a statement"); return builder_.addLeaf(HirKind::Error); }
         std::string kw = takeIdent();
         HirFlags flags = parseFlags();
-        if (kw == "block") { auto k = parseBraceNodes(); return builder_.makeBlock(k, flags); }
-        if (kw == "if") {
-            expect(Tk::LParen, "'('"); HirNodeId cond = parseNode(); expect(Tk::RParen, "')'");
-            HirNodeId then = parseNode();
-            std::optional<HirNodeId> els;
-            if (acceptKeyword("else")) els = parseNode();
-            return builder_.makeIfStmt(cond, then, els, flags);
+        auto const which = kHirTextStmtKwTable.fromName(kw);
+        if (!which.has_value()) {
+            // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: this said only
+            // `unknown statement 'foo'`, which is the least useful thing a reader
+            // can say about a closed keyword set it is holding.
+            //
+            // ★ THE SET IS THE UNION, AND THAT IS NOT PADDING. `parseNode` routes
+            // on `isExprKeyword` FIRST, so a keyword reaching here is one BOTH
+            // tables missed — the accepted set at this position is every node
+            // keyword, not just the statement half. Naming only the statement set
+            // would send an author who typo'd `addressof` looking for a statement
+            // that was never what they wanted.
+            malformed(std::format(
+                "unknown node keyword '{}' — accepted statements: {}; accepted "
+                "expressions: {}", kw,
+                detail::renderAllowedList(allNames(kHirTextStmtKwTable)),
+                detail::renderAllowedList(allNames(kHirTextExprKwTable))));
+            return builder_.addLeaf(HirKind::Error, InvalidType, 0, flags);
         }
-        if (kw == "seh_try") {
-            // c115 SEH round-trip: `seh_try` <tryBody> `seh_except (` filter `)`
-            // <handler> — mirrors the writer arm exactly.
-            HirNodeId tryBody = parseNode();
-            if (!acceptKeyword("seh_except")) malformed("expected 'seh_except'");
-            expect(Tk::LParen, "'('"); HirNodeId filter = parseNode(); expect(Tk::RParen, "')'");
-            HirNodeId handler = parseNode();
-            return builder_.makeSehTryExcept(tryBody, filter, handler, flags);
-        }
-        if (kw == "while") {
-            expect(Tk::LParen, "'('"); HirNodeId cond = parseNode(); expect(Tk::RParen, "')'");
-            HirNodeId body = parseNode();
-            return builder_.makeWhileStmt(cond, body, flags);
-        }
-        if (kw == "do") {
-            HirNodeId body = parseNode();
-            if (!acceptKeyword("while")) malformed("expected 'while'");
-            expect(Tk::LParen, "'('"); HirNodeId cond = parseNode(); expect(Tk::RParen, "')'");
-            return builder_.makeDoWhileStmt(body, cond, flags);
-        }
-        if (kw == "for") return parseFor(flags);
-        if (kw == "switch") {
-            // c60 (Design I-A): `switch (disc) { body: <block> case v L<ord> ...
-            // default L<ord> }` — the body Block then the dispatch arms.
-            expect(Tk::LParen, "'('"); HirNodeId disc = parseNode(); expect(Tk::RParen, "')'");
-            expect(Tk::LBrace, "'{'");
-            if (!acceptKeyword("body")) malformed("expected 'body:' in switch");
-            expect(Tk::Colon, "':'");
-            HirNodeId body = parseNode();
-            std::vector<HirNodeId> arms;
-            while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
-                std::uint32_t const off = cursorOff();
-                arms.push_back(parseNode());
-                if (cursorOff() == off) lex_.take();
+        // ⓘ `-Werror=switch` is the pairing guard: a row in
+        // `kHirTextStmtKwTable` with no arm here fails the build.
+        switch (*which) {
+            case HirTextStmtKw::Block: { auto k = parseBraceNodes(); return builder_.makeBlock(k, flags); }
+            case HirTextStmtKw::If: {
+                expect(Tk::LParen, "'('"); HirNodeId cond = parseNode(); expect(Tk::RParen, "')'");
+                HirNodeId then = parseNode();
+                std::optional<HirNodeId> els;
+                if (acceptKeyword("else")) els = parseNode();
+                return builder_.makeIfStmt(cond, then, els, flags);
             }
-            expect(Tk::RBrace, "'}'");
-            return builder_.makeSwitchStmt(disc, body, arms, flags);
+            case HirTextStmtKw::SehTry: {
+                // c115 SEH round-trip: `seh_try` <tryBody> `seh_except (` filter `)`
+                // <handler> — mirrors the writer arm exactly.
+                HirNodeId tryBody = parseNode();
+                if (!acceptKeyword("seh_except")) malformed("expected 'seh_except'");
+                expect(Tk::LParen, "'('"); HirNodeId filter = parseNode(); expect(Tk::RParen, "')'");
+                HirNodeId handler = parseNode();
+                return builder_.makeSehTryExcept(tryBody, filter, handler, flags);
+            }
+            case HirTextStmtKw::While: {
+                expect(Tk::LParen, "'('"); HirNodeId cond = parseNode(); expect(Tk::RParen, "')'");
+                HirNodeId body = parseNode();
+                return builder_.makeWhileStmt(cond, body, flags);
+            }
+            case HirTextStmtKw::Do: {
+                HirNodeId body = parseNode();
+                if (!acceptKeyword("while")) malformed("expected 'while'");
+                expect(Tk::LParen, "'('"); HirNodeId cond = parseNode(); expect(Tk::RParen, "')'");
+                return builder_.makeDoWhileStmt(body, cond, flags);
+            }
+            case HirTextStmtKw::For: return parseFor(flags);
+            case HirTextStmtKw::Switch: {
+                // c60 (Design I-A): `switch (disc) { body: <block> case v L<ord> ...
+                // default L<ord> }` — the body Block then the dispatch arms.
+                expect(Tk::LParen, "'('"); HirNodeId disc = parseNode(); expect(Tk::RParen, "')'");
+                expect(Tk::LBrace, "'{'");
+                if (!acceptKeyword("body")) malformed("expected 'body:' in switch");
+                expect(Tk::Colon, "':'");
+                HirNodeId body = parseNode();
+                std::vector<HirNodeId> arms;
+                while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+                    std::uint32_t const off = cursorOff();
+                    arms.push_back(parseNode());
+                    if (cursorOff() == off) lex_.take();
+                }
+                expect(Tk::RBrace, "'}'");
+                return builder_.makeSwitchStmt(disc, body, arms, flags);
+            }
+            case HirTextStmtKw::Case: {
+                HirNodeId v = parseNode(); std::uint32_t ord = parseLabelOrdinal();
+                return builder_.makeCaseArm(v, ord, flags);
+            }
+            case HirTextStmtKw::Default: {
+                std::uint32_t ord = parseLabelOrdinal();
+                return builder_.makeCaseArm(std::nullopt, ord, flags);
+            }
+            // c60 (Design I-A): `label L<ord>:` <body> and `goto L<ord>` / `goto *expr`
+            // (the switch body's case markers render as `label` statements, so the
+            // round-trip parser must read them).
+            case HirTextStmtKw::Label: {
+                std::uint32_t ord = parseLabelOrdinal();
+                expect(Tk::Colon, "':'");
+                HirNodeId body = parseNode();
+                return builder_.makeLabelStmt(ord, body, flags);
+            }
+            case HirTextStmtKw::Goto: {   // `goto L<ord>` (the plain label form)
+                std::uint32_t ord = parseLabelOrdinal();
+                return builder_.makeGotoStmt(ord, flags);
+            }
+            case HirTextStmtKw::Break: {
+                std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
+                return builder_.makeBreak(d, flags);
+            }
+            case HirTextStmtKw::Continue: {
+                std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
+                return builder_.makeContinue(d, flags);
+            }
+            // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm barrier — a bare
+            // `inline_asm` leaf (mirrors the writer arm; no payload in cycle-1).
+            case HirTextStmtKw::InlineAsm: return parseInlineAsm(flags);
+            case HirTextStmtKw::Return: {
+                // A return value may carry inline attributes (`return @loc(...) expr`).
+                // A value-less `return` is always block-terminal (nothing may follow
+                // it — checkBlockTermination), so a leading `@` here unambiguously
+                // introduces an attributed value, never the next statement's attrs.
+                if (peekIs(Tk::At) || startsExpr()) { HirNodeId v = parseNode(); return builder_.makeReturn(v, flags); }
+                return builder_.makeReturn(std::nullopt, flags);
+            }
+            case HirTextStmtKw::Expr: { HirNodeId e = parseNode(); return builder_.makeExprStmt(e, flags); }
+            case HirTextStmtKw::Var:
+            case HirTextStmtKw::Param: return parseVarLike(flags);
+            case HirTextStmtKw::Assign: {
+                HirNodeId tgt = parseNode(); expect(Tk::Equal, "'='"); HirNodeId val = parseNode();
+                return builder_.makeAssignStmt(tgt, val, flags);
+            }
+            case HirTextStmtKw::Unreachable:
+                return builder_.addLeaf(HirKind::Unreachable, InvalidType, 0, flags);
+            case HirTextStmtKw::Function:       return parseFunction(flags);
+            case HirTextStmtKw::ExternFunction: return parseExternFunction(flags);
+            case HirTextStmtKw::Global: {
+                std::uint32_t sym = parseSymHandle(); TypeId t = parseTypeAnnot();
+                std::optional<HirNodeId> init;
+                if (accept(Tk::Equal)) init = parseNode();
+                return builder_.makeGlobal(t, sym, init, flags);
+            }
+            case HirTextStmtKw::TypeDecl: {
+                std::uint32_t sym = parseSymHandle(); TypeId t = parseTypeAnnot();
+                return builder_.makeTypeDecl(t, sym, flags);
+            }
+            case HirTextStmtKw::ExternGlobal: {
+                std::uint32_t sym = parseSymHandle();
+                TypeId t = accept(Tk::Colon) ? parseType() : InvalidType;
+                return builder_.makeExternGlobal(t, sym, flags);
+            }
+            case HirTextStmtKw::ImportGroup: { auto m = parseBraceNodes(); return builder_.makeImportGroup(m, flags); }
+            case HirTextStmtKw::ExtNode: return parseExtNode(flags);
+            case HirTextStmtKw::Error:   return parseErrorNode(flags);
+            // Unlisted sentinel — see the expression switch's arm for why it is
+            // an arm rather than a `default:`.
+            case HirTextStmtKw::Count_: break;
         }
-        if (kw == "case") { HirNodeId v = parseNode(); std::uint32_t ord = parseLabelOrdinal();
-            return builder_.makeCaseArm(v, ord, flags); }
-        if (kw == "default") { std::uint32_t ord = parseLabelOrdinal();
-            return builder_.makeCaseArm(std::nullopt, ord, flags); }
-        // c60 (Design I-A): `label L<ord>:` <body> and `goto L<ord>` / `goto *expr`
-        // (the switch body's case markers render as `label` statements, so the
-        // round-trip parser must read them).
-        if (kw == "label") {
-            std::uint32_t ord = parseLabelOrdinal();
-            expect(Tk::Colon, "':'");
-            HirNodeId body = parseNode();
-            return builder_.makeLabelStmt(ord, body, flags);
-        }
-        if (kw == "goto") {   // `goto L<ord>` (the plain label form)
-            std::uint32_t ord = parseLabelOrdinal();
-            return builder_.makeGotoStmt(ord, flags);
-        }
-        if (kw == "break") { std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
-            return builder_.makeBreak(d, flags); }
-        if (kw == "continue") { std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
-            return builder_.makeContinue(d, flags); }
-        // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm barrier — a bare
-        // `inline_asm` leaf (mirrors the writer arm; no payload in cycle-1).
-        if (kw == "inline_asm") return parseInlineAsm(flags);
-        if (kw == "return") {
-            // A return value may carry inline attributes (`return @loc(...) expr`).
-            // A value-less `return` is always block-terminal (nothing may follow
-            // it — checkBlockTermination), so a leading `@` here unambiguously
-            // introduces an attributed value, never the next statement's attrs.
-            if (peekIs(Tk::At) || startsExpr()) { HirNodeId v = parseNode(); return builder_.makeReturn(v, flags); }
-            return builder_.makeReturn(std::nullopt, flags);
-        }
-        if (kw == "expr") { HirNodeId e = parseNode(); return builder_.makeExprStmt(e, flags); }
-        if (kw == "var" || kw == "param") return parseVarLike(flags);
-        if (kw == "assign") { HirNodeId tgt = parseNode(); expect(Tk::Equal, "'='"); HirNodeId val = parseNode();
-            return builder_.makeAssignStmt(tgt, val, flags); }
-        if (kw == "unreachable") return builder_.addLeaf(HirKind::Unreachable, InvalidType, 0, flags);
-        if (kw == "function") return parseFunction(flags);
-        if (kw == "extern_function") return parseExternFunction(flags);
-        if (kw == "global") {
-            std::uint32_t sym = parseSymHandle(); TypeId t = parseTypeAnnot();
-            std::optional<HirNodeId> init;
-            if (accept(Tk::Equal)) init = parseNode();
-            return builder_.makeGlobal(t, sym, init, flags);
-        }
-        if (kw == "type_decl") { std::uint32_t sym = parseSymHandle(); TypeId t = parseTypeAnnot();
-            return builder_.makeTypeDecl(t, sym, flags); }
-        if (kw == "extern_global") {
-            std::uint32_t sym = parseSymHandle();
-            TypeId t = accept(Tk::Colon) ? parseType() : InvalidType;
-            return builder_.makeExternGlobal(t, sym, flags);
-        }
-        if (kw == "import_group") { auto m = parseBraceNodes(); return builder_.makeImportGroup(m, flags); }
-        if (kw == "ext_node") return parseExtNode(flags);
-        if (kw == "error") return parseErrorNode(flags);
+        // Unreachable: `-Werror=switch` proves the switch is total over the enum,
+        // and `fromName` cannot return a value outside it.
         malformed(std::format("unknown statement '{}'", kw));
         return builder_.addLeaf(HirKind::Error, InvalidType, 0, flags);
     }
@@ -2341,11 +3190,58 @@ private:
                     expect(Tk::RBrack, "']'");
                 }
                 op.spellings = parseSpells();
+                // ── D-HIR-TEXT-INLINE-ASM-REGISTER-CLASS-ORDINAL-IS-UNVALIDATED ──
+                //
+                // ⚠ THE ORDINAL IS VALIDATED, NOT CAST — the same hole
+                // D-MIR-TEXT-DIAG-CODE-CAST-IS-UNVALIDATED names one production
+                // over, found while adding the sibling clause below. This read
+                // `static_cast<std::uint8_t>(takeInt())` straight onto the wire,
+                // so `class 200` loaded CLEAN and handed every consumer a
+                // `TargetRegClass` with no row — and `bindAsmOperand`'s only
+                // guard is `cls == None`, which a garbage ordinal passes. The
+                // ordinal STAYS the wire form (that is the writer's shape and a
+                // spelling change would break stored goldens); what changes is
+                // that a value the enum does not define is now refused by name.
                 if (acceptKeyword("class")) {
-                    op.regClassResolved = true;
-                    op.regClass = static_cast<std::uint8_t>(takeInt());
+                    std::uint64_t const raw = takeInt();
+                    if (raw > 0xFFu
+                        || kTargetRegClassTable
+                               .nameOrEmpty(static_cast<TargetRegClass>(
+                                   static_cast<std::uint8_t>(raw)))
+                               .empty()) {
+                        malformed(std::format(
+                            "inline-asm operand register class {} names no "
+                            "TargetRegClass this build defines - accepted "
+                            "ordinals spell: {}", raw,
+                            detail::renderAllowedList(
+                                allNames(kTargetRegClassTable))));
+                    } else {
+                        op.regClassResolved = true;
+                        op.regClass = static_cast<std::uint8_t>(raw);
+                    }
                 }
                 if (acceptKeyword("pin")) op.fixedRegister = takeStr();
+                // The inverse of the writer's `operand_kind` clause. ABSENT means
+                // "the letter did not resolve to a form", which is a real state
+                // (`binds` names exactly one arm) and NOT the same as a dropped
+                // field — which is precisely why the writer emits the clause at
+                // all (D-HIR-TEXT-INLINE-ASM-OPERAND-KIND-DROPPED-IN-TRANSIT).
+                // ★ AN UNKNOWN SPELLING IS REFUSED, NAMING THE ACCEPTED SET —
+                // the same treatment the `class` ordinal just above now gets,
+                // arrived at from the two opposite directions the format uses.
+                if (acceptKeyword("operand_kind")) {
+                    std::string const kind = takeIdent();
+                    if (auto const which = operandKindFilterFromName(kind)) {
+                        op.operandKindResolved = true;
+                        op.operandKind = static_cast<std::uint8_t>(*which);
+                    } else {
+                        malformed(std::format(
+                            "unknown inline-asm operand kind '{}' - accepted: {}",
+                            kind,
+                            detail::renderAllowedList(
+                                allNames(kOperandKindFilterTable))));
+                    }
+                }
                 expect(Tk::Arrow, "'->' before an inline-asm operand value");
                 children.push_back(parseNode());
                 d.operands.push_back(std::move(op));
@@ -2390,11 +3286,22 @@ private:
             std::string role = takeIdent();
             expect(Tk::Colon, "':'");
             HirNodeId n = parseNode();
-            if (role == "init") init = n;
-            else if (role == "cond") cond = n;
-            else if (role == "update") update = n;
-            else if (role == "body") body = n;
-            else malformed(std::format("unknown for-clause '{}'", role));
+            // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: keyed on
+            // `kHirTextForClauseTable`, so the refusal names the four roles and a
+            // new row cannot be added without a dispatch arm (`-Werror=switch`).
+            auto const which = kHirTextForClauseTable.fromName(role);
+            if (!which.has_value()) {
+                malformed(std::format(
+                    "unknown for-clause '{}' — accepted: {}", role,
+                    detail::renderAllowedList(allNames(kHirTextForClauseTable))));
+            } else {
+                switch (*which) {
+                    case HirTextForClause::Init:   init   = n; break;
+                    case HirTextForClause::Cond:   cond   = n; break;
+                    case HirTextForClause::Update: update = n; break;
+                    case HirTextForClause::Body:   body   = n; break;
+                }
+            }
             if (cursorOff() == off) lex_.take();  // progress guard
         }
         expect(Tk::RBrace, "'}'");
@@ -2482,6 +3389,37 @@ private:
         // carries the Atomic bit. Closes the pre-existing volatile-drops-in-text gap too.
         if (kw == "volatile") return wrap1(&TypeInterner::volatileQualified);
         if (kw == "atomic") return wrap1(&TypeInterner::atomicQualified);
+        // ★★ C23 `_BitInt(N)` / `unsigned _BitInt(N)` — THE INVERSE OF
+        // `appendType`'s BitInt ARM, WHICH HAD NONE.
+        //
+        // The writer has rendered `unsigned _BitInt(N)` since the `_BitInt` arc
+        // landed and this reader had no such keyword, so the spelling was
+        // WRITE-ONLY on a format whose own header states a byte-identical
+        // round-trip contract
+        // (D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS part (d)).
+        //
+        // ⚠ AND THIS HALF IS NOT A DEBUG SURFACE. `emitHir`/`parseHir` have no
+        // callers in `src/` outside this TU, but `parseTypeFromText` drives THIS
+        // production — ✔MEASURED 2026-08-23: 9 call sites, 7 in
+        // `ffi/shipped_lib_descriptor.cpp` and 2 in
+        // `analysis/semantic/semantic_analyzer.cpp` — so before this arm existed
+        // no shipped FFI descriptor could name a bit-precise type at all.
+        //
+        // The width goes to `TypeInterner::bitInt`, which owns the legality of the
+        // value; a text reader re-deciding it would be a second owner of one fact.
+        if (kw == "_BitInt" || kw == "unsigned") {
+            bool const isSigned = (kw != "unsigned");
+            if (!isSigned && !acceptKeyword("_BitInt")) {
+                malformed("expected '_BitInt' after 'unsigned' — 'unsigned' is not "
+                          "a type keyword on its own in this format (an unsigned "
+                          "primitive is spelled by its own name, e.g. 'u32')");
+                return InvalidType;
+            }
+            expect(Tk::LParen, "'('");
+            auto const width = static_cast<std::int64_t>(takeInt());
+            expect(Tk::RParen, "')'");
+            return interner_.bitInt(width, isSigned);
+        }
         if (kw == "fnptr") { expect(Tk::LAngle, "'<'"); (void)parseType(); expect(Tk::RAngle, "'>'");
             malformed("fnptr<> is not constructible in this interner"); return InvalidType; }
         if (kw == "vec") { expect(Tk::LAngle, "'<'"); TypeId e = parseType(); expect(Tk::Comma, "','");
@@ -2677,7 +3615,12 @@ private:
         for (NamedTypeBinding const& nb : namedTypes_) {
             if (nb.name == kw && nb.type.valid()) return nb.type;
         }
-        malformed(std::format("unknown type '{}'", kw));
+        // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: this named nothing at all —
+        // on the production that decodes every shipped FFI descriptor's type
+        // strings, where the author reading the message is writing a `.json`
+        // descriptor and has no other way to learn what the decoder takes.
+        malformed(std::format("unknown type '{}' — accepted: {}", kw,
+                              typeKeywordsAccepted()));
         return InvalidType;
     }
 };

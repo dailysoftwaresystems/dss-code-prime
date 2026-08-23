@@ -12,7 +12,7 @@ namespace dss {
 namespace {
 
 // D-CSUBSET-UINT128-TYPE (TF-C94): the wide-integer accessors' fail-loud exit —
-// a byte-for-byte mirror of `latticeFatal` (type_lattice.cpp:36), which is the
+// a byte-for-byte mirror of `latticeFatal` (type_lattice.cpp), which is the
 // backstop `TypeInterner::bitIntWidth`/`bitIntIsSigned` already use for the same
 // precondition class. Reaching here means a caller asked for the width/signedness
 // of a type that is NOT multi-limb, i.e. a facade site that skipped its `isWideInt`

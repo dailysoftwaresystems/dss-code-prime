@@ -49,7 +49,7 @@ using namespace dss;
 // point of routing 39 sites through one function.
 //
 // WHY THE ROOT MUST BE PER-RUN (D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES).
-// `tests/CMakeLists.txt:156` registers a SECOND ctest entry that runs THIS
+// `tests/CMakeLists.txt` registers a SECOND ctest entry that runs THIS
 // binary again under `--gtest_shuffle --gtest_repeat=20`, deliberately without
 // serialization. So on any ordinary `ctest -j` two live processes of this
 // binary overlap — and while the fixtures derived their directories from
@@ -66,7 +66,7 @@ using namespace dss;
 // run, and dropping the shuffle arm would give up the order-dependence
 // coverage it exists for. Neither is a fix; do not "simplify" back to either.
 //
-// `ScratchDir` (tests/test_support/scratch_dir.hpp:114) already carries the
+// `ScratchDir` (tests/test_support/scratch_dir.hpp) already carries the
 // correct scheme, so this REUSES it rather than growing a second one: a PID
 // SEED plus an atomic claim via `create_directory` (SINGULAR) in a loop. The
 // singular form returns true only for the caller that actually created the
@@ -89,14 +89,14 @@ using namespace dss;
 
 // Shared schema fixture: load once per test binary process, and hand back a
 // REFERENCE to the cached owner. Same shape as `x86Schema()` in
-// tests/lir/test_lir.cpp:36.
+// tests/lir/test_lir.cpp.
 //
 // D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE — WHY THIS RETURNS A REFERENCE.
 // While this returned `std::shared_ptr<GrammarSchema const>` BY VALUE, every
 // call built a fresh schema owned solely by the returned temporary, so the
 // one-liner `auto const& x = cSubset()->accessor();` bound a reference into an
 // object destroyed at the end of that full-expression. `GrammarSchema`'s
-// accessors (`preprocess()`, src/core/types/grammar_schema.hpp:665) return
+// accessors (`preprocess()`, src/core/types/grammar_schema.hpp) return
 // references INTO the schema, so that is a heap-use-after-free — MEASURED with
 // ASan as a 40/40 deterministic `heap-use-after-free`, and reported from
 // Windows/g++/libstdc++ as a non-deterministic 0xC0000005 that a full-suite run
@@ -1524,6 +1524,14 @@ TEST(Preprocessor, IncludeSpliceDiagnosticsRenderToRealFilesAndLines) {
     auto dir = ppScratchRoot() / "dss_pp_render_attribution_test";
     fs::create_directories(dir);
     // Header error: a stray `@` (illegal char) on the header's line 1.
+    // ★ THE EXPECTED LINES ARE NAMED, NEVER SPELLED INTO THE EXPECTATION. A bare
+    // `"<file>:<line>:"` literal is indistinguishable from a positional CITATION — to
+    // a reader and to `check-plan-citations` alike — and it restates a magic
+    // number instead of saying where the number comes from. These two constants
+    // ARE the fixture's shape: the header's only line, and the main file's line
+    // AFTER the leading `#include`, which is the whole point of this pin.
+    constexpr int kHeaderErrorLine = 1;
+    constexpr int kMainErrorLine   = 2;
     { std::ofstream(dir / "bad.h", std::ios::binary)
           << "int hdr(void) { return @; }\n"; }
     // Main: a LEADING include (line 1), then a main-file error (`@`) on line 2.
@@ -1549,14 +1557,18 @@ TEST(Preprocessor, IncludeSpliceDiagnosticsRenderToRealFilesAndLines) {
 
     std::string const rendered = cu.trees()[0].diagnostics().formatAll(bufs);
 
-    // The header error attributes to bad.h line 1.
-    EXPECT_NE(rendered.find("bad.h:1:"), std::string::npos)
-        << "header-origin diagnostic must render the header path:line\n"
+    // The header error attributes to bad.h's own line.
+    std::string const headerAt =
+        "bad.h:" + std::to_string(kHeaderErrorLine) + ":";
+    EXPECT_NE(rendered.find(headerAt), std::string::npos)
+        << "header-origin diagnostic must render " << headerAt << "\n"
         << rendered;
-    // The main error attributes to the ORIGINAL main.c line 2 (after the
+    // The main error attributes to the ORIGINAL main.c line (after the
     // leading #include) -- proving the splice did not drift the main line.
-    EXPECT_NE(rendered.find("main.c:2:"), std::string::npos)
-        << "main-origin diagnostic must render the ORIGINAL main.c line 2\n"
+    std::string const mainAt =
+        "main.c:" + std::to_string(kMainErrorLine) + ":";
+    EXPECT_NE(rendered.find(mainAt), std::string::npos)
+        << "main-origin diagnostic must render the ORIGINAL " << mainAt << "\n"
         << rendered;
     // Never the unknown-buffer sentinel -- every origin buffer is registered.
     EXPECT_EQ(rendered.find("<unknown-buffer"), std::string::npos)
@@ -2822,7 +2834,7 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "__APPLE_CC__ — the platform-selection macros clang/gcc define on Darwin; "
            "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
            "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
-           "TargetConditionals.h:342 conjunction that gates the whole Darwin ladder";
+           "TargetConditionals.h conjunction that gates the whole Darwin ladder";
     EXPECT_EQ(ungated, 19u)
         << "the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
            "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) + the 5 TF-C83 "
@@ -2899,7 +2911,7 @@ TEST(Preprocessor, FC15bPredefinedMacroBadObjectFormatIsLoadError) {
 //
 // WHY VALUES AND NOT JUST PRESENCE: `__GNUC__` alone would satisfy a
 // presence-only test while yielding GCC_VERSION 4000000 instead of the truthful
-// 4002001 that sqliteInt.h:112 computes.
+// 4002001 that sqliteInt.h computes.
 TEST(Preprocessor, TFC83IdentityPredefineValuesMatchClang) {
     auto c = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(c.has_value());
@@ -2919,7 +2931,7 @@ TEST(Preprocessor, TFC83IdentityPredefineValuesMatchClang) {
     EXPECT_EQ(got, want)
         << "the TF-C83 identity predefines must carry their clang-MEASURED "
            "values; __DSSCP__ must be VERSION (0.0.2) packed to 2";
-    // The GCC_VERSION arithmetic sqliteInt.h:112 actually performs.
+    // The GCC_VERSION arithmetic sqliteInt.h actually performs.
     EXPECT_EQ(std::stoll(got.at("__GNUC__")) * 1000000
                   + std::stoll(got.at("__GNUC_MINOR__")) * 1000
                   + std::stoll(got.at("__GNUC_PATCHLEVEL__")),
@@ -3321,7 +3333,7 @@ TEST(Preprocessor, TfC82PragmaOperatorAndDirectiveAgree) {
 // ★ TF-C82 — C 6.10.9p1 DE-STRINGIZE: `\"` -> `"` and `\\` -> `\`. The escape
 // pass is exactly those two replacements, NOT the general string decoder (which
 // would turn a `\n` a pragma legitimately contains into a newline byte).
-// `sys/queue.h:225` needs this.
+// `sys/queue.h` needs this.
 TEST(Preprocessor, TfC82PragmaOperatorDestringizesPerC6109) {
     PreprocessResult r;
     // The operand de-stringizes to: clang diagnostic ignored "-Wfoo"
@@ -3453,7 +3465,7 @@ void ppUnderFormat(std::string text, std::optional<ObjectFormatKind> fmt,
 
 // ★ ONE `["warning"]` ROW, ALL FOUR REACHED PAYLOAD SHAPES. MEASURED in the
 // corpus: `disable : N` (msvc.h x15, mutex_w32.c, totype.c), `push`/`pop`
-// (mutex_w32.c:40,64) and `default : N` (totype.c:504). The row claims nothing
+// (mutex_w32.c) and `default : N` (totype.c). The row claims nothing
 // about the argument list, which is exactly why one row can cover four shapes —
 // and the test asserts all four rather than the one that happens to dominate.
 TEST(Preprocessor, TfC85WarningPragmaIsInertInEveryReachedShape) {
@@ -6901,8 +6913,8 @@ TEST(Preprocessor, TfC70ErrorDirectiveInNotTakenElseIsSilent) {
 // RED-ON-DISABLE: the (1) hoist reds this too. The nesting-specific pin is the
 // CONJUNCTION of two engine facts, and the test reds if BOTH are undone:
 // `sbHandleIf` pushing `thisBranchActive = enclosing && cond`
-// (preprocessor.cpp:287) AND `sbStackActive` walking every frame
-// (preprocessor.cpp:204-209). Undoing either ALONE leaves the composite
+// in preprocessor.cpp AND `sbStackActive` walking every frame
+// there too. Undoing either ALONE leaves the composite
 // predicate correct -- they are observationally equivalent by construction,
 // which is why no test can separate them; what this test pins is that at least
 // one of the two survives, i.e. that a live-looking inner group inside a dead
@@ -7027,7 +7039,7 @@ TEST(Preprocessor, TfC70ErrorDirectiveOperandIsNotMacroExpanded) {
 // ★ WHY THIS TEST EXISTS AT ALL: every other TfC70 operand test uses bare prose,
 // and bare prose is exactly the form that does NOT expose the bug — as does
 // `"abc" tail`, because there the join ends on `tail`. The suite was green over
-// that subset while `#warning "Unsupported compiler detected"` — sys/cdefs.h:81,
+// that subset while `#warning "Unsupported compiler detected"` — sys/cdefs.h,
 // the literal shape that motivated this whole feature — silently reported a
 // truncated `"Unsupported compiler detected` with no closing quote. A
 // multi-FORM contract needs a test per form, not per site.
@@ -7066,7 +7078,7 @@ TEST(Preprocessor, TfC70OperandKeepsClosingStringDelimiter) {
         return firstMessageWithCode(
             r, DiagnosticCode::P_PreprocessorWarningDirective);
     };
-    // (A) THE sys/cdefs.h:81 SHAPE — operand is a lone string literal.
+    // (A) THE sys/cdefs.h SHAPE — operand is a lone string literal.
     EXPECT_NE(msgOf("#warning \"Unsupported compiler detected\"\n")
                   .find("\"Unsupported compiler detected\""),
               std::string::npos)
@@ -8523,7 +8535,7 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
 //   (b) `__BIG_ENDIAN__` is declared by NO layer, on NO format. That is not a
 //       missing feature, it is the declaration that DSS ships no big-endian
 //       target (MEASURED 2026-08-04: clang defines it only for
-//       aarch64_be-linux-gnu), and Apple's libkern/OSByteOrder.h:165 tests it
+//       aarch64_be-linux-gnu), and Apple's libkern/OSByteOrder.h tests it
 //       BEFORE the little-endian arm, so a stray row silently selects
 //       byte-swapping macros on a little-endian machine.
 TEST(Preprocessor, TFC115EndiannessPredefinesCrossLayerCoherence) {
@@ -8573,7 +8585,7 @@ TEST(Preprocessor, TFC115EndiannessPredefinesCrossLayerCoherence) {
 //     #ifndef __has_include
 //     #define __has_include(x) 0
 //     #endif
-// — Apple SDK `sys/cdefs.h:91-93`, and the same three lines in glibc, musl,
+// — Apple SDK `sys/cdefs.h`, and the same three lines in glibc, musl,
 // Boost — therefore went LIVE, shadowing an operator DSS actually implements
 // with a function-like macro that answers 0 forever. The damage was not the 0:
 // it was that the pre-scan's FIX-3 arm (preprocessor.cpp, "a function-like-macro
@@ -9095,8 +9107,8 @@ TEST(Preprocessor, Tf87ReentryPermittedForIfNotDefinedParenGuard) {
 }
 
 // ── FORM 3: `#if !defined X` — NO PARENTHESES. ──────────────────────────────
-// MEASURED as real SDK vocabulary (`math.h:809`, `libxslt/xsltconfig.h:173`,
-// `Spatial/SPPose3D.h:23` …) though never as a first-line guard in this tree.
+// MEASURED as real SDK vocabulary (`math.h`, `libxslt/xsltconfig.h`,
+// `Spatial/SPPose3D.h` …) though never as a first-line guard in this tree.
 // Supported because a spelling that is legal C must not become a refused
 // include the day someone uses it as a guard.
 TEST(Preprocessor, Tf87ReentryPermittedForIfNotDefinedNoParenGuard) {
@@ -9546,7 +9558,7 @@ TEST(Preprocessor, Tf87GuardSplitAcrossLineContinuationIsStillDetected) {
 // before the change: `__arm64__` and `__APPLE__` defined, `__LP64__` NOT
 // defined, `sizeof(long)==8`, `sizeof(void*)==8` — LP64 widths with ILP32
 // headers. The macOS SDK gates 234 occurrences across 91 headers on `__LP64__`;
-// `mach/port.h:113-114` then asserted the user32 struct size 12 instead of
+// `mach/port.h` then asserted the user32 struct size 12 instead of
 // user64's 16, which is sqlite `mem1.c`'s three `error[S0029]`.
 //
 // ★ WHAT THESE TESTS PIN THAT THE FORMAT-SCHEMA TESTS CANNOT
@@ -9842,7 +9854,7 @@ TEST(Preprocessor, HeaderCaseHasIncludeAngleFollowsFormatPolicyNotHost) {
         ASSERT_EQ(lexs.size(), 3u);
         EXPECT_EQ(lexs[1], "yes")
             << "a case-insensitive format must see <Windows.h> -> windows.json "
-               "on ANY build host (sqlite3.c:67322 spells it with a capital W)";
+               "on ANY build host (sqlite3.c spells it with a capital W)";
     }
     {   // elf convention: it is NOT — byte-exact or nothing.
         PreprocessResult r;

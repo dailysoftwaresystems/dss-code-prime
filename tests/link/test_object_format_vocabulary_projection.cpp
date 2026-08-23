@@ -66,6 +66,7 @@
 
 #include "format_reject_support.hpp"
 #include "repo_root.hpp"
+#include "vocabulary_message_probe.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -142,23 +143,14 @@ struct ShippedFormatDoc {
     return out;
 }
 
-// Every `'…'`-quoted token in a diagnostic message. The shared renderer quotes
-// each vocabulary spelling, so this is how a test reads back WHAT THE MESSAGE
-// CLAIMS — as opposed to re-deriving it from the table, which would make the
-// comparison circular and green by construction.
-[[nodiscard]] std::vector<std::string> quotedTokens(std::string const& msg) {
-    std::vector<std::string> out;
-    std::size_t              i = 0;
-    while (true) {
-        auto const open = msg.find('\'', i);
-        if (open == std::string::npos) break;
-        auto const close = msg.find('\'', open + 1);
-        if (close == std::string::npos) break;
-        out.push_back(msg.substr(open + 1, close - open - 1));
-        i = close + 1;
-    }
-    return out;
-}
+// ★ `quotedTokens` used to be a file-local copy here, byte-identical to the one
+// three `tests/core` files had already merged — and therefore invisible to the
+// mutant that closed
+// D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE. It has ONE
+// owner now, `tests/test_support/vocabulary_message_probe.hpp`, which is
+// json-free and reachable from every suite; see
+// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED.
+using ::dss::test_support::quotedTokens;
 
 [[nodiscard]] bool contains(std::span<std::string_view const> names,
                             std::string_view                  needle) {
@@ -281,27 +273,57 @@ void runVocabularySite(VocabularySite const& site) {
 }
 
 // The vocabularies whose accepted set is "the table MINUS a sentinel the
-// loader refuses explicitly". Computed, never hand-listed — `namesWhere<M>`
-// makes a wrong M a COMPILE error rather than a list that quietly stops
-// matching the check.
+// loader refuses explicitly". Computed, never hand-listed.
+//
+// ★★ THESE ARE RE-DERIVED HERE ON PURPOSE, AND THAT IS THE PIN. `src/` now owns
+// ONE definition of each (`kSelectableExitMechanismNames` and
+// `kSelectableArgsMechanismNames` beside their enums in
+// `core/types/target_schema.hpp`, `kSelectableRuntimeLibraryRoleNames` in
+// `core/types/object_format_kind.hpp`) and the loader RENDERS those arrays into
+// its refusals. Expecting the loader's own array back out of its own message
+// would assert only that `allowedList` round-trips. Re-deriving from the TABLE
+// with this file's own predicate keeps the expectation independent of the
+// array under test, so a canonical projection that is itself wrongly filtered
+// still reds here. The table stays the single owner of the SPELLINGS; what is
+// duplicated is the derivation, which is the whole point of a pin.
+//
+// ⚠⚠ EACH `M` IS A LITERAL AND EACH CARRIES A SENTINEL-COUNT `static_assert`.
+// All three were spelled `rows.size() - 1` until this cycle, and that spelling
+// is `x == x`: `namesWhere<M>` compares `M` against the rows the predicate
+// ACCEPTS, so deriving `M` from the table the predicate walks makes both sides
+// move together (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
+// ✔MEASURED with `g++ -std=c++23 -fsyntax-only` over a nine-arm probe: a new
+// SELECTABLE enumerator reds only under the literal, a second UNSELECTABLE row
+// reds only under the derived form — so neither spelling alone is the guard the
+// comment that stood here claimed, and both parts are written.
 [[nodiscard]] constexpr bool selectableRole(RuntimeLibraryRole r) noexcept {
     return r != RuntimeLibraryRole::None;
 }
 constexpr auto kSelectableRoleNames =
-    namesWhere<kRuntimeLibraryRoleTable.rows.size() - 1>(kRuntimeLibraryRoleTable,
-                                                         selectableRole);
+    namesWhere<3>(kRuntimeLibraryRoleTable, selectableRole);
+static_assert(kRuntimeLibraryRoleTable.rows.size()
+                  == kSelectableRoleNames.size() + 1,
+              "exactly one runtimeLibraries role is unselectable (the 'none' "
+              "sentinel) — a second one leaves this expectation silently "
+              "narrower than the set the loader accepts");
 [[nodiscard]] constexpr bool selectableExit(ExitMechanism m) noexcept {
     return m != ExitMechanism::None;
 }
 constexpr auto kSelectableExitNames =
-    namesWhere<kExitMechanismTable.rows.size() - 1>(kExitMechanismTable,
-                                                    selectableExit);
+    namesWhere<2>(kExitMechanismTable, selectableExit);
+static_assert(kExitMechanismTable.rows.size() == kSelectableExitNames.size() + 1,
+              "exactly one processExit mechanism is unselectable (the 'none' "
+              "sentinel) — a second one leaves this expectation silently "
+              "narrower than the set the loader accepts");
 [[nodiscard]] constexpr bool selectableArgs(ArgsMechanism m) noexcept {
     return m != ArgsMechanism::None;
 }
 constexpr auto kSelectableArgsNames =
-    namesWhere<kArgsMechanismTable.rows.size() - 1>(kArgsMechanismTable,
-                                                    selectableArgs);
+    namesWhere<2>(kArgsMechanismTable, selectableArgs);
+static_assert(kArgsMechanismTable.rows.size() == kSelectableArgsNames.size() + 1,
+              "exactly one processArgs mechanism is unselectable (the 'none' "
+              "sentinel) — a second one leaves this expectation silently "
+              "narrower than the set the loader accepts");
 
 constexpr auto kDataModelNames        = allNames(kDataModelTable);
 constexpr auto kHeaderMatchNames      = allNames(kHeaderNameMatchingTable);

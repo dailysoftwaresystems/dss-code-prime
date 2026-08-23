@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"  // EnumNameTable (kOperatorAssocTable, kOperatorArityTable)
 #include "core/types/rule_id.hpp"
 #include "core/types/strong_ids.hpp"
 
@@ -26,13 +27,36 @@ enum class OperatorAssoc : std::uint8_t {
     Right,
 };
 
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// ★★★ THIS ONE HAD TWO OWNERS OF TWO DIFFERENT SPELLING SETS FOR ONE ENUM, and
+// that is worse than a drift hazard — it is a vocabulary that already disagreed
+// with itself. `operators[].associativity` is written `"left"`/`"right"`/
+// `"none"` and was resolved by an inline `a == "left" / "right" / "none"` chain
+// in the grammar loader; this helper answered the same question with
+// `"Left"`/`"Right"`/`"None"`, so the one diagnostic in the tree that rendered
+// through the pair (`operatorArityName`, in the duplicate-operator refusal)
+// printed a spelling NO config file may contain. The table below is the CONFIG
+// spelling — the one a schema author reads and writes — and both directions now
+// project from it.
+//
+// ⚠ Invisible to the retyped-set census at every setting: the loader's refusals
+// render the set unquoted (`(expected left|right|none)`), the blind spot
+// D-CONFIG-CLOSED-SET-RENDERED-UNQUOTED-IS-INVISIBLE-TO-EVERY-CENSUS names.
+// Found by reading every inline chain in the file rather than by the count.
+inline constexpr EnumNameTable<OperatorAssoc, 3> kOperatorAssocTable{{{
+    { OperatorAssoc::None,  "none"  },
+    { OperatorAssoc::Left,  "left"  },
+    { OperatorAssoc::Right, "right" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kOperatorAssocTable);
+
 [[nodiscard]] constexpr std::string_view operatorAssocName(OperatorAssoc a) noexcept {
-    switch (a) {
-        case OperatorAssoc::None:  return "None";
-        case OperatorAssoc::Left:  return "Left";
-        case OperatorAssoc::Right: return "Right";
-    }
-    std::unreachable();
+    return kOperatorAssocTable.name(a);
+}
+[[nodiscard]] constexpr std::optional<OperatorAssoc>
+operatorAssocFromName(std::string_view s) noexcept {
+    return kOperatorAssocTable.fromName(s);
 }
 
 enum class OperatorArity : std::uint8_t {
@@ -43,14 +67,27 @@ enum class OperatorArity : std::uint8_t {
                // a middle clause (to the `:` separator) + a right operand
 };
 
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// `operators[].arity`, the sibling of `kOperatorAssocTable` above and the site
+// where the two-spelling-set split was OBSERVABLE: the loader's
+// "operator '{}' ({}) declared twice" refusal rendered this helper's PascalCase
+// `Postfix` at an author who had written `"postfix"` and could not have written
+// anything else. Now both directions project from the config spelling.
+inline constexpr EnumNameTable<OperatorArity, 4> kOperatorArityTable{{{
+    { OperatorArity::Infix,   "infix"   },
+    { OperatorArity::Prefix,  "prefix"  },
+    { OperatorArity::Postfix, "postfix" },
+    { OperatorArity::Ternary, "ternary" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kOperatorArityTable);
+
 [[nodiscard]] constexpr std::string_view operatorArityName(OperatorArity a) noexcept {
-    switch (a) {
-        case OperatorArity::Infix:   return "Infix";
-        case OperatorArity::Prefix:  return "Prefix";
-        case OperatorArity::Postfix: return "Postfix";
-        case OperatorArity::Ternary: return "Ternary";
-    }
-    std::unreachable();
+    return kOperatorArityTable.name(a);
+}
+[[nodiscard]] constexpr std::optional<OperatorArity>
+operatorArityFromName(std::string_view s) noexcept {
+    return kOperatorArityTable.fromName(s);
 }
 
 namespace detail {

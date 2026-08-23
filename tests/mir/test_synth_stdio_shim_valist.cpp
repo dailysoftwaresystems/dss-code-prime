@@ -265,7 +265,8 @@ std::optional<std::int64_t> constI64(Mir const& mir, MirInstId id) {
 // ── POSITIONAL OPERAND PROBES (TF-C119) ──────────────────────────────────────
 //
 // ★ WHY THESE EXIST HERE AT ALL, and why "not a Const" is not good enough. MEASURED
-// (TF-C112, recorded at tests/mir/test_mir_merge.cpp:3216-3223 with the rule at :3226):
+// (TF-C112, recorded in tests/mir/test_mir_merge.cpp's `__stdio_common_vsprintf`
+// per-operand pins, with the rule stated beside them):
 // transposing `buf` and `fmt` in the SPRINTF arm passed every assertion in BOTH stdio
 // test binaries AND the MirVerifier, because both operands are `char*` and the only
 // thing separating them is their POSITION. The rule that measurement produced is
@@ -568,7 +569,7 @@ TEST(SynthStdioShimVaListArm, HomePayloadTracksEachRecipesNamedArgCount) {
 // pinned here beside its siblings rather than trusted to the runtime witness alone.
 //
 // (2) IT IS THE ONLY RECIPE IN THIS FAMILY THAT IS NOT A SINGLE BLOCK. Its body ends
-// with the UCRT header's `_Result < 0 ? -1 : _Result` clamp (`ucrt/stdio.h:1443`),
+// with the UCRT header's `_Result < 0 ? -1 : _Result` clamp (`ucrt/stdio.h`),
 // which MIR has no Select opcode for and so spells as a compare + CondBr + two
 // returning blocks — the `thrd_join` shape. ★ THIS TEST IS THE CLAMP'S ONLY WITNESS,
 // and that is stated rather than glossed: on every return value measured to date the
@@ -588,7 +589,7 @@ TEST(SynthStdioShimVaListArm, HomePayloadTracksEachRecipesNamedArgCount) {
 // ★★ AND EVERY OTHER OPERAND IS PINNED BY POSITION TOO, which it was not until TF-C119.
 // The rule comes from a MEASUREMENT, not from tidiness: transposing `buf` and `fmt` in
 // the SPRINTF arm passed every assertion in both stdio test binaries and the
-// MirVerifier (tests/mir/test_mir_merge.cpp:3216-3226) — both are `char*`, so only the
+// MirVerifier (tests/mir/test_mir_merge.cpp) — both are `char*`, so only the
 // POSITION distinguishes them. This arm had `_Options` and `_BufferCount` pinned but
 // `_Buffer` (`Arg 0`), `_Format` (`Arg 2`) and `_Locale` bare, so the very same
 // transposition was invisible HERE while being caught two files over. snprintf makes it

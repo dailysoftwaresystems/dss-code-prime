@@ -2291,7 +2291,7 @@ TEST(HirLoweringCSubset, NoreturnIndirectCalleeIsNotWrapped) {
 //
 // This is the CONSUMPTION end of the sink the Tcl 9 `TclStubs` member shape
 // feeds (`struct { __attribute__((__noreturn__)) void (*tcl_Panic)(…); }` —
-// tclDecls.h:1893). Host clang honors it here too: measured, `int f(struct S
+// tclDecls.h). Host clang honors it here too: measured, `int f(struct S
 // *s){ s->p(1); }` draws no -Wreturn-type when `p` is decorated and does when
 // it is not.
 //
@@ -2322,7 +2322,7 @@ TEST(HirLoweringCSubset, NoreturnFunctionPointerObjectCallWrapsAndVerifies) {
 // The Tcl 9 `TclStubs` declaration itself, end-to-end through HIR: the leading
 // member attribute position must LOWER, not merely parse. Two decorated
 // function-pointer members plus a trailing `__format__` run — the literal shape
-// at tclDecls.h:1893/:2024.
+// at tclDecls.h.
 TEST(HirLoweringCSubset, TclStubsLeadingMemberAttributeLowersClean) {
     SemanticModel model = analyzeCSubset(
         "typedef struct TclStubs {\n"
@@ -2520,7 +2520,7 @@ TEST(HirLoweringCSubset, SingleStringLinkageArgResolvesHiddenVisibility) {
 // stored) — which additionally witnesses that the visibility fold does not
 // clobber the binding axis.
 //
-// PROVENANCE: this arrives from Tcl, not sqlite — tcl.h:210
+// PROVENANCE: this arrives from Tcl, not sqlite — tcl.h
 // `#define DLLEXPORT __attribute__((visibility("default")))` under
 // `__GNUC__ > 3`, reaching tclsqlite-ex.c through TCL_STORAGE_CLASS/EXTERN.
 
@@ -2574,7 +2574,7 @@ TEST(HirLoweringCSubset, VisibilityDefaultAppliesDefaultVisibilityBesideWeak) {
 }
 
 // (3) `externDecl` position — a DIFFERENT scan root with its own
-// `linkageSpecifiers` map, and THE one Tcl actually reaches (tcl.h:306
+// `linkageSpecifiers` map, and THE one Tcl actually reaches (tcl.h
 // `#define EXTERN extern TCL_STORAGE_CLASS` puts the attribute AFTER `extern`,
 // into `externSpecifiers`' TF-C77 repeat rather than `declSpecifiers`).
 TEST(HirLoweringCSubset, VisibilityDefaultExternDeclLowersClean) {
@@ -2607,7 +2607,7 @@ TEST(HirLoweringCSubset, VisibilityDefaultExternDeclLowersClean) {
 // This is a VOCABULARY-COMPLETENESS limit, not a silent drop: `visibility:hidden`
 // has carried the identical limit since FC4 c1. Closing it means either two more
 // keys per value or dunder-normalizing the lookup — a mechanism change with its
-// own design. Real headers reaching DSS today (tcl.h:210, sqlite) write the bare
+// own design. Real headers reaching DSS today (tcl.h, sqlite) write the bare
 // spelling, so the loud refusal is the correct residue.
 TEST(HirLoweringCSubset, VisibilityDefaultDunderSpellingIsRefusedLoud) {
     SemanticModel model = analyzeCSubset(
@@ -2722,7 +2722,7 @@ TEST(HirLoweringCSubset, VisibilityDefaultRowsAreIndependentlyLoadBearing) {
 // (`no_sanitize`) BEFORE the composite pairing, and `no_sanitize` is in NEITHER
 // `linkageSpecifierIgnoredNames` list — so the pairing assembles the composite
 // key `no_sanitize:<arg>`, the strict lookup misses, and H000C fires. sqlite
-// writes only the bare spelling (src/wal.c:932), so the loud refusal is the
+// writes only the bare spelling (src/wal.c), so the loud refusal is the
 // correct residue and not a gap.
 //
 // ★★ WHY THIS PIN EXISTS AT ALL: THE WRONG FIX IS A ONE-TOKEN EDIT. Adding
@@ -5214,7 +5214,7 @@ namespace {
 // tier reports AGAINST — the MIR brace-init refusals name it — and before this pin
 // `lowerBraceInit` returned it WITHOUT `track(...)`, so those diagnostics printed
 // with no `--> file:line` and the offending construct had to be found by grepping
-// the source by hand. MEASURED cost: that is exactly how sqlite's `shell.c:25283`
+// the source by hand. MEASURED cost: that is exactly how sqlite's `shell.c`
 // `struct stat x = {0};` had to be located.
 //
 // RED-ON-DISABLE: drop the `track(...)` wrapper on either `lowerBraceInit`'s or
@@ -7387,7 +7387,7 @@ TEST(HirLoweringCSubset, ArrayComparisonConditionOperandsDecayToPointer) {
 // decay) BEFORE the Deref types its result. `derefResultType` is Ptr-only (the
 // law SHARED with the semantic-tier typer), so pre-fix `*(arrayName)` reached it
 // as a raw Array → InvalidType → a TYPELESS Deref → H0001 (the sqlite
-// getVarint32(zBuf,…) test3.c:474 blocker; `zBuf` is `unsigned char zBuf[100]`).
+// getVarint32(zBuf,…) test3.c blocker; `zBuf` is `unsigned char zBuf[100]`).
 // `arrayName[0]` (Index → indexResultType types an Array base) and `*(arrayName
 // + 0)` (c59) already lowered — this is the DIRECT-deref-of-an-array hole. This
 // pin names the HIR tier: the Deref is TYPED as the element and its operand is

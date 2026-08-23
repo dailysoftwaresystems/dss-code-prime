@@ -14,6 +14,7 @@
 #include "link/format/macho_codesign.hpp"
 #include "link/format/object_symbol_names.hpp"
 #include "link/format/string_table.hpp"
+#include "link/format/weak_definition_gate.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -90,10 +91,32 @@ namespace dss::macho {
 // not enforce. `namesWhere<M>` also makes the count a compile-time obligation —
 // adding a direct-shaped spelling without widening this fails to build, which
 // is the loud outcome rather than a quietly stale sentence.
+//
+// ★ BUT THAT OBLIGATION RAN IN ONE DIRECTION ONLY, AND THE DIRECTION IT MISSED
+// IS THE EXACT SPELLING THE PARAGRAPH ABOVE NAMES AS THE HAZARD.
+// D-CORE-NAMESWHERE-LITERAL-COUNT-IS-BLIND-TO-A-SECOND-SENTINEL: `namesWhere<M>`
+// compares `M` against the rows the predicate ACCEPTS, so a THIRD,
+// INDIRECT-shaped spelling changes only the REFUSED side and moves nothing the
+// count can observe. ✔MEASURED 2026-08-23 in a worktree with
+// `g++ -std=c++23 -fsyntax-only -I src src/link/format/macho.cpp`: adding an
+// `indirect-stub` row to `kExternCallDispatchTable` and widening
+// `externCallUsesIndirectShape` to cover it COMPILED CLEAN. The `static_assert`
+// pins the REFUSED count — the vocabulary's own row total against this
+// projection's literal, two numbers with DIFFERENT OWNERS — so a new call shape
+// of EITHER kind stops at this walker and its `__stubs` assumption gets
+// re-checked, instead of the assumption silently widening to cover a shape
+// nobody weighed against it.
 inline constexpr auto kMachoAcceptedExternCallDispatch =
     namesWhere<1>(kExternCallDispatchTable, [](ExternCallDispatch d) {
         return !externCallUsesIndirectShape(d);
     });
+static_assert(kExternCallDispatchTable.rows.size()
+                  == kMachoAcceptedExternCallDispatch.size() + 1,
+              "kExternCallDispatchTable must have exactly ONE row this walker "
+              "refuses (the indirect-shaped 'indirect-slot') — a second one "
+              "leaves `namesWhere`'s literal count matching while a NEW extern "
+              "call shape reaches Mach-O with nobody re-checking it against the "
+              "symbolVa→__stubs reality the coherence guard below encodes");
 
 
 namespace {
@@ -1039,6 +1062,37 @@ encode(AssembledModule const&    module,
         }
         return encodeExec(module, targetSchema, fmt, *secText, reporter);
     }
+
+    // ── D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS ──
+    //    ASK THE CONFIG BEFORE SPELLING A WEAK DEFINITION.
+    //
+    // `definedNDesc` below sets N_WEAK_DEF (0x0080) in `n_desc` — the Mach-O
+    // spelling of a weak definition, and the `symbol-flag` dialect. Until this
+    // gate landed it did so UNCONDITIONALLY, deciding a per-FORMAT fact inside
+    // the walker while the config key that owns that fact sat unread on two pe
+    // documents. A key the writer does not read drifts silently while reading
+    // as authoritative, which is the defect
+    // [[D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED]] exists to prevent — so
+    // the declaration and this consultation land together, never one first.
+    //
+    // ★★ THE GATE IS ON THE MH_OBJECT ARM ONLY, AND THE ASYMMETRY IS THE POINT
+    // RATHER THAN AN OMISSION. The image arms (MH_EXECUTE / MH_DYLIB) never
+    // ENCODE a weak definition: `refuseWeakImageAlias` refuses a weak alias
+    // outright, because N_WEAK_DEF on an image needs MH_WEAK_DEFINES in the
+    // mach header and these writers copy the schema's flags verbatim
+    // (D-LK3-DYLIB-WEAK-EXPORT). A dialect declared on an exec/dylib document
+    // would therefore be a key NOBODY READS — precisely the drift this row
+    // exists to close — so those four documents deliberately declare none, and
+    // the shipped-scope pin asserts that rather than remembering it.
+    //
+    // ★ SCAN FIRST, ASK SECOND: `requireWeakDefinitionDialect` only asks the
+    // schema when the module actually carries a weak definition.
+    if (!link::format::requireWeakDefinitionDialect(
+            module, fmt, WeakDefinitionDialect::SymbolFlag,
+            "macho::encode (MH_OBJECT)", reporter)) {
+        return {};
+    }
+
     // NOTE: the MH_OBJECT path does not APPLY relocations (the assembler
     // stamped the bytes; the .o writer serializes them + relocation_info
     // records the FINAL linker resolves). `targetSchema` is consulted only

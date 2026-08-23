@@ -21,3 +21,18 @@ dss_add_test(NAME hir/test_hir_lowering_toy   SOURCES test_hir_lowering_toy.cpp)
 dss_add_test(NAME hir/test_hir_lowering_generic   SOURCES test_hir_lowering_generic.cpp)
 dss_add_test(NAME hir/test_hir_lowering_tsql  SOURCES test_hir_lowering_tsql.cpp)
 dss_add_test(NAME hir/test_hir_lowering_multi_lang SOURCES test_hir_lowering_multi_lang.cpp)
+
+# D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET + D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM
+# + D-MIR-TEXT-DIAG-CODE-CAST-IS-UNVALIDATED + the `_BitInt` half of
+# D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS. Separate from
+# test_hir_text.cpp because those arms pin the FORMAT and these pin the
+# VOCABULARY and the two capability gaps.
+dss_add_test(NAME hir/test_hir_text_vocabulary_and_capability SOURCES test_hir_text_vocabulary_and_capability.cpp)
+
+# D-HIR-TEXT-INLINE-ASM-OPERAND-KIND-DROPPED-IN-TRANSIT — the CONSEQUENCE half.
+# Separate from test_hir_text.cpp because those arms pin the round trip and this
+# one pins what the NEXT tier reads back: a dropped operand-form binding is
+# indistinguishable from "no target was in scope", so `hir_to_mir` refuses a
+# declared letter with a false reason. It therefore links the MIR lowering.
+dss_add_test(NAME hir/test_hir_text_operand_form_reaches_mir
+             SOURCES test_hir_text_operand_form_reaches_mir.cpp)

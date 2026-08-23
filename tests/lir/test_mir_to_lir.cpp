@@ -484,7 +484,7 @@ TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
 // (runtime witness = the qemu-arm64 default-PIE gcc link of the abs .o).
 TEST(MirToLir, GotExternAddrValueEmitsGotMacroNotAbsoluteLea) {
     TypeInterner interner{CompilationUnitId{1}};
-    TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+    TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
     // `void* f(void) { return &abs; }` — GlobalAddr(abs) used as a VALUE
     // (its sole use is the Return, so neither the direct-call fold nor the
     // riprel-load fold fires; the value-form GOT arm is reached).
@@ -564,7 +564,7 @@ TEST(MirToLir, GotExternAddrValueEmitsGotMacroNotAbsoluteLea) {
 // regression that fired the GOT arm unconditionally would flip this red.
 TEST(MirToLir, NoExternAddrBindingKeepsAbsoluteLeaForExternValue) {
     TypeInterner interner{CompilationUnitId{1}};
-    TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+    TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
     TypeId const callerSig =
         interner.fnSig(std::span<TypeId const>{}, ptrT, CallConv::CcSysV);
     MirBuilder mb;
@@ -2780,8 +2780,11 @@ TEST_P(MirToLirCastMapping, EmitsExpectedMnemonicAndRegClass) {
 
     // Synthetic MIR: single src-typed arg → cast → return dst-typed value.
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const srcT = interner.primitive(param.srcKind);
-    auto const dstT = interner.primitive(param.dstKind);
+    // D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR: the IntToPtr /
+    // PtrToInt / Bitcast rows name `Ptr`, which is structural — the ONE resolver
+    // in `synthetic_fn.hpp` builds the opaque `void*` the row means.
+    auto const srcT = ::dss::test_support::probeTypeOfKind(interner, param.srcKind);
+    auto const dstT = ::dss::test_support::probeTypeOfKind(interner, param.dstKind);
     std::array<::dss::TypeId, 1> params{srcT};
     auto const fnSig = interner.fnSig(params, dstT, ::dss::CallConv::CcSysV);
 
@@ -2862,7 +2865,7 @@ TEST(MirToLir, GepDynamicIndexEmitsFourOperandLea) {
     auto const& sch = **target;
 
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const i64  = interner.primitive(::dss::TypeKind::I64);
     std::array<::dss::TypeId, 2> params{ptrT, i64};
     auto const fnSig = interner.fnSig(params, ptrT, ::dss::CallConv::CcSysV);
@@ -3115,7 +3118,7 @@ TEST(MirToLir, WideLiteralStringRoutesThroughLiteralPool) {
     auto const& sch = **target;
 
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const ptrT  = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT  = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const fnSig = interner.fnSig(std::span<::dss::TypeId const>{}, ptrT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
     ::dss::MirLiteralValue lv;
@@ -3576,7 +3579,7 @@ TEST(MirToLir, ExternCallEmitsCallIndirectViaExternOpcode) {
 
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
     auto const i32   = interner.primitive(::dss::TypeKind::I32);
-    auto const ptrT  = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT  = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const externSig = interner.fnSig(
         std::array<::dss::TypeId const, 1>{ptrT}, i32,
         ::dss::CallConv::CcMS64);
@@ -3709,7 +3712,7 @@ lowerStdExternFixture(::dss::TargetSchema const& sch,
                       ::dss::CallConv cc = ::dss::CallConv::CcMS64) {
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
     auto const i32  = interner.primitive(::dss::TypeKind::I32);
-    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const internalSig = interner.fnSig(
         std::span<::dss::TypeId const>{}, i32, cc);
 
@@ -3938,7 +3941,7 @@ TEST(MirToLir, ExtractValueZeroIndexLowersToLoad) {
     auto const& sch = **target;
 
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const i32  = interner.primitive(::dss::TypeKind::I32);
     std::array<::dss::TypeId, 1> params{ptrT};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
@@ -3979,7 +3982,7 @@ TEST(MirToLir, ExtractValueNonZeroIndexDefersWithDiagnostic) {
     auto const& sch = **target;
 
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const i32  = interner.primitive(::dss::TypeKind::I32);
     std::array<::dss::TypeId, 1> params{ptrT};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
@@ -4020,7 +4023,7 @@ TEST(MirToLir, ExtractValueZeroIndexAcceptsUintLiteralVariant) {
     ASSERT_TRUE(target.has_value());
     auto const& sch = **target;
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const ptrT = interner.primitive(::dss::TypeKind::Ptr);
+    auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const i32  = interner.primitive(::dss::TypeKind::I32);
     std::array<::dss::TypeId, 1> params{ptrT};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
@@ -4484,8 +4487,12 @@ namespace {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     EXPECT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    auto const srcTy = interner.primitive(src);
-    auto const dstTy = interner.primitive(dst);
+    // D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR: three `CastCase` rows
+    // below name `Ptr` as a src or dst kind (IntToPtr / PtrToInt / Bitcast), and
+    // `primitive(TypeKind::Ptr)` would mint a pointer with NO pointee. The ONE
+    // resolver in `synthetic_fn.hpp` builds what the row means.
+    auto const srcTy = ::dss::test_support::probeTypeOfKind(interner, src);
+    auto const dstTy = ::dss::test_support::probeTypeOfKind(interner, dst);
     std::array<::dss::TypeId, 1> params{srcTy};
     auto const fnSig = interner.fnSig(params, dstTy, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;

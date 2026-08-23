@@ -247,3 +247,58 @@ dss_add_test(NAME core/test_composite_kind_vocabulary_projection
 # stale pointer THROWS rather than passing vacuously.
 target_link_libraries(dss_core_test_composite_kind_vocabulary_projection
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN — the SWEEP of the
+# owner shape the retyped-set census could not see, in the one file that held
+# all of it: every inline `==` chain in `grammar_schema_json.cpp`. Thirteen
+# vocabularies plus the `synthesizedTypes` ROLE ROUTER.
+# ★★ THE EXPECTATIONS ARE HAND-WRITTEN, NOT PROJECTED. A pin whose expected set
+#    comes off the same table the code renders moves BOTH HALVES TOGETHER: a
+#    renamed row re-spells a config key across the tree and every
+#    "the-message-names-the-table" assertion stays green through it. This file
+#    states each accepted set, and its COUNT, as literals.
+# ⚠ MUST run through ctest, never a bare .exe: `findShippedConfig` walks the cwd
+# unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME core/test_grammar_loader_chain_vocabulary_projection
+             SOURCES test_grammar_loader_chain_vocabulary_projection.cpp)
+# Mutates the SHIPPED language JSON in memory at pointers found by SEARCHING for
+# the objects that carry each key (nlohmann consumer) — never by index, and a
+# locator that finds nothing fails the arm rather than passing vacuously.
+target_link_libraries(dss_core_test_grammar_loader_chain_vocabulary_projection
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-TYPEKIND-PASCALCASE-SPELLINGS-HAVE-TWO-OWNERS — `TypeKind`'s forty PascalCase
+# spellings had THREE hand-written owners (`lir/lir_text.cpp`'s `.dsslir` `core`
+# tag, `type_lattice/type_reintern.cpp`'s abort name, `grammar_schema_json.cpp`'s
+# twenty-row config table) and the PRIMITIVE subset had TWO. The first pair had
+# already drifted, on `Count_`.
+# ★★ THE EXPECTATIONS ARE HAND-WRITTEN, NOT PROJECTED — a set read off the same
+#    table the code renders moves BOTH HALVES TOGETHER. Every list and every
+#    count in this file is a literal.
+# ⚠ MUST run through ctest, never a bare .exe: `findShippedConfig` and
+# `TargetSchema::loadShipped` walk the cwd unless `DSS_CONFIG_ROOT` is set, and
+# only `dss_add_test` sets it.
+dss_add_test(NAME core/test_type_kind_vocabulary_projection
+             SOURCES test_type_kind_vocabulary_projection.cpp)
+# Mutates the SHIPPED language JSON in memory at a pointer guarded by `at()`,
+# which THROWS rather than passing vacuously when it stops resolving (nlohmann
+# consumer). The `.dsslir` half needs no JSON — it rewrites the tag in a module
+# the emitter produced.
+target_link_libraries(dss_core_test_type_kind_vocabulary_projection
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LATTICE-PRIMITIVE-BUILDER-ACCEPTS-A-NON-PRIMITIVE-KIND — `TypeInterner::
+# primitive` interned WHATEVER kind it was handed (a fieldless "struct", an
+# element-less "complex"), and the only gate on that argument, the config
+# loader's `isPrimitiveTypeKind`, guarded ONE of the builder's callers.
+# ★ THE FIRING IS THE DELIVERABLE. The gap was ✔MEASURED as not a live defect,
+#   so a guard that could not be shown to fire would be strictly worse than
+#   none. Twenty per-kind death arms (a loop inside one expectation ends at the
+#   FIRST abort and would assert nothing about the other nineteen), plus the
+#   INVERSE arm proving all twenty LEAF kinds still intern, plus a partition arm
+#   so a new enumerator cannot land in neither list and leave both quiet.
+# ★★ EVERY SET AND EVERY COUNT IS A LITERAL — a list read off the same table or
+#    the same predicate the code consults moves BOTH HALVES TOGETHER.
+# No config, no shipped JSON: the subject is the interner itself.
+dss_add_test(NAME core/test_primitive_builder_leaf_kind_gate
+             SOURCES test_primitive_builder_leaf_kind_gate.cpp)

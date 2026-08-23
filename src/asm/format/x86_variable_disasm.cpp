@@ -44,9 +44,9 @@ readImm64LE(std::span<std::uint8_t const> bytes, std::size_t offset) noexcept {
 //
 // D-CSUBSET-INTRINSIC-BSWAP: the slot reaches this form from TWO
 // sources, and the ENCODER treats them identically — `wireSlot`
-// (x86_variable.cpp:211-244) fills `opcodePlusReg3` from either, and
-// the emit at :1122-1130 ORs it into the last opcode byte without
-// asking which one wrote it. Only THIS predicate was asymmetric:
+// (its `OpcodePlusReg` case in x86_variable.cpp) fills `opcodePlusReg3`
+// from either, and the `B8+rd` emit arm ORs it into the last opcode
+// byte without asking which one wrote it. Only THIS predicate was asymmetric:
 //   * a `resultSlot` of `opcode.reg`  — `mov r64, imm64` (B8+rd io);
 //   * a WIRE on operand 0 of `opcode.reg` — the 2-address `+rd` shape
 //     (`bswap`, 0F C8+rd), where `requires2Address` makes operand 0 BE

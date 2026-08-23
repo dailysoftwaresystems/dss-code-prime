@@ -12,6 +12,7 @@
 #include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/object_symbol_names.hpp"
 #include "link/format/string_table.hpp"
+#include "link/format/weak_definition_gate.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -3058,6 +3059,47 @@ encode(AssembledModule const&    module,
                  + ")");
         return {};
     }
+
+    // ── D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS ──
+    //    ASK THE CONFIG BEFORE SPELLING A WEAK DEFINITION.
+    //
+    // `stbForBinding` maps `SymbolBinding::Weak` to STB_WEAK — the ELF spelling
+    // of a weak definition, and the `symbol-binding` dialect. Until this gate
+    // landed it did so UNCONDITIONALLY, i.e. this walker decided a per-FORMAT
+    // fact for itself while the config key that owns that fact sat unread on
+    // two pe documents. A key the writer does not read drifts silently while
+    // reading as authoritative, which is the defect
+    // [[D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED]] exists to prevent — so
+    // the declaration and this consultation land together, never one first.
+    //
+    // ★ ONE CALL COVERS EVERY ELF FLAVOR, because it sits at `encode()` — the
+    // single entry every flavor passes through — and NOT because every flavor
+    // funnels through one binding helper. The ET_DYN route below and the
+    // ET_REL/ET_EXEC fall-through therefore share this gate rather than
+    // carrying a copy each — a gate that refuses in one arm and shrugs in
+    // another is a silent downgrade wearing a fixed bug's clothes.
+    //
+    // ⚠ THIS COMMENT PREVIOUSLY GAVE THE WRONG REASON, and the P28 step-10
+    // audit caught it: it said *"every flavor reaches `stbForBinding` through
+    // the alias pass"*. ✔MEASURED FALSE — `encodeElfExecDynamic`'s `.dynsym`
+    // export loop open-codes `binding == Weak ? STB_WEAK : STB_GLOBAL` and
+    // never calls `stbForBinding` at all. Coverage was complete anyway, by
+    // position rather than by the stated mechanism.
+    // ★ That second open-coded ternary is precisely the hazard
+    // `weak_definition_gate.hpp` cites as its own justification, so the
+    // sentence was recommending the shape it exists to eliminate. Keep the
+    // gate where it is; do not move it into a helper on the strength of a
+    // funnel that does not exist.
+    //
+    // ★ SCAN FIRST, ASK SECOND: `requireWeakDefinitionDialect` only asks the
+    // schema when the module actually carries a weak definition, so an ELF
+    // document that never meets one is not forced to answer.
+    if (!link::format::requireWeakDefinitionDialect(
+            module, fmt, WeakDefinitionDialect::SymbolBinding, "elf::encode",
+            reporter)) {
+        return {};
+    }
+
     // c150 + c151 (D-LK1-4): ET_DYN routes to the dynamic-image
     // walker UNCONDITIONALLY — both sub-shapes need `.dynamic` /
     // `.dynsym` / `.hash` even with zero extern imports (a `.so` for
@@ -3214,7 +3256,7 @@ encode(AssembledModule const&    module,
     // walker emits a loadable `.rodata` section when the module
     // carries any `AssembledData` item with `section ==
     // DataSectionKind::Rodata`. Mirrors the PE walker's `.rdata` arm
-    // (pe.cpp:655-714) precisely: per-item bytes are placed at the
+    // (the `.rdata` build in `pe.cpp`) precisely: per-item bytes are placed at the
     // item's `Alignment` (padding zero-filled); the section's VA is
     // computed contiguously after `.text`. This rodata is folded
     // into the SAME R+X `.text` PT_LOAD (SHF_ALLOC only — strictly

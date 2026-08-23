@@ -49,6 +49,22 @@ namespace {
 
 char const* const kMachOBlocks[] = { "macho", "image" };
 
+// D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS. The weak-
+// definition spellings THIS backend's walker writes. One row: `macho.cpp`
+// spells a weak definition as the N_WEAK_DEF (0x0080) flag bit in `n_desc`,
+// alongside an ordinary N_SECT|N_EXT binding — never as a binding value of its
+// own, which is what separates `symbol-flag` from ELF's `symbol-binding`.
+//
+// ⚠ THIS IS THE WALKER'S CAPABILITY, NOT EVERY MACH-O DOCUMENT'S. Only the
+// MH_OBJECT arm encodes one; the image arms REFUSE a weak definition outright
+// (`refuseWeakImageAlias` — N_WEAK_DEF on an image needs MH_WEAK_DEFINES in
+// the mach header, D-LK3-DYLIB-WEAK-EXPORT), which is why the exec/dylib
+// documents declare no dialect at all. Per-format declaration is the schema's
+// question; this answers only "can this walker spell it".
+constexpr WeakDefinitionDialect kMachOWeakDialects[] = {
+    WeakDefinitionDialect::SymbolFlag,
+};
+
 class MachOBackend final : public ObjectFormatBackend {
 public:
     [[nodiscard]] std::string_view configName() const noexcept override {
@@ -70,6 +86,10 @@ public:
         // it lands WITH its walker arm, never before it, or a Mach-O schema
         // could declare a reserve that is silently dropped at emit.
         return {};
+    }
+    [[nodiscard]] std::span<WeakDefinitionDialect const>
+    weakDefinitionDialects() const noexcept override {
+        return kMachOWeakDialects;
     }
 
     [[nodiscard]] bool

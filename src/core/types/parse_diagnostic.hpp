@@ -227,7 +227,7 @@ enum class DiagnosticCode : std::uint16_t {
     //       #ifndef __has_include
     //       #define __has_include(x) 0
     //       #endif
-    //   (Apple SDK `sys/cdefs.h:91`, glibc, musl, ...) is now DEAD code on DSS
+    //   (Apple SDK `sys/cdefs.h`, glibc, musl, ...) is now DEAD code on DSS
     //   — `#ifndef __has_include` is false because the operator IS defined — so
     //   the `#define` inside it never executes and this code never fires for
     //   it. MEASURED: zero occurrences of an UNGUARDED `#define`/`#undef` of
@@ -1392,7 +1392,7 @@ enum class DiagnosticCode : std::uint16_t {
     // ★ WHY PARSE-THEN-REFUSE RATHER THAN LEAVE IT A PARSE ERROR. Before P1 the
     // grammar's `asmStmt` ended at `)`, so the first `:` produced P_UnexpectedToken
     // and the parser never recovered — MEASURED 53 diagnostics for the ONE `rdtsc`
-    // statement in sqlite's `src/hwtime.h:43`. A construct the compiler cannot
+    // statement in sqlite's `src/hwtime.h`. A construct the compiler cannot
     // support should cost exactly one message that says so, not a cascade that
     // buries every real error after it in the file.
     //
@@ -2234,7 +2234,7 @@ enum class DiagnosticCode : std::uint16_t {
     //         `macho`, a DECLARED field, never a format-NAME parse;
     //     (2) `dependency.artifactProfile ∈ F.artifactProfiles()`;
     //     (3) `crossValidateTargetFormat(target, F)` passes — the EXISTING
-    //         validator (`program/cross_validate_target_format.hpp:52`:
+    //         validator (`crossValidateTargetFormat`:
     //         machine identity + ABI model), not a parallel one minted here.
     //   This code is the ZERO-candidate outcome; 0xD023 is the two-or-more
     //   outcome. The prose must name all three coordinates the search ran over
@@ -2251,8 +2251,10 @@ enum class DiagnosticCode : std::uint16_t {
     //   object-format served-profile sets are pairwise DISJOINT (`cli` 7
     //   formats, `lib` 5, `staticlib` 5, and 7 serve none, over all 24
     //   `src/dss-config/object-formats/*.format.json`), and
-    //   `program.cpp:2053-2064` enforces `profile ∈ format.artifactProfiles()`
-    //   on EVERY `targets[]` entry. So a `cli` consumer's specs are always
+    //   `program.cpp`'s AP3 driver gate (`artifactProfileSupported` +
+    //   `enforceArtifactProfileFormat`) enforces
+    //   `profile ∈ format.artifactProfiles()` on EVERY `targets[]` entry.
+    //   So a `cli` consumer's specs are always
     //   `…-exec` / `…-pie` and a `staticlib` dependency's are always
     //   `…-staticlib`: the two lists can never share a string, and the superset
     //   rule would have rejected EVERY legitimate ArtifactLink edge — a dead
@@ -2286,12 +2288,12 @@ enum class DiagnosticCode : std::uint16_t {
     //
     //   ★ EMIT-SITE OBLIGATION, because clause (3) is a REPORTER and not a
     //   predicate. `crossValidateTargetFormat` emits
-    //   `D_TargetMachineCodeMismatch` / `D_TargetAbiModelMismatch`
-    //   (`cross_validate_target_format.cpp:63,126`) on the failing path. Used
+    //   `D_TargetMachineCodeMismatch` / `D_TargetAbiModelMismatch` from
+    //   `cross_validate_target_format.cpp` on the failing path. Used
     //   as a candidate FILTER it is deliberately run against candidates
     //   EXPECTED to fail — every other arch's format of the same kind — so the
     //   probe MUST run on a throwaway reporter (the `DiagnosticReporter
-    //   scratch{…}` pattern already in use at `program.cpp:1752`), with only
+    //   scratch{…}` pattern already in use in `program.cpp`), with only
     //   the final verdict reported. Otherwise an ordinary single-arch build
     //   emits a mismatch line per rejected candidate and this code arrives
     //   buried in noise it manufactured itself.
@@ -2339,8 +2341,9 @@ enum class DiagnosticCode : std::uint16_t {
     //   `artifactProfiles: ["cli"]` and the same `machine` — so the triple
     //   (elf, cli, x86_64) genuinely has two answers. It never reaches this
     //   derivation only because `cli` is `DependencyComposition::NotConsumable`
-    //   (`artifact_profile.hpp:98`) and 0xD01B rejects it first. The ORDER of
-    //   those two gates is therefore a correctness dependency, not a
+    //   (its `kRegisteredArtifactProfiles` row) and 0xD01B rejects it first.
+    //   The ORDER of those two gates is therefore a correctness dependency,
+    //   not a
     //   convenience: run the derivation before the consumability gate and this
     //   code becomes reachable, with a real ambiguity, for the commonest
     //   profile in the repo. Whoever reorders them owns that.
@@ -3756,7 +3759,8 @@ enum class DiagnosticCode : std::uint16_t {
     //   deliberately enforce the SAME rules under the SAME code: the MIR
     //   whole-program merge (`mir_merge.cpp` — the LIVE route: `--compile a.c
     //   b.c` and every `--project` build) and the assembled-tier fold
-    //   (`link/linker.cpp:568`, reached via `--resolve-library`).
+    //   (`mergeModules`' D-LK11-EXTERN-IMPORT-DEDUP fold in `link/linker.cpp`,
+    //   reached via `--resolve-library`).
     //   ⚠ A DIVERGENCE BETWEEN THE TWO TIERS IS A DEFECT, NOT A DESIGN CHOICE.
     //   Until TF-C119 the MIR tier keyed on `mangledName` ALONE — folding
     //   across `libraryPath` AND `version` (the c156 D-LK-ELF-SYMBOL-VERSIONING
@@ -3833,11 +3837,12 @@ enum class DiagnosticCode : std::uint16_t {
     //   ★ HOW A MODULE GETS HERE (INFERRED — from the call graph; this is the
     //   only route found, not a proof that no other exists):
     //   `injectEntryTrampoline` sets `module.imageEntryOverride = 0` as the last
-    //   act of every SUCCESSFUL injection (`link/entry_trampoline.cpp:732` — the
-    //   FILE'S ONLY assignment to that field, so grep it if the line has
-    //   drifted; a comment here cited `:708` for a while, which is a line about
-    //   `expectedFuncCount`. The one early return below the prepend rolls the
-    //   prepend back and returns false, so a module that got a trampoline ALWAYS
+    //   act of every SUCCESSFUL injection (in `link/entry_trampoline.cpp` — the
+    //   FILE'S ONLY assignment to that field, which is why it is named and not
+    //   numbered: this sentence carried a line number TWICE, and ✔RE-MEASURED
+    //   2026-08-23 BOTH had drifted onto unrelated `expectedFuncCount` code by
+    //   the time anyone re-read them. The one early return below the prepend
+    //   rolls it back and returns false, so a module that got a trampoline ALWAYS
     //   carries the override), and `resolveEntryFnIdx` honors it before it can
     //   reach this arm. So an un-trampolined module AT THE WALKER means
     //   `{elf,macho,pe}::encode` was driven DIRECTLY, bypassing `linker::link`.
@@ -3861,9 +3866,10 @@ enum class DiagnosticCode : std::uint16_t {
     //   mechanism; the program runs off the end of `main` into whatever bytes
     //   follow it.
     //   ★ A WALKER-TIER DUPLICATE OF A LINKER-TIER CHECK IS DELIBERATE, NOT
-    //   REDUNDANT. The precedent is recorded in prose at `link/linker.cpp:769-773`
-    //   (the image-request gate): the first cut split the CAPABILITY and BOUNDS
-    //   checks between the linker gate and the walker, and a direct `pe::encode`
+    //   REDUNDANT. The precedent is recorded in prose at `linker::link`'s
+    //   per-PROGRAM image-request gate (`enforceImageRequest`): the first cut
+    //   split the CAPABILITY and BOUNDS checks between the linker gate and the
+    //   walker, and a direct `pe::encode`
     //   call then wrote an out-of-range stack reserve AND REPORTED SUCCESS. Here
     //   the case is stronger still -- `linker::link`'s `needsTrampoline` gate
     //   CANNOT see this fault (the fault is precisely that `link` was never

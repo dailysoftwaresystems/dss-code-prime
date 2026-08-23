@@ -152,14 +152,32 @@ public:
     // off the synthesized buffer back onto the real header/main file via its
     // line-map: `fn` inspects the buffer id and, when it is the synth buffer,
     // overwrites both the buffer id and the span with the resolved origin.
-    // `fn` is invoked once per diagnostic with mutable references; a no-op
+    // `fn` is invoked once per LOCATION with mutable references; a no-op
     // `fn` (or one that leaves non-synth diagnostics untouched) is harmless.
     // Only `buffer`/`span` are mutable -- code/severity/message are
     // unchanged. The recent-duplicate hash window is NOT rebuilt (it tracks
     // already-admitted diagnostics; remap runs after admission).
+    //
+    // ★★ EVERY LOCATION MEANS EVERY LOCATION -- THE PRIMARY *AND* EACH
+    // `related` ENTRY. A `RelatedLocation` is a (buffer, span) pair of the
+    // SAME diagnostic ("previously declared here"), minted from the same tree
+    // and therefore in the same coordinate system as the primary; a remap that
+    // moved only the primary left the note behind in coordinates the primary no
+    // longer uses. ✔MEASURED through the CLI before this was added
+    // ([[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]]): a redeclaration whose
+    // FIRST declaration lives in an `#include`d header rendered its primary at
+    // the main file and its `note:` at the main file TOO -- naming a line of
+    // main.c that holds different text, because the note's real home is the
+    // header. The primary-only loop is why: it was never a policy that notes
+    // keep synth coordinates, it was an omission that nothing could see.
+    // Symmetric by construction now -- one `fn`, applied to both, so no future
+    // caller can fix one half and not the other.
     template <class F>
     void remapBuffers(F&& fn) {
-        for (ParseDiagnostic& d : all_) fn(d.buffer, d.span);
+        for (ParseDiagnostic& d : all_) {
+            fn(d.buffer, d.span);
+            for (RelatedLocation& r : d.related) fn(r.buffer, r.span);
+        }
     }
 
     // ★★★ RE-ANCHOR A RANGE OF ALREADY-ADMITTED DIAGNOSTICS ONTO A NEW PRIMARY

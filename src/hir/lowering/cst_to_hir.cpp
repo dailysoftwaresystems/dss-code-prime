@@ -4373,7 +4373,7 @@ struct Lowerer {
         // so it is a true pointer DIFFERENCE `p - q` (ptrdiff_t), not the p±n
         // index path. c59 deferred this (its array-decay fires only when the
         // OTHER operand is a SCALAR index; here the other is a Ptr or Array).
-        // sqlite vdbeSorter `(u8)(pTask - pSorter->aTask)` (sqlite3.c:107252) —
+        // sqlite vdbeSorter `(u8)(pTask - pSorter->aTask)` (sqlite3.c) —
         // without it the un-decayed Array RHS made ptrIntArith true → the MIR
         // `p±n` branch tried to widen the Array index via mapCast(Array,I64) →
         // MirOpcode::Invalid → an addInst ABORT (a compiler crash). Covers
@@ -4387,7 +4387,7 @@ struct Lowerer {
             // Decay ONLY when the element/pointee types MATCH (a true pointer
             // difference). A MISMATCHED pairing (`int* - char[]`, which gcc
             // rejects) is left UN-decayed → it stays an Array index → the MIR p±n
-            // widen hits the c65 fail-loud guard (hir_to_mir.cpp:1208), so it
+            // widen hits the c65 fail-loud guard in `hir_to_mir.cpp`, so it
             // fails LOUD (a clean diagnostic) rather than silently miscomputing
             // the array's address as an index — WITHOUT this match-guard the
             // decayed-but-mismatched `int* - char*` is non-ptrSub → it slips into
@@ -4426,7 +4426,7 @@ struct Lowerer {
         // → the BinaryOp mis-typed as the array → a downstream `*(array+i)` Deref came
         // out TYPELESS (H0001 Deref-unresolved + H0009 lvalue-classify on the
         // assignment-LHS form — sqlite `AtomicStore(aReadMark+i,…)`). Reuses the SAME
-        // coerce array-decay as the cast path (cst_to_hir.cpp:4299). GUARD: decay an
+        // coerce array-decay as the usual-arithmetic-conversions arm above. GUARD: decay an
         // array ONLY when the OTHER operand is a scalar index (non-Array AND non-Ptr)
         // — so `array - array` / `p - arrayName` stay on the deferred pointer-DIFF
         // path (D-CSUBSET-POINTER-DIFF-EDGE-CASES) and `array + ptr` (no C meaning) is
@@ -5794,6 +5794,24 @@ struct Lowerer {
                                     // register. No class to record, and recording a
                                     // default one would claim a register binding
                                     // this constraint never asked for.
+                                    // ★★★ BUT THE FORM **IS** A RESOLUTION AND IS
+                                    // CARRIED AS ONE. This arm used to be a bare
+                                    // `break`, which left a DECLARED letter looking
+                                    // exactly like an UNDECLARED one to every tier
+                                    // below — and the tier that refuses said so, in
+                                    // those words, about a letter the target
+                                    // declares (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED).
+                                    // ⚠ GUARDED ON `has_value()` LIKE ITS TWO
+                                    // SIBLINGS, and here the guard is not
+                                    // ceremonial: `OperandKindFilter::Reg` is 0, so
+                                    // an unguarded copy of a disengaged payload
+                                    // would publish "binds a register form" as a
+                                    // measurement.
+                                    if (c->operandKind.has_value()) {
+                                        rec.operandKindResolved = true;
+                                        rec.operandKind = static_cast<std::uint8_t>(
+                                            *c->operandKind);
+                                    }
                                     break;
                             }
                         }

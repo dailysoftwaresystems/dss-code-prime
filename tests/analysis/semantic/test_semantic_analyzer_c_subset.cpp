@@ -1331,7 +1331,7 @@ TEST(SemanticAnalyzerCSubset, PtrInitAddressOfAndPointerVarRejectIdentically) {
 // which would have incorrectly matched binary-arithmetic operator
 // tokens (MinusOp/PlusOp/StarOp/BitAndOp are registered for BOTH
 // Prefix and Infix arities at the SAME SchemaTokenId in
-// c-subset.lang.json:128). The position-based fix only fires when
+// c-subset.lang.json). The position-based fix only fires when
 // the FIRST visible child is a prefix-capable token — distinguishing
 // `-x` (first-position) from `a-b` (first-position is `a`). This
 // pin asserts S_TypeMismatch STILL fires on `f(1+1)` where `f`
@@ -1697,7 +1697,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeof1ArgFolds) {
 
 // ── TF-C101 — two INDEPENDENT C11 gaps that compose in Tcl 9.0's tclDecls.h ──
 //
-// The witness is `tclDecls.h:4046`'s TCLBOOLWARNING, which writes
+// The witness is `tclDecls.h`'s TCLBOOLWARNING, which writes
 //   `(void)(sizeof(struct {_Static_assert(sizeof(*(boolPtr)) <= sizeof(int), "…");
 //                          int dummy;}))`
 // and needs BOTH of these, each legal C11 on its own and each previously a hard
@@ -1865,7 +1865,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertStructMemberMintsNoField) {
         << "the real fields around the assertions must still resolve";
 }
 
-// (i)+(ii) COMPOSED — the literal tclDecls.h:4046 TCLBOOLWARNING shape, in both
+// (i)+(ii) COMPOSED — the literal tclDecls.h TCLBOOLWARNING shape, in both
 // polarities. `int *boolPtr` ⇒ 4 <= 4 holds; the false twin uses `long long *`
 // ⇒ 8 <= 4, which is exactly the misuse the real macro exists to catch.
 TEST(SemanticAnalyzerCSubset, TclBoolWarningComposedFormHolds) {
@@ -7276,7 +7276,7 @@ constexpr DeclKindAxis kDeclKindAxes[] = {
 // AXIS × FUNCTION — every one of the four must stay SILENT where the attribute
 // genuinely applies. This is the anti-over-broad half, and it is what a gate written
 // as "warn whenever the flag is dropped" would fail: the function position is the one
-// sqlite actually uses (`wal.c:942`, `:2590`).
+// sqlite actually uses (`wal.c`'s `walIndexWriteHdr` / `walIndexTryHdr`).
 TEST(SemanticAnalyzerCSubset, AttributeDeclKindMatrixFunctionPositionStaysSilent) {
     for (auto const& ax : kDeclKindAxes) {
         SCOPED_TRACE(ax.attr);
@@ -8143,8 +8143,8 @@ TEST(SemanticAnalyzerCSubset, RepeatTypedefSameTypeIsAccepted) {
 
 // (2) THE REGRESSION WITNESS — the real macOS SDK shape, and the reason this rule
 // had to close for the arm64-macho sqlite leg to reach zero. Two DIFFERENT headers
-// typedef ONE tag: `$SDK/usr/include/malloc/_malloc_type.h:79` names the
-// forward-declared `struct _malloc_zone_t`, then `malloc/malloc.h:246` typedefs the
+// typedef ONE tag: `$SDK/usr/include/malloc/_malloc_type.h` names the
+// forward-declared `struct _malloc_zone_t`, then `malloc/malloc.h` typedefs the
 // SAME tag AT ITS COMPLETION (`typedef struct _malloc_zone_t { … } malloc_zone_t;`).
 // After the preprocessor flattens the TU they are two same-scope typedefs of one
 // name — MEASURED in sqlite's mem1.c, and MEASURED again here by extracting the two
@@ -8685,7 +8685,7 @@ TEST(SemanticAnalyzerCSubset, MultiMemberSingleVsCommaByteIdentical) {
     EXPECT_FALSE(ti.fieldBitWidth(b, 0).has_value());
 }
 
-// (e) The sqlite3.c:15516 frontier shape, made buildable: a multi-declarator
+// (e) The sqlite3.c frontier shape, made buildable: a multi-declarator
 // pointer PAIR (`*next, *prev`) sharing one head tag + a `void *data` + a
 // trailing `int count`. (sqlite's HashElem points at ITSELF -- `struct HashElem
 // *next`; an inline SELF-referential struct-tag pointer is a SEPARATE pre-
@@ -9326,7 +9326,7 @@ TEST(SemanticAnalyzerCSubset, C25UndefinedEnumTagFailsLoudUnknownType) {
 // ─────────────────────────────────────────────────────────────────────────
 // c28 D-CSUBSET-LOCAL-TYPE-DEFINITION: a BLOCK-SCOPED struct/union/enum
 // DEFINITION with NO declarator (`struct S { int a; };` as a STATEMENT inside
-// a function — sqlite3.c:68508 walMergesort). The varDecl init-declarator-list
+// a function — sqlite3.c walMergesort). The varDecl init-declarator-list
 // became OPTIONAL (mirroring topLevelDecl), so the unified c25 structSpec
 // defines the type in the ENCLOSING BLOCK scope; a later `struct S v;` resolves
 // it. These pins assert the NODE SHAPE (a `varDecl` holding a `structSpec` with
@@ -9544,7 +9544,7 @@ TEST(SemanticAnalyzerCSubset, C28OrdinaryLocalDeclsUnaffected) {
 
 // ─────────────────────────────────────────────────────────────────────────
 // c30 D-CSUBSET-LOCAL-TYPEDEF: a BLOCK-SCOPED `typedef` as a STATEMENT inside a
-// function (sqlite3.c:187603 `typedef void(*LOGFUNC_t)(void*,int,const char*);`).
+// function (sqlite3.c `typedef void(*LOGFUNC_t)(void*,int,const char*);`).
 // `typedefDecl` is now a `statement` alternative; the alias binds into the
 // enclosing BLOCK scope (Ordinary namespace) and resolves there — the whole
 // typedef-name machinery (Pass-1 bind, the resolver's scope walk, the parse-time
@@ -9601,7 +9601,7 @@ TEST(SemanticAnalyzerCSubset, C30LocalTypedefNodeShapeAndType) {
         << "the pointee is the function type int(int)";
 }
 
-// (c30b) The exact sqlite3.c:187603 frontier shape: a block-scoped fn-ptr typedef
+// (c30b) The exact sqlite3.c frontier shape: a block-scoped fn-ptr typedef
 // with a void return + (void*,int,const char*) params, then a local var of that
 // type. Must be clean (no S_UnknownType for the in-block typedef-name use).
 TEST(SemanticAnalyzerCSubset, C30LocalTypedefFrontierShape) {
@@ -11725,7 +11725,7 @@ TEST(SemanticAnalyzerCSubset, ThreadLocalInvalidCombinationsFailLoud) {
 // is a MISMATCH (`Ptr<int[5]>` vs `array(vlaArray(int),2)`; int[5] != int[n]) and must
 // REJECT with S_TypeMismatch, never silently decay-accept. Forward-guard for the deferred
 // init form (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING): whatever makes `= b` work must NOT
-// weaken this exact-row compare. RED-ON-DISABLE: broaden the type_rules.hpp:371 decay
+// weaken this exact-row compare. RED-ON-DISABLE: broaden the array-to-pointer decay
 // branch to ignore the element type → this stops firing.
 TEST(SemanticAnalyzerCSubset, PtrToVlaFixedPointeeFromVlaObjectRejects) {
     auto model = analyzeShipped("c-subset", {
@@ -12948,7 +12948,7 @@ TEST(SemanticAnalyzerCSubset, GnuAlignedTypedefWeakerThanNaturalIsSilent) {
 
 // ARM 3 — ★ layout params ABSENT ⇒ STAY SILENT. This deliberately diverges from
 // the alignas precedent (which fails loud when it cannot compute an alignment).
-// `src/lsp/lsp_server.cpp:429` calls `dss::analyze(cu, DiagnosticBudget::libraryDefault())` with NO layout params, so
+// `src/lsp/lsp_server.cpp` calls `dss::analyze(cu, DiagnosticBudget::libraryDefault())` with NO layout params, so
 // failing loud here would put a red squiggle under every real SDK typedef in the
 // editor while the same source compiles clean from the CLI.
 // CANNOT-DETERMINE MUST NOT BECOME CANNOT-COMPILE.
@@ -13713,7 +13713,7 @@ TEST(SemanticAnalyzerCSubset, AsmLabelOnStaticLocalIsHonored) {
 
 // ── D-CSUBSET-TYPEDEF-MULTI-DECLARATOR ──────────────────────────────────────
 
-// THE corpus witness, verbatim from the macOS SDK (`mach/vm_types.h:87`).
+// THE corpus witness, verbatim from the macOS SDK (`mach/vm_types.h`).
 // Asserting all THREE aliases resolve to the SAME type is what catches the
 // "lowered only the first declarator" implementation — which compiles clean and
 // leaves aliases 2..N undeclared, so a `vm_map_read_t x;` later reads as an
@@ -13725,7 +13725,7 @@ TEST(SemanticAnalyzerCSubset, TypedefMultiDeclaratorBindsEveryAlias) {
         "vm_map_t a; vm_map_read_t b; vm_map_inspect_t c;\n"
         "int main(void) { return (int)(a + b + c); }\n",
     });
-    EXPECT_FALSE(m.diagnostics().hasErrors()) << "SDK mach/vm_types.h:87";
+    EXPECT_FALSE(m.diagnostics().hasErrors()) << "SDK mach/vm_types.h";
     auto const* base = findSymbolNamed(m, "mach_port_t");
     ASSERT_NE(base, nullptr);
     for (char const* alias : {"vm_map_t", "vm_map_read_t", "vm_map_inspect_t"}) {
@@ -13977,7 +13977,7 @@ TEST(SemanticAnalyzerCSubset, TFC89UnresolvableTypeNameStillFailsLoud) {
 // Pass-1.5 bind → S0018 S_InvalidFunctionDeclarator ("function prototype
 // declarations are not supported here"). MEASURED as 6 of sqlite's arm64/macho
 // residuals, all in `src/mem1.c`, all through Darwin's FUNCTION typedefs
-// ($SDK/usr/include/malloc/malloc.h:537,546,550 — `memory_reader_t`,
+// ($SDK/usr/include/malloc/malloc.h — `memory_reader_t`,
 // `vm_range_recorder_t`, `print_task_printer_t` are function, NOT
 // function-pointer, typedefs, used bare as parameters).
 //
@@ -14284,7 +14284,7 @@ TEST(SemanticAnalyzerCSubset, SameNamedInlineFunctionTypedParamsDoNotCollide) {
 // THE INSTRUMENT, not a feature: S0029 used to print the author's string and
 // nothing else. MEASURED on sqlite's `src/mem1.c`, its three S0029 all come
 // from ONE macro (`xnu_static_assert_struct_size`, $SDK/usr/include/mach/
-// port.h:100) instantiated ~25× in `mach/message.h`, so all three shared one
+// port.h) instantiated ~25× in `mach/message.h`, so all three shared one
 // span, one condition source text and one author string — three literally
 // indistinguishable errors. Appending the condition's SOURCE TEXT would have
 // produced three byte-identical strings; only the FOLDED VALUES discriminate.
@@ -14412,7 +14412,7 @@ TEST(SemanticAnalyzerCSubset, StaticAssertNonConstantOperandRendersAsNonConstant
 //
 // "If the size is not present, the array type is an incomplete type." A typedef
 // may therefore NAME one. MEASURED as sqlite's blocker:
-// $SDK/usr/include/mach/vm_region.h:355 `#define VM_PAGE_INFO_MAX` is an EMPTY
+// $SDK/usr/include/mach/vm_region.h `#define VM_PAGE_INFO_MAX` is an EMPTY
 // object-like macro, so `:357` `typedef int vm_page_info_data_t[VM_PAGE_INFO_MAX];`
 // expands to `typedef int vm_page_info_data_t[];` and was S000B.
 //
@@ -14474,7 +14474,7 @@ TEST(SemanticAnalyzerCSubset, EmptyMacroArrayBoundTypedefMatchesTheSdkSpelling) 
     });
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 0u)
-        << "the shipped mach/vm_region.h:357 spelling must compile";
+        << "the shipped mach/vm_region.h spelling must compile";
     EXPECT_FALSE(model.hasErrors());
     auto const* t = findSym(model, "vm_page_info_data_t");
     ASSERT_NE(t, nullptr);
@@ -14593,7 +14593,7 @@ TEST(SemanticAnalyzerCSubset, ExternIncompleteArrayTypedefObjectStaysLegal) {
 // ── D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18) ────────────────────────────
 //
 // MEASURED: `uint64_t ns_threadids[0];` — the last member of `struct
-// netfs_status`, $SDK/usr/include/sys/mount.h:366, reached by sqlite — was
+// netfs_status`, $SDK/usr/include/sys/mount.h, reached by sqlite — was
 // S000C S_ArrayLengthOutOfRange from the `*len <= 0` reject.
 //
 // ★ ONE MECHANISM, per the registry row's instruction to look for the shared
@@ -14794,7 +14794,7 @@ TEST(SemanticAnalyzerCSubset, ZeroLengthBoundInATypedefStillFailsLoud) {
 // ── TF-C97 (D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY): ONE file-scope TAG, ──
 // ── ONE TYPE — across the descriptor / source boundary (C 6.2.3)            ──
 //
-// The sqlite `os_unix.c:7731` shape, and the LAST error on the arm64-macho leg:
+// The sqlite `os_unix.c` shape, and the LAST error on the arm64-macho leg:
 //     struct timespec conchModTime;          /* :7711 */
 //     conchModTime = buf.st_mtimespec;       /* :7731 → error[S0003] */
 //
@@ -15071,9 +15071,9 @@ TEST(SemanticAnalyzerCSubset, CrossOriginTagStaysDistinctOnLlp64) {
 // TF-C94 (D-CSUBSET-GNU-ATTRIBUTE): the LEADING struct/union member attribute
 // position, and the `noreturn` sink that makes opening it safe.
 //
-// THE WITNESS: Tcl 9.0's `TclStubs` (tclDecls.h:1893/:2024/:2185) writes
+// THE WITNESS: Tcl 9.0's `TclStubs` (tclDecls.h) writes
 //   TCL_NORETURN1 void (*tcl_Panic) (const char *format, ...) …;
-// where tcl.h:116 expands TCL_NORETURN1 to `__attribute__ ((__noreturn__))`.
+// where tcl.h expands TCL_NORETURN1 to `__attribute__ ((__noreturn__))`.
 // Before this cycle the shape was `error[P0009] … got '__attribute__'`.
 //
 // ★★ WHY THESE TESTS ASSERT A FLAG AND NOT "no error". Opening an attribute
@@ -15919,7 +15919,7 @@ TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingReachesInlineAsmQualifierSlot) 
                        "this qualifier spelling";
     }
     // ★★★ THE RESIDUE IS GONE, AND THAT IS THE HEADLINE OF INLINE-ASM P5.
-    // This block used to assert that sqlite's `src/hwtime.h:43` shape still
+    // This block used to assert that sqlite's `src/hwtime.h` shape still
     // failed loud, on the grounds that accepting an operand list without
     // BINDING it would be a miscompile. That reasoning was right and it is now
     // satisfied the other way: P5 CAPTURES both operands — constraint,
@@ -15939,7 +15939,7 @@ TEST(SemanticAnalyzerCSubset, GnuVolatileSpellingReachesInlineAsmQualifierSlot) 
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InlineAsmExtendedUnsupported), 0u)
-        << "sqlite's `src/hwtime.h:43` shape is what P5 exists to compile";
+        << "sqlite's `src/hwtime.h` shape is what P5 exists to compile";
     EXPECT_EQ(model.diagnostics().all().size(), 0u)
         << "and it must cost NO messages at all — no cascade, no residual "
            "refusal, no second opinion about the same statement";
@@ -16020,7 +16020,7 @@ TEST(SemanticAnalyzerCSubset, InlineAsmExtendedRefusalCostsOneDiagnosticAndParse
 
     // (b) ⚠⚠ THE VERDICT FLIPPED IN INLINE-ASM P5 AND THE TEST FLIPPED WITH IT.
     // This used to assert exactly ONE S_InlineAsmExtendedUnsupported. `rdtsc`
-    // with `"=a"(lo), "=d"(hi)` is sqlite's own `src/hwtime.h:43` and is the
+    // with `"=a"(lo), "=d"(hi)` is sqlite's own `src/hwtime.h` and is the
     // arc's exit criterion — P5 CAPTURES it (both operands, both value
     // expressions, into the HIR descriptor) instead of refusing it, so ZERO
     // diagnostics is now the correct answer.

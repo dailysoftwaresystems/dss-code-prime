@@ -1,9 +1,12 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/enum_name_table.hpp"  // EnumNameTable (kImportStrategyTable)
 
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace dss {
@@ -30,6 +33,30 @@ namespace dss {
 // time (`C_UnknownShape` / `C_UnknownToken`), so a loaded schema is guaranteed
 // resolvable; the resolver's `.find()`-miss tolerance is defensive only.
 enum class ImportStrategy : std::uint8_t { None, IncludeFollowing, NameMatching };
+
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN) ──
+//
+// `imports.strategy`. Unlike the other sentinel-bearing vocabularies in this
+// class, `None` IS declarable here — `"none"` is a legal strategy meaning "this
+// language has no import mechanism" — so there is no `namesWhere` subset and the
+// whole table is the accepted set. Previously an inline
+// `strategyStr == "none" / "include-following" / "name-matching"` chain in the
+// grammar loader, with the triple retyped in TWO sentences beside it.
+inline constexpr EnumNameTable<ImportStrategy, 3> kImportStrategyTable{{{
+    { ImportStrategy::None,             "none"              },
+    { ImportStrategy::IncludeFollowing, "include-following" },
+    { ImportStrategy::NameMatching,     "name-matching"     },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kImportStrategyTable);
+
+[[nodiscard]] constexpr std::string_view
+importStrategyName(ImportStrategy s) noexcept {
+    return kImportStrategyTable.name(s);
+}
+[[nodiscard]] constexpr std::optional<ImportStrategy>
+importStrategyFromName(std::string_view s) noexcept {
+    return kImportStrategyTable.fromName(s);
+}
 
 struct DSS_EXPORT ImportConfig {
     ImportStrategy strategy = ImportStrategy::None;

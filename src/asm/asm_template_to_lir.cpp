@@ -1025,6 +1025,100 @@ struct AsmInstructionLowering::Impl {
         case AsmRegisterLookup::Resolved:
             break;
         }
+
+        // ★★★ A MEMORY-BOUND PLACEHOLDER DENOTES THE **MEMORY AT** THE
+        // REGISTER, NOT THE REGISTER — AND IT REACHES THE EXISTING MEMORY PATH
+        // RATHER THAN A NEW ONE (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED).
+        //
+        // The host bound `%1` to a register holding the operand's ADDRESS and
+        // said so with `operandKind == membase`. Filling the memory fields here
+        // — base + scale + displacement, the same triple `8(%rdi)` and
+        // `[x29, #-8]` decode to — hands the operand to `appendMemory` and the
+        // `[Reg, MemBase, MemOffset]` encoding-variant guards both shipped
+        // targets already declare. ⇒ the DIALECT decides how it is PRINTED and
+        // the TARGET decides how it is ENCODED; this function decides neither,
+        // which is why `(%rdi)` and `[x0]` need no arm anywhere.
+        //
+        // ★ SCALE 1 AND DISPLACEMENT 0 ARE THE FORM'S DEFINITION, NOT A DEFAULT
+        // TO BE REVISITED: the constraint bound ONE address and nothing else. A
+        // dialect that lets a template write an offset around a placeholder
+        // (`[%1, #8]`) is the nested-placeholder shape `decodeOperand`'s own
+        // descent comment refuses today, and it would arrive through the roled
+        // memory decode, not through here.
+        //
+        // ⚠ EVERY FORM THIS ENGINE CANNOT SHAPE FAILS LOUD RATHER THAN DECAYING
+        // TO A REGISTER, and the register arm is the plausible wrong answer
+        // precisely because it always assembles. ✔MEASURED while the immediate
+        // form was unrealized: a `"i"(7)` operand that fell through to the
+        // register arm would emit the register HOLDING 7 where the template
+        // asked for the literal — same mnemonic, different instruction, no
+        // diagnostic. The immediate arm below now shapes that case; the arms
+        // after it still refuse.
+        switch (resolved.operandKind) {
+            case OperandKindFilter::Reg:
+                break;
+            case OperandKindFilter::MemBase:
+                out.role     = AsmOperandRole::Memory;
+                out.isMemory = true;
+                out.baseReg  = resolved.reg;
+                out.hasIndex = false;
+                out.scale    = 1;
+                out.disp     = 0;
+                return out;
+            // ★★★ AN IMMEDIATE-BOUND PLACEHOLDER DENOTES A **NUMBER**, AND IT
+            // REACHES THE ROLE THE DECODER ALREADY HAS
+            // (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED). `AsmOperandRole::
+            // Immediate` plus `hasValue`/`value` is exactly the shape a
+            // `.s`-written `add x0, x0, #5` decodes to, so a `"i"`-bound
+            // placeholder joins the EXISTING scalar-source path — the one that
+            // range-checks against the 32-bit LIR immediate slot and emits
+            // `LirOperand::makeImmInt32` — with no new role and no new operand
+            // kind. ⇒ the DIALECT decides how it would have been PRINTED and the
+            // TARGET decides how it is ENCODED (the `[Reg, ImmInt]` variants both
+            // shipped targets declare); this function decides neither, which is
+            // why `$7` and `7` need no arm anywhere.
+            // ⚠ THE HOST OWES THE VALUE, AND ITS ABSENCE IS A REFUSAL RATHER
+            // THAN A ZERO. `hasImmediate == false` on an immediate binding means
+            // the caller named the form and handed over nothing; encoding the
+            // default `0` would be a silent wrong answer in the one place where
+            // the operand IS its value.
+            case OperandKindFilter::ImmInt:
+                if (!resolved.hasImmediate) {
+                    sink_.fail(node,
+                         std::format("'{}' is bound to the operand form '{}', "
+                                     "but the binding carries no value — an "
+                                     "immediate operand IS its value, so there "
+                                     "is nothing here to encode{}",
+                                     written,
+                                     operandKindFilterName(
+                                         OperandKindFilter::ImmInt),
+                                     sink_.pairSuffix()));
+                    return std::nullopt;
+                }
+                out.role     = AsmOperandRole::Immediate;
+                out.hasValue = true;
+                out.value    = resolved.value;
+                out.isMemory = false;
+                out.indirect = false;
+                return out;
+            case OperandKindFilter::SymbolRef:
+            case OperandKindFilter::MemOffset:
+            case OperandKindFilter::BlockRef:
+            case OperandKindFilter::LiteralIndex:
+                sink_.fail(node,
+                     std::format("'{}' is bound to the operand form '{}', which "
+                                 "this engine does not shape — only '{}' (the "
+                                 "register itself), '{}' (the memory at the "
+                                 "register) and '{}' (a compile-time constant) "
+                                 "have a template shape{}",
+                                 written,
+                                 operandKindFilterName(resolved.operandKind),
+                                 operandKindFilterName(OperandKindFilter::Reg),
+                                 operandKindFilterName(OperandKindFilter::MemBase),
+                                 operandKindFilterName(OperandKindFilter::ImmInt),
+                                 sink_.pairSuffix()));
+                return std::nullopt;
+        }
         out.regSpelling  = std::move(written);
         out.regWidthBits = resolved.widthBits;
         out.reg          = resolved.reg;
@@ -2540,9 +2634,21 @@ public:
         // register, and letting the TARGET win there would silently ignore the
         // binding the caller asked for.
         if (auto const* b = bindingFor(spelling); b != nullptr) {
-            out.reg       = b->reg;
-            out.regClass  = b->regClass;
-            out.widthBits = b->widthBits;
+            out.reg         = b->reg;
+            out.regClass    = b->regClass;
+            out.widthBits   = b->widthBits;
+            // The form travels with the register; `decodePlaceholder` is what
+            // turns it into the dialect's memory shape. A PHYSICAL register
+            // spelling (the fallthrough below) leaves the default `Reg` — a
+            // register written in the assembly text denotes itself.
+            out.operandKind = b->operandKind;
+            // ★ AND THE IMMEDIATE PAYLOAD TRAVELS WITH IT, for the same reason:
+            // the FORM says what `%N` denotes and, for `imm32`, the value IS the
+            // operand. A physical register spelling (the fallthrough below)
+            // leaves both at their defaults — text-written registers denote
+            // themselves and no constraint letter is in play.
+            out.hasImmediate = b->hasImmediate;
+            out.value        = b->value;
             return AsmRegisterLookup::Resolved;
         }
         auto const physical =

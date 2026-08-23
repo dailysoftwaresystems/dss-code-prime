@@ -137,7 +137,8 @@ callConvFromName(std::string_view s) noexcept {
 // round-trip with no diagnostic. Pin: table size MUST cover every
 // enum value, AND each row MUST sit at the index matching its
 // enum's underlying value (also makes the lookup O(1) on a dense
-// enum). Pattern mirrors `c_mangle.cpp:42`. Anchored
+// enum). Pattern mirrors `kMangleErrorTableRowsAligned` in
+// `c_mangle.cpp`. Anchored
 // D-ENUM-NAME-TABLE-STATIC-ASSERTS for retrofit to the 5 sibling
 // tables (TargetAbiModel / TargetCondCode / TargetResultRule /
 // TargetRegClass / TargetEncodingShape) — same silent-fallback
@@ -325,8 +326,21 @@ targetRegClassFromName(std::string_view s) noexcept {
 isOperableTargetRegClass(TargetRegClass c) noexcept {
     return c != TargetRegClass::None;
 }
+// ⚠ The `4` is a LITERAL and the companion assert is the other half of the
+// guard. D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY: written
+// as `rows.size() - 1` this would be `x == x`, because `namesWhere<M>` compares
+// `M` against the rows this same table's predicate accepts. The literal reds on
+// a new OPERABLE class; the assert reds on a SECOND inoperable one, which the
+// literal alone cannot see. Both arms ✔MEASURED — the write-up is at
+// `kSelectableExitMechanismNames` below.
 inline constexpr auto kOperableTargetRegClassNames =
     namesWhere<4>(kTargetRegClassTable, isOperableTargetRegClass);
+static_assert(kTargetRegClassTable.rows.size()
+                  == kOperableTargetRegClassNames.size() + 1,
+              "kTargetRegClassTable must have exactly ONE inoperable row (the "
+              "'none' no-class value) — a second one leaves `namesWhere`'s "
+              "literal count matching while `/registerClassOps/{}/class` "
+              "silently stops naming the set its gate accepts");
 
 // Map a substrate-tier `TypeKind` to its `TargetRegClass`. Universal
 // across all register-machine targets — floats use the FPR envelope,
@@ -890,6 +904,60 @@ struct DSS_EXPORT TargetCallingConvention {
     // fully agnostically, never a per-CC-name branch.
     std::optional<VaListLayout> vaListLayout;
 };
+
+// ── THE ALLOCATABLE-POOL LISTS — ONE OWNER FOR "WHICH OF A CALLING
+//    CONVENTION'S REGISTER LISTS MAKE A REGISTER ALLOCATABLE" ─────────────
+//
+// D-TARGET-ALLOCATABLE-POOL-LIST-SET-HAS-NO-OWNER.
+//
+// The register-allocator's free lists and the rewriter's spill-reload scratch
+// pool are BOTH "the register table INTERSECTED with some of this calling
+// convention's name lists". Which lists is one fact, and until this table it
+// had TWO hand-kept owners — `lir_regalloc::buildFreeLists` and
+// `lir_rewrite::collectAllocatable` — each spelling out the same six
+// `absorb(...)` calls. ⚠ Two copies of a set is not a redundancy that shows
+// up as a build break if they drift: an allocator that thinks a register is
+// reserved while the rewriter thinks it is free scratch (or the reverse) is a
+// SILENT wrong-register answer, and nothing compares them.
+//
+// ★ WHY IT LIVES IN `core/` RATHER THAN BESIDE ITS TWO LIR CONSUMERS. It is
+// read by `TargetSchemaData::validate()` — the load-time judge — which is one
+// tier BELOW LIR and cannot include it. That placement is not a compromise: it
+// is what makes the aliased-view rule in `validate()` see the same set the
+// engine will absorb, so ADDING A LIST HERE is immediately judged against
+// every shipped target rather than silently changing what the allocator hands
+// out. Removing `argVrs` from this table is not an option a future cycle has
+// to remember — it is a list that was never in it, and putting it in is the
+// edit `validate()` refuses by name (see the aliased-view block there).
+//
+// ⚠ THE ARG/RETURN POOLS ARE HERE FOR A DIFFERENT REASON THAN `callerSaved`.
+// `callerSaved`/`calleeSaved` DECLARE allocability; the arg/return pools are
+// ABI PLACEMENT and appear here only because a register the ABI can place a
+// value in must also be one the allocator may hand out. On both shipped
+// targets they are subsets of `callerSaved`, so this table currently adds
+// nothing beyond it — which is exactly why an inconsistency here would be
+// invisible without a rule that judges the UNION.
+using TargetCcRegisterList = std::vector<std::string> TargetCallingConvention::*;
+inline constexpr std::array<TargetCcRegisterList, 6> kAllocatablePoolLists{{
+    &TargetCallingConvention::callerSaved,
+    &TargetCallingConvention::calleeSaved,
+    &TargetCallingConvention::argGprs,
+    &TargetCallingConvention::argFprs,
+    &TargetCallingConvention::returnGprs,
+    &TargetCallingConvention::returnFprs,
+}};
+// The JSON key each entry above is spelled with, in the SAME order — used by
+// the load-time diagnostic to name the list a register was found in. Kept
+// adjacent so a new entry that forgets its name fails the `static_assert`
+// below rather than reporting a register as belonging to the wrong list.
+inline constexpr std::array<std::string_view, 6> kAllocatablePoolListNames{{
+    "callerSaved", "calleeSaved", "argGprs", "argFprs", "returnGprs",
+    "returnFprs",
+}};
+static_assert(kAllocatablePoolLists.size() == kAllocatablePoolListNames.size(),
+              "every allocatable-pool list must carry the JSON key it is "
+              "spelled with — a nameless entry would be reported as another "
+              "list's");
 
 // Discriminates the byte-encoding shape an opcode commits to (plan 13
 // AS1). `None` is the default; opcodes without an `encoding` block in
@@ -2258,6 +2326,51 @@ exitMechanismFromName(std::string_view s) noexcept {
     return kExitMechanismTable.fromName(s);
 }
 
+// ── THE SELECTABLE SPELLINGS — the table MINUS the `none` sentinel ────────
+//
+// D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET: the set a
+// `.format.json` author may actually write, which every refusal that names
+// this vocabulary has to render. `processExit.mechanism` resolves the spelling
+// and then rejects `ExitMechanism::None` explicitly, so the accepted set is the
+// table minus that one row.
+//
+// ★ IT LIVES HERE, BESIDE THE ENUM, BECAUSE THE PROJECTION IS A PROPERTY OF THE
+// VOCABULARY AND NOT OF ANY READER. Before this definition the SAME projection
+// was computed in FOUR places — `link/linker.cpp` (`kDeclarableExitMechanismNames`),
+// `link/format/exec_reloc_apply.hpp`, `link/object_format_schema_json.cpp` and
+// `tests/link/test_object_format_vocabulary_projection.cpp` — each with its own
+// predicate and its own count, and two of the four counts were unable to fail.
+// See `kSelectableObjectFormatKindNames` in `core/types/object_format_kind.hpp`
+// for the same shape one vocabulary over.
+[[nodiscard]] constexpr bool isSelectableExitMechanism(ExitMechanism m) noexcept {
+    return m != ExitMechanism::None;
+}
+
+// ⚠⚠ THE COUNT IS A LITERAL AND THE COMPANION `static_assert` IS NOT DECORATION
+// — TOGETHER THEY ARE THE ONLY SPELLING THAT REDS IN BOTH DIRECTIONS.
+// D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY.
+// `namesWhere<M>` compares the rows the predicate ACCEPTS against `M`, so
+// writing `M` as `rows.size() - 1` makes both sides move together and the check
+// can never fire. ✔MEASURED with `g++ -std=c++23 -fsyntax-only` over a nine-arm
+// probe (a 3-row / 4-row-with-a-new-selectable-row / 4-row-with-a-second-
+// sentinel copy of this exact table × the derived, literal, and literal-plus-
+// assert spellings of `M`):
+//   * a NEW SELECTABLE enumerator  — derived COMPILES, literal ERRORS;
+//   * a SECOND UNSELECTABLE row    — derived ERRORS,   literal COMPILES.
+// So the literal alone does not dominate the derived form; it MOVES the blind
+// spot. The `static_assert` below closes the second direction by relating the
+// table's own row count to the projection's literal count — two numbers with
+// different owners — so a second sentinel reds here even though `namesWhere`
+// would not see it.
+inline constexpr auto kSelectableExitMechanismNames =
+    namesWhere<2>(kExitMechanismTable, isSelectableExitMechanism);
+static_assert(kExitMechanismTable.rows.size()
+                  == kSelectableExitMechanismNames.size() + 1,
+              "kExitMechanismTable must have exactly ONE unselectable row (the "
+              "'none' sentinel) — a second one leaves `namesWhere`'s literal "
+              "count matching while the projection silently stops being 'the "
+              "table minus its sentinel'");
+
 // Per-OS process-exit descriptor. Lives on `ObjectFormatData`
 // (loaded from format JSON's `processExit` block). The trampoline
 // emitter (Slice C) reads the active arm based on `mechanism`:
@@ -2381,7 +2494,7 @@ enum class ArgsMechanism : std::uint8_t {
     //     `__p___argv()` -> `char***` (ord 82),
     //     `__p___wargv()` -> `wchar_t***` (ord 83) — accessors returning the
     //     ADDRESS of the state, so each needs EXACTLY ONE dereference
-    //     (`ucrt/stdlib.h:1144-1145`, macros `:1153-1154`).
+    //     (their `ucrt/stdlib.h` declarations and the wrapper macros beside them).
     // Like CrtOutParam this needs a real call sequence, so it rides the SAME
     // MIR-tier synth-init seam (the trampoline's own arg-setup stays a no-op)
     // — the difference is entirely in the emitted body, which is why it is a
@@ -2414,6 +2527,27 @@ DSS_CHECK_ENUM_NAME_TABLE(kArgsMechanismTable);
 argsMechanismFromName(std::string_view s) noexcept {
     return kArgsMechanismTable.fromName(s);
 }
+
+// The selectable spellings — the table MINUS the `none` sentinel, which
+// `processArgs.mechanism` resolves and then rejects explicitly. Beside the enum
+// for the reason `kSelectableExitMechanismNames` states in full: the projection
+// belongs to the vocabulary, not to whichever loader renders it.
+[[nodiscard]] constexpr bool isSelectableArgsMechanism(ArgsMechanism m) noexcept {
+    return m != ArgsMechanism::None;
+}
+
+// ⚠ Literal `M` plus the sentinel-count assert, both halves required — see the
+// nine-arm measurement written out at `kSelectableExitMechanismNames`
+// (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY). A count
+// spelled `rows.size() - 1` here would be `x == x`.
+inline constexpr auto kSelectableArgsMechanismNames =
+    namesWhere<2>(kArgsMechanismTable, isSelectableArgsMechanism);
+static_assert(kArgsMechanismTable.rows.size()
+                  == kSelectableArgsMechanismNames.size() + 1,
+              "kArgsMechanismTable must have exactly ONE unselectable row (the "
+              "'none' sentinel) — a second one leaves `namesWhere`'s literal "
+              "count matching while the projection silently stops being 'the "
+              "table minus its sentinel'");
 
 // Per-OS program-entry argument descriptor. Lives on
 // `ObjectFormatData` (loaded from the format JSON's `processArgs`
@@ -2464,7 +2598,8 @@ struct DSS_EXPORT ProcessArgs {
     //     PROBE-0): one accessor serves both, so there is no
     //     `wideArgcAccessorFn`.
     //   * `argvMode` — the `_crt_argv_mode` value handed to the configure call.
-    //     The enum is `…/VC/Tools/MSVC/<ver>/include/vcruntime_startup.h:19-24`
+    //     That enum is declared in the MSVC toolset's
+    //     `…/VC/Tools/MSVC/<ver>/include/vcruntime_startup.h`
     //     (the MSVC TOOLSET header — NOT in the Windows SDK; a grep of the SDK
     //     include tree for the enumerator names returns zero hits), so the
     //     value is declared here rather than derived. MEASURED 2026-08-10 with a

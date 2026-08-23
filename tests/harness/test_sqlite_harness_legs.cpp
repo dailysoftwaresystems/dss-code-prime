@@ -4138,7 +4138,7 @@ struct Script {
 // The 1-based line number of `content` in the RAW file, or 0.
 //
 // ★ NOT the index into `liveLines`, and this is not a nicety: the first version
-// of this test reported the live index, which pointed at build-and-test.ps1:45
+// of this test reported the live index, which named line 45 of build-and-test.ps1
 // for a defect on line 373 — a diagnostic that sends the reader to an unrelated
 // line is worse than one that gives no line at all. `liveLines` hands back its
 // lines verbatim, so the raw number is recoverable by looking the text back up.

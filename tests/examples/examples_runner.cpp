@@ -1025,7 +1025,7 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
 //
 // This is the SUBDIRECTORY a project build routes its artifact into:
 // `Program::compileProject` forces `setPerFormatOutputSubdir(true)`
-// (src/program/program.cpp:1760), so a project artifact lands at
+// (src/program/program.cpp), so a project artifact lands at
 // `<outDir>/<formatName>/<name><ext>` even for a single-target build, where a
 // `--compile` build would have put it flat at `<outDir>/<name><ext>`.
 //
@@ -1917,7 +1917,7 @@ compileAndRunArm(fs::path const& exampleDir,
     }
 
     // D-AP2-OUTPUT-ROUTING: a PROJECT build forces `setPerFormatOutputSubdir(true)`
-    // (src/program/program.cpp:1760), so its artifact is at
+    // (src/program/program.cpp), so its artifact is at
     // `<outDir>/<formatName>/<name><ext>`, NOT at `<outDir>/<artifact>`.
     //
     // COMPUTED EXPLICITLY rather than absorbed into the manifest string. Writing

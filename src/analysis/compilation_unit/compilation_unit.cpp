@@ -91,7 +91,9 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                  std::vector<std::unordered_map<std::uint32_t, std::uint32_t>>
                                      pragmaPackMaps,
                                  std::vector<std::unordered_set<std::uint32_t>>
-                                     pragmaNoOptimizeSets)
+                                     pragmaNoOptimizeSets,
+                                 std::vector<PreprocessedPositionMap>
+                                     preprocessedPositionMaps)
     : id_(id)
     , schema_(std::move(schema))
     , trees_(std::move(trees))
@@ -101,7 +103,8 @@ CompilationUnit::CompilationUnit(PrivateTag,
     , typeNameReparseCount_(typeNameReparseCount)
     , auxiliaryBuffers_(std::move(auxiliaryBuffers))
     , pragmaPackMaps_(std::move(pragmaPackMaps))
-    , pragmaNoOptimizeSets_(std::move(pragmaNoOptimizeSets)) {}
+    , pragmaNoOptimizeSets_(std::move(pragmaNoOptimizeSets))
+    , preprocessedPositionMaps_(std::move(preprocessedPositionMaps)) {}
 
 CompilationUnit::~CompilationUnit()                                            = default;
 CompilationUnit::CompilationUnit(CompilationUnit&&) noexcept                   = default;
@@ -136,6 +139,51 @@ CompilationUnit::pragmaNoOptimizeFor(std::size_t treeIndex) const noexcept {
     static std::unordered_set<std::uint32_t> const kEmpty;
     if (treeIndex >= pragmaNoOptimizeSets_.size()) return kEmpty;
     return pragmaNoOptimizeSets_[treeIndex];
+}
+
+bool CompilationUnit::isSynthesizedPreprocessorBuffer(
+        BufferId buffer) const noexcept {
+    if (!buffer.valid()) return false;
+    for (PreprocessedPositionMap const& m : preprocessedPositionMaps_) {
+        if (m.synth == buffer) return true;
+    }
+    return false;
+}
+
+void CompilationUnit::remapPreprocessedPosition(BufferId&   buffer,
+                                                SourceSpan& span) const {
+    // The common case by a wide margin: a CU whose files were never
+    // preprocessed (toy / tsql / assembly, and every hand-built test CU) owns no
+    // maps at all, so the whole mechanism costs one empty-vector test.
+    if (preprocessedPositionMaps_.empty()) return;
+    // Every closure self-gates on its OWN synth buffer id, so the order is
+    // irrelevant and a position belonging to none of them is untouched. Once one
+    // closure has moved the position, the rest no longer match it.
+    for (PreprocessedPositionMap const& m : preprocessedPositionMaps_) {
+        if (m.remap) m.remap(buffer, span);
+    }
+    // ★ THE REFUSAL. Reaching here with the position STILL on a recorded synth
+    // buffer means the line-map that was recorded as covering that buffer could
+    // not resolve the offset — a compiler-internal contradiction. The
+    // alternative is to hand the user a file:line that names real text at a line
+    // it does not occupy, which is precisely the class this closes, and which
+    // survived for months exactly because it looked plausible. A named refusal
+    // cannot.
+    if (isSynthesizedPreprocessorBuffer(buffer)) {
+        cuFatal("CompilationUnit::remapPreprocessedPosition: a diagnostic "
+                "position is still in SYNTHESIZED preprocessor coordinates "
+                "after every line-map remap ran - the preprocessor recorded a "
+                "line map for this buffer, so the offset must resolve to an "
+                "origin file");
+    }
+}
+
+void CompilationUnit::remapPreprocessedPositions(
+        DiagnosticReporter& reporter) const {
+    if (preprocessedPositionMaps_.empty()) return;
+    reporter.remapBuffers([this](BufferId& b, SourceSpan& s) {
+        remapPreprocessedPosition(b, s);
+    });
 }
 
 std::string CompilationUnit::compositeSourceLanguage() const {
@@ -383,6 +431,24 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         sidecar.schema          = std::move(schema);
         sidecar.ppTokens        = std::move(pp.tokens);
         sidecar.ppRemap         = std::move(remap);
+        // [[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]]: record the SYNTH
+        // buffer so the finished CU can answer "is this position in synthesized
+        // coordinates" for EVERY later tier — the parse tier is simply the only
+        // one that used to run while this builder was still alive.
+        //
+        // Recorded ONLY when the line map can actually move a position off the
+        // synth buffer: a non-empty map, EVERY segment of which names a real
+        // origin. `LineMap::resolve` picks a segment by offset and hands back
+        // that segment's origin, so one null origin anywhere is one offset range
+        // the remap legitimately cannot move — and the CU's refusal must fire on
+        // a contradiction, never on a case the map never claimed to cover.
+        bool remapCoversEverySegment = !pp.lineMap.empty();
+        for (LineMapSegment const& seg : pp.lineMap.segments()) {
+            if (!seg.origin) { remapCoversEverySegment = false; break; }
+        }
+        if (remapCoversEverySegment) {
+            sidecar.ppSynthBuffer = sidecar.source->id();
+        }
         // TF-C82 (D-PP-PRAGMA-REGISTRY): carry the `#pragma pack` stamps to the
         // finished CU. Empty for a TU with no `#pragma pack`, which is every TU
         // that existed before this cycle.
@@ -1010,6 +1076,29 @@ CompilationUnit UnitBuilder::finish() && {
         }
     }
 
+    // ★★★ [[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]]: hand the line-map
+    // remaps to the FINISHED CU, so they outlive this builder.
+    //
+    // Everything above this line is the builder's own use of them — the parse
+    // tier's `remapDiagnostics`, the FC2 oracle reparse, the descriptor refs.
+    // Every tier BELOW (semantic, HIR, MIR, LIR, the assembly engine, the
+    // linker) re-derives its positions from the SAME trees and therefore re-mints
+    // the same synthesized coordinates; until now it had nothing to convert them
+    // with, and the mismatch was invisible because the synth buffer carries the
+    // main source's NAME. Moving the closures onto the CU is what makes the
+    // coordinate system a property of the compiled unit rather than of a builder
+    // that has already been consumed.
+    //
+    // One entry per PREPROCESSED tree, in tree order. `sidecars_` is
+    // index-parallel to `trees_` by construction; the ORDER carries no meaning
+    // here (each closure self-gates on its own synth buffer), only the SET does.
+    std::vector<PreprocessedPositionMap> preprocessedPositionMaps;
+    for (auto& sc : sidecars_) {
+        if (!sc.ppRemap) continue;
+        preprocessedPositionMaps.push_back(
+            PreprocessedPositionMap{sc.ppSynthBuffer, std::move(sc.ppRemap)});
+    }
+
     // TF-C82: flatten the per-tree `#pragma pack` stamps out of the sidecars, in
     // tree order. `sidecars_` is index-parallel to `trees_` by construction
     // (`addTree` appends exactly one sidecar), so this vector is too.
@@ -1037,6 +1126,7 @@ CompilationUnit UnitBuilder::finish() && {
         std::move(auxiliaryBuffers_),
         std::move(pragmaPackMaps),
         std::move(pragmaNoOptimizeSets),
+        std::move(preprocessedPositionMaps),
     };
 }
 

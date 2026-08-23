@@ -125,14 +125,25 @@ sectionKindFromName(std::string_view s) noexcept {
 // Narrow subset of `SectionKind` that a producer can legitimately
 // emit via `AssembledData`. Closes D-LK4-RODATA-SECTION-NARROW.
 //
-// Of the 14 `SectionKind` values, 9 are walker-synthesized
+// Of the 16 `SectionKind` values, 10 are walker-synthesized
 // (`Text` = executable code; `Symtab`/`Strtab`/`ShStrtab` = symbol
 // + name tables; `RelocTable` = relocation entries; `Dynamic` =
 // dynamic linking metadata; `Note` = vendor notes; `Debug` =
-// DWARF/CodeView; `Custom` = format-specific anything). A producer
-// constructing `AssembledData{symbol, SectionKind::Symtab, ...}`
-// is semantically nonsense — the assembler doesn't emit symbol
-// tables; the linker walker synthesizes them.
+// DWARF/CodeView; `ThreadVars` = the Mach-O tlv descriptors, minted
+// by the WRITER and never by a producer; `Custom` = format-specific
+// anything). A producer constructing
+// `AssembledData{symbol, SectionKind::Symtab, ...}` is semantically
+// nonsense — the assembler doesn't emit symbol tables; the linker
+// walker synthesizes them.
+//
+// ⚠ THOSE TWO NUMBERS READ `14` AND `9` UNTIL 2026-08-23, AND THE
+// PARENTHESIS OMITTED `ThreadVars`. They had been wrong since
+// `ThreadVars` and `RelRoConst` landed: a count hand-typed into prose
+// has no owner, so nothing moved it when the enum grew — the same
+// species of defect as the projection count below, arriving through a
+// comment instead of through a template argument. Both are now pinned
+// by the `static_assert` beside `kDataSectionKindNames`, which fails
+// the build if the 6/10 split ever moves.
 //
 // The SIX valid producer-emittable kinds:
 //   * `Rodata` — read-only initialised data (string literals,
@@ -153,7 +164,7 @@ sectionKindFromName(std::string_view s) noexcept {
 // `toSectionKind()` conversion is total — every `DataSectionKind`
 // value maps to its corresponding `SectionKind`. The reverse
 // direction is partial: `dataSectionKindOf()` returns nullopt for
-// the 9 walker-synthesized kinds.
+// the 10 walker-synthesized kinds.
 enum class DataSectionKind : std::uint8_t {
     Rodata     = static_cast<std::uint8_t>(SectionKind::Rodata),
     Data       = static_cast<std::uint8_t>(SectionKind::Data),
@@ -242,12 +253,42 @@ dataSectionKindName(DataSectionKind d) noexcept {
 // narrowed to the data subrange. What a loader's "the closed set is …" half
 // must render.
 //
-// ⚠ THE COUNT IS NOT DECORATION. `namesWhere` refuses a `M` that disagrees with
-// the number of accepted rows, at COMPILE TIME, so adding a seventh data kind
-// (or renaming one) cannot leave this list — or any diagnostic rendered from
-// it — advertising the old set.
+// ⚠ THE COUNT IS NOT DECORATION — AND IT TAKES BOTH LINES BELOW TO BE TRUE IN
+// BOTH DIRECTIONS. `namesWhere` refuses an `M` that disagrees with the number
+// of accepted rows, at COMPILE TIME, so adding a seventh DATA kind (or renaming
+// one) cannot leave this list — or any diagnostic rendered from it —
+// advertising the old set.
+//
+// ★ WHAT `namesWhere` ALONE CANNOT SEE IS THE OTHER HALF OF THE SPLIT.
+// D-CORE-NAMESWHERE-LITERAL-COUNT-IS-BLIND-TO-A-SECOND-SENTINEL: it only ever
+// compares `M` against the ACCEPTED total, so a new WALKER-SYNTHESIZED kind — a
+// row `isDataSectionKind` REJECTS — moves nothing it can observe. ✔MEASURED
+// 2026-08-23 in a worktree with `g++ -std=c++23 -fsyntax-only -I src`: a
+// seventeenth `SectionKind` row left on `dataSectionKindOf`'s `default:` arm
+// COMPILED CLEAN before the `static_assert` below existed, and the mutation
+// that DID red (a seventeenth row wired into `dataSectionKindOf`) is the one
+// this comment already claimed. The assert pins the REJECTED count instead —
+// the table's own row total against this projection's literal, two numbers with
+// DIFFERENT OWNERS, so it is not the tautology a `rows.size() - 10` spelling
+// would have been (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
+//
+// ⓘ THE SENTINEL SHAPE ONE VOCABULARY OVER: `kSelectableObjectFormatKindNames`
+// in `core/types/object_format_kind.hpp` is the same pair where the rejected
+// set is a single sentinel row. Here it is a SUBRANGE of ten, which is why the
+// constant is `10` and not the `1` every sibling site carries — it is derived
+// from THIS table, never copied from a neighbour.
 inline constexpr auto kDataSectionKindNames =
     namesWhere<6>(kSectionKindTable, isDataSectionKind);
+static_assert(kSectionKindTable.rows.size()
+                  == kDataSectionKindNames.size() + 10,
+              "kSectionKindTable must have exactly TEN rows that are NOT "
+              "producer-emittable (the walker-synthesized kinds, for which "
+              "`dataSectionKindOf` returns nullopt) — an eleventh leaves "
+              "`namesWhere`'s literal count matching while every 'the closed "
+              "set is …' message silently stops describing the split "
+              "`isDataSectionKind` actually enforces. If the new kind IS "
+              "producer-emittable, widen `DataSectionKind` + `dataSectionKindOf` "
+              "and the `namesWhere` count; if it is not, widen this constant.");
 
 // ⚠ DERIVED, NOT A SECOND IF-CHAIN. This used to spell all six names again,
 // beside `kSectionKindTable` which already owned them and beside

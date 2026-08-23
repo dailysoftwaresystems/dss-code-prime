@@ -350,7 +350,8 @@ bool injectEntryTrampoline(AssembledModule&          module,
     // fold). `maxV+1` / `maxV+2` are uint32 — at UINT32_MAX they
     // wrap silently to 0/1 (the InvalidSymbol sentinel + low-ID
     // user fns), silently colliding with declared symbols. The
-    // BOTH-defined-AND-ExternImport guard at linker.cpp:121 would
+    // BOTH-defined-AND-ExternImport guard — `buildCompoundIndex`'s
+    // duplicate-compound-key `declare()` gate in `linker.cpp` — would
     // catch the ByNameImport arm but the pure Syscall arm has no
     // cross-table check. Fail loud HERE before the wrap can
     // corrupt the module.
@@ -673,7 +674,8 @@ bool injectEntryTrampoline(AssembledModule&          module,
     // Run the synthetic Lir through `assemble()`. `lirToMir` is a
     // parallel-sized vector of sentinel `MirInstId{}` — the
     // assembler enforces `lirToMir.size() == lir.instCount()` at
-    // entry (`asm.cpp:167`), but the synthetic Lir has no MIR
+    // entry (the `A_LirToMirSizeMismatch` check in
+    // `asm.cpp`), but the synthetic Lir has no MIR
     // provenance to attribute. Anchored D-LK10-ENTRY-LIRTOMIRSENTINEL
     // (factor an `assembleHandBuilt()` wrapper at 2nd synthetic-Lir
     // caller).

@@ -758,7 +758,8 @@ TEST(BuildWindowsCommandLine, ArgumentWithATabIsQuoted) {
 TEST(BuildWindowsCommandLine, EmbeddedQuoteIsBackslashEscaped) {
     // The naive `"` + arg + `"` produces `"a"b"`, whose embedded quote CLOSES
     // the argument — everything after it re-splits into new arguments. This is
-    // half of the live defect documented at run_binary.hpp:343-349.
+    // half of the live defect documented as
+    // D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED in run_binary.hpp.
     auto const got = buildWindowsCommandLine({"a\"b"});
     EXPECT_EQ(got, std::wstring{L"\"a\\\"b\""}) << narrowForMessage(got);
 }

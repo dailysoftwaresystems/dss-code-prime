@@ -88,7 +88,8 @@ firstConfigCauseInline(std::span<ConfigDiagnostic const> diags) {
 // reporter access). D-FF2-2 fold: the struct-side mirror closes the
 // gap where LSP / test pins had to re-parse reporter prose to locate
 // the offending decl. `HirSourceLoc{}` is the documented absent
-// value (source_span.hpp:31-39) — no optional wrapper.
+// value (`HirSourceLoc` in `hir/attributes/source_span.hpp`) — no optional
+// wrapper.
 [[nodiscard]] HeaderReadError
 emitAndReturn(HeaderReadErrorKind kind, std::string detail,
               DiagnosticReporter& reporter,
@@ -325,6 +326,17 @@ readCHeaderFromText(std::string_view    text,
     // The reporter is the object that spans the gap, so it retains the buffers.
     for (auto const& tree : cu->trees()) {
         if (auto s = tree.sourceShared()) reporter.sourceBuffers().add(std::move(s));
+    }
+    // ★ AND THE PREPROCESSOR'S ORIGIN BUFFERS TOO, FOR THE SAME REASON THE
+    // DRIVER REGISTERS THEM ([[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]]).
+    // A tree's own `source()` is the SYNTHESIZED buffer; every diagnostic whose
+    // position has been converted onto the file it really came from names one of
+    // THESE instead. Registering only the tree sources was sufficient while the
+    // semantic tier still reported synthesized coordinates — i.e. it was
+    // sufficient only because of the defect. `add` keys on the buffer's own id,
+    // so this is idempotent with the loop above.
+    for (auto const& b : cu->auxiliaryBuffers()) {
+        if (b) reporter.sourceBuffers().add(b);
     }
     for (auto const& d : model.diagnostics().all()) {
         reporter.report(d);

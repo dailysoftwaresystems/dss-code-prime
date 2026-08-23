@@ -1510,10 +1510,13 @@ struct DSS_EXPORT ObjectFormatData {
     // (`K_FormatLacksWeakDefinitionDialect`); a walker that never meets one
     // never asks, so the key is not a back-door requirement on every schema.
     //
-    // Declared today by the pe **object** and **staticlib** formats — the two
-    // whose walker arm (the COFF `.obj` writer) consults it. Deliberately NOT
-    // declared by ELF or Mach-O yet: their writers encode `STB_WEAK` /
-    // `N_WEAK_DEF` without asking, and a key nobody reads drifts silently while
+    // Declared by every format whose walker arm CONSULTS it, and by no other:
+    // the pe object + staticlib documents (the COFF `.obj` writer), all ten ELF
+    // documents (`elf::encode`, whose alias pass reaches `stbForBinding` on
+    // every flavor), and the four Mach-O OBJECT/staticlib documents
+    // (`macho::encode`'s MH_OBJECT arm). The Mach-O IMAGE documents, the pe
+    // IMAGE documents, wasm and spirv declare NOTHING, because their walkers
+    // encode no weak definition — a key nobody reads drifts silently while
     // reading as authoritative, which is worse than no key at all
     // ([[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]]).
     std::optional<WeakDefinition> weakDefinition;

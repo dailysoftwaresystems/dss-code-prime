@@ -989,8 +989,9 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     };
     // `dataSizeBytes` / `dataAlignBytes` SIZE the ELF copy-relocation `.bss` slot
     // (c84 D-LK-EXTERN-DATA-IMPORT). One CU legitimately holds an INCOMPLETE type
-    // (`extern const char v[];` ⇒ 0/0 — extern_import.hpp:76-81), so a zero is
-    // "unknown here", not a disagreement: take the non-zero. Two DIFFERING
+    // (`extern const char v[];` ⇒ 0/0 — see `ExternImport::dataSizeBytes` in
+    // extern_import.hpp), so a zero is "unknown here", not a disagreement:
+    // take the non-zero. Two DIFFERING
     // non-zero values would reserve the SAME slot two ways — the loader memcpy's
     // `st_size` bytes, so picking either silently truncates or over-copies.
     auto const foldNonZero = [&](std::uint64_t& kept, std::uint64_t incoming,
@@ -1033,7 +1034,8 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                     ci, e.mangledName.c_str(), kept.symbol.v, mergedSym.v);
                 std::abort();
             }
-            // `isEagerImport` — OR-COMBINE, as extern_import.hpp:112-114 mandates
+            // `isEagerImport` — OR-COMBINE, as `ExternImport::isEagerImport`'s own
+            // contract note in extern_import.hpp mandates
             // (D-LINK-EXTERN-IMPORT-REFERENCE-GATE (e)). Keeping a NON-eager row
             // when a sibling CU declared the same import EAGER lets the linker's
             // `rejectOrDropUnreferencedExterns` DROP a

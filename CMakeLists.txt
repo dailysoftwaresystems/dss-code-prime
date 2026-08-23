@@ -612,6 +612,102 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/scripts/check-plan-citations/check-plan-citations.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Wall-clock-literal guard (2026-08-23 —
+    # D-TEST-A-NEW-WALL-CLOCK-LITERAL-IN-A-TEST-IS-UNGUARDED).
+    # A duration number written into a test is sized on the machine that wrote it:
+    # it passes there and reds on the slowest leg, NAMING THE WRONG EVENT, because
+    # a timeout usually surfaces as a sentinel return value the assertion then
+    # reports as a wrong result. ✔MEASURED on CI run 32585879580: a two-second
+    # deadline that takes 622 ms idle and 1912 ms under 3x contention crossed at
+    # 2204 ms on `linux-clang-asan` and read `Which is: -1`.
+    #
+    # ★ A RATCHET, NOT A BAN, and the numbers are why: ✔MEASURED 2026-08-23, 48
+    # literals across 11 files already exist — 26 of them the single idiom
+    # `runBinary(exe, std::chrono::milliseconds{5000})`. Per-file ceilings that may
+    # only come DOWN, so a NEW literal reds at once and a fixed one reds until its
+    # ceiling is lowered in the same commit. Same shape as check-no-abort-in-tests.
+    # ⚠ Green here means NO NEW literal landed. It never means the tests are free of
+    # them; the inventory is DEBT.
+    # ★★ `sleep_for` / `sleep_until` are DELIBERATELY not refused: a sleep is a
+    # delay, not a verdict, and a guard that reds on every one-millisecond sleep
+    # gets turned off within a week.
+    # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
+    # the tree and then drives 23 matcher arms against synthetic fixtures, so this
+    # entry cannot pass without also proving the guard can fail
+    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    add_test(
+        NAME wall_clock_in_tests_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-wall-clock-in-tests/check-wall-clock-in-tests.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Diagnostic-code allocation gate (2026-08-23 —
+    # D-GATE-DIAGNOSTIC-CODE-ALLOCATOR-HAS-NO-CTEST-ENTRY).
+    # ★ THE ASYMMETRY IS THE POINT: this is the gate written BECAUSE "a lane
+    # allocates an ordinal and nothing mechanical notices" — and ✔MEASURED
+    # 2026-08-23 it was itself noticed only when a human remembered to run it: no
+    # `add_test` entry here and no `.github/workflows/**` step invoking it.
+    # ⚠ Registering it was only half the fix. Its `main()` ran `self_test()` ONLY
+    # under `--self-test`, and this entry passes no flag — the exact shape that left
+    # `enum_name_table_guard` proving nothing. The other half is in the script: the
+    # no-argument form now verifies the header AND runs the self-test, honouring
+    # both statuses.
+    add_test(
+        NAME diagnostic_codes_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-diagnostic-codes/check-diagnostic-codes.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # ── THE REST OF THE GUARDS NOTHING MECHANICAL RAN ───────────────────────
+    # D-GATE-FOUR-GUARD-SCRIPTS-STILL-HAVE-NO-CTEST-ENTRY.
+    #
+    # ★★★ REGISTERING `diagnostic_codes_guard` above closed ONE instance of
+    # "a guard written because nothing mechanical notices, which nothing
+    # mechanical runs" and left four. ✔MEASURED 2026-08-23: 14 `scripts/check-*`
+    # directories against 9 registered entries, and ✔no `.github/workflows/**`
+    # step invoked any of the missing ones either.
+    #
+    # ⚠⚠ AND THE COST WAS NOT HYPOTHETICAL. Running `check-no-abort-in-tests`
+    # by hand at the end of cycle P28 found it **exit 1**: three lanes had each
+    # added a `std::abort()` to a test fixture, breaching a ratchet, in a cycle
+    # whose whole-tree gate was 1557/1557 green. `abort()` kills the test
+    # BINARY, so every sibling in that executable loses its verdict — the
+    # failure mode the ratchet exists to prevent, shipped past a green suite
+    # because the only thing that could see it was a script nobody ran.
+    #
+    # ⓘ `check-ninja-deps` stays unregistered and that is deliberate, not the
+    # same omission: it takes a build directory and asks whether a specific
+    # object's dependency set contains a file, so it has no argument-free form
+    # to register. It is a probe, not a tree invariant.
+    add_test(
+        NAME no_abort_in_tests_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-no-abort-in-tests/check-no-abort-in-tests.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(
+        NAME path_identity_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-path-identity/check-path-identity.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(
+        NAME retyped_closed_sets_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-retyped-closed-sets/check-retyped-closed-sets.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # ★ `check-anchor-balance` needs a BASE REF to compare against, so its
+    # ordinary form cannot be a ctest entry — a cycle supplies that ref. Its
+    # `--self-test` has no such obstacle: 58 cases over the real arithmetic,
+    # including the red-on-disable proving the `+bookkept` term is load-bearing.
+    # Registering the self-test is what stops the instrument that judges every
+    # cycle from being the one thing no cycle checks.
+    add_test(
+        NAME anchor_balance_selftest_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-anchor-balance/check-anchor-balance.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()
 
 # ── The install set (D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE) ──

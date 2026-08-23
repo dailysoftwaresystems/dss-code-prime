@@ -2468,7 +2468,7 @@ INSTANTIATE_TEST_SUITE_P(
         // ★ THE SQLITE SHAPE. `SQLITE_INLINE` expands to
         // `__attribute__((always_inline)) inline`, so the attribute is COMBINED
         // with the C99 `inline` function specifier TF-C79 landed. sqlite's ONE
-        // use site (btree.c:1846, `static SQLITE_INLINE int allocateSpace(…)`)
+        // use site (btree.c, `static SQLITE_INLINE int allocateSpace(…)`)
         // is exactly this, and the two features must compose.
         AlwaysInlineFormCase{
             "combined-with-inline-specifier",
@@ -2993,8 +2993,8 @@ INSTANTIATE_TEST_SUITE_P(
         // ★ MODE-3 IS **THE SQLITE SHAPE**: the attribute sits in the specifier
         // PREFIX between `static` and the type, so it routes through
         // `declSpecifiers` into the topLevelDecl row. Both of sqlite's use sites
-        // (`static SQLITE_NO_TSAN void walIndexWriteHdr(Wal*)`, wal.c:942, and
-        // `static SQLITE_NO_TSAN int walIndexTryHdr(Wal*,int*)`, wal.c:2590) are
+        // (`static SQLITE_NO_TSAN void walIndexWriteHdr(Wal*)`, wal.c, and
+        // `static SQLITE_NO_TSAN int walIndexTryHdr(Wal*,int*)`, wal.c) are
         // exactly this, so this case is the one the provenance rests on.
         NoSanitizeThreadFormCase{
             "mode3-leading-prefix-sqlite-shape",
@@ -10498,11 +10498,11 @@ TEST(MirLoweringCSubsetVolatile, TwoVolatileStoresToDifferentGlobalsKeepRelative
 // DCE. Source `void f(volatile int *p){ *p = 1; }` lowers to a single volatile
 // Store (`*p = 1` writes through the `volatile int` pointee). NOTE: this
 // survival is CURRENTLY guaranteed by `Store`'s UNCONDITIONAL opcode-level
-// `hasSideEffects` — `isSideEffectRoot` (dce.cpp:50-55) keeps EVERY Store,
+// `hasSideEffects` — `isSideEffectRoot` (dce.cpp) keeps EVERY Store,
 // volatile or not — so it does NOT isolate the Volatile bit today. It is a
 // future-safety regression guard: a future dead-store-elimination (DSE) pass
 // MUST route its elision decision through an `isSideEffectRoot`-equivalent
-// OR-against-`MirInstFlags::Volatile`, exactly as DCE's dce.cpp:50-55 already
+// OR-against-`MirInstFlags::Volatile`, exactly as DCE's dce.cpp already
 // does — otherwise it would wrongly drop this observable volatile write.
 TEST(MirLoweringCSubsetVolatile, VolatileStoreThroughPointerParamSurvivesDce) {
     auto L = lowerCSubset(
@@ -10524,7 +10524,7 @@ TEST(MirLoweringCSubsetVolatile, VolatileStoreThroughPointerParamSurvivesDce) {
     EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 1u)
         << "DCE must NOT elide the volatile Store — it survives (today via "
            "Store's opcode-level hasSideEffects; a future DSE must OR against "
-           "MirInstFlags::Volatile like dce.cpp:50-55)";
+           "MirInstFlags::Volatile like dce.cpp)";
 }
 
 // ── c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION — opaque / incomplete struct ──
@@ -12490,7 +12490,7 @@ TEST(MirLoweringCSubset, InlineAsmEmptySectionFormsEachLowerToOneCompilerBarrier
 // eax/edx with the allocator uninformed and `lo` never written).
 //
 // ★★ ITS OWN COMMENT CALLED IT UNREACHABLE, AND THAT WAS TRUE OF THE DRIVER
-// ONLY. `compile_pipeline.cpp:303` and `c_header_parser.cpp:313` both bail on
+// ONLY. `compile_pipeline.cpp` and `c_header_parser.cpp` both bail on
 // `hasErrors()` before lowering, and the semantic tier refuses extended asm, so
 // production never gets here. THIS TIER HAS NO SUCH GUARD: `lowerCSubset` at the
 // top of this file calls `lowerToHir(model, hirReporter)` unconditionally — on

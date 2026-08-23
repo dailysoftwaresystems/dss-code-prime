@@ -987,7 +987,7 @@ TEST(ParserCSubsetSmoke, ExternVariableDeclParses) {
 // symmetric with its leading slot and topLevelHead's trailing slot. So a base type
 // FOLLOWED by a cv-qualifier — `LONG volatile` == `volatile LONG` (C 6.7.1) — parses
 // on BOTH a typedef-name and a builtin base. The pre-fix const-only slot P0009'd at a
-// trailing `volatile`. Motivating case: sqlite `src/test1.c:9346`
+// trailing `volatile`. Motivating case: sqlite `src/test1.c`
 // `extern LONG volatile sqlite3_os_type;` (LONG = windows.json) under #if
 // SQLITE_OS_WIN. A parser-level test needs no `typedef` for LONG: externDecl is
 // committed by `extern`, so `typeBaseAllowingStruct`'s Identifier arm reads LONG as
@@ -1727,7 +1727,7 @@ TEST(ParserCSubsetSmoke, LongInitializerRidesTheStatementProbeBudget) {
 // yet the probe keeps speculating through the WHOLE member list, so a struct
 // whose body exceeds 4096 tokens trips exceededBudget() → the body-form alt
 // fails → the parser mis-recovers to the matching `}` → P0009 at the orphan
-// `};`. This is `struct sqlite3` (sqlite3.c:18907) in minimal form. It is NOT
+// `};`. This is `struct sqlite3` (sqlite3.c) in minimal form. It is NOT
 // a member-COUNT limit (a 130-member control parses); it is a TOKEN-budget
 // cliff that any large mixed struct (real SQLite) reaches at ~80 members.
 TEST(ParserCSubsetSmoke, LargeStructBodyMustNotHitSpeculationBudget) {
@@ -2281,7 +2281,7 @@ constexpr std::string_view kCanonicalTypedefRoles =
     "rule:typedefDeclaratorList/rule:typedefAttrRun/tok:EndStatement";
 
 // TRAILING (after the declarator) — the real SDK witness
-// `bsm/audit.h:199`: `typedef u_int64_t au_asflgs_t __attribute__ ((aligned(8)));`
+// `bsm/audit.h`: `typedef u_int64_t au_asflgs_t __attribute__ ((aligned(8)));`
 // The attribute lands in the SECOND `typedefAttrRun`; the first stays empty and
 // `declarator` keeps role-index 2.
 TEST(ParserCSubsetSmoke, TypedefTrailingAttributeParsesIntoTheSecondAttrRun) {
@@ -2290,7 +2290,7 @@ TEST(ParserCSubsetSmoke, TypedefTrailingAttributeParsesIntoTheSecondAttrRun) {
         "typedef u_int64_t       au_asflgs_t __attribute__ ((aligned(8)));\n");
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors())
-        << "bsm/audit.h:199 must parse: " << firstErrorText(t);
+        << "bsm/audit.h must parse: " << firstErrorText(t);
 
     // The SECOND typedefDecl is the attributed one.
     NodeId attributed{};
@@ -2318,7 +2318,7 @@ TEST(ParserCSubsetSmoke, TypedefTrailingAttributeParsesIntoTheSecondAttrRun) {
 }
 
 // BETWEEN the head and the declarator — the real SDK witness
-// `libkern/OSAtomicDeprecated.h:129/796/799`:
+// `libkern/OSAtomicDeprecated.h`:
 // `typedef int64_t __attribute__((__aligned__(8))) _OSAtomic_int64_t;`
 // The attribute lands in the FIRST `typedefAttrRun` — a SIBLING of the head,
 // never a child of it.
@@ -2328,7 +2328,7 @@ TEST(ParserCSubsetSmoke, TypedefMidAttributeParsesIntoTheFirstAttrRun) {
         "typedef int64_t __attribute__((__aligned__(8))) _OSAtomic_int64_t;\n");
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors())
-        << "libkern/OSAtomicDeprecated.h:129 must parse: " << firstErrorText(t);
+        << "libkern/OSAtomicDeprecated.h must parse: " << firstErrorText(t);
 
     NodeId attributed{};
     RuleId const typedefRule = t.schema().rules().find("typedefDecl");
@@ -2375,7 +2375,7 @@ TEST(ParserCSubsetSmoke, TypedefPostKeywordAttributeRidesTheSpecifierPrefix) {
 }
 
 // GAP 2 — `attrArgItem` accepts a `key = value` argument. Real SDK witness
-// `sys/cdefs.h:332` (the `__swift_unavailable(_msg)` macro):
+// `sys/cdefs.h` (the `__swift_unavailable(_msg)` macro):
 // `__attribute__((__availability__(swift, unavailable, message=_msg)))`.
 // The assignment is an OPTIONAL TAIL on the item, so FIRST(attrArgItem) is
 // unchanged and the comma list stays predictive.
@@ -2385,7 +2385,7 @@ TEST(ParserCSubsetSmoke, AttributeArgumentAcceptsKeyEqualsValue) {
         "message=\"unavailable in Swift\")));\n");
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors())
-        << "sys/cdefs.h:332 must parse: " << firstErrorText(t);
+        << "sys/cdefs.h must parse: " << firstErrorText(t);
 
     // Exactly one of the three arg items carries the `=` tail, and its shape is
     // atom/`=`/atom — pinned so a future edit cannot quietly turn the tail into
@@ -2590,7 +2590,7 @@ TEST(ParserCSubsetSmoke, MidListMemberAttributeFailsLoud) {
 // ── TF-C94: the LEADING member attribute position (`structMemberDeclSpecifier`)
 //
 // The Tcl-9 gap. `struct TclStubs { TCL_NORETURN1 void (*tcl_Panic)(…); … }`
-// (tclDecls.h:1893/:2024/:2185, the `tcl.h:116` macro
+// (tclDecls.h, the `tcl.h` macro
 // `#define TCL_NORETURN1 __attribute__ ((__noreturn__))`) put a GNU attribute
 // BEFORE a member's declaration-specifiers, which GNU 6.34 permits on any
 // declaration. RED-ON-DISABLE (measured through the real CLI at the pre-change
@@ -2788,7 +2788,7 @@ TEST(ParserCSubsetSmoke, FileScopeGnuAlignedParsesCleanly) {
 
 // ── TF-C73: the AFTER-KEYWORD composite attribute slot ──────────────────────
 //
-// `struct __attribute__((aligned(16))) T { … };` — `mach-o/dyld_images.h:124`,
+// `struct __attribute__((aligned(16))) T { … };` — `mach-o/dyld_images.h`,
 // and 64 of the SDK audit's 204 `aligned` sites (31.4%). Both shapes below are
 // clang-clean under
 //   clang -fsyntax-only -Wall -Wextra -isysroot $(xcrun --show-sdk-path)
@@ -2815,7 +2815,7 @@ TEST(ParserCSubsetSmoke, AfterKeywordCompositeAttributeParsesIntoTheLeadSlot) {
     Tree t = parseCSubset("struct __attribute__((aligned(16))) T { int x; };\n");
     ASSERT_NE(t.root(), InvalidNode);
     EXPECT_FALSE(t.diagnostics().hasErrors())
-        << "mach-o/dyld_images.h:124 must parse: " << firstErrorText(t);
+        << "mach-o/dyld_images.h must parse: " << firstErrorText(t);
 
     NodeId const spec = findFirstNodeWithRule(t, "structSpec");
     ASSERT_TRUE(spec.valid());

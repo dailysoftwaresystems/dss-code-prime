@@ -27,7 +27,7 @@
 // Caller writes the bytes to disk first via
 // `dss::linker::writeImage`. Caller-side responsibility for
 // permissions on POSIX + .exe extension on Windows (the parent-
-// directory contract is documented at `writer.hpp:30-34`). The
+// directory contract is documented at `writer.hpp`). The
 // POSIX arm also chmod+x the spawned binary so `posix_spawn`
 // can exec it (the linker writes 0644 by default; a caller that
 // already applied 0755 sees the redundant chmod as a no-op).

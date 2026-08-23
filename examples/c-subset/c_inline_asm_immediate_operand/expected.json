@@ -1,0 +1,32 @@
+{
+  "$comment": "D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED: the first runnable witness that the `\"i\"` IMMEDIATE constraint reaches the template. ★★★ THIS EXAMPLE WAS BORN RED — before the fix it did not compile at all, on either target, at either config: `__asm__(\"addl %1, %0\" : \"+r\"(r) : \"i\"(5))` was refused with `error[H0009] … operand 1 (constraint \"i\") binds the operand form 'imm32', which this pipeline does not yet realize`, about a letter BOTH shipped targets declare (`{ \"letter\": \"i\", \"binds\": \"operandKind\", \"operandKind\": \"imm32\" }`). gcc 13.3.0 compiles the same construct on both (✔RE-MEASURED: `nop $7` / `nop 7` for the reference shape, `addl $5, %eax` / `add x0, x0, 5` for the runnable one), and one working reference makes the behaviour required. ★★★ WHY THE EXIT CODE IS A RESULT AND NOT A STRUCTURE PIN: an immediate is the ONLY operand form that binds no register — the number is written INTO the instruction — and a regression that materialized the constant into a register and bound THAT still compiles rc=0, still assembles, and still emits an `add`. On x86_64 it even encodes a perfectly legal `add reg, reg`. Nothing but EXECUTION can see the difference. ★★ FOUR SHAPES, EACH A DIFFERENT PATH TO THE SAME BINDING: (1) behind a CALL, positional `%N`, so nothing folds away; (2) a CONSTANT EXPRESSION (`2 + 3`) rather than a literal — the constraint requires an INTEGER CONSTANT EXPRESSION, so an implementation accepting only a bare literal token is red here alone; (3) the SYMBOLIC `%[name]` spelling, which reaches the operand through a second binding row — an immediate travelling only on the positional row is red here alone; (4) `sizeof(int)`, a TYPE QUERY that folds only if the constant-proof environment carries the layout engine (✔gcc: `nop $4` / `nop 4`). Each shape returns its own exit code (1/2/3/4), so a failure names which path broke instead of collapsing to a single 1. ⚠ WHY THE aarch64 ARM USES `long` AND THE 3-OPERAND SPELLING: `add` is suffix-less there and the operand REGISTERS state the width; `%w0` is an operand MODIFIER no shipped target declares a width-view vocabulary for, so the semantic tier refuses it fail-loud (D-CSUBSET-INLINE-ASM-OPERANDS) rather than running at the wrong width. ⚠ THE `volatile` SEED IS LOAD-BEARING for its sibling `c_inline_asm_memory_operand`'s reason: without it release folds the accumulator to a constant before lowering, silently changing which mechanism each arm tests.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

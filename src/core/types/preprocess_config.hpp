@@ -1005,7 +1005,7 @@ struct DSS_EXPORT PreprocessConfig {
 //           #ifndef __has_include
 //           #define __has_include(x) 0
 //           #endif
-//       (Apple SDK `sys/cdefs.h:91-93`, and the same three lines in glibc,
+//       (Apple SDK `sys/cdefs.h`, and the same three lines in glibc,
 //       musl, Boost, zlib, ...): the guard is DEAD on a compiler that has the
 //       operator. Reading the name as undefined takes the arm and SHADOWS the
 //       real operator with a function-like macro that answers 0 forever.

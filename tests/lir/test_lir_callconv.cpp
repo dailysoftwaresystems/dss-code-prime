@@ -60,7 +60,7 @@ struct RewrittenBundle {
 
 // `ccIndex` default `= 0` is a TEST-HARNESS convenience only — the
 // underlying `allocateRegisters` parameter is REQUIRED (no default)
-// per `src/lir/lir_regalloc.hpp:183-187`'s "no default" discipline,
+// per `src/lir/lir_regalloc.hpp`'s "no default" discipline,
 // which exists to prevent a future caller from inheriting the
 // pre-D-FF3-3 hardcode silently. Tests pinning ccIndex=1 behavior
 // must pass `1` explicitly; the default exists so the dozens of
@@ -571,7 +571,7 @@ TEST(LirCallconv, NonLeafAarch64FramePrologueEpilogueByteExact) {
         /*ccIndex=*/0, /*targetName=*/"arm64");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.rewritten.ok);
-    // The EXACT production pass order (compile_pipeline.cpp:340-363):
+    // The EXACT production pass order (compile_pipeline.cpp):
     // legalizeTwoAddress -> materializeCallingConvention -> assemble.
     DiagnosticReporter legRep;
     auto legal = legalizeTwoAddress(bundle.rewritten.lir, *bundle.lowered.target,
@@ -3470,7 +3470,7 @@ TEST(LirCallconvAbi, AllocaWithVirtualResultFailsLoud) {
 // 2026-06-04): a target schema that declares the `alloca` opcode
 // but OMITS `lea` is structurally misconfigured — the materialize
 // pass cannot lower `alloca` to its `lea result, [sp + offset]`
-// form. Per `lir_callconv.cpp:877` the pass MUST fail loud with
+// form. Per `lir_callconv.cpp` the pass MUST fail loud with
 // `L_RequiredLirOpcodeMissing` when it encounters an `alloca`
 // instruction without the `lea` handle resolved.
 //

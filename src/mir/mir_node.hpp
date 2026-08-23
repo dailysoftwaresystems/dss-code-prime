@@ -349,7 +349,7 @@ struct MirFunc {
     // three tiers earlier, and the day an instrumentation pass lands it would have
     // to re-derive from source what the front-end already parsed
     // ([[D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP]]). sqlite's `SQLITE_NO_TSAN`
-    // (wal.c:932) marks the two wal-index header functions whose races are
+    // (`wal.c`) marks the two wal-index header functions whose races are
     // DELIBERATE and benign — a fact about the program's concurrency contract, not
     // a performance hint, which is exactly the kind a compiler should not silently
     // forget.
