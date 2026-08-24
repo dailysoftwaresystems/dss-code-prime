@@ -394,8 +394,8 @@ rewriteOneFunc(Lir const&               src,
     // SAME `forbiddenBase` the spilled-indirect-callee filter uses; the
     // result's class pool only ever matches its own-class arg regs).
     // `arg` ops have no operands, so THIS handle covers only the arg-op's
-    // OWN spilled RESULT store. ★ SCOPE-CORRECTED (TF-C55, D-AS-REWRITE-SPILL-
-    // SCRATCH-INCOMING-ARG-CLOBBER): c75's premise that "every later
+    // OWN spilled RESULT store. ★ SCOPE-CORRECTED (TF-C55,
+    // D-AS-REWRITE-SPILL-SCRATCH-INCOMING-ARG-CLOBBER): c75's premise that "every later
     // instruction runs after all args are materialized, so the arg-op result
     // store is the SOLE entry-region reload that can clobber a live incoming
     // arg reg" is FALSE under the release optimizer, which reorders a spilled

@@ -16,8 +16,7 @@
 
 // Shared relocatable-object READER substrate: decide, in neutral coordinates,
 // which defined symbols START a body -- and prove that no defined symbol's body
-// was silently dropped. D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-
-// NOT-ATOM.
+// was silently dropped. D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM.
 //
 // ★★★ THE FAILURE THIS ADDRESSES.
 //

@@ -1317,8 +1317,8 @@ constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
     {DiagnosticCode::S_InlineAsmNonEmptyTemplate, kWhyInlineAsmTemplate},
     {DiagnosticCode::S_InlineAsmExtendedUnsupported, kWhyInlineAsmExtended},
     {DiagnosticCode::S_InlineAsmLabelSectionRequiresGoto, kWhyInlineAsmLabelSection},
-    // Inline-asm P5 operand binding, 0xE065..0xE06B (D-CSUBSET-INLINE-ASM-
-    // OPERANDS + D-CSUBSET-INLINE-ASM-TEXT). SEVEN codes, all admitted on
+    // Inline-asm P5 operand binding, 0xE065..0xE06B (D-CSUBSET-INLINE-ASM-OPERANDS
+    // + D-CSUBSET-INLINE-ASM-TEXT). SEVEN codes, all admitted on
     // PRONG (1), and the prong is met the same way in each: the construct has
     // a SECOND CANDIDATE LOWERING that a silenced compiler would take without
     // saying so — an unbound operand, an alternative the binder chose itself,
@@ -1357,8 +1357,8 @@ constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
     // it: `volatile volatile` has one candidate reading, a name used twice has
     // exactly two and the compiler picks one in silence.
     {DiagnosticCode::S_InlineAsmDuplicateSymbolicName, kWhyAsmDuplicateSymbolicName},
-    // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-
-    // RESIDUAL): a bit-field compound/inc-dec/value mutation through an anonymous-
+    // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL):
+    // a bit-field compound/inc-dec/value mutation through an anonymous-
     // member or array-arrow base. Suppressed, the mutation falls to the generic
     // via-ptr path whose full-unit store CLOBBERS packed neighbours + skips
     // truncation — a silent miscompile. Same silent-miscompile-guard class as the

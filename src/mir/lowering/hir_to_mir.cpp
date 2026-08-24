@@ -85,8 +85,8 @@ struct Lowerer {
     HirFfiMap const*         ffiMap;      // optional — populated by CST→HIR or FF5
                                            // (LK6 cycle 2d, D-LK6-6).
     HirLinkageMap const*     linkageMap;  // optional — native-decl binding/
-                                           // visibility (D-CSUBSET-LINKAGE-
-                                           // SPECIFIERS). nullptr ⇒ all Global.
+                                           // visibility (D-CSUBSET-LINKAGE-SPECIFIERS).
+                                           // nullptr ⇒ all Global.
     HirNoInlineMap const*    noInlineMap; // optional — native-FUNCTION inliner
                                            // opt-out (TF-C78, D-CSUBSET-NOINLINE).
                                            // nullptr / no entry ⇒ inlinable.
@@ -127,8 +127,8 @@ struct Lowerer {
                                            // (FC17.9(c), D-CSUBSET-SETJMP). nullptr /
                                            // no entry ⇒ ordinary call (no flag).
     HirAlignmentMap const*   alignmentMap; // optional — per-DECLARATION explicit
-                                           // `alignas` (D-CSUBSET-ALIGNAS-VARIABLE-
-                                           // CODEGEN). nullptr / no entry ⇒ natural.
+                                           // `alignas` (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN).
+                                           // nullptr / no entry ⇒ natural.
     HirThreadLocalMap const* threadLocalMap; // optional — per-DECLARATION thread
                                            // storage duration (TLS C1,
                                            // D-CSUBSET-THREAD-LOCAL). nullptr / no
@@ -1502,8 +1502,8 @@ struct Lowerer {
         return mir.addInst(cmp, c, boolTy);
     }
 
-    // ══ C23 _BitInt(N>64) — the multi-limb HARD arithmetic (C3, D-CSUBSET-BITINT-C3-
-    // MULDIV): `*` schoolbook via UMulH, `/`·`%` binary long division. Builds ENTIRELY
+    // ══ C23 _BitInt(N>64) — the multi-limb HARD arithmetic (C3, D-CSUBSET-BITINT-C3-MULDIV):
+    // `*` schoolbook via UMulH, `/`·`%` binary long division. Builds ENTIRELY
     // on the C2 substrate + the small limb helpers below. Sign handling: multiply's low
     // N bits are two's-complement sign-AGNOSTIC (one path, signedness enters only at the
     // final maskTopLimb); divide operates on magnitudes with a C99 trunc-toward-zero sign
@@ -6918,9 +6918,23 @@ struct Lowerer {
     // ordinary I64/F64 MIR arg the UNCHANGED callconv places by class) or a
     // by-reference pointer; the callee reconstructs into the param's frame slot.
     // Both sides derive the SAME piece sequence from (type × CC), so the caller's
-    // operand order matches the callee's Arg ordinals by construction. Struct
-    // RETURNS by value stay fail-loud this phase (sret needs the multi-register
-    // MIR Return — D-FC7-SYSV-STRUCT-RETURN-IN-REGS).
+    // operand order matches the callee's Arg ordinals by construction.
+    // ⚠⚠ THIS COMMENT USED TO CLOSE WITH *"Struct RETURNS by value stay
+    // fail-loud this phase (sret needs the multi-register MIR Return —
+    // <row>)"*, and that sentence IS FALSE. It is corrected in place rather
+    // than deleted because "this phase" is exactly the qualifier that made it
+    // look safe: a scope word does not stop a present-tense verb from being
+    // read as the present tense once the phase is over
+    // (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+    // ✔RE-MEASURED at the CLI 2026-08-24 on x86_64:pe64-x86_64-windows-exec,
+    // debug AND release, one program covering all three return classes — an 8-
+    // byte struct (one register), a 16-byte struct (two registers) and a
+    // 24-byte struct (class MEMORY, the hidden-pointer path) each returned by
+    // value from a callee and read back by the caller: rc=0 and the program
+    // RUNS returning 42. D-FC7-SYSV-STRUCT-RETURN-IN-REGS IS CLOSED, and this
+    // very file already carried the machinery — `currentFnResult_`/`sretPtr_`
+    // are declared for it above, and the by-value-returning CALL arm lives
+    // beside the complex-rvalue arms below.
 
     // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG): the running physical-arg ordinal.
     // INDEPENDENT CCs (SysV/AAPCS64, `slotAligned=false`) count GPR and FPR
@@ -8105,8 +8119,7 @@ struct Lowerer {
                 // too (its value is unused) — share the ExprStmt aggregate
                 // chokepoint (lowerDiscardedExpr) so an aggregate ternary/comma
                 // in a for-clause routes through the carrier, not lowerExpr's
-                // anti-resurrection fail-loud (D-CSUBSET-AGGREGATE-VALUED-
-                // CONTROL-EXPR).
+                // anti-resurrection fail-loud (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR).
                 return lowerDiscardedExpr(node);
         }
     }
@@ -9545,6 +9558,25 @@ struct Lowerer {
         // re-typed copy of it.
         std::vector<std::optional<HirLiteralValue>>
             immediateValues(src.operands.size());
+        // ★★★ WHICH HIR OPERAND EACH `desc.outputs` SLOT DESCRIBES, BECAUSE THE
+        // TWO ARE NO LONGER THE SAME INDEX SPACE
+        // (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED). The SOURCE's
+        // output section is `[0, src.outputCount)`; `MirAsmDescriptor::outputs`
+        // is defined by its own docblock as the RESULT-PIECE list — *"output k
+        // is result piece k"* — and a memory-form operand produces no result
+        // piece, so it is not a member of that list. `desc.outputs[k]` therefore
+        // describes `kids[regOutputKid[k]]`, and every piece ordinal, piece
+        // type, store-back address and register class below is indexed by k
+        // through this map.
+        // ⚠ THE THREE COUNTS USED TO BE ONE NUMBER AND THAT IS THE HAZARD THIS
+        // VECTOR EXISTS TO REMOVE: `src.outputCount` (the source's output
+        // section), `desc.outputs.size()` (the result pieces) and the
+        // `ReturnPiece` ordinal space were spelled `src.outputCount` at every
+        // site. They coincide for every statement whose outputs all bind
+        // registers, so a site left behind reads correct on the whole existing
+        // corpus and mis-indexes only when a memory-form output is present.
+        std::vector<std::size_t> regOutputKid;
+        regOutputKid.reserve(src.outputCount);
         for (std::size_t i = 0; i < src.operands.size(); ++i) {
             HirInlineAsmOperand const& o = src.operands[i];
             // ★★★ THE QUESTION IS "DID THE LETTER RESOLVE TO **ANYTHING**", NOT
@@ -9705,33 +9737,82 @@ struct Lowerer {
                 }
                 immediateValues[i] = *r.value;
             }
-            // ★ AND THE **OUTPUT** HALF OF THE MEMORY FORM IS A DIFFERENT
-            // MECHANISM, NOT A DIFFERENT CASE. An `"=r"` output is realized as a
-            // `ReturnPiece` plus a store-back through the lvalue's address; an
-            // `"=m"` output has no register to capture and no piece to anchor —
-            // the template writes the memory itself, so the whole piece/
-            // store-back carriage below is not merely unnecessary but wrong. It
-            // is refused rather than lowered as if it were the input form,
-            // which would silently drop every write the template performed.
-            // ✔MEASURED: gcc 13.3.0 compiles `"=m"` on both shipped targets, so
-            // this too is a recorded gap with a live reference
-            // (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED).
-            if (asmOperandBindsMemoryForm(o) && i < src.outputCount) {
-                unsupported(node, std::format(
-                    "inline-asm operand {} (constraint \"{}\") binds the memory "
-                    "form in the OUTPUT section — the template writes that "
-                    "memory itself, so there is no register to capture and no "
-                    "result piece to anchor, and lowering it like an input form "
-                    "would silently discard every write the template performed "
-                    "(D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED)",
-                    i, o.constraint.raw));
-                return false;
-            }
+            // ★★★ THE **OUTPUT** HALF OF THE MEMORY FORM IS THE **SAME MACHINE
+            // CARRIAGE** AS THE INPUT HALF, AND THAT IS WHY IT NEEDS NO NEW
+            // VOCABULARY (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED).
+            //
+            // An `"=r"` output is realized as a `ReturnPiece` plus a store-back
+            // through the lvalue's address: the template writes a REGISTER and
+            // this tier moves that register into the object. A memory-form
+            // output has no such register — the template writes the OBJECT — so
+            // the piece-and-store-back carriage is not merely unnecessary but
+            // wrong, and lowering one like an `"=r"` would silently discard
+            // every write the template performed. That much the refusal this
+            // block replaced had right.
+            //
+            // ★ WHAT IT MISSED IS THAT SOMETHING STILL HAS TO SUPPLY THE
+            // ADDRESS AND THE WIDTH, and the INPUT form already answers both:
+            // `lowerLvalueAddress` materialises the object's ADDRESS and
+            // `bindAsmOperand` takes the register class and the width from that
+            // address's own (pointer) type. `"m"` and `"=m"` hand the template
+            // the identical thing — a register holding the object's address —
+            // and the DIRECTION lives entirely in the template's own
+            // instruction. ✔MEASURED, gcc 13.3.0, `-O0` AND `-O2`, x86_64-linux-gnu
+            // AND aarch64-linux-gnu: `"=m"(*p)` behind a call emits
+            // `movq %rdx, (%rax)` / `str x1, [x0]` — the same `(%reg)` / `[reg]`
+            // form the input arm already produces — and the programs RUN
+            // (exit 42 on both, native and under qemu-aarch64).
+            //
+            // ⇒ SUCH AN OPERAND IS FILED IN `desc.inputs`, AND THAT IS THE
+            // FIELD'S OWN DEFINITION RATHER THAN A CONVENIENCE.
+            // `MirAsmDescriptor::outputs` documents itself as the RESULT-PIECE
+            // list (*"output k is result piece k"*); a memory-form operand
+            // produces no result piece, so it is not a member of it. `inputs` is
+            // documented as the list ALIGNED 1:1 WITH THE INSTRUCTION'S MIR
+            // OPERANDS, and this operand has exactly one MIR operand: its
+            // address. The SOURCE's section is not lost — `spellings` still
+            // carries the `%N` the front end minted from the source's
+            // outputs-then-inputs numbering, and `constraint` still carries
+            // `"=m"` verbatim — so no consumer has to reconstruct anything.
+            // ⚠ ORDER: the loop walks the source's operands in order and the
+            // output section comes first, so these entries land at the FRONT of
+            // `desc.inputs`, ahead of the source-written inputs and the
+            // synthesized tied read halves. The value loop below appends their
+            // addresses in the same order for the same reason — the two lists
+            // are 1:1 and nothing else keeps them so.
+            //
+            // ★★★ `"+m"` RIDES THIS EXACT PREDICATE AND IS REALIZED BY THE SAME
+            // CARRIAGE, WHICH IS NOT AN ACCIDENT: for a memory operand the
+            // location the template READS and the location it WRITES are the
+            // same memory, named by ONE address register, so `+` asks for
+            // nothing `=` does not already provide. ✔MEASURED, gcc 13.3.0, both
+            // targets, `-O0` and `-O2`: `"+m"(x)` compiles and RUNS
+            // (`addq $5, -16(%rbp)`; the aarch64 twin loads, adds and stores
+            // through `[sp, 8]`) — one working reference, so it is REQUIRED.
+            bool const memoryFormOutput =
+                asmOperandBindsMemoryForm(o) && i < src.outputCount;
             MirAsmOperand mo;
             mo.constraint     = o.constraint.raw;
             mo.regClass       = static_cast<TargetRegClass>(o.regClass);
             mo.fixedRegister  = o.fixedRegister;
-            mo.isReadWrite    = o.constraint.isReadWrite;
+            // ★★ `isReadWrite` IS THE REQUEST FOR A **TIED READ HALF**, NOT A
+            // RECORD THAT THE SOURCE WROTE `+`. Its own docblock defines it as
+            // *"one input tied to one output"*, and `tieAsmReadWriteOperands` is
+            // its only consumer: an entry carrying it with no `tiedOutput` is
+            // refused as *"a `+` written in the INPUT section"*. A memory-form
+            // output has no second machine fact to tie, so leaving the flag set
+            // would fire that refusal — with a stated reason that is FALSE about
+            // an operand the source wrote in the OUTPUT section, the exact
+            // species of defect this operand form's parent row was closed for.
+            // ⓘ NOTHING IS LOST: `constraint` above carries `"+m"` verbatim, so
+            // every diagnostic still quotes what the source wrote.
+            // ⛔ AND THE FLAG IS CLEARED ONLY FOR THE **OUTPUT** SECTION. A `+`
+            // written in the INPUT section keeps it and is still refused, for
+            // the memory form as for the register form — ✔MEASURED, gcc 13.3.0
+            // on both shipped targets, `"+m"` in the input section is
+            // `error: input operand constraint contains '+'`, byte-identical to
+            // its `"+r"` verdict.
+            mo.isReadWrite    = o.constraint.isReadWrite && !memoryFormOutput;
             mo.isEarlyClobber = o.constraint.earlyClobber;
             // The form arm travels beside the class arm; exactly one is live,
             // and the consumer switches rather than guessing (the `regClass`
@@ -9751,8 +9832,12 @@ struct Lowerer {
             // every real compile while hand-built unit tests, which construct
             // `MirAsmOperand` directly, keep passing.
             mo.spellings      = o.spellings;
-            if (i < src.outputCount) desc.outputs.push_back(std::move(mo));
-            else                     desc.inputs.push_back(std::move(mo));
+            if (i < src.outputCount && !memoryFormOutput) {
+                regOutputKid.push_back(i);
+                desc.outputs.push_back(std::move(mo));
+            } else {
+                desc.inputs.push_back(std::move(mo));
+            }
         }
 
         // ★★★ `"+r"` — ONE SOURCE OPERAND, TWO MACHINE FACTS, AND THE READ HALF
@@ -9780,8 +9865,15 @@ struct Lowerer {
         // no `ReturnPiece` and no lvalue address to invent one from. It keeps
         // `isReadWrite` with no `tiedOutput`, which is precisely the shape a
         // consumer must still refuse.
-        for (std::size_t k = 0; k < src.outputCount; ++k) {
-            if (!src.operands[k].constraint.isReadWrite) continue;
+        //
+        // ⚠ AND A `+` ON A **MEMORY-FORM** OUTPUT GETS NOTHING HERE EITHER, for
+        // the opposite reason: it needs no read half because its read half is
+        // the memory the address register already names. Such an operand is not
+        // in `desc.outputs` at all (it produces no result piece), which is why
+        // this loop runs over `regOutputKid` — the result-piece list — rather
+        // than over `[0, src.outputCount)`.
+        for (std::size_t k = 0; k < regOutputKid.size(); ++k) {
+            if (!src.operands[regOutputKid[k]].constraint.isReadWrite) continue;
             MirAsmOperand tied = desc.outputs[k];
             tied.isEarlyClobber = false;   // `&` is the OUTPUT's promise, not the read's
             tied.tiedOutput     = static_cast<std::uint32_t>(k);
@@ -9808,19 +9900,37 @@ struct Lowerer {
         // piece set — the shape `mir_to_lir`'s piece-consumption refusal names
         // as drowning the root cause.
         std::vector<MirInstId> outAddrs;
-        outAddrs.reserve(src.outputCount);
+        outAddrs.reserve(regOutputKid.size());
+        // The ADDRESSES of the memory-form OUTPUTS, in source-output order —
+        // the VALUES of the `desc.inputs` entries the descriptor loop filed at
+        // the front of that list, and the two orders must agree because nothing
+        // else keeps the list 1:1 with the instruction's operands.
+        std::vector<MirInstId> memOutAddrs;
         // The VALUES behind the tied read halves appended to `desc.inputs`
         // above, in the same (output) order. Kept apart from `inputs` until the
         // source-written inputs are in, because the two lists must end up
         // aligned 1:1 with `desc.inputs` and that list is source-inputs-first.
         std::vector<MirInstId> tiedReads;
-        for (std::size_t k = 0; k < src.outputCount; ++k) {
-            MirInstId const addr = lowerLvalueAddress(kids[k]);
+        // ⚠ ONE LOOP OVER THE SOURCE'S OUTPUT SECTION, NOT TWO PASSES SPLIT BY
+        // FORM. The operand expressions are lowered here and an lvalue may carry
+        // a side effect (`a[i++]`), so splitting the walk would reorder the
+        // source's own evaluations between two operands of one statement. Each
+        // operand's address is taken exactly ONCE, in source order, and only the
+        // LIST it lands in depends on the form.
+        for (std::size_t i = 0; i < src.outputCount; ++i) {
+            MirInstId const addr = lowerLvalueAddress(kids[i]);
             if (!addr.valid()) return false;
+            // A memory-form output IS its address and nothing else: no
+            // store-back target (the template wrote the object) and no read half
+            // (the same memory serves both roles).
+            if (asmOperandBindsMemoryForm(src.operands[i])) {
+                memOutAddrs.push_back(addr);
+                continue;
+            }
             outAddrs.push_back(addr);
-            if (!src.operands[k].constraint.isReadWrite) continue;
+            if (!src.operands[i].constraint.isReadWrite) continue;
             // ★★ THE READ HALF LOADS FROM THE ADDRESS ALREADY TAKEN — the
-            // operand expression is lowered ONCE. Re-lowering `kids[k]` as an
+            // operand expression is lowered ONCE. Re-lowering `kids[i]` as an
             // rvalue is the obvious spelling and it is a MISCOMPILE.
             // ✔MEASURED 2026-08-15 by running that exact mutant: on
             // `"+r"(p[i])` it emits a SECOND `const`/`mul`/`gep` chain, so the
@@ -9835,12 +9945,17 @@ struct Lowerer {
             // stamps the c21 Volatile flag, and `volatile`-qualified operands are
             // the common case in the headers this feature exists for.
             std::array<MirInstId, 1> const ld{addr};
-            MirInstId const val = emitScalarLoad(ld, hir.typeId(kids[k]), kids[k]);
+            MirInstId const val = emitScalarLoad(ld, hir.typeId(kids[i]), kids[i]);
             if (!val.valid()) return false;
             tiedReads.push_back(val);
         }
         std::vector<MirInstId> inputs;
-        inputs.reserve(src.operands.size() - src.outputCount + tiedReads.size());
+        inputs.reserve(memOutAddrs.size()
+                       + src.operands.size() - src.outputCount
+                       + tiedReads.size());
+        // The memory-form outputs FIRST — the order the descriptor loop filed
+        // their entries in, for the reason stated there.
+        inputs.insert(inputs.end(), memOutAddrs.begin(), memOutAddrs.end());
         for (std::size_t j = src.outputCount; j < src.operands.size(); ++j) {
             // ★★★ A MEMORY-FORM INPUT IS **ADDRESSED**, NOT READ, AND THAT IS THE
             // WHOLE DIFFERENCE BETWEEN `"m"` AND `"r"`. `"r"(*p)` hands the
@@ -9890,7 +10005,14 @@ struct Lowerer {
         // the C type of `out` in `"=r"(out)`. The register CLASS is the CONSTRAINT's
         // and is carried separately on the piece; the two are independent facts and
         // conflating them is the §4.4.5 defect.
-        auto pieceTypeFor = [&](std::size_t k) { return hir.typeId(kids[k]); };
+        // ⚠ `k` INDEXES `desc.outputs` (the RESULT-PIECE list), NOT the source's
+        // output section — see `regOutputKid`, which is the map between them.
+        auto pieceTypeFor = [&](std::size_t k) {
+            return hir.typeId(kids[regOutputKid[k]]);
+        };
+        // The HIR operand expression `desc.outputs[k]` was written on, for the
+        // store-back's `_Atomic`/`volatile` routing and its diagnostics.
+        auto pieceLvalueFor = [&](std::size_t k) { return kids[regOutputKid[k]]; };
 
         // The per-output register CLASSES, snapshotted BEFORE `desc` is moved into
         // the builder. `MirBuilder` deliberately exposes no descriptor reader — the
@@ -9947,7 +10069,7 @@ struct Lowerer {
             for (auto const& e : res.edges) {
                 if (!e.split) continue;
                 mir.beginBlock(e.successor);
-                for (std::size_t k = 0; k < src.outputCount; ++k) {
+                for (std::size_t k = 0; k < regOutputKid.size(); ++k) {
                     MirInstId const rp = mir.addReturnPiece(
                         res.terminator, static_cast<std::uint32_t>(k),
                         outClasses[k], pieceTypeFor(k));
@@ -9962,7 +10084,7 @@ struct Lowerer {
                     // `emitScalarLoad`, so the two halves of one operand were
                     // asymmetric.
                     std::array<MirInstId, 2> st{rp, outAddrs[k]};
-                    emitScalarStore(st, pieceTypeFor(k), kids[k]);
+                    emitScalarStore(st, pieceTypeFor(k), pieceLvalueFor(k));
                 }
                 mir.addBr(e.onward);
             }
@@ -9984,8 +10106,15 @@ struct Lowerer {
 
         // The non-terminator form. `resultType` is output 0's type (the instruction's
         // own result IS piece 0 — `Call`'s rule) or InvalidType when there are none.
+        // ⚠⚠ "NONE" IS `desc.outputs` BEING EMPTY, NOT `src.outputCount == 0`, AND
+        // THE DIFFERENCE IS A PROCESS ABORT RATHER THAN A WRONG ANSWER:
+        // `MirBuilder::addInlineAsm` calls `std::abort()` when a result type is
+        // supplied for a descriptor that declares no outputs (and again in the
+        // other direction). A statement whose only output is memory-form —
+        // `__asm__("nop %0" : "=m"(a))`, which gcc 13.3.0 compiles on both
+        // shipped targets — has `src.outputCount == 1` and NO result pieces.
         TypeId const resultType =
-            src.outputCount > 0 ? pieceTypeFor(0) : InvalidType;
+            regOutputKid.empty() ? InvalidType : pieceTypeFor(0);
         MirInstId const asmInst =
             mir.addInlineAsm(std::move(desc), inputs, resultType);
         if (!asmInst.valid()) return false;
@@ -9996,8 +10125,8 @@ struct Lowerer {
         // take a register the asm block has already overwritten. Piece 0 is
         // `asmInst` itself.
         std::vector<MirInstId> pieceVals;
-        pieceVals.reserve(src.outputCount);
-        for (std::size_t k = 0; k < src.outputCount; ++k) {
+        pieceVals.reserve(regOutputKid.size());
+        for (std::size_t k = 0; k < regOutputKid.size(); ++k) {
             if (k == 0) { pieceVals.push_back(asmInst); continue; }
             MirInstId const rp = mir.addReturnPiece(
                 asmInst, static_cast<std::uint32_t>(k),
@@ -10012,9 +10141,9 @@ struct Lowerer {
         // funnel does not license moving these stores up beside their producer, which
         // would break the producer→`ReturnPiece` adjacency `lir_callconv.cpp` fails
         // loud on.
-        for (std::size_t k = 0; k < src.outputCount; ++k) {
+        for (std::size_t k = 0; k < regOutputKid.size(); ++k) {
             std::array<MirInstId, 2> st{pieceVals[k], outAddrs[k]};
-            emitScalarStore(st, pieceTypeFor(k), kids[k]);
+            emitScalarStore(st, pieceTypeFor(k), pieceLvalueFor(k));
         }
         return true;
     }
@@ -10608,8 +10737,8 @@ struct Lowerer {
             }
             case HirKind::Unreachable: {
                 // A statement-position `Unreachable` (cst_to_hir synthesizes one
-                // after a provably-infinite loop — D-HIR-INFINITE-LOOP-NOT-
-                // TERMINATING — wrapping it as `Block{ loop, Unreachable }` so the
+                // after a provably-infinite loop — D-HIR-INFINITE-LOOP-NOT-TERMINATING
+                // — wrapping it as `Block{ loop, Unreachable }` so the
                 // HIR verifier's structural-termination check matches the dynamic
                 // truth). It lowers to a MIR `Unreachable` terminator on the open
                 // block. Control provably never arrives here, so the block (and
@@ -12593,8 +12722,8 @@ struct Lowerer {
     // such a member (the address is not known until link), so the whole
     // aggregate would otherwise fall to runtimeInit and trip the
     // bitfield-rvalue fail-loud guard. This is the AGGREGATE generalization of
-    // the F5 scalar mechanism (`tryClassifyAsSymbolAddr`, D-CSUBSET-SYMBOL-
-    // ADDRESS-GLOBAL): emit STATIC DATA with abs64 relocations at the member
+    // the F5 scalar mechanism (`tryClassifyAsSymbolAddr`, D-CSUBSET-SYMBOL-ADDRESS-GLOBAL):
+    // emit STATIC DATA with abs64 relocations at the member
     // offsets (the C-correct, gcc-matching placement) instead of a
     // __module_init__ store-chain.
     //

@@ -142,8 +142,8 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
 // Closed-table enum resolution. A miss is a malformed descriptor (the JSON
 // named an enumerator outside the closed set) → reported by the caller.
 //
-// ★ TABLES, NOT IF-CHAINS (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-
-// CLOSED-SET). These were two hand-written if-chains, each with its accepted
+// ★ TABLES, NOT IF-CHAINS (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+// These were two hand-written if-chains, each with its accepted
 // set RETYPED into the refusal message beside its call site — the same fact
 // owned twice, drifting the moment a spelling is added or renamed. The rows are
 // now the only owner and the refusals render `allNames(…)` over them.
@@ -1409,8 +1409,7 @@ namespace {
 // recipe — `WaitForSingleObject; if(res) GetExitCodeThread; CloseHandle`, its canonical
 // StructCfMarkers rederived module-wide after finish()). STILL deferred: thrd_equal · the
 // timed-waits AND thrd_sleep (a pe timespec read has an unverified time_t/long-width
-// layout — a wrong offset is a silent miscompile → elf-FFI-only, D-CSUBSET-C11-THREADS-
-// TIMED).
+// layout — a wrong offset is a silent miscompile → elf-FFI-only, D-CSUBSET-C11-THREADS-TIMED).
 //
 // <stdio.h> (6): the WHOLE printf/scanf family the UCRT leaves undefined — `printf`,
 // `fprintf`, `sprintf`, `snprintf`, `vfprintf`, `sscanf`. `ucrtbase.dll` exports NOT ONE of
@@ -1451,8 +1450,8 @@ constexpr RecipeRow kRecipes[] = {
     {"thrd_create", ShimFamily::Threads},   {"thrd_join", ShimFamily::Threads},
     {"call_once", ShimFamily::Threads},
     // <stdio.h> printf/scanf family — synthesized over the UCRT __stdio_common_v* cores,
-    // which ucrtbase exports in place of any concrete printf/sprintf/… (D-FFI-PE-CRT-UCRT-
-    // MIGRATION Phase 3). See the note above for why these six and no more.
+    // which ucrtbase exports in place of any concrete printf/sprintf/…
+    // (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3). See the note above for why these six and no more.
     {"printf", ShimFamily::Stdio},          {"fprintf", ShimFamily::Stdio},
     {"sprintf", ShimFamily::Stdio},         {"snprintf", ShimFamily::Stdio},
     {"vfprintf", ShimFamily::Stdio},        {"sscanf", ShimFamily::Stdio},
@@ -1604,8 +1603,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                              "includes", "symbols", "constants", "floatConstants",
                              "typedefs", "structs", "unions", "macros"});
 
-    // (3.pre) TYPEDEFS resolved FIRST — Option C (D-FFI-DESCRIPTOR-TYPEDEF-NAME-
-    // RESOLUTION). A descriptor's own typedefs are decoded BEFORE its symbols /
+    // (3.pre) TYPEDEFS resolved FIRST — Option C (D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION).
+    // A descriptor's own typedefs are decoded BEFORE its symbols /
     // constants / structs, and each resolved `name -> TypeId` is threaded into the
     // working `mergedNamedTypes` so a later signature, struct field, or typedef can
     // spell an earlier descriptor typedef BY NAME (`ptr<Tcl_Obj>`) instead of

@@ -1,0 +1,32 @@
+{
+  "$comment": "D-LIR-ASM-TEMPLATE-EMITTING-NO-INSTRUCTION-ABORTS-WITH-NO-DIAGNOSTIC: an inline-asm template that PARSES but lowers to ZERO instructions aborted the compiler. ★★★ THIS EXAMPLE WAS BORN RED — before the fix `int main(void){ __asm__(\"   \"); return 42; }` exited 127 with `dss::Lir fatal: LirBuilder::lastInst: no instruction has been appended`: no diagnostic code, no source position, nothing naming the construct. ✔MEASURED aborting on `pe64-x86_64` and `elf64-x86_64` for all five shapes in main.c, while gcc 13.3.0 compiles and runs every one returning 42 — one working reference makes it REQUIRED (bar §A.3b). ★★★ THE DEFECT WAS SHADOW STATE, NOT ASSEMBLY: `mir_to_lir` needed the id `addInst` will mint next, `LirBuilder` exposed no count, so the lowering kept a `bool` MIRRORING the arena — and because the assembly engine emits straight into the builder, bypassing the site that maintained the mirror, the asm path re-derived it FROM THE SHAPE OF THE INPUT (did the template carry a non-blank line?). That argument enumerated its exceptions — a directive, a label, both already refusals — and missed a comment, whitespace and a bare newline, so the mirror was set true over an EMPTY arena and `lastInst()` aborted. The fix adds `LirBuilder::hasAnyInst()`, the count whose absence forced the mirror, and DELETES the mirror rather than repairing the proxy. ★★ WHY STATEMENT 1 IS THE WITNESS: `lastInst()` aborts only on an EMPTY arena, so only a zero-instruction template with nothing emitted before it in the module reaches the abort — ✔MEASURED, the same template after any other statement compiled rc=0 both before and after. Statements 2–5 are coverage of the shapes sharing that path; the ordering is load-bearing and main.c says so, so a later reader cannot disarm the example by tidying it. ⚠ NO `#` COMMENT SHAPE ON PURPOSE: it is the same lowering path but an x86 gas spelling — ✔MEASURED, the arm64 dialect refuses it fail-loud with `error[P0009]`, which is correct, so a portable example must not carry it. ⓘ THE EXIT CODE WITNESSES COMPILE+LINK+RUN, which is exactly what the abort denied; it does NOT witness the memory clobber in statement 6 (both loads read the same unchanging seed, so a lost barrier still returns 42) — that was measured separately by disassembly: two loads of the global with no CSE, and an image byte-identical to the empty-template control. ⚠ THE `volatile` SEED IS LOAD-BEARING: without it the release pipeline folds the value before lowering and the arms stop testing the path they name.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

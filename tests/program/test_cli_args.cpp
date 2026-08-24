@@ -212,8 +212,8 @@ TEST(CliArgs, CompileModeRejectsEmptyFileList) {
     EXPECT_EQ(r.error().kind, CliArgsError::EmptyFileList);
 }
 
-// ★★ `--language` IS OPTIONAL FOR --compile (D-DRIVER-ASM-DIALECT-SELECTED-BY-
-// TARGET). This test previously asserted the OPPOSITE — `MissingLanguage` —
+// ★★ `--language` IS OPTIONAL FOR --compile (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET).
+// This test previously asserted the OPPOSITE — `MissingLanguage` —
 // and the assertion was correct until a second assembly dialect shipped. Both
 // `asm-x86_64-att` and `asm-arm64-gas` declare `.s`/`.S`, so the extension
 // cannot name one and a single `--language` would force the wrong dialect on

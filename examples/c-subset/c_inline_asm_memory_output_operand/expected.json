@@ -1,0 +1,32 @@
+{
+  "$comment": "D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED: the first runnable witness that the `\"m\"` MEMORY constraint reaches the template in the OUTPUT section — `\"=m\"`, `\"+m\"` and `\"=&m\"`. ★★★ THIS EXAMPLE WAS BORN RED. ✔MEASURED through the real CLI on a clean HEAD build, all six runnable cells (x86_64:pe64-x86_64-windows-exec, x86_64:elf64-x86_64-linux-exec, arm64:elf64-aarch64-linux-exec x debug/release): `__asm__(\"movl %1, %0\" : \"=m\"(*p) : \"r\"(v))` was refused with `error[H0009] … operand 0 (constraint \"=m\") binds the memory form in the OUTPUT section — the template writes that memory itself, so there is no register to capture and no result piece to anchor`, and `\"+m\"` was refused BY THE SAME PREDICATE with the byte-identical message at all six. gcc 13.3.0 compiles AND RUNS both on x86_64-linux-gnu and aarch64-linux-gnu, at -O0 and -O2 (✔MEASURED: exit 42 natively and under qemu-aarch64; `movq %rdx, (%rax)` / `str x1, [x0]` behind a call, `addq $5, -16(%rbp)` for the read-write spelling), and one working reference makes the behaviour REQUIRED. ★★★ WHY THE EXIT CODE IS A RESULT AND NOT A STRUCTURE PIN: `\"=m\"` differs from `\"=r\"` in that the template writes the OBJECT rather than a register, and the machine names an object by its ADDRESS — a regression that lowered the operand's VALUE into the bound register still compiles rc=0, still emits a memory form and still assembles. It just writes through a wild pointer. That is a crash or a corrupted neighbour with no diagnostic anywhere, so the only instrument that can see it is EXECUTION. ★★ EIGHT SHAPES, EACH ITS OWN EXIT CODE: (1) the address arrives as a PARAMETER, behind a call; (2) the address is a FRAME OFFSET, lowered directly in `main` — the shape the optimizer can see through, which is why the `release` arm is mandatory rather than decorative, and a statement with NO result piece at all (getting that wrong is a `MirBuilder::addInlineAsm` process ABORT, not a wrong answer); (3) the SYMBOLIC `%[name]` spelling, a second row pointing at the same register; (4) a GLOBAL, whose address is a SYMBOL rather than a frame offset; (5) `\"+m\"` read-modify-write, which is also the MIXED shape whose output 0 is memory-form while the only result piece belongs to output 1; (6) MIXED WIDTHS — a 32-bit `\"=m\"` ahead of a 64-bit `\"=r\"` in ONE statement, so the result piece's type must come from the REGISTER output rather than from the memory operand preceding it in the source's output section; (7) `\"=&m\"` earlyclobber, whose promise is already true by construction here (✔MEASURED in the emitted code: `lea 0xb0(%rsp),%r13` for the address and `%r15` for the input — different registers); (8) TWO memory-form outputs in one statement written from two different inputs, so a carriage that shared or crossed their address registers produces the wrong pair rather than the right one twice. ⚠ THE `volatile` SEEDS ARE LOAD-BEARING for the sibling `c_inline_asm_memory_operand`'s reason: without them release folds the values to constants before lowering, silently changing which mechanism each arm tests. ⚠ WHY `long long` FOR THE READ-MODIFY-WRITE PAIR AND THE WIDE OPERAND: `long` is 64-bit under LP64 and 32-bit under LLP64, so one template spelling cannot serve both x86_64 formats — ✔MEASURED, the `long` spelling compiled on elf64 and failed on pe64 with `error[A0008] 'movq' declares operand width 64, but its register operands are 32 bits`; `long long` and `int` have one width across all four shipped formats. ⚠ THE x86_64 READ-MODIFY-WRITE ARM WRITES `addq $5, %0` IN PLACE AS OF 2026-08-23, and the sentence here used to explain the workaround it replaced (a load, an add in a register, and a store back, because memory-destination arithmetic was refused with `error[A0008] 'addl' produced 4 LIR operand(s) at width 32, and no candidate target opcode encodes that shape`). That refusal was a MISSING ROW rather than a missing capability, and the rows landed (D-TARGET-X86-64-DECLARES-NO-MEMORY-DESTINATION-ARITHMETIC). The aarch64 arm still loads/adds/stores because that ISA has no memory-destination arithmetic — ✔MEASURED, gcc emits the same three instructions there. Shape 5 keeps its MIXED property: both arms end by reading `%0` back into `%1`, so the statement still pairs a memory-form output owning no result piece with a register output owning the only one, and `scratch` is now ASSERTED (exit 11) instead of written and ignored. ⚠ NO `%w0`-style operand MODIFIER anywhere: no shipped target declares a width-view vocabulary and the semantic tier refuses one fail-loud — ✔MEASURED for THIS constraint rather than inherited from the sibling example, `__asm__(\"str %w1, %0\" : \"=m\"(m) : \"r\"(s))` on arm64:elf64-aarch64-linux-exec is `error[S0067] … the inline-asm template uses the operand modifier `%w` … no shipped target declares its width-view vocabulary` (D-CSUBSET-INLINE-ASM-OPERANDS) — so every operand is used at its own natural width. ✔All four legs COMPILE at both configs (measured); the three runnable legs RUN and return 42 on this host (pe64 natively, elf64 x86_64 under WSL, elf64 aarch64 under qemu-aarch64).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

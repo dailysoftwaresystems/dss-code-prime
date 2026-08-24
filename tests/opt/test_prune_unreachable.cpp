@@ -266,11 +266,11 @@ TEST(PruneUnreachable, SwitchAllArmsReturnOrphansExit) {
 //     corpus + the `test_hir_verifier` warning pins.
 //   * a provably-infinite loop whose body returns (`while(1){return;}`,
 //     `for(;;){return;}`, `do{return;}while(1)`) is wrapped as
-//     `Block{ loop, Unreachable }` in HIR lowering (D-HIR-INFINITE-LOOP-NOT-
-//     TERMINATING) so the function structurally terminates; pinned by the
+//     `Block{ loop, Unreachable }` in HIR lowering (D-HIR-INFINITE-LOOP-NOT-TERMINATING)
+//     so the function structurally terminates; pinned by the
 //     `nonmain_*_inf_return` corpus. (The earlier HirBuilder double-attach on
-//     such non-terminating `main`s was fixed in D-HIR-LOOP-BODY-ONLY-RETURN-
-//     DOUBLE-ATTACH.) The `for`-with-condition returning-body case above still
+//     such non-terminating `main`s was fixed in D-HIR-LOOP-BODY-ONLY-RETURN-DOUBLE-ATTACH.)
+//     The `for`-with-condition returning-body case above still
 //     exercises the update-block orphan in THIS prune file.
 
 // ── PHI INTEGRITY (pins acceptPhiIncoming) ─────────────────────────────

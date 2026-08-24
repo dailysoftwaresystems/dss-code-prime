@@ -578,8 +578,8 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
            "JSON-array order declared in c-subset.lang.json";
 }
 
-// ── Deep-nest predictive-prune O(N) pin (D-PARSE-SPECULATION-OPERAND-
-//    QUADRATIC) ──────────────────────────────────────────────────────────
+// ── Deep-nest predictive-prune O(N) pin (D-PARSE-SPECULATION-OPERAND-QUADRATIC)
+//    ──────────────────────────────────────────────────────────
 //
 // `((((…0…))))` is the C cast-vs-paren worst case: at EVERY nesting level
 // `operand`'s speculative alt sees `(`, and pre-fix tried the `castExpr`
@@ -604,17 +604,28 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
 // CI timing jitter while still catching an O(N²) reintroduction (which would
 // be orders of magnitude over, not a small multiple).
 //
-// NOTE: only the PARSE is exercised here — the downstream semantic / HIR /
-// MIR passes recurse on the host stack and overflow at ~25 levels
-// (D-PARSE-DEEP-FRONTEND-STACK, a SEPARATE anchor), so this stays at the
-// parser boundary deliberately.
+// NOTE: only the PARSE is exercised here, and that scoping is deliberate — a
+// parser pin should measure the parser. ⚠⚠ THE REASON THIS NOTE USED TO GIVE
+// WAS *"the downstream semantic / HIR / MIR passes recurse on the host stack
+// and overflow at ~25 levels"*, and that reason IS FALSE — the row it cited,
+// D-PARSE-DEEP-FRONTEND-STACK, HAS BEEN CLOSED by the plan-24 iterative
+// traversal, which put every expression / statement / const-eval family onto
+// an explicit heap work-stack. ✔RE-MEASURED at the CLI 2026-08-24 on
+// x86_64:pe64-x86_64-windows-exec: `return ((…42…));` nested 25, 100 and 900
+// deep each compiles rc=0 through the WHOLE pipeline and the program RUNS
+// returning 42. The wording is corrected in place rather than deleted because
+// the scoping decision it justified is still right and the next author would
+// otherwise re-derive the same stale reason
+// (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
 //
 // NOTE 2 (the generous 8× ceiling): the parse WORK is O(N) — the companion
 // `FlatChainParseWorkIsLinear` pins the shared machinery flat — but this
 // RECURSIVE nest carries a residual ~exp-1.7 wall-clock super-linearity that
 // is a memory-hierarchy constant of the N-deep host recursion (live call
 // stack + strided unwind), NOT an algorithmic term. It is bounded/moot in
-// practice (the 256 depth cap + the recursion-bound downstream frontend) and
+// practice by the grammar's own configured `maxExpressionDepth` backstop —
+// NAMED rather than quoted, because this note previously carried the literal
+// `256` and c-subset.lang.json has since raised it — and the residual is
 // documented as D-PARSE-DEEP-NEST-RECURSION-MEMORY; the 8× bound is sized to
 // absorb it while still catching an O(N²) speculation regression (orders of
 // magnitude over).
@@ -684,8 +695,8 @@ TEST(ParserSpeculation, DeepNestCastVsParenIsLinear) {
 
     // The deep parse recurses one host-stack frame per paren level, so run on
     // a large-stack thread — the parser's own stack ceiling (not the
-    // speculation cost) is otherwise the depth limit (D-PARSE-DEEP-FRONTEND-
-    // STACK). N=500 and N=1000 are the task's deep-nest proof points; 1000 is
+    // speculation cost) is otherwise the depth limit (D-PARSE-DEEP-FRONTEND-STACK).
+    // N=500 and N=1000 are the task's deep-nest proof points; 1000 is
     // exactly 2× 500, so an O(N) parse scales ~2× and an O(N²) regression
     // ~4× — and the historical bug's per-level panic-scan blowup pushes it
     // FAR past that (the pre-fix CLI hung for >150 s at N=300).
@@ -929,16 +940,28 @@ flatChainParseMetrics(std::shared_ptr<GrammarSchema const> const& schema,
 // linear one does not. Grammar-agnostic (no magic per-element constant):
 //   (1) NODE count — the O(N) STRUCTURE (the tree the parse emits);
 //   (2) token ACCESS count — the O(N) total WORK (peek+advance, incl. every
-//       speculative re-scan). A backtracking O(N²) (the D-PARSE-SPECULATION-
-//       OPERAND-QUADRATIC class) re-consumes a growing prefix → the access
+//       speculative re-scan). A backtracking O(N²) (the D-PARSE-SPECULATION-OPERAND-QUADRATIC
+//       class) re-consumes a growing prefix → the access
 //       first difference would GROW; a per-node rescan that emits no extra
 //       nodes (a time-only O(N²) the node pin misses) also shows here.
 // This REPLACES a wall-clock ratio pin that flaked on shared CI at a sub-ms
 // baseline: work-count is exact, so the guard is deterministic AND strictly
-// stronger (it catches the same O(N²) classes without measuring time). The
-// deep-nest residual (an N-deep HOST-recursion memory-hierarchy constant
-// factor, moot under the depth cap) is the separate, still-open
+// stronger (it catches the same O(N²) classes without measuring time).
+// ⚠⚠ THIS PARAGRAPH USED TO END *"the deep-nest residual (…) is the separate,
+// still-open <row>"*, and the status half of that sentence WAS FALSE by the
+// time anyone read it: the row IS CLOSED. It is corrected in place rather than
+// deleted, because the TECHNICAL half is exactly why this flat control exists
+// and the two halves are easy to conflate
+// (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+// WHAT SURVIVES, and it is the whole reason for the pair: the RECURSIVE
+// deep-nest sibling carries an N-deep memory-hierarchy constant factor that
+// this non-recursive chain does not, which is why the two tests carry
+// different bounds — the separate row is
 // D-PARSE-DEEP-NEST-RECURSION-MEMORY.
+// ⚠ FOR ITS STATUS ASK THE INSTRUMENT — `python
+// scripts/check-anchor-balance/check-anchor-balance.py` — never a comment: a
+// status word in prose is a measurement with no instrument attached, which is
+// how this sentence rotted in the first place.
 TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(loaded.has_value());
@@ -1096,8 +1119,8 @@ TEST(ParserSpeculation, SpeculativeOptionalBodyExceedsBudgetParsesNonSpeculative
 // VLA C4c (§B): speculative INLINE repeat-alt. The schema compiler must honor
 // `"speculative": true` on an inline `{"repeat": {"alt": […], …}}` by
 // propagating the flag onto the loopEntry AltChoice the parser dispatches at
-// (grammar_schema_json.cpp "repeat" arm) — reusing the D-PARSE-SPECULATIVE-
-// OPTIONAL skip-branch machinery so the loop-exit continuation is excluded
+// (grammar_schema_json.cpp "repeat" arm) — reusing the D-PARSE-SPECULATIVE-OPTIONAL
+// skip-branch machinery so the loop-exit continuation is excluded
 // from candidate enumeration. Without the fix the flag lands on the inner
 // alt's Position (`innerStart`), which the parser never dispatches at, so the
 // repeat runs NON-speculatively and commits to the FIRST FIRST-matching branch

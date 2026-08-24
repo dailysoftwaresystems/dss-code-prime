@@ -971,8 +971,8 @@ constexpr std::uint32_t kMhSubsections = 0x2000;  // MH_SUBSECTIONS_VIA_SYMBOLS
         ModuleSymbol{SymbolId{10}, "_realfn", SymbolBinding::Global,
                      SymbolVisibility::Default},
         // `static` in the source: the writer carves the NAME to `_sym_11` and
-        // emits bare N_SECT (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-
-        // COLLISION), which is precisely why the reader cannot recover it by
+        // emits bare N_SECT (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION),
+        // which is precisely why the reader cannot recover it by
         // name or by binding and must read the wire fields instead.
         ModuleSymbol{SymbolId{11}, "_statfn", SymbolBinding::Local,
                      SymbolVisibility::Default},

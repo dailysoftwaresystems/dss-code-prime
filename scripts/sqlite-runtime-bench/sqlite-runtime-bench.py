@@ -2,8 +2,8 @@
 # PURPOSE: measure the RUNTIME of an emitted sqlite3 binary, the standing runtime-differential instrument.
 """sqlite-runtime-bench.py — RUNTIME of an emitted sqlite3 binary, measured.
 
-The standing runtime-differential instrument (P10, D-OPT7-CROSSCU-LTO-
-SINGLE-OPTIMIZE): compile-time and exe size are PROXIES for output quality;
+The standing runtime-differential instrument (P10, D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE):
+compile-time and exe size are PROXIES for output quality;
 this measures the thing itself. Rule context: the shipped unit-stage variant
 must not be slower at RUNTIME than the incumbent, same machine, repeat
 protocol, median.

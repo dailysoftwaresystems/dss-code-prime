@@ -2266,8 +2266,8 @@ TEST(SemanticAnalyzerCSubset, PackedStructFollowedByDeclaratorParses) {
 }
 
 // FAIL-LOUD: packed + a bit-field member → S_PackedBitfieldUnsupported (bit-granular
-// packed packing is a distinct, deferred algorithm — D-CSUBSET-PACKED-BITFIELD-
-// INTERACTION). NEVER a silent NON-packed layout.
+// packed packing is a distinct, deferred algorithm —
+// D-CSUBSET-PACKED-BITFIELD-INTERACTION). NEVER a silent NON-packed layout.
 TEST(SemanticAnalyzerCSubset, PackedBitfieldFailsLoud) {
     auto cu = buildShippedUnit("c-subset", {
         "struct S { int a : 3; } __attribute__((packed));\n"
@@ -10473,8 +10473,8 @@ TEST(SemanticAnalyzerCSubset, ConstexprExactRepresentabilityCurrentlyUnenforced)
         << "documents the OPEN 6.7.1p10 boundary — update when the deferral closes";
 }
 
-// ── FC17.5 (D-CSUBSET-EMPTY-INITIALIZER + D-CSUBSET-FUNC-PREDEFINED-
-//    IDENTIFIER): C23 {} empty/scalar brace-init × constexpr, and the C99
+// ── FC17.5 (D-CSUBSET-EMPTY-INITIALIZER + D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER):
+//    C23 {} empty/scalar brace-init × constexpr, and the C99
 //    6.4.2.2 `__func__` predefined identifier ────────────────────────────────
 
 // F3 (C23 6.7.10p11 × 6.7.1): an EMPTY brace initializer zero-initializes —
@@ -16152,8 +16152,8 @@ TEST(SemanticAnalyzerCSubset, InlineAsmEmptySectionFormsAreAccepted) {
 // (`::`, `::`) — whitespace BETWEEN two fused pairs is lexically irrelevant, so
 // those two share ONE route — and the loop was missing the ALL-PLAIN form
 // altogether, which is the only spelling that reaches `asmLabelsTail` unfused.
-// Two routes claimed as three, with the third one absent: [[D-CONFIG-COMMENT-
-// CLAIM-ROT]] in test prose. The four forms and their routes now are
+// Two routes claimed as three, with the third one absent:
+// [[D-CONFIG-COMMENT-CLAIM-ROT]] in test prose. The four forms and their routes now are
 //     ("" ::::)      ::  ::         asmInputsTailFused → asmLabelsTailFused
 //     ("" :: ::)     ::  ::         the SAME route — kept as the WHITESPACE
 //                                   CONTROL, the pair that proves the fusion is

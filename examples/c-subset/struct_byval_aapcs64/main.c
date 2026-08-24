@@ -21,8 +21,8 @@
  * every far field (2nd FPR/GPR piece, the @16 sret field) must survive the transfer.
  *   sumPairD=10+5=15 · mkTriF=3+4+0=7 · mkTri=2+1+4=7 · sumBig=(2+1)+8+2=13 → 42.
  * The aggregate types use `typedef` because a top-level `struct Tag` specifier as a
- * function RETURN type is a pre-FC4 grammar residue (D-CSUBSET-STRUCT-BODY-VARDECL-
- * POSITION); the typedef-name return type is the idiomatic reachable form and
+ * function RETURN type is a pre-FC4 grammar residue (D-CSUBSET-STRUCT-BODY-VARDECL-POSITION);
+ * the typedef-name return type is the idiomatic reachable form and
  * exercises the identical ABI codegen. AAPCS64 runtime closes on arm64-ELF under
  * qemu (SysV/Win64 take the hidden-arg sret path; Apple Mach-O is the same struct
  * ABI but runs only on the macos CI leg). RED-ON-DISABLE: a dropped HFA piece, a

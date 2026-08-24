@@ -208,20 +208,43 @@ variantNegMagnitude(std::span<LirOperand const>        instOps,
 // W-forms vs their 64-bit siblings). A variant with absent immMin/immMax
 // matches ANY immediate magnitude (every pre-existing variant); a
 // magnitude-keyed variant matches only when its value-bearing operand's
-// magnitude is in [immMin, immMax]. The D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-
-// SUB SIGN axis (`negValue`) selects WHICH magnitude the range gate reads:
+// magnitude is in [immMin, immMax]. The D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB
+// SIGN axis (`negValue`) selects WHICH magnitude the range gate reads:
 // the non-negative half (default) or the |value| of a strictly-negative
 // operand (negValue=true, e.g. arm64's `SUB Xd,Xn,#|disp|` negative-disp
 // lea vs its positive `ADD` sibling). Shared by BOTH walkers (x86_variable +
 // fixed32) — all three axes are format-agnostic by construction.
+//
+// D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE adds a FOURTH axis,
+// `memoryIsDestination` (`lirInstMemoryIsDestination(flags)`): whether the
+// instruction's memory reference occupies its destination position. A variant
+// with no `memoryDestination` key matches EITHER — full back-compat, and the
+// property `store` needs, since one dialect reaches it through the memory-
+// destination path and another through the register-destination path. Both
+// callers derive the argument from the SAME `flags` byte they derive
+// `instWidthBits` from, which is what keeps the text lowering's election and
+// the encoder's variant choice identical.
 [[nodiscard]] inline bool
 variantMatchesInst(std::span<LirOperand const>  instOps,
                    std::uint8_t                 instWidthBits,
+                   bool                         memoryIsDestination,
                    TargetEncodingVariant const& v) noexcept {
     if (v.guardWidthBits != 0 && v.guardWidthBits != instWidthBits) {
         return false;
     }
     if (!operandsMatchGuard(instOps, v.operandKinds)) {
+        return false;
+    }
+    // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE: the
+    // MEMORY-DIRECTION axis. Absent ⇒ the variant does not discriminate and
+    // matches either direction (every pre-existing variant, `store`
+    // included). Present ⇒ it must equal the instruction's own flag. This is
+    // the ONLY axis that can separate `cmp mem, reg` (39 /r) from
+    // `cmp reg, mem` (3B /r): their operand lists are byte-identical, so
+    // both directions would otherwise elect the first-declared variant and
+    // one spelling would silently encode the other's instruction.
+    if (v.memoryDestination.has_value()
+        && *v.memoryDestination != memoryIsDestination) {
         return false;
     }
     // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the SIGN axis selects which

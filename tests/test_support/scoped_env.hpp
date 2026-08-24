@@ -15,8 +15,8 @@
 // `tests/program/test_system_dirs_cwd_independent.cpp`. A duplication row that
 // undercounts its own subject is the same instrument failure this tree has been
 // burned by before — enumerate with a matcher, never from memory.
-// ✅ ALL FIVE are now repointed here (`D-TEST-SCOPED-ENV-STRAGGLERS-IN-TESTS-
-// PROGRAM`, 2026-08-13) — the two above were the last, and the census in
+// ✅ ALL FIVE are now repointed here (`D-TEST-SCOPED-ENV-STRAGGLERS-IN-TESTS-PROGRAM`,
+// 2026-08-13) — the two above were the last, and the census in
 // `test_scoped_env.cpp` now asserts this file is the ONLY definition under
 // `tests/`, with the walk carrying its own positive control so an all-clear
 // cannot come from a walk that read nothing.

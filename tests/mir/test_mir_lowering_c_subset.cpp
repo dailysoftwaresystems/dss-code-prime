@@ -133,8 +133,8 @@ struct Lowered {
     if (auto t = TargetSchema::loadShipped(targetName); t.has_value()) {
         mirCfg.aggregateLayout       = (*t)->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
-        // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75 (D-TARGET-
-        // CHAR-SIGNEDNESS-PER-PLATFORM): thread the RESOLVED bare-`char`
+        // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75
+        // (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM): thread the RESOLVED bare-`char`
         // signedness exactly as compile_pipeline.cpp does, so the char→int
         // promotion lowers as SExt (signed) or ZExt (unsigned). ★ Routed
         // through the REAL production accessor and fed the SHIPPED format's own

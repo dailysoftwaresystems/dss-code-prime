@@ -63,8 +63,8 @@ std::uint16_t op(std::string_view mnemonic) {
     ImplicitRegisterConstraint c;
     // ⚠ `rax` appears in BOTH `outputs` and `clobbered`, and that is not
     // decoration: `LirBuilder::regConstraintPoolAdd` enforces
-    // `outputs ⊆ clobbered` (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-
-    // SUBSET-OF-CLOBBERED), so a set that declared `rax` an output
+    // `outputs ⊆ clobbered` (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED),
+    // so a set that declared `rax` an output
     // without clobbering it would abort the process here instead of
     // reaching the verifier rule this fixture exists to exercise.
     c.inputNames        = {"rcx"};

@@ -177,8 +177,8 @@ enum class TargetCondCode : std::uint8_t {
     Ule = 7,  // unsigned <=
     Ugt = 8,  // unsigned >
     Uge = 9,  // unsigned >=
-    // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-
-    // FCMP adjudication): FLOAT condition codes over the flags an FP
+    // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-FCMP
+    // adjudication): FLOAT condition codes over the flags an FP
     // compare instruction sets (x86 UCOMISD/UCOMISS → ZF/PF/CF; arm64
     // FCMP → NZCV). These are SEPARATE entries from the integer codes
     // because the (predicate → ISA condition) mapping diverges per
@@ -1030,8 +1030,8 @@ enum class OperandKindFilter : std::uint8_t {
                     // signed 32-bit displacement for [base+disp]
                     // addressing. Wired to `Disp32Mem` to emit 4 LE
                     // bytes after the ModR/M (and SIB when present).
-    BlockRef  = 5,  // `LirOperand{kind == BlockRef}` — D-CSUBSET-
-                    // WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): refers
+    BlockRef  = 5,  // `LirOperand{kind == BlockRef}` —
+                    // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): refers
                     // to an INTRA-FUNCTION basic block. Wired to the
                     // `BlockRel32` slot on x86 (4-byte trailing PC-
                     // relative displacement, resolved at assemble time
@@ -1571,11 +1571,44 @@ enum class EncodingSlotKind : std::uint8_t {
     // round-trip oracle recovers the ORIGINAL negative LIR operand value
     // rather than the raw field.
     Imm16Inverted = 31,
+    // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: TWO immediate bytes appended after
+    // the opcode (and ModR/M + SIB, when present), little-endian — the `iw`
+    // field of the 16-bit immediate forms (`mov r/m16, imm16` = 66 C7 /0 iw,
+    // `add/sub/and/or/xor/cmp r/m16, imm16` = 66 81 /N iw).
+    //
+    // ★★★ WHY IT IS NOT `Imm16`, WHICH IS THE OBVIOUS NAME AND IS ALREADY
+    // TAKEN BY A DIFFERENT MACHINE FACT. `Imm16` is a 16-bit BIT-WINDOW at
+    // bits 5..20 of a 32-bit fixed word (AArch64 MOVZ), so `slotShapeFor`
+    // binds it to the `fixed32` shape and `validate()` rejects it under an
+    // `x86-variable` opcode. This slot is the APPENDED-BYTES family — the
+    // one `Imm8` (1 byte), `Imm32` (4 bytes) and `Imm64` (8 bytes) belong to
+    // — and the width alone does not name it. Same relationship as
+    // `Imm12` / `Imm12Scaled` / `Imm12HiLo24` one level up: identical
+    // nominal width, different encode semantics, therefore distinct slots
+    // with qualified names.
+    //
+    // ⚠ DECLARING THE VARIANT WITH THE EXISTING `imm32` SLOT INSTEAD WOULD
+    // EMIT FOUR BYTES WHERE THE INSTRUCTION TAKES TWO — a corrupt
+    // instruction stream with no diagnostic anywhere. That is the failure
+    // this slot exists to make impossible, not merely a missing convenience.
+    //
+    // ENCODE CONTRACT (x86_variable.cpp `wireImm16`): the wired value must
+    // fit the 2-byte field read either as SIGNED or as UNSIGNED —
+    // [-32768, 65535] — because AT&T writes both `$-1` and `$65535` for the
+    // same halfword. Anything outside fails loud
+    // (`A_ImmediateOperandOutOfRange`); it never silently truncates.
+    //
+    // GENERIC BY CONSTRUCTION: any variable-length ISA with a 2-byte
+    // trailing immediate wires this slot. The variant GUARD vocabulary is
+    // unchanged — the operand KIND filter stays `"imm32"` (the
+    // `LirOperandKind::ImmInt` discriminator, whose name is historical); the
+    // SLOT decides the emitted width, exactly as `Imm8` already does.
+    Imm16Bytes = 32,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 32> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 33> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -1608,6 +1641,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 32> kEncodingSlotKindTable{{{
     { EncodingSlotKind::AbsoluteDisp32Mem, "absdisp32.mem" },
     { EncodingSlotKind::MemRelocDisp32,    "memreloc.disp32" },
     { EncodingSlotKind::Imm16Inverted, "imm16.inverted" },
+    { EncodingSlotKind::Imm16Bytes,   "imm16.bytes"    },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -1631,7 +1665,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 32,
+static_assert(kEncodingSlotKindCount == 33,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -1650,6 +1684,10 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Imm8:
+        // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: the 2-byte APPENDED immediate is
+        // an x86-variable construct (trailing bytes after ModR/M), unlike the
+        // fixed32 `Imm16` bit-window it shares a nominal width with.
+        case EncodingSlotKind::Imm16Bytes:
         case EncodingSlotKind::Disp32:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
@@ -1894,6 +1932,10 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Imm8:
+        // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: a literal 2-byte immediate,
+        // never a linker-patched field — a 16-bit displacement reaches no
+        // symbol on this ISA.
+        case EncodingSlotKind::Imm16Bytes:
         // D-CSUBSET-BITFIELD-WIDE-UNIT: the `mov r64, imm64` slots write
         // the wide value / opcode-byte register directly — no relocation.
         case EncodingSlotKind::Imm64:
@@ -1948,8 +1990,8 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
             // is `RipRelDisp32` above; it's distinct because it forces
             // the ModR/M state (mod=00 rm=101) in addition to the
             // disp32 patch site, where Disp32 alone (e.g. `call rel32`)
-            // has no associated ModR/M byte. CondCodeNibble (D-CSUBSET-
-            // WHILE-LOOP-SUBSTRATE) writes into the opcode byte from
+            // has no associated ModR/M byte. CondCodeNibble
+            // (D-CSUBSET-WHILE-LOOP-SUBSTRATE) writes into the opcode byte from
             // the inst payload — no symbol. BlockRel32 patches a 4-byte
             // intra-function displacement at assemble time — also no
             // symbol-tier relocation.
@@ -2100,6 +2142,31 @@ struct DSS_EXPORT TargetEncodingVariant {
     // on a variant with NEITHER an `imm32` NOR a `memoffset` operand (no
     // value to sign-route on).
     bool                               negValue = false;
+    // ── MEMORY-DIRECTION routing axis — the JSON key
+    // `guard.memoryDestination` (bool). Anchor:
+    // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE.
+    //
+    // ABSENT (nullopt) ⇒ this variant does not discriminate on the memory
+    // reference's ROLE — every pre-existing variant, including `store`,
+    // whose one operand shape is reached from a destination-LAST dialect's
+    // memory-destination path AND from a destination-FIRST dialect's
+    // register-destination path and must stay electable from both.
+    //
+    // PRESENT ⇒ the variant matches only an instruction whose
+    // `kLirInstFlagMemoryIsDestination` agrees with it. `true` is the
+    // direction that reads memory as the operation's LEFT operand
+    // (x86 `39 /r` — `cmp mem, reg`); `false` is the direction that reads
+    // it as the right one (`3B /r` — `cmp reg, mem`). The two build the
+    // BYTE-IDENTICAL LIR operand list, so this axis is the only thing that
+    // can separate them — and without it, declaring either would silently
+    // encode the other for the opposite spelling.
+    //
+    // ⚠ A `true`/`false` PAIR IS THE POINT: declaring only one leaves the
+    // other direction matching nothing, which is a loud refusal rather than
+    // a wrong encoding, but is rarely what an author means. validate()
+    // rejects the axis on a guard with no memory operand at all (nothing to
+    // route) — the same coherence family as `negValue` and immMin/immMax.
+    std::optional<bool>                memoryDestination;
     TargetEncodingTemplate             tmpl;
     // Where the instruction's RESULT register goes (when the inst
     // has a result). Nullopt for value-less instructions (e.g.
@@ -2240,8 +2307,8 @@ enum class RelocFormulaKind : std::uint8_t {
     // slide-safe classifier from mis-treating it as a Linear-absolute-in-
     // `.text` fixup (D-LK-DYN-TEXT-ABS-RELOC keys `formulaKind == Linear`).
     Aarch64AdrGotPage     = 5,
-    // ARM64 R_AARCH64_LD64_GOT_LO12_NC (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-
-    // GOT, TF-C52): the LDR word of the same GOT-address macro (the
+    // ARM64 R_AARCH64_LD64_GOT_LO12_NC (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT,
+    // TF-C52): the LDR word of the same GOT-address macro (the
     // scaled 12-bit GOT-slot offset). Same foreign-linked-only /
     // fail-loud-in-kernel discipline as Aarch64AdrGotPage above.
     Aarch64Ld64GotLo12    = 6,
@@ -2881,8 +2948,8 @@ struct DSS_EXPORT ImplicitRegisterConstraint {
     std::vector<std::uint16_t> outputOrdinals;
     std::vector<std::uint16_t> clobberedOrdinals;
 
-    // Role-tagged projection contract (D-CSUBSET-MOD-OP-CODEGEN-
-    // OUTPUT-INDEX-CONTRACT closure, 2026-06-10). Optional JSON
+    // Role-tagged projection contract (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT
+    // closure, 2026-06-10). Optional JSON
     // objects `inputRoles` / `outputRoles` map a ROLE name (from the
     // loader's registered role vocabulary — "dividend", "quotient",
     // "remainder") to a register name that must ALSO appear in the
@@ -2921,8 +2988,8 @@ struct DSS_EXPORT ImplicitRegisterConstraint {
     }
 
     // ★★★ THE `outputs ⊆ clobbered` INVARIANT, AS A QUERY ON THE TYPE
-    // ITSELF (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-
-    // CLOBBERED, 2026-08-15). Returns the index of the first output
+    // ITSELF (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED,
+    // 2026-08-15). Returns the index of the first output
     // ordinal absent from `clobberedOrdinals`, or nullopt when the
     // invariant holds.
     //

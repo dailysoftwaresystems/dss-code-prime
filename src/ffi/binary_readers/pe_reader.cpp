@@ -433,8 +433,8 @@ readPe(std::span<std::uint8_t const> bytes,
         // version baked into an api-set DLL's own name
         // (`api-ms-win-crt-stdio-l1-1-0.dll`) — i.e. library IDENTITY, which
         // `soname`/`libraryPath` above already carry. Nothing here is
-        // "pending"; see `ffi/import_surface.hpp` (D-FFI-BINARY-READER-
-        // SURFACES-NO-SYMBOL-VERSION) for the full statement.
+        // "pending"; see `ffi/import_surface.hpp`
+        // (D-FFI-BINARY-READER-SURFACES-NO-SYMBOL-VERSION) for the full statement.
 
         // Classify. Forwarder FIRST: the export directory lives in a
         // (data) section, so an in-span RVA would otherwise misclassify

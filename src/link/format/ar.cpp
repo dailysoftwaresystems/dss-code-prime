@@ -11,8 +11,8 @@
 #include <string_view>
 #include <vector>
 
-// GNU / System V `ar` static-archive writer -- c163, D-LK-STATIC-ARCHIVE-
-// WRITER. See ar.hpp for the full contract + byte layout. The inverse of the
+// GNU / System V `ar` static-archive writer -- c163, D-LK-STATIC-ARCHIVE-WRITER.
+// See ar.hpp for the full contract + byte layout. The inverse of the
 // c161 reader (src/ffi/binary_readers/ar_reader.cpp); byte-audited against GNU
 // `ar` 2.42.
 

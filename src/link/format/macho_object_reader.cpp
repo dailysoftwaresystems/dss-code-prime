@@ -62,8 +62,7 @@ constexpr std::size_t kHdrFlagsOff    = 24;
 // independently" -- i.e. EVERY defined symbol starts its own atom unless it
 // says otherwise with N_ALT_ENTRY. This is the flag that makes an object's
 // symbol table SUFFICIENT to slice it, which is exactly what a size-less
-// nlist_64 otherwise is not (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-
-// LABEL-NOT-ATOM).
+// nlist_64 otherwise is not (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
 constexpr std::uint32_t kMhSubsectionsViaSymbols = 0x00002000u;
 
 // nlist_64.n_type masks (<mach-o/nlist.h>).

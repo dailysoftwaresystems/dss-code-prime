@@ -213,6 +213,26 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
             variant.negValue = nv.get<bool>();
         }
     }
+    // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE: OPTIONAL
+    // `memoryDestination` (bool). Absent ⇒ the variant does not discriminate
+    // on the memory reference's role (every pre-existing variant). Present ⇒
+    // the variant matches only an instruction whose
+    // `kLirInstFlagMemoryIsDestination` agrees. This is what separates
+    // `cmpq %r14, mem` (39 /r) from `cmpq mem, %r14` (3B /r), whose LIR
+    // operand lists are byte-identical. A non-boolean is a load-time reject,
+    // never a silently dropped axis — dropping it would collapse the two
+    // directions onto one variant and encode one spelling as the other.
+    if (g.contains("memoryDestination")) {
+        auto const& md = g.at("memoryDestination");
+        if (!md.is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/encoding/variants/{}/guard/memoryDestination",
+                                  opIdx, vi),
+                      "'memoryDestination' must be a boolean");
+        } else {
+            variant.memoryDestination = md.get<bool>();
+        }
+    }
     // `D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD` discipline: every key this
     // guard object may carry is read ABOVE (or just below, for
     // `operandKinds`) via a bare `g.contains(...)`, so a typo — or a
@@ -228,8 +248,9 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     // generalized from a memory displacement to any value-bearing operand;
     // the old spelling now lands here as an unknown key rather than being
     // read as `false`.
-    static constexpr std::array<std::string_view, 5> kGuardKeys{
-        "operandKinds", "width", "immMin", "immMax", "negValue"};
+    static constexpr std::array<std::string_view, 6> kGuardKeys{
+        "operandKinds", "width", "immMin", "immMax", "negValue",
+        "memoryDestination"};
     DSS_CHECK_KEY_VOCABULARY(kGuardKeys);
     rejectUnknownKeys(g, kGuardKeys,
                       std::format("/opcodes/{}/encoding/variants/{}/guard",
@@ -2082,8 +2103,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 readRegArray("inputs",    irc.inputNames);
                 readRegArray("outputs",   irc.outputNames);
                 readRegArray("clobbered", irc.clobberedNames);
-                // Role maps (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-
-                // CONTRACT): each is an OBJECT of role → register
+                // Role maps (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT):
+                // each is an OBJECT of role → register
                 // name. Shape-only here; role-vocabulary, membership
                 // (role's register ∈ the positional array), and
                 // name→ordinal resolution happen in the post-register
@@ -3311,8 +3332,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                 // it names the OTHER strategy that would have
                                 // read the key, which is what distinguishes a
                                 // typo from a copy-paste off the wrong ABI
-                                // (D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-
-                                // KEY). Routing it would trade a diagnostic
+                                // (D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-KEY).
+                                // Routing it would trade a diagnostic
                                 // for a shape.
                                 if (detail::isDocumentationKey(key)) continue;
                                 if (inSet(kVaListCommonKeys, key)) continue;
@@ -3569,8 +3590,8 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             }
         }
 
-        // Role-map resolution + validation (D-CSUBSET-MOD-OP-CODEGEN-
-        // OUTPUT-INDEX-CONTRACT, 2026-06-10). Three rejects per role:
+        // Role-map resolution + validation (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT,
+        // 2026-06-10). Three rejects per role:
         //   1. unknown role name (typo discriminator — the lowering
         //      queries a registered vocabulary; "remaindr" must fail
         //      at LOAD, not surface as a missing-role at lowering);

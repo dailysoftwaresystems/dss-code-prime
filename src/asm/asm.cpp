@@ -563,8 +563,8 @@ namespace {
 // Byte-width of a primitive TypeKind. Returns nullopt for non-primitive
 // kinds (Array / Struct / Ptr / FnSig / ...). Aggregate globals do NOT pass
 // through here — they take the `MirAggregateValue` arm + `encodeAggregateValue`
-// (the interner-side recursive layout walk, D-LK4-RODATA-PRODUCER-AGGREGATE-
-// GLOBAL); this gate only widths the SCALAR-global fast path.
+// (the interner-side recursive layout walk, D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL);
+// this gate only widths the SCALAR-global fast path.
 [[nodiscard]] std::optional<std::size_t>
 primitiveByteSize(TypeKind k) noexcept {
     switch (k) {
@@ -1246,14 +1246,14 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
 
         AssembledData d;
         d.symbol  = sym;
-        // Section selection for an INITIALIZED global (D-LK4-DATA-PRODUCER-
-        // MUTABLE-GLOBAL): a `const` global is genuinely read-only → `.rodata`;
+        // Section selection for an INITIALIZED global (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL):
+        // a `const` global is genuinely read-only → `.rodata`;
         // a mutable one is written at runtime → writable `.data` (a store into
         // `.rodata` faults — the bug this cycle fixes). Keyed on the config-
         // driven `MirGlobal.isConst` PROPERTY threaded from the source's
         // const-qualifier, NOT on any target/format identity. A string-literal
-        // global's isConst is set at its MINT site (D-CSUBSET-MUTABLE-CHAR-ARRAY-
-        // RODATA): a SYNTHETIC string-pool global — the immutable bytes a
+        // global's isConst is set at its MINT site (D-CSUBSET-MUTABLE-CHAR-ARRAY-RODATA):
+        // a SYNTHETIC string-pool global — the immutable bytes a
         // `char *p = "hi"` / a function-body literal points to — is minted const
         // → `.rodata`; a NAMED `char arr[N] = "str"` honors its declared
         // const-ness. So the string-literal arm below no longer overrides the
@@ -1295,8 +1295,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // HIR string-literal's `Array<Char,N+1>` type), which
         // `primitiveByteSize` does NOT handle (returns nullopt →
         // K_NoMatchingObjectFormat with a misleading "non-primitive
-        // global types are anchored under D-LK4-RODATA-PRODUCER-
-        // AGGREGATE-GLOBAL" message). The dispatch on the LITERAL-
+        // global types are anchored under D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL"
+        // message). The dispatch on the LITERAL-
         // POOL VARIANT (not the TypeKind) is the correct
         // discriminator for the string case. A future refactor
         // that reorders to "TypeKind check first" would silently

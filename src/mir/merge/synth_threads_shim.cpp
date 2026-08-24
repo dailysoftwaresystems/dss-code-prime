@@ -92,11 +92,22 @@ bool synthesizeThreadsShim(
     // synthesize over. A missing `librarySynthesis` block is a format/descriptor mismatch:
     // fail LOUD, never silently assume a vehicle (a disguised `if (format != known) →
     // win32` default is exactly the identity branch the bar forbids).
+    // ⚠ NO DEFERRAL ROW IS NAMED IN THE EMITTED TEXT, AND THAT IS DELIBERATE.
+    // This message used to carry `(D-CSUBSET-C11-THREADS-MACHO)`. That row is
+    // CLOSED — closing it is how `macho64-arm64` GOT its `librarySynthesis`
+    // block — so citing it told an operator "a known deferral, wait for it"
+    // about a format whose omission is a standing argued decision (see that
+    // format's own `$remainingDeliberateOmissionsComment`), not a queue item.
+    // ★ THE REFUSAL WAS REAL AND THE ATTRIBUTION WAS FALSE, which is the
+    // harder half of the species to see: nothing about the behaviour was wrong.
+    // ⇒ a diagnostic states the CONDITION and the ACTION; provenance lives
+    // here, where closing a row cannot turn a comment into compiler output.
     if (!librarySynthesis.has_value()) {
         emitErr(reporter,
                 "synthesizeThreadsShim: <threads.h> synth recipes are present but the target "
-                "object format declares no `librarySynthesis` vehicle "
-                "(D-CSUBSET-C11-THREADS-MACHO) — refusing to assume a primitive family");
+                "object format declares no `librarySynthesis` vehicle — refusing to assume "
+                "a primitive family. Declare one in the format descriptor, or drop the "
+                "synthesize-tagged <threads.h> symbols for this format");
         return false;
     }
     LibrarySynthVehicle const vehicle       = librarySynthesis->vehicle;
@@ -653,8 +664,8 @@ bool synthesizeThreadsShim(
                 // Widen the i32 res to i64, then to ptr<void> — the C idiom
                 // `pthread_exit((void*)(intptr_t)res)`. An EXPLICIT SExt (never an implicit
                 // width/kind pun): SExt is the sign-preserving widening AND the only i32→64
-                // form arm64 realizes this cycle (SXTW; ZExt admits no I32 source — D-CSUBSET-
-                // 32BIT-ALU-FORMS). The retval is unretrievable without thrd_join (Cycle 2).
+                // form arm64 realizes this cycle (SXTW; ZExt admits no I32 source —
+                // D-CSUBSET-32BIT-ALU-FORMS). The retval is unretrievable without thrd_join (Cycle 2).
                 std::array<MirInstId, 1> se{res};
                 MirInstId const res64  = builder.addInst(MirOpcode::SExt, se, i64Ty);
                 std::array<MirInstId, 1> itp{res64};

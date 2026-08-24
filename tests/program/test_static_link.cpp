@@ -126,8 +126,8 @@ struct Schemas {
 // vocabulary apart from one read through the IMAGE's. That conflict was not a
 // design difference: the image value was a TYPO that contradicted its own row's
 // name and its own stated packing, and correcting it made all four documents
-// agree (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-
-// ROW). The family is kept because it is still a real leg with a real writer
+// agree (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-ROW).
+// The family is kept because it is still a real leg with a real writer
 // round trip; what it can no longer do is discriminate two vocabularies, and no
 // case here asks it to.
 [[nodiscard]] Schemas loadMachoX86Schemas() {
@@ -557,7 +557,7 @@ TEST(StaticLink, DriverStaticLinkBuildsSelfContainedExec) {
     // .a-request surface (D-FF1-AR-STATICLIB-DRIVER-WIRING) to land honestly.
     // The pulled dss_lib_answer body is IN the exe -> exit 42. No
     // LD_LIBRARY_PATH needed (that is the self-containedness).
-    auto const r = runBinary(mainPath, std::chrono::milliseconds{5000});
+    auto const r = runBinary(mainPath);
     ASSERT_TRUE(r.spawned) << "main must spawn. " << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -679,7 +679,7 @@ TEST(StaticLink, RealGccSectionRelativeJumpTableLibExitsFortyTwo) {
     ASSERT_TRUE(fs::exists(mainPath)) << "the self-contained exec must exist";
 
 #if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__))
-    auto const r = runBinary(mainPath, std::chrono::milliseconds{5000});
+    auto const r = runBinary(mainPath);
     ASSERT_TRUE(r.spawned) << "main must spawn. " << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -800,7 +800,7 @@ TEST(StaticLink, MachODriverStaticLinkBuildsSelfContainedExec) {
 #if defined(__APPLE__) && defined(__aarch64__)
     // RUN (Apple-Silicon macOS): the pulled dss_lib_answer body is IN the exe ->
     // exit 42. No dylib dependency for the archive's symbols (self-contained).
-    auto const r = runBinary(mainPath, std::chrono::milliseconds{5000});
+    auto const r = runBinary(mainPath);
     ASSERT_TRUE(r.spawned) << "main must spawn. " << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -894,7 +894,7 @@ TEST(StaticLink, CoffDriverStaticLinkExitsFortyTwo) {
     ASSERT_TRUE(fs::exists(mainPath)) << "the self-contained PE exec must exist";
 
 #if defined(_WIN32)
-    auto const r = runBinary(mainPath, std::chrono::milliseconds{5000});
+    auto const r = runBinary(mainPath);
     ASSERT_TRUE(r.spawned) << "main must spawn. " << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -1172,7 +1172,7 @@ TEST(StaticLink, StaticLibFatArchiveExecRunsFortyTwo) {
 #if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__))
     // RUN (x86_64 Linux host): dss_lib_answer's body -- merged in from
     // libanswer.a via libfat.a -- is IN the exe -> exit 42.
-    auto const r = runBinary(mainPath, std::chrono::milliseconds{5000});
+    auto const r = runBinary(mainPath);
     ASSERT_TRUE(r.spawned) << "main must spawn. " << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -1275,7 +1275,7 @@ TEST(StaticLink, PeFatArchiveSequentialInProcessMergeExecRunsFortyTwo) {
     // RUN (Windows host): dss_input_answer's body -- merged input.lib -> fatlib.lib
     // -> pulled into main -- is IN the exe -> exit 42. A dropped merge would fault-
     // load here (STATUS_ENTRYPOINT_NOT_FOUND) instead.
-    auto const r = runBinary(mainExe, std::chrono::milliseconds{5000});
+    auto const r = runBinary(mainExe);
     ASSERT_TRUE(r.spawned) << "main.exe must spawn. " << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -1446,8 +1446,8 @@ TEST(StaticArchive, ReleaseMemberIsProgramStageOptimized) {
 // OWN comment states, decodes to r_type=SIGNED / 8 bytes / NOT pc-relative, and
 // the row named `_4` declared a TWO-byte slot. The documents refuted
 // themselves; no external authority was needed to call it a bug. When it was
-// corrected (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-
-// OWN-ROW) all four macho64-x86_64 documents became IDENTICAL on this axis, the
+// corrected (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-ROW)
+// all four macho64-x86_64 documents became IDENTICAL on this axis, the
 // image stopped refusing, and the pin went red — having spent its life
 // asserting a consequence that rested on a defect.
 // ⇒ A DIVERGENCE DISCRIMINATOR IS KEPT ONLY WHERE THE DIVERGENCE IS GENUINE AND
@@ -2670,7 +2670,7 @@ TEST(StaticLink, PeArchiveMemberBindsAnOperatorNamedLibraryThroughTheDriver) {
     // beside the exe. A binding that named the wrong image — or none — would
     // fault at LOAD (0xC0000139) rather than return 42, which is exactly why
     // this witness is a RUN and not a header inspection.
-    auto const r = runBinary(clientExe, std::chrono::milliseconds{5000});
+    auto const r = runBinary(clientExe);
     ASSERT_TRUE(r.spawned) << "client.exe must spawn. " << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)

@@ -110,8 +110,8 @@ struct DSS_EXPORT Relocation {
     std::int64_t   addend = 0;    // ABI-specific (e.g. PC-relative bias)
 };
 
-// One synthetic SYMBOL ↔ interior-block byte-offset binding (D-CSUBSET-
-// COMPUTED-GOTO `&&label`). The block-address `lea` materializes a
+// One synthetic SYMBOL ↔ interior-block byte-offset binding
+// (D-CSUBSET-COMPUTED-GOTO `&&label`). The block-address `lea` materializes a
 // SYNTHETIC per-block local symbol's runtime address; that symbol is
 // not a function or a data item, so it gets no VA from the usual
 // function/data symbolVa population. Instead the encoder records this

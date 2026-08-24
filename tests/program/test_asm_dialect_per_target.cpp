@@ -12,8 +12,8 @@
 // the per-target loop ever ran. It now resolves the grammar PER `CuBuildKey`:
 // the caller's `--language` when there is one, else the target's declared
 // `defaultAssemblyLanguage` (a NAME the `.target.json` carries as vocabulary —
-// never assembly grammar; see `D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-
-// VOCABULARY` for the facet that was reverted for crossing that line).
+// never assembly grammar; see `D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY`
+// for the facet that was reverted for crossing that line).
 //
 // ── WHY THESE TESTS LIVE HERE AND NOT IN `examples/**` ────────────────────
 // Same structural reason `TFC74CuCacheKeyIsPerTargetNotPerObjectFormat` gives:

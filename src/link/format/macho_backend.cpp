@@ -179,8 +179,8 @@ public:
                                               " / ")));
                         }
                     } else if (ft.is_number_integer()) {
-                        // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-
-                        // CLOSED-SET, on the WIRE half. `MachOObjectType`'s
+                        // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET,
+                        // on the WIRE half. `MachOObjectType`'s
                         // enumerators ARE the MH_* wire values, so the accepted
                         // integers are a projection of the same table the string
                         // arm resolves through — this used to be a 1/2/6
@@ -487,8 +487,8 @@ public:
                                 // nCodeSlots*hashSize layout math safely within
                                 // u32 for any in-range codeLimit (a sub-page
                                 // pageSize like 1 would overflow the slot table
-                                // on a multi-GiB binary — D-LK7-CODESIGN-
-                                // PAGESIZE-OVERFLOW-HARDENING for the residual
+                                // on a multi-GiB binary —
+                                // D-LK7-CODESIGN-PAGESIZE-OVERFLOW-HARDENING for the residual
                                 // ~4 GiB-codeLimit case).
                                 if (v < 4096
                                  || v > 65536
@@ -539,8 +539,8 @@ public:
                         }
                     }
                 }
-                // LC_BUILD_VERSION platform / min-OS / SDK (D-LK10-ENTRY-
-                // MACHO-EXIT). Optional nested object; absent → no
+                // LC_BUILD_VERSION platform / min-OS / SDK
+                // (D-LK10-ENTRY-MACHO-EXIT). Optional nested object; absent → no
                 // LC_BUILD_VERSION emitted. `platform` is a CLOSED enum (a
                 // typo fails loud, mirroring codeSignature). `minOs`/`sdk`
                 // are dotted "X.Y[.Z]" version strings encoded to the on-wire
@@ -769,8 +769,8 @@ public:
                 // them (`machoObjectTypeName`), not retyped: a remedy that
                 // names a spelling by hand goes stale on a rename exactly as a
                 // retyped accepted-set does, and a remedy nobody can follow is
-                // worse than none (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-
-                // THEIR-CLOSED-SET, at single-value scale).
+                // worse than none (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET,
+                // at single-value scale).
                 fail("/image/useChainedFixups",
                      std::format(
                          "'useChainedFixups' = true is invalid for "

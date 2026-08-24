@@ -1,5 +1,5 @@
-/* D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY + D-LK4-RODATA-PRODUCER-NONSTRING-
- * GLOBAL-ARRAY-DECAY (FC8) end-to-end RUNTIME witness across all targets.
+/* D-LK4-RODATA-PRODUCER-LOCAL-ARRAY-DECAY + D-LK4-RODATA-PRODUCER-NONSTRING-GLOBAL-ARRAY-DECAY
+ * (FC8) end-to-end RUNTIME witness across all targets.
  * Non-string array -> pointer DECAY (C 6.3.2.1): an array used where a pointer
  * is expected decays to the address of its first element. Exercised:
  *   - LOCAL array decay: `bump(a)` / `sum3(a)` pass `int a[3]` (an alloca) as

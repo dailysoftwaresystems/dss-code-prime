@@ -28,8 +28,8 @@
 
 
 // ─────────────────────────────────────────────────────────────────────────
-// ★★★ COMPILE-ERROR PIN — D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-
-// BRANCHES (TF-C125). DO NOT DELETE TO "FIX A BUILD ERROR".
+// ★★★ COMPILE-ERROR PIN — D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES
+// (TF-C125). DO NOT DELETE TO "FIX A BUILD ERROR".
 // ─────────────────────────────────────────────────────────────────────────
 //
 // Twin of the pin in `object_format_schema.cpp` — READ THE FULL NOTE THERE,
@@ -363,8 +363,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         "runtimeLibraries", "sehPersonality",
         // stack-reserve capability + its remedy axis
         "stackReserveControl", "stackReserveUnsupportedReason",
-        // the weak-DEFINITION spelling (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-
-        // DECLARED). A typo here does NOT silently default: the walker refuses
+        // the weak-DEFINITION spelling (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED).
+        // A typo here does NOT silently default: the walker refuses
         // an unanswered schema the moment it meets a weak definition, so the
         // failure is loud either way — but it fails at EMIT rather than at
         // LOAD, which is why the key is registered here so the load can carry
@@ -2480,8 +2480,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
 
     // D-LK2-RODATA closure — `supportedDataSections`. Optional
     // top-level array of `DataSectionKind` names ("rodata" / "data" /
-    // "bss" / "tdata" / "tbss" — the last two per D-CSUBSET-THREAD-
-    // LOCAL — plus "relro" per D-LK-RELRO-CONST-DATA-RELOCATABLE, c145)
+    // "bss" / "tdata" / "tbss" — the last two per D-CSUBSET-THREAD-LOCAL
+    // — plus "relro" per D-LK-RELRO-CONST-DATA-RELOCATABLE, c145)
     // the format's walker accepts on `AssembledModule.
     // dataItems`. Absent / empty = walker rejects all producer-data-
     // section items (the format-side validate() rule below also

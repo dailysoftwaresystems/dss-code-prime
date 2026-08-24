@@ -68,8 +68,8 @@
 //     (F32 / F16 narrow, F64 identity; F80 / F128 refuse with
 //     `UnsupportedTypeKind` — no host backing, keyed on
 //     floatKindInfo.hostBacked; F80 joined with FC17.9(e), whose
-//     per-format arithmetic arc is D-CSUBSET-LONG-DOUBLE-CONSTFOLD-
-//     PRECISION; F128 was plan-12.5 §0.2 D1b mapped to plan 19).
+//     per-format arithmetic arc is D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION;
+//     F128 was plan-12.5 §0.2 D1b mapped to plan 19).
 //     Logical and Ternary cond accept floats too (via the shared
 //     `asBool(value, allowFloat)` helper). When `allowFloat=false`
 //     any float-involving operand refuses with `UnsupportedTypeKind`.

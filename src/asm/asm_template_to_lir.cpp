@@ -594,8 +594,8 @@ struct AsmInstructionLowering::Impl {
         for (std::size_t i = 0; i < cfg_.instructions.size(); ++i) {
             auto const& row = cfg_.instructions[i];
             // ⚠ BOTH COMPARISONS IN THIS LOOP ARE `spellingMatches`, AND THEY
-            // HAD TO MOVE TOGETHER (D-ASM-DIALECT-MNEMONIC-MATCH-IS-CASE-
-            // SENSITIVE). Folding the MNEMONIC while the SELECTOR stayed exact
+            // HAD TO MOVE TOGETHER (D-ASM-DIALECT-MNEMONIC-MATCH-IS-CASE-SENSITIVE).
+            // Folding the MNEMONIC while the SELECTOR stayed exact
             // would make `MRS X0, CNTVCT_EL0` fail one token later instead of
             // at the mnemonic — a different diagnostic for the same refusal,
             // which reads as progress and is none. The load-time disjointness
@@ -1303,6 +1303,78 @@ struct AsmInstructionLowering::Impl {
         return width;
     }
 
+    // ★ THE OPERAND POSITION THIS DIALECT CALLS THE DESTINATION. The SAME rule
+    // `buildLirInst` uses, named once so the width check and the operand
+    // partition cannot drift — a role-keyed width check reading a different
+    // position from the one that becomes the destination would police the
+    // wrong register, quietly.
+    [[nodiscard]] std::size_t destinationIndex(std::size_t n) const noexcept {
+        return cfg_.operandOrder == AsmOperandOrder::DestinationLast ? n - 1 : 0;
+    }
+
+    // ★★★ THE TWO-WIDTH CHECK — D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE.
+    //
+    // A width-EXTENDING move (`movzbl`, `movswq`, `movslq`, AArch64 `sxtb`)
+    // is a SOURCE width and a DESTINATION width in one instruction, which the
+    // single-width model above cannot express: `dataRegisterWidth` requires
+    // every data register to agree and refuses `movzbl %cl, %ecx` outright.
+    //
+    // ⚠ THE FIX IS NOT TO RELAX THAT CHECK, and this is the whole design.
+    // That check is what refuses `movl %rax, %ecx` — which GNU as 2.42 also
+    // refuses (✔MEASURED: `operand type mismatch`) — so deleting or widening
+    // it globally would trade one conformance gap for its mirror image, and
+    // the mirror image is the dangerous direction (accepting a spelling no
+    // reference accepts means silently encoding SOMETHING for it). Instead a
+    // row that HAS two widths SAYS SO, and the check splits by ROLE while
+    // staying exactly as strict on each side:
+    //
+    //   * the destination-position register must be exactly `destWidth`;
+    //   * every source register must be exactly `width`.
+    //
+    // ⇒ `movzbl %cl, %ecx` is accepted and `movzbl %cl, %rcx` is refused,
+    // which is gas's own answer to both. A memory operand never participates
+    // (it carries an ADDRESS, not the operation width) — the same exclusion
+    // `dataRegisterWidth` documents, which is what lets `movzbl 8(%r15), %ecx`
+    // work.
+    //
+    // TARGET-NEUTRAL BY CONSTRUCTION: nothing here reads a mnemonic, an
+    // architecture or a format. A dialect whose extending move spells its two
+    // widths in the REGISTERS rather than the mnemonic declares the same two
+    // numbers on its own row and this function is unchanged.
+    bool checkRoleKeyedWidths(AsmDecodedInstruction const& ins,
+                              AsmInstructionSpelling const& row) {
+        std::size_t const n = ins.operands.size();
+        if (n == 0) {
+            sink_.fail(ins.node,
+                 std::format("'{}' declares a destination width of {} bits but "
+                             "was written with no operands — there is no "
+                             "destination to check it against{}",
+                             ins.mnemonic, *row.destWidth, sink_.pairSuffix()));
+            return false;
+        }
+        std::size_t const di = destinationIndex(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            auto const& op = ins.operands[i];
+            if (op.role != AsmOperandRole::Register) continue;
+            if (op.isMemory || op.indirect) continue;
+            std::uint32_t const want =
+                (i == di) ? *row.destWidth : *row.width;
+            if (op.regWidthBits == want) continue;
+            sink_.fail(op.node,
+                 std::format("'{}' widens a {}-bit value into a {}-bit "
+                             "destination, but its {} register '{}' is {} bits "
+                             "— the spelling and the register disagree, and "
+                             "encoding either width would silently be a "
+                             "different instruction{}",
+                             ins.mnemonic, *row.width, *row.destWidth,
+                             i == di ? "destination" : "source",
+                             op.regSpelling, op.regWidthBits,
+                             sink_.pairSuffix()));
+            return false;
+        }
+        return true;
+    }
+
     // The width this instruction actually operates on, reconciling what the
     // dialect DECLARED (a mnemonic suffix) with what the operands SAY (register
     // widths). Either source may be absent; when both are present they must
@@ -1310,6 +1382,19 @@ struct AsmInstructionLowering::Impl {
     std::optional<std::uint32_t> effectiveWidth(AsmDecodedInstruction const& ins,
                                                 AsmInstructionSpelling const& row,
                                                 bool consultOperands) {
+        // ★ THE TWO-WIDTH ROW SHORT-CIRCUITS, because the single-width
+        // reconciliation below is FALSE about it by construction: its
+        // registers are SUPPOSED to disagree. The operation width it returns
+        // is the SOURCE width — the number the LIR instruction carries and the
+        // target's encoding guard is keyed on; the destination width is spent
+        // entirely on the check above, because an instruction that writes a
+        // different width is a different opcode on the target side.
+        if (row.destWidth.has_value()) {
+            if (consultOperands && !checkRoleKeyedWidths(ins, row)) {
+                return std::nullopt;
+            }
+            return row.width;
+        }
         std::optional<std::uint32_t> derived;
         if (consultOperands) {
             derived = dataRegisterWidth(ins);
@@ -1838,15 +1923,17 @@ struct AsmInstructionLowering::Impl {
         // the candidate and saying the shape does not fit, instead of encoding
         // a wrong register with no diagnostic.
         if (n == 0) {
-            auto const chosen = electAmong(consumers, {}, widthBits, ins);
+            // A zero-operand instruction names no memory reference, so the
+            // memory-direction axis is `false` by construction.
+            auto const chosen =
+                electAmong(consumers, {}, widthBits, false, ins);
             if (!chosen.has_value()) return;
             if (!checkElectedWidth(*chosen, *width, ins)) return;
             builder_.addInst(chosen->opcode, InvalidLirReg, {}, payload, flags);
             host_.onInstructionEmitted();
             return;
         }
-        std::size_t const destIndex =
-            cfg_.operandOrder == AsmOperandOrder::DestinationLast ? n - 1 : 0;
+        std::size_t const destIndex = destinationIndex(n);
         AsmDecodedOperand const& dest = ins.operands[destIndex];
         if (dest.indirect) {
             sink_.fail(dest.node,
@@ -1934,12 +2021,25 @@ struct AsmInstructionLowering::Impl {
         if (dest.isMemory) {
             std::vector<LirOperand> operands = sources;
             appendMemory(dest, operands);
+            // ★ THE ONE SITE THAT SETS THE MEMORY-DIRECTION AXIS
+            // (D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE). This
+            // arm ran because the DESTINATION-position operand is the memory
+            // reference; the flag records exactly that, and it is what lets a
+            // target declare `cmp mem, reg` (39 /r) apart from the
+            // byte-identical operand list of `cmp reg, mem` (3B /r).
             auto const chosen =
-                electAmong(consumers, operands, widthBits, ins);
+                electAmong(consumers, operands, widthBits, true, ins);
             if (!chosen.has_value()) return;
             if (!checkElectedWidth(*chosen, *width, ins)) return;
+            // ⚠ THE FLAG IS STAMPED ON THE INSTRUCTION, NOT MERELY USED FOR
+            // THE ELECTION, and that is the whole soundness argument: the
+            // ENCODER re-runs the same selection post-regalloc, reading the
+            // axis off these same `flags`. An election axis the encoder could
+            // not reproduce would let the two tiers pick different variants
+            // with no diagnostic anywhere.
             builder_.addInst(chosen->opcode, InvalidLirReg, operands, payload,
-                             flags);
+                             static_cast<std::uint8_t>(
+                                 flags | kLirInstFlagMemoryIsDestination));
             host_.onInstructionEmitted();
             return;
         }
@@ -1950,7 +2050,9 @@ struct AsmInstructionLowering::Impl {
         // it.
         std::optional<asm_elect::ElectedOpcode> chosen;
         std::vector<LirOperand>                 operands;
-        Election pe = electQuiet(producers, sources, widthBits);
+        // The destination here is a REGISTER; any memory reference is a
+        // SOURCE, so the memory-direction axis is `false`.
+        Election pe = electQuiet(producers, sources, widthBits, false);
         if (!pe.ambiguousWith.empty()) {
             reportAmbiguous(ins, pe, widthBits);
             return;
@@ -1961,7 +2063,7 @@ struct AsmInstructionLowering::Impl {
             twoAddr.reserve(sources.size() + 1);
             twoAddr.push_back(LirOperand::makeReg(destReg));
             twoAddr.insert(twoAddr.end(), sources.begin(), sources.end());
-            Election t = electQuiet(producers, twoAddr, widthBits);
+            Election t = electQuiet(producers, twoAddr, widthBits, false);
             if (!t.ambiguousWith.empty()) {
                 reportAmbiguous(ins, t, widthBits);
                 return;
@@ -2024,7 +2126,7 @@ struct AsmInstructionLowering::Impl {
         Election ce =
             (anyMemory && !producers.empty())
                 ? Election{}
-                : electQuiet(consumers, destFirst, widthBits);
+                : electQuiet(consumers, destFirst, widthBits, false);
         if (!ce.ambiguousWith.empty()) {
             reportAmbiguous(ins, ce, widthBits);
             return;
@@ -2059,8 +2161,8 @@ struct AsmInstructionLowering::Impl {
     }
 
     // ★★★ M2 — LOWER A SYMBOL-NAMED SOURCE OPERAND TO ITS ADDRESS.
-    // D-ASM-SYMBOL-OPERAND-NOT-LOWERED + D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-
-    // AT-AN-OFFSET, which are ONE mechanism seen from two sides: `adr x0, msg`
+    // D-ASM-SYMBOL-OPERAND-NOT-LOWERED + D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET,
+    // which are ONE mechanism seen from two sides: `adr x0, msg`
     // and `adr x0, Lcase1` differ only in WHAT the label is, and the second
     // operand is the whole difference.
     //
@@ -2151,11 +2253,13 @@ struct AsmInstructionLowering::Impl {
     [[nodiscard]] Election
     electQuiet(std::vector<std::string> const& names,
                std::span<LirOperand const> operands,
-               std::uint8_t widthBits) const {
+               std::uint8_t widthBits,
+               bool memoryIsDestination) const {
         Election e;
         if (names.empty()) return e;
         e.opcode = asm_elect::electOpcode(target_, names, operands,
-                                          widthBits, &e.rejections,
+                                          widthBits, memoryIsDestination,
+                                          &e.rejections,
                                           &e.ambiguousWith);
         if (!e.ambiguousWith.empty()) {
             // `electOpcode` returns nullopt on ambiguity; recover the FIRST
@@ -2167,8 +2271,9 @@ struct AsmInstructionLowering::Impl {
                 if (!ordinal) continue;
                 auto const* info = target_.opcodeInfo(*ordinal);
                 if (info == nullptr) continue;
-                if (asm_elect::selectEncodingVariant(*info, operands,
-                                                     widthBits) != nullptr) {
+                if (asm_elect::selectEncodingVariant(
+                        *info, operands, widthBits,
+                        memoryIsDestination) != nullptr) {
                     e.firstWinner = name;
                     break;
                 }
@@ -2220,8 +2325,10 @@ struct AsmInstructionLowering::Impl {
     std::optional<asm_elect::ElectedOpcode>
     electAmong(std::vector<std::string> const& names,
                std::span<LirOperand const> operands, std::uint8_t widthBits,
+               bool memoryIsDestination,
                AsmDecodedInstruction const& ins) {
-        Election e = electQuiet(names, operands, widthBits);
+        Election e = electQuiet(names, operands, widthBits,
+                                memoryIsDestination);
         if (e.opcode.has_value()) return e.opcode;
         if (!e.ambiguousWith.empty()) {
             reportAmbiguous(ins, e, widthBits);
@@ -2276,7 +2383,8 @@ struct AsmInstructionLowering::Impl {
             return;
         }
         auto const elected = electAmong(
-            names, std::span<LirOperand const>{}, lirInstWidthBits(flags), ins);
+            names, std::span<LirOperand const>{}, lirInstWidthBits(flags),
+            false, ins);
         if (!elected.has_value()) return;
         if (!checkElectedWidth(*elected, lirInstWidthBits(flags), ins)) {
             return;
@@ -2316,7 +2424,7 @@ struct AsmInstructionLowering::Impl {
         std::array<LirOperand, 1> const ops{
             LirOperand::makeBlockRef(target->v)};
         auto const elected =
-            electAmong(names, ops, lirInstWidthBits(flags), ins);
+            electAmong(names, ops, lirInstWidthBits(flags), false, ins);
         if (!elected.has_value()) return;
         if (!checkElectedWidth(*elected, lirInstWidthBits(flags), ins)) {
             return;
@@ -2348,7 +2456,7 @@ struct AsmInstructionLowering::Impl {
             LirOperand::makeBlockRef(taken->v),
             LirOperand::makeBlockRef(fallthrough.v)};
         auto const elected =
-            electAmong(names, ops, lirInstWidthBits(flags), ins);
+            electAmong(names, ops, lirInstWidthBits(flags), false, ins);
         if (!elected.has_value()) return;
         if (!checkElectedWidth(*elected, lirInstWidthBits(flags), ins)) {
             return;
@@ -2398,7 +2506,7 @@ struct AsmInstructionLowering::Impl {
                              ins.mnemonic, sink_.pairSuffix()));
             return;
         }
-        auto const elected = electAmong(names, ops, widthBits, ins);
+        auto const elected = electAmong(names, ops, widthBits, false, ins);
         if (!elected.has_value()) return;
         if (!checkElectedWidth(*elected, widthBits, ins)) return;
         // ★ A CALL IS NOT A TERMINATOR — plain `addInst`. And this path runs
@@ -2472,7 +2580,7 @@ struct AsmInstructionLowering::Impl {
         // names an opcode that cannot take a register is a config defect, and
         // reporting it before the successor-set refusal keeps the two failures
         // distinguishable.
-        auto const elected = electAmong(names, ops, widthBits, ins);
+        auto const elected = electAmong(names, ops, widthBits, false, ins);
         if (!elected.has_value()) return;
         if (!checkElectedWidth(*elected, widthBits, ins)) return;
         std::vector<LirBlockId> const succs = host_.addressTakenSuccessors();

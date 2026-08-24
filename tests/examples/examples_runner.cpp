@@ -259,8 +259,8 @@ struct OptimizedArm {
 };
 
 // ★★★ THE EXEMPTION THAT UNLOCKS A PER-ARM EXPECTATION, AND WHY THE AXIOM DID
-// NOT SIMPLY GET RELAXED (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-
-// EMITTED). `OptimizedArm`'s contract — "same exit code + stdout as the
+// NOT SIMPLY GET RELAXED (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED).
+// `OptimizedArm`'s contract — "same exit code + stdout as the
 // baseline" — was carrying TWO facts in one sentence:
 //   (i)  the CORRECTNESS INVARIANT: an optimizer must not change a program's
 //        observable behaviour; and
@@ -1509,8 +1509,8 @@ struct ArtifactIdentityTally {
 // prerequisite LIBRARY artifact into `outDir`, RECURSIVELY building its own
 // nested `dependsOn` FIRST (into the same `outDir`) and threading their output
 // paths into THIS dep's `--resolve-library`. So a `-staticlib` dep listing a
-// nested `-staticlib` dep MERGES it (the fat archive, D-FF1-STATICLIB-FAT-
-// ARCHIVE): the nested input `.a` is built, then the fat `.a` build resolves it
+// nested `-staticlib` dep MERGES it (the fat archive, D-FF1-STATICLIB-FAT-ARCHIVE):
+// the nested input `.a` is built, then the fat `.a` build resolves it
 // and bundles its members in. ORDER-CORRECT (a dep's prerequisites exist on
 // disk before its own build runs) and fully generic (arbitrary depth, no
 // example-name special-casing). `dep.sources` resolve against `scratchPath`
@@ -1737,6 +1737,23 @@ compileAndRunArm(fs::path const& exampleDir,
     }
     // Every DECLARED source must have been among the copied files — a
     // manifest typo fails loud here, not as a confusing driver error.
+    //
+    // ★★ THESE PATHS ARE ABSOLUTE, AND THAT IS ONE OF THE FOUR SHAPES A USER CAN
+    // TYPE (`D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH`).
+    // `main.c`, `sub/main.c` and `./main.c` are the other three, and a corpus
+    // that spells only one of them could not see
+    // `D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH` — a
+    // HIGH, user-facing `#include` failure that reached HEAD behind a green
+    // gate. ⇒ THE OTHER THREE SHAPES ARE PINNED IN
+    // `tests/program/test_source_argument_shape.cpp` (in-process, the same
+    // `compileFiles`/`compileUnits` entry points this arm drives) and in
+    // `runSourceArgumentShapePin` on the `integrated_tests/cli-surface` entry
+    // (argv tier). ⚠ Do NOT "fix" the blindness by respelling this line: the
+    // shape is a property of the INVOCATION, not of an example, so respelling it
+    // would change the compile input for every manifest in the corpus and still
+    // leave
+    // exactly ONE shape covered — the corpus would simply be blind to a
+    // different one.
     std::vector<std::string> srcPaths;
     srcPaths.reserve(m.sources.size());
     for (auto const& s : m.sources) {

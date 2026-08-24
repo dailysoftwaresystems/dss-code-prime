@@ -1466,8 +1466,8 @@ if mutate "H7 make a failed run-dir operation look fine" "$WORK/m7.sh" 'RUN_DIR_
 fi
 
 # H8 — forward the DRIVER-PATH group by NAME instead of with its value, which is
-# the quieter half of D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-
-# BOUNDARY: the variable crosses, nothing is translated, and Tcl blames the
+# the quieter half of D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY:
+# the variable crosses, nothing is translated, and Tcl blames the
 # acquisition. The resolver refuses that spelling, so the mutant's helper `die`s
 # and the assignment the pin asserts never appears.
 if mutate "H8 forward a DRIVER PATH by name, untranslated" "$WORK/m8.sh" 'call+=("--forward-path=$n=${!n}"); carried=1' '

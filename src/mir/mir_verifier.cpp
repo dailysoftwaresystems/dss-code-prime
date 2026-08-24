@@ -1078,8 +1078,8 @@ void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {
             // was already materialized as an explicit Cast/Bitcast node by
             // cst_to_hir's coerce arm — that is precisely what
             // `HirVerifier::checkCallArguments` enforces with its strict
-            // `PointerConversionRules{}` (D-HIR-VERIFIER-POINTER-CONVERT-
-            // CONTRACT), and the FfiDescriptorIntPointeeArgRealizesAsPtrBitcast
+            // `PointerConversionRules{}` (D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT),
+            // and the FfiDescriptorIntPointeeArgRealizesAsPtrBitcast
             // pin witnesses a Ptr→Ptr bitcast being emitted for exactly this
             // reason. So a call operand's type must EQUAL its parameter's:
             //   * identical TypeId, or

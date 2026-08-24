@@ -214,10 +214,34 @@ struct DSS_EXPORT MirAsmDescriptor {
 
     // Outputs in SOURCE order. Output k is result piece k: the `ReturnPiece`
     // anchored to this instruction whose payload ordinal is k.
+    //
+    // ⚠ THAT DEFINITION IS EXACT AND IT EXCLUDES A SHAPE THE SOURCE CALLS AN
+    // OUTPUT. A memory-form operand written in the output section (`"=m"`,
+    // `"+m"`, `"=&m"`) produces NO result piece — the template writes the memory
+    // itself — so it is NOT a member of this list. It is filed in `inputs`,
+    // because its single MIR operand IS its address (see below, and
+    // `hir_to_mir.cpp` — `lowerInlineAsm`, which carries the full argument).
+    // ★ Read the two facts together: `outputs` is the RESULT-PIECE list, not the
+    // "things the source wrote left of the colon" list, and the two stopped
+    // coinciding when the memory-form output direction was realized
+    // ([[D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED]]).
     std::vector<MirAsmOperand> outputs;
     // Inputs in SOURCE order, ALIGNED 1:1 with the instruction's MIR operands
     // (operand j is input j — an asm block has no callee operand, which is why
     // `InlineAsm` is `{0,N}` and not `Call`'s `{1,N}`).
+    //
+    // ⚠⚠ THE ORDERING BELOW IS NOT EXHAUSTIVE ON ITS OWN — READ THIS FIRST. The
+    // full order is [MEMORY-FORM OUTPUTS][source-written inputs][tied read
+    // halves]. A memory-form operand written in the OUTPUT section is filed
+    // here, at the FRONT, because source order puts the output section before
+    // the input section. Nothing in the sentence below became false — `outputs`
+    // is still exactly the result-piece list, this list is still 1:1 with the
+    // instruction's operands, and the tied halves are still last — but a reader
+    // who takes the two-part enumeration as complete will mis-read entry 0 of a
+    // `"=m"` statement as a source-written input when it is the output's
+    // ADDRESS. ⓘ The staleness was introduced by the cycle that realized the
+    // memory-form output direction, which is why it is recorded rather than
+    // silently repaired ([[D-MIR-ASM-DESCRIPTOR-INPUTS-DOCBLOCK-DOES-NOT-NAME-THE-MEMORY-FORM-OUTPUTS]]).
     //
     // ⚠ THE SOURCE-WRITTEN INPUTS COME FIRST, THEN THE TIED READ HALVES. Every
     // `"+r"` OUTPUT appends one entry here carrying `tiedOutput` — GNU's own

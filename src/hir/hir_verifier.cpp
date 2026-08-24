@@ -902,8 +902,8 @@ void HirVerifier::checkCallArguments(DiagnosticReporter& reporter) const {
                 // would have produced `S_TypeMismatch` before HIR
                 // lowering, so reaching the verifier with arg=IntLit
                 // in a Ptr<*> slot implies value==0. This is the
-                // structural-invariant guarantee D-HIR-VERIFIER-
-                // POINTER-CONVERT-CONTRACT documents as the
+                // structural-invariant guarantee
+                // D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT documents as the
                 // post-coerce invariant — extended here to the
                 // null-pointer-constant case which is admitted at
                 // value-tier (semantic) rather than type-tier

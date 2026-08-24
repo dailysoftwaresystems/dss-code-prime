@@ -437,8 +437,7 @@ struct CompileOptions {
     CompileConfig config = CompileConfig::Debug;
 
     // Non-null: bypasses the JSON registry; used by the examples_runner's
-    // differential-verify arm + MIR unit tests (D-OPT1-DIFFERENTIAL-
-    // VERIFY-RUNNER).
+    // differential-verify arm + MIR unit tests (D-OPT1-DIFFERENTIAL-VERIFY-RUNNER).
     ::dss::opt::OptPipeline const* pipelineOverride = nullptr;
 
     // c162 (D-FF1-READER-CONSUMER): the `--resolve-library <path>` driver
@@ -952,8 +951,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's
 // cross-CU merge (LK11a resolution + LK11b byte emission). Returns true iff the
 // image is `ok()`, no link-tier error fired, and `writeImage` committed bytes.
-// `request` carries the per-PROGRAM image knobs (D-SQLITE-PE64-FULL-TIER-
-// STACK-DEPTH); it is forwarded verbatim to `linker::link`, which gates it
+// `request` carries the per-PROGRAM image knobs (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH);
+// it is forwarded verbatim to `linker::link`, which gates it
 // against the format's DECLARED capability. Defaults to empty.
 [[nodiscard]] DSS_EXPORT bool
 linkAndWrite(std::span<AssembledModule const> modules,
@@ -1003,8 +1002,8 @@ isArArchiveFile(std::filesystem::path const& path);
 // `ObjectFormatKind` (ELF / Mach-O / PE) through one shared chokepoint; a format
 // whose kind has no reader arm fails loud rather than mis-parsing a member.
 //
-// ── `dynamicLibraries` (D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-
-// LIBRARY) ──────────────────────────────────────────────────────────────────
+// ── `dynamicLibraries` (D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY)
+// ──────────────────────────────────────────────────────────────────
 // An object file records an undefined symbol's NAME and nothing else -- no
 // format has anywhere to say WHICH library owns it. So a member whose extern was
 // bound to a library when it was COMPILED reads back unbound, and the binding
@@ -1075,8 +1074,8 @@ linkAndWriteWithStaticArchives(AssembledModule                        clientModu
                                DiagnosticReporter&                    reporter,
                                ImageRequest const&                    request = {});
 
-// c163 (D-LK-STATIC-ARCHIVE-WRITER, the writer half of D-FF1-AR-WRITER-STATIC-
-// LINK): link N assembled CUs into N RELOCATABLE object members and bundle them
+// c163 (D-LK-STATIC-ARCHIVE-WRITER, the writer half of D-FF1-AR-WRITER-STATIC-LINK):
+// link N assembled CUs into N RELOCATABLE object members and bundle them
 // into ONE GNU/System V `ar` static archive (`.a`) committed to `outPath`. The
 // static-library counterpart of `linkAndWrite` (which emits ONE image).
 //

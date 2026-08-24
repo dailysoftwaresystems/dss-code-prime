@@ -1508,8 +1508,8 @@ TEST(MachoImageSymbolNames,
         // THE discriminating case: a final image wants this name (it is the
         // frame a debugger and a crash reporter print), while a relocatable
         // `.o` must NOT expose it (a foreign linker keys by name, and two TUs'
-        // `helper`s would collide -- D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-
-        // FOREIGN-COLLISION). Pre-fix, every arm spelled it `_sym_7`.
+        // `helper`s would collide -- D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION).
+        // Pre-fix, every arm spelled it `_sym_7`.
         AssembledFunction f7;
         f7.symbol = SymbolId{7};
         f7.bytes  = port.retBytes;

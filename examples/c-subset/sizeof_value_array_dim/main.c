@@ -1,5 +1,5 @@
-// D-FC6-SIZEOF-ARRAY-DIM-VALUE-FORM ✅ + D-SEMANTIC-SUBTREETYPE-TRANSPARENT-
-// WRAPPERS ✅: `sizeof` of an EXPRESSION (the value form) in an array dimension
+// D-FC6-SIZEOF-ARRAY-DIM-VALUE-FORM ✅ + D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS ✅:
+// `sizeof` of an EXPRESSION (the value form) in an array dimension
 // now folds — the classic element-count idiom `sizeof(b)/sizeof(b[0])`.
 //
 // This works because the complete semantic-tier expression typer derives the

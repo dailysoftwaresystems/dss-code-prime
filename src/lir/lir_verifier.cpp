@@ -770,8 +770,8 @@ bool verifyLirText(Lir const& lir, TargetSchema const& schema,
     // join here too. The text-load path has no MIR cross-reference (the source
     // MIR isn't part of `.dsslir`), so MIR-dependent rules (2–4) are
     // deliberately not invoked.
-    // ★ Rule 1b matters MOST on this path (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-
-    // DROPPED): the text reader is the one producer that ever built a
+    // ★ Rule 1b matters MOST on this path (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED):
+    // the text reader is the one producer that ever built a
     // terminator whose two CFG channels disagreed, and it did so silently with
     // `ok == true`. A rule that runs only where the bug cannot occur is not a
     // net.

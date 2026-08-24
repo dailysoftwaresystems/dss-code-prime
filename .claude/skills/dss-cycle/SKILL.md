@@ -120,8 +120,9 @@ hand-typing every edit or reading every subsystem.
    `src/dss-config/**` is a FILE SET like any other, and a config document is an INPUT to
    every lane's build. Editing one while a lane is running does not merely risk a merge
    conflict — it changes what that lane's binaries MEAN between two runs.
-   ⚠ ✔MEASURED 2026-08-20 (cycle P22, `D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-
-   OWNERSHIP`): the orchestrator corrected a relocation `nativeId` while a lane was mid
+   ⚠ ✔MEASURED 2026-08-20 (cycle P22,
+   `D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-OWNERSHIP`): the orchestrator
+   corrected a relocation `nativeId` while a lane was mid
    red-on-disable run. A test's verdict flipped between two runs of the same binary, and the
    lane reported a stale tree as a defect in its final report. **The damage is not the wasted
    report — it is that a red-on-disable observation is the ONE measurement this project

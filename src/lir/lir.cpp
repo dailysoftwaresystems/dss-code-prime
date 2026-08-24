@@ -507,10 +507,18 @@ LirReg LirBuilder::instResult(LirInstId inst) const {
     return instArena_.at(inst).result;
 }
 
-LirInstId LirBuilder::lastInst() const {
+bool LirBuilder::hasAnyInst() const noexcept {
     // Slot 0 is the arena's reserved sentinel, so `size() <= 1` means
     // "nothing appended".
-    if (instArena_.size() <= 1) {
+    return instArena_.size() > 1;
+}
+
+LirInstId LirBuilder::lastInst() const {
+    // ★ THE SAME PREDICATE `hasAnyInst()` PUBLISHES -- deliberately not a
+    // second copy of `size() <= 1`, so a caller that guards with
+    // `hasAnyInst()` is guarded by exactly this refusal and not by a lookalike
+    // that could be edited apart from it.
+    if (!hasAnyInst()) {
         lirFatal("LirBuilder::lastInst: no instruction has been appended");
     }
     return LirInstId{static_cast<std::uint32_t>(instArena_.size() - 1),

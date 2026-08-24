@@ -1,0 +1,13 @@
+{
+  "_comment": [
+    "Per-file ceilings for WRAPPED anchor ids -- an id split across a line break.",
+    "A wrapped id does not fail, it DISAPPEARS: no grep returns it and no anchor",
+    "guard counts it. A ceiling may only come DOWN. Un-wrap a site (put the id on",
+    "one line of its own) and lower the number in the SAME commit; the guard prints",
+    "the new value. Raising an entry, or adding a file, is a FAILURE -- that is the",
+    "ratchet. This file is DEBT, not a pass: green means no NEW wrap landed.",
+    "Burn-down tracked by D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP.",
+    "EMPTY as of cycle P29: 290 sites across 145 files were un-wrapped. Green now means ZERO, so a single new wrap reds immediately -- there is no headroom left to hide one in."
+  ],
+  "ceilings": {}
+}

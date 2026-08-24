@@ -812,8 +812,8 @@ TEST(MirText, UnknownFunctionAttributeIsMalformed) {
 // ── inline asm in the text format ───────────────────────────────────────────
 //
 // ★★★ THIS FILE HAD **ZERO** COVERAGE OF EITHER ASM OPCODE, IN EITHER
-// DIRECTION, UNTIL 2026-08-19 (D-MIR-TEXT-INLINE-ASM-RENDERS-A-POOL-INDEX-AND-
-// NO-EDGES). Both fell into the writer's `default:` arm, which rendered the
+// DIRECTION, UNTIL 2026-08-19 (D-MIR-TEXT-INLINE-ASM-RENDERS-A-POOL-INDEX-AND-NO-EDGES).
+// Both fell into the writer's `default:` arm, which rendered the
 // operands and then the raw `instPayload` — an index into the module's
 // `MirAsmDescriptorPool`, meaningless once the text leaves the module — and,
 // because `default:` renders no successors, an `asm goto` printed with **no CFG

@@ -74,6 +74,28 @@ import subprocess
 import sys
 import tempfile
 
+# ── OUTPUT ENCODING — NOT COSMETIC, AND THE STREAM IS HALF THE FACT ─────────────
+# ✔MEASURED 2026-08-23 (CPython 3.14.3, Windows, BOTH streams PIPES, which is
+# exactly how ctest runs every guard): `sys.stdout` comes up
+# `encoding='cp1252' errors='surrogateescape'` and `sys.stderr` comes up
+# `errors='backslashreplace'`. `surrogateescape` rescues only lone surrogates left
+# by an earlier decode; it does NOTHING for an ordinary unencodable character. So a
+# report printed on STDOUT — where this guard names every index document that
+# disagrees with the tree —
+# raises `UnicodeEncodeError` and kills the guard INSIDE ITS OWN REPORT: the run
+# still reds, but the finding is lost and the traceback names a `print` rather than
+# the thing that was wrong. STDERR merely mangles the glyph into an escape.
+# ⚠ Paths are ASCII in this tree TODAY, which makes this prophylactic rather than a
+# live red — and one non-ASCII script name away from not being.
+# Applied at IMPORT, so every path this module can print on is covered.
+# D-GATE-PYTHON-GUARD-DIES-PRINTING-TREE-TEXT-ON-A-WINDOWS-PIPE
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):   # pragma: no cover - odd stream
+        pass
+
+
 # The two documents. Both are generated between the markers and hand-written
 # outside them, so the prose that explains the index is never machine-owned.
 README_REL = os.path.join("scripts", "README.md")

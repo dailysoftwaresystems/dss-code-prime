@@ -1002,7 +1002,7 @@ TEST(LK10EntrySliceC, RunnableBinaryExitFortyTwo) {
     ASSERT_TRUE(linker::writeImage(image, exePath, rep))
         << "writeImage must succeed";
 
-    auto const result = runBinary(exePath, std::chrono::milliseconds{5000});
+    auto const result = runBinary(exePath);
     ASSERT_TRUE(result.spawned)
         << "CreateProcess must succeed for the emitted .exe — if "
            "this fails, the binary is structurally invalid at the "

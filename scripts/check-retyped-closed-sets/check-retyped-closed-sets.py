@@ -125,6 +125,27 @@ import re
 import sys
 from pathlib import Path
 
+
+# ── output encoding ─────────────────────────────────────────────────────────
+# ⚠ NOT COSMETIC, AND THE POSITION IS THE POINT: this runs AT IMPORT, not inside
+# `main()`. On Windows a Python child whose stdout is a PIPE — which is how ctest
+# runs every guard — comes up cp1252, and this script's own subject matter is
+# diagnostics full of em dashes and arrows. Reconfiguring inside `main()` leaves
+# every import-time failure path, and any caller that imports this module rather
+# than running it, still on cp1252.
+# ✔MEASURED: the run once died mid-listing with a UnicodeEncodeError AFTER
+# printing the count line — a reader greps for their file, does not find it, and
+# concludes it is clean. A census that can stop early must not do so silently.
+# ⛔ DO NOT move this back into `main()`. `check-guard-output-encoding` inventoried
+# this file as DEBT for exactly that shape; the entry was deleted in the same
+# commit that moved the block here, and that guard REFUSES an inventory entry
+# that now passes, so re-adding the entry will not quiet it either.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):        # pragma: no cover - old/odd stream
+        pass
+
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 
@@ -505,17 +526,8 @@ def main() -> int:
                          "exit 1 if any of them stopped seeing its subject")
     args = ap.parse_args()
 
-    # Windows consoles and redirected pipes default to cp1252, and this
-    # script's own subject matter is diagnostics full of em dashes and arrows.
-    # Without this the run died mid-listing with a UnicodeEncodeError AFTER
-    # printing the count line -- a reader greps for their file, does not find
-    # it, and concludes it is clean. A census that can stop early must not do
-    # so silently.
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
+    # ⓘ The stream reconfiguration that used to sit here now runs AT IMPORT —
+    # see the block under the imports for why the position matters.
 
     if args.min_tokens < 1:
         print("--min-tokens must be >= 1", file=sys.stderr)
@@ -560,7 +572,17 @@ def main() -> int:
         for o in owners:
             print(f"    OWNER  : {o}")
         print()
-    return 0
+    # ★★ THE CENSUS ABOVE ALWAYS RETURNS 0 — IT IS A LISTING, NOT AN ASSERTION —
+    # SO THE NO-ARGUMENT FORM DRIVES THE SELF-TEST AND RETURNS **THAT**. Without
+    # this, the registered ctest entry could only fail by CRASHING: it printed a
+    # census nobody read and asserted nothing, which is exactly
+    # D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS.
+    # ⛔ DO NOT register `--self-test` instead to get the arms: that path returns
+    # before the census, so the log would lose the listing a reader greps. The
+    # two are complementary, and the entry needs both. ✔MEASURED 2026-08-24
+    # (cycle P29, independent step-10 audit): registered bare, this entry ran the
+    # census and ZERO of the 9 arms.
+    return run_self_test()
 
 
 if __name__ == "__main__":

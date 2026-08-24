@@ -23,8 +23,8 @@ set_property(TEST test_support/test_repo_root APPEND PROPERTY
              ENVIRONMENT "GTEST_FILTER=-BakedRootOnly.*")
 dss_add_test(NAME test_support/test_host_native_target
              SOURCES test_host_native_target.cpp)
-# D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-MANIFEST-ARM64-ARM-WITHOUT-
-# EMULATOR. On a windows/x86_64 host the corpus produces ZERO environmental
+# D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR.
+# On a windows/x86_64 host the corpus produces ZERO environmental
 # skips (every non-Windows arm is excluded by `runOn` first), so without these
 # the strict-mode guard would have no witness on that leg at all.
 dss_add_test(NAME test_support/test_arm_verdict_ledger

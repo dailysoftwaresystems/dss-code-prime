@@ -1442,8 +1442,9 @@ encode(AssembledModule const&    module,
                            + module.dataItems.size());
 
     // Defined function symbols (type=FUNCTION, SectionNumber=1 for `.text`).
-    // Storage class is coupled to the NAME (D-LK-INTERNAL-LINKAGE-FN-EMITTED-
-    // GLOBAL-FOREIGN-COLLISION, TF-C54): a static/synthesized `sym_<id>` def is
+    // Storage class is coupled to the NAME
+    // (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION,
+    // TF-C54): a static/synthesized `sym_<id>` def is
     // Local -> IMAGE_SYM_CLASS_STATIC (3), so a sibling `.obj`'s unrelated
     // `sym_<id>` can never collide with it at a FOREIGN multi-TU link; an
     // externally-visible def keeps EXTERNAL (2). COFF has NO local-first
@@ -2660,8 +2661,8 @@ encodeExec(AssembledModule const&    module,
     // 1u : 0u)]` arithmetic that an earlier shape used.
     //
     // **Anchor D-LK2-RODATA-SECTION-LAYOUT-RECORD**: this type is
-    // walker-local today (PE is the sole consumer); when D-LK1-
-    // RODATA (ELF) or D-LK3-RODATA (Mach-O) closes, hoist to
+    // walker-local today (PE is the sole consumer); when
+    // D-LK1-RODATA (ELF) or D-LK3-RODATA (Mach-O) closes, hoist to
     // `src/link/format/data_section_layout.hpp` as shared
     // substrate. Trigger: 2nd walker arm.
     struct DataSectionLayout {
@@ -2684,8 +2685,8 @@ encodeExec(AssembledModule const&    module,
     // Schema discipline: requireSection(Rodata) fail-louds if the
     // format JSON omits the row — silent walker emission is
     // forbidden. SymbolId→VA resolution for relocations targeting
-    // rodata items is deferred to D-LK4-RODATA-WALKER-RELOC-BASE-
-    // OFFSET (no producer emits such relocations yet — see plan
+    // rodata items is deferred to D-LK4-RODATA-WALKER-RELOC-BASE-OFFSET
+    // (no producer emits such relocations yet — see plan
     // §3.1 anchor row).
     //
     // D-LK2-RODATA (`.rdata`) + D-LK4-DATA-PRODUCER (writable `.data` +

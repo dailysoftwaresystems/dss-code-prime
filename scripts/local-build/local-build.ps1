@@ -46,8 +46,9 @@ $ErrorActionPreference = 'Stop'
 # a property a script can decide, which is why the pairing rule is a review
 # obligation in the first place.
 #
-# MEASURED 2026-08-20 (cycle P23, D-BUILD-CONCURRENT-LANES-TRIP-A-TOOLCHAIN-
-# HEADER-READ-FAILURE): under several concurrent lane builds g++ failed to READ
+# MEASURED 2026-08-20 (cycle P23,
+# D-BUILD-CONCURRENT-LANES-TRIP-A-TOOLCHAIN-HEADER-READ-FAILURE):
+# under several concurrent lane builds g++ failed to READ
 # a standard-library header and printed a bare path plus an errno string,
 # followed by ~6 CASCADED diagnostics that look exactly like source defects.
 #

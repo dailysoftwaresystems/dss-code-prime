@@ -4,8 +4,8 @@
 # WHY THIS EXISTS. DSS's Mach-O object writer declares MH_SUBSECTIONS_VIA_SYMBOLS
 # in its object schema, which is a LICENCE for ld64 to dead-strip at SYMBOL
 # granularity. The moment a writer emits an ALIAS -- a second defined symbol at
-# the same address as a canonical one (D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-
-# OBJECT-SYMTAB) -- ld64 either treats it as another name for the same atom
+# the same address as a canonical one (D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB)
+# -- ld64 either treats it as another name for the same atom
 # (benign) or mints a ZERO-LENGTH atom at that address (dangerous: a reference
 # that reaches only the alias keeps the zero-length atom while the body is
 # stripped -- perfect bytes, wrong program).

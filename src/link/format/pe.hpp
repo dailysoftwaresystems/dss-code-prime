@@ -37,8 +37,8 @@
 
 namespace dss::pe {
 
-// `request` carries the per-PROGRAM image knobs (D-SQLITE-PE64-FULL-TIER-
-// STACK-DEPTH). Defaults to empty so every existing caller is unchanged.
+// `request` carries the per-PROGRAM image knobs (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH).
+// Defaults to empty so every existing caller is unchanged.
 // This walker implements the `pe-optional-header` stack-reserve vehicle for
 // the **exec** flavor only; it RE-CHECKS the schema's declared capability
 // rather than trusting the linker gate, because `pe::encode` is a public

@@ -380,8 +380,25 @@ public:
     // but the SHARED dispatch `lir_pass_util::emitTerminator` returns a
     // bool (it routes to one of five builder entrypoints), so its callers
     // otherwise have no handle on what it just emitted. Aborts if nothing
-    // has been appended yet.
+    // has been appended yet -- ask `hasAnyInst()` first when that is possible.
     [[nodiscard]] LirInstId lastInst() const;
+
+    // Whether ANY instruction has been appended yet.
+    //
+    // ★★★ THIS EXISTS BECAUSE ITS ABSENCE WAS A CRASH. A caller
+    // that needs "the id `addInst` will mint next" has to distinguish the
+    // empty module, and with no query to ask, `mir_to_lir` MIRRORED the arena
+    // in a `bool` it maintained itself. The assembly engine emits straight
+    // into the builder and bypassed the site that set the mirror, so the asm
+    // path re-derived it from the SHAPE OF THE INPUT (did the template carry
+    // a line?) rather than from what was emitted -- and a template that
+    // carries a line but emits nothing (a comment, a bare newline,
+    // whitespace) set the flag over an EMPTY arena. `lastInst()` then aborted
+    // with no diagnostic code and no source position, on source gcc compiles.
+    // ⇒ STATE THAT MIRRORS THE ARENA IS STATE THAT CAN DISAGREE WITH IT.
+    // `lastInst()` is defined in terms of this predicate, so "is it safe to
+    // call `lastInst()`" and `lastInst()`'s own refusal cannot drift apart.
+    [[nodiscard]] bool hasAnyInst() const noexcept;
 
     // Consume the builder, returning the frozen Lir module. Aborts
     // on any contract violation (open function with no terminated

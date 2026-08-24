@@ -3,8 +3,8 @@
  *   - 8 int params: i7,i8 overflow past the 6 SysV GPR arg registers;
  *   - 11 double params: d9,d10,d11 overflow past the 8 SysV FP arg registers.
  * The pre-regalloc lowerWideCallArgs pass must split BOTH the int and the FP
- * overflow args to `store_outgoing_arg` carriers (D-AS-REGALLOC-WIDE-CALL-
- * OPERAND-COUNT), and the callee must read the GPR-overflow and FP-overflow
+ * overflow args to `store_outgoing_arg` carriers (D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT),
+ * and the callee must read the GPR-overflow and FP-overflow
  * stack args from DISTINCT monotonic offsets (D-FF3).
  *
  * WITNESS: register args are uniform (=1) but the OVERFLOW args are distinct-

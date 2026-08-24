@@ -86,8 +86,8 @@ windowFor(EncodingSlotKind s) noexcept {
         //     SymbolPatchMarker) are not decoded by this mirror yet — the
         //     disasm-completeness gap tracked by D-AS5-MULTIWORD-DISASM.
         //     (Imm9 + MemBaseNoScale ARE decoded above — FC12c fstur_q;
-        //     Imm12 + Imm12Scaled ARE decoded above — D-ASM-AARCH64-LARGE-
-        //     FRAME-IMM12 load_u/store_u.)
+        //     Imm12 + Imm12Scaled ARE decoded above —
+        //     D-ASM-AARCH64-LARGE-FRAME-IMM12 load_u/store_u.)
         // Both return nullopt — behavior unchanged from the prior
         // enum-drift fallback. Listed EXHAUSTIVELY (no `default:`) so the
         // D-AS-ENCODINGSLOT-EXHAUSTIVE-WARN gate flags a new enumerator.
@@ -95,6 +95,9 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRm:
         case EncodingSlotKind::Imm32:
         case EncodingSlotKind::Imm8:
+        // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: x86-variable, never on a
+        // fixed32 variant.
+        case EncodingSlotKind::Imm16Bytes:
         case EncodingSlotKind::Disp32:
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:

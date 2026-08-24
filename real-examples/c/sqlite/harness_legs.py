@@ -1635,8 +1635,8 @@ def _measure_wall_clock_step(config, clock=None, awake=_PROBE_DEFAULT,
     consequently AWAKE seconds and may be far short of the wall time the run
     took; that is the instrument working, not the defect.
 
-    ✔THE SIGNATURE THIS IS CALIBRATED AGAINST (D-ENV-WSL2-CLOCK-REALTIME-STEPS-
-    34S, MEASURED 2026-08-01, two independent instruments): CLOCK_REALTIME
+    ✔THE SIGNATURE THIS IS CALIBRATED AGAINST (D-ENV-WSL2-CLOCK-REALTIME-STEPS-34S,
+    MEASURED 2026-08-01, two independent instruments): CLOCK_REALTIME
     oscillates between two values ~34.47 s apart, flipping every ~5 s; 49 and 48
     steps observed; total spread 35.164 s. So a 20 s sample at 250 ms sees ~4
     flips, and `minStepSeconds: 5` sits ~7x below the real magnitude and ~4
@@ -6725,8 +6725,7 @@ def acquire(leg, root, offline=False, downloader=_download):
 
 
 def _audit_embedded_paths(label, member, blob):
-    """★ THE GUARD THIS ANCHOR EXISTS FOR — D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-
-    SCRIPT-LIBRARY.
+    """★ THE GUARD THIS ANCHOR EXISTS FOR — D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY.
 
     A `.dylib`/`.so`/`.dll` is not always self-contained. Tcl bakes in its script
     library, ICU its data bundle, tzdata its zone directory — and acquisition
@@ -7720,8 +7719,7 @@ def emit_sh(resolved):
         # driver reads the VERB and asks this resolver for the directory, the
         # launcher argv and the argv prefixes (`--run-dir-plan`), because the run
         # directory's filesystem is a property of the LAUNCHER and not of the
-        # machine that happens to be driving. D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-
-        # IS-DRVFS.
+        # machine that happens to be driving. D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS.
         put("LEG_RUN_FILESYSTEM", run["runFilesystem"])
         # THE EARNED CONFOUNDS, PER LEG, IN THE DRIVERS' OWN WIRE GRAMMAR. This
         # is the whole of D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG:
@@ -8931,8 +8929,8 @@ DSS_REGIONS = {
 #      paired with its twin, or declared single-driver WITH A REASON. A helper
 #      added to one driver and not the other is a LOUD failure at the moment it
 #      is added, which is the capability-pair defect class this project keeps
-#      paying for ([[D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-
-#      DRIVER]] and its siblings).
+#      paying for ([[D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER]]
+#      and its siblings).
 #
 #   2. DIFFERENTIAL EXECUTION, for the pairs that are pure functions of their
 #      input. Both copies are EXTRACTED FROM THE SHIPPED DRIVERS by their
@@ -10786,8 +10784,8 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     labels = [leg["label"] for leg in legs]
 
     # ★ THE LOAD-BEARING ASSERTION. Every host, every launcher availability,
-    # the SAME build set in the SAME order. This is D-HARNESS-CROSS-HOST-ANY-
-    # TARGET item (2) expressed as an executable property: if a future edit
+    # the SAME build set in the SAME order. This is D-HARNESS-CROSS-HOST-ANY-TARGET
+    # item (2) expressed as an executable property: if a future edit
     # makes the leg list depend on the host in ANY way, this reds.
     for host in SELF_TEST_HOSTS:
         for available in (None, set(),
@@ -15670,8 +15668,9 @@ def main(argv=None):
                 result = acquire_plan(leg, root)
             else:
                 # ★ THE RESULT IS PRINTED ON BOTH OUTCOMES, and it is the SAME
-                # RECORD SHAPE either way — D-HARNESS-PINNED-ARCHIVE-FAILURE-
-                # RETURN-OMITS-ACQUIRED: "a function whose SUCCESS return and
+                # RECORD SHAPE either way —
+                # D-HARNESS-PINNED-ARCHIVE-FAILURE-RETURN-OMITS-ACQUIRED:
+                # "a function whose SUCCESS return and
                 # FAILURE return carry different field sets is a silent-omission
                 # generator". A driver needs `scriptLibraryDir` most when
                 # acquisition has just failed and it is reporting why, so the

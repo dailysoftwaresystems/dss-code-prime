@@ -397,8 +397,9 @@ struct ScriptRun {
     std::string diagnostic;
     std::string scriptPath;
     std::map<std::string, StepOutcome> outcomes;   // marker -> verdict + its output
-    // ★ THE LOG PATH TRAVELS WITH THE RESULT. [D-TEST-NATIVE-PROBE-COMPILE-FAILURE-
-    // DISCARDS-ITS-OWN-OUTPUT, same shape.] A driver that launched and then
+    // ★ THE LOG PATH TRAVELS WITH THE RESULT.
+    // [D-TEST-NATIVE-PROBE-COMPILE-FAILURE-DISCARDS-ITS-OWN-OUTPUT,
+    // same shape.] A driver that launched and then
     // produced no marker has an explanation sitting in its capture file, and the
     // first version of this file threw it away: the failure read `produced no
     // @@PROBE IDENT marker ... the shell could not run it`, which named a guess

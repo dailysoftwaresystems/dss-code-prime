@@ -52,8 +52,9 @@ default_build_type_for() {
 }
 
 # ── TOOLCHAIN I/O FAILURE — a distinct outcome from a build failure ─────────
-# ✔MEASURED 2026-08-20 (cycle P23, D-BUILD-CONCURRENT-LANES-TRIP-A-TOOLCHAIN-
-# HEADER-READ-FAILURE): under several concurrent lane builds, g++ failed to READ
+# ✔MEASURED 2026-08-20 (cycle P23,
+# D-BUILD-CONCURRENT-LANES-TRIP-A-TOOLCHAIN-HEADER-READ-FAILURE):
+# under several concurrent lane builds, g++ failed to READ
 # a standard-library header and printed
 #     C:/Strawberry/c/include/c++/13.2.0/bits/locale_facets.tcc: Invalid argument
 # followed by ~6 CASCADED diagnostics that look exactly like source defects

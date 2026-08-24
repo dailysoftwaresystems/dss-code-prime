@@ -1108,8 +1108,8 @@ if (-not $python3) { Die "python3 not found on PATH — needed to resolve the le
 #                              since 2026-08-11 — the PRECONDITION DISCRIMINATOR,
 #                              driven over real zero-byte segment logs so that "one
 #                              resume, not ten" is asserted rather than described
-#                              [D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-
-#                              SILENT-CRASH]. Each pin carries its red-on-disable
+#                              [D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH].
+#                              Each pin carries its red-on-disable
 #                              mutation, asserted to have LANDED.
 #   test-mirror-regions.ps1    the `dss:` REGIONS — every region declared with who
 #                              verifies it (a claimed verifier that does not read
@@ -1472,8 +1472,8 @@ foreach ($lg in $AllLegs) {
   # ★ THE FIDELITY, BESIDE THE MODE — the two are not the same fact, and the whole
   # reason this field exists is that one `launched` line can mean real aarch64
   # hardware and another can mean qemu. Printing the mode alone is what made the
-  # distinction unreadable. [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-
-  # RECORDED-NOR-SELECTABLE]
+  # distinction unreadable.
+  # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
   if ("$($lg.run.fidelity)") { $runTxt = "$runTxt  fidelity: $($lg.run.fidelity)" }
   Info "  [$sel] $($lg.label.PadRight(15)) $($lg.spec.PadRight(34)) build: ATTEMPTED   $runTxt"
 }
@@ -1820,8 +1820,8 @@ BLD="$DIR/bld-dss"; mkdir -p "$BLD"
 # ✔MEASURED 2026-08-06 on the elf64-x86_64 corpus: with these flags absent, 362
 # of the 1,241 files the run called COMPLETED asserted nothing — they returned at
 # their first `ifcapable` gate while DSS had already compiled the code they
-# would have tested. D-HARNESS-CORPUS-FILES-COMPLETE-WITHOUT-ASSERTING-BECAUSE-
-# CAPABILITIES-ARE-OFF.
+# would have tested.
+# D-HARNESS-CORPUS-FILES-COMPLETE-WITHOUT-ASSERTING-BECAUSE-CAPABILITIES-ARE-OFF.
 STAGE_CONFIGURE_FLAGS="__STAGE_CONFIGURE_FLAGS__"
 STAGE_MAKE_OPTIONS="__STAGE_MAKE_OPTIONS__"
 STAGE_REQUIRED_DEFINES="__STAGE_REQUIRED_DEFINES__"
@@ -2443,8 +2443,7 @@ $winPathBody = if ($script:HostNeedsWsl) { 'wslpath -m "$1"' } else { 'printf ''
 # ★ FAIL LOUD IF IT CANNOT BE RESOLVED, never fall back to "no flags" — that
 #   fallback IS the bug: it configures a sqlite with fts5/fts3/rtree/session OFF,
 #   and the corpus then reports ~270 test files as completed having asserted
-#   nothing. D-HARNESS-CORPUS-FILES-COMPLETE-WITHOUT-ASSERTING-BECAUSE-
-#   CAPABILITIES-ARE-OFF.
+#   nothing. D-HARNESS-CORPUS-FILES-COMPLETE-WITHOUT-ASSERTING-BECAUSE-CAPABILITIES-ARE-OFF.
 try {
   # Same shape as the --plan call above: capture with 2>&1 and take $LASTEXITCODE
   # DIRECTLY, never through a pipe, and keep the native call out of a context
@@ -5442,8 +5441,8 @@ $runEnvPath = Get-LegLoaderSearchPath $leg $legLibDirs
 # there is no `host-system` leg left for which $TclLibrary is the right answer -
 # yet until legs.json declares a `dataDirs` entry with role `tclScriptLibrary`,
 # `scriptLibraryDir` is empty and every leg lands here, on the HOST's script
-# library. That is exactly the pairing D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-
-# LIBRARY warns about (a packager's library against a host's scripts, matched on
+# library. That is exactly the pairing D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY
+# warns about (a packager's library against a host's scripts, matched on
 # nothing but a version-number coincidence). It is kept because removing it would
 # red a currently-working tier before the declaration lands, and the per-leg WARN
 # at acquisition time says so out loud every run rather than letting it pass.

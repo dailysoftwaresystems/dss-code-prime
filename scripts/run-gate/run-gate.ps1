@@ -53,13 +53,90 @@
 .EXAMPLE
     scripts/run-gate/run-gate.ps1 build/ctest.log '100% tests passed' ctest --test-dir build/dbg --output-on-failure
 #>
-[CmdletBinding()]
-param(
-    [Parameter(Mandatory = $true, Position = 0)][string]$LogPath,
-    [Parameter(Mandatory = $true, Position = 1)][string]$SuccessPattern,
-    [Parameter(Mandatory = $true, Position = 2)][string]$Command,
-    [Parameter(ValueFromRemainingArguments = $true)][string[]]$CommandArgs
-)
+# ⛔ THIS PARAM BLOCK IS DELIBERATELY PLAIN. DO NOT ADD [CmdletBinding()], AND DO
+# NOT ADD A [Parameter()] ATTRIBUTE TO ANY OF THESE — EITHER ONE RE-BREAKS IT.
+# D-GATE-RUN-GATE-PS1-SILENTLY-DROPS-A-COMMON-PARAMETER-PREFIX-FROM-THE-GATE-COMMAND
+#
+# ✔MEASURED 2026-08-23 (cycle P29) with a child script echoing its own argv, three
+# variants of this block:
+#   [CmdletBinding()] + [Parameter()] attrs + ValueFromRemainingArguments
+#       -> `-V`, `-v`, `-D` VANISH from the pass-through array
+#   [Parameter()] attrs + ValueFromRemainingArguments, no [CmdletBinding()]
+#       -> `-V`, `-v`, `-D` STILL VANISH
+#   plain param(), rest collected from $args   (this one)
+#       -> `--test-dir | build/dbg | -V | -R | foo | -D | x | -v` — all present
+#
+# ★ THE ROOT CAUSE IS NOT [CmdletBinding()]. A [Parameter()] attribute on ANY
+# parameter makes a script ADVANCED on its own, and an advanced script's COMMON
+# PARAMETER binder claims `-Verbose`/`-Debug` and their unambiguous prefixes BEFORE
+# the remaining-arguments array is built. Deleting only [CmdletBinding()] looks like
+# the fix, changes nothing, and leaves a green gate over the same silent loss — so
+# the first write-up of this defect named half of it, and the half it named was the
+# half that did not matter.
+#
+# ⚠ WHY IT IS WORTH THIS MUCH COMMENT: the flags dropped are not exotic. `ctest -V`
+# is precisely the flag this repo uses to PROVE a registered entry actually executes
+# its self-test arms — ✔a guard registered by an entry passing no flag was measured
+# this same cycle running ZERO arms. So the one instrument for "did this guard run
+# anything" was itself being silently discarded. rc stays 0, the success witness
+# still matches, and the footer below prints the command with the flag ALREADY GONE,
+# so the log is self-consistent and the loss is invisible in review.
+# ⓘ `-E`/`-O`/`-W` die loudly as ambiguous; `-N`/`-j`/`-R`/`-Z` were never affected.
+# ✔The `.sh` twin uses "$@" and never had this: a live .sh/.ps1 divergence inside the
+# tool whose own header names divergence as its subject.
+# ⛔ AND THE PARAM BLOCK IS **EMPTY** — DO NOT DECLARE $LogPath/$SuccessPattern/
+# $Command AS PARAMETERS EITHER. NAMING THEM RE-BREAKS IT A THIRD WAY.
+# ✔MEASURED 2026-08-24, after the [Parameter()] fix above: a plain
+# `param($LogPath, $SuccessPattern, $Command)` still does NAME binding, and
+# `-c` is an unambiguous PREFIX of `-Command`. So
+#     run-gate.ps1 <log> <witness> python -c "import sys; sys.exit(7)"
+# bound `$Command = "import sys; sys.exit(7)"` and left `python` in the rest,
+# ARGUMENTS REORDERED. The wrapper then ran the wrong thing and reported **127**
+# where the `.sh` twin reported the command's real **7** — and its footer printed
+# `command : exit 7 bash`, i.e. the reordering was visible in the log and still
+# read as a plausible failure. ⚠ `ctest -C Debug` is the everyday casualty, and it
+# is TOTAL: ✔MEASURED against the binder, `<log> <witness> ctest --test-dir build/dbg
+# -C Debug -j 8` bound **$Command = "Debug"** and left `ctest --test-dir build/dbg
+# -j 8` in the rest — so the wrapper would try to EXECUTE a program named `Debug`,
+# fail 127, and report "the gate command was NOT FOUND": a true sentence about a
+# command the caller never wrote. ★ Every name declared here donates its unambiguous
+# PREFIXES to the binder, matched against a namespace the caller cannot see; `-C`,
+# `-c`, `-S` and `-L` were all live. That is why the block must stay EMPTY.
+# ⚠⚠ `-L` IS THE WORST, and it is an ordinary ctest label filter: ✔MEASURED,
+# `<log> <witness> ctest -L smoke -j 8` shifts ALL THREE positionals by one —
+# $LogPath="smoke", $SuccessPattern=<the log path>, $Command=<the witness regex>.
+# The wrapper would then WRITE ITS LOG TO A FILE NAMED `smoke` in the cwd, a path
+# the caller never named and would never look for, and try to execute a program
+# called `100% tests passed`. Declaring even ONE name puts the caller's whole
+# argv at the binder's mercy.
+# ✔The empty form preserves order and every flag, measured with a child echoing
+# its own argv: `-c`, `-C Debug` and `-V` all arrive, in position.
+param()
+
+$__argv = @($args)
+# Mandatory/positional is enforced HERE rather than by a parameter declaration,
+# because the declaration is what breaks the pass-through. The refusal text is what
+# [Parameter(Mandatory)] would have produced, minus the interactive prompt — correct
+# for a gate wrapper: a gate that stops to ask a question in CI has already failed.
+if ($__argv.Count -lt 3) {
+    Write-Host "run-gate.ps1: FAIL - expected at least 3 arguments, got $($__argv.Count)."
+    Write-Host "  usage: run-gate.ps1 <log-path> <success-regex> <command> [args...]"
+    exit 2
+}
+$LogPath        = [string]$__argv[0]
+$SuccessPattern = [string]$__argv[1]
+$Command        = [string]$__argv[2]
+foreach ($required in @(
+        @{ Name = 'LogPath';        Value = $LogPath },
+        @{ Name = 'SuccessPattern'; Value = $SuccessPattern },
+        @{ Name = 'Command';        Value = $Command })) {
+    if ([string]::IsNullOrEmpty($required.Value)) {
+        Write-Host "run-gate.ps1: FAIL - required argument '$($required.Name)' is empty."
+        Write-Host "  usage: run-gate.ps1 <log-path> <success-regex> <command> [args...]"
+        exit 2
+    }
+}
+$CommandArgs = if ($__argv.Count -gt 3) { $__argv[3..($__argv.Count - 1)] } else { @() }
 
 $ErrorActionPreference = 'Continue'
 

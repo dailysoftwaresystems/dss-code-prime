@@ -1380,7 +1380,7 @@ TEST(CoffForeignObjectNative, SingleClObjStaticLinkExitsFortyTwo) {
     auto const exe = dir / "main.exe";
     ASSERT_TRUE(std::filesystem::exists(exe));
 
-    auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -1429,7 +1429,7 @@ TEST(CoffForeignObjectNative, MultiMemberComdatDedupExitsFortyTwo) {
     auto const exe = dir / "main.exe";
     ASSERT_TRUE(std::filesystem::exists(exe));
 
-    auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -1575,7 +1575,7 @@ TEST(CoffLocalFunctionInArchive, DssBuiltLibMemberCallingAStaticHelperExitsForty
     // ★ The general shape: A CROSS-COMPILE TEST THAT SPAWNS ITS OUTPUT IS TWO
     // TESTS, and only the second one is about the host.
 #if defined(_WIN32)
-    auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -1630,7 +1630,7 @@ TEST(CoffForeignObjectNative, ClObjLibMemberCallingAStaticHelperExitsFortyTwo) {
     auto const exe = dir / "main.exe";
     ASSERT_TRUE(std::filesystem::exists(exe));
 
-    auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -1781,9 +1781,8 @@ TEST(CoffForeignObject, ComdatSelectionComesFromTheSectionSymbolNotAPrecedingAux
 }
 
 // ============================================================================
-// THE COFF DATA HALF -- D-LK-COFF-ARCHIVE-MEMBER-READER-LOSES-STATIC-RODATA-
-// SYMBOLS, the second half of D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-
-// LABEL-NOT-ATOM.
+// THE COFF DATA HALF -- D-LK-COFF-ARCHIVE-MEMBER-READER-LOSES-STATIC-RODATA-SYMBOLS,
+// the second half of D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM.
 //
 // ★ WHY THE DERIVED TYPE CANNOT DECIDE THIS ONE. COFF stamps `notype` on EVERY
 // data symbol regardless of linkage -- `pe.cpp`'s defined-DATA loop says so in
@@ -2910,7 +2909,7 @@ TEST(CoffWeakExternalNative, ForeignLinkerConsumesADssReEmittedWeakAlias) {
 
     // 5. ...and it RUNS. 10*2 + 11*2 = 42, which is only reachable if BOTH
     //    names reached the SAME body.
-    auto const r = test_support::runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = test_support::runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)

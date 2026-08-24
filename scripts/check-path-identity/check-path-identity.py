@@ -47,6 +47,28 @@ import pathlib
 import re
 import sys
 
+# ── OUTPUT ENCODING — NOT COSMETIC, AND THE STREAM IS HALF THE FACT ─────────────
+# ✔MEASURED 2026-08-23 (CPython 3.14.3, Windows, BOTH streams PIPES, which is
+# exactly how ctest runs every guard): `sys.stdout` comes up
+# `encoding='cp1252' errors='surrogateescape'` and `sys.stderr` comes up
+# `errors='backslashreplace'`. `surrogateescape` rescues only lone surrogates left
+# by an earlier decode; it does NOTHING for an ordinary unencodable character. So a
+# report printed on STDOUT — where this guard names every file that resolves paths
+# outside the one canonicalizer —
+# raises `UnicodeEncodeError` and kills the guard INSIDE ITS OWN REPORT: the run
+# still reds, but the finding is lost and the traceback names a `print` rather than
+# the thing that was wrong. STDERR merely mangles the glyph into an escape.
+# ⚠ Paths are ASCII in this tree TODAY, which makes this prophylactic rather than a
+# live red — and one non-ASCII filename away from not being.
+# Applied at IMPORT, so every path this module can print on is covered.
+# D-GATE-PYTHON-GUARD-DIES-PRINTING-TREE-TEXT-ON-A-WINDOWS-PIPE
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):   # pragma: no cover - odd stream
+        pass
+
+
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 SRC = REPO / "src"
 
@@ -267,7 +289,18 @@ def main() -> int:
             print(f"  {p}\n")
         return 1
     print("check-path-identity: OK — one canonicalizer, allowlist respected")
-    return 0
+    # ★★ THE NO-ARGUMENT FORM VERIFIES THE TREE **AND THEN** DRIVES THE
+    # SELF-TEST, so the ctest entry cannot pass without also proving this guard
+    # is able to fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    # ⛔ DO NOT make `--selftest` the registered form to get the arms: it RETURNS
+    # from the self-test and never scans the tree, so it would trade the check
+    # for the proof rather than adding the proof to the check. ✔MEASURED
+    # 2026-08-24 (cycle P29, independent step-10 audit): registered bare, this
+    # entry ran the scan and ZERO arms; the sibling defect was measured live in
+    # `no_abort_in_tests_guard`, which ran 0 arms at HEAD with no CMakeLists
+    # change needed to fix it — registration is not execution
+    # (D-GATE-NO-ABORT-IN-TESTS-CTEST-FORM-NEVER-SELF-TESTED).
+    return selftest()
 
 
 if __name__ == "__main__":

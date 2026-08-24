@@ -500,8 +500,8 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn,
     //     anyway; block-merge is exclusive with jump-thread elision).
     // Markers are NOT a gate: both-non-Linear (P, B) pairs merge —
     // the post-rebuild canonical re-derivation stamps the merged
-    // block's actual structural role (D-OPT4-1-NON-LINEAR-MARKER-
-    // MERGE closed). The remaining conditions are pure CFG-legality.
+    // block's actual structural role (D-OPT4-1-NON-LINEAR-MARKER-MERGE
+    // closed). The remaining conditions are pure CFG-legality.
     // `preds` is the caller's precomputed whole-module predecessor map
     // (invariant this pass) — no per-function rebuild here anymore.
     auto isCandidateForMerge = [&](MirBlockId P, MirBlockId B) -> bool {

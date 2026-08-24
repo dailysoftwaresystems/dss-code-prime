@@ -208,8 +208,8 @@ constexpr std::uint32_t kScnCntUninitializedData = 0x00000080u;
 // body in its OWN COMDAT section; the duplicate-resolution policy lives in the
 // section-definition auxiliary record's Selection byte (decoded below --
 // D-LK-COFF-COMDAT-UNSUPPORTED-SELECTION).
-// ⚠ THIS BIT IS NO LONGER FOREIGN-ONLY. It said so until D-LK-OBJECT-WEAK-DEF-
-// RELOCATABLE landed: COFF has no per-symbol weak-DEFINITION encoding, so DSS's
+// ⚠ THIS BIT IS NO LONGER FOREIGN-ONLY. It said so until D-LK-OBJECT-WEAK-DEF-RELOCATABLE
+// landed: COFF has no per-symbol weak-DEFINITION encoding, so DSS's
 // own writer now spells every weak definition as a per-body IMAGE_SCN_LNK_COMDAT
 // section with Selection = IMAGE_COMDAT_SELECT_ANY (`pe.cpp`, the COMDAT
 // sections walk). The COMDAT path below therefore runs on DSS's OWN output as
@@ -1225,8 +1225,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                        SymbolVisibility::Default});
         } else if (role == CoffSymbolRole::Static && declaresFunction(s)) {
             // A FILE-LOCAL (`static`) FUNCTION -- an atom BOUNDARY, exactly like
-            // an external one. D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-
-            // LABEL-NOT-ATOM: the only thing internal linkage changes is WHO MAY
+            // an external one. D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM:
+            // the only thing internal linkage changes is WHO MAY
             // SEE the definition, never whether it has a body, so classifying it
             // by EXTERNAL-ness dropped whole functions on the archive-member
             // read-back path (loud as `K_SymbolUndefined` when called, and

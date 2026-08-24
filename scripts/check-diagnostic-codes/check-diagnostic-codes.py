@@ -18,8 +18,8 @@ hit both:
       diligence, which is the same non-mechanism that `scripts/run-gate/run-gate.sh` was
       written to replace. Two lanes, one counter, no lock.
 
-  (2) ★ A CODE LANDED WITH NO TEST AT ALL. `D-AP6-NEW-DIAGNOSTIC-CODES-HAD-NO-
-      VALUE-PIN` closed on exactly this and it RE-OPENED ONE CYCLE LATER:
+  (2) ★ A CODE LANDED WITH NO TEST AT ALL. `D-AP6-NEW-DIAGNOSTIC-CODES-HAD-NO-VALUE-PIN`
+      closed on exactly this and it RE-OPENED ONE CYCLE LATER:
       `D_LanguageTargetIsaMismatch` (0xD02A) shipped engine code in `src/`
       while appearing in ZERO test files. The hand-maintained contiguity pin in
       `tests/core/test_parse_diagnostic.cpp` cannot see this -- it can only
@@ -93,6 +93,29 @@ import os
 import re
 import subprocess
 import sys
+
+# ── OUTPUT ENCODING — NOT COSMETIC, AND THE STREAM IS HALF THE FACT ─────────────
+# ✔MEASURED 2026-08-23 (CPython 3.14.3, Windows, BOTH streams PIPES, which is
+# exactly how ctest runs every guard): `sys.stdout` comes up
+# `encoding='cp1252' errors='surrogateescape'` and `sys.stderr` comes up
+# `errors='backslashreplace'`. `surrogateescape` rescues only lone surrogates left
+# by an earlier decode; it does NOTHING for an ordinary unencodable character. So a
+# report printed on STDOUT — where this guard names every uncovered code, every
+# duplicate ordinal and every UNVALUED enumerator, all of them identifiers and
+# initialiser TEXT read straight out of the header —
+# raises `UnicodeEncodeError` and kills the guard INSIDE ITS OWN REPORT: the run
+# still reds, but the finding is lost and the traceback names a `print` rather than
+# the thing that was wrong. STDERR merely mangles the glyph into an escape.
+# ⚠ This is the one guard in the battery whose stdout report carries CODE TEXT rather
+# than only paths: an enumerator's initialiser is reproduced verbatim.
+# Applied at IMPORT, so every path this module can print on is covered.
+# D-GATE-PYTHON-GUARD-DIES-PRINTING-TREE-TEXT-ON-A-WINDOWS-PIPE
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):   # pragma: no cover - odd stream
+        pass
+
 
 HEADER_REL = "src/core/types/parse_diagnostic.hpp"
 TESTS_REL = "tests"

@@ -6368,8 +6368,9 @@ PreprocessResult preprocessRun(
         formatPredefinedMacros, activeFormat,
         schema->preprocess().mutuallyExclusivePredefinedMacros);
     if (!merged.conflicts.empty()) {
-        // EITHER a name owned by more than one config, OR (D-LANG-PE64-DEFINES-
-        // BOTH-MSC-VER-AND-GNUC) a mutually exclusive group with more than one
+        // EITHER a name owned by more than one config, OR
+        // (D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC)
+        // a mutually exclusive group with more than one
         // member effective on this format. Both are the same failure in the
         // end — the TU would be preprocessed under an identity that is not a
         // real one — so neither may silently win and the pass does not run at

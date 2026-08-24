@@ -150,8 +150,7 @@ constexpr std::uint8_t N_SECT = 0x0E;
 // interior label apart from a whole body in Mach-O, because nlist_64 carries
 // no size field, and it is meaningful exactly when the mach_header declares
 // MH_SUBSECTIONS_VIA_SYMBOLS (which the object/staticlib format schemas do,
-// via `MachOIdentity::flags`) -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
-// BLOCK-LABEL-NOT-ATOM.
+// via `MachOIdentity::flags`) -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM.
 //
 // ⚠ 0x0200, NOT 0x0020 -- ✔MEASURED 2026-08-20 against clang 19 targeting
 // arm64-apple-macos, which emits n_desc=0x0200 for an explicit `.alt_entry`
@@ -1693,8 +1692,8 @@ encode(AssembledModule const&    module,
     // ONE mapping, THREE call sites (functions, data items, alias rows), for the
     // reason `definedNDesc` is one function: the ELF writer states the identical
     // fact through `stbForBinding`, and three open-coded ternaries is how the
-    // name/binding pair drifts (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-
-    // COLLISION was exactly that drift).
+    // name/binding pair drifts (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION
+    // was exactly that drift).
     auto definedNType = [&](SymbolBinding binding) -> std::uint8_t {
         return binding == SymbolBinding::Local
                    ? N_SECT
@@ -1750,8 +1749,8 @@ encode(AssembledModule const&    module,
     };
 
     // Defined function symbols: n_sect=1, n_value=offset. n_type binding is
-    // coupled to the NAME (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-
-    // COLLISION, TF-C54): a static/synthesized `_sym_<id>` def is Local → bare
+    // coupled to the NAME (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION,
+    // TF-C54): a static/synthesized `_sym_<id>` def is Local → bare
     // N_SECT (NO N_EXT), so a sibling `.o`'s unrelated `_sym_<id>` can never
     // bind to it at a FOREIGN link; an externally-visible def keeps N_SECT|N_EXT.
     // A Mach-O RELOCATABLE object carries no LC_DYSYMTAB (no local/extern range
@@ -1823,11 +1822,11 @@ encode(AssembledModule const&    module,
     // indices line up. Externally-visible items carry their real
     // (pre-mangled) name + N_SECT|N_EXT; static/synthesized ones keep
     // `_sym_<id>` + Local → bare N_SECT, NO N_EXT (the same name+binding
-    // coupling the function loop above uses — D-LK-INTERNAL-LINKAGE-FN-EMITTED-
-    // GLOBAL-FOREIGN-COLLISION, TF-C54).
+    // coupling the function loop above uses —
+    // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION, TF-C54).
     // A WEAK data def takes N_WEAK_DEF in n_desc through the SAME
-    // `definedNDesc` the function loop above uses (D-LK-OBJECT-WEAK-DEF-
-    // RELOCATABLE) - one decision, two sites, so the pair cannot drift.
+    // `definedNDesc` the function loop above uses (D-LK-OBJECT-WEAK-DEF-RELOCATABLE)
+    // - one decision, two sites, so the pair cannot drift.
     for (auto const& d : dataSyms) {
         std::string const symName = objNames.definedName(d.symId, "_sym_");
         SymbolBinding const binding = objNames.definedBinding(d.symId);
@@ -2819,8 +2818,8 @@ encodeExecDynamic(AssembledModule const&    module,
         }
     }
 
-    // Dispatch ↔ symbolVa-target coherence guard (D-FFI-EXTERN-CALL-
-    // DISPATCH). This walker points every extern's symbolVa at its
+    // Dispatch ↔ symbolVa-target coherence guard (D-FFI-EXTERN-CALL-DISPATCH).
+    // This walker points every extern's symbolVa at its
     // `__stubs` STUB (see `symbolVa.emplace(..., stubVa)` below) and the
     // stub does the __got indirection — that is `direct-plt` semantics.
     // A format that declares `indirect-slot` would make the call site

@@ -216,8 +216,8 @@ TEST(UnsuppressableCodes, ThreadLocalRejectsAreUnsuppressable) {
 }
 
 // Inline-asm operand binding (D-CSUBSET-INLINE-ASM-OPERANDS +
-// D-CSUBSET-INLINE-ASM-TEXT + D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-
-// OPERAND, 0xE065..0xE06C). All EIGHT are members on PRONG (1): each refuses a
+// D-CSUBSET-INLINE-ASM-TEXT + D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-OPERAND,
+// 0xE065..0xE06C). All EIGHT are members on PRONG (1): each refuses a
 // construct that has a SECOND CANDIDATE LOWERING a silenced compiler would take
 // unannounced — an unbound operand, an alternative the binder chose itself, a
 // full-width register where a narrow view was written, a dropped clobber, a

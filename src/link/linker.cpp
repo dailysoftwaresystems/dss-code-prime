@@ -446,8 +446,8 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     //
     // ★ ONE id LEGITIMATELY CARRIES SEVERAL ROWS — the subject of
     // D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW. Equal-offset defined symbols collapse
-    // to ONE atom under several names (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-
-    // TWIN-ATOMS): `strong_fn` GLOBAL + `weak_alias` WEAK at one address is what gcc
+    // to ONE atom under several names (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS):
+    // `strong_fn` GLOBAL + `weak_alias` WEAK at one address is what gcc
     // emits for `__attribute__((weak, alias("strong_fn")))`, it is the representation
     // `object_symbol_names.hpp`'s `definedAliases` reads, and every relocatable-object
     // reader produces it. This map used to keep only the FIRST row per id, so every
@@ -1417,8 +1417,8 @@ LinkedImage link(std::span<AssembledModule const> modules,
             //       string literal global, etc. (D-LK4-RODATA-PRODUCER
             //       2026-06-02 — the per-format walker merges these
             //       into its symbolVa map at section-relative offsets), OR
-            //   (d) it is a WRITER-RESERVED singleton id (D-CSUBSET-THREAD-
-            //       LOCAL TLS C3 — the PE `_tls_index` slot the format writer
+            //   (d) it is a WRITER-RESERVED singleton id (D-CSUBSET-THREAD-LOCAL
+            //       TLS C3 — the PE `_tls_index` slot the format writer
             //       mints + binds; the writer defines it into symbolVa or
             //       fails loud, exactly like an extern import in (b)).
             // Anything else is a hard undefined.
@@ -1494,8 +1494,8 @@ LinkedImage link(std::span<AssembledModule const> modules,
     }
 
     // D-LK4-RODATA-SUBSTRATE precondition guard: until the per-
-    // format walker arms (D-LK2-RODATA / D-LK1-RODATA / D-LK3-
-    // RODATA) close, no walker consumes `module.dataItems`. A
+    // format walker arms (D-LK2-RODATA / D-LK1-RODATA /
+    // D-LK3-RODATA) close, no walker consumes `module.dataItems`. A
     // future producer (HIR string-literal promotion → MIR global →
     // assembler) that lands `dataItems` BEFORE the matching walker
     // arm would silently emit a binary with NO `.rdata`/`.rodata`/
@@ -1532,8 +1532,8 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // `supportedDataSections: ["rodata", ...]` array advertising
     // which `DataSectionKind` values its walker accepts. The gate
     // below consults that set per-item — formats whose walker arm
-    // has not landed (ELF + Mach-O until D-LK1-RODATA / D-LK3-
-    // RODATA close), AND format flavors that cannot carry rodata
+    // has not landed (ELF + Mach-O until D-LK1-RODATA / D-LK3-RODATA
+    // close), AND format flavors that cannot carry rodata
     // (PE Obj — relocatable .obj emits rodata via the symbol
     // table, not via the dataItems pipeline), reject loudly.
     //

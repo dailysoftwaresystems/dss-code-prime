@@ -66,6 +66,48 @@ import re
 import subprocess
 import sys
 
+# ── OUTPUT ENCODING — AND HERE THE GLYPH **IS** THE FACT ────────────────────────
+# ⚠ A GATE THAT CRASHES WHILE REPORTING IS WORSE THAN ONE THAT SAYS NOTHING.
+# ✔MEASURED 2026-08-12 (the provenance of the single-stream call this replaced):
+# this script died with UnicodeEncodeError on a Windows cp1252 console the first
+# time it had to print an OPENED row, because the status excerpt began with 🟠
+# (U+1F7E0). Every prior run had printed only counts, so the reporting path had
+# never been exercised with real content -- the crash was latent for exactly as
+# long as the gate was passing.
+#
+# ✔MEASURED 2026-08-23 (CPython 3.14.3, Windows, BOTH streams PIPES with
+# `PYTHONIOENCODING` unset — exactly how ctest runs a guard): `sys.stdout` comes up
+# `encoding='cp1252' errors='surrogateescape'` and RAISES on an ordinary
+# unencodable character; `sys.stderr` comes up `errors='backslashreplace'` and
+# survives with the glyph mangled to its escape. `surrogateescape` rescues only lone
+# surrogates left by an earlier decode -- it does nothing for a real character.
+#
+# ★★★ WHY `errors="replace"` ALONE WAS NOT ENOUGH **IN THIS GUARD SPECIFICALLY**,
+# and it is the whole reason this block replaced the single-stream call that used to
+# sit in `main()`. What this instrument prints excerpts of is a registry STATUS
+# CELL, and in that registry THE GLYPH IS THE STATUS: ✅ closed, 🔵 disclosed, ⏳/⛔
+# gated. Re-encoding to cp1252 with `replace` does not degrade the formatting -- it
+# turns the reported fact into `?`, in the one instrument whose job is to report
+# exactly that fact. ✔MEASURED side by side on this registry, same input, cp1252
+# pipe: no reconfigure ⇒ `UnicodeEncodeError`, nothing printed; `errors="replace"`
+# alone ⇒ survives and prints `? **OPEN — named 2026-08-23`; this form ⇒ the glyph
+# arrives intact. A report that erases what it quotes is a fail-loud violation, not
+# a cosmetic one.
+#
+# ★ AT IMPORT, NOT IN `main()`, AND BOTH STREAMS. The call this replaced ran AFTER
+# `parse_args()`, so every path that prints before it was unprotected -- ✔MEASURED
+# at the base ref: `--help` through a cp1252 pipe died with
+# `UnicodeEncodeError: 'charmap' codec can't encode character '✔'`, rc=1, ZERO
+# bytes of help printed. The `sys.exit(msg)` arms that interpolate git's stderr
+# print on stderr and were likewise uncovered.
+# D-GATE-ANCHOR-BALANCE-REPORT-DEGRADES-ITS-STATUS-GLYPH-TO-A-QUESTION-MARK
+# D-GATE-PYTHON-GUARD-DIES-PRINTING-TREE-TEXT-ON-A-WINDOWS-PIPE
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):   # pragma: no cover - odd stream
+        pass
+
 PLANS_DIR = ".plans"
 REG_REL = ".plans/_deferred-anchor-registry.md"
 
@@ -239,9 +281,34 @@ def norm_cell(text):
     return strip_decoration(text).lower()
 
 
+# ⚠⚠ AN ESCAPED PIPE IS NOT A CELL SEPARATOR, AND READING IT AS ONE SHIFTED EVERY
+# CELL AFTER IT. `\|` is the house spelling for a literal pipe inside a cell -- the
+# registry guard's PURPOSE line is literally "refuse a markdown table row whose
+# unescaped pipes would silently drop cells" -- and this splitter was a bare
+# `line.split("|")`, which treats the escape as a separator.
+# ✔MEASURED 2026-08-23 at 6dc63be0 over the 2,233 anchor-bearing table rows in
+# `.plans/`: **161 carry an escaped pipe**; for every one of them the
+# CLOSING-WORK cell was a FRAGMENT of the real cell, and for 131 the STATUS cell
+# was truncated at the escape. The ANCHOR cell moved in **zero** rows, which is
+# why the OPEN population (706) and the mis-marked population (0) are byte-identical
+# before and after -- the defect was silent, not visible, and that is the point.
+# ★★ ITS ONE LIVE CONSEQUENCE WAS A BLIND SPOT, NOT A WRONG NUMBER, AND IT WAS
+# MEASURED: `D-ENV-WSL2-CLOCK-REALTIME-STEPS-34S` and `D-PP-HAS-EXTENSION-BUILTIN-ABSENT`
+# both lead their CLOSING-WORK cell with a gate marker, and both were invisible to
+# `is_gated` because the cell this splitter handed it was `0.1 s\` and `\`
+# respectively (D-GATE-ANCHOR-BALANCE-SPLIT-ROW-TREATS-AN-ESCAPED-PIPE-AS-A-SEPARATOR).
+# ★ The escape is UNDONE in the returned text: a caller matching on cell content
+# should see the pipe the author wrote, not its markdown spelling.
+_UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
+
+
 def split_row(line):
-    """Cells of a markdown table row, 1-based (index 0 is the empty pre-pipe lead)."""
-    return line.split("|")
+    """Cells of a markdown table row, 1-based (index 0 is the empty pre-pipe lead).
+
+    Splits on UNESCAPED pipes only; `\\|` is a literal pipe and is un-escaped in
+    the result. See the note above for the 161-row measurement behind that.
+    """
+    return [c.replace("\\|", "|") for c in _UNESCAPED_PIPE.split(line)]
 
 
 def is_closed(cell):
@@ -433,9 +500,52 @@ def is_mismarked_closure(status, closing_work):
 # The rows the ruling is ABOUT declare themselves in words -- `TRIGGER-GATED`,
 # `MUST-NOT-BUILD`, `trigger-gated`, `TRIGGER-NOT-FIRED` -- and there are 62 open
 # ones, which is also why this arm is a DIFFERENTIAL and not a day-one refusal.
+#
+# ⚠⚠ THE SEPARATOR CLASS IS PART OF THE DECLARATION, AND OMITTING THE HOUSE COLON
+# HID NINETEEN GENUINE GATES -- D-GATE-ANCHOR-BALANCE-GATED-DECL-CANNOT-SPELL-THE-HOUSE-COLON.
+# The original class was `[\s-]*`, so `TRIGGER-NOT-FIRED` matched but `Trigger: NOT
+# FIRED` -- which is how the registry actually writes a trigger field, `Trigger: <x>`
+# -- did not. ✔MEASURED 2026-08-23 over the worktree's 944 OPEN status-bearing rows:
+# admitting `:` and the em-dash, plus the `has`/`yet` forms the same field uses, moves
+# the gated population 72 -> 91, and all 19 added rows were READ. Every one declares a
+# real unfired trigger in the registry's own field syntax -- e.g.
+# `D-CSUBSET-ATTRIBUTE-BEFORE-EXTERN-KEYWORD` (*"Trigger: NOT FIRED, and do not pull it
+# forward"*), `D-DIAG-CODE-RANGE-0X5XXX-DOUBLE-ALLOCATED` (*"Trigger has NOT fired as a
+# live bug"*) and `D-SCRIPT-CMAKE-IMPORT-SCRATCH-LEFTOVER-ACCUMULATION`.
+# ★ THE DIRECTION IS WHAT MAKES IT A DEFECT RATHER THAN A REFINEMENT: it under-reported,
+# which is the direction that flatters the cycle, and it is the fifth time this
+# instrument has erred that way (see the module docstring's three, plus the escape-aware
+# splitter above).
 GATED_DECL = re.compile(
-    r"MUST[\s-]*NOT[\s-]*BUILD|TRIGGER[\s-]*GATED|TRIGGER[\s-]*NOT[\s-]*FIRED",
+    r"MUST[\s:\u2014-]*NOT[\s:\u2014-]*BUILD"
+    r"|TRIGGER[\s:\u2014-]*GATED"
+    r"|TRIGGER[\s:\u2014-]*(?:HAS[\s:\u2014-]*)?NOT[\s:\u2014-]*(?:YET[\s:\u2014-]*)?FIRED",
     re.IGNORECASE)
+# ★★★ A **NEGATED** DECLARATION IS NOT A DECLARATION, AND THE NOTE THAT USED TO SIT
+# BELOW THIS SAID THE OPPOSITE -- D-GATE-ANCHOR-BALANCE-IS-GATED-ACCUSES-A-ROW-THAT-DECLARES-NO-GATE.
+# The old note claimed ✔MEASURED that no row under `.plans/` writes a negated form. That
+# measurement was about the FIRED test ("not already fired", "never fired") and it still
+# holds there; the negation of the **declaration** was never considered, and a row
+# reading *"no longer merely trigger-gated"* was accused on the strength of the words
+# inside its own denial. ⇒ CORRECTED HERE rather than left to be inherited.
+# ⓘ ✔MEASURED 2026-08-23 in the worktree: this arm changes the accused population by
+# **0** rows TODAY, because the one live instance (`D-FFI-OFFSETOF-MACRO`) was reworded
+# out during the P29 registry sweep -- which is itself the outcome the FAIL text below
+# tells authors NOT to take. The shape is real, it recurred once, and it is pinned
+# synthetically so it cannot come back unseen.
+# ⚠ The window looks only BEHIND the hit, so `TRIGGER NOT FIRED` -- a declaration that
+# CONTAINS a negator -- is unaffected: its `NOT` is part of the matched text, not before it.
+_DECL_NEGATOR = re.compile(
+    r"(?:NO\s+LONGER|NOT\s+MERELY|NOT\s+JUST|NEVER|IS\s+NOT|WAS\s+NOT|ARE\s+NOT"
+    r"|WERE\s+NOT|STOPPED\s+BEING|CEASED\s+TO\s+BE)[\s\w,]{0,24}$", re.IGNORECASE)
+
+
+def declares_gate(flat):
+    """A NON-NEGATED gate declaration appears in `flat` (already decoration-stripped)."""
+    for m in GATED_DECL.finditer(flat):
+        if not _DECL_NEGATOR.search(flat[max(0, m.start() - 34):m.start()]):
+            return True
+    return False
 # ★★★ A ROW WHOSE TRIGGER HAS **ALREADY FIRED** IS NOT GATED, WHATEVER ELSE IT
 # SAYS, AND THIS IS DEFINITIONAL RATHER THAN AN ESCAPE HATCH: "gated" means
 # waiting on an event that has not happened. Once the event happens the row is
@@ -465,14 +575,109 @@ GATED_DECL = re.compile(
 # ⇒ SAME CELL, TWO CONVENTIONS: the window is right for the closure test and wrong
 # for this one. By contrast the fired test costs exactly **2 rows** (63 -> 61 in the
 # worktree, 63 -> 62 at the base ref) and both are correct exclusions.
-# ⓘ ✔MEASURED: no row anywhere under `.plans/` writes a NEGATED form ("not already
-# fired", "never fired"), so the match has no known false-exclusion path today.
+# ⓘ ✔MEASURED: no row anywhere under `.plans/` writes a NEGATED form of THIS phrase
+# ("not already fired", "never fired"), so the match has no known false-exclusion path
+# today. ⚠ THAT SENTENCE USED TO BE WRITTEN ABOUT NEGATION IN GENERAL AND WAS FALSE AS
+# SUCH: the negation of the DECLARATION -- *"no longer merely trigger-gated"* -- does
+# occur, and reading it as a declaration is a live defect. It is handled at
+# `_DECL_NEGATOR` above; this note is now scoped to the phrase it was actually measured
+# over, which is what it should always have said.
 # star Like the disclosed mark, this is a CHECKABLE CLAIM rather than a formatting
 # choice: writing "already fired" when it has not is a false statement about the
 # world, and a reader can look. The direction of error is also the safe one -- this
 # can only ever SHRINK the accused set, and an escaped gate joins the reported DEBT
 # population, whereas a false accusation is what gets a guard turned off.
-TRIGGER_FIRED = re.compile(r"ALREADY[\s-]*FIRED", re.IGNORECASE)
+#
+# ★★★ AND IT RECOGNIZED **ONE SPELLING OUT OF SIX** --
+# D-GATE-ANCHOR-BALANCE-TRIGGER-FIRED-RECOGNIZES-ONE-SPELLING-OF-SIX. The phrase above
+# was `ALREADY FIRED` and nothing else, but the registry's own trigger FIELD spells the
+# same claim without the adverb. The un-adverbed spelling is the registry's COMMONEST
+# and this pattern matched none of it, which is the finding; the arithmetic below is
+# only how it was noticed.
+# ⚠ THE ORIGINAL SPLIT PUBLISHED HERE DOES NOT REPRODUCE AND IS CORRECTED IN PLACE,
+# because a wrong number in the file that explains a fix is how the next reader
+# re-derives the wrong lesson. It read `Trigger: FIRED` **317** / `Trigger fired` 56 /
+# `the trigger fired` 15 / `Trigger HAS fired` 8 / `TRIGGER-FIRED` 1 against
+# `ALREADY FIRED` **84**. ✔RE-MEASURED 2026-08-24 over the guard's OWN harvested
+# population (`scan_worktree`, 2,299 recognized deferral-table rows, open and closed,
+# case-insensitive): **105 / 73 / 16 / 10 / 3** against **77**. ★ The mechanism of the
+# error is worth more than the digits: **317 was a GREEDY `Trigger:.*FIRED` count** --
+# a real total for "some fired-spelling appears after a `Trigger:` label", silently
+# attributed to the FIRST bucket alone, so the split over-counted its lead term ~3x
+# while the sum stayed honest. A total that is right makes a wrong split look checked.
+# ★ THE CONSEQUENCE WAS A FALSE ACCUSATION, NOT A COUNT: three OPEN rows state their own
+# trigger fired and were still asked to name an opener, and one of them is exactly the
+# exclusion the P29 audit was arguing about -- `D-ENV-WSL2-CLOCK-REALTIME-STEPS-34S`,
+# whose closing cell ends *"Trigger: FIRED (measured). Priority: HIGH."* while leading
+# with a ⛔ that means *do not fix this in the compiler*, not *do not build this yet*.
+# ⚠⚠ THE NEGATED FORMS ARE THE WHOLE DIFFICULTY AND THEY ARE STRUCTURAL, NOT LISTED:
+# `NOT` / `NOT YET` / `HAS NOT` may not appear between the noun and `FIRED`, so the
+# pattern admits only the words that can legitimately sit there. ✔MEASURED: **40** rows
+# carry a not-fired spelling and NONE is exonerated -- including
+# `D-LSP-DIAGNOSTIC-RENDERED-AGAINST-THE-OPEN-DOCUMENT-IGNORING-ITS-BUFFER`
+# (*"TRIGGER-GATED, TRIGGER NOT FIRED"*), `D-AS4-ARM64-INDEXED-LEA-SCALE` and
+# `D-FF1-MACHO-SECT-KIND` (*"STILL GATED (trigger NOT fired)"*), all three of which
+# stay gated.
+TRIGGER_FIRED = re.compile(
+    r"TRIGGER(?:'S)?[\s:\u2014,-]*(?:HAS|HAVE|HAD)?[\s:\u2014,-]*(?:ALREADY)?"
+    r"[\s:\u2014,-]*FIRED"
+    r"|ALREADY[\s-]*FIRED", re.IGNORECASE)
+# ★★★ A ROW THAT DECLARES IT HAS **NO TRIGGER** IS NOT GATED, AND IT IS THE ESCAPE THE
+# FIRED TEST CANNOT PROVIDE -- D-GATE-ANCHOR-BALANCE-IS-GATED-ACCUSES-A-ROW-THAT-DECLARES-NO-GATE.
+# The FAIL text below tells a row that is *about* gated rows to state its own verdict
+# instead of rewording, and offers exactly one: `ALREADY FIRED`. ⚠ **A ROW WITH NO
+# TRIGGER CANNOT HONESTLY CLAIM ITS TRIGGER FIRED** -- so for a pointer row, a rule, or
+# a census the only sanctioned escape was a false statement, and the cheapest way out
+# was to reword, which is what the same paragraph forbids.
+# The row that motivated it is `D-LK11-FAMILY-IS-TRACKED-IN-PLAN-14-NOT-HERE`, a signpost
+# whose status cell reads *"Trigger: none — informational, permanent"* and whose closing
+# cell reads *"Nothing to do."*, accused solely for quoting the status of the two rows it
+# points at (*"both OPEN, trigger-gated"*). Same shape as the census case pinned below: a
+# description of a class classified as a member of it.
+# ⚠ THIS COMMENT SAID "exactly **one** live row takes it" AND THAT WAS ALREADY WRONG WHEN
+# IT WAS WRITTEN. ✔RE-MEASURED 2026-08-24, and STATE THE PREDICATE WITH THE NUMBER,
+# because two independent measurements got 9 and 2 and BOTH ARE CORRECT — they count
+# different things, which is exactly how a bare integer in a comment misleads:
+#   · **9** rows carry an own-verdict no-trigger declaration at all (open AND closed);
+#   · **2** live OPEN rows take the escape LOAD-BEARINGLY, i.e. would otherwise be
+#     gated and asked for an opener — `D-PLANS-OPT7-INLINE-LEGALITY-GATE-ROW-DECLARES-NO-TRIGGER-OF-ITS-OWN`
+#     and `D-LK11-FAMILY-IS-TRACKED-IN-PLAN-14-NOT-HERE`.
+# ⇒ re-derive whichever you mean rather than quoting either: a figure in a comment is a
+# measurement with no instrument attached, and a figure whose PREDICATE is unstated is
+# not even wrong (D-TEST-CMAKE-COMMENT-QUOTES-A-CORPUS-COUNT-THE-TEST-IT-REGISTERS-FORBIDS).
+NO_TRIGGER = re.compile(r"TRIGGER:?\s*(?:IS\s+)?NONE", re.IGNORECASE)
+# ⚠⚠⚠ AND THE EXONERATION ABOVE HAD THE EXACT DEFECT IT WAS WRITTEN TO CURE.
+# ✔MEASURED 2026-08-24 (cycle P29, independent step-10 audit): the test was a bare
+# `NO_TRIGGER.search(flat)` over the WHOLE row, so an ATTRIBUTIVE mention of some
+# OTHER row's "trigger: none" exonerated THIS one -- and A/B measurement showed it
+# flipped all four genuine gate shapes to not-gated. The paragraph above congratulates
+# itself on catching "a description of a class classified as a member of it", and then
+# the regex it introduces reads a description of ANOTHER ROW'S state as this row's own
+# verdict. ⇒ D-GATE-ANCHOR-BALANCE-NO-TRIGGER-ESCAPE-READS-ANOTHER-ROWS-VERDICT-AS-ITS-OWN.
+# ★ THE DISCRIMINATOR IS WHOSE VERDICT IT IS, and it is structural rather than a word
+# list: an attributive mention NAMES the row it is about, so if an anchor id sits between
+# the nearest clause boundary and the phrase, the phrase is talking about SOMEBODY ELSE.
+# A row's own verdict says "Trigger: none", never "[[D-OTHER]], whose trigger is none".
+_CLAUSE_BREAK = re.compile(r"[.;—]|\*\*")
+_ANCHOR_TOKEN = re.compile(r"D-[A-Z0-9]+(?:-[A-Z0-9]+)+")
+
+
+def declares_no_trigger(flat):
+    """True only when the row declares that ITS OWN trigger is none.
+
+    ⛔ DO NOT collapse this back to `NO_TRIGGER.search(...)`. The bare search is
+    what let one row's quotation of another row's state silence this guard, and a
+    row silenced here is reported NOWHERE -- not gated, not DEBT -- which is the
+    one outcome a fail-loud instrument must never produce.
+    """
+    for m in NO_TRIGGER.finditer(flat):
+        head = flat[:m.start()]
+        breaks = list(_CLAUSE_BREAK.finditer(head))
+        clause = head[breaks[-1].end():] if breaks else head
+        if _ANCHOR_TOKEN.search(clause):
+            continue                       # attributive: it is about another row
+        return True
+    return False
 # ⓘ The opener SPELLING reuses the registry's existing `[[anchor-name]]` link
 # form -- deliberately NOT a new syntax, because one already resolves. What is
 # added is a required LABEL in front of it, because a bare `[[...]]` is satisfied
@@ -488,25 +693,169 @@ OPENER_REF = re.compile(r"OPEN(?:ED|S)?[\s-]*BY[\s:]*\[\[([^\]|]+)\]\]",
                         re.IGNORECASE)
 
 
-def is_gated(status):
+# ★★★ THE DECLARATION LIVES IN EITHER CELL, AND KEYING ON THE STATUS CELL ALONE
+# WAS A MEASURED BLIND SPOT -- D-GATE-ANCHOR-BALANCE-IS-GATED-BLIND-TO-THE-REMEDY-CELL.
+# The operator's rule is about the SEMANTICS ("a ⛔ MUST-NOT-BUILD row must name the
+# row that opens it"), and the house style writes the gate into the CLOSING-WORK
+# cell -- `⏳ **TRIGGER: …**`, `⏳ trigger = a shipped __finally consumer`,
+# `⛔ **DO NOT PATCH LOCALLY.**`. A phrase test over the status cell alone reports
+# OK while rows the rule condemns sit unseen.
+# ✔MEASURED 2026-08-23 across `.plans/`, on top of the escape-aware `split_row`
+# above: the gated population moves **64 → 97**, **33 added and 0 dropped**, and
+# EVERY added row was read before this landed. Four of them are exactly the shape
+# the ruling is about and none was visible before: `D-PP-HAS-EXTENSION-BUILTIN-ABSENT`
+# (⏳ PENDING A USER DECISION), `D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME`
+# (⏳ NOT YET DISCHARGED, waiting on an operator confirmation),
+# `D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN`
+# (⏳ BLOCKER: AN OPERATOR DECISION ONLY) and `D-TARGET-NO-CROSS-CLASS-MOVE-VERB`
+# (⛔ DO NOT PATCH LOCALLY -- bring it as a §B).
+# ⚠⚠ THOSE TWO ABSOLUTE FIGURES DO NOT REPRODUCE AND MUST NOT BE RE-QUOTED -- they
+# were taken mid-cycle, BEFORE the P29 registry sweep landed `ALREADY FIRED` verdicts
+# on ~29 rows, and a population figure is a property of the tree it was read on.
+# ✔RE-MEASURED the same day after the sweep: **35 → 72, +37 added and 0 dropped.**
+# The DIFFERENTIAL is what the claim rests on and it reproduced exactly: **0 dropped**,
+# i.e. the widening only ever ADDS, so it cannot have hidden a row the old rule saw.
+# ★ AND ONE OF THE FOUR IS WRONG ON RE-READING, which is why re-measuring beat
+# re-quoting: `D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME`'s own cell ends *"Trigger:
+# FIRED — it exists to fix the measured $INODE64 misbinding"*, so by this file's own
+# definitional rule it is NOT gated. It is exonerated by TRIGGER_FIRED and reported by
+# ARM 4 instead, because a ⏳ lead over a fired trigger is a row that needs re-verdicting,
+# not one that needs an opener.
+#
+# ⚠⚠ AND THE GLYPH IS READ ONLY IN THE **CLOSING-WORK** CELL, NEVER IN THE STATUS
+# CELL, WHICH IS THE OPPOSITE OF WHAT A NAIVE WIDENING WOULD DO. The measurement
+# recorded above GATED_DECL still stands: ⛔ leads six STATUS cells and five of them
+# mean *do not re-propose this* (REFUTED-DESIGN / NEGATIVE RESULT / SUPERSEDED),
+# which have no opener and never will. In the CLOSING-WORK cell the same glyph means
+# *do not build this yet*. SAME GLYPH, TWO CELLS, TWO MEANINGS -- and this is the
+# second time this file has had to record that a cell's convention is per-cell
+# (see the VERDICT_WINDOW note, which reaches the mirror-image conclusion).
+#
+# ★★★ AND AN ENUMERATION OF GLYPHS IS THE ONE THING THIS FILE'S DOCSTRING SAYS NEVER TO
+# WRITE -- D-GATE-ANCHOR-BALANCE-GATE-LEAD-MARKS-IS-A-SILENT-GLYPH-ENUMERATION. The
+# first version of this gate enumerated the OPEN glyphs and was blind to the hourglass;
+# the rule learned from it is *define the complement, never enumerate the variants*, and
+# a two-element tuple of gate glyphs breaks it in the same direction: the day somebody
+# writes a third one, the row is silently classified NOT-GATED and never asked for an
+# opener. ✔MEASURED 2026-08-23: **11 distinct glyphs** lead a closing-work cell on an
+# OPEN row (★ ⚠ ✅ 🔴 ⛔ ⏳ 🟡 — ⏭ ⓘ §) and **20** lead a status cell, so the vocabulary
+# is demonstrably wider than two and still growing -- `⏸` already leads
+# `D-AS4-ARM64-INDEXED-LEA-SCALE`'s status cell meaning exactly *paused*.
+#
+# ★★ THE COMPLEMENT CANNOT BE DEFINED HERE -- SO THE **RESIDUAL IS MADE LOUD INSTEAD**,
+# WHICH IS THE PATTERN `EXCLUDED_HEADERS` ALREADY USES AND SAYS WHY. "Gated" is a
+# positive declaration; there is no "everything that is not X" to invert, because a
+# closing-work cell may honestly lead with anything. So BOTH sides are enumerated and
+# NAMED -- gate leads here, non-gate leads below, each one READ before it was listed --
+# and a lead marker in NEITHER list is not silently treated as prose: it is RECORDED and
+# REPORTED, exactly as an unrecognized table header is. The enumeration then cannot hide
+# a glyph; it can only decide whether a KNOWN one is counted. Keep it that way.
+# ⓘ ✔MEASURED 2026-08-23: with these two lists the residual over the whole worktree is
+# **0**, so the arm is affordable at FATAL for a row this cycle touched (see ARM 5).
+GATE_LEAD_MARKS = ("⏳", "⛔")     # hourglass, no-entry
+# ── The measured non-gate leads. Each was READ, and each is a VERDICT or an emphasis
+# mark rather than a deferral: ★ emphasis, ⚠ caution, ✅ a closed sub-item, 🔴/🟡 a
+# priority, — an em-dash lead-in, ⏭ "skipped/next", ⓘ a note, § a section pointer.
+# ⚠ `⏸` is deliberately ABSENT from both lists: it means *paused* and would plausibly be
+# a gate, but ✔MEASURED it never leads a closing-work cell today, so listing it either
+# way would be a guess. Leaving it unclassified is the point -- the first row that uses
+# it there gets reported instead of silently classified.
+NON_GATE_LEAD_MARKS = ("★", "⚠", "✅", "🔴", "🟡", "—", "⏭", "ⓘ", "§")
+# A cell that opens with ordinary prose, a bullet, a quote or a parenthesis carries no
+# lead marker at all and is none of this arm's business.
+_NO_LEAD_MARKER = "(-\"'"
+
+
+def lead_mark_class(closing_work):
+    """-> "gate" / "none" / the UNCLASSIFIED marker itself.
+
+    "none" means the cell opens with ordinary text or a listed non-gate mark. A
+    returned marker means this instrument does not know what the author meant, and
+    the caller MUST report it rather than assume.
+    """
+    text = strip_decoration(closing_work).lstrip("*_ ")
+    if not text:
+        return "none"
+    if text.startswith(GATE_LEAD_MARKS):
+        return "gate"
+    if text.startswith(NON_GATE_LEAD_MARKS):
+        return "none"
+    ch = text[0]
+    if ch.isalnum() or ch in _NO_LEAD_MARKER:
+        return "none"
+    return ch
+# ★★★ A ROW WITH NO CLOSING WORK IS NOT A GATE, AND THIS IS DEFINITIONAL LIKE
+# `ALREADY FIRED` RATHER THAN AN ESCAPE HATCH: a gate DEFERS work, so a row that
+# declares it has none is a record, not a deferral, and asking which row will open
+# it asks which row will cause something that will never happen.
+# ✔MEASURED 2026-08-23: seven OPEN rows declare it, in two spellings
+# (`NO CLOSING WORK`, `Closing work: none`), and every one is a refutation, a
+# negative result or a consequence-record -- e.g.
+# `D-ENV-MACOS-GATEKEEPER-ADMISSION-IRREDUCIBLE` (*"THERE IS NOTHING TO FIX. The row
+# exists to STOP the investigation from recurring"*) and
+# `D-CONFIG-TOOLCHAIN-AXIS-REFUTED`. ⚠ Without this arm both would be accused, and a
+# false accusation is what gets a guard turned off.
+# ★ The direction of error is the safe one, and it was CHECKED rather than assumed:
+# ✔MEASURED, this arm removes **nothing** from the population the old rule counted
+# (33 added, 0 dropped) -- it only declines to add two rows the widening would
+# otherwise have swept in. Like the fired-trigger test it is a CHECKABLE CLAIM: a row
+# saying it has no closing work while carrying some is a false statement a reader can
+# look at.
+NO_CLOSING_WORK = re.compile(
+    r"NO\s+CLOSING\s+WORK|CLOSING\s+WORK:?\s*(?:IS\s+)?NONE", re.IGNORECASE)
+
+
+def is_gated(status, closing_work=""):
     """The row DECLARES ITSELF trigger-gated / must-not-build, and is still waiting.
 
-    Two conditions, and the second is what separates a row that declares itself
-    gated from one that merely MENTIONS the vocabulary: a row stating its trigger
-    has ALREADY FIRED is not gated, because a fired gate is not a gate. See the
-    TRIGGER_FIRED note for the measurement, and for why windowing the declaration
-    is the wrong discriminator here even though it is the right one for closures.
+    Reads BOTH cells, because a row is one claim spread over its cells and the
+    house style puts the trigger in the closing-work one -- the same correction
+    `is_mismarked_closure` already had to make for the walk-back test.
+
+    FOUR EXONERATIONS, AND EVERY ONE IS THE ROW'S OWN CHECKABLE CLAIM rather than
+    an escape hatch -- which is the property that lets them exist at all:
+      * its trigger has FIRED          -> a fired gate is not a gate;
+      * it has NO TRIGGER              -> nothing can open what nothing blocks, and a
+                                          row with no trigger cannot honestly claim
+                                          its trigger fired, so it needs its own words;
+      * it has NO CLOSING WORK         -> a gate defers work;
+      * the declaration is NEGATED     -> a denial is not a declaration.
+    Only then does a non-negated declaration in either cell, or a gate marker leading
+    the closing-work cell, make the row gated.
     """
-    flat = strip_decoration(status)
-    if not GATED_DECL.search(flat):
+    flat = strip_decoration(status) + " " + strip_decoration(closing_work)
+    closing = strip_decoration(closing_work)
+    if TRIGGER_FIRED.search(flat):
         return False
-    return not TRIGGER_FIRED.search(flat)
+    if declares_no_trigger(flat):
+        return False
+    if NO_CLOSING_WORK.search(closing):
+        return False
+    if declares_gate(flat):
+        return True
+    return lead_mark_class(closing_work) == "gate"
 
 
 def opener_of(whole_row):
     """The anchor id this row names as its opener, or "" when it names none."""
     m = OPENER_REF.search(strip_decoration(whole_row))
     return m.group(1).strip() if m else ""
+
+
+def opener_state(opener, names, open_names):
+    """-> "none" / "dangling" / "closed" / "open" for a gated row's named opener.
+
+    ★ THREE OUTCOMES WHERE THERE USED TO BE TWO, and the new one is the point:
+    resolving to a row is not the same as resolving to a LIVE dependency. `names`
+    holds every data row open or closed; `open_names` holds the open ones. A name
+    in the first and not the second is a row all of whose homes are closed --
+    and a closed row cannot open anything.
+    """
+    if not opener:
+        return "none"
+    if opener not in names:
+        return "dangling"
+    return "open" if opener in open_names else "closed"
 
 
 def row_name(cell1):
@@ -542,6 +891,13 @@ class Scan(object):
     mismarked  : {"relpath#name": status_excerpt} contradicting their own verdict
     gated_rows : {"relpath#name": (opener_id, status_excerpt)}; opener_id is ""
                  when the row names none.
+    unclassified: {"relpath#name": (marker, closing_excerpt)} whose CLOSING-WORK
+                 cell leads with a marker in neither GATE_LEAD_MARKS nor
+                 NON_GATE_LEAD_MARKS -- i.e. rows this instrument could not
+                 classify. Recorded so the residual of an enumeration is never
+                 silent; see ARM 5.
+    unblocked  : {"relpath#name": reason} -- the row still PRESENTS as blocked but
+                 the blocker it names has been discharged. See ARM 4.
     """
 
     def __init__(self):
@@ -551,6 +907,8 @@ class Scan(object):
         self.bookkeeping = set()
         self.mismarked = {}
         self.gated_rows = {}
+        self.unclassified = {}
+        self.unblocked = {}
 
     def merge(self, other):
         self.rows.update(other.rows)
@@ -559,6 +917,8 @@ class Scan(object):
         self.bookkeeping |= other.bookkeeping
         self.mismarked.update(other.mismarked)
         self.gated_rows.update(other.gated_rows)
+        self.unclassified.update(other.unclassified)
+        self.unblocked.update(other.unblocked)
         return self
 
 
@@ -674,8 +1034,23 @@ def scan_document(text, relpath):
                         scan.bookkeeping.add(key)
                     if is_mismarked_closure(status, closing):
                         scan.mismarked[key] = excerpt
-                    if opened and is_gated(status):
-                        scan.gated_rows[key] = (opener_of(raw), excerpt)
+                    if opened:
+                        gated = is_gated(status, closing)
+                        if gated:
+                            scan.gated_rows[key] = (opener_of(raw), excerpt)
+                        marker = lead_mark_class(closing)
+                        if marker not in ("gate", "none"):
+                            scan.unclassified[key] = (
+                                marker, " ".join(closing.split())[:80])
+                        # ARM 4 (b): the row says its trigger FIRED and still leads its
+                        # closing-work cell with a gate marker. It is not gated -- its
+                        # own verdict says so -- but it still READS as blocked, so it
+                        # needs re-verdicting rather than silently leaving the arm.
+                        elif (not gated and marker == "gate"
+                                and TRIGGER_FIRED.search(
+                                    strip_decoration(status) + " "
+                                    + strip_decoration(closing))):
+                            scan.unblocked[key] = "trigger declared FIRED"
                 # Only OPEN rows are recorded, so when one name carries several rows in
                 # the same file (the registry has a few), the name counts as OPEN if
                 # ANY of its rows is open. Same behaviour as the predecessor, and it is
@@ -882,9 +1257,10 @@ def self_test():
     cases = []
 
     def case(doc, expect, why, path=REG_REL, expect_fatal=0, expect_warn=0,
-             book=(), mismark=(), gated=None):
+             book=(), mismark=(), gated=None, unclass=(), unblock=()):
         cases.append((doc, expect, why, path, expect_fatal, expect_warn,
-                      set(book), set(mismark), dict(gated or {})))
+                      set(book), set(mismark), dict(gated or {}),
+                      set(unclass), set(unblock)))
 
     # ── (a) the inversion, on the REGISTRY shape (all pre-existing pins, preserved) ──
     case(_doc(*REG_HDR, "| `D-A` | ✅ **CLOSED** | done | refs |"), set(),
@@ -1073,6 +1449,22 @@ def self_test():
          gated={"D-XX-GATEDXREF": ""})
     case(_doc(*REG_HDR, "| `D-XX-GATEDSHUT` | ✅ **CLOSED, was TRIGGER-GATED** | - | r |"),
          set(), "a CLOSED gated row is not asked for an opener")
+    # ★★★ THE `NO TRIGGER` ESCAPE, PINNED FROM BOTH SIDES -- IT SHIPPED WITH NEITHER.
+    # It was the only one of the four exonerations with no mirror arm, and it was a bare
+    # search over the whole row, so it read ANOTHER row's verdict as this row's own. The
+    # first arm is the escape doing its job; the second is the abuse it must refuse, and
+    # WITHOUT THE SECOND the first passes just as well with the attributive check deleted.
+    # ⚠ An exonerated row is reported NOWHERE -- not gated, not DEBT -- so a false
+    # exoneration here is silent, which is why the negative arm carries the weight.
+    case(_doc(*REG_HDR,
+              "| `D-XX-NOTRIG` | \U0001f7e0 **OPEN -- Trigger: none, informational and permanent** | w | r |"),
+         {"D-XX-NOTRIG"},
+         "a row declaring ITS OWN trigger is none is not gated")
+    case(_doc(*REG_HDR,
+              "| `D-XX-NOTRIGXREF` | \U0001f7e0 **OPEN -- TRIGGER-GATED**; unlike [[D-XX-OTHER]], whose trigger is none, this one waits | w | r |"),
+         {"D-XX-NOTRIGXREF"},
+         "quoting ANOTHER row's 'trigger: none' does NOT exonerate this one",
+         gated={"D-XX-NOTRIGXREF": ""})
     case(_doc(*REG_HDR, "| `D-XX-MUSTNOT` | \U0001f7e0 **OPEN -- MUST-NOT-BUILD** | w | r |"),
          {"D-XX-MUSTNOT"}, "MUST-NOT-BUILD is the same declaration as TRIGGER-GATED",
          gated={"D-XX-MUSTNOT": ""})
@@ -1104,13 +1496,155 @@ def self_test():
          {"D-XX-FIREDLATE"},
          "a fired trigger exonerates from anywhere in the cell")
 
+    # ── (h2) THE DECLARATION MAY LIVE IN THE **CLOSING-WORK** CELL ──
+    # D-GATE-ANCHOR-BALANCE-IS-GATED-BLIND-TO-THE-REMEDY-CELL. Every arm below was
+    # RED before the widening: the house style writes the gate into the remedy cell
+    # and a status-cell-only test reported OK over all of it.
+    case(_doc(*REG_HDR,
+              "| `D-XX-GATEDREMEDY` | \U0001f7e0 **OPEN -- normal** | ⏳ **TRIGGER: an "
+              "ILP32 target lands.** | r |"),
+         {"D-XX-GATEDREMEDY"},
+         "an hourglass LEADING the closing-work cell is a gate declaration",
+         gated={"D-XX-GATEDREMEDY": ""})
+    case(_doc(*REG_HDR,
+              "| `D-XX-GATEDSTOP` | \U0001f7e0 **OPEN -- normal** | ⛔ **DO NOT PATCH "
+              "LOCALLY** -- bring it as a section B. | r |"),
+         {"D-XX-GATEDSTOP"},
+         "a no-entry sign LEADING the closing-work cell is a gate declaration",
+         gated={"D-XX-GATEDSTOP": ""})
+    case(_doc(*REG_HDR,
+              "| `D-XX-GATEDWORDS` | \U0001f7e0 **OPEN -- normal** | Implement it. Trigger: "
+              "trigger-gated. Priority: low. | r |"),
+         {"D-XX-GATEDWORDS"},
+         "the DECLARATION WORDS in the closing-work cell count too",
+         gated={"D-XX-GATEDWORDS": ""})
+    # star THE MIRROR-IMAGE CASE, AND IT IS THE ONE THAT KEEPS THE GLYPH RULE HONEST.
+    # ⛔ LEADING A **STATUS** CELL overwhelmingly means "do not re-propose this"
+    # (REFUTED-DESIGN / NEGATIVE RESULT / SUPERSEDED) -- five of the six live
+    # instances. Reading the glyph there would demand an opener from rows that
+    # cannot have one, so the glyph is read ONLY in the closing-work cell.
+    case(_doc(*REG_HDR,
+              "| `D-XX-REFUTED` | ⛔ **REFUTED-DESIGN -- do not re-propose.** | w | r |"),
+         {"D-XX-REFUTED"},
+         "a no-entry sign leading the STATUS cell is NOT read as a gate")
+    # star A ROW WITH NO CLOSING WORK IS NOT A GATE. Both live spellings are pinned;
+    # without this arm the widening accuses every negative-result row in the registry.
+    case(_doc(*REG_HDR,
+              "| `D-XX-NOWORK` | \U0001f7e0 **OPEN -- NEGATIVE RESULT** | ⛔ **NO CLOSING "
+              "WORK -- there is nothing to fix.** | r |"),
+         {"D-XX-NOWORK"},
+         "a row declaring NO CLOSING WORK is not a gate, whatever glyph it leads with")
+    case(_doc(*REG_HDR,
+              "| `D-XX-NOWORK2` | \U0001f7e0 **OPEN** | ⏳ Closing work: none -- recorded "
+              "so nobody re-investigates. | r |"),
+         {"D-XX-NOWORK2"},
+         "... and the second live spelling, `Closing work: none`, too")
+    # star THE ESCAPED PIPE. D-GATE-ANCHOR-BALANCE-SPLIT-ROW-TREATS-AN-ESCAPED-PIPE-AS-A-SEPARATOR.
+    # 161 live rows carry one; before the fix everything after it shifted one cell
+    # left, so the closing-work cell handed to the two arms above was a FRAGMENT.
+    # ⚠ The fixture puts the escape in the STATUS cell and the gate in the CLOSING
+    # cell -- the exact live shape of `D-PP-HAS-EXTENSION-BUILTIN-ABSENT`. With a
+    # naive split the gate marker lands in cell 4 and is never read.
+    case(_doc(*REG_HDR,
+              "| `D-XX-ESCPIPE` | \U0001f7e0 **OPEN** -- the shape is `a \\| b` | "
+              "⏳ **TRIGGER: a consumer needs it.** | r |"),
+         {"D-XX-ESCPIPE"},
+         "an ESCAPED pipe does not shift the cells (the gate is still found)",
+         gated={"D-XX-ESCPIPE": ""})
+    case(_doc(*REG_HDR,
+              "| `D-XX-ESCPIPECLOSED` | ✅ **CLOSED 2026-01-01** -- pattern `x \\| y` | "
+              "- | r |"),
+         set(), "an escaped pipe in a CLOSED row still leaves it closed")
+
+    # ── (h3) THE FOUR EXONERATIONS, EACH PINNED WITH ITS MIRROR ────────────────
+    # Every arm below has a partner case that must STAY gated, because an
+    # exoneration with no counter-case passes just as well with the predicate
+    # deleted -- the same pairing the census/still-gated fixtures above use.
+    #
+    # star D-GATE-ANCHOR-BALANCE-TRIGGER-FIRED-RECOGNIZES-ONE-SPELLING-OF-SIX:
+    # `Trigger: FIRED` without the adverb is the registry's commonest spelling
+    # and matched nothing. (No count here on purpose: the 317 this comment used to
+    # quote was a greedy `Trigger:.*FIRED` total mis-attributed to one bucket --
+    # see the note above `TRIGGER_FIRED`. The claim that carries the arm is
+    # "commonest and unmatched", which no arithmetic can rot.)
+    case(_doc(*REG_HDR,
+              "| `D-XX-FIREDFIELD` | \U0001f7e0 **OPEN -- TRIGGER-GATED** when opened. "
+              "Trigger: FIRED (measured). | w | r |"),
+         {"D-XX-FIREDFIELD"},
+         "`Trigger: FIRED` -- no adverb -- exonerates, like ALREADY FIRED")
+    case(_doc(*REG_HDR,
+              "| `D-XX-FIREDVERB` | \U0001f7e0 **OPEN -- MUST-NOT-BUILD** until then; the "
+              "trigger fired on 2026-01-01. | w | r |"),
+         {"D-XX-FIREDVERB"}, "... and so does `the trigger fired`")
+    case(_doc(*REG_HDR,
+              "| `D-XX-NOTFIRED` | \U0001f7e0 **OPEN** | Implement it. Trigger: NOT "
+              "FIRED -- no consumer yet. | r |"),
+         {"D-XX-NOTFIRED"},
+         "`Trigger: NOT FIRED` is a GATE, never an exoneration",
+         gated={"D-XX-NOTFIRED": ""})
+    case(_doc(*REG_HDR,
+              "| `D-XX-NOTYETFIRED` | \U0001f7e0 **OPEN** -- the trigger has NOT yet "
+              "fired. | w | r |"),
+         {"D-XX-NOTYETFIRED"},
+         "... and so is `the trigger has NOT yet fired` (the house colon form)",
+         gated={"D-XX-NOTYETFIRED": ""})
+    # star D-GATE-ANCHOR-BALANCE-IS-GATED-ACCUSES-A-ROW-THAT-DECLARES-NO-GATE, arm 1:
+    # a row with NO trigger cannot honestly claim its trigger fired, so it needs
+    # its own words. The live instance is a POINTER row accused for quoting the
+    # status of the rows it points at.
+    case(_doc(*REG_HDR,
+              "| `D-XX-POINTER` | \U0001f4cd **POINTER ROW** -- the family lives in "
+              "plan 14 (both OPEN, trigger-gated). Trigger: none -- informational, "
+              "permanent. | Nothing to do. | r |"),
+         {"D-XX-POINTER"},
+         "a row declaring `Trigger: none` is not gated by what it QUOTES")
+    # star ... arm 2: a NEGATED declaration is not a declaration. The live instance
+    # was reworded out during the P29 sweep, which is what the FAIL text forbids --
+    # so the shape is pinned here instead of relying on a row to carry it.
+    case(_doc(*REG_HDR,
+              "| `D-XX-NEGATED` | \U0001f7e0 **OPEN -- HIGH.** Priority raised: no longer "
+              "merely trigger-gated, a real consumer exists. | w | r |"),
+         {"D-XX-NEGATED"},
+         "a NEGATED declaration is not a declaration")
+    case(_doc(*REG_HDR,
+              "| `D-XX-NEGATEDPAIR` | \U0001f7e0 **OPEN -- HIGH.** It is trigger-gated, a "
+              "real consumer is still missing. | w | r |"),
+         {"D-XX-NEGATEDPAIR"},
+         "... and the SAME words un-negated still gate (the negator is not a hole)",
+         gated={"D-XX-NEGATEDPAIR": ""})
+
+    # ── (i) THE LEAD-MARKER ENUMERATION MUST NEVER BE SILENT ──────────────────
+    # D-GATE-ANCHOR-BALANCE-GATE-LEAD-MARKS-IS-A-SILENT-GLYPH-ENUMERATION.
+    # A glyph in neither list is REPORTED, not assumed -- the EXCLUDED_HEADERS
+    # pattern. Without this the third gate glyph anybody invents is silently
+    # classified as prose, in the direction that flatters the cycle.
+    case(_doc(*REG_HDR,
+              "| `D-XX-NOVELLEAD` | \U0001f7e0 **OPEN** | \U0001f6a7 **BLOCKED on a "
+              "decision.** | r |"),
+         {"D-XX-NOVELLEAD"},
+         "a lead marker in NEITHER list is REPORTED, never assumed to be prose",
+         unclass={"D-XX-NOVELLEAD"})
+    case(_doc(*REG_HDR,
+              "| `D-XX-KNOWNLEAD` | \U0001f7e0 **OPEN** | ★ Implement the widening. | r |"),
+         {"D-XX-KNOWNLEAD"},
+         "a NAMED non-gate lead marker is classified, not reported")
+    # star ARM 4: the row's stated blocker is gone, so it is UNBLOCKED, not gated.
+    # A fired trigger under a ⏳ lead is the live shape
+    # (`D-ENV-WSL2-CLOCK-REALTIME-STEPS-34S`, `D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME`).
+    case(_doc(*REG_HDR,
+              "| `D-XX-STALEGATE` | \U0001f7e0 **OPEN** | ⏳ NOT YET DISCHARGED -- verify "
+              "first. Trigger: FIRED (measured). | r |"),
+         {"D-XX-STALEGATE"},
+         "a FIRED trigger under a gate lead is UNBLOCKED, and is REPORTED as such",
+         unblock={"D-XX-STALEGATE"})
+
     def bare(keys):
         """Row keys are `relpath#name`; the cases assert on the NAME half."""
         return set(k.split("#", 1)[1] for k in keys)
 
     failed = 0
     for (doc, expect, why, path, expect_fatal, expect_warn,
-         exp_book, exp_mismark, exp_gated) in cases:
+         exp_book, exp_mismark, exp_gated, exp_unclass, exp_unblock) in cases:
         s = scan_document(doc, path)
         got = bare(s.rows)
         # star SEVERITY IS ASSERTED, NOT JUST THE COUNT. FATAL means "rows exist that
@@ -1122,12 +1656,21 @@ def self_test():
         got_book = bare(s.bookkeeping)
         got_mismark = bare(s.mismarked)
         got_gated = dict((k.split("#", 1)[1], v[0]) for k, v in s.gated_rows.items())
+        got_unclass = bare(s.unclassified)
+        got_unblock = bare(s.unblocked)
         ok = (got == expect and n_fatal == expect_fatal and n_warn == expect_warn
               and got_book == exp_book and got_mismark == exp_mismark
-              and got_gated == exp_gated)
+              and got_gated == exp_gated and got_unclass == exp_unclass
+              and got_unblock == exp_unblock)
         if not ok:
             failed += 1
         extra = ""
+        if got_unclass != exp_unclass:
+            extra += "  unclassified expected=%s got=%s" % (sorted(exp_unclass),
+                                                            sorted(got_unclass))
+        if got_unblock != exp_unblock:
+            extra += "  unblocked expected=%s got=%s" % (sorted(exp_unblock),
+                                                         sorted(got_unblock))
         if (n_fatal, n_warn) != (expect_fatal, expect_warn):
             extra += "  findings expected=%d fatal/%d warn got=%d/%d" % (
                 expect_fatal, expect_warn, n_fatal, n_warn)
@@ -1217,6 +1760,35 @@ def self_test():
         "bookkept=%d net=%d" % (len(bal3.bookkept), bal3.net_new))
     extra_total += 1
 
+    # ── (h4) AN OPENER MUST RESOLVE TO AN **OPEN** ROW ────────────────────────
+    # D-GATE-ANCHOR-BALANCE-ACCEPTS-AN-OPENER-THAT-IS-ALREADY-CLOSED. Needs two rows
+    # in one document -- the gated row and the row it points at -- so it cannot ride
+    # `cases`. All three outcomes are pinned in one scan, because a test that only
+    # showed the closed one would pass with `opener_state` returning "closed" always.
+    d4 = scan_document(_doc(*REG_HDR,
+                            "| `D-XX-GATEDCLOSED` | \U0001f7e0 **OPEN -- TRIGGER-GATED**, "
+                            "opened by [[D-XX-DEADOPENER]] | w | r |",
+                            "| `D-XX-GATEDLIVE` | \U0001f7e0 **OPEN -- TRIGGER-GATED**, "
+                            "opened by [[D-XX-LIVEOPENER]] | w | r |",
+                            "| `D-XX-GATEDGHOST` | \U0001f7e0 **OPEN -- TRIGGER-GATED**, "
+                            "opened by [[D-XX-NOSUCHROW]] | w | r |",
+                            "| `D-XX-DEADOPENER` | ✅ **CLOSED 2026-01-01** | - | r |",
+                            "| `D-XX-LIVEOPENER` | \U0001f7e0 **OPEN** | work | r |"),
+                       REG_REL)
+    names4 = set(k.split("#", 1)[1] for k in d4.names)
+    open4 = set(k.split("#", 1)[1] for k in d4.rows)
+    states = dict((k.split("#", 1)[1], opener_state(v[0], names4, open4))
+                  for k, v in d4.gated_rows.items())
+    want4 = {"D-XX-GATEDCLOSED": "closed", "D-XX-GATEDLIVE": "open",
+             "D-XX-GATEDGHOST": "dangling"}
+    pin(states == want4,
+        "an opener resolves to OPEN / CLOSED / DANGLING, not merely 'resolves'",
+        "expected=%s got=%s" % (sorted(want4.items()), sorted(states.items())))
+    pin(opener_state("", names4, open4) == "none",
+        "and a row naming no opener at all is 'none'",
+        "got=%s" % opener_state("", names4, open4))
+    extra_total += 2
+
     failed += extra_failed[0]
     print("self-test: %d case(s), %d failed" % (len(cases) + extra_total, failed))
     return 1 if failed else 0
@@ -1240,18 +1812,9 @@ def main():
                     help="check the instrument, not the registry")
     args = ap.parse_args()
 
-    # ⚠ A GATE THAT CRASHES WHILE REPORTING IS WORSE THAN ONE THAT SAYS NOTHING.
-    # ✔MEASURED 2026-08-12: this script died with UnicodeEncodeError on a Windows
-    # cp1252 console the first time it had to print an OPENED row, because the
-    # status excerpt began with 🟠 (U+1F7E0). Every prior run had printed only
-    # counts, so the reporting path had never been exercised with real content —
-    # the crash was latent for exactly as long as the gate was passing. The
-    # excerpt is diagnostic prose; an unencodable glyph must degrade to a
-    # placeholder, never take the gate down.
-    try:
-        sys.stdout.reconfigure(errors="replace")
-    except (AttributeError, ValueError):          # pragma: no cover - old python
-        pass
+    # ⓘ The stream reconfiguration that used to sit here now runs at IMPORT, above
+    # the constants -- see the block there for the measurement that moved it and
+    # for why `errors="replace"` alone erased the fact this guard reports.
 
     if args.self_test:
         return self_test()
@@ -1271,7 +1834,14 @@ def main():
           % (args.base, len(b_reg), len(b_plan), len(before.rows)))
     print("anchor-balance: OPEN now %-13s registry=%-5d plans=%-5d total=%d"
           % ("", len(a_reg), len(a_plan), len(after.rows)))
-    print("anchor-balance: GATED count %d -> %d   (net %+d)"
+    # ⚠ THIS LINE USED TO BE LABELLED "GATED count", AND IT IS NOT THE GATED SET.
+    # `gated_set()` means "the set THE GATE counts", i.e. the denominator after the
+    # `--denominator` filter -- so the line printed the OPEN population under the word
+    # `gated`, two lines above a DEBT line reporting a completely different `gated`
+    # number. In an instrument whose failures have four times been somebody reading
+    # the wrong number, two contradictory quantities sharing one word is a defect in
+    # itself. The label now says what the number is; nothing else changed.
+    print("anchor-balance: COUNTED (gate denominator) %d -> %d   (net %+d)"
           % (bal.before, bal.after, bal.after - bal.before))
     print("anchor-balance: closed %d, opened %d  (created %d, disclosed-pre-existing %d, "
           "bookkeeping-only closures %d)"
@@ -1324,15 +1894,41 @@ def main():
     # the census makes it mandatory rather than merely tidy: 62 open gated rows at
     # cf27fe8b, essentially none carrying an opener, so a day-one refusal would red
     # the tree for every lane over debt none of them created.
-    unopened, dangling = [], []
+    #
+    # ★★★ AND THE OPENER MUST RESOLVE TO AN **OPEN** ROW, NOT MERELY TO A ROW --
+    # D-GATE-ANCHOR-BALANCE-ACCEPTS-AN-OPENER-THAT-IS-ALREADY-CLOSED. The arm used to
+    # check resolution against `after.names`, which holds every data row open OR
+    # CLOSED, so `opened by [[X]]` was satisfied by an X that finished cycles ago.
+    # **A CLOSED ROW CANNOT OPEN ANYTHING.** ✔MEASURED 2026-08-23 over the worktree:
+    # of the 11 gated rows that name an opener, **9 name a row that is already ✅
+    # CLOSED** -- the three `D-FULLC-STDBIT-*` rows, three `D-CSUBSET-ATTRIBUTE-*`
+    # rows, two `D-CSUBSET-CONSTEXPR-*` rows and `D-CSUBSET-TYPEOF-UNQUAL-GNU-SPELLING`
+    # -- so nine rows satisfied the SYNTAX the operator's ruling asked for while
+    # carrying no live dependency at all, each one's real gate stated only in prose.
+    # ⓘ THE REFERENCE IS NOT DELETED AND MUST NOT BE: it records which cycle CO-OPENED
+    # the row, which is genuine history. What changes is the VERDICT -- a gated row
+    # whose opener has closed is not opened, it is **UNBLOCKED**, and it belongs in
+    # ARM 4 so somebody re-verdicts it instead of leaving it gated forever.
+    unopened, dangling, closed_opener = [], [], []
     known = set(n.split("#", 1)[1] for n in after.names)
+    known_open = set(n.split("#", 1)[1] for n in after.rows)
+    unblocked = dict(after.unblocked)
     for k in sorted(after.gated_rows):
         opener, excerpt = after.gated_rows[k]
+        # `after.rows` holds OPEN rows only, so a name in `known` but not in
+        # `known_open` is a row every one of whose homes is CLOSED.
+        state = opener_state(opener, known, known_open)
         if k in before.gated_rows:
-            continue                       # pre-existing: DEBT, reported below
-        if not opener:
+            # Pre-existing: DEBT either way. A verdict that went stale under its
+            # author is not a contradiction the author wrote.
+            if state == "closed":
+                unblocked[k] = "opener [[%s]] is already CLOSED" % opener
+            continue
+        if state == "closed":
+            closed_opener.append((k, opener))
+        elif state == "none":
             unopened.append((k, excerpt))
-        elif opener not in known:
+        elif state == "dangling":
             dangling.append((k, opener))
     stale_gated = [k for k in after.gated_rows if k in before.gated_rows]
     if stale_gated:
@@ -1340,6 +1936,46 @@ def main():
         print("anchor-balance: DEBT - %d gated row(s) predate %s; %d of them name no "
               "opener." % (len(stale_gated), args.base,
                            sum(1 for k in stale_gated if not after.gated_rows[k][0])))
+
+    # == ARM 4: A ROW WHOSE STATED BLOCKER IS GONE IS **UNBLOCKED**, NOT OPENED =====
+    # Two detectors, one finding: the row still READS as blocked while the thing it
+    # names as blocking it has been discharged. Advisory by construction -- nothing
+    # here is a contradiction the author introduced, it is a verdict that has gone
+    # stale under them, and the remedy is a re-read rather than an edit to this gate.
+    # ⚠ WITHOUT THIS ARM BOTH SHAPES VANISH SILENTLY: a closed-opener row satisfies
+    # arm 3 and a fired-trigger row is exonerated by `is_gated`, so in both cases the
+    # gate goes quiet on a row that is now actionable and nobody is told.
+    if unblocked:
+        print()
+        print("anchor-balance: DEBT - %d row(s) still present as blocked while the "
+              "blocker they name is already discharged (UNBLOCKED, not opened):"
+              % len(unblocked))
+        for k in sorted(unblocked):
+            print("  = %s   %s" % (k, unblocked[k]))
+        print("  Re-verdict each: it is schedulable NOW. A gate whose opener has closed "
+              "and a gate whose trigger has fired are both work waiting to be picked "
+              "up, not deferrals -- leaving the marker in place hides them from the "
+              "queue for as long as nobody re-reads the row.")
+
+    # == ARM 5: A CLOSING-WORK LEAD MARKER THIS INSTRUMENT CANNOT CLASSIFY =========
+    # The residual of the GATE_LEAD_MARKS / NON_GATE_LEAD_MARKS enumeration, made
+    # loud for the reason EXCLUDED_HEADERS is: an enumeration is only safe when what
+    # falls outside it is REPORTED rather than assumed. A glyph in neither list would
+    # otherwise be silently read as "not a gate", which is the direction that flatters
+    # the cycle -- the exact failure this instrument's first version shipped.
+    # ★ DIFFERENTIAL FOR THE SAME REASON THE OTHER ARMS ARE: a novel glyph on a row
+    # somebody wrote months ago is DEBT, but one on a row THIS cycle touched is a
+    # measurement this run could not make, and that fails.
+    new_unclass = sorted(k for k in after.unclassified if k not in before.unclassified)
+    old_unclass = sorted(k for k in after.unclassified if k in before.unclassified)
+    if old_unclass:
+        print()
+        print("anchor-balance: DEBT - %d row(s) lead their closing-work cell with a "
+              "marker this gate cannot classify (pre-existing at %s):"
+              % (len(old_unclass), args.base))
+        for k in old_unclass:
+            print("  ? %s   %r  %s" % (k, after.unclassified[k][0],
+                                       after.unclassified[k][1]))
 
     # ⚠ FAIL LOUD ON AN UNPARSED TABLE. A silently skipped anchor table is the exact
     # defect D-GATE-BALANCE-COUNTS-ONLY-THE-REGISTRY names, so an unknown shape that
@@ -1385,33 +2021,50 @@ def main():
     # no opener is a deferral nothing can ever discharge -- "a precondition with no
     # cause attached is indistinguishable from a permanent block" (operator,
     # 2026-08-23). Neither is fixable by widening this gate.
-    if new_mismarked or unopened or dangling:
+    if new_mismarked or unopened or dangling or closed_opener or new_unclass:
         print()
         print("anchor-balance: FAIL - %d row(s) this cycle added or edited are "
-              "self-contradicting:" % (len(new_mismarked) + len(unopened) + len(dangling)))
+              "self-contradicting:"
+              % (len(new_mismarked) + len(unopened) + len(dangling)
+                 + len(closed_opener) + len(new_unclass)))
         for k in new_mismarked:
             print("  ! MIS-MARKED CLOSURE  %s   %s" % (k, after.mismarked[k]))
         for k, excerpt in unopened:
             print("  ! GATED, NO OPENER    %s   %s" % (k, excerpt))
         for k, opener in dangling:
             print("  ! OPENER RESOLVES TO NOTHING  %s   -> [[%s]]" % (k, opener))
+        for k, opener in closed_opener:
+            print("  ! OPENER IS ALREADY CLOSED    %s   -> [[%s]]" % (k, opener))
+        for k in new_unclass:
+            print("  ! UNCLASSIFIED LEAD MARKER    %s   %r  %s"
+                  % (k, after.unclassified[k][0], after.unclassified[k][1]))
         if new_mismarked:
             print("  MIS-MARKED CLOSURE -> the cell's first word is a closure verdict "
                   "but its leading marker is not the closure mark. Either mark it closed "
                   "(lead the cell with the closure mark followed by the bookkeeping mark "
                   "when the work predates this cycle - that closure is net-neutral), or "
                   "reword the opening so it stops claiming a closure it did not make.")
-        if unopened or dangling:
+        if unopened or dangling or closed_opener:
             print("  A GATED ROW NAMES ITS OPENER as `opened by [[D-XX-OPENER]]`, "
-                  "reusing the registry's own link form. The opener must RESOLVE to a "
-                  "row: a gate whose opener is an unowned event is unfalsifiable and "
-                  "will sit forever, while a gate whose opener is a ROW is a dependency "
+                  "reusing the registry's own link form. The opener must RESOLVE to an "
+                  "OPEN row: a gate whose opener is an unowned event is unfalsifiable "
+                  "and will sit forever, and one whose opener has ALREADY CLOSED is not "
+                  "gated at all -- it is unblocked, and saying otherwise hides "
+                  "schedulable work. A gate whose opener is an OPEN ROW is a dependency "
                   "-- schedulable, sizable, and visible in the queue.")
             print("  IF THIS ROW IS *ABOUT* GATED ROWS RATHER THAN BEING ONE -- a census, "
                   "a rule, a report that has to quote the vocabulary -- do NOT reword it "
                   "to dodge this check. A row must be able to name the thing it is about. "
-                  "State its own verdict instead: a row whose trigger has ALREADY FIRED "
-                  "is not gated, and saying so is a claim a reader can check.")
+                  "State its own verdict instead, in whichever of these is TRUE: its "
+                  "trigger has ALREADY FIRED, or it has no trigger (`Trigger: none`), or "
+                  "it has no closing work. Each is a claim a reader can check.")
+        if new_unclass:
+            print("  UNCLASSIFIED LEAD MARKER -> the closing-work cell opens with a "
+                  "glyph this gate has never been taught. It will NOT guess: add the "
+                  "marker to GATE_LEAD_MARKS if it means *do not build this yet*, or to "
+                  "NON_GATE_LEAD_MARKS if it is emphasis or a verdict -- after reading "
+                  "the row. Do not delete this check: an enumeration whose residual is "
+                  "silent is how this instrument under-counted four times before.")
         return 1
 
     net_new = bal.net_new

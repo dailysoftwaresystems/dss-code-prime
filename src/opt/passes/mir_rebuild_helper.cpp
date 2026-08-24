@@ -376,8 +376,8 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     for (MirBlockId const oldB : blocks) {
         MirBlockId const newB = blockMap_.at(oldB.v);
         dst_.beginBlock(newB);
-        // Mem2Reg's IDF-phi-insertion site (D-OPT-MIR-REBUILDER-
-        // ONBLOCKBEGIN-HOOK). Default no-op for every other pass.
+        // Mem2Reg's IDF-phi-insertion site (D-OPT-MIR-REBUILDER-ONBLOCKBEGIN-HOOK).
+        // Default no-op for every other pass.
         active_->onBlockBegin(oldB, newB, dst_, rewrite_, blockMap_);
 
         // Walk source-block insts. If a block-merge policy chooses to
@@ -509,8 +509,7 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         // must thread the position or it silently defaults to the ordinal and
         // the inliner mis-maps mixed-class actuals. Every pass drives this
         // rebuilder (Identity is the FIRST release pass), so a wipe here kills
-        // the position before Inlining runs (D-OPT-RELEASE-SYSV-MIXED-CLASS-
-        // REG-ARG-DROP).
+        // the position before Inlining runs (D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP).
         MirInstId const newId = dst_.addArg(src_.argIndex(oldId),
                                             src_.instType(oldId),
                                             src_.argPosition(oldId));

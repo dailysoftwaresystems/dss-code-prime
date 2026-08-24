@@ -11,9 +11,19 @@
 // 6-10 from the overflow area. Sum = 55 → exit 55. A wrong overflow geometry (bad
 // overflow_arg_area base, wrong pointer bump, or a misclassified register cutover)
 // changes the total and flips the exit. NOTE: `n` is the only fixed param (1 GPR),
-// so the fixed-params-overflow-to-stack sub-case (D-FC12A-VARIADIC-OVERFLOW-FIXED-
-// STACK-ARGS, fail-loud) is NOT exercised here — this witnesses the common,
-// implemented overflow read path. Runs natively on the x86_64-Linux CI leg.
+// so the fixed-params-overflow-to-stack sub-case (D-FC12A-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)
+// is NOT exercised here — this witnesses the common overflow read path instead.
+// ⚠ THIS NOTE USED TO CALL THAT SUB-CASE `fail-loud` AND THAT HAD BEEN FALSE
+// SINCE 2026-06-20, when the row closed: a variadic callee whose FIXED scalar
+// params overflow the arg registers LOWERS, and va_start bakes the fixed-stack
+// displacement into the `VaOverflowArgAreaAddr` payload. ✔RE-MEASURED at the
+// CLI: an 8-fixed-param variadic callee compiles rc=0 on
+// x86_64:pe64-x86_64-windows-exec and x86_64:elf64-x86_64-linux-exec at debug
+// AND release, and RUNS with the right answer. The sub-case is simply covered
+// ELSEWHERE — `varargs_overflow_fixed_stack` is its direct SysV twin and
+// `varargs_aapcs64_overflow_fixed_stack` the AAPCS64 one — which is the true
+// reason to say it is not exercised here. Runs natively on the x86_64-Linux CI
+// leg.
 
 int sum(int n, ...) {
     va_list ap;

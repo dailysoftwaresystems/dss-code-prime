@@ -6234,8 +6234,8 @@ TEST(MirToLir, F128SoftcallDoesNotClobberDoubleLiveAcrossCall) {
 //
 // `long double _Complex` on elf-x86_64 (x87-80 axis) has an F80 ELEMENT.
 // `materializeComplexBinaryOp` emits its addition COMPONENTWISE — plain F80
-// Load/FAdd/Store over the element type — so with D-CSUBSET-LONG-DOUBLE-X87-
-// ARITH (LD-1) landing the scalar x87 memory sequence, the complex LOCAL
+// Load/FAdd/Store over the element type — so with D-CSUBSET-LONG-DOUBLE-X87-ARITH
+// (LD-1) landing the scalar x87 memory sequence, the complex LOCAL
 // arithmetic RIDES it for free and now LOWERS (an fld/fld/faddp/fstp per
 // component). This is a REALIZED path, not a walled one — the componentwise
 // scalar ops are individually correct, so the complex result is correct.

@@ -70,8 +70,8 @@ namespace dss {
 // work without touching its `#include`s.
 
 // SymbolBinding + SymbolVisibility lifted to `core/types/symbol_attrs.hpp`
-// so MIR-tier producers (the optimizer's DCE pass — D-OPT1-SYMBOL-
-// BINDING-VISIBILITY-THREAD) can consume the vocabulary without a
+// so MIR-tier producers (the optimizer's DCE pass —
+// D-OPT1-SYMBOL-BINDING-VISIBILITY-THREAD) can consume the vocabulary without a
 // layer inversion through the link header. The canonical definitions
 // + name-tables live there; the file-top `#include` re-exports them
 // into the `dss` namespace for every existing link-side consumer. No
@@ -550,8 +550,7 @@ struct DSS_EXPORT MachOIdentity {
                                      //   N_ALT_ENTRY in n_desc) that lets a
                                      //   reader tell a file-local body from
                                      //   an interior label — see
-                                     //   D-LINK-NONEXTERNAL-DEFINED-SYMBOL-
-                                     //   READ-AS-BLOCK-LABEL-NOT-ATOM and
+                                     //   D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM and
                                      //   the rationale in each object
                                      //   format's `macho.$comment`.
 };
@@ -1175,8 +1174,8 @@ struct DSS_EXPORT ObjectFormatData {
     // still applies and is still filtered ONCE downstream.
     std::vector<PredefinedMacroDef> predefinedMacros;
 
-    // ── NOT HERE: bare-`char` signedness (D-TARGET-CHAR-SIGNEDNESS-PER-
-    // PLATFORM) ─────────────────────────────────────────────────────────
+    // ── NOT HERE: bare-`char` signedness (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM)
+    // ─────────────────────────────────────────────────────────
     // The axis is (processor × platform), and it is declared ENTIRELY on the
     // TARGET — one key, `charIsUnsigned`, carrying its own per-object-format
     // overrides (`{"default": …, "byObjectFormat": {…}}`), resolved by

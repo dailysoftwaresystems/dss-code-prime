@@ -455,8 +455,8 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
             // scanLiveSymbols was supposed to populate perFunc[f.v]
             // for every function whose symbol entered liveSymbols.
             // Anonymous (symbol.v=0) and duplicate-symbol cases now
-            // fail loud INSIDE scanLiveSymbols (see D-OPT3-DCE-
-            // ANONYMOUS-SYMBOL + D-OPT3-DCE-DUPLICATE-SYMBOL), so
+            // fail loud INSIDE scanLiveSymbols (see
+            // D-OPT3-DCE-ANONYMOUS-SYMBOL + D-OPT3-DCE-DUPLICATE-SYMBOL), so
             // reaching this site means scanLiveSymbols dropped a
             // function on a path other than those two.
             std::fprintf(stderr,

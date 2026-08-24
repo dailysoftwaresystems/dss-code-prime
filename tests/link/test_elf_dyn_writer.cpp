@@ -459,8 +459,8 @@ TEST(ElfDynFormatJson, TextVaNotEqualPageAlignRejectedAtLoad) {
     EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
 }
 
-// ★ THE VOCABULARY DELETION, pinned — D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-
-// AN-ALIAS-SET. `"copy-relocation"` was a real `DataImportBinding` member: the
+// ★ THE VOCABULARY DELETION, pinned — D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET.
+// `"copy-relocation"` was a real `DataImportBinding` member: the
 // ELF non-PIE ET_EXEC mechanism (a `.bss` slot + a DEFINED OBJECT dynsym + one
 // R_*_COPY). It is UNSOUND because its convergence-on-one-storage is
 // NAME-SCOPED: glibc exports ONE environment object under THREE names, and an

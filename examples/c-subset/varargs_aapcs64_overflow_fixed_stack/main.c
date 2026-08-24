@@ -1,5 +1,6 @@
-// D-ASM-AARCH64-LARGE-FRAME-IMM12 + FC12-deferral④ (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-
-// FIXED-STACK-ARGS) runtime witness: an AAPCS64 variadic callee whose FIXED params
+// D-ASM-AARCH64-LARGE-FRAME-IMM12 + FC12-deferral④
+// (D-FC12C-AAPCS64-VARIADIC-OVERFLOW-FIXED-STACK-ARGS)
+// runtime witness: an AAPCS64 variadic callee whose FIXED params
 // overflow the 8 integer arg registers onto the incoming stack, AND whose frame is large
 // enough that the 9th fixed param's incoming-stack load needs the SCALED imm12 LDR form
 // (the byte offset exceeds the unscaled imm9 ±256 reach). This is the case the scalar-

@@ -34,12 +34,43 @@ a pass. A guard that reports success while scanning nothing is the worst defect
 a guard can have, and this repo has already shipped that bug once
 (D-GATE-ANCHOR-GUARD-FAILS-OPEN-ON-MISSING-ROOT).
 
+★★ THE NO-ARGUMENT FORM (the ctest form) VERIFIES THE TREE **AND THEN RUNS THE
+SELF-TEST**, honouring both statuses. Until 2026-08-23 `--selftest` was a separate
+branch and the registered entry passes no flag, so the matcher — which is "the
+whole correctness of this guard", by its own self-test's docstring — was proven by
+nothing mechanical. Same shape as D-GATE-ENUM-NAME-TABLE-CTEST-FORM-NEVER-SELF-TESTED,
+and the two halves run UNCONDITIONALLY so a red tree cannot short-circuit the proof
+that the instrument still works.
+
 Exit codes: 0 = clean, 1 = a live abort call site, 2 = the scan collapsed.
 """
 import io
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+
+# ── OUTPUT ENCODING — NOT COSMETIC, AND THE STREAM IS HALF THE FACT ─────────────
+# ✔MEASURED 2026-08-23 (CPython 3.14.3, Windows, BOTH streams PIPES, which is
+# exactly how ctest runs every guard): `sys.stdout` comes up
+# `encoding='cp1252' errors='surrogateescape'` and `sys.stderr` comes up
+# `errors='backslashreplace'`. `surrogateescape` rescues only lone surrogates left
+# by an earlier decode; it does NOTHING for an ordinary unencodable character.
+# ⇒ This guard prints the RAW SOURCE LINE of every finding, and the test tree it
+# scans is full of box-drawing and typographic characters. It prints them on
+# STDERR, so it does not die — but `backslashreplace` mangles the evidence into an
+# escape, and a report that renders the offending line differently from the file
+# it names is an instrument arguing with itself. The same text on STDOUT would
+# raise `UnicodeEncodeError` and kill the guard inside its own report.
+# Applied at IMPORT, so every path this module can print on is covered.
+# D-GATE-PYTHON-GUARD-DIES-PRINTING-TREE-TEXT-ON-A-WINDOWS-PIPE
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError, OSError):   # pragma: no cover - odd stream
+        pass
 
 ROOTS = ('tests', 'integrated_tests')
 EXTS = ('.cpp', '.hpp', '.h', '.cc')
@@ -270,6 +301,72 @@ def main() -> int:
     return 0
 
 
+# U+2502 BOX DRAWINGS LIGHT VERTICAL — absent from cp1252, which is the entire
+# reason it is the fixture. Built with `chr()` rather than written as the glyph or
+# as a backslash escape: the line that carries the fixture stays pure ASCII, so no
+# editor, transfer or re-encode anywhere in the chain can quietly turn it into
+# something cp1252 CAN encode and leave the arm passing while asserting nothing.
+_BOX = chr(0x2502)
+
+
+def _pipe_arm() -> bool:
+    """Drive a FINDING through a real cp1252 pipe, in a CHILD process.
+
+    ★★★ NOTHING ELSE IN THIS FILE CAN WITNESS THIS, AND THE REASON IS STRUCTURAL.
+    The stripper cases above are pure string work; they never touch a stream. The
+    defect is a property of the PIPE — a run attached to a terminal proves nothing
+    — and of the CHILD, because the encoding is fixed when the interpreter starts.
+    (D-GATE-PYTHON-GUARD-DIES-PRINTING-TREE-TEXT-ON-A-WINDOWS-PIPE)
+
+    ★ `PYTHONIOENCODING=cp1252` IS FORCED, which is what makes this arm mean
+    something on every host. Left to the ambient locale it would be vacuous on
+    Linux and macOS, where the pipe is already UTF-8 — i.e. on most of the gate,
+    including both remote legs. The module's own `reconfigure` at import overrides
+    the variable, which is precisely the property under test.
+
+    ⚠ THE EXIT CODE CANNOT CARRY THE VERDICT. This guard reports findings on
+    STDERR, whose default handler is `backslashreplace`, so the unfixed form does
+    not die — it prints the offending source line with the glyph replaced by an
+    escape, i.e. it reports a line that does not match the file it names. The arm
+    therefore asserts the GLYPH ITSELF survived, which is the only assertion that
+    separates a faithful report from a mangled one.
+    """
+    root = tempfile.mkdtemp(prefix='no-abort-pipe-')
+    try:
+        os.makedirs(os.path.join(root, 'tests', 'unit'))
+        os.makedirs(os.path.join(root, 'integrated_tests'))
+        io.open(os.path.join(root, 'tests', 'unit', 'fixture.cpp'), 'w',
+                encoding='utf-8', newline='\n').write(
+                    '#include <cstdlib>\n'
+                    'void f() {\n'
+                    '    abort();  // %s a character cp1252 cannot encode\n'
+                    '}\n' % _BOX)
+        io.open(os.path.join(root, 'integrated_tests', 'keep.cpp'), 'w',
+                encoding='utf-8', newline='\n').write('void g() {}\n')
+        driver = ('import importlib.util, sys\n'
+                  'spec = importlib.util.spec_from_file_location("g", %r)\n'
+                  'm = importlib.util.module_from_spec(spec)\n'
+                  'spec.loader.exec_module(m)\n'
+                  'm.FILE_FLOOR = 1\n'
+                  'sys.exit(m.main())\n' % os.path.abspath(__file__))
+        env = dict(os.environ)
+        env['PYTHONIOENCODING'] = 'cp1252'
+        p = subprocess.run([sys.executable, '-c', driver], cwd=root, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = (p.stdout + p.stderr).decode('utf-8', 'replace')
+        died = 'UnicodeEncodeError' in out
+        reported = 'a NEW abort() call site' in out
+        faithful = _BOX in out
+        ok = p.returncode == 1 and not died and reported and faithful
+        print(f'  [{"ok " if ok else "FAIL"}] '
+              f'{"finding survives a cp1252 PIPE, glyph intact":<30} '
+              f'rc={p.returncode} died={died} reported={reported} '
+              f'glyph_intact={faithful}')
+        return ok
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def _selftest() -> int:
     """The comment/string stripper is the whole correctness of this guard."""
     cases = [
@@ -309,11 +406,30 @@ def _selftest() -> int:
         bad += 1
     else:
         print('  [ok ] line numbers preserved across a multiline block comment')
+    if not _pipe_arm():
+        bad += 1
     print(f'selftest: {"FAIL" if bad else "OK"} ({bad} failure(s))')
     return 1 if bad else 0
 
 
 if __name__ == '__main__':
-    if '--selftest' in sys.argv:
+    _argv = sys.argv[1:]
+    _unknown = [a for a in _argv if a != '--selftest']
+    if _unknown:
+        # Fail loud rather than scan: a typo'd flag that is silently ignored turns
+        # an intended self-test into a tree check whose result is read as the
+        # other one's.
+        print('no-abort-in-tests: unknown argument(s): %s' % ' '.join(_unknown),
+              file=sys.stderr)
+        sys.exit(2)
+    if '--selftest' in _argv:
         sys.exit(_selftest())
-    sys.exit(main())
+    # ★ THE NO-ARGUMENT FORM IS THE CTEST FORM, and it must do BOTH halves: verify
+    # the tree, then prove the instrument can still fail. Either alone is a
+    # vacuous pass. ⚠ BOTH RUN UNCONDITIONALLY — `main() or _selftest()` would
+    # short-circuit the proof exactly when the tree reddens, so a broken
+    # instrument would hide behind the failure it was trusted to report.
+    _rc = main()
+    print('')
+    _rc_self = _selftest()
+    sys.exit(_rc or _rc_self)

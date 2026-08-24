@@ -5,8 +5,8 @@
  *
  * const-eval cannot fold an address inside the aggregate, so before c67 the whole
  * table fell to the runtime-init path and `emitGlobals_`'s lowerExpr on the
- * aggregate tripped the bit-field-rvalue fail-loud guard (D-CSUBSET-BITFIELD-
- * RVALUE-RUNTIME). c67 emits these as STATIC DATA with abs64 RELOCATIONS at the
+ * aggregate tripped the bit-field-rvalue fail-loud guard (D-CSUBSET-BITFIELD-RVALUE-RUNTIME).
+ * c67 emits these as STATIC DATA with abs64 RELOCATIONS at the
  * member offsets — the C-correct, gcc-matching placement, extending the F5 scalar
  * mechanism (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL) from top-level scalars to aggregate
  * MEMBERS. The aggregate lands in writable-at-load .data (the loader patches the
@@ -24,8 +24,8 @@
  * Red-on-disable: revert the c67 classify arm (tryClassifyAggregateConst /
  * tryClassifyNullPointerConst / the Cast+Ref symbol-addr peels) OR the asm
  * encodeAggregateValue reloc-leaf arm -> the table falls to runtime-init and the
- * compile fails with H_UnsupportedLoweringForKind (D-CSUBSET-BITFIELD-RVALUE-
- * RUNTIME) on every target.
+ * compile fails with H_UnsupportedLoweringForKind
+ * (D-CSUBSET-BITFIELD-RVALUE-RUNTIME) on every target.
  */
 
 static int target = 30;             /* &target -> abs64 reloc into a .data slot */

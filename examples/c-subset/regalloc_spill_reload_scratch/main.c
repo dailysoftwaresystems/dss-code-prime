@@ -20,8 +20,8 @@
  * x86_64 GPRs -> the allocator spills, and (pre-fix) the empty scratch
  * pool cannot reload the spilled vreg. `main` calls `f` with 15 args (a
  * call that FITS the register file, so NO wide-call operand explosion —
- * that separate limit is the deferred D-AS-REGALLOC-WIDE-CALL-OPERAND-
- * COUNT). arm64 (~30 GPRs) never spills here, so it compiles trivially
+ * that separate limit is the deferred D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT).
+ * arm64 (~30 GPRs) never spills here, so it compiles trivially
  * and simply verifies the value. RED-ON-DISABLE: revert the reservation
  * -> error[L_VirtualRegInPostRegalloc] on x86_64. => 42. */
 int f(int a0,int a1,int a2,int a3,int a4,int a5,int a6,int a7,

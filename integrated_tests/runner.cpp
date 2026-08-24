@@ -24,8 +24,7 @@
 // run somewhere). ⚠ `runOn` names an OS, NOT a machine: two arms
 // can both say `linux` while only one of them can execute here,
 // which is exactly how a native aarch64 host came to verify
-// nothing at all (D-TEST-INTEGRATED-TESTS-CANNOT-PASS-ON-A-NATIVE-
-// ARM64-LINUX-HOST).
+// nothing at all (D-TEST-INTEGRATED-TESTS-CANNOT-PASS-ON-A-NATIVE-ARM64-LINUX-HOST).
 //
 // A SKIP IS NOT A PASS (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT). Every
 // DECLARED target arm of every manifest — including the ones this runner's
@@ -76,6 +75,11 @@
 // implemented identically in the in-process sibling.
 
 #include "arm_verdict_ledger.hpp"
+#include "host_native_target.hpp"  // hostNativeTarget / hostExeArtifact — the
+                                   // source-argument-shape pin BUILDS AND SPAWNS
+                                   // its own output, so it must build for this
+                                   // machine (do not rely on the transitive
+                                   // include through arm_verdict_ledger.hpp)
 #include "repo_root.hpp"
 #include "run_binary.hpp"
 #include "stage_tree.hpp"  // recursive corpus staging — ONE copy, shared with
@@ -215,7 +219,8 @@ std::vector<DeclaredArm> declaredArms;
 // SEPARATE from `declaredArms.size()` so [Test 4]'s non-vacuity guard can tell
 // "the corpus root produced no manifest" apart from "manifests were read but
 // not one of them declared a runOn host" — the two distinct diagnostics the
-// in-process twin gives at tests/examples/examples_runner.cpp:1227 and :1230.
+// in-process twin gives in `ExamplesCorpusLint.EveryArmAgreesWithItsSiblingsOnTheEmulator`
+// (`ASSERT_GT(manifestCount, 0u)` and `ASSERT_FALSE(arms.empty())`).
 // Either state makes the lint vacuous; they have different causes and
 // different fixes, so collapsing them would cost the reader the fix.
 std::size_t manifestsWalked = 0;
@@ -1117,7 +1122,7 @@ struct ExampleManifest {
 // The FORMAT half of a manifest spec ("x86_64:pe64-x86_64-windows-exec" →
 // "pe64-x86_64-windows-exec") — the subdirectory a PROJECT build routes its
 // artifact into, because `Program::compileProject` forces
-// `setPerFormatOutputSubdir(true)` (src/program/program.cpp:1760) even for a
+// `setPerFormatOutputSubdir(true)` (`Program::compileProject`) even for a
 // single-target build. Empty ⇒ the spec has no ':' and the caller fails loud
 // rather than composing a wrong path.
 //
@@ -1628,8 +1633,23 @@ std::size_t dependencyImagesDiffered  = 0;
     //
     // Scoped to PROJECT MODE deliberately. A `--compile` invocation is handed
     // ABSOLUTE source paths, so its behaviour does not depend on the cwd, and
-    // moving 580 existing examples' compiles onto a different working directory
+    // moving every existing example's compile onto a different working directory
     // would be an unmeasured change riding along with this one.
+    //
+    // ★★ AND THAT SCOPING IS EXACTLY WHY THE CORPUS COULD NOT SEE
+    // `D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH`
+    // (`D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH`). The
+    // absolute path is the one shape of the four a user can type, and until
+    // `runSourceArgumentShapePin` landed, the other three — `main.c`,
+    // `sub/main.c`, `./main.c` — were exercised by nothing in this repository at
+    // the CLI tier. ⇒ THE GAP IS CLOSED BY THAT PIN, NOT BY THIS CALL SITE, and
+    // deliberately so: the argument SHAPE is a property of the invocation, not
+    // of an example, so it is ONE existence claim on the `cli-surface` entry
+    // rather than a manifest key minted to serve ONE manifest out of the whole
+    // corpus. Its
+    // in-process twin is `tests/program/test_source_argument_shape.cpp`. Do NOT
+    // "close the gap properly" by moving this scope: that changes the compile
+    // input for the whole corpus and still leaves exactly one shape covered.
     bool const projectMode = m.project.has_value();
     std::string projectArg;
     if (projectMode) {
@@ -1787,7 +1807,7 @@ std::size_t dependencyImagesDiffered  = 0;
 
     // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT: THE case this defect is about — these two are the checks a RED run reaches, and in their throwing form a failing example killed the runner rather than naming itself.
     // D-AP2-OUTPUT-ROUTING: a PROJECT build forces `setPerFormatOutputSubdir(true)`
-    // (src/program/program.cpp:1760), so its artifact is at
+    // (in `Program::compileProject`), so its artifact is at
     // `<outDir>/<formatName>/<name><ext>`, NOT at `<outDir>/<artifact>`.
     // COMPUTED EXPLICITLY rather than folded into the manifest string: spelling
     // the target's `artifact` as `"pe64-x86_64-windows-exec/main.exe"` composes
@@ -1892,8 +1912,27 @@ std::size_t dependencyImagesDiffered  = 0;
         // Capturing unconditionally would swap every example's inherited stdio
         // for a pipe — a behavioural change to 597 examples riding along with a
         // harness fix, and one that examples never pinned would never notice.
+        // D-TEST-WALL-CLOCK-LITERAL-INVENTORY-IS-DEBT: the deadline was a bare
+        // `chrono::milliseconds{5000}` here — a wall-clock number sized by
+        // nobody, in the one call this harness makes ~618 times.
+        //
+        // ★ `kRunBudget` AND NOT `kWaitBudget`, AND THE DISTINCTION IS THE WHOLE
+        // POINT OF A NAMED BUDGET. ✔MEASURED in `tests/test_support/`:
+        // `kRunBudget` is 5000 ms and its docblock sizes it as ">2x the worst
+        // WARM latency ever measured" for a COMPILED PROGRAM — which is exactly
+        // what this call spawns — while `kWaitBudget` is 60 s and is sized for a
+        // test WAITING on something that should already have happened. Routing
+        // this site through the wait budget would have multiplied every
+        // example's hang ceiling by twelve and mis-described a run as a wait;
+        // `kRunBudget` carries the measurement that actually sized THIS number
+        // and is byte-identical in value, so the change is a naming of intent
+        // and not a behaviour change.
+        //
+        // ⚠ It is `runBinary`'s own DEFAULT for this parameter, and it is passed
+        // explicitly anyway: `captureStdout` and `launcherPrefix` follow it
+        // positionally, so the default cannot be reached by omission here.
         result = dss::test_support::runBinary(
-            absArtifact, std::chrono::milliseconds{5000}, captureStdout,
+            absArtifact, dss::test_support::kRunBudget, captureStdout,
             launcherPrefix);
     }
     check(armName + ": spawn succeeded (diag='"
@@ -1958,7 +1997,7 @@ std::size_t dependencyImagesDiffered  = 0;
 // but it reaches it through the CLI, where the arm is selected by a FLAG the
 // user actually types (`--config=release`) rather than by an in-process
 // `pipelineOverride` that BYPASSES the shipped pipeline registry entirely
-// (src/program/compile_pipeline.hpp:172). So the two runners witness genuinely
+// (`CompileOptions::pipelineOverride`). So the two runners witness genuinely
 // different halves of the same promise: the sibling proves the release PIPELINE
 // preserves behaviour, and this one proves that asking the shipped BINARY for it
 // on the command line actually delivers that pipeline. Neither substitutes for
@@ -2269,8 +2308,8 @@ void runSelectedTargetViaCli(std::string const& compiler,
 // Bind the target this runner will drive, ledger EVERY declared arm of the
 // manifest, and run the bound one.
 //
-// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-CLI-HARNESS-BINDS-FIRST-
-// MATCHING-TARGET: this runner drives ONE target per manifest and never
+// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-CLI-HARNESS-BINDS-FIRST-MATCHING-TARGET:
+// this runner drives ONE target per manifest and never
 // considers the rest — a known harness limitation with its own anchor,
 // deliberately NOT fixed here. What IS fixed here is the accounting: an arm this
 // runner never reaches is ledgered as `NotSelectedByRunner` rather than being
@@ -2322,8 +2361,8 @@ void runExampleViaCli(std::string const& compiler,
     // work is (target × arm), not target alone. Before the optimized arms
     // landed, a 4-target 2-arm manifest declared 4 rows here and the Results
     // line's `T declared target arms` understated the corpus by the whole
-    // optimizer axis — the same undercount D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-
-    // VERDICT closed one level up. An unreached target's arms carry THAT
+    // optimizer axis — the same undercount D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT
+    // closed one level up. An unreached target's arms carry THAT
     // target's reason, because that is genuinely why they did not run.
     for (std::size_t i = 0; i < m.targets.size(); ++i) {
         if (i == boundIndex) continue;
@@ -2596,7 +2635,8 @@ void runAllExamples(std::string const& compiler,
         return;
     }
     // Published for [Test 4]'s non-vacuity guard. Counts manifests FOUND (the
-    // same thing the in-process twin counts at examples_runner.cpp:1213), not
+    // same thing the in-process twin's `manifestCount` counts in
+    // `ExamplesCorpusLint.EveryArmAgreesWithItsSiblingsOnTheEmulator`), not
     // manifests parsed: a manifest that fails to parse is already a `[FAIL]`
     // below, and folding it out of this count would let a corpus-wide parse
     // break re-open the vacuous-lint hole from the other side.
@@ -2691,11 +2731,12 @@ void runManifestEmulatorLint() {
     // empty: [Test 4] printed the single line `[PASS] every declared target arm
     // agrees ... (0 declarations)` and the process exited 0. With the checks
     // present the same injection reds twice and exits 1 (2 failed). The
-    // in-process twin already guards this exact pair — examples_runner.cpp:1227
-    // (`ASSERT_GT(manifestCount, 0u)`) and :1230 (`ASSERT_FALSE(arms.empty())`)
-    // — and one runner enforcing a guard while its sibling shrugs is the silent
-    // harness bug this whole change exists to close (integrated_tests/
-    // CMakeLists.txt:42-46 states the pairing rule).
+    // in-process twin already guards this exact pair — in
+    // `ExamplesCorpusLint.EveryArmAgreesWithItsSiblingsOnTheEmulator`,
+    // `ASSERT_GT(manifestCount, 0u)` and `ASSERT_FALSE(arms.empty())` — and one
+    // runner enforcing a guard while its sibling shrugs is the silent harness
+    // bug this whole change exists to close (the per-example entry discovery
+    // note in `integrated_tests/CMakeLists.txt` states the pairing rule).
     //
     // The floor is `> 0`, deliberately NOT a pinned corpus size: 558 manifests
     // today, 557 last cycle. A hardcoded expected count is the same inert pin in
@@ -2982,12 +3023,33 @@ void corpusWideFloors(std::size_t declared, std::size_t built,
         return 1;
     }
     if (cells.size() < population) {
-        // Not a failure and NOT a pass. The operator asked for a subset; say so
-        // in ctest's own vocabulary and assert nothing.
+        // Not a failure and NOT a pass: a corpus-wide existence floor cannot be
+        // judged from part of the corpus. Say so in ctest's own vocabulary and
+        // assert nothing.
+        //
+        // ⚠ TWO CAUSES, AND THIS MESSAGE USED TO NAME ONLY ONE. It said "the
+        // operator asked for a subset", which is an ASSUMED cause — ✔MEASURED
+        // 2026-08-23 during cycle P29 on a `-R` that selected the WHOLE
+        // `^integrated_tests/` unit and still landed here, at 615 cells against a
+        // population of 616. The second cause is a STALE BUILD TREE: the
+        // per-example entries come from a `GLOB_RECURSE` in the root
+        // `CMakeLists.txt`, which is a CONFIGURE-time snapshot. It carries
+        // `CONFIGURE_DEPENDS`, so a `cmake --build` re-globs — but `ctest` alone
+        // does not, so an example added since the last BUILD exists on disk,
+        // is counted in `population`, and has no entry to emit its cell.
+        // ⇒ A reader sent to their `-R` by the old wording would have found
+        // nothing wrong with it. Naming both causes costs one sentence; naming
+        // the wrong one costs a search.
         std::cout << "  [SKIP] " << cells.size() << " of " << population
-                  << " example(s) reported a cell — this is a SUBSET run, and a"
-                     " corpus-wide existence floor cannot be judged from part of"
-                     " the corpus. Classified skip, never a pass.\n";
+                  << " example(s) reported a cell — a corpus-wide existence"
+                     " floor cannot be judged from part of the corpus."
+                     " Classified skip, never a pass. TWO causes reach here:"
+                     " a deliberate SUBSET run (`-R`/`--only`), or a BUILD TREE"
+                     " whose per-example entries predate an example that now"
+                     " exists on disk — re-run `cmake --build` (the manifest"
+                     " glob is CONFIGURE_DEPENDS, so building re-globs; ctest"
+                     " alone does not) and compare `ctest -N -R"
+                     " '^integrated_tests/'` against the population above.\n";
         return kAdjudicatorSkipRc;
     }
 
@@ -3576,6 +3638,219 @@ void runManifestClosedKeySetPin(fs::path const& scratch) {
     std::cout << "\n";
 }
 
+// ── THE FOUR SOURCE-ARGUMENT SHAPES, AT THE ARGV TIER ──────────────────────
+//
+// ★★★ THE CORPUS WALK BELOW CAN ONLY SPELL ONE OF THEM, AND THIS PIN IS WHY
+// THAT IS NO LONGER THE WHOLE STORY
+// (D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH).
+// A user hands `--compile` a path in one of exactly four shapes: ABSOLUTE,
+// BARE-RELATIVE (`main.c`, no directory component at all), DIRECTORY-RELATIVE
+// (`sub/main.c`) and DOT-RELATIVE (`./main.c`). This runner builds
+// `(exampleDir / s).string()` for every example and the in-process sibling
+// builds `scratch.path() / s`, so EVERY manifest in the corpus exercises the
+// absolute form and the other three are exercised by nothing. (No count is
+// quoted: a raw count of a growing corpus rots in place, and this one grew by
+// one DURING the cycle that added this pin.)
+//
+// ★★ THAT HOLE SHIPPED A HIGH, USER-FACING DEFECT.
+// `D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH`:
+// `dss --compile main.c` refused a header sitting beside `main.c` while the
+// other three shapes resolved it, because an EMPTY parent path was read as "no
+// directory" when it means THE PROCESS WORKING DIRECTORY. Nothing in the corpus
+// could see it.
+//
+// ⇒ ONE ENTRY, NOT SIX HUNDRED. The claim "some invocation exercises the
+// bare-relative form" is EXISTENTIAL, and the P24 ruling keeps an existence
+// claim at one entry; the claim "EVERY shape resolves the includer's header" is
+// universal over a FOUR-element set, so each shape is its own case below and a
+// failure names the shape. Neither reading wants a manifest key: the shape is a
+// property of the INVOCATION, and the manifest vocabulary is a closed key set
+// whose two parsers a source-level pin holds equal.
+//
+// ⇒ ITS IN-PROCESS COUNTERPART is `tests/program/test_source_argument_shape.cpp`
+// (suite `SourceArgumentShape`), which drives the same four shapes through
+// `Program::compileFiles`/`compileUnits`. Deliberately the SAME experiment at
+// both tiers — same header name, same two answers — because a capability
+// enforced on one tier while the other shrugs is the silent harness bug
+// [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] names. What only THIS side can
+// see is argv: the token the shell hands the driver, unnormalised by any
+// `fs::path` this harness built.
+//
+// ★ THE DECOY IS WHAT MAKES THE EXIT CODE DISCRIMINATING. For the two shapes
+// whose includer directory is NOT the working directory, a second header of the
+// SAME NAME carrying a DIFFERENT value sits in the working directory. Resolving
+// against the cwd then yields a binary that builds clean, runs, and answers
+// wrong — with no diagnostic. For the other two the includer's directory IS the
+// working directory, so no decoy is possible and none is planted.
+void runSourceArgumentShapePin(std::string const& compiler,
+                               fs::path const&    scratch) {
+    std::cout << "[Harness self-test] `--compile` accepts all FOUR"
+                 " source-argument shapes\n";
+
+    // The value the header BESIDE the source defines, and the value the decoy in
+    // the working directory defines. Neither is 0 (which a do-nothing binary
+    // also returns) and neither is 42 (the corpus's house exit code), so a
+    // copy-paste could not have produced either by accident.
+    constexpr unsigned kSiblingAnswer = 73;
+    constexpr unsigned kDecoyAnswer   = 11;
+    char const* const  kHeaderName    = "sibling.h";
+    char const* const  kAnswerMacro   = "DSS_SOURCE_ARG_SHAPE_ANSWER";
+    char const* const  kSubdir        = "sub";
+    char const* const  kMainName      = "main.c";
+    // DERIVED from the directory name, never re-typed: a hand-written "sub/" in
+    // the table below could drift from the directory the fixture actually
+    // creates, and the case would then be testing a path that does not exist —
+    // which fails, but for the wrong reason and with a misleading message.
+    std::string const  kSubdirPrefix  = std::string{kSubdir} + "/";
+
+    auto const headerText = [&](unsigned answer) {
+        return std::string{"#define "} + kAnswerMacro + " "
+             + std::to_string(answer) + "\n";
+    };
+    auto const writeText = [](fs::path const& p, std::string const& text) {
+        std::error_code ec;
+        fs::create_directories(p.parent_path(), ec);
+        std::ofstream f(p.string(), std::ios::binary);
+        f << text;
+    };
+
+    struct Shape {
+        char const* label;
+        bool        subdirectory;  // sources one level below the working dir
+        char const* prefix;        // "" for absolute — computed at run time
+        bool        absolute;
+    };
+    // ⚠ THE LIST IS THE CLAIM. Four shapes, spelled out, so a reader can check
+    // the enumeration is complete rather than trust that it is.
+    Shape const shapes[] = {
+        {"absolute",           true,  "",                     true},
+        {"bare-relative",      false, "",                     false},
+        {"directory-relative", true,  kSubdirPrefix.c_str(),  false},
+        {"dot-relative",       false, "./",                   false},
+    };
+
+    std::string const spec{::dss::test_support::hostNativeTarget().execTarget};
+    // DERIVED from the source's name, never re-typed: the driver names the
+    // artifact for the source's STEM, so a hand-written "main" here would keep
+    // passing if either the fixture's file name or that rule changed.
+    std::string const artifactName = ::dss::test_support::hostExeArtifact(
+        fs::path{kMainName}.stem().string());
+
+    for (auto const& sh : shapes) {
+        std::string const name = std::string{"--compile <"} + sh.label + ">";
+        auto const  workDir  = scratch / sh.label;
+        auto const  srcDir   = sh.subdirectory ? workDir / kSubdir : workDir;
+        auto const  outDir   = workDir / "out";
+        std::error_code ec;
+        fs::create_directories(outDir, ec);
+        if (ec) {
+            check(name + ": scratch tree created", false, ec.message());
+            continue;
+        }
+        writeText(srcDir / kHeaderName, headerText(kSiblingAnswer));
+        if (sh.subdirectory) {
+            writeText(workDir / kHeaderName, headerText(kDecoyAnswer));
+            // THE PREMISE OF THIS SHAPE'S EXIT-CODE ASSERTION. Without a decoy
+            // that really differs, "it returned the sibling's value" holds
+            // whichever header was resolved, and the case asserts nothing.
+            auto const decoy = fileExists(workDir / kHeaderName);
+            check(name + ": a DIFFERENT header of the same name sits in the"
+                         " working directory",
+                  decoy.ok, decoy.why);
+        }
+        writeText(srcDir / kMainName,
+                  std::string{"#include \""} + kHeaderName + "\"\n"
+                  + "int main(void) { return " + kAnswerMacro + "; }\n");
+
+        // The single variable across the four cases: the token in front of
+        // `main.c`. Everything else — the tree, the language, the target, the
+        // output directory — is identical.
+        std::string const argument =
+            sh.absolute ? (srcDir / kMainName).string()
+                        : (std::string{sh.prefix} + kMainName);
+
+        auto const cliLog = outDir / "cli.log";
+        std::string const cmd = quote(compiler)
+            + " --compile "  + quote(argument)
+            + " --language c-subset"
+            + " --target "   + spec
+            + " --output "   + quote(outDir.string())
+            + " > " + quote(cliLog.string()) + " 2>&1";
+
+        // THE WORKING DIRECTORY IS THE OTHER HALF OF A RELATIVE ARGUMENT. Scoped
+        // and restored by the same `CwdGuard` the project-mode compile uses, and
+        // FAIL-CLOSED: a chdir that did not take would resolve the argument
+        // against the build tree and the failure would read as a DSS defect.
+        bool cwdOk = true;
+        int const sysRc = [&]() {
+            CwdGuard cwd{workDir};
+            check(name + ": compile cwd set to " + workDir.generic_string(),
+                  cwd.ok,
+                  cwd.ok ? "" : "chdir failed; a relative source argument would"
+                                " resolve against the build tree instead");
+            cwdOk = cwd.ok;
+            if (!cwd.ok) return -1;
+            return std::system(shellWrap(cmd).c_str());
+        }();
+        if (!cwdOk) continue;
+
+        if (sysRc != 0) {
+            std::string body;
+            {
+                std::ifstream in(cliLog.string(), std::ios::binary);
+                body.assign(std::istreambuf_iterator<char>(in),
+                            std::istreambuf_iterator<char>());
+            }
+            check(name + ": compile exits 0 (rc=" + std::to_string(sysRc) + ")",
+                  false,
+                  "a refusal naming a quote include is the includer-directory"
+                  " derivation reading an EMPTY parent path as 'no directory'"
+                  " when it means the process working directory. cli output: "
+                      + body);
+            continue;
+        }
+        check(name + ": compile exits 0", true);
+
+        // The artifact must land at the SAME place for every shape — the driver
+        // derives the stem from the source's stem, not from the spelling it was
+        // handed. A `sub/`-prefixed argument that routed its output under `sub/`
+        // would put a user's binary somewhere they never asked for.
+        auto const artifact = outDir / artifactName;
+        auto const present  = fileExists(artifact);
+        check(name + ": artifact at " + artifact.generic_string(),
+              present.ok, present.why);
+        if (!present.ok) continue;
+
+        // `runBinary`'s own default deadline (`kRunBudget`, sized and documented
+        // beside it) rather than a literal repeated here.
+        //
+        // ⚠ NO `fs::absolute` CALL, deliberately: `artifact` descends from the
+        // run root, which is already absolute, and the no-argument
+        // `fs::absolute` THROWS — this function sits outside every `try` in
+        // `main`, which is precisely
+        // D-TEST-INTEGRATED-CORPUS-WALK-THROWS-UNCAUGHT (`libc++abi:
+        // terminating` as the whole output, no [FAIL] line, no name for what
+        // died).
+        auto const r = ::dss::test_support::runBinary(artifact);
+        check(name + ": spawn succeeded (diag='" + r.diagnostic + "')",
+              r.spawned);
+        if (!r.spawned) continue;
+        check(name + ": no timeout", !r.timedOut, r.diagnostic);
+        if (r.timedOut) continue;
+        check(name + ": exits " + std::to_string(kSiblingAnswer)
+                  + " — the value the header BESIDE the source defines",
+              r.exitCode == kSiblingAnswer,
+              "got " + std::to_string(r.exitCode)
+                  + (r.exitCode == kDecoyAnswer
+                         ? " — the quote include resolved against the PROCESS"
+                           " WORKING DIRECTORY instead of the includer's own"
+                           " directory: a build that succeeds, runs, and"
+                           " answers wrong with no diagnostic anywhere"
+                         : ""));
+    }
+    std::cout << "\n";
+}
+
 // ⚠ AN IDENTIFIER MATCH, NOT A SUBSTRING MATCH, AND THE DIFFERENCE IS NOT
 // PEDANTRY. ✔MEASURED 2026-08-21 by exercising the arm: the first draft used
 // `body.find("pipelineOverride")`, and renaming the member to
@@ -3801,13 +4076,13 @@ void reportArmVerdicts() {
     //
     // NOT gated on strict mode, by design: an empty ledger is a broken
     // instrument on every host, not a property of the machine — the same reason
-    // the twin's guard at examples_runner.cpp:1109 is a plain
+    // the twin's guard in `Examples.RunFromManifest` is a plain
     // `ASSERT_GT(ledger.total(), 0u)` and not part of its strict block. `> 0` is
     // the honest floor for "this instrument ran at all"; a pinned count would
     // red every time the corpus grows and would be edited back into a stamp.
     // ★★ THE FLOOR IS PER-MODE, AND THAT IS A STRENGTHENING RATHER THAN THE
-    // WEAKENING IT LOOKS LIKE. D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-
-    // ONE-THREAD split this runner into entries, and `--only=cli` deliberately
+    // WEAKENING IT LOOKS LIKE. D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD
+    // split this runner into entries, and `--only=cli` deliberately
     // performs no corpus walk — so its ledger is legitimately empty, and the
     // unconditional `> 0` reported that as a defect (✔MEASURED: `--only=cli`
     // exited 1 on this very check before the split was taught about).
@@ -4365,6 +4640,15 @@ int main(int argc, char* argv[]) {
     // itself rather than letting every dependency comparison go quietly inert.
     runDependsOnParserPin(outputBase / "harness-dependson-parser");
     runManifestClosedKeySetPin(outputBase / "harness-manifest-keys");
+    // UNNUMBERED for the same reason its two neighbours are: the `[Test N]`
+    // labels are cited from `.plans/_deferred-anchor-registry.md`, so inserting
+    // a number would silently invalidate a registry citation. It runs with the
+    // CLI surface rather than in the walk because it is ONE existence claim
+    // about the driver's argv handling, not a property of any example — and
+    // because the walk cannot express it at all: every example the walk compiles
+    // is handed an absolute path by construction, which is the gap this closes.
+    runSourceArgumentShapePin(compiler,
+                              outputBase / "harness-source-arg-shapes");
 
     }  // wantCliSurface
 

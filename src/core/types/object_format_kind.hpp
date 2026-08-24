@@ -25,9 +25,9 @@
 //                      diagnostics; `abi_catalog.cpp`'s `kAbiCatalog`
 //                      still SELECTS THE CALLING CONVENTION from a
 //                      table keyed on (target name, this enum) — an
-//                      OPEN identity branch, anchored at [[D-FFI-ABI-
-//                      CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-
-//                      IDENTITY]], NOT a sanctioned use.
+//                      OPEN identity branch, anchored at
+//                      [[D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY]],
+//                      NOT a sanctioned use.
 //                      ⚠ THIS BULLET USED TO READ "FF4 C-mangling
 //                      dispatches on `ObjectFormatKind` (per-format
 //                      leading-underscore rule)", which `c_mangle.cpp`
@@ -459,8 +459,8 @@ dataImportBindingFromName(std::string_view s) noexcept {
     return kDataImportBindingTable.fromName(s);
 }
 
-// ── Extern-ADDRESS materialization binding (D-LK-ARM64-EXTERN-DATA-
-//     ADDR-PIE-GOT, TF-C52) ───────────────────────────────────────
+// ── Extern-ADDRESS materialization binding (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT,
+//     TF-C52) ───────────────────────────────────────
 //
 // How code MATERIALIZES the ADDRESS of an undefined/preemptible extern
 // (function OR data) as a LIVE code-form VALUE — an argument, an

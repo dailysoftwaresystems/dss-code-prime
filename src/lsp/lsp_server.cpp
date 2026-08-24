@@ -384,8 +384,8 @@ std::optional<std::string> LspServer::handleInitialize_(Request const& req) {
     // root is the only thing that leads to a project manifest, so this is where
     // the editor learns which CPU its `.s` files belong to. The ROOTS are fixed
     // here; the PREFERENCE derived from them is not — see
-    // `refreshWorkspacePreference_` (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-
-    // INITIALIZE), which re-derives it whenever the manifest set may have moved
+    // `refreshWorkspacePreference_` (D-LSP-WORKSPACE-PREFERENCE-FROZEN-AT-INITIALIZE),
+    // which re-derives it whenever the manifest set may have moved
     // and republishes the open documents whose answer changed.
     //
     // Threading: every dispatcher handler runs on the `run()` thread, so this

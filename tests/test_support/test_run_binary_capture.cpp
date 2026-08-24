@@ -46,6 +46,7 @@
 #include "byte_emit.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
+#include "test_wait_budget.hpp"  // kWaitBudget — the shared, measured wait cap
 
 #include <gtest/gtest.h>
 
@@ -100,11 +101,16 @@ TEST(RunBinaryCapture, ALargeChildIsDrainedConcurrentlyAndNotDeadlocked) {
     std::vector<std::string> const prefix{
         self.string(), std::string{kEmitFlag} + std::to_string(kPayloadBytes)};
 
-    // A bounded budget: if the ordering regresses, this pin must RED in a
-    // minute rather than inherit whatever the default budget is.
+    // A bounded budget, and DELIBERATELY NOT `kRunBudget` (this harness's 5 s
+    // default): the child here is a multi-megabyte gtest binary re-exec'd to
+    // spit 256 KiB down a pipe, and if the concurrent drain regresses the child
+    // WEDGES — so the number has to be a hang detector, not a program budget.
+    // `kWaitBudget` (60 s) is that detector, shared and measured: this pin then
+    // reds in a minute rather than inheriting a budget sized for a program that
+    // just returns an exit code.
     auto const t0 = std::chrono::steady_clock::now();
     auto const r  = dss::test_support::runBinary(
-        self, std::chrono::seconds{60}, /*captureStdout=*/true, prefix);
+        self, dss::test_support::kWaitBudget, /*captureStdout=*/true, prefix);
     auto const elapsedMs =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0)
@@ -146,8 +152,10 @@ TEST(RunBinaryCapture, ASmallChildStillRoundTripsItsBytes) {
     ASSERT_TRUE(std::filesystem::exists(self)) << self;
     std::vector<std::string> const prefix{self.string(),
                                           std::string{kEmitFlag} + "7"};
+    // Same budget and the same reason as the large-payload pin above: the
+    // failure being bounded is a WEDGE, not a slow program.
     auto const r = dss::test_support::runBinary(
-        self, std::chrono::seconds{60}, /*captureStdout=*/true, prefix);
+        self, dss::test_support::kWaitBudget, /*captureStdout=*/true, prefix);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut) << r.diagnostic;
     EXPECT_EQ(r.capturedStdout, std::string(6, kFill) + kSentinel);
@@ -550,8 +558,19 @@ TEST(QemuGuestSysroot, RunBinaryRefusesTheSpawnAndSaysWhichVariableIsUnset) {
     auto const guest = scratch.path() / "guest.elf";
     writeElf64(guest, kUnresolvableInterp);
 
+    // ★ THIS BUDGET IS UNREACHABLE ON THE PATH UNDER TEST, and saying so is the
+    // point of naming it rather than typing a number. ✔MEASURED by reading
+    // `runBinary`: a non-empty `launcherPrefix` SKIPS the admission warm-up, and
+    // `spawnAndWait` calls `ensureQemuGuestSysroot` BEFORE a single handle
+    // exists — so on this arm the function returns its refusal without ever
+    // creating a process, and nothing is ever waited on. A wall-clock deadline
+    // is therefore standing in for a CONDITION here
+    // ([[D-TEST-WALL-CLOCK-DEADLINE-STANDS-IN-FOR-A-CONDITION-ON-A-REFUSAL-PATH]]);
+    // the condition is what `EXPECT_FALSE(result.spawned)` below asserts, and if
+    // this budget is ever actually spent that assertion is what reds. The shared
+    // cap is passed so no unmeasured number exists on a line that cannot use one.
     auto const result = dss::test_support::runBinary(
-        guest, std::chrono::seconds{10}, /*captureStdout=*/false,
+        guest, dss::test_support::kWaitBudget, /*captureStdout=*/false,
         {kFakeQemuLauncher});
 
     EXPECT_FALSE(result.spawned) << "nothing may be exec'd once the guest's "

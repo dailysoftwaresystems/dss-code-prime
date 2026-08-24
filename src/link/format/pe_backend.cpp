@@ -171,8 +171,8 @@ public:
                     if (tEnum.has_value()) {
                         data.pe.objectType = *tEnum;
                     } else {
-                        // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-
-                        // CLOSED-SET: projected from the table the lookup
+                        // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET:
+                        // projected from the table the lookup
                         // above consults, never retyped beside it.
                         coll.emit(DiagnosticCode::C_MalformedJson, "/pe/type",
                                   std::format("'type' must be {}",

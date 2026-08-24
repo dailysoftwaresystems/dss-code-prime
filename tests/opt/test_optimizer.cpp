@@ -994,8 +994,8 @@ TEST(Optimizer, EffectivenessSDivSurvivesShippedReleasePipeline) {
 // (cycle 10r 7-agent review fold pr-test #3 7/10, 2026-06-04). The
 // SDiv test above pins that the signed divide survives the shipped
 // release pipeline. UDiv has NO source-language entry in c-subset
-// today (no unsigned types yet — anchored D-CSUBSET-UDIV-RUNTIME-
-// HIGH-BIT-PIN), so the only way UDiv reaches codegen is via hand-
+// today (no unsigned types yet — anchored D-CSUBSET-UDIV-RUNTIME-HIGH-BIT-PIN),
+// so the only way UDiv reaches codegen is via hand-
 // built MIR — exactly the path this test pins. Without this analog,
 // a future opt-pass regression that folded MirOpcode::UDiv with
 // opaque args would silently disappear the entire `xor_rdx_zero +

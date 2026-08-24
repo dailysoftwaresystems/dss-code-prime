@@ -126,8 +126,8 @@ struct UnsuppressableEntry {
 //     callee/arg-setup collision backstop), L_StackPassedArgUnsupported,
 //     L_CcRegLookupFailed, L_VlaDynamicAllocaUnsupported,
 //     L_VlaNonLeafFrameUnsupported,
-//     L_TerminatorSuccessorMismatch (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-
-//     DROPPED — the terminator's recorded successors and its own BlockRef
+//     L_TerminatorSuccessorMismatch (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED
+//     — the terminator's recorded successors and its own BlockRef
 //     operands disagree),
 //     L_SideStructureIndexDangling, L_SideStructurePoolShrank,
 //     L_SideStructureReferenceLost (D-LIR-PER-INST-REG-CONSTRAINTS — the

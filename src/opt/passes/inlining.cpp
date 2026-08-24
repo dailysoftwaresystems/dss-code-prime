@@ -249,8 +249,8 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // callee whose body contains an `IntrinsicCall` is now ADMITTED (it
     // clones SSA-correctly via the same generic arm; the per-op check below
     // carries the frame-sensitivity caveat + its trigger-gated anchor
-    // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC). OPT7 (D-OPT7-MULTIBLOCK-
-    // SPLICE-PHI) LIFTS the callee-`Phi` refusal too — a multi-block callee
+    // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC). OPT7 (D-OPT7-MULTIBLOCK-SPLICE-PHI)
+    // LIFTS the callee-`Phi` refusal too — a multi-block callee
     // that carries a `Phi` at a real CFG merge (a value-producing `?:` /
     // `&&` / `||` lowers to a MIR Phi BEFORE Mem2Reg; or a post-Mem2Reg
     // join / loop header) is now ADMITTED. `spliceMultiBlock` clones each

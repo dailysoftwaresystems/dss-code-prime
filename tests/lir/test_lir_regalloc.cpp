@@ -774,8 +774,8 @@ TEST(LirRegAlloc, PressuredDivCoveringVregsExcludeImplicitInputAndClobberSet) {
 // argGprs ∪ argFprs from any range of the callee vreg covering the
 // call (lir_regalloc.cpp's indirect-callee consumer).
 //
-// THE PIN MUST BE PRESSURED (the D-LIR-REGALLOC-PRESSURED-IMPLICIT-
-// CLOBBER-PIN lesson): unpressured, the linear scan picks a non-arg
+// THE PIN MUST BE PRESSURED (the D-LIR-REGALLOC-PRESSURED-IMPLICIT-CLOBBER-PIN
+// lesson): unpressured, the linear scan picks a non-arg
 // caller-saved register (r11/r10 first on SysV's LIFO) and the pin
 // passes even with the exclusion disabled. The shape below drains the
 // pools at the callee's allocation point:

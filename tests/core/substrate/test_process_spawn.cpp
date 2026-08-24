@@ -29,6 +29,7 @@
 #include "run_binary.hpp"
 
 #include "scratch_dir.hpp"
+#include "test_wait_budget.hpp"  // kWaitBudget — the shared, measured wait cap
 
 #include <gtest/gtest.h>
 
@@ -416,15 +417,27 @@ private:
                                         // every member above it
 };
 
-// 60 s. ⚠ MEASURED on the MSVC-Debug leg (Windows 11, this repo's local gate):
-// the whole flood pin — one `CreateProcessW` of the multi-megabyte gtest binary,
-// 256 KiB written, the wait, and reading the file back — takes 49 ms. So the
-// budget is ~1200x the observed cost and cannot fire on a merely loaded or
-// emulated machine; it is a HANG detector, not a performance assertion.
-// It is also 25x shorter than ctest's default per-test timeout, which is the
-// number it exists to beat: a deadlock then costs one minute and names itself,
-// instead of costing 25 minutes and naming nothing.
-constexpr std::chrono::milliseconds kRedirectDeadline{60000};
+// THE SHARED BUDGET, not a number written here — `dss::test_support::kWaitBudget`
+// (60 s), whose own header carries the derivation. This is precisely the case it
+// was defined for: the wait is for something the code under test SHOULD ALREADY
+// HAVE DONE, so any elapsed time at all is a symptom rather than work.
+//
+// ⚠ WHY 60 s IS THE RIGHT CAP HERE, MEASURED rather than inherited on faith. On
+// the MSVC-Debug leg (Windows 11, this repo's local gate) the whole flood pin —
+// one `CreateProcessW` of the multi-megabyte gtest binary, 256 KiB written, the
+// wait, and reading the file back — takes 49 ms. So the budget is ~1200x the
+// observed cost and cannot fire on a merely loaded or emulated machine; it is a
+// HANG detector, not a performance assertion. It is also 25x shorter than ctest's
+// default per-test timeout, which is the number it exists to beat: a deadlock then
+// costs one minute and names itself, instead of costing 25 minutes and naming
+// nothing. Both properties survive the move to the shared cap because the shared
+// cap is the same 60 s — what changed is that it is now ONE decision.
+//
+// ⛔ Do NOT reinstate a local constant here to "make it explicit". A name beside
+// the site is not a measurement (see
+// [[D-TEST-WALL-CLOCK-ROW-REMEDY-SANCTIONS-A-SHAPE-ITS-OWN-GUARD-COUNTS]]); it is
+// the same unmeasured number with a label, and `check-wall-clock-in-tests` counts
+// it as the literal it is.
 
 // Compare two large blobs WITHOUT dumping them. `EXPECT_EQ` on a 256 KiB string
 // prints both operands in full, burying the only fact that matters — where they
@@ -1685,8 +1698,8 @@ TEST(SpawnAndWaitInherit, ArgumentsReachTheChildByteIdenticallyWithNoShell) {
 // ★ THE DEADLINE IS NOT DECORATION. This pin's failure mode is not a wrong
 // value, it is no value at all: a capture with a bounded buffer and no
 // concurrent drain wedges permanently once the child outruns it (measured, on
-// only ~7 KB, as `run_binary.hpp`'s D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-
-// DEADLOCKS). Without `CallDeadline` the observable result of that regression
+// only ~7 KB, as `run_binary.hpp`'s D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS).
+// Without `CallDeadline` the observable result of that regression
 // is a CI job hanging until an outer timeout kills the suite — no test name and
 // no red. With it, the hang becomes a named non-zero exit in 60 s.
 //
@@ -1709,7 +1722,7 @@ TEST(SpawnAndWaitRedirectStdout, ALargeStdoutIsCapturedByteForByteAndReturns) {
     RedirectRun run;
     {
         CallDeadline const deadline{
-            kRedirectDeadline,
+            dss::test_support::kWaitBudget,
             "spawnAndWaitRedirectStdout with a child writing "
                 + std::to_string(kFloodBytes) + " bytes to stdout"};
         run = runFixtureRedirected(

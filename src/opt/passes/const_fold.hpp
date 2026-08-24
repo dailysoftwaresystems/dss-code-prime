@@ -28,8 +28,8 @@
 // Downstream passes (DCE etc.) MUST NOT delete the instruction based
 // on the nullopt signal.
 //
-// **Runtime-init globals carve-out** (D-OPT2-CONST-FOLD-RUNTIME-INIT-
-// GLOBALS): if any module global has `initFunc.valid()`, the pass
+// **Runtime-init globals carve-out** (D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS):
+// if any module global has `initFunc.valid()`, the pass
 // returns `ok=true, instructionsFolded=0` without rebuilding. The
 // caller keeps the unoptimized MIR; const-fold simply doesn't pay
 // for this module yet. (Full closure: thread a func-id remap through

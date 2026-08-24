@@ -298,8 +298,8 @@ private:
     // INSTRUCTION ENGINE USES. `.quad Lcase0` and `movq $8,%rax` must agree
     // about what a scalar is, what a negated literal is and which tokens spell
     // a dotted name — and two decoders is exactly how they stop agreeing (the
-    // measured `D-ASM-NEGATIVE-SCALAR-LOSES-ITS-SIGN` / `D-ASM-DOTTED-NAME-NOT-
-    // AN-OPERAND` pair are both "one reading, applied in one place only").
+    // measured `D-ASM-NEGATIVE-SCALAR-LOSES-ITS-SIGN` / `D-ASM-DOTTED-NAME-NOT-AN-OPERAND`
+    // pair are both "one reading, applied in one place only").
     [[nodiscard]] std::optional<AsmDecodedOperand> decodeOperand(NodeId node) {
         AsmDecodedOperand out;
         if (!engine_.decodeOperandInto(node, out)) return std::nullopt;
@@ -495,8 +495,9 @@ private:
                              spelling, sink_.pairSuffix()));
             return;
         }
-        // ★★ A SECTION NAME IS NOT A DIRECTIVE (D-ASM-SECTION-DIRECTIVE-WITH-
-        // OPERAND-UNMODELLED). The row exists so `.section rodata` can resolve;
+        // ★★ A SECTION NAME IS NOT A DIRECTIVE
+        // (D-ASM-SECTION-DIRECTIVE-WITH-OPERAND-UNMODELLED).
+        // The row exists so `.section rodata` can resolve;
         // writing it bare is what gas itself refuses, and the refusal names the
         // form that works rather than saying "unknown directive" about a
         // spelling the dialect visibly declares.
@@ -822,8 +823,8 @@ private:
             if (!decoded) return;
             if (!decoded->hasValue) {
                 // ★★★ A SYMBOL-VALUED DATA SLOT IS A RELOCATION, AND THE
-                // RELOCATION IS ALL IT IS (D-ASM-INTERIOR-LABELS-NOT-
-                // ADDRESSABLE-AT-AN-OFFSET). `.quad Lcase0` writes
+                // RELOCATION IS ALL IT IS
+                // (D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET). `.quad Lcase0` writes
                 // `unitBytes` ZERO bytes now and asks the linker to write the
                 // address later — byte-for-byte the shape a C
                 // symbol-address global (`int* p = &x;`) already emits

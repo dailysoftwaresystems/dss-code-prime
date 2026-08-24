@@ -52,8 +52,45 @@ and this tool reported `FAIL … 1 of 2 objects` and exited 1 while the healthy
 sibling passed. The parser self-tests (`--self-test`) pin the verdict rule; that
 experiment pins the wiring.
 
+★★★ AND THE THIRD CLAUSE WAS FALSE IN THE CODE FOR AS LONG AS IT HAS BEEN
+WRITTEN HERE — D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST.
+✔MEASURED 2026-08-23 at 6dc63be0, from the repo root:
+
+    $ python scripts/check-ninja-deps/check-ninja-deps.py build-dbg
+    ninja-deps: SKIP build-dbg -- no build.ninja (not a ninja build dir)
+    rc=0
+    $ ls -d build-dbg
+    ls: cannot access 'build-dbg': No such file or directory
+
+`build-dbg` has not existed since the one-root `build/` migration, and the gate
+reference instructed every cycle to run exactly that command. ⇒ **the
+build-verifiability check has been running against a nonexistent directory and
+returning 0, which every caller read as a pass.** A MISSING DIRECTORY IS
+"NOTHING RAN", and this file's own contract already forbids that outcome.
+⚠ THE OTHER TWO DOCUMENTED CLAIMS WERE BOTH HALF-RIGHT, AND SAYING WHICH HALF
+MATTERS BECAUSE A FIX AIMED AT THE WRONG ONE IS WORSE THAN NONE:
+`references/build-layout.md` and `default_build_dir`'s own docstring say the
+auto-pick "returns the NEW path when neither exists, so it fails loud on a
+missing tree". ✔The RETURN half is true and was always true; the FAIL-LOUD half
+described `check()`, which skipped. One code path, one fix, and it is in
+`target_verdict` below.
+
+★★ IS A BARE `SKIP` EVER LEGITIMATE? THE JUDGEMENT, RATHER THAN A DELETION.
+  * A directory that DOES NOT EXIST: never. The caller named a tree it wanted
+    verified and there is nothing there — that is the "nothing ran" case, and no
+    flag opts out of it.
+  * A directory that EXISTS but carries no `build.ninja`: legitimately possible —
+    this project's CMake also configures under non-ninja generators, where
+    `ninja -t deps` has nothing to say. So the CONCEPT is kept, but it must be
+    ASKED FOR: `--allow-non-ninja` turns that one case into a reported SKIP.
+    Without it, it is FATAL, because an unasked-for skip is indistinguishable
+    from a pass.
+⇒ the illegitimate case (a stale path silently returning 0) is now unreachable,
+and the legitimate one is visible in the command line that requested it.
+
 Usage:
     python scripts/check-ninja-deps/check-ninja-deps.py [build-dir ...]     # default: build/dbg, else build-dbg
+    python scripts/check-ninja-deps/check-ninja-deps.py --allow-non-ninja <dir>
     python scripts/check-ninja-deps/check-ninja-deps.py --self-test
 
 The default is TRANSITION-SAFE by design. The repo is moving to a single build
@@ -65,13 +102,37 @@ it. It therefore prefers `build/dbg` and falls back to `build-dbg`, so there is
 no flag day. ⚠ A missing default is FATAL, never a skip: "the tree I was told to
 check is not there" must not read as "nothing to check".
 
-Exit: 0 clean · 1 dep-less objects found · 2 the instrument could not run.
+Exit: 0 clean · 1 dep-less objects found · 2 the instrument could not run
+(including: the named directory does not exist, or is not a ninja build dir and
+`--allow-non-ninja` was not passed).
 """
 
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+# ── OUTPUT ENCODING — NOT COSMETIC, AND THE STREAM IS HALF THE FACT ─────────────
+# ✔MEASURED 2026-08-23 (CPython 3.14.3, Windows, BOTH streams PIPES, which is
+# exactly how ctest runs every guard): `sys.stdout` comes up
+# `encoding='cp1252' errors='surrogateescape'` and `sys.stderr` comes up
+# `errors='backslashreplace'`. `surrogateescape` rescues only lone surrogates left
+# by an earlier decode; it does NOTHING for an ordinary unencodable character. So a
+# report printed on STDOUT — where this guard names every object that carries no
+# header dependencies, as paths parsed out of ninja's own output —
+# raises `UnicodeEncodeError` and kills the guard INSIDE ITS OWN REPORT: the run
+# still reds, but the finding is lost and the traceback names a `print` rather than
+# the thing that was wrong. STDERR merely mangles the glyph into an escape.
+# ⚠ The paths come from a BUILD tree, which is not under this repository's naming
+# discipline at all — a dependency path can carry anything the toolchain emits.
+# Applied at IMPORT, so every path this module can print on is covered.
+# D-GATE-PYTHON-GUARD-DIES-PRINTING-TREE-TEXT-ON-A-WINDOWS-PIPE
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):   # pragma: no cover - odd stream
+        pass
+
 
 # ── the explicit allowlist ───────────────────────────────────────────────────
 # object-path SUFFIX -> why a zero-dep record is legitimate for it.
@@ -108,12 +169,46 @@ def allowed(obj):
     return any(obj.endswith(suffix) for suffix in ALLOWLIST)
 
 
-def check(build_dir):
+def target_verdict(build_dir, allow_non_ninja):
+    """-> ("run"|"skip"|"fatal", message) for one named build directory.
+
+    ★ A PURE FUNCTION, SPLIT OUT SO THE SELF-TEST DRIVES THE SAME DECISION THE
+    REAL PATH DRIVES. The three outcomes are deliberately NOT collapsed: they are
+    the difference between "verified", "you asked me not to look" and "I could
+    not look", and returning 0 for the last of those is the defect this split
+    closes (D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST).
+    """
+    d = Path(build_dir)
+    if not d.is_dir():
+        return ("fatal",
+                f"ninja-deps: FATAL -- {build_dir} does not exist; the check did NOT "
+                f"run. A missing tree is 'nothing ran', never 'nothing to check'. "
+                f"(If the path is a pre-migration flat one, the tree is now "
+                f"build/<name> -- see D-BUILD-LAYOUT-FLAT-ROOT-BUILD-DIRS-NOT-MIGRATED.)")
+    if not (d / "build.ninja").is_file():
+        if allow_non_ninja:
+            return ("skip",
+                    f"ninja-deps: SKIP {build_dir} -- no build.ninja, and "
+                    f"--allow-non-ninja was passed. NOTHING WAS VERIFIED here.")
+        return ("fatal",
+                f"ninja-deps: FATAL -- {build_dir} exists but has no build.ninja, so "
+                f"`ninja -t deps` has nothing to read and the check did NOT run. If "
+                f"this tree is deliberately built by a non-ninja generator, say so "
+                f"with --allow-non-ninja; an unasked-for skip is indistinguishable "
+                f"from a pass.")
+    return ("run", "")
+
+
+def check(build_dir, allow_non_ninja=False):
     """Returns an exit code for one build directory."""
     d = Path(build_dir)
-    if not (d / "build.ninja").is_file():
-        print(f"ninja-deps: SKIP {build_dir} -- no build.ninja (not a ninja build dir)")
+    verdict, message = target_verdict(build_dir, allow_non_ninja)
+    if verdict == "skip":
+        print(message)
         return 0
+    if verdict == "fatal":
+        print(message)
+        return 2
     try:
         r = subprocess.run(["ninja", "-C", str(d), "-t", "deps"],
                            capture_output=True, text=True, timeout=600)
@@ -191,12 +286,65 @@ def self_test():
     case("empty input parses as zero objects, which the caller treats as FATAL",
          "", 0, [])
 
+    # ── the TARGET-RESOLUTION verdict, which had no pin at all until 2026-08-23
+    # and was WRONG in the one direction that matters
+    # (D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST).
+    # ★ Driven through `check()` as well as `target_verdict`, because the defect
+    # was not in the decision — there was no decision — it was in the EXIT CODE
+    # `check()` returned for it. Both arms assert the MESSAGE: "fatal" has two
+    # distinct causes that share exit 2, and an arm that reads only the code
+    # cannot tell which one it proved.
+    import tempfile as _tempfile
+    _tmp = _tempfile.mkdtemp(prefix="ninja-deps-selftest-")
+    try:
+        missing = str(Path(_tmp) / "no-such-tree")
+        empty = str(Path(_tmp) / "not-a-ninja-tree")
+        Path(empty).mkdir()
+        ninja = str(Path(_tmp) / "looks-like-ninja")
+        Path(ninja).mkdir()
+        (Path(ninja) / "build.ninja").write_text("# marker\n", encoding="utf-8")
+
+        def verdict_case(name, path, allow, want_kind, want_rc, says):
+            kind, msg = target_verdict(path, allow)
+            if kind != want_kind or says not in msg:
+                fails.append(f"{name}: got ({kind!r}, {msg!r}), want {want_kind!r} "
+                             f"saying {says!r}")
+            if kind != "run":
+                # ⚠ `check()`'s own print is CAPTURED here. A self-test that emits
+                # the word FATAL five times on its way to OK teaches the reader to
+                # skim past FATAL, which is the opposite of what this battery wants.
+                import contextlib as _ctx
+                import io as _io
+                _buf = _io.StringIO()
+                with _ctx.redirect_stdout(_buf):
+                    rc = check(path, allow)
+                if rc != want_rc:
+                    fails.append(f"{name}: check() returned {rc}, want {want_rc}")
+                if says not in _buf.getvalue():
+                    fails.append(f"{name}: check() printed {_buf.getvalue()!r}, "
+                                 f"which does not say {says!r}")
+
+        verdict_case("a MISSING directory is FATAL, never a skip", missing, False,
+                     "fatal", 2, "does not exist")
+        verdict_case("--allow-non-ninja does NOT excuse a missing directory",
+                     missing, True, "fatal", 2, "does not exist")
+        verdict_case("a directory with no build.ninja is FATAL by default",
+                     empty, False, "fatal", 2, "no build.ninja")
+        verdict_case("... and a reported SKIP only when it was ASKED for",
+                     empty, True, "skip", 0, "--allow-non-ninja was passed")
+        verdict_case("a real ninja tree is RUN", ninja, False, "run", 0, "")
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(_tmp, ignore_errors=True)
+        if Path(_tmp).exists():
+            fails.append("self-test temp tree was not removed")
+
     if fails:
         print("ninja-deps self-test: FAIL")
         for f in fails:
             print("   ", f)
         return 1
-    print(f"ninja-deps self-test: OK (7 cases)")
+    print(f"ninja-deps self-test: OK (7 parser cases, 5 target-verdict cases)")
     return 0
 
 
@@ -210,6 +358,11 @@ def default_build_dir():
     it. ⚠ If NEITHER exists, return the NEW path: `check()` then fails loud on a
     missing directory, which is the correct outcome. Returning the legacy path
     would send the reader hunting for a tree that was deliberately removed.
+    ★ THAT LAST SENTENCE WAS A CLAIM ABOUT `check()` THAT `check()` DID NOT HONOUR
+    until 2026-08-23: it printed SKIP and returned 0 for a missing directory, so
+    the auto-pick landed on the right path and the tool then said nothing about
+    it. `target_verdict` is where the claim became true
+    (D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST).
     """
     return "build/dbg" if Path("build/dbg").is_dir() else (
         "build-dbg" if Path("build-dbg").is_dir() else "build/dbg")
@@ -218,10 +371,18 @@ def default_build_dir():
 def main(argv):
     if "--self-test" in argv:
         return self_test()
+    unknown = [a for a in argv
+               if a.startswith("-") and a not in ("--self-test", "--allow-non-ninja")]
+    if unknown:
+        print("ninja-deps: FATAL -- unknown argument(s): %s. Refusing to run rather "
+              "than silently ignoring a flag the caller believed in."
+              % " ".join(unknown))
+        return 2
+    allow_non_ninja = "--allow-non-ninja" in argv
     dirs = [a for a in argv if not a.startswith("-")] or [default_build_dir()]
     worst = 0
     for d in dirs:
-        worst = max(worst, check(d))
+        worst = max(worst, check(d, allow_non_ninja))
     return worst
 
 

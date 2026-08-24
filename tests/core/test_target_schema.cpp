@@ -1645,7 +1645,7 @@ TEST(TargetSchema, LinkRegisterMustBeString) {
 
 TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // 16 GPRs + 16 FPRs + rflags + the 16 32-bit GPR views (eax..r15d)
-    // + the 16 8-bit views (al..r15b) = 65.
+    // + the 16 16-bit views (ax..r15w) + the 16 8-bit views (al..r15b) = 81.
     // EXPECT_EQ (not EXPECT_GE) so a future accidental duplicate / addition
     // trips the test rather than silently passing.
     //
@@ -1659,7 +1659,7 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // grew one, all trip it now and none of them tripped the total.
     auto r = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ((*r)->registerCount(), 65u);
+    EXPECT_EQ((*r)->registerCount(), 81u);
 
     // ★★ THE COMPOSITION IS KEYED ON (class, sub-ness, WIDTH), NOT JUST
     // (class, sub-ness) — extended when the 8-bit views landed
@@ -1671,7 +1671,18 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // view that forgot its `subOf`, a 32-bit view that grew a byte width, and a
     // duplicated file at either width each trip a DIFFERENT expectation than
     // the bare total does.
-    std::size_t fullGpr = 0, subGpr32 = 0, subGpr8 = 0, subGprOther = 0;
+    // ★★★ THE 16-BIT BUCKET IS A NEW EXPECTATION, NOT A RE-CUT TOTAL
+    // (D-ASM-SUB-NATIVE-OPERAND-UNUSABLE-IN-INLINE-ASM, 2026-08-23). The
+    // `subGprOther == 0` line below used to carry the sentence *"no 16-bit
+    // (ax..r15w) file is declared — no consumer writes one yet"*; that trigger
+    // fired when the AT&T dialect grew `movw`, so the word views landed under
+    // the same first-consumer rule the other two blocks did. ⚠ THE PIN IS
+    // STRENGTHENED RATHER THAN RELAXED: `subGprOther` stays and still expects
+    // ZERO, so it now means "no sub-register of a width this file does not
+    // enumerate", which is a claim the old form could not make about a 2-byte
+    // row. A total re-cut to 81 alone would have said strictly less.
+    std::size_t fullGpr = 0, subGpr32 = 0, subGpr16 = 0, subGpr8 = 0;
+    std::size_t subGprOther = 0;
     std::size_t fpr = 0, flags = 0, other = 0;
     for (auto const& info : (*r)->registers()) {
         bool const sub = !info.subOf.empty();
@@ -1679,6 +1690,7 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
             case TargetRegClass::GPR:
                 if (!sub) { ++fullGpr; break; }
                 if (info.widthBytes == 4)      ++subGpr32;
+                else if (info.widthBytes == 2) ++subGpr16;
                 else if (info.widthBytes == 1) ++subGpr8;
                 else                           ++subGprOther;
                 break;
@@ -1690,12 +1702,16 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     EXPECT_EQ(fullGpr,  16u) << "rax..r15";
     EXPECT_EQ(subGpr32, 16u) << "eax..r15d — the 32-bit views, `subOf` their "
                                 "64-bit parent";
+    EXPECT_EQ(subGpr16, 16u) << "ax..r15w — the 16-bit views; without them a "
+                                "hand-written `movw %ax, %cx` (which gas "
+                                "accepts) cannot name a register";
     EXPECT_EQ(subGpr8,  16u) << "al..r15b — the 8-bit views; without them "
                                 "gas's `sete %al` is unspellable and the only "
                                 "form DSS could spell (`sete %rax`) is one gas "
                                 "rejects";
-    EXPECT_EQ(subGprOther, 0u) << "no 16-bit (ax..r15w) file is declared — no "
-                                  "consumer writes one yet";
+    EXPECT_EQ(subGprOther, 0u) << "every declared sub-register is 4, 2 or 1 "
+                                  "bytes wide — a row at any other width is "
+                                  "one this composition does not describe";
     EXPECT_EQ(fpr,      16u) << "xmm0..xmm15";
     EXPECT_EQ(flags,     1u) << "rflags";
     EXPECT_EQ(other,     0u);
@@ -3158,6 +3174,26 @@ std::set<std::string> registersInClass(TargetSchema const& s,
     return out;
 }
 
+// The FULL-WIDTH members of `cls` — the register FILE, with the narrow VIEWS
+// (`subOf` rows: `eax`, `ax`, `al`, `w0`) left out.
+// ★★★ THIS EXISTS BECAUSE A VIEW SPELLING CAN LEGITIMATELY COINCIDE ACROSS
+// TARGETS AND A FILE MEMBER CANNOT — see
+// D-ASM-SUB-NATIVE-OPERAND-UNUSABLE-IN-INLINE-ASM
+// (2026-08-23). x86_64's 16-bit views landed with `movw`, and gas spells the
+// word view of `rsp` as `%sp` — which is ALSO the name of AArch64's full 8-byte
+// stack pointer. One spelling, two targets, two different things: exactly the
+// per-target resolution the constraint-letter test is about, so the disjointness
+// claim below is made about the FILES and the coincidence is asserted
+// separately rather than papered over by dropping the claim.
+std::set<std::string> registerFileOfClass(TargetSchema const& s,
+                                          TargetRegClass cls) {
+    std::set<std::string> out;
+    for (auto const& r : s.registers()) {
+        if (r.regClass == cls && r.subOf.empty()) out.insert(r.name);
+    }
+    return out;
+}
+
 }  // namespace
 
 TEST(TargetSchema, AsmConstraintsAbsentIsEmptyNotAnError) {
@@ -3541,12 +3577,41 @@ TEST(TargetSchema, SameAsmConstraintLetterResolvesDifferentlyPerTarget) {
     EXPECT_TRUE(aRegs.contains("x0"));
     EXPECT_FALSE(aRegs.contains("rax"));
 
+    // ★★★ THE DISJOINTNESS CLAIM IS ABOUT THE REGISTER **FILES**, AND IT WAS
+    // NARROWED FROM "every name in the class" ON 2026-08-23 BECAUSE THE OLD
+    // FORM BECAME FALSE FOR A REASON THAT IS ITSELF EVIDENCE FOR THIS TEST.
+    // x86_64's 16-bit views landed with the AT&T `movw` spelling, and gas names
+    // the word view of `rsp` `%sp` — which is also AArch64's full 8-byte stack
+    // pointer. ✔MEASURED, the intersection of the two GPR classes is EXACTLY
+    // {"sp"}: one spelling, two targets, a 2-byte VIEW of `rsp` on one and an
+    // 8-byte FILE MEMBER on the other. Widening the claim to tolerate any
+    // overlap would have been the guard-weakened-by-its-own-subject shape; the
+    // claim instead moves to the files, where an overlap really would mean one
+    // target is describing the other's registers, and the coincidence is
+    // asserted BELOW as the sharper fact it is.
+    auto const xFile = registerFileOfClass(**x86, *rx->registerClass);
+    auto const aFile = registerFileOfClass(**arm, *ra->registerClass);
     std::vector<std::string> shared;
-    std::ranges::set_intersection(xRegs, aRegs, std::back_inserter(shared));
+    std::ranges::set_intersection(xFile, aFile, std::back_inserter(shared));
     EXPECT_TRUE(shared.empty())
-        << "letter 'r' must resolve to two disjoint register sets; "
+        << "letter 'r' must resolve to two disjoint register FILES; "
            << shared.size() << " name(s) appear in both, which would mean "
               "one of the targets is describing the other's register file";
+
+    // ★★ THE COINCIDING SPELLING, PINNED RATHER THAN EXCUSED. `sp` denotes a
+    // 2-byte view of `rsp` under x86_64 and the 8-byte stack pointer under
+    // arm64. If a lookup ever folded register names across targets, THIS is the
+    // name it would get wrong, and it would do so silently.
+    auto const* xSp = (*x86)->registerInfo(
+        (*x86)->registerByName("sp").value_or(0));
+    auto const* aSp = (*arm)->registerInfo(
+        (*arm)->registerByName("sp").value_or(0));
+    ASSERT_NE(xSp, nullptr);
+    ASSERT_NE(aSp, nullptr);
+    EXPECT_EQ(xSp->widthBytes, 2u) << "x86_64 `sp` is the WORD view of rsp";
+    EXPECT_EQ(xSp->subOf, "rsp");
+    EXPECT_EQ(aSp->widthBytes, 8u) << "arm64 `sp` is a full-width register";
+    EXPECT_TRUE(aSp->subOf.empty());
 
     // ── half two: `a` is declared by ONE of them, and the other REFUSES ──
     // ✔MEASURED: aarch64-linux-gnu-gcc rejects `"=a"` with `error:
@@ -4039,4 +4104,127 @@ TEST(TargetSchemaContentDigest, ConstructionBypassingLoadFromTextLeavesItEmpty) 
     EXPECT_TRUE(schema.contentDigest().empty())
         << "a schema with no document bytes reported a digest: "
         << schema.contentDigest();
+}
+
+// ══ THE THREE NEW GUARD/VARIANT COHERENCE RULES (cycle P29) ════════════════
+//
+// D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE added the
+// memory-DIRECTION axis (`guard.memoryDestination`) and
+// D-TARGET-PRODUCER-VARIANT-WITHOUT-A-RESULT-SLOT-ENCODES-REGISTER-ZERO added
+// the missing mirror of an already-enforced rule. Both are LOAD-TIME refusals
+// whose absence is silent, so each gets a pin that mutates the SHIPPED document
+// and asserts the refusal.
+
+namespace {
+
+// One opcode's variant array in a parsed target document, or nullptr.
+[[nodiscard]] nlohmann::json*
+variantsOfOpcode(nlohmann::json& doc, std::string_view mnemonic) {
+    for (auto& op : doc.at("opcodes")) {
+        if (op.value("mnemonic", std::string{}) == mnemonic) {
+            return &op.at("encoding").at("variants");
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
+TEST(TargetSchema, MemoryDirectionAxisNeedsAMemoryOperandToRouteOn) {
+    // The coherence rule, in the same family as `negValue` and immMin/immMax: a
+    // guard with no `membase` names no memory reference, so an axis about that
+    // reference's ROLE would key on a fact the instruction cannot have — and
+    // the variant would silently match nothing for one of the axis's two
+    // values.
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            auto* vs = variantsOfOpcode(doc, "cmp");
+            ASSERT_NE(vs, nullptr) << "x86_64 declares no `cmp`";
+            for (auto& v : *vs) {
+                auto& g = v.at("guard");
+                if (g.at("operandKinds")
+                    != nlohmann::json::array({"reg", "reg"})) continue;
+                if (g.value("width", 0) != 64) continue;
+                g["memoryDestination"] = true;
+            }
+        });
+    EXPECT_FALSE(mutated.has_value())
+        << "`memoryDestination` on a guard with no `membase` operand must be a "
+           "load-time refusal";
+}
+
+TEST(TargetSchema, OppositeMemoryDirectionsAreNotShadowingSiblings) {
+    // ★ THE POSITIVE HALF, and it is what makes the pin above meaningful: the
+    // SHIPPED document declares two `cmp` variants with identical
+    // `operandKinds`, identical `width` and identical immediate domain,
+    // separated ONLY by `memoryDestination` — and it loads. If the shadowing
+    // check did not treat the axis as a disambiguator, the shipped target
+    // itself would be refused.
+    auto shipped = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(shipped.has_value());
+    auto const ordinal = (*shipped)->opcodeByMnemonic("cmp");
+    ASSERT_TRUE(ordinal.has_value());
+    auto const* info = (*shipped)->opcodeInfo(*ordinal);
+    ASSERT_NE(info, nullptr);
+    std::size_t trues = 0;
+    std::size_t falses = 0;
+    for (auto const& v : info->encoding.variants) {
+        if (!v.memoryDestination.has_value()) continue;
+        (*v.memoryDestination ? trues : falses) += 1;
+    }
+    EXPECT_GT(trues, 0u) << "no memory-destination `cmp` variant is declared";
+    EXPECT_EQ(trues, falses)
+        << "the direction axis is declared in PAIRS by construction — a lone "
+           "half leaves the opposite spelling matching nothing, which is a "
+           "loud refusal but almost never what the author meant";
+}
+
+TEST(TargetSchema, ProducingX86VariantWithoutAResultSlotIsRefused) {
+    // ★★★ THE MIRROR OF A RULE THAT HAS BEEN ENFORCED SINCE THE SCHEMA EXISTED
+    // (`result: none` + a `resultSlot` is rejected), and the mirror is the
+    // DANGEROUS half. ✔MEASURED 2026-08-23 on a variant authored in this cycle:
+    // without the rule the document LOADED CLEAN and the walker emitted
+    // register field 0 for the result, so `movw $42, %cx`, `%dx` and `%r15w`
+    // all produced the SAME bytes — `%ax` — with rc=0 and no diagnostic. The
+    // enforced direction fails loud at encode time; this one shipped a wrong
+    // register (D-TARGET-PRODUCER-VARIANT-WITHOUT-A-RESULT-SLOT-ENCODES-REGISTER-ZERO).
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            auto* vs = variantsOfOpcode(doc, "zext32");
+            ASSERT_NE(vs, nullptr) << "x86_64 declares no `zext32`";
+            for (auto& v : *vs) v.erase("resultSlot");
+        });
+    EXPECT_FALSE(mutated.has_value())
+        << "a value-producing x86-variable variant with no `resultSlot` must be "
+           "a load-time refusal — it encodes register 0 otherwise";
+}
+
+TEST(TargetSchema, TheResultSlotRuleExemptsTheShapesThatLegitimatelyHaveNone) {
+    // ⚠ THE EXEMPTIONS ARE PINNED, NOT ASSUMED, because a rule that false-fires
+    // gets weakened rather than fixed. Both shipped targets LOAD, and each
+    // carries at least one producing variant with no resultSlot that the rule
+    // must NOT reject: x86_64's `call` (a call's result is the ABI return
+    // register, never an encoded field) and arm64's 3-word `sub sp, sp, #imm`
+    // (a fixed32 template with the destination BAKED into its fixed word).
+    for (auto const* name : {"x86_64", "arm64"}) {
+        auto shipped = TargetSchema::loadShipped(name);
+        EXPECT_TRUE(shipped.has_value())
+            << name << " must still load with the result-slot rule in force";
+    }
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value());
+    auto const callOrd = (*x86)->opcodeByMnemonic("call");
+    ASSERT_TRUE(callOrd.has_value());
+    auto const* call = (*x86)->opcodeInfo(*callOrd);
+    ASSERT_NE(call, nullptr);
+    EXPECT_TRUE(call->isCall)
+        << "the exemption is keyed on `isCall`; if `call` stopped declaring it "
+           "the shipped target would stop loading";
+    bool anyWithoutSlot = false;
+    for (auto const& v : call->encoding.variants) {
+        anyWithoutSlot = anyWithoutSlot || !v.resultSlot.has_value();
+    }
+    EXPECT_TRUE(anyWithoutSlot)
+        << "`call` no longer exercises the exemption — re-aim this pin at "
+           "whatever shape does, or the rule's exemption is untested";
 }

@@ -31,8 +31,8 @@ typed rows and must not see JSON; move the JSON work to its *_json.cpp sibling \
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────
-// ★★★ COMPILE-ERROR PIN — D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-
-// BRANCHES (TF-C125). DO NOT DELETE TO "FIX A BUILD ERROR".
+// ★★★ COMPILE-ERROR PIN — D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES
+// (TF-C125). DO NOT DELETE TO "FIX A BUILD ERROR".
 // ─────────────────────────────────────────────────────────────────────────
 //
 // If your build just failed with `'ObjectFormatKind': ambiguous symbol`

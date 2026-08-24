@@ -13,6 +13,32 @@ underneath it is not consent.
 
 Nobody did anything wrong; the shared tree was the wrong venue. So:
 
+### ★★ H.0a — AND IT GOES AT A **SHORT** ABSOLUTE PATH, NEVER UNDER THE SESSION SCRATCH DIRECTORY
+
+✔MEASURED 2026-08-23 (cycle P29, `D-CYCLE-WORKTREE-UNDER-THE-SESSION-SCRATCH-PATH-CANNOT-BE-BUILT-ON-WINDOWS`).
+Two cycle rules — *mutate in a worktree* and *every temporary file lives under the session scratch
+directory* — compose into a path that **cannot be built on Windows**:
+`…/AppData/Local/Temp/claude/C--Source-DailySoftware-dss-code-prime/<uuid>/scratchpad/<cycle>/lane-<x>/wt`
+is **~150 characters before any build path is appended**, and the generated `.obj.d` paths then
+exceed MAX_PATH.
+
+⚠⚠ **THE FAILURE MODE IS THE DANGEROUS PART.** It is not a link error at the end — it is a **per-TU
+compile error in files the lane never touched** (`fatal error: opening dependency file
+tests\core\CMakeFiles\…\<name>.cpp.obj.d: No such file or directory`, repeated across `tests/core`),
+so it reads as **somebody else's breakage** and sends the lane to investigate an unrelated subsystem.
+✔The control that settles it: the same commit, same patch, same generator, re-created at
+`C:/dss-<cycle><lane>-rod` builds clean.
+
+⇒ **A red-on-disable worktree goes at a SHORT absolute root** — `C:/dss-<cycle><lane>-rod` is the
+convention — **never under the session scratch directory**, and is removed with `git worktree remove`
+when the lane finishes. The scratch-directory rule governs a lane's *files*; it was never meant to
+govern a *build root*, and on this host the two cannot both be satisfied.
+
+⚠ **And read a build's exit code from the PROCESS, not from the tail of a pipeline.** The same run
+reported `EXIT=0` over that failure because `$LASTEXITCODE` after a PowerShell pipeline is the LAST
+command's — `Select-String`'s — not `cmake`'s. An instrument that reports success over a failed build
+is the same class as a red-on-disable whose mutant never compiled in.
+
 - **Any experiment whose whole point is that bytes change** — byte-neutrality probes, red-on-disable
   mutants, "what does the corpus look like if…" — runs in a `git worktree`, never in the shared tree.
   The lane hands back a `git apply --check`-verified **patch**; the main loop decides whether it lands.

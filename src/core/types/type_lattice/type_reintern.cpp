@@ -163,8 +163,9 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
     // an operand TypeId always refers to an ALREADY-interned (lower) id; there are
     // no forward / mutable operand edges among them, hence no cycles. (Composites —
     // the only types that CAN cycle — are handled above with memo-before-recursion.)
-    // The GuardedSpan results decay to raw spans here (D-TYPEINTERNER-OPERAND-
-    // SPAN-LIFETIME-GUARD): SAFE — `src` is `const` and every intern below targets
+    // The GuardedSpan results decay to raw spans here
+    // (D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD):
+    // SAFE — `src` is `const` and every intern below targets
     // `dst`, a DISTINCT interner, so `src`'s pools are never mutated while these
     // views are live (the dangling hazard the guard exists for cannot arise).
     std::span<TypeId const>       srcOps    = src.operands(srcId);

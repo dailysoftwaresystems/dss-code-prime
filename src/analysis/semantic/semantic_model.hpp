@@ -676,8 +676,8 @@ struct DSS_EXPORT ShippedExternSymbol {
     // precise WITHOUT anyone enumerating a core set — the mechanism already in the
     // tree does it, which is also why this needs no update when a recipe is added.
     //
-    // TRUE for every ordinary declared shipped extern (D-FFI-DESCRIPTOR-EAGER-
-    // IMPORT: a `#include`d descriptor's symbol is imported whether or not the TU
+    // TRUE for every ordinary declared shipped extern (D-FFI-DESCRIPTOR-EAGER-IMPORT:
+    // a `#include`d descriptor's symbol is imported whether or not the TU
     // calls it), so every pre-existing row is byte-identical.
     bool eagerImport = true;
     // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the CONFIG-ROOT-RELATIVE path of
@@ -917,8 +917,8 @@ public:
         return shippedExterns_;
     }
 
-    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS) + c156 (D-LK-ELF-SYMBOL-
-    // VERSIONING): the link identity (per-format library map + required ELF
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS) + c156 (D-LK-ELF-SYMBOL-VERSIONING):
+    // the link identity (per-format library map + required ELF
     // version) of a shipped descriptor symbol that GOAL-2 SUPPRESSED because a
     // user declaration claimed the name (shell.c bare-declares `popen` while
     // also `#include <stdio.h>`; the versioned case is `realpath` over `#include

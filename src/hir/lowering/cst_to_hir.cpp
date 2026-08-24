@@ -118,8 +118,8 @@ namespace {
         || k == TypeKind::BitInt;
 }
 
-// Full-width-integer return predicate for D-LK10-ENTRY-MAIN-IMPLICIT-
-// RETURN. Restricted to I32+ / U32+ because the SysV AMD64 + MS x64
+// Full-width-integer return predicate for D-LK10-ENTRY-MAIN-IMPLICIT-RETURN.
+// Restricted to I32+ / U32+ because the SysV AMD64 + MS x64
 // ABIs do NOT zero-extend sub-32-bit integer returns to the full GPR
 // — the trampoline's 64-bit `mov status, returnGprs[0]` would copy
 // indeterminate upper bits to the exit syscall arg → non-deterministic
@@ -481,8 +481,8 @@ struct Lowerer {
         if (child.type == target) return child;
         TypeKind const ck = interner.kind(child.type);
         TypeKind const tk = interner.kind(target);
-        // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-
-        // STRING closure, 2026-06-02): `Array<T,N>` rvalue in a
+        // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-STRING
+        // closure, 2026-06-02): `Array<T,N>` rvalue in a
         // `Ptr<T>` context decays to the address of the first
         // element. Emitted as a `Cast` HIR node (the universal
         // type-conversion marker); HIR→MIR's `mapCast` recognizes
@@ -808,8 +808,8 @@ struct Lowerer {
                 return {cast, target};
             }
         }
-        // C 6.7.2.2 enum ↔ int implicit conversion (D-CSUBSET-ENUM-INT-
-        // CONVERSION): an enum HAS an integer type, so a context that mixes
+        // C 6.7.2.2 enum ↔ int implicit conversion (D-CSUBSET-ENUM-INT-CONVERSION):
+        // an enum HAS an integer type, so a context that mixes
         // an enum value with an int (`int x = BLUE;`, `enum Color c = 1;`,
         // a `c += 1` write-back, an enum arg to an int param) materializes
         // a synthetic Cast so the MIR-tier sees a width-exact int↔int move.
@@ -1631,8 +1631,8 @@ struct Lowerer {
                 if (j + 1 < toks.size()
                     && tree().tokenKind(toks[j]) == strStart
                     && tree().tokenKind(toks[j + 1]) == strBody) {
-                    // C 5.1.1.2 phase 6 adjacent concat (D-CSUBSET-ADJACENT-
-                    // STRING-CONCAT) makes `("a" "b")` grammatically valid here
+                    // C 5.1.1.2 phase 6 adjacent concat (D-CSUBSET-ADJACENT-STRING-CONCAT)
+                    // makes `("a" "b")` grammatically valid here
                     // too, but a CONCATENATED facet key is unreachable in any
                     // real attribute (sqlite uses single-string args only). This
                     // path reads ONE body; rather than SILENTLY DROP a second
@@ -5562,8 +5562,9 @@ struct Lowerer {
             // body. It reuses the FILE-scope externDecl lowering WHOLESALE:
             // `lowerExternDeclInto` mints N ExternFunction/ExternGlobal HIR nodes (one
             // per declarator) AND records each import row. We route EACH node to the
-            // module-decls accumulator (the D-CSUBSET-LOCAL-STATIC / D-CSUBSET-BLOCK-
-            // SCOPE-PROTOTYPE pattern) — NEVER a statement-position push (lowerStmtNode
+            // module-decls accumulator (the D-CSUBSET-LOCAL-STATIC /
+            // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE
+            // pattern) — NEVER a statement-position push (lowerStmtNode
             // has no ExternFunction/ExternGlobal arm → it would fail-loud) — and lower
             // the STATEMENT itself to a no-op (an empty Block, the `Skip` precedent
             // below), since the extern emits no code in the body. Pass-1 bound each
@@ -5604,8 +5605,9 @@ struct Lowerer {
                 // D-CSUBSET-EXTERN-MULTI-DECLARATOR: a block-scope extern lowers to N
                 // ExternGlobal/ExternFunction nodes (one per declarator, or none when
                 // absorbed). They carry no runtime code, so route EACH to the module-
-                // decls accumulator (the D-CSUBSET-LOCAL-STATIC / D-CSUBSET-BLOCK-
-                // SCOPE-PROTOTYPE pattern — a statement-position push would fail loud
+                // decls accumulator (the D-CSUBSET-LOCAL-STATIC /
+                // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE
+                // pattern — a statement-position push would fail loud
                 // in lowerStmtNode, which has no Extern* arm) and lower the STATEMENT
                 // to a no-op empty Block (the Skip precedent).
                 std::vector<HirNodeId> externs;
@@ -9115,8 +9117,8 @@ struct Lowerer {
                 : track(builder.makeVarDecl(type, sym.v, init), d);
             // Carry const-ness from the bound symbol to the Global node so
             // HIR→MIR can route a const-init global to read-only `.rodata` and a
-            // mutable one to writable `.data` (D-LK4-DATA-PRODUCER-MUTABLE-
-            // GLOBAL). Locals are stack slots — mutability is irrelevant there.
+            // mutable one to writable `.data` (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL).
+            // Locals are stack slots — mutability is irrelevant there.
             // TLS C1: thread-storage duration rides the same global-only
             // discipline (a block-scope thread_local WITHOUT static already
             // failed loud in Pass 2 — no automatic can reach here marked).
@@ -9753,8 +9755,8 @@ struct Lowerer {
                                   declarators.empty() ? NodeId{} : declarators[0]);
             // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): a C99 6.7.4p7 inline
             // definition provides no external definition — lower it as a
-            // DECLARATION, plus (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-
-            // EMITTED) a MARKED body the optimizer may inline from and whose
+            // DECLARATION, plus (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED)
+            // a MARKED body the optimizer may inline from and whose
             // emission the optimizer's epilogue unconditionally suppresses.
             if (lowerInlineDefinitionAsDeclaration(node, decl, dc, fnLink,
                                                    discNode, out)) {
@@ -10138,8 +10140,9 @@ struct Lowerer {
         std::vector<NodeId> declarators;
         collectDeclarators(tree(), vis[*decl.declaratorListChild], dc, declarators);
         // The specifier prefix (`externSpecifiers`) is per-DECLARATION — shared by
-        // every declarator — so resolve its linkage ONCE. D-CSUBSET-LINKAGE-UNKNOWN-
-        // SPECIFIER-DIAGNOSTIC: route through the SAME linkageFrom chokepoint as
+        // every declarator — so resolve its linkage ONCE.
+        // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC:
+        // route through the SAME linkageFrom chokepoint as
         // lowerTopLevel/lowerFunctionDecl so specifier validation is by-construction.
         // TF-C73: an AFTER-DECLARATOR attribute is per-DECLARATOR, so it is folded
         // on top of this base inside `recordExtern`, not here.
@@ -10192,8 +10195,8 @@ struct Lowerer {
         //      undefined and rejected LOUD (K_SymbolUndefined). This is the SAME
         //      unbound channel the bare-prototype producer has always used; there is
         //      deliberately NO per-CU availability error here, because a per-CU
-        //      verdict can be wrong (D-FFI-FORMAT-ORACLE-BYPASSED-WITHOUT-RESOLVE-
-        //      LIBRARY, whose named prerequisite is
+        //      verdict can be wrong (D-FFI-FORMAT-ORACLE-BYPASSED-WITHOUT-RESOLVE-LIBRARY,
+        //      whose named prerequisite is
         //      D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD).
         //
         // AGNOSTIC: every input is DATA on a descriptor row, already per-format

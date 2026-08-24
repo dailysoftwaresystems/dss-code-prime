@@ -310,8 +310,8 @@ struct Parser::Impl {
     // SEMANTIC nesting limit, no longer a host-stack-overflow backstop.
     std::size_t expressionDepth = 0;
 
-    // The EXPLICIT expression-descent work-stack (D-PARSE-DEEP-NEST-
-    // RECURSION-MEMORY). Replaces the recursive `parseExpressionAt`
+    // The EXPLICIT expression-descent work-stack (D-PARSE-DEEP-NEST-RECURSION-MEMORY).
+    // Replaces the recursive `parseExpressionAt`
     // re-entries with heap frames so a deeply-nested expression carries
     // FLAT O(1) host-stack cost. `driveExprWorkStack(baseline)` processes
     // frames until the stack returns to `baseline`; each `walkExpression`
@@ -711,8 +711,7 @@ struct Parser::Impl {
     // declarators contribute nothing — a legal outcome).
     // A binder name plus the source span of its declaring name-token. The
     // span flows into the sketch binding so the CU oracle can distinguish a
-    // typedef's own defining occurrence from a use (D-CSUBSET-FN-TYPE-
-    // TYPEDEF-PAREN-NAME).
+    // typedef's own defining occurrence from a use (D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME).
     struct BinderName {
         std::string name;
         bool        isType;
@@ -2294,8 +2293,8 @@ void pumpTrivia(Parser::Impl& I) {
     }
 }
 
-// ── Explicit expression-descent work-stack (D-PARSE-DEEP-NEST-RECURSION-
-//    MEMORY) ────────────────────────────────────────────────────────────
+// ── Explicit expression-descent work-stack (D-PARSE-DEEP-NEST-RECURSION-MEMORY)
+//    ────────────────────────────────────────────────────────────
 //
 // The former recursive `parseExpressionAt` is now a FLAT driver over the
 // `I.exprWorkStack` member: each former re-entry is a `pushExprFrame`

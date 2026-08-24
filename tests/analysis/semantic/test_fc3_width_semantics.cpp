@@ -421,8 +421,9 @@ TEST(Fc3WidthSemantics, FloatSuffixedLiteralTypesF32) {
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "F32 widens implicitly into a double param";
     // (Formerly: `take(1.5)` into a float param was expected to MISMATCH, using the
-    // narrowing rejection as a proxy that unsuffixed 1.5 is F64. D-CSUBSET-FLOAT-FROM-
-    // DOUBLE-NARROWING now ADMITS double->float narrowing, so that proxy is obsolete —
+    // narrowing rejection as a proxy that unsuffixed 1.5 is F64.
+    // D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING
+    // now ADMITS double->float narrowing, so that proxy is obsolete —
     // the width is pinned DIRECTLY via _Generic SELECTION, which matches on the
     // controlling expression's TYPE with NO promotion: 1.5f selects the `float:`
     // association and 1.5 selects `double:`, proving the SUFFIX, not the base core,
@@ -709,8 +710,8 @@ TEST(Fc3ShiftResult, ShippedAndAbsentDefaultToPromotedLeft) {
         << "absent shiftResult → default promotedLeft (back-compat) → 4";
 }
 
-// ── D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE + D-CSUBSET-SUBTREETYPE-UNARY-
-//    PROMOTION-DRIFT: the SEMANTIC type-oracle (`subtreeType`) reports C's
+// ── D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE + D-CSUBSET-SUBTREETYPE-UNARY-PROMOTION-DRIFT:
+//    the SEMANTIC type-oracle (`subtreeType`) reports C's
 //    LANGUAGE result types for operator expressions ─────────────────────────
 //
 // A comparison / logical result is `int` (C 6.5.8p6 relational, 6.5.9p3

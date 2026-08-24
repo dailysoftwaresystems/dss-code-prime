@@ -1187,8 +1187,8 @@ TEST(HirText, InlineAsmDescriptorRoundTripsWithEveryField) {
         // !operandKindResolved` is byte-identical to "no target was in scope",
         // and `hir_to_mir` refuses that operand saying the letter was never
         // bound to a processor — a FALSE reason for a letter both shipped
-        // targets declare (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-
-        // DECLARED, reproduced one tier over).
+        // targets declare (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED,
+        // reproduced one tier over).
         HirInlineAsmOperand mem;
         mem.spellings           = {"%2"};
         mem.constraint          = parseAsmConstraint("m").value;

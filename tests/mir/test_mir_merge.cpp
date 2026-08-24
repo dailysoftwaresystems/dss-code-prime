@@ -3965,8 +3965,8 @@ TEST(SynthStdioShim, MissingUcrtCoreImportFailsLoud) {
     EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
 }
 
-// FAIL-LOUD (3/3): NO va-list model resolved. `CuMirModule::vaListLayout` (D-FFI-PE-CRT-
-// UCRT-MIGRATION Phase 3 widened it from `optional<VaListStrategy>` to
+// FAIL-LOUD (3/3): NO va-list model resolved. `CuMirModule::vaListLayout`
+// (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3 widened it from `optional<VaListStrategy>` to
 // `optional<VaListLayout>`) is `std::optional` precisely so UNRESOLVED is distinguishable
 // from resolved — and widening it did NOT weaken that, because a default-constructed
 // `VaListLayout` is a REAL one: its `strategy` defaults to SysVRegisterSave, so a

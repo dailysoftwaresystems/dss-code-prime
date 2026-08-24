@@ -17,8 +17,9 @@
  * r02=8 r04=336 r05=1 r06=1 r11=100; ArraySize collapses to 1) — rows
  * 8/13 happened to coincide pre-fix (q->c was Pass-2-stamped; *q is 8=8).
  * => 42. Rows 16-26 + the two _Static_asserts extend the grid to the OPERATOR-
- * RESULT type (D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE + D-CSUBSET-SUBTREETYPE-
- * UNARY-PROMOTION-DRIFT): a comparison/logical result is int (4) and a unary
+ * RESULT type (D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE +
+ * D-CSUBSET-SUBTREETYPE-UNARY-PROMOTION-DRIFT):
+ * a comparison/logical result is int (4) and a unary
  * +/-/~ on a sub-int operand promotes to int (4); rows 24-26 pin the runtime
  * values. NOTE: members are `double` (8 bytes on EVERY target) — `long`
  * would be 4 on pe64/LLP64 and break the grid's expected sizes. */
@@ -56,8 +57,9 @@ int main(void) {
     if (sizeof(*q) != 8) return 13;                        /* deref small */
     if (sizeof p != 8) return 14;                          /* bare ident */
     if (sizeof(s) != 8) return 15;                         /* bare struct */
-    /* c-subset (D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE + D-CSUBSET-SUBTREETYPE-
-     * UNARY-PROMOTION-DRIFT): a comparison/logical RESULT is C's int (4) and a
+    /* c-subset (D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE +
+     * D-CSUBSET-SUBTREETYPE-UNARY-PROMOTION-DRIFT):
+     * a comparison/logical RESULT is C's int (4) and a
      * unary +/-/~ on a sub-int operand integer-PROMOTES to int (4) — subtreeType
      * now reports the LANGUAGE type, not the 1-byte i1/Bool carrier / the raw
      * sub-int operand. Rows 24-26 witness the runtime VALUE (1/0/2). RED-ON-DISABLE:

@@ -159,8 +159,8 @@ namespace dss::linker {
 // path (full image emission, behavior unchanged). N>1 builds the collision-proof
 // index + validates, then fail-louds `K_CrossCuMergeUnsupported` — the multi-CU
 // image MERGE (cross-CU name resolution + weak-vs-strong) is LK11.
-// `request` carries the per-PROGRAM image knobs (D-SQLITE-PE64-FULL-TIER-
-// STACK-DEPTH — see `link/image_request.hpp`). It DEFAULTS to empty, so every
+// `request` carries the per-PROGRAM image knobs (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH
+// — see `link/image_request.hpp`). It DEFAULTS to empty, so every
 // caller that has nothing to request is source-unchanged. A populated request
 // is gated HERE, before the walker dispatch, against the format's DECLARED
 // capability: this is the single chokepoint every image emission passes

@@ -997,8 +997,8 @@ subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind,
 // `declaratorDeclaredType` (the c27 volatile path) — one structural model, the
 // const verdict cannot drift from the type the declarator actually forms.
 //
-// GROUPS (D-CSUBSET-GROUPED-DECLARATOR-CONST + D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-
-// CLASSIFICATION, closed together): a GROUPED pointer declarator hides its layer
+// GROUPS (D-CSUBSET-GROUPED-DECLARATOR-CONST + D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-CLASSIFICATION,
+// closed together): a GROUPED pointer declarator hides its layer
 // inside the parens — `char (* const p)` (scalar), and the array-of-const-fn-ptr
 // direct-declarator spelling `int (* const ops[N])(int)` (an array whose ELEMENT
 // is a const pointer; C 6.7.3p9 so-qualifies the element, and gcc/clang park such
@@ -1039,8 +1039,8 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
     // directDeclaredType / declaratorNameNode do (by config-resolved ROLE, never a
     // rule name), skipping the direct's own array/fn suffixes (they carry outer
     // array-/fn-ness, never the object's const, which lives on the pointer star).
-    // D-CSUBSET-GROUPED-DECLARATOR-CONST + D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-
-    // CLASSIFICATION: without this descent the grouped/element-forming layer was
+    // D-CSUBSET-GROUPED-DECLARATOR-CONST + D-MIR-ELEMENT-CONST-ARRAY-GLOBAL-CLASSIFICATION:
+    // without this descent the grouped/element-forming layer was
     // invisible, the object fell to the head scan below, and an array of const
     // pointers mis-classified MUTABLE → its file-scope global landed in writable
     // `.data` instead of relocated-read-only relro on EVERY format (correctness-
@@ -5685,8 +5685,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // (consistent fail-loud, not a block-local shadow). A
                         // non-proto declarator binds in `current` unchanged.
                         //
-                        // D-CSUBSET-BLOCK-SCOPE-EXTERN / D-CSUBSET-EXTERN-MULTI-
-                        // DECLARATOR: the re-home is for a BARE prototype (implicit
+                        // D-CSUBSET-BLOCK-SCOPE-EXTERN / D-CSUBSET-EXTERN-MULTI-DECLARATOR:
+                        // the re-home is for a BARE prototype (implicit
                         // external linkage referring to the file-scope function). An
                         // EXPLICIT `extern` declaration (nonDefiningDeclaration) is
                         // NOT re-homed: it is a non-defining declaration that already
@@ -5826,8 +5826,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         }
                         // A function PROTOTYPE is a function DECLARATION, never an
                         // "unused variable" — suppress warnIfUnused for it. This
-                        // matters for a BLOCK-scope proto (D-CSUBSET-BLOCK-SCOPE-
-                        // PROTOTYPE), whose local declaration rule sets
+                        // matters for a BLOCK-scope proto (D-CSUBSET-BLOCK-SCOPE-PROTOTYPE),
+                        // whose local declaration rule sets
                         // warnIfUnused; re-homed to file scope and absorbed by the
                         // definition (its own use-set stays empty — the call
                         // resolves to the definition), it would otherwise emit a
@@ -6240,8 +6240,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     return here;
 }
 
-// pass1 — iterative whole-tree PRE-ORDER walk (D-PARSE-DEEP-NEST-RECURSION-
-// MEMORY plan 24 Stage 2): an explicit heap work-stack replaces host recursion.
+// pass1 — iterative whole-tree PRE-ORDER walk (D-PARSE-DEEP-NEST-RECURSION-MEMORY
+// plan 24 Stage 2): an explicit heap work-stack replaces host recursion.
 // Each node: skip if invalid / empty-space, else run `pass1Node` (scope push +
 // declaration binding) and push its children under the returned scope `here`, in
 // SOURCE order. OUTPUT-IDENTICAL — pre-order scope/bind, left-to-right children.
@@ -8769,8 +8769,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             }
                                             erec.enumValue = value;
                                             erec.isEnumerator = true;
-                                            // C23 6.7.2.2 (D-CSUBSET-ENUM-
-                                            // UNDERLYING-TYPE): with an EXPLICIT
+                                            // C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE):
+                                            // with an EXPLICIT
                                             // underlying type every enumerator
                                             // must be representable in it — fail
                                             // loud (S_EnumeratorValueOutOfRange)
@@ -9574,8 +9574,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // path pays ~nothing, and a peer's full type is computed only once a nullptr
     // operand is actually present. A NullptrT value arising from a NON-literal
     // subexpression (`(c?nullptr:nullptr)+1`, astronomically rare) is not caught here
-    // — it degrades to defined 0-arithmetic, never a crash: D-CSUBSET-NULLPTR-
-    // NONLITERAL-OPERAND (trigger: a real program hits it).
+    // — it degrades to defined 0-arithmetic, never a crash:
+    // D-CSUBSET-NULLPTR-NONLITERAL-OPERAND (trigger: a real program hits it).
     if (k == NodeKind::Internal
         && cfg.pointerConversions.nullPointerConstantFromNullptrT) {
         auto const& hirCfg = tree.schema().hirLowering();
@@ -9903,8 +9903,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // lowering's `resolveStampedTypeBelow` recovers the SIZED type); the VALUE
         // form (`sizeof e`) leaves its operand typed normally. BOTH forms stamp the
         // node `size_t` — the result type for enclosing checks. The operand is
-        // UNEVALUATED (C 6.5.3.4); only its type matters. D-LANG-TYPE-IDENTITY-
-        // VOCABULARY: `size_t` is C's NAMED alias (`unsigned long` on LP64,
+        // UNEVALUATED (C 6.5.3.4); only its type matters. D-LANG-TYPE-IDENTITY-VOCABULARY:
+        // `size_t` is C's NAMED alias (`unsigned long` on LP64,
         // `unsigned long long` on LLP64), declared per data model in
         // `semantics.synthesizedTypes` and resolved through `synthesizedType`. A
         // bare anonymous U64 here matched NEITHER named entry, so
@@ -11109,8 +11109,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     }
 }
 
-// pass2 — iterative whole-tree POST-ORDER walk (D-PARSE-DEEP-NEST-RECURSION-
-// MEMORY plan 24 Stage 2): an explicit heap work-stack replaces host recursion
+// pass2 — iterative whole-tree POST-ORDER walk (D-PARSE-DEEP-NEST-RECURSION-MEMORY
+// plan 24 Stage 2): an explicit heap work-stack replaces host recursion
 // so a deeply-nested tree (statements OR expressions) carries flat O(N)
 // host-stack cost. Two phases per node — phase 0 resolves its scope `here` +
 // `childLoopDepth` (the prior pre-child setup) and pushes its children in SOURCE
@@ -12281,8 +12281,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             // 6.5.15p6) → the POINTER type. The c64 array arm below needs BOTH arms
             // to be arrays, so it misses the `array : 0` pair → the fallback would
             // type it Array<char,N> and the aggregate lowering then materializes
-            // the literal-0 arm as a string → H0009 (D-LK4-RODATA-PRODUCER-
-            // NONSTRING-ARRAY-LITERAL-DECAY). Handles BOTH arm orders.
+            // the literal-0 arm as a string → H0009
+            // (D-LK4-RODATA-PRODUCER-NONSTRING-ARRAY-LITERAL-DECAY). Handles BOTH arm orders.
             if (thenT.valid()
                 && interner.kind(thenT) == TypeKind::Array
                 && isLiteralIntegerZero(s, tree, elseN)) {
@@ -13929,9 +13929,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                                     sym.version,
                                                     sym.synthesize,
                                                     sym.signature,
-                                                    // TF-C121 (D-FFI-SHIPPED-
-                                                    // SYMBOL-PER-TARGET-LINK-
-                                                    // NAME): and so does the
+                                                    // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME):
+                                                    // and so does the
                                                     // per-target LINK BASE NAME
                                                     // — a user prototype of
                                                     // `fstat` that lost it would
@@ -13939,8 +13938,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                                     // LEGACY 32-bit-inode
                                                     // `_fstat`, silently.
                                                     sym.linkName,
-                                                    // D-RUNTIME-DSS-SHIPS-NO-
-                                                    // IMPLEMENTATION-HALF: and so
+                                                    // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: and so
                                                     // does the SHIPPED-SOURCE
                                                     // realization. A user bare
                                                     // prototype of `opendir` over

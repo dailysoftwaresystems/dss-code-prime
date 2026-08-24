@@ -75,11 +75,85 @@ using Nanos = std::chrono::nanoseconds;
 
 constexpr std::string_view kHangFlag = "--dss-hang-ms=";
 
-// The child sleeps this long; the parent's budget is a small fraction of it, so
-// the kill is unambiguous even on a loaded box. Both are small enough that the
-// pin costs well under a second when it passes.
+// ══ THE DURATIONS BELOW ARE THIS FILE'S SUBJECT, NOT ITS BUDGETS ══════════════
+//
+// ★★★ EVERY ONE OF THEM IS AN `ALLOWLIST`-BY-PROOF ENTRY IN
+// `scripts/check-wall-clock-in-tests/check-wall-clock-in-tests.py`, KEYED BY
+// `path::symbol`, and the proof each entry carries is the sentence beside it
+// here. They are NOT routed through `test_wait_budget.hpp`, and routing them
+// there would destroy the tests: a test OF a deadline clock has to name
+// durations, because the duration is the thing under test. `kSpawnBudget` in
+// particular is the deadline the pin exists to prove fires — replacing it with
+// the shared 5 s `kRunBudget` would put the budget ABOVE the child's 4 s hang and
+// the child would exit normally, so the assertion that a deadline fires would
+// pass by never being reached.
+//
+// ⚠ THE TEST THAT MAKES A CLAIM ABOUT A LITERAL MUST STILL SURVIVE A SLOW HOST,
+// and that is checked per constant rather than asserted for the group. The
+// distinction used below: a STIMULUS (something this test causes) can only make
+// the assertions MORE true when the host is slow; a BOUND (something this test
+// asserts) is where a slow host reds. Bounds here come in THREE kinds, and the
+// third is why this sentence is stated as three rather than two: a lower bound,
+// safe under load by construction; a bound compared against another CLOCK
+// rather than against a number; and exactly ONE upper bound against a number,
+// `EXPECT_LT(awakeElapsed, kSpawnBudget + kKillSlack)`, whose slack is 20 s
+// against a 400 ms budget precisely so a loaded host cannot reach it — see
+// `kKillSlack` below, which names itself as that one and says what it is and is
+// not for.
+// ⚠ AN EARLIER DRAFT OF THIS PARAGRAPH SAID *EVERY* BOUND WAS ONE OF THE FIRST
+// TWO, and `kKillSlack` — added to this file by the SAME commit, forty lines
+// down — already described itself as *the only bound in this file that is an
+// upper bound against a number*. The file contradicted itself in one diff. Kept
+// and corrected rather than quietly reworded, because the lesson is the shape:
+// a UNIVERSAL claim over the contents of a file is falsified by anything the
+// same commit adds to that file, and nothing mechanical checks it
+// ([[D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED]]).
+
+// STIMULUS. The child sleeps this long; the parent's budget is a small fraction
+// of it, so the kill is unambiguous even on a loaded box. A slow host makes the
+// child MORE certainly outlive the budget, never less, so this cannot red under
+// load. Small enough that the pin costs well under a second when it passes.
 constexpr std::chrono::milliseconds kChildHang{4000};
+
+// THE SUBJECT. This is the deadline whose firing is under test, and it must stay
+// well below `kChildHang` or there is nothing to fire. The only assertion that
+// reads it as a lower bound is `EXPECT_GE(awakeElapsed, kSpawnBudget)`, which a
+// slow host also only makes more true.
 constexpr std::chrono::milliseconds kSpawnBudget{400};
+
+// STIMULUS. The sleep the advance pin measures the clock across; the assertions
+// that read it DERIVE from it (`kProbeSleep / 2`) rather than restating a second
+// number, so the relationship cannot drift.
+constexpr auto kProbeSleep = std::chrono::milliseconds{80};
+
+// THE READ-JITTER TOLERANCE, and it is a DISCRIMINATOR rather than a budget: it
+// separates "two clocks are the same clock" from "two clocks are different
+// clocks", and it sits FAR below the thing it must discriminate — 50 ms against
+// the 144661 s of recorded suspend on the host this defect was found on, a factor
+// of ~2.9 million. (An earlier comment here said "four orders of magnitude"; the
+// arithmetic says more than six, and the direction of that error was to
+// understate the margin.) A slow host can delay two adjacent `now()` calls, but
+// it cannot move two clock ids apart by hours, which is what the arms below are
+// looking for.
+constexpr auto kReadJitter = std::chrono::milliseconds{50};
+
+// THE SUSPEND FLOOR — "has this host actually slept?", a fact about the MACHINE'S
+// HISTORY rather than about how long anything may take. Below it the two clocks
+// cannot be told apart by reading them and the arm says so instead of asserting;
+// above it they MUST differ. Nothing here is a deadline and no elapsed time is
+// being bounded.
+constexpr auto kSuspendFloor = std::chrono::seconds{1};
+
+// THE KILL SLACK. The only bound in this file that is an upper bound against a
+// number, and it is deliberately LOOSE: it prices spawn + poll + SIGKILL + reap
+// on a box that may be running the rest of the suite at -j 8, so it is here to
+// catch a deadline that has stopped bounding anything at all, not to time the OS.
+// ⚠ ITS DISCRIMINATING POWER IS ALREADY OWNED BY `EXPECT_TRUE(result.timedOut)`
+// one line above it: a deadline that stopped firing lets the child run its full
+// `kChildHang`, which is 4 s and would pass THIS bound. Said plainly rather than
+// implied — this is a sanity rail, and the pin's teeth are the `timedOut`
+// assertion and the `EXPECT_GE` lower bound.
+constexpr auto kKillSlack = std::chrono::seconds{20};
 
 [[nodiscard]] Nanos absDiff(Nanos a, Nanos b) {
     return (a > b) ? (a - b) : (b - a);
@@ -144,7 +218,6 @@ static_assert(std::is_same_v<AwakeClock::duration, std::chrono::nanoseconds>);
 TEST(RunBinaryDeadlineClock, TheDeadlineIsSpentOnTheClockThatStopsWithTheMachine) {
     auto const awake  = AwakeClock::now().time_since_epoch();
     auto const steady = steadySinceItsEpoch();
-    constexpr auto kReadJitter = std::chrono::milliseconds{50};
 
 #if defined(__APPLE__)
     // Darwin publishes TWO continuous monotonic ids and one awake one, and
@@ -212,11 +285,11 @@ TEST(RunBinaryDeadlineClock, TheDeadlineIsSpentOnTheClockThatStopsWithTheMachine
                      .count()
               << " s of suspend since boot (CLOCK_MONOTONIC - CLOCK_UPTIME_RAW)"
               << std::endl;
-    if (recordedSuspend > std::chrono::seconds{1}) {
+    if (recordedSuspend > kSuspendFloor) {
         // The measured discriminator: on a Mac that has actually slept, the old
         // clock and the new one are far apart, so this reds the moment the
         // Darwin arm is reverted.
-        EXPECT_GT(absDiff(awake, steady), std::chrono::seconds{1})
+        EXPECT_GT(absDiff(awake, steady), kSuspendFloor)
             << "this host recorded real suspend, so its awake clock and its "
                "steady_clock MUST read differently — reading the same means the "
                "deadline is back on the suspend-counting clock";
@@ -273,15 +346,38 @@ TEST(RunBinaryDeadlineClock, TheDeadlineIsSpentOnTheClockThatStopsWithTheMachine
 // comparison above. A stub returning 0 would pass the selection arm on Linux
 // (0 vs 0) and is exactly the shape of pin this project refuses to ship.
 TEST(RunBinaryDeadlineClock, TheDeadlineClockAdvancesAcrossRealAwakeTime) {
-    auto const before = AwakeClock::now();
-    std::this_thread::sleep_for(std::chrono::milliseconds{80});
-    auto const after = AwakeClock::now();
-    EXPECT_GT(after - before, std::chrono::milliseconds{40})
-        << "the deadline clock did not advance across an 80 ms sleep";
-    EXPECT_LT(after - before, std::chrono::seconds{10})
-        << "the deadline clock advanced absurdly across an 80 ms sleep — its "
-           "unit conversion is wrong, which would make every spawn budget in "
-           "the tree wrong by the same factor";
+    // The steady window ENCLOSES the awake window, so the upper bound below is
+    // an ordering fact rather than a timing guess.
+    auto const steadyBefore = steadySinceItsEpoch();
+    auto const before       = AwakeClock::now();
+    std::this_thread::sleep_for(kProbeSleep);
+    auto const after        = AwakeClock::now();
+    auto const steadyAfter  = steadySinceItsEpoch();
+
+    auto const awakeElapsed  = after - before;
+    auto const steadyElapsed = steadyAfter - steadyBefore;
+
+    EXPECT_GT(awakeElapsed, kProbeSleep / 2)
+        << "the deadline clock did not advance across a " << kProbeSleep.count()
+        << " ms sleep";
+    // ★ THE UPPER BOUND IS AGAINST THE OTHER CLOCK, NOT AGAINST A NUMBER, and
+    // that is a strictly stronger pin than the `< 10 s` it replaces. The defect
+    // it catches is the same one — a unit conversion inside `AwakeClock::now()`
+    // that inflates every reading, and therefore every spawn budget in the tree,
+    // by the same factor. But a wall-clock ceiling sized on a developer machine
+    // reds when the host deschedules this process for longer than the ceiling,
+    // whereas a DESCHEDULE MOVES BOTH CLOCKS EQUALLY and cancels here. The
+    // tolerance is `kReadJitter` — 50 ms, against the ~80 s a 1000x unit error
+    // would produce here, i.e. a factor of ~1600 — instead of 10 s of
+    // unexplained headroom that was both looser AND flakier.
+    // Ordering makes this safe on every leg: `AwakeClock` IS `steady_clock` off
+    // Darwin, and on Darwin it is CLOCK_UPTIME_RAW against CLOCK_MONOTONIC_RAW —
+    // same rate, same adjustment domain, and the awake one additionally EXCLUDES
+    // any suspend that lands inside the window.
+    EXPECT_LE(awakeElapsed, steadyElapsed + kReadJitter)
+        << "the deadline clock advanced further than steady_clock did across a "
+           "window that CONTAINS it — its unit conversion is wrong, which would "
+           "make every spawn budget in the tree wrong by the same factor";
 }
 
 // ── (2) The deadline, end to end, through the real spawn path ──────────────
@@ -315,15 +411,15 @@ TEST(RunBinaryDeadlineClock, AHangingChildIsStillKilledAndTheBudgetIsAwakeTime) 
     // Generous upper bound: this measures spawn + poll + SIGKILL + reap on a
     // box that may be running the rest of the suite at -j 8. It is here to
     // catch a deadline that has stopped bounding anything, not to time the OS.
-    EXPECT_LT(awakeElapsed, kSpawnBudget + std::chrono::seconds{20})
+    EXPECT_LT(awakeElapsed, kSpawnBudget + kKillSlack)
         << "the kill took far longer than the budget it was given";
     // A suspend-EXCLUDING clock can never outrun one that counts suspend. If a
     // nap lands inside this spawn — which is exactly what happens on the
     // operator's Mac — this is where it shows, and the budget above is still
     // met in awake seconds.
-    EXPECT_GE(steadyElapsed + std::chrono::milliseconds{50}, awakeElapsed)
+    EXPECT_GE(steadyElapsed + kReadJitter, awakeElapsed)
         << "the awake clock outran steady_clock across one spawn";
-    if (steadyElapsed > awakeElapsed + std::chrono::seconds{1}) {
+    if (steadyElapsed > awakeElapsed + kSuspendFloor) {
         std::cout << "[  CLOCK   ] a host suspend of ~"
                   << std::chrono::duration_cast<std::chrono::seconds>(
                          steadyElapsed - awakeElapsed)

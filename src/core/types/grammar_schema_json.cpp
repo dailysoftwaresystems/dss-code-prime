@@ -146,8 +146,8 @@ std::optional<TypeKind> coreTypeFromName(std::string_view name) {
 }
 
 // The composite-kind accepted set, built ONCE off `kCompositeKindTable`
-// (`semantic_config.hpp`, beside the enum). D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-
-// RETYPE-THEIR-CLOSED-SET.
+// (`semantic_config.hpp`, beside the enum).
+// D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET.
 //
 // ★ TWO SITES IN THIS FILE ACCEPT A `compositeKind` — `declarations[].
 // fieldChildren.compositeKind` and the tag-reference row's `compositeKind` — and
@@ -13420,8 +13420,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                       "'name' is required and must be a string");
                             continue;
                         }
-                        // CLOSED KEY VOCABULARY (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-
-                        // LOUD). Without it a mis-spelled or misplaced knob loads
+                        // CLOSED KEY VOCABULARY (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD).
+                        // Without it a mis-spelled or misplaced knob loads
                         // clean and does NOTHING — the exact "knob that lies" this
                         // same loader rejects two screens up ('rank' requires a
                         // 'name'; 'signature' and 'params'/'result' are mutually
@@ -15943,8 +15943,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         assemblyClean = false;
                         continue;
                     }
-                    static constexpr std::array<std::string_view, 5>
-                        kInstRowKeys{"spelling", "opcodes", "width", "cond",
+                    static constexpr std::array<std::string_view, 6>
+                        kInstRowKeys{"spelling", "opcodes", "width",
+                                     "destWidth", "cond",
                                      "operandSelectors"};
                     DSS_CHECK_KEY_VOCABULARY(kInstRowKeys);
                     // ★ NAME THE RENAME. `opcode` (a single string) was this
@@ -16079,6 +16080,45 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         ins.width = row.at("width").get<std::uint32_t>();
+                    }
+                    // ── destWidth ── OPTIONAL; the DESTINATION's width when this
+                    // spelling writes a result of a different width from the
+                    // value it operates on. Anchor:
+                    // D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE.
+                    // `movzbl` = width 8, destWidth 32.
+                    // ★★ IT IS REFUSED WITHOUT `width`, AND THAT IS NOT
+                    // BOOKKEEPING: `width` is the number that reaches the LIR
+                    // instruction and selects the target's encoding variant, so
+                    // a row stating only the destination would leave the
+                    // operation width to be DERIVED from the registers — and
+                    // for an extending move the registers disagree by
+                    // construction, which is the very refusal this key exists
+                    // to resolve.
+                    if (row.contains("destWidth")) {
+                        if (!row.at("destWidth").is_number_unsigned()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/destWidth",
+                                      "'destWidth' must be the DESTINATION's "
+                                      "width in BITS (8, 16, 32 or 64); omit "
+                                      "the key entirely unless this spelling "
+                                      "writes a result of a different width "
+                                      "from the value it operates on");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        if (!ins.width.has_value()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      path + "/width",
+                                      "'destWidth' is declared without 'width' "
+                                      "— a spelling whose destination width "
+                                      "differs from its operation width must "
+                                      "state BOTH, because it is 'width' that "
+                                      "reaches the instruction and elects the "
+                                      "target's encoding variant");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        ins.destWidth = row.at("destWidth").get<std::uint32_t>();
                     }
                     // ── operandSelectors ── OPTIONAL; the written operands that
                     // are part of the MNEMONIC rather than operands of it.

@@ -5743,8 +5743,8 @@ TEST(Preprocessor, ProductSpansSurviveAcrossFlush) {
     // token + a closing `"` -- see reconstructStringLiteral above -- so we check
     // the distinctive product BODIES (which slice from productText_; an invalid
     // multi-flush span would yield an empty/garbage lexeme, not the exact body).
-    // This test is count-free by construction, so D-TOK-CLOSING-DELIMITER-HAS-NO-
-    // TOKEN left it GREEN; only the wording above needed the correction (the
+    // This test is count-free by construction, so D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN
+    // left it GREEN; only the wording above needed the correction (the
     // close is no longer "implied", it is a real token).
     auto has = [&](std::string_view s) {
         for (auto const& l : lexs) if (l == s) return true;

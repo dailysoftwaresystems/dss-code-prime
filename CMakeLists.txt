@@ -456,8 +456,8 @@ if(DSS_BUILD_TESTS)
     # here) each twin mirrors tests/ into a per-run temp tree, mutates
     # it 12 ways, and asserts it reds with the right exit code and the
     # right message each time — so this entry cannot pass without also
-    # proving the guard can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-
-    # VACUOUS-PASS, D-CENSUS-INSTRUMENT-UNGUARDED-BY-CTEST). Cost,
+    # proving the guard can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS,
+    # D-CENSUS-INSTRUMENT-UNGUARDED-BY-CTEST). Cost,
     # MEASURED on this Windows workstation: ~18 s (.sh) / ~11 s (.ps1),
     # which ctest -j overlaps with the other ~810 entries and is in
     # family with the anchor guard's own 9.6–14.7 s.
@@ -685,6 +685,19 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/scripts/check-no-abort-in-tests/check-no-abort-in-tests.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ⚠ THESE TWO RAN ZERO SELF-TEST ARMS UNTIL 2026-08-24 (cycle P29,
+    # independent step-10 audit), AND THE ENTRIES BELOW ARE UNCHANGED — the
+    # repair was in the SCRIPTS, which is the whole lesson. Both carried a
+    # self-test behind a flag (`--selftest` / `--self-test`) that nothing passed,
+    # so each entry exercised its tree check and proved nothing about its own
+    # ability to fail — the identical shape measured live in
+    # `no_abort_in_tests_guard` (D-GATE-NO-ABORT-IN-TESTS-CTEST-FORM-NEVER-SELF-TESTED).
+    # ⛔ THE OBVIOUS FIX — ADDING THE FLAG HERE — IS WRONG AND MUST NOT BE MADE:
+    # ✔MEASURED, in BOTH scripts that flag RETURNS from the self-test without
+    # scanning the tree, so it would have TRADED the check for the proof instead
+    # of adding the proof to the check. The no-argument form now does both, and
+    # a red-on-disable drove the mutant through each registered form to prove the
+    # failure actually propagates (D-GATE-TWO-GUARDS-SELF-TEST-BEHIND-A-FLAG-NOBODY-PASSES).
     add_test(
         NAME path_identity_guard
         COMMAND ${Python3_EXECUTABLE}
@@ -698,8 +711,15 @@ if(DSS_BUILD_TESTS)
 
     # ★ `check-anchor-balance` needs a BASE REF to compare against, so its
     # ordinary form cannot be a ctest entry — a cycle supplies that ref. Its
-    # `--self-test` has no such obstacle: 58 cases over the real arithmetic,
-    # including the red-on-disable proving the `+bookkept` term is load-bearing.
+    # `--self-test` has no such obstacle: it runs its whole case set over the
+    # real arithmetic — the guard prints the count itself, and no figure is
+    # quoted here on purpose — including the red-on-disable proving the
+    # `+bookkept` term is load-bearing. ⚠ This comment said "58 cases", which was
+    # true at HEAD and made FALSE BY THIS CYCLE'S OWN EDITS to the same guard
+    # (✔MEASURED at the fold: 78). A count in a comment is a measurement with no
+    # instrument attached — the reader cannot re-derive it and no guard can check
+    # it — so it decays silently in the direction of looking authoritative
+    # (D-TEST-CMAKE-COMMENT-QUOTES-A-CORPUS-COUNT-THE-TEST-IT-REGISTERS-FORBIDS).
     # Registering the self-test is what stops the instrument that judges every
     # cycle from being the one thing no cycle checks.
     add_test(
@@ -707,6 +727,179 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/scripts/check-anchor-balance/check-anchor-balance.py"
                 --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Wrapped-anchor-id guard (2026-08-23 —
+    # D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP).
+    # An anchor id split across a line break — the line ends `…D-SOME-ANCHOR-`
+    # and the next opens `PART-OF-THE-ID` — still READS as a citation, but no
+    # grep for the whole id will ever return it. ★★★ IT DOES NOT FAIL, IT
+    # DISAPPEARS, which is the one failure mode a fail-loud project cannot catch
+    # by watching for a failure: the row simply loses an inbound link and starts
+    # looking unreferenced.
+    #
+    # ⚠ NEITHER EXISTING ANCHOR GUARD CAN COUNT ONE, AND THAT IS BY DESIGN.
+    # `anchor_registry_guard` RECOVERS a wrapped citation (its `WRAP_JOIN_AWK`
+    # joins the fragment to the next line's head token) and then resolves the
+    # joined name — recovery, not refusal, because refusing would red hundreds of
+    # lines of honest text. `check-anchor-balance` reads WHOLE-LINE ids, so a
+    # wrapped one is not there at all. ⇒ the gap is that nothing COUNTS them, and
+    # ✔MEASURED 2026-08-23 the population is 290 sites across 145 files.
+    #
+    # ★ A RATCHET, NOT A BAN, for the reason the two guards above give: per-file
+    # ceilings in `inventory.json` that may only come DOWN. ✔AND THE BURN-DOWN
+    # COMPLETED IN THIS SAME COMMIT, so the ceiling set is EMPTY and the ratchet
+    # now holds a floor of ZERO: any wrapped id landing hereafter is the first,
+    # and reds. ⚠ An earlier draft of this block said the un-wrap was "a separate,
+    # quiet-tree step … while that happens" — true when typed, false when the
+    # commit landed, and left uncorrected it would have told the next reader that
+    # a finished burn-down was still in flight. Re-derive the population with the
+    # guard itself rather than trusting any number written here.
+    # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
+    # the tree and then drives 35 arms, every red arm asserting the MESSAGE of the
+    # refusal it names, so this entry cannot pass without also proving the guard
+    # can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS). Its fixtures are
+    # SYNTHESIZED into a temp tree at run time and deleted: an on-disk wrapped
+    # fixture would be a deliberate wrap that the burn-down step would un-wrap,
+    # silently breaking the self-test.
+    add_test(
+        NAME wrapped_anchor_ids_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-wrapped-anchor-ids/check-wrapped-anchor-ids.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Ninja dependency-record probe, SELF-TEST arm (2026-08-23 —
+    # D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST).
+    # ⚠ THE `ⓘ` NOTE IN THE BLOCK ABOVE — `check-ninja-deps` "has no argument-free
+    # form to register" — IS TRUE ONLY OF ITS PROBE FORM, AND IS STALE AS WRITTEN;
+    # correcting it in place is left to the owner of that block. Its `--self-test`
+    # takes no build directory at all — exactly the shape `anchor_balance_selftest_guard`
+    # exists for — so the instrument that decides whether a gate may be trusted was
+    # itself the one thing no gate checked. ✔MEASURED 2026-08-23: pointed at a
+    # directory that does not exist it printed `SKIP` and exited 0, while its own
+    # docstring claimed a missing tree is FATAL.
+    # ⓘ The PROBE form still cannot be registered: it needs a build directory, and
+    # a source checkout has none. Registering the self-test is what stops the
+    # verdict rule from drifting unwatched.
+    add_test(
+        NAME ninja_deps_selftest_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-ninja-deps/check-ninja-deps.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Guard-output-encoding ratchet (2026-08-23 —
+    # D-GATE-NOTHING-RATCHETS-A-NEW-GUARD-INTO-RECONFIGURING-ITS-STREAMS).
+    # On Windows a Python child whose stdout is a PIPE — which is how ctest runs
+    # every guard above — comes up cp1252/surrogateescape, and `surrogateescape`
+    # does nothing for an ordinary unencodable character. So a guard printing tree
+    # text with a box-drawing rule or a status glyph dies INSIDE ITS OWN REPORT:
+    # the run reds, but the finding is lost and the traceback names a `print`.
+    # The scripts that carry the five-line block were given it ONE AT A TIME in
+    # cycle P29; nothing made the NEXT one carry it, and "the class is closed by
+    # inspection" is the state that let the population accumulate the first time.
+    # ⓘ No population count is quoted here ON PURPOSE — the guard prints its own
+    # census (`N primary script(s) probed; … SELF, … TRANSITIVE, … UNPROTECTED`)
+    # and that is the only figure that cannot rot. ✔An earlier draft of this block
+    # said "Twelve … the thirteenth" when the guard reported TEN SELF, which is
+    # the same defect this comment now exists to avoid.
+    #
+    # ★★★ IT TESTS THE PROPERTY, NEVER THE SOURCE TEXT. Each Python primary is
+    # IMPORTED in a child whose two streams are forced to cp1252/strict and are
+    # pipes; the child then writes U+1F7E0 to both and the parent asserts the
+    # UTF-8 bytes arrive. Forcing the encoding is what keeps the arm from being
+    # vacuous on the Linux and macOS legs, where a pipe is already UTF-8. Two
+    # self-test arms pin the rule from both sides: an EQUIVALENT block written a
+    # different way passes, and the literal block present only as a string fails.
+    #
+    # ★ A RATCHET, NOT A BAN, like the two above: the primaries that reach the
+    # property late (inside main()) or never are listed in `inventory.json` as
+    # DEBT that may only get shorter — the guard names them on every run. A NEW
+    # primary without the block is refused.
+    # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
+    # the tree and then drives 17 arms, every red arm asserting the MESSAGE of the
+    # refusal it names, so this entry cannot pass without also proving the guard
+    # can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    add_test(
+        NAME guard_output_encoding_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-guard-output-encoding/check-guard-output-encoding.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Stale-refusal-citation ratchet (2026-08-24 —
+    # D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+    # An author writes "X therefore stays refused fail-loud (D-SOME-ROW)" while
+    # that row is OPEN; a sibling lane closes the row IN THE SAME COMMIT. The
+    # sentence was TRUE WHEN IT WAS TYPED and FALSE WHEN THE COMMIT LANDED, and
+    # it still READS as evidence — so the next author is sent to fix an engine
+    # gap that no longer exists. The window is MINUTES, not cycles, which is
+    # exactly the window a human diff review cannot see.
+    #
+    # ★★★ AND IT IS REGISTERED BECAUSE THE SWEEP THAT FOUND IT WAS
+    # INSTANCE-DRIVEN. The cycle that named the species closed it claiming TWO
+    # instances, read out of its own diff. Two independent auditors then found at
+    # least EIGHT MORE in the same tree, in files the diff never touched — one of
+    # them a config `$comment` declaring a 16-bit sibling absent FOURTEEN LINES
+    # ABOVE the 16-bit sibling the same commit added. A sweep finds the instances
+    # somebody happened to read; a predicate finds the class.
+    #
+    # ★★ HOW A STATE PREDICATE CATCHES A TRANSITION WITH NO BASE REF, which is
+    # the whole design rather than a side effect: the day a row closes, every
+    # sentence anywhere in the tree that still calls that row a live blocker
+    # BECOMES a finding, its file rises above its inventory ceiling, and this
+    # entry reds — naming the file and quoting the sentence. The file need not
+    # have been touched. A self-test arm drives exactly that transition.
+    #
+    # ★★ THE UNIT IS A SENTENCE, NEVER A LINE WINDOW, and that is measured rather
+    # than tidy: a JSON `$comment` in this tree is ONE PHYSICAL LINE holding
+    # kilobytes of paragraphs, so a ±N-line window swallows the lot and a single
+    # past-tense word anywhere inside it suppresses a real hit. ✔MEASURED
+    # 2026-08-24 against a hand-written line-window predicate over the same tree:
+    # it missed a live site in `c_inline_asm_memory_arithmetic/expected.json`
+    # that this guard reported.
+    #
+    # ★ A RATCHET, NOT A BAN: sites already exist and the guard prints its own
+    # census on every run -- no population count is quoted here, because this
+    # number falls as they are repaired and a stale one reads as authority. Per-file ceilings that may only come DOWN, so a NEW site
+    # reds at once and a corrected one reds until its ceiling is lowered in the
+    # same commit. `--write` burns down and is structurally unable to raise —
+    # ✔PROVEN live, it refuses with rc=1 and leaves the inventory byte-identical.
+    # ⚠ Green here means NO NEW stale refusal citation landed. It never means the
+    # tree's comments are true; the inventory is DEBT, and every entry in it is
+    # an unrepaired candidate rather than a sanctioned exception.
+    #
+    # ★★★ FALSE POSITIVES WERE THE DESIGN CONSTRAINT, because a guard weakened
+    # every time it fires asserts nothing. Six narrowings, each measured against
+    # the whole tree with the others held fixed (relax all six: 147 candidates;
+    # shipped: 9):
+    #   * the trigger is a PERSISTENCE word, never a copula — a definitional
+    #     "X IS A REFUSAL" is a closure DELIVERING a refusal, not a gap  (9→101);
+    #   * a RESIDUAL BOUNDARY exempts the claim: "a frame > 16 MiB stays
+    #     fail-loud" is TRUE while the row it cites closed frames UP TO 16 MiB —
+    #     the row closed a SUBSET of what the sentence refuses            (9→17);
+    #   * `open` counts only predicatively ("stays open"), never attributively
+    #     ("still the open block", which is IR jargon)                    (9→10);
+    #   * a sentence ends at a closer or a JSON value→key boundary        (9→12);
+    #   * a sentence citing an OPEN row too is attributed to that row     (9→12);
+    #   * row ids are MASKED before the prose is read — worth 0 today, decisive
+    #     in any draft that widens the trigger, and pinned by its own arm.
+    # ⓘ `.plans/` is deliberately NOT governed — 40 of the 49 tree-wide
+    # candidates live there, 27 in the registry alone, in documents rewritten
+    # every cycle; and a registry row contradicting its own verdict is already
+    # `check-anchor-balance`'s mismarked-closure arm.
+    #
+    # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
+    # the tree and then drives its arms against fixtures SYNTHESIZED into a temp
+    # tree at run time, every red arm asserting the MESSAGE of the refusal it
+    # names, so this entry cannot pass without also proving the guard can fail
+    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS). An on-disk fixture is
+    # impossible by construction: it would BE an instance of the defect, would
+    # sit in this guard's own inventory forever, and the first person to repair
+    # it would silently break the self-test.
+    add_test(
+        NAME stale_refusal_citations_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-stale-refusal-citations/check-stale-refusal-citations.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()
 

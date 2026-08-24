@@ -227,8 +227,8 @@ struct DSS_EXPORT EnumUnderlyingTypeSpec {
 // `scopes` via `C_InvalidSemantics`.
 enum class CompositeKind : std::uint8_t { Struct, Union, Enum };
 
-// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-
-//    THEIR-CLOSED-SET) ──────────────────────────────────────────────────────
+// ── THE SPELLINGS HAVE ONE OWNER (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET)
+//    ──────────────────────────────────────────────────────
 //
 // ★★ WHAT THIS REPLACED. Until this table existed, `CompositeKind` had NO name
 // table and NO `fromName` — the config-facing spellings lived in two separate
@@ -2694,8 +2694,8 @@ struct DSS_EXPORT SemanticConfig {
     // dirs (the wiring layer walks up from cwd to find each, mirroring
     // `findShippedConfig`). DISTINCT from the quote form's search
     // (self-dir + includeDirs). The angle name (`<stdio.h>`) resolves to a
-    // language-NEUTRAL JSON descriptor `<stem>.json` (D-FFI-SHIPPED-LIB-
-    // DESCRIPTOR-AGNOSTIC, v0.0.2 V2-2): its symbols (name + a hir-text
+    // language-NEUTRAL JSON descriptor `<stem>.json`
+    // (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC, v0.0.2 V2-2): its symbols (name + a hir-text
     // type-string signature decoded by `parseTypeFromText`) are injected
     // into semantic scope BEFORE Pass 2 (the `builtinFunctions` seam) so a
     // call resolves with NO inline `extern`, then synthesized as externs

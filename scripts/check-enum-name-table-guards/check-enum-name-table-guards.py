@@ -40,6 +40,29 @@ import os
 import re
 import sys
 
+# ── OUTPUT ENCODING — NOT COSMETIC, AND THE STREAM IS HALF THE FACT ─────────────
+# ✔MEASURED 2026-08-23 (CPython 3.14.3, Windows, BOTH streams PIPES, which is
+# exactly how ctest runs every guard): `sys.stdout` comes up
+# `encoding='cp1252' errors='surrogateescape'` and `sys.stderr` comes up
+# `errors='backslashreplace'`. `surrogateescape` rescues only lone surrogates left
+# by an earlier decode; it does NOTHING for an ordinary unencodable character. So a
+# report printed on STDOUT — where this guard names every unguarded vocabulary and
+# the file that declares it —
+# raises `UnicodeEncodeError` and kills the guard INSIDE ITS OWN REPORT: the run
+# still reds, but the finding is lost and the traceback names a `print` rather than
+# the thing that was wrong. STDERR merely mangles the glyph into an escape.
+# ⚠ Names and paths are ASCII in this tree TODAY (\u2714MEASURED 2026-08-23: 0 of 2605
+# tracked paths are unencodable in cp1252), which makes this prophylactic rather
+# than a live red — and one non-ASCII identifier away from not being.
+# Applied at IMPORT, so every path this module can print on is covered.
+# D-GATE-PYTHON-GUARD-DIES-PRINTING-TREE-TEXT-ON-A-WINDOWS-PIPE
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):   # pragma: no cover - odd stream
+        pass
+
+
 DECL = re.compile(r'inline\s+constexpr\s+EnumNameTable\s*<[^>]*>\s*\n?\s*(k[A-Za-z0-9_]+)\s*\{')
 GUARD = re.compile(r'DSS_CHECK_ENUM_NAME_TABLE\s*\(\s*(k[A-Za-z0-9_]+)\s*\)')
 

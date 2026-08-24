@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Python PRIMARY scripts that CANNOT carry a non-cp1252 character through a",
+    "pipe when imported -- their streams are left at the host default, so a report",
+    "carrying one dies (stdout) or is mangled (stderr). This list is DEBT, not a",
+    "pass: green means no NEW one landed. It may only get SHORTER.",
+    "Add the five-line reconfiguration block at IMPORT (both streams) and delete",
+    "the entry in the SAME commit; the guard refuses an entry that now passes.",
+    "Adding a file here instead of fixing it is exactly what the ratchet refuses.",
+    "✔MEASURED 2026-08-23 (cycle P29, lane L): four reached the property late or",
+    "not at all -- check-retyped-closed-sets and check-shell-portability",
+    "reconfigured inside main(), refresh_landing_log and sqlite-runtime-bench never.",
+    "Their --help and bad-flag paths were probed through a cp1252 pipe and none",
+    "died TODAY, so these are LATENT rather than live. Latent is what",
+    "check-anchor-balance was until the day its --help printed zero bytes.",
+    "✔2026-08-24 (cycle P29, independent step-10 audit): check-retyped-closed-sets",
+    "was REPAIRED -- the block moved to import -- and its entry deleted in the same",
+    "commit, because the guard refuses a repaired entry that lingers. That refusal",
+    "is what made the deletion happen rather than being remembered.",
+    "Burn-down tracked by D-GATE-FOUR-PYTHON-PRIMARIES-REACH-UTF-8-TOO-LATE-OR-NEVER."
+  ],
+  "unprotected": [
+    "scripts/check-shell-portability/check-shell-portability.py",
+    "scripts/refresh_landing_log/refresh_landing_log.py",
+    "scripts/sqlite-runtime-bench/sqlite-runtime-bench.py"
+  ]
+}

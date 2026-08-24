@@ -6,8 +6,24 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - **★★★ THE BUILD IS VERIFIABLE — run this BEFORE trusting any ctest result:**
 
   ```bash
-  python scripts/check-ninja-deps/check-ninja-deps.py build-dbg
+  python scripts/check-ninja-deps/check-ninja-deps.py            # no argument: it finds the tree
+  python scripts/check-ninja-deps/check-ninja-deps.py build/p29-x  # or name YOUR lane's tree
   ```
+
+  ⚠⚠ **THIS LINE USED TO READ `… check-ninja-deps.py build-dbg`, AND THAT PATH HAS NOT EXISTED SINCE
+  THE ONE-ROOT `build/` MIGRATION.** ✔MEASURED 2026-08-23 at `6dc63be0`: the tool printed
+  `SKIP build-dbg -- no build.ninja` and exited **0**, so a cycle following this reference verbatim
+  ran the build-verifiability check against a nonexistent directory and read `rc=0` as a pass.
+  Both halves are fixed: the invocation above, and the tool — a named directory that does not exist
+  is now **exit 2**, never a skip (`D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST`).
+  A directory that exists but is not a ninja tree is also exit 2 unless you pass `--allow-non-ninja`,
+  which prints a SKIP naming the flag — an unasked-for skip is indistinguishable from a pass.
+  ⓘ The no-argument form auto-picks `build/dbg`, else the pre-migration `build-dbg`, else fails loud
+  on `build/dbg`. **Name your own tree when you are a lane** — the whole point is to verify the tree
+  the ctest result came from.
+  ⓘ Its `--self-test` (7 parser cases + 5 target-verdict cases) now rides ctest as
+  `ninja_deps_selftest_guard`. The PROBE form still cannot be a ctest entry: it needs a build
+  directory, and a source checkout has none.
 
   A green ctest proves nothing about the current source if the objects it linked were never
   rebuilt, and that is not hypothetical here: `ninja -t deps` has twice reported `#deps 0` on
@@ -248,6 +264,36 @@ get, along with our defined priorities."*
 
 **Path: `.plans/_handoff.md`.** One file, rewritten in place each cycle — never a per-cycle copy,
 never a dated sibling. If it does not exist, **create it this cycle**.
+
+##### ⛔ REWRITE IT ENCODE-FIRST AND REPLACE ATOMICALLY — never open the real file for writing
+
+✔MEASURED 2026-08-24 (cycle P29, `D-CYCLE-HANDOFF-PATCHER-TRUNCATES-ITS-TARGET-BEFORE-IT-CAN-FAIL`):
+an orchestrator patch script did `io.open(path, "w", …)` and then `fh.write(...)`. The write raised
+on a lone surrogate pair in one of its own literals — **and `"w"` had already TRUNCATED the file**, so
+a **377 KB handoff became 0 bytes**. It was recovered with `git checkout --` only because the handoff
+had not yet been edited that cycle; ten minutes later that recovery would have destroyed real work.
+
+⇒ **Build the bytes first, then touch the target:**
+
+```python
+data = "\n".join(lines).encode("utf-8")   # any failure lands HERE, target untouched
+tmp = path + ".tmp"
+with io.open(tmp, "wb") as fh:
+    fh.write(data)
+os.replace(tmp, path)                     # atomic
+```
+
+★ **The repository's own scripts already do this** — `check-plan-citations` and
+`check-wrapped-anchor-ids` both write `path + ".tmp"` and `os.replace`, and `check-scripts-index`
+does the same. ⚠ **The gap was in the ORCHESTRATOR's own fold tooling, which no guard covers**, and
+that is the general shape: the cycle's throwaway scripts hold the same power over the tree as the
+registered ones and none of the discipline. A scratch script that rewrites a tracked file is subject
+to every rule a shipped one is.
+
+⚠ **And a lone surrogate pair is a real hazard here, not a curiosity.** `"🔵"` written as
+two `\u` escapes is not a character — it is two unpaired surrogates, and it encodes to nothing. The
+status glyphs this project uses are astral (🔵 is `U+1F535`), so **write them as the literal glyph or
+as a single `\U0001F535`**, never as a surrogate pair.
 
 It answers exactly five questions, in this order, and nothing else:
 

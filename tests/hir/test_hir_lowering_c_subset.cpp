@@ -6309,8 +6309,9 @@ TEST(HirLoweringCSubset, D5_5_EnumValueUseViaBareName) {
 }
 
 // Top-level enum with a TRAILING COMMA parses cleanly — the RED-ON-DISABLE guard
-// for the schema-compiler `recomputeAltExpectedSets` fixpoint (D-CSUBSET-STRUCT-
-// BODY-VARDECL-POSITION §2d). The enum body `enumerator (Comma enumerator?)*` is
+// for the schema-compiler `recomputeAltExpectedSets` fixpoint
+// (D-CSUBSET-STRUCT-BODY-VARDECL-POSITION
+// §2d). The enum body `enumerator (Comma enumerator?)*` is
 // an `optional` inside a `repeat` before the required `}` closer; without the
 // fixpoint the trailing-comma optional never learns `}` can follow, so the
 // SPECULATIVE body probe (`topLevelCompositeSpec`) hits P_NoAlternativeMatched
@@ -6543,8 +6544,8 @@ TEST(HirLoweringCSubset, D5_5_EnumHirTextRoundTrip) {
 // precondition: a breadth of representative c-subset programs each lower
 // to a HIR whose intrinsic registry is EMPTY. The day a frontend starts
 // emitting intrinsics this pin goes RED — forcing whoever adds it to
-// confront the frame-sensitivity gate (D-OPT7-INLINE-FRAME-SENSITIVE-
-// INTRINSIC) BEFORE the inliner can silently inline a frame-sensitive
+// confront the frame-sensitivity gate (D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC)
+// BEFORE the inliner can silently inline a frame-sensitive
 // one. A prose anchor alone is not load-bearing against a code change
 // cycles away; this RED-on-emit pin is.
 TEST(HirLoweringCSubset, NoShippedConstructLowersToIntrinsic) {
@@ -7265,8 +7266,8 @@ TEST(HirLoweringCSubset, PlainAssignAsValueStoresRhsCoercedToLvalueType) {
     }
 }
 
-// c91 (D-CSUBSET-ARRAY-DECAY-IN-COMPARISON + D-CSUBSET-ARRAY-DECAY-IN-
-// CONDITION, closing the D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY HIR surface):
+// c91 (D-CSUBSET-ARRAY-DECAY-IN-COMPARISON + D-CSUBSET-ARRAY-DECAY-IN-CONDITION,
+// closing the D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY HIR surface):
 // an ARRAY operand of a comparison, a condition, or `!` decays to Ptr<elem>
 // (C 6.3.2.1p3) THROUGH THE ONE coerce funnel — the tier-boundary pin at the
 // exact nodes the property lives on. Pre-c91 the operand kept its Array type
@@ -8314,8 +8315,8 @@ TEST(HirLoweringCSubset, InlineFunctionTypedParamEmitsItsOwnParamSlot) {
 // PIN 2 — C 6.2.1p4: a parameter name is scoped to its own declarator and has
 // NO linkage, so two functions may reuse one freely. Classifying the inline
 // spelling as a prototype ALSO re-homed the parameter symbol onto the FILE
-// scope (that is what the prototype path does, per D-CSUBSET-BLOCK-SCOPE-
-// PROTOTYPE), where two same-named parameters met as one symbol. MEASURED
+// scope (that is what the prototype path does, per D-CSUBSET-BLOCK-SCOPE-PROTOTYPE),
+// where two same-named parameters met as one symbol. MEASURED
 // before the fix: S0022 S_IncompatibleRedeclaration on `g`, pointing at the
 // OTHER function's parameter — legal C rejected outright.
 TEST(HirLoweringCSubset, SameNamedInlineFunctionTypedParamsStayFunctionLocal) {
@@ -8380,8 +8381,8 @@ TEST(HirLoweringCSubset, SameNamedInlineFunctionTypedParamsStayFunctionLocal) {
 // five, so the channel was always open and merely inert. That is why these pins
 // are structural (recipe map / import rows) and not "does it still build".
 //
-// ★ NOT the same defect as D-CSUBSET-PE-BARE-EXTERN-STILL-MSVCRT-AFTER-UCRT-
-//   FLIP. That one is the `extern`-KEYWORD path, which never consults
+// ★ NOT the same defect as D-CSUBSET-PE-BARE-EXTERN-STILL-MSVCRT-AFTER-UCRT-FLIP.
+//   That one is the `extern`-KEYWORD path, which never consults
 //   `suppressedShippedSymbolFor` at all, takes the language default library,
 //   and yields a CRT split that still loads. Different mechanism, different
 //   symptom; do not merge these pins with that one's.

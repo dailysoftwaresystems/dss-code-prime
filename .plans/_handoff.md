@@ -9,8 +9,8 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-23 — cycles **P14 … P28**. ★★★ **P28: THE GATE THAT COULD NOT OPEN, TWO LIVE SILENT MISCOMPILES NOBODY WENT LOOKING FOR, AND A HIGH DEFECT THAT SHIPPED BEHIND A GREEN 1539-TEST SUITE.** Thirteen lanes; balance **1036 → 1022, net −14** (closed 22, opened 8 — 6 created, 2 disclosed, 7 bookkeeping-only and net-neutral). ★★ **The operator ruling that reshaped it:** *"BUILD THE 128-BIT VR OPERAND. It is not gated — it is the GATE-OPENER, and treating it as an external precondition is what was turning a sequencing gate into a permanent one."* ✔MEASURED and it was right, with a mechanism attached: the row's trigger was **already TRUE and had been since `"w"` was declared**, and **the row's own stated instrument could never have observed it** — *assert the build does NOT emit `R_SpilledDueToPressure`* cannot become true until the fix lands, so it restated the remedy instead of detecting the trigger. A tripwire that can actually flip now exists, and operator Condition 4's marker — required 2026-08-21 and never built — is in `src/` and `tests/`. ★★ **Staging step 2 is UNREACHABLE, measured:** *"unaliased"* is a property of the SOURCE CONSTRUCT while the aliasing that breaks it is a property of the TARGET'S REGISTER FILE — all 32 arm64 d-views are already allocatable and every v-view aliases one — so steps 2 and 4 are one step, and the naive fix reproduced the double-count (`d7` carrying two live values at rc=0). ★★★ **TWO LIVE SILENT MISCOMPILES, neither on any queue:** the inline-asm operand move was CLASS-BLIND on both shipped targets (arm64 `mov x29, x15` reading integer 15 while the value sat in **d15**; x86_64 `mov %r13,%r13`, a no-op), and the frame-slot stride enumerated two classes instead of deriving, overlapping two 16-byte slots by 8 and reading past the top of the frame. ★★ **The branch's HIGH row closed** — and its scope was measured too narrow TWICE: the ASM/LIR tier carried both shapes too, and its *"zero shift on elf with no `--define`s"* caveat holds only for a SPLICE-FREE TU, so **every quote-including TU was shifted on every target**. ★★★ **AND A HIGH USER-FACING DEFECT SHIPPED BEHIND A GREEN 1539-TEST GATE:** `dss --compile main.c` could not find `#include "sibling.h"` beside it while `./main.c` could — an empty `parent_path()` read as *"no directory"* when it means the PROCESS WORKING DIRECTORY, in four copies of one derivation. ✔**The reason it survived: both example runners always hand `--compile` an ABSOLUTE path, so 3 of the 4 argument shapes a user can type are exercised by nothing in the corpus.** ⚠⚠ **And the step-10 audit paid for itself in one hour:** it returned MUST-NOT-COMMIT on three blockers, and running one of the four UNREGISTERED guard scripts by hand found **three lanes had each added a `std::abort()` to a test fixture**, breaching a ratchet, past a 1557/1557 green suite — because the only instrument that could see it was a script nothing ran. Four guards are registered now, including the balance guard's own self-test.
-**Branch:** `feature/c23-conformance-burndown-4` · **HEAD:** this commit (Cycle P28), branched clean from `main` at `cf27fe8b`. ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`.
+**Last updated:** 2026-08-24 — cycles **P14 … P29**. ★★★ **P29: THE ROWS P28 OPENED — AND MEASURING THEM KEPT EXPOSING THE INSTRUMENTS DOING THE MEASURING.** Nine lanes, five waves; balance **1022 → 1022, net +0** (closed 6, opened 6 — **2 created**, 4 disclosed, 2 bookkeeping-only, **1 BORN CLOSED**) — ⚠ the authority is `python scripts/check-anchor-balance/check-anchor-balance.py`, which prints every one of those numbers on every run; re-measure rather than re-quote this line. Gate **1580/1580** in 431.59 s, up from 1562. ★★★ **A TENTH FINDING ARRIVED AFTER THE AUDIT, FROM A REPAIR LANE'S OWN PROBE: AN INLINE-ASM TEMPLATE THAT PARSES BUT EMITS NO INSTRUCTION *ABORTED* THE COMPILER** — `__asm__ ("   ")` → rc=127, `dss::Lir fatal: LirBuilder::lastInst: no instruction has been appended`, no code and no source position, on five shapes gcc 13.3.0 compiles and RUNS (a `/* */` comment among them, so not an exotic input). ★ **THE CAUSE WAS SHADOW STATE AND THE AUTHOR'S OWN COMMENT NAMED IT BEFORE IT BIT** — *"`LirBuilder` exposes no count, so the empty case is TRACKED rather than probed"*: the tracking `bool` MIRRORED the arena, the assembly engine bypasses the site that maintained it, so the asm path re-derived it FROM THE SHAPE OF THE INPUT on an argument that ENUMERATED its exceptions — and a comment, whitespace and a bare newline were not in the enumeration. Fixed by ADDING the missing count (`LirBuilder::hasAnyInst()`) and DELETING both the mirror and the proxy; ✔it is a crash and NOT a miscompile, measured (barrier intact, two loads no CSE, release image byte-IDENTICAL before/after). ★★ **AND THE SAME SPECIES REACHING THE OPERATOR: 71 shipped diagnostics cite a row that has CLOSED** — sized, not swept, and P30's item 1. ★★ **FOUR of the five addressable P28 openings are CLOSED — not five:** `D-PLANS-GATED-ROWS-NAME-NO-OPENER` is still 🔵 OPEN, it is the one row whose debt this cycle GREW, and it is P30's item 1. ★★★ **FIVE OF THE NINE LANES ENDED UP FIXING THE TOOLS THAT JUDGE THIS PROJECT:** `check-anchor-balance`'s `split_row` read an ESCAPED PIPE as a column separator (**161 of 2,252 rows mis-split**) — found by TWO INDEPENDENT LANES from opposite directions, and neither could have concluded it alone; `is_gated` read a PHRASE rather than the operator's rule and was blind to **98** rows the rule condemns, then after its first widening enumerated 2 glyphs where 11 lead a cell and recognised **one spelling of six** for *trigger fired*; `run-gate.ps1` silently swallowed `-V`/`-v`/`-D` — **the exact flag this repo uses to prove a guard runs its arms** — with rc 0 and the success witness still matching; `check-ninja-deps` exited 0 on a directory that does not exist while the gate reference told every cycle to invoke it there; and `check-plan-citations --write` could RAISE the ratchet ceiling it exists to lower. ★★ **AND A GUARD REGISTERED BY AN ENTRY THAT PASSES NO FLAG CAN EXECUTE ZERO ARMS** — ✔`no_abort_in_tests_guard` ran **0** self-test arms at HEAD and now runs **16** (printed by the registered no-argument form itself), with no `CMakeLists.txt` change: P28 registered four unregistered guards, P29 found that registration alone does not mean the guard checks anything. ★★★ **TWO LIVE SILENT MISCOMPILES, BOTH FOUND BY BYTE-DIFFING AGAINST THE REFERENCE:** an x86 encoding variant with no `resultSlot` emitted register field 0, so `movw $42` into `%cx`/`%dx`/`%bx`/`%si`/`%r15w` all produced the identical bytes writing **`%ax`** — rc=0, no diagnostic, **and the corpus example was GREEN through it**; and a `"=m"` lowering its operand's VALUE where its ADDRESS belongs compiles clean and dies at run time. ★★ **CONFORMANCE:** `"=m"`/`"+m"`/`"=&m"` RUN on both targets with **zero functional lines** changed in `mir_to_lir.cpp`, and x86_64 went from **0 of 86** probed memory/sub-native spellings compiling to **83**, 58 byte-identical to GNU as. ⚠⚠ **ONE DIVERGENCE IS NOW A §B IN FRONT OF THE OPERATOR:** bare `%N` means a different register width in DSS than in gcc/clang — **on aarch64 only**, x86_64 agrees — so *"the reference rule"* is a PER-TARGET property and neither fix arm may be an architecture branch. ★★ **The wrapped-anchor arc CLOSED: 290 sites / 145 files → 0**, and the defect is worse than the row said — **a wrap does not only make an id disappear, it MINTS one** (`D-TO-PINNED-ARCHIVE` is the trailing `D` of the word `GENERALISED` joined to the next line), and **six anchor ids had ZERO greppable citation anywhere in the repository** before this pass.
+**Branch:** `feature/c23-conformance-burndown-4` · **HEAD:** this commit (Cycle P29). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`.
 
 ---
 
@@ -276,7 +276,7 @@ commit that lands it, and never delete a ticked row.
       ⚠ Two rows the operator's ruling settled are recorded so they are not re-litigated: the ⛔ stays
       on the ALLOCATOR (not the operand), and its trigger is now known to have been **TRUE all along**
       with an instrument that could not see it.
-- [ ] **P29 — THE ROWS P28 OPENED, FIRST, per the standing order refined 2026-08-20.** Re-derive each
+- [x] **P29 — THE ROWS P28 OPENED, FIRST, per the standing order refined 2026-08-20.** Re-derive each
       from the REGISTRY at the pick; this list is a pointer, not a verdict.
       1. **`D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP`** — ✔**239 wrap sites
          across 126 governed files**, each a REGISTERED id split across a line break and therefore
@@ -298,7 +298,66 @@ commit that lands it, and never delete a ticked row.
       and `D-TARGET-ARM64-W-CONSTRAINT-BINDS-A-CLASS-NO-C-VALUE-EVER-LIVES-IN` (both **§B**, and the
       lane that found the first recommends deciding them **together with the allocator arc**, since
       an aliasing-aware allocator needs the same verb).
-- [ ] **P29+ — THE REST OF WHAT P21 AND P22 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
+      ✅ **DONE 2026-08-24 — WITH ONE ADDRESSABLE ROW LEFT OPEN, ROLLED INTO P30 PER THE STANDING
+      ORDER REFINED 2026-08-20.** **FOUR of the five** addressable P28 openings are CLOSED;
+      `D-PLANS-GATED-ROWS-NAME-NO-OPENER` is NOT, and it is item 1 of the P30 entry below.
+      Balance at the lock: 1022 → 1022, net +0; gate 1580/1580 — ⚠ re-measure with
+      `python scripts/check-anchor-balance/check-anchor-balance.py` rather than re-quoting this line.
+      Detail in §0.00000000000000000000000000000000.
+- [ ] **P30 — THE ROW P29 LEFT OPEN, THEN THE ROWS P29 OPENED, per the standing order refined
+      2026-08-20.** P29 opened **2 created** rows and 3 disclosed **and left one of its own queued
+      rows open**; re-derive each from the REGISTRY at the pick — this list is a pointer, not a
+      verdict.
+      1. ★★ **`D-PLANS-GATED-ROWS-NAME-NO-OPENER` — THE ADDRESSABLE P28 ROW P29 DID NOT CLOSE, AND
+         THE ONE WHOSE DEBT IT GREW.** ✔MEASURED, both predicates over the same tree: the base-ref
+         `is_gated` finds **30** openerless gated rows, the corrected one **70**
+         (`python scripts/check-anchor-balance/check-anchor-balance.py` prints the live figure every
+         run). The jump is the instrument finally seeing what the rule always condemned, not debt
+         P29 created. ⚠ The row still quotes P28's `59`, measured at `cf27fe8b` under the old
+         predicate — re-measure before acting on it. **Blocker (NAMED, and it is the row's own):**
+         naming an opener is a judgement about each row's subject, so a lane that guessed 70 openers
+         would be manufacturing dependencies. ⇒ burn it down in ratcheted batches, or reclassify the
+         rows that no row can ever open as NEGATIVE RESULTS, which is what the REFUTED-DESIGN rows
+         already do correctly.
+      2. ⛔ **`D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE` — §B, NOT PICKABLE without an
+         operator word.** Both arms are sized in the row. ⚠ Option (B) is NOT the cheap arm:
+         diagnosing the divergence needs the same per-target natural-width declaration that FIXING
+         it needs, and (B) can never make `char`/`short` work on aarch64 at all. ⚠ The row's blast
+         radius is a MEASUREMENT, not a constant: re-run
+         `clang-19 --target=<t> -fsyntax-only -Wasm-operand-widths` before quoting it — a second
+         example (`c_inline_asm_memory_arithmetic`, 19 aarch64 references) already diverges beyond
+         the one file the row enumerates.
+      3. ⛔ **`D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES` — §B, the SECOND row P29
+         created, named by its own independent step-10 audit.** gas assembles `mov $0x10000, %cx`
+         and `mov $-32769, %cx` (the second with NO diagnostic at all); DSS refuses both. The two
+         rules this project lives by point in opposite directions here — §A.3b says match a working
+         reference, fail-loud says never silently narrow — so **no lane may resolve it**. ⓘ Whichever
+         arm is taken, the test comment must stop calling DSS's own window a conformance fact.
+      4. **`D-GATE-FOUR-PYTHON-PRIMARIES-REACH-UTF-8-TOO-LATE-OR-NEVER`** — 🔵 disclosed;
+         `check-retyped-closed-sets` and `check-shell-portability` reconfigure only inside `main()`,
+         `refresh_landing_log` and `sqlite-runtime-bench` never. Sized: the same five-line block each,
+         plus deleting the inventory entry. Latent today, not live.
+      5. **`D-GATE-WALL-CLOCK-GUARD-CMAKE-COMMENT-DESCRIBES-A-RATCHET-THAT-IS-EMPTY`** — 🔵
+         the root `CMakeLists.txt` comment is stale three ways (48 literals → 0; "the inventory is
+         DEBT" → empty; "23 matcher arms" → 35). Replacement text is in the row.
+      6. **`D-PLANS-OPT7-INLINE-LEGALITY-GATE-ROW-DECLARES-NO-TRIGGER-OF-ITS-OWN`** — 🔵 one
+         cell (`Trigger: none`, the escape this cycle built). ⚠ An instrument-side heuristic was
+         considered and REFUSED: it fixes one of the row's two hits and would exonerate genuine gates.
+      ★★ **THEN THE CENSUS BACKLOG, which is the real work and is already enumerated:**
+      **16 rows needing an OPERATOR DECISION** and **16 INCONCLUSIVE**, both listed by the gated-row
+      census. ⚠ The class-4 list is mostly SHIP decisions (an ILP32 target, a big-endian target,
+      static Mach-O, a second language) — including
+      `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS`, **a MUST-NOT-BUILD ruling standing over
+      a trigger the row itself records as ALREADY TRUE.**
+      ⚠ **The openerless-gated-row population is item 1 above and is NOT restated here** — a figure
+      written twice is a figure that goes stale in one place first. Read it from
+      `python scripts/check-anchor-balance/check-anchor-balance.py`, which prints it every run.
+      ⚠ **A STRUCTURAL GAP IN THE OPERATOR'S OWN RULE, found by the census and not patched around:**
+      five rows wait on something schedulable that has **no ROW** — the OPT5 LIR address-mode phase,
+      the separate-compilation driver, Plan-16 CS1, the `gui` profile. Plans 16/22/27 schedule these as
+      PHASES and declare no anchor rows, so *"name the ROW"* cannot be satisfied without minting
+      placeholders. Classified (4) and the DECISION named instead.
+- [ ] **P30+ — THE REST OF WHAT P21 AND P22 FOUND, in registry order.** Operator instruction 2026-08-20: *"start a
       /loop using /dss-cycle each iteration to address ALL anchors found in _handoff §0."* Re-derive each pick
       from the REGISTRY, never from this list.
 - [x] **OPERATOR CALL — ✅ FILED 2026-08-19: <https://sqlite.org/bugs/forumpost/97cd29ca44624113c73b30f5d2504729e6ffc5c5ebcba137078ea1a868cd97c9>.**
@@ -405,6 +464,213 @@ second pattern beside the one P23 built and pinned.**
   `examples/*/*/expected.json` (**613** examples, hoisted to the root `CMakeLists.txt` in P24); a
   `"[=+]?w"` constraint search over `.c/.h/.s/.S/.json` under `examples/` returns **0 files**, and the
   same search over the sqlite real-example tree returns **0**. No corpus example exercises `"w"`.
+
+---
+
+## 0.00000000000000000000000000000000 CYCLE P29 — THE ROWS P28 OPENED, AND WHAT MEASURING THEM FOUND UNDERNEATH
+
+**Nine lanes across five waves, then a step-10 audit, then a repair lane whose own probe found a live
+abort. Balance 1022 → 1022, net +0** (closed 6, opened 6 — **2 created**, 4
+disclosed-pre-existing, 2 bookkeeping-only, **1 born closed**). Gate **1580/1580** in 431.59 s, up from
+1562. ⓘ The net is +0 rather than −1 because the last finding was SIZED HONESTLY rather than
+written small: 71 operator-facing diagnostics cite a closed row, which is a cycle of work and so a
+disclosed row — debt that already existed, which the balance gate exempts — not a number massaged
+to keep a headline.
+⚠ **THE BALANCE FIGURE IS THE INSTRUMENT'S, NOT THIS PARAGRAPH'S** — run
+`python scripts/check-anchor-balance/check-anchor-balance.py`, which prints every one of those
+numbers on every run. It is quoted here only so a reader knows what it said at the lock; the first
+draft of this section quoted `1022 → 1020, net −2, opened 4, 1 created` in four places and every one
+of them erred in the direction that flattered the cycle.
+
+**The pick was the standing order, unmodified:** the operator's argument was *"proceed to next cycle
+(which must also include this `D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP`)"*,
+and §0's P29 entry already said *the rows P28 opened, first*. Re-derived from the REGISTRY at HEAD:
+**9 rows carried a P28 date and were still OPEN** — 5 addressable, 4 explicitly not (two §B, one ⛔
+awaiting an operator word, one trigger-gated with its opener named). ★★ **FOUR of the five
+addressable ones are closed — NOT five.** The fifth,
+`D-PLANS-GATED-ROWS-NAME-NO-OPENER`, is still 🔵 OPEN in the registry, and it is the one row whose
+debt this cycle GREW (the corrected `is_gated` reports 70 openerless gated rows where the base-ref
+predicate over the same tree reports 30). It rolls into P30 as an addressable item rather than being
+dropped: **an open row that no queue entry names is invisible.**
+
+### ★★★ THE DESIGN AUDIT EARNED ITS PLACE, AND ONE OF ITS SEVEN BLOCKERS WOULD HAVE SUNK THE GATE
+
+Verdict PROCEED WITH CORRECTIONS; 7 blockers and 8 corrections, all folded into the briefs before any
+lane launched. The three that changed outcomes:
+
+- **B1 — every brief omitted the mandated "ANCHOR *AND CLOSE*" paragraph.** ✔The measured precedent
+  is four lane briefs producing 22 open rows. The audit's arithmetic put the cycle at **≤3 plausible
+  closures against five lanes told only to anchor**, i.e. the balance gate would have refused. Pasted
+  verbatim into the common brief along with the *"is this the work I was sent to do?"* test.
+- **B2 — lane C's gate regex `-R "examples"` matches ZERO `integrated_tests/` entries.** That lane
+  would have reported green having never executed the CLI-subprocess half of its own deliverable —
+  precisely the silent-harness bug its own brief warned it about.
+- **B4 — the `"=m"` refusal is keyed on `OperandKindFilter::MemBase`, the FORM, deliberately not the
+  letter**, so `"+m"` rides the same predicate into `tieAsmReadWriteOperands`, which collapses a
+  read-write operand onto ONE register that a memory operand does not have. Lifting it naively is a
+  silent miscompile, not a diagnostic.
+
+⚠ **Two of the orchestrator's own claims were refuted by the audit:** `239 wrap sites / 126 files`
+does not reproduce (it got 249/128; the guard later measured **290/145**), and the ownership map was
+**not** disjoint — 20 of one lane's 46 wall-clock sites sat in `tests/program/**`, owned outright by
+another. The wave boundary was right *by accident*, and the reason written into the brief was wrong.
+
+### ★★★ THE CYCLE'S REAL SUBJECT TURNED OUT TO BE THE INSTRUMENTS
+
+Five of the nine lanes ended up fixing the tools that judge this project, because measuring the
+queued rows kept exposing the thing measuring them.
+
+- **`check-anchor-balance`'s `split_row` read an escaped pipe as a column separator**, in a registry
+  whose own authoring contract escapes literal pipes: **161 of 2,252 rows mis-split**, feeding
+  `is_mismarked_closure` the tail of the status cell instead of the closing-work cell. ★★ **TWO
+  INDEPENDENT LANES FOUND THE SAME ROOT CAUSE FROM OPPOSITE DIRECTIONS** — one by censusing rows, the
+  other by having its own census disagree with the design audit's and tracking down why. **Neither
+  could have concluded it alone**: the first would have had a number nobody could check, the second a
+  disagreement it might have written off. That convergence is why the two were deliberately forbidden
+  to read each other.
+- **`is_gated` read a PHRASE, not the operator's rule.** It matched three literal strings in the
+  STATUS cell only, never the ⛔/⏳ glyphs and never the REMEDY cell where the house style actually
+  puts `⏳ TRIGGER:`. ✔**98 rows the rule condemns were invisible to it**; 3 it accused declare no gate
+  at all, one of them on the *negated* form *"no longer merely trigger-gated"*. And after the first
+  widening: it enumerated **2** glyphs where **11** lead a closing-work cell, and `TRIGGER_FIRED`
+  recognised **one spelling of six** — the un-adverbed `Trigger: FIRED` is the registry's COMMONEST
+  spelling of the claim and matched NOTHING, while `ALREADY FIRED` was the only spelling that hit.
+  ⚠ **THE PER-SPELLING FIGURES FIRST WRITTEN HERE (`317` vs `84`) DO NOT REPRODUCE, AND THE
+  MECHANISM IS INSTRUCTIVE:** a greedy `Trigger:.*FIRED` over whole rows is ~395, and the split
+  over-attributed nearly all of it to the first bucket. ✔RE-MEASURED over every recognized
+  deferral-table row in the worktree (the guard's own harvester, case-insensitive, open and closed):
+  `Trigger: FIRED` **105**, `ALREADY FIRED` **77**. **The conclusion is unchanged; the count was
+  never what carried it** — which is the whole of
+  [[D-TEST-CMAKE-COMMENT-QUOTES-A-CORPUS-COUNT-THE-TEST-IT-REGISTERS-FORBIDS]] restated against the
+  section that anchored it. ⚠ The same unreproducible split is still written into
+  `scripts/check-anchor-balance/check-anchor-balance.py`'s comment above `TRIGGER_FIRED`; that file
+  is not this section's to edit and the correction is REPORTED, not smuggled.
+- **A guard registered by a ctest entry that passes no flag can execute ZERO arms.** ✔MEASURED:
+  `no_abort_in_tests_guard` ran **0** self-test arms at HEAD and now runs **16**, with no
+  `CMakeLists.txt` change — the arms are printed by the registered no-argument form itself
+  (`python scripts/check-no-abort-in-tests/check-no-abort-in-tests.py`), so the number is
+  re-derivable and this line is not its source. ⚠ The first draft here said 15, counted by hand.
+  And `check-plan-citations`' `main` returned before its self-test whenever the tree reddened,
+  so in a shared tree its self-test had not run once all session. **P28 registered four unregistered
+  guards; P29 found that registration alone does not mean the guard checks anything.**
+- **`run-gate.ps1` silently swallowed `-V`, `-v` and `-D`** out of the pass-through array — rc 0,
+  success witness still matching. ★ `ctest -V` is precisely the flag this repo uses to prove a
+  registered entry executes its arms, so the one instrument for *"did this guard run anything"* was
+  itself being discarded, and the wrapper's footer printed the command with the flag ALREADY GONE.
+  ⚠⚠ **THE FIRST DIAGNOSIS WAS HALF RIGHT AND THE HALF IT NAMED DID NOT MATTER:** it blamed
+  `[CmdletBinding()]` and sized the fix as "delete one line". ✔Applied and re-measured — `-V` was
+  **still** dropped, because a `[Parameter()]` attribute on ANY parameter makes a script advanced on
+  its own. **A row whose remedy does not work is worse than an open row**, because the next reader
+  applies it and believes the defect is fixed. ✔The `.sh` twin uses `"$@"` and never had it: a live
+  `.sh`/`.ps1` behavioural divergence inside the tool whose own header names divergence as its
+  subject.
+- **`check-ninja-deps` exited 0 on a directory that does not exist**, and the gate reference told
+  every cycle to invoke it on `build-dbg` — a flat-layout path gone since the one-root migration. ⇒
+  the build-verifiability check had been running against nothing and reading rc=0 as a pass.
+- **`check-plan-citations --write` could RAISE a ratchet ceiling** — the command its own failure
+  message tells you to run after a red. ✔Replaying every revision of the inventory across 7 commits:
+  **no ceiling has ever been raised without the guard being widened in the same change** (17 raises in
+  one commit, all reproduced exactly by re-running that commit's census over the prior tree). The
+  claim is now measured rather than assumed — but nothing in the tool could have told a widening from
+  a regression.
+
+### ★★★ TWO LIVE SILENT MISCOMPILES, BOTH FOUND BY BYTE-DIFFING AGAINST THE REFERENCE
+
+- **A value-producing x86-variable encoding variant with no `resultSlot` emitted register field 0.**
+  `movw $42, %cx`, `%dx`, `%bx`, `%si` and `%r15w` all produced the identical `66 c7 c0 …` — every one
+  of them writing `%ax`. rc=0, no diagnostic, **and the corpus example was GREEN through it**. Found
+  only by a byte diff against gas. The loader now refuses the shape (scoped to the ENCODING SHAPE, not
+  a target), with both exemptions measured against the shipped tables and pinned.
+- **`"=m"` lowering the operand's VALUE where its ADDRESS belongs** compiles rc=0 with no diagnostic
+  anywhere and dies at run time with `0xC0000005`. Only EXECUTION sees it — which is why the corpus
+  example asserts a result rather than the absence of an error.
+
+### ★★ THE CONFORMANCE WORK — and one divergence that is now a §B in front of the operator
+
+`"=m"`, `"+m"` and `"=&m"` compile, link and **RUN** on both shipped targets at debug and release —
+with **zero functional lines** changed in `mir_to_lir.cpp`, because a memory-form operand written in
+the output section belongs in `MirAsmDescriptor::inputs`: its one MIR operand IS its address, and it
+produces no result piece. Then x86_64 gained memory-destination arithmetic, the 8/16-bit ALU family,
+a 2-byte immediate slot and 11 extending-move spellings: **83 of 86 probed spellings now compile**
+where 0 did, 58 byte-identical to GNU as 2.42 and the rest re-decoding to the same instruction text.
+The 3 still refused are refused by gas too — conformance running in both directions.
+
+⚠⚠ **AND `%N` MEANS A DIFFERENT REGISTER WIDTH IN DSS THAN IN THE REFERENCES — ON aarch64 ONLY.**
+✔MEASURED from emitted code: on aarch64 gcc and clang substitute bare `%N` as the 64-bit `x` register
+regardless of operand type, while DSS substitutes at the operand's own type width; on **x86_64 all
+three agree with DSS**. So *"the reference rule"* is a PER-TARGET property, and neither fix arm may be
+an architecture branch. ★ The shape that makes this more than portability:
+`long long m; int v; __asm__("str %1, %0" : "=m"(m) : "r"(v))` — **DSS exits 1** (4-byte store, high
+half stale), **gcc exits 42**, and neither compiler says a word. ★ **BLAST RADIUS — MEASURE IT, DO
+NOT RE-QUOTE IT.** The detector is the row's own and it is fail-closed:
+`clang-19 --target=<t> -fsyntax-only -Wasm-operand-widths`, counting
+*"value size does not match register size"* and refusing to read a zero out of a file whose parse rc
+is not 0. ✔At the P29 lock it found **8** divergent operand references in
+`examples/c-subset/c_inline_asm_memory_output_operand/main.c` and **0** anywhere on x86_64. ⚠⚠ **THE
+`ONE FILE` HALF OF THAT SENTENCE IS ALREADY FALSE AND THAT IS THE POINT:** the same detector re-run
+over the worktree finds **a second example diverging, `c_inline_asm_memory_arithmetic`, with 19**
+aarch64 references, because its aarch64 arms bind `int` operands. **The universal claim is what
+survives — every inline-asm example whose aarch64 arms use `long`/`long long` is unaffected, and
+every one that binds a narrower type diverges** — so state the rule, run the detector, and never
+trust the integer. ⇒ `D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE`, **§B, both arms sized,
+and option (B) is not the cheap one**: diagnosing the divergence needs the same per-target
+natural-width declaration that fixing it needs, and (B) can never make `char`/`short` work on aarch64
+at all.
+
+### ★★ THE WRAPPED-ANCHOR ARC CLOSED, AND THE DEFECT WAS WORSE THAN THE ROW SAID
+
+Detector FIRST (registered, 35 self-test arms, fixtures synthesized at run time so nothing on disk is
+a deliberate wrap), then the un-wrap in a quiet tree: **290 sites across 145 files → 0**, ceiling set
+empty. ★★★ **A WRAP DOES NOT ONLY MAKE AN ID DISAPPEAR — IT MINTS ONE.** ✔Un-wrapping four sites in
+this file removed **five phantom keys** from the harvest; the sharpest, `D-TO-PINNED-ARCHIVE`, is not a
+truncation of anything — it is the trailing `D` of the word `GENERALISED` joined to `-TO-PINNED-ARCHIVE`.
+✔And the row's central claim, finally measured: **six anchor ids had ZERO greppable citation anywhere
+in the repository** and now have one. ⚠ **The independent review of the 288-edit log changed the
+result**: six results ended a line on the file's own `--` with the next opening `D-SOMETHING` — the
+defect's exact silhouette, invisible to every guard — so the whole pass was reverted to its byte
+copies and re-run three times under four new rules.
+
+### ⚠ WHAT THIS CYCLE OWES THE NEXT ONE, and it is a queue, not a mood
+
+1. **`D-DIAG-OPERATOR-FACING-DIAGNOSTIC-CITES-A-CLOSED-DEFERRAL-ROW` — the row THIS cycle opened, so
+   it takes slot 1 by the standing order's own refinement, not by preference.** ✔MEASURED against the
+   registry's own CLOSED set: **476** anchor ids sit inside C++ string literals under `src/`, **271**
+   name a CLOSED row, and **72** of those are inside a call to a reporting entrypoint — **71 after the
+   one instance adjudicated and fixed in P29**. ★★★ **THE HARD HALF IS THAT THE REFUSAL CAN BE REAL
+   WHILE THE ATTRIBUTION IS FALSE**, which is why no sweep can do this: the fixed instance refused
+   correctly and deliberately, and only the row it blamed had moved. Citing a row as PROVENANCE stays
+   legitimate after it closes; citing it as a LIVE BLOCKER does not — and only reading the site tells
+   them apart. ⚠ **DO NOT CLOSE THIS BY WIDENING `check-stale-refusal-citations`**: that guard demands
+   a persistence word near a refusal word, these carry none, and it is CORRECT to stay silent —
+   widening it re-opens the false-positive surface its six measured narrowings (147 → 9) exist to
+   close. The natural close is the census productionised as its own ratcheted guard, ratchet starting
+   at the measured 71 so no NEW instance can land during the burn-down.
+2. **`D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE`** — §B, in front of the operator, with both
+   arms sized. Nothing proceeds on it without a word.
+3. **16 rows that need an operator decision and 16 that are INCONCLUSIVE**, both enumerated by the
+   gated-row census. The class-4 list is mostly SHIP decisions (an ILP32 target, a big-endian target,
+   static Mach-O, a second language) — ⚠ including
+   `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS`, **a MUST-NOT-BUILD ruling standing over a
+   trigger the row itself records as ALREADY TRUE.**
+4. **`D-PLANS-GATED-ROWS-NAME-NO-OPENER` IS STILL OPEN — the one addressable P28 row this cycle did
+   not close, and the one whose debt it GREW.** ✔MEASURED, both predicates over the SAME tree so the
+   predicate change is isolated from the registry change: the base-ref `is_gated` finds **30**
+   openerless gated rows, the corrected one **70**
+   (`python scripts/check-anchor-balance/check-anchor-balance.py` prints the live figure on every
+   run — read it there, not here). That jump is the instrument finally seeing what the rule always
+   condemned, **not debt this cycle created** — and the arm is DEBT-reporting, not fatal. ⚠ The row
+   itself still quotes P28's `59`, measured at `cf27fe8b` under the old predicate; the registry is
+   another lane's file this cycle, so that staleness is REPORTED here rather than edited.
+5. **A structural gap the census found in the operator's own rule:** five rows wait on something
+   schedulable that has **no ROW** — the OPT5 LIR address-mode phase, the separate-compilation driver,
+   Plan-16 CS1, the `gui` profile. Plans 16/22/27 schedule these as phases and declare no anchor rows,
+   so *"name the ROW"* cannot be satisfied without minting placeholders. Classified (4) and the
+   DECISION named instead of a row invented.
+
+ⓘ **An incident recorded rather than buried:** one lane ran `git stash push` inside a compound command
+by mistake and stashed the whole shared tree, recovering it immediately with byte-for-byte
+verification. Nothing was lost and no other lane was live — but a stash in a nine-lane uncommitted
+tree has no commit to recover from, and the next brief says so.
 
 ---
 
@@ -2528,8 +2794,8 @@ is correct.** The `r15`-as-sixth-argument reading is retracted for the second an
 
 ## 0.000000000000000 ★★★ CYCLE P16 — THE VERDICT LINE NOW SAYS *WHICH* KIND OF "NO ORACLE" IT MEANS
 
-Two rows closed, **net −1**, and the cheap half of the cycle is the lesson: `D-HARNESS-FAILING-REFERENCE-ORACLE-
-COLLAPSES-TO-NO-ORACLE` had been **cited as a closing dependency since 2026-08-18 and never written**. A
+Two rows closed, **net −1**, and the cheap half of the cycle is the lesson: `
+D-HARNESS-FAILING-REFERENCE-ORACLE-COLLAPSES-TO-NO-ORACLE` had been **cited as a closing dependency since 2026-08-18 and never written**. A
 `[[wikilink]]` to a non-existent anchor is invisible to every guard here — the anchor-balance instrument counts
 ROWS, and a citation is not a row. Worth a sweep.
 
@@ -2589,8 +2855,8 @@ orphaned copy, which is the worst of the set: it answers repo-wide greps and not
 
 **The queue re-derivation paid for itself again**: the C7 "provider conversions" the handoff queued
 were ALREADY DONE — the pinned-archive-everywhere conversion landed 2026-08-10 in `3e86a187`
-(PR #48) and three rows sat stale-open for 9 days (`D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-
-GENERALISED-TO-PINNED-ARCHIVE`, `D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER` —
+(PR #48) and three rows sat stale-open for 9 days (`
+D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE`, `D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER` —
 both closed this cycle; the "PS1 dispatch arm" sub-row never existed under the name I queued).
 What remained was the ROW'S OWN STANDARD: *"the closing test is per-cell and by EXECUTION"*.
 
@@ -2670,11 +2936,11 @@ below; its LOW stale-citation finding folded same-cycle; MH_HAS_TLV_DESCRIPTORS 
 structurally at the shared flag site (both polarities pinned exec-side).
 
 ⚠ **The Mac window is STILL OPEN and the queue for it is NOT empty** — remaining Mac-gated work,
-next window: the C7 provider conversions (`D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-
-ONE-DRIVER` PARTIALLY CLOSED: generalize `ubuntu-ports` onto pinned-archive + declare routes for
+next window: the C7 provider conversions (`
+D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER` PARTIALLY CLOSED: generalize `ubuntu-ports` onto pinned-archive + declare routes for
 `elf64-x86_64`/`pe64-x86_64` + the `.ps1` dispatch arm for elf64-arm64 — the four red BUILD-matrix
-cells) — then validate the macOS×{elf64-x86_64, pe64-x86_64} cells ON the Mac. `D-LK3-DYLIB-WEAK-
-EXPORT`'s validation also wants the Mac (implementation is format-side).
+cells) — then validate the macOS×{elf64-x86_64, pe64-x86_64} cells ON the Mac. `
+D-LK3-DYLIB-WEAK-EXPORT`'s validation also wants the Mac (implementation is format-side).
 
 **NEXT — the loop continues:** (1) the C7 provider conversions above while the Mac is up;
 (1b) the TLS-dylib CORPUS ARM (audit residual): a two-file `_Thread_local` dylib + client

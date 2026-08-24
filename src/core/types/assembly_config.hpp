@@ -479,6 +479,41 @@ struct AsmInstructionSpelling {
     // operands: a disagreement is refused, in both directions, exactly as gas
     // rejects `movl %rax,%ecx` and `movl %eax,%rcx`.
     std::optional<std::uint32_t> width;
+    // ★★★ OPTIONAL — THE DESTINATION'S WIDTH, WHEN THIS SPELLING WRITES A
+    // RESULT WIDER (OR NARROWER) THAN THE VALUE IT OPERATES ON.
+    // D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE.
+    //
+    // ⚠ ABSENT IS NOT "64" AND NOT "UNKNOWN" — it is "this spelling has ONE
+    // width", which is true of every ordinary instruction and is why the
+    // single-width model held for so long. `width` then governs BOTH sides
+    // and the lowering requires every data register to agree, which is the
+    // guard that refuses `movl %rax, %ecx` (✔MEASURED, GNU as 2.42 refuses
+    // it too — `operand type mismatch`).
+    //
+    // ★★ A WIDTH-EXTENDING MOVE IS TWO WIDTHS IN ONE INSTRUCTION BY
+    // DEFINITION and no amount of relaxing the agreement check can express
+    // it — relaxing would ACCEPT `movl %rax, %ecx`, trading one conformance
+    // gap for its mirror image. PRESENT therefore SPLITS the check by ROLE
+    // rather than weakening it: the destination-position register must be
+    // exactly `destWidth`, every source register exactly `width`, and any
+    // other pairing is refused as loudly as before. `movzbl` declares
+    // width 8 / destWidth 32, so `movzbl %cl, %ecx` is accepted and
+    // `movzbl %cl, %rcx` is refused — which is precisely gas's own answer
+    // to both (✔MEASURED, 2.42).
+    //
+    // ★ IT IS A DIALECT FACT FOR THE SAME REASON `width` IS: WHERE the two
+    // widths are written is the dialect's business. AT&T bakes both into the
+    // mnemonic (`movzbl` = byte source, long destination); an ISA that spells
+    // the pair in its REGISTER names (`sxtb x0, w0`) declares the same two
+    // numbers on its own row and the engine reads them identically. The
+    // TARGET side needs nothing new: an instruction that writes a different
+    // width is a different machine instruction, so it is a different opcode
+    // in `opcodeNames`, exactly as `load` and `load_subreg` already are.
+    //
+    // ⚠ A row declaring `destWidth` MUST declare `width` too — a destination
+    // width with no source width states half a fact, and the half it omits is
+    // the one the LIR instruction carries. The loader refuses it.
+    std::optional<std::uint32_t> destWidth;
     // OPTIONAL: the `TargetCondCode` spelling this mnemonic carries (`je` →
     // `"eq"`, arm64 `b.eq` → `"eq"`). EMPTY means the row declares none.
     //

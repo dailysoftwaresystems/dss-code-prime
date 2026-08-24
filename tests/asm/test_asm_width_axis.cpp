@@ -1651,27 +1651,82 @@ TEST(FloatWidthAxisArm64, CsetFloatCondsInvertNibbleAtBit12) {
 // half-word memory forms (D-LIR-INT-MEMORY-WIDTH-EXACT — STURH/LDURH, 0x66
 // mov / movzx r16); an OUT-of-vocabulary width (e.g. 24) is still a load-time
 // reject — never a silent match-nothing variant.
-TEST(WidthAxisLoader, GuardWidthSixteenAcceptedOutOfVocabularyRejected) {
-    auto okWidth16 = test_support::mutateShippedTargetSchemaDoc(
-        "x86_64", [](nlohmann::json& doc) {
-            for (auto& op : doc["opcodes"]) {
-                if (op.value("mnemonic", "") != "neg") continue;
-                op["encoding"]["variants"][0]["guard"]["width"] = 16;
-            }
-        });
-    EXPECT_TRUE(okWidth16.has_value())
-        << "guard width 16 is now in the closed width vocabulary "
-           "(D-LIR-INT-MEMORY-WIDTH-EXACT half-word memory forms)";
+// ⚠⚠ THE MUTATION VEHICLE IS CHOSEN BY SEARCH, NOT BY NAME, AND THAT IS A
+// REPAIR RATHER THAN A CONVENIENCE. This test used to retype `neg`'s FIRST
+// variant to width 16 — and on 2026-08-23 `neg` GAINED a real width-16 variant,
+// so the retype produced a DUPLICATE (same operandKinds, same width) and the
+// document was refused by the SHADOWING rule. The test then read that refusal as
+// "width 16 is not in the vocabulary" and failed, having silently stopped
+// testing the vocabulary at all. ⇒ pick a victim whose siblings do NOT already
+// declare width 16, and FAIL LOUD when no such victim exists rather than
+// asserting about whichever opcode happened to be first.
+namespace {
 
-    auto badWidth = test_support::mutateShippedTargetSchemaDoc(
-        "x86_64", [](nlohmann::json& doc) {
-            for (auto& op : doc["opcodes"]) {
-                if (op.value("mnemonic", "") != "neg") continue;
-                op["encoding"]["variants"][0]["guard"]["width"] = 24;
+// The (opcode, variant) index of the first x86-variable variant that can be
+// retyped to width 16 without colliding with a same-operandKinds sibling.
+// Returns false when the shipped table offers none.
+[[nodiscard]] bool findRetypableVariant(nlohmann::json const& doc,
+                                        std::string& mnemonicOut,
+                                        std::size_t& variantOut) {
+    for (auto const& op : doc.at("opcodes")) {
+        auto const& enc = op.value("encoding", nlohmann::json::object());
+        if (!enc.contains("variants")) continue;
+        auto const& vs = enc.at("variants");
+        for (std::size_t i = 0; i < vs.size(); ++i) {
+            auto const& g = vs[i].value("guard", nlohmann::json::object());
+            if (!g.contains("width") || g.at("width") == 16) continue;
+            bool collides = false;
+            for (std::size_t j = 0; j < vs.size(); ++j) {
+                if (j == i) continue;
+                auto const& gj = vs[j].value("guard", nlohmann::json::object());
+                if (gj.value("width", 0) != 16) continue;
+                if (gj.value("operandKinds", nlohmann::json::array())
+                    == g.value("operandKinds", nlohmann::json::array())) {
+                    collides = true;
+                    break;
+                }
             }
-        });
-    EXPECT_FALSE(badWidth.has_value())
-        << "an out-of-vocabulary width (24) must be a load-time reject";
+            if (collides) continue;
+            mnemonicOut = op.value("mnemonic", std::string{});
+            variantOut  = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+TEST(WidthAxisLoader, GuardWidthSixteenAcceptedOutOfVocabularyRejected) {
+    auto const pristineR =
+        test_support::detail::parseShippedTargetJson("x86_64");
+    ASSERT_TRUE(pristineR.has_value())
+        << "the shipped x86_64 target document must parse";
+    nlohmann::json const& pristine = *pristineR;
+    std::string victim;
+    std::size_t vi = 0;
+    ASSERT_TRUE(findRetypableVariant(pristine, victim, vi))
+        << "no x86_64 variant can be retyped to width 16 without colliding with "
+           "a sibling — this test can no longer say anything about the width "
+           "vocabulary and must be re-aimed rather than deleted";
+
+    auto const retype = [&](int width) {
+        return test_support::mutateShippedTargetSchemaDoc(
+            "x86_64", [&](nlohmann::json& doc) {
+                for (auto& op : doc["opcodes"]) {
+                    if (op.value("mnemonic", "") != victim) continue;
+                    op["encoding"]["variants"][vi]["guard"]["width"] = width;
+                }
+            });
+    };
+
+    EXPECT_TRUE(retype(16).has_value())
+        << "guard width 16 is in the closed width vocabulary "
+           "(D-LIR-INT-MEMORY-WIDTH-EXACT half-word memory forms); victim was '"
+        << victim << "' variant " << vi;
+    EXPECT_FALSE(retype(24).has_value())
+        << "an out-of-vocabulary width (24) must be a load-time reject; victim "
+           "was '" << victim << "' variant " << vi;
 }
 
 TEST(WidthAxisLoader, AmbiguousWidthMixIsRejected) {

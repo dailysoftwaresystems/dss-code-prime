@@ -154,6 +154,20 @@
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
+            "$comment": "★★★ mov r16, r16 — 0x66 0x8B /r (D-ASM-SUB-NATIVE-OPERAND-UNUSABLE-IN-INLINE-ASM, 2026-08-23). The 0x66 operand-size prefix selects the 16-bit form and MUST precede any REX (the walker's mandatoryPrefix step runs before its REX step, which is exactly this ordering rule). Writes ONLY bits 15:0 of the destination — the upper 48 bits are LEFT UNCHANGED, which is what distinguishes a 16-bit MOV from the zero-extending MOVZX the `load` rows use, and why a `short` inline-asm operand needs this row rather than a wider one. First consumer: the AT&T dialect's `movw` spelling, whose only C-side reachable shape is a `short`-typed `\"r\"` operand.",
+            "guard":      { "operandKinds": ["reg"], "width": 16 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [139] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "★★★ mov r8, r/m8 — 0x8A /r (D-ASM-SUB-NATIVE-OPERAND-UNUSABLE-IN-INLINE-ASM, 2026-08-23). Writes ONLY bits 7:0; the upper 56 are left unchanged. ⚠⚠ `forceRexPrefix: true` IS A CORRECTNESS REQUIREMENT, NOT A SIZE CHOICE, and it is the same rule `setcc` and `store`'s byte row already carry: WITHOUT a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes `ah`/`ch`/`dh`/`bh` instead of `spl`/`bpl`/`sil`/`dil` — i.e. a DIFFERENT physical register, silently. A template operand binds whichever GPR the allocator chose, so all 16 must be reachable.",
+            "guard":      { "operandKinds": ["reg"], "width": 8 },
+            "template":   { "opcode": [138], "forceRexPrefix": true },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
             "guard":      { "operandKinds": ["imm32"], "width": 64 },
             "template":   { "rexW": true, "opcode": [199], "modrmRegExt": 0 },
             "resultSlot": "modrm.rm",
@@ -167,11 +181,27 @@
             "wires":      [{ "index": 0, "slotKind": "imm32" }]
           },
           {
+            "$comment": "mov r/m8, imm8 — 0xC6 /0 ib (2026-08-23, the `movb $5, %al` spelling). The `imm32` operand KIND is the JSON-side label for `OperandKindFilter::ImmInt`; the SLOT is what decides how many bytes are emitted, and `imm8` emits one — the same pairing the shift rows use for their `ib` count. `forceRexPrefix` for the byte-register rationale on the row above. ⚠⚠ THIS SENTENCE SHIPPED FALSE AND IS CORRECTED IN PLACE RATHER THAN DELETED, BECAUSE THE SHAPE IS THE REUSABLE PART — AND IT IS THE SHARPEST INSTANCE IN THE TREE: it said THERE IS DELIBERATELY NO 16-BIT SIBLING and that the spelling STAYS FAIL-LOUD, and the 16-bit sibling it denies sits FOURTEEN LINES BELOW IT IN THIS SAME FILE, added by the same commit. The reason it gave was real up to that moment: `movw $5, %ax` is `0x66 0xC7 /0 iw` — a TWO-byte immediate — and the x86-variable walker declared no 2-byte immediate slot, so declaring the row with an `imm32` slot would have emitted FOUR bytes where the instruction takes two, i.e. a corrupt instruction stream with no diagnostic. That is why the spelling was fail-loud rather than approximated, and it is still why an `imm32` slot must never be substituted here. The slot now exists as `EncodingSlotKind::Imm16Bytes` (the older `Imm16` belongs to the fixed32 shape and `checkSlotShape` still refuses THAT one here at load), the width-16 row below wires it, and [[D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT]] is CLOSED. ⇒ a cross-lane citation of an OPEN row is a claim with an expiry date, and the fold is when it expires ([[D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED]]).",
+            "guard":      { "operandKinds": ["imm32"], "width": 8 },
+            "template":   { "opcode": [198], "modrmRegExt": 0, "forceRexPrefix": true },
+            "resultSlot": "modrm.rm",
+            "wires":      [{ "index": 0, "slotKind": "imm8" }]
+          },
+          {
             "$comment": "FC8 (D-CSUBSET-BITFIELD-WIDE-UNIT): mov r64, imm64 — REX.W (0x48) + B8+rd + 8-byte LE immediate (Intel SDM Vol. 2B MOV, REX.W B8+rd io). The destination register's low 3 bits ride the opcode byte (B8+rd) via the `opcode.reg` result slot; its high bit drives REX.B. The `imm64` operand-kind is a `LirOperand{kind==LiteralIndex}` — the wide value lives in the LIR literal pool (the 8-byte operand POD cannot inline a 64-bit immediate), and the encoder reads it back to emit the 8 LE bytes of the `io` field. width:64 keys it to 64-bit constants only; there is no 32-bit imm64 form (a 32-bit-typed wide constant uses the imm32 forms above).",
             "guard":      { "operandKinds": ["imm64"], "width": 64 },
             "template":   { "rexW": true, "opcode": [184] },
             "resultSlot": "opcode.reg",
             "wires":      [{ "index": 0, "slotKind": "imm64" }]
+          },
+          {
+            "$comment": "\u2605\u2605\u2605 THE ROW THIS ANCHOR IS NAMED FOR \u2014 D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT. `movw $42, %cx` = 0x66 0xC7 /0 iw, a TWO-byte immediate. The previous cycle declared the byte sibling (0xC6 /0 ib) and had to leave this one refused because the x86-variable walker had no 2-byte immediate slot; `imm16.bytes` is that slot. \u26a0 NOT byte-identical to gas, which prefers the accumulator/+rw short form `0x66 0xB9 iw` (4 bytes vs 5) \u2014 the same deliberate difference the byte and 32-bit rows already carry for register-DIRECT immediates; both encode the same instruction. \u2714MEASURED against GNU as 2.42: `movw $42, %cx`.",
+            "guard":    { "operandKinds": ["imm32"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [199], "modrmRegExt": 0 },
+            "resultSlot": "modrm.rm",
+            "wires":    [
+              { "index": 0, "slotKind": "imm16.bytes" }
+            ]
           }
         ]
       }
@@ -183,11 +213,11 @@
       "hasSideEffects": false,
       "requires2Address": true,
       "minOperands":   2,
-      "maxOperands":   2,
+      "maxOperands":   4,
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
-        "$comment": "2-address shape: `operands[0]` IS the destination after `lir_2addr_legalize` ensures result==operands[0]. So no resultSlot — the wire for operands[0] handles the destination placement (its hwEncoding goes into ModR/M.rm). validate() rule G has a `requires2Address` exception for exactly this shape. FC3 c2: width-keyed 64/32 pairs — the 32-bit forms are the SAME opcodes without REX.W (Intel SDM ADD), computing mod-2^32 with auto-zero-extension (the C-defined `unsigned int` wraparound).",
+        "$comment": "2-address shape: `operands[0]` IS the destination after `lir_2addr_legalize` ensures result==operands[0]. So no resultSlot — the wire for operands[0] handles the destination placement (its hwEncoding goes into ModR/M.rm). validate() rule G has a `requires2Address` exception for exactly this shape. FC3 c2: width-keyed 64/32 pairs — the 32-bit forms are the SAME opcodes without REX.W (Intel SDM ADD), computing mod-2^32 with auto-zero-extension (the C-defined `unsigned int` wraparound).\n★★★ THE MEMORY-SOURCE PAIR (D-TARGET-X86-64-DECLARES-NO-MEMORY-DESTINATION-ARITHMETIC, 2026-08-23): `addq -16(%rbp), %rax` — an ADD whose SECOND operand is a memory reference — is `0x03 /r` (ADD r64, r/m64), the direction-swapped twin of the `0x01 /r` rows above: destination in ModR/M.reg, memory in ModR/M.rm. ✔MEASURED, GNU as 2.42 assembles it (`add -0x10(%rbp),%rax`) and gcc 13.3.0 emits it for an `\"m\"`-constrained input, so bar §A.3b makes it REQUIRED. It rides the SAME `requires2Address` tie: the assembly-text lowering's two-address retry builds `[dst, base, MemBase, MemOffset]`, operand 0 IS the destination, and its wire targets `modrm.reg` (a destination-bearing slot, so validate() rule G's 2-addr exception applies).\n⚠ `maxOperands` WIDENED 2→4 FOR THESE ROWS. The count is a DECLARATION, not an enforcement point — ✔MEASURED, no tier checks a LIR instruction's operand count against `TargetOpcodeInfo::min/maxOperands` (only MIR does, against `MirOpcodeInfo`), which is why `load` has shipped 4-operand variants under `maxOperands: 3`. Widening keeps the declaration TRUE of the variants beside it rather than letting it read as a bound the file does not honour.\n★ THE MEMORY-**DESTINATION** DIRECTION IS A DIFFERENT OPCODE, `add_mem`, AND THE SPLIT IS FORCED BY THE ENGINE'S OWN ELECTION RULE: `AsmInstructionLowering::buildLirInst` elects a memory-destination shape among the row's `result: none` candidates ONLY (shape 3), and a memory-source shape among its `result: value` candidates (shape 1). One opcode cannot be both, so the two directions are two rows — exactly the `load`/`store` split one mnemonic already has.",
         "format": "x86-variable",
         "variants": [
           {
@@ -224,18 +254,98 @@
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "imm32" }
             ]
+          },
+          {
+            "$comment": "add r64, [base + disp32] — REX.W 0x03 /r (ADD r64, r/m64). The memory-SOURCE direction; see the opcode $comment.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [3] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "add r32, [base + disp32] — 0x03 /r without REX.W.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [3] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT family: `addw %ax, %cx` \u2014 the 32-bit opcode byte with the 0x66 operand-size prefix. \u2714MEASURED against GNU as 2.42: `addw %ax, %cx`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [1] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT family: `addb %al, %cl` \u2014 the byte opcode is the 32-bit one minus 1. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `addb %al, %cl`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 8 },
+            "template": { "opcode": [0], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `addw $300, %cx` \u2014 0x66 0x81 /0 iw. THE ROW THIS ANCHOR WAS NAMED FOR: the `imm16.bytes` slot is what makes the 2-byte immediate expressible; wiring `imm32` here would emit FOUR bytes where the instruction takes two. \u2714MEASURED against GNU as 2.42: `addw $300, %cx`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm16.bytes" }
+            ]
+          },
+          {
+            "$comment": "`addb $5, %cl` \u2014 0x80 /0 ib, the byte immediate group. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `addb $5, %cl`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 0, "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          },
+          {
+            "$comment": "Memory SOURCE, width 16: `addw 4096(%r15), %ax` \u2014 0x66 + the 32-bit memory-source opcode. \u2714MEASURED against GNU as 2.42: `addw 4096(%r15), %ax`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [3] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Memory SOURCE, width 8: `addb 4096(%r15), %al`. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `addb 4096(%r15), %al`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [2], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
           }
         ]
       }
     },
     {
-      "$comment": "sub reg-reg — REX.W 0x29 /r (SUB r/m64, r64). Same 2-address shape as `add`.",
+      "$comment": "sub reg-reg — REX.W 0x29 /r (SUB r/m64, r64). Same 2-address shape as `add`, memory-SOURCE pair included (0x2B /r = SUB r64, r/m64); the memory-DESTINATION direction is `sub_mem`.",
       "mnemonic":      "sub",
       "result":        "value",
       "hasSideEffects": false,
       "requires2Address": true,
       "minOperands":   2,
-      "maxOperands":   2,
+      "maxOperands":   4,
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
@@ -274,6 +384,987 @@
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "sub r64, [base + disp32] — REX.W 0x2B /r (SUB r64, r/m64). Memory-SOURCE direction.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [43] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "sub r32, [base + disp32] — 0x2B /r without REX.W.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [43] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT family: `subw %ax, %cx` \u2014 the 32-bit opcode byte with the 0x66 operand-size prefix. \u2714MEASURED against GNU as 2.42: `subw %ax, %cx`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [41] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT family: `subb %al, %cl` \u2014 the byte opcode is the 32-bit one minus 1. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `subb %al, %cl`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 8 },
+            "template": { "opcode": [40], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `subw $300, %cx` \u2014 0x66 0x81 /5 iw. THE ROW THIS ANCHOR WAS NAMED FOR: the `imm16.bytes` slot is what makes the 2-byte immediate expressible; wiring `imm32` here would emit FOUR bytes where the instruction takes two. \u2714MEASURED against GNU as 2.42: `subw $300, %cx`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 5 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm16.bytes" }
+            ]
+          },
+          {
+            "$comment": "`subb $5, %cl` \u2014 0x80 /5 ib, the byte immediate group. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `subb $5, %cl`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 5, "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          },
+          {
+            "$comment": "Memory SOURCE, width 16: `subw 4096(%r15), %ax` \u2014 0x66 + the 32-bit memory-source opcode. \u2714MEASURED against GNU as 2.42: `subw 4096(%r15), %ax`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [43] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Memory SOURCE, width 8: `subb 4096(%r15), %al`. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `subb 4096(%r15), %al`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [42], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "★★★ THE MEMORY-DESTINATION ARITHMETIC FAMILY — `add_mem` / `sub_mem` / `and_mem` / `or_mem` / `xor_mem` / `not_mem` / `neg_mem` (D-TARGET-X86-64-DECLARES-NO-MEMORY-DESTINATION-ARITHMETIC, 2026-08-23). ONE $comment for seven rows because they differ only in an opcode byte and a ModR/M digit; each row below carries its own pair.\n★★★ WHY THEY ARE SEPARATE OPCODES RATHER THAN VARIANTS ON `add`/`sub`/… , AND IT IS THE ENGINE'S RULE RATHER THAN A STYLE CHOICE: `AsmInstructionLowering::buildLirInst` splits a row's candidate opcodes into PRODUCERS (`result: value`) and CONSUMERS (`result: none`) and offers a MEMORY-DESTINATION operand list to the consumers ONLY. `add` produces a value, so no variant of it can ever be elected for `addq $5, -16(%rbp)`. This is the SAME split one mnemonic already has: AT&T `movq` is `mov` (reg→reg), `load` (mem→reg) and `store` (reg→mem) — three opcodes behind one spelling, chosen by which operand is memory.\n★★★ AND THE SPLIT IS ALSO WHAT KEEPS THE TWO DIRECTIONS FROM COLLIDING, WHICH IS A SILENT-MISCOMPILE GUARD RATHER THAN TIDINESS. ✔MEASURED by reading the lowering: the memory-DESTINATION list for `subq %rax, mem` is `[reg, reg, MemBase, MemOffset]` and the memory-SOURCE list for `subq mem, %rax` is `[reg, reg, MemBase, MemOffset]` — BYTE-IDENTICAL guards for `mem := mem - rax` (0x29 /r) and `rax := rax - mem` (0x2B /r), two different instructions with OPPOSITE operands. They stay distinguishable only because they live on two opcodes that are elected from two disjoint candidate sets: shape 3 (memory destination) reaches the `*_mem` consumers, shape 1 (register destination) reaches the producers, and shape 2 is withheld outright while a memory operand is present AND the row lists a producer.\n⚠ THE ONE MNEMONIC THAT CANNOT TAKE THIS TREATMENT IS `cmp`, AND IT IS ANCHORED RATHER THAN GUESSED AT: `cmp` is ALREADY `result: none`, so its row lists NO producer, shape 2 is therefore offered, and the two byte-identical lists above would both reach the same candidate set — the collision this family avoids by construction. `cmpq` against memory stays fail-loud (`A0008`) in both directions. See [[D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE]].\n★ `result: none` + `hasSideEffects: true` — these write MEMORY, exactly like `store`, so no pass may drop or reorder them. `requires2Address` is deliberately ABSENT: the schema loader refuses it on a `result: none` opcode (there is no destination register to legalize into), and there is nothing to legalize — the destination IS the memory operand the wires name.",
+      "mnemonic":      "add_mem",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "add [base + disp32], imm32 — REX.W 0x81 /0 (ADD r/m64, imm32 sign-extended). ✔MEASURED: gcc 13.3.0 emits exactly this for a `\"+m\"` read-modify-write at -O0 AND -O2 (`addq $5, -16(%rbp)`), and GNU as 2.42 assembles it. Byte order is the walker's canonical x86 one — ModR/M, SIB (when the base is rsp/r12), disp32, THEN the immediate — so the imm32 wire's declaration position does not move it ahead of the displacement.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "add [base + disp32], imm32 at width 32 — 0x81 /0 without REX.W.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "add [base + disp32], r64 — REX.W 0x01 /r (ADD r/m64, r64). Operand 0 is the ADDED register (ModR/M.reg); operands 1..3 are the memory destination. Same wiring shape as `store`'s 4-op row, different opcode byte.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [1] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "add [base + disp32], r32 — 0x01 /r without REX.W.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [1] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `addw $300, 4096(%r15)` \u2014 0x66 0x81 /0 iw with a memory destination. \u2714MEASURED against GNU as 2.42: `addw $300, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm16.bytes" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`addb $5, 4096(%r15)` \u2014 0x80 /0 ib with a memory destination. No forceRexPrefix: the only register here is the ADDRESS base, which is never a byte view. \u2714MEASURED against GNU as 2.42: `addb $5, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm8" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`addw %ax, 4096(%r15)` \u2014 0x66 + the 32-bit memory-destination opcode. \u2714MEASURED against GNU as 2.42: `addw %ax, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [1] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`addb %al, 4096(%r15)`. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `addb %al, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [0], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Memory-destination SUB — see the `add_mem` $comment for why this is its own opcode. 0x81 /5 (imm) and 0x29 /r (reg). ⚠ NON-COMMUTATIVE, and this is the row where the direction MATTERS: AT&T `subq %rax, -16(%rbp)` means `mem := mem - rax`, which is 0x29 /r with the memory in ModR/M.rm — NOT 0x2B /r, which is the memory-SOURCE form declared on `sub` and computes `rax := rax - mem`. The two have identical operand-kind lists and opposite meanings; only the producer/consumer split keeps them apart.",
+      "mnemonic":      "sub_mem",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 5 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 5 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [41] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [41] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `subw $300, 4096(%r15)` \u2014 0x66 0x81 /5 iw with a memory destination. \u2714MEASURED against GNU as 2.42: `subw $300, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 5 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm16.bytes" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`subb $5, 4096(%r15)` \u2014 0x80 /5 ib with a memory destination. No forceRexPrefix: the only register here is the ADDRESS base, which is never a byte view. \u2714MEASURED against GNU as 2.42: `subb $5, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 5 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm8" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`subw %ax, 4096(%r15)` \u2014 0x66 + the 32-bit memory-destination opcode. \u2714MEASURED against GNU as 2.42: `subw %ax, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [41] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`subb %al, 4096(%r15)`. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `subb %al, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [40], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Memory-destination AND — see the `add_mem` $comment. 0x81 /4 (imm) and 0x21 /r (reg).",
+      "mnemonic":      "and_mem",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [33] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [33] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `andw $300, 4096(%r15)` \u2014 0x66 0x81 /4 iw with a memory destination. \u2714MEASURED against GNU as 2.42: `andw $300, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm16.bytes" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`andb $5, 4096(%r15)` \u2014 0x80 /4 ib with a memory destination. No forceRexPrefix: the only register here is the ADDRESS base, which is never a byte view. \u2714MEASURED against GNU as 2.42: `andb $5, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm8" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`andw %ax, 4096(%r15)` \u2014 0x66 + the 32-bit memory-destination opcode. \u2714MEASURED against GNU as 2.42: `andw %ax, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [33] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`andb %al, 4096(%r15)`. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `andb %al, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [32], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Memory-destination OR — see the `add_mem` $comment. 0x81 /1 (imm) and 0x09 /r (reg).",
+      "mnemonic":      "or_mem",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 1 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 1 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [9] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [9] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `orw $300, 4096(%r15)` \u2014 0x66 0x81 /1 iw with a memory destination. \u2714MEASURED against GNU as 2.42: `orw $300, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 1 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm16.bytes" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`orb $5, 4096(%r15)` \u2014 0x80 /1 ib with a memory destination. No forceRexPrefix: the only register here is the ADDRESS base, which is never a byte view. \u2714MEASURED against GNU as 2.42: `orb $5, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 1 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm8" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`orw %ax, 4096(%r15)` \u2014 0x66 + the 32-bit memory-destination opcode. \u2714MEASURED against GNU as 2.42: `orw %ax, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [9] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`orb %al, 4096(%r15)`. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `orb %al, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [8], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Memory-destination XOR — see the `add_mem` $comment. 0x81 /6 (imm) and 0x31 /r (reg).",
+      "mnemonic":      "xor_mem",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 6 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 6 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [49] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [49] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `xorw $300, 4096(%r15)` \u2014 0x66 0x81 /6 iw with a memory destination. \u2714MEASURED against GNU as 2.42: `xorw $300, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 6 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm16.bytes" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`xorb $5, 4096(%r15)` \u2014 0x80 /6 ib with a memory destination. No forceRexPrefix: the only register here is the ADDRESS base, which is never a byte view. \u2714MEASURED against GNU as 2.42: `xorb $5, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 6 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm8" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`xorw %ax, 4096(%r15)` \u2014 0x66 + the 32-bit memory-destination opcode. \u2714MEASURED against GNU as 2.42: `xorw %ax, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [49] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`xorb %al, 4096(%r15)`. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `xorb %al, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [48], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Memory-destination NOT — see the `add_mem` $comment. 0xF7 /2, the SAME F7-group unary shape `not` already declares, with the operand in memory instead of a register. ⚠ THE UNARY SHAPE REACHES SHAPE 3 BY A DIFFERENT ROUTE and it is worth stating: `notq -16(%rbp)` has ONE operand, which is therefore also the DESTINATION under this dialect's `destinationLast` order, so the lowering builds `[base, MemBase, MemOffset]` with no leading source at all.",
+      "mnemonic":      "not_mem",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 2 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [247], "modrmRegExt": 2 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "`notw 4096(%r15)` \u2014 0x66 0xF7 /2 against memory. \u2714MEASURED against GNU as 2.42: `notw 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [247], "modrmRegExt": 2 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`notb 4096(%r15)` \u2014 0xF6 /2 against memory. No forceRexPrefix: the only register is the ADDRESS base, never a byte view. \u2714MEASURED against GNU as 2.42: `notb 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [246], "modrmRegExt": 2 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Memory-destination NEG — see the `add_mem` and `not_mem` $comments. 0xF7 /3.",
+      "mnemonic":      "neg_mem",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [247], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "`negw 4096(%r15)` \u2014 0x66 0xF7 /3 against memory. \u2714MEASURED against GNU as 2.42: `negw 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [247], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`negb 4096(%r15)` \u2014 0xF6 /3 against memory. No forceRexPrefix: the only register is the ADDRESS base, never a byte view. \u2714MEASURED against GNU as 2.42: `negb 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [246], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "\u2605 AN IMMEDIATE WRITTEN STRAIGHT INTO MEMORY \u2014 `movq/movl/movw/movb $imm, mem` (C7 /0 and C6 /0). The memory-destination sibling of `mov`, exactly as `add_mem` is `add`'s: `store` takes a REGISTER source and has no immediate form, so before this opcode every `mov $imm, mem` spelling was refused fail-loud with `no candidate target opcode encodes that shape`. `result: none` + `hasSideEffects: true` because it writes memory and produces no value \u2014 which is also what makes it electable ONLY from the memory-destination shape. The width-16 row is the one that needed [[D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT]].",
+      "mnemonic": "mov_mem", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 4, "maxOperands": 4,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "Width 64: `movq $5, 4096(%r15)`. \u2714MEASURED against GNU as 2.42: `movq $5, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [199], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Width 32: `movl $5, 4096(%r15)`. \u2714MEASURED against GNU as 2.42: `movl $5, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [199], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Width 16: `movw $42, 4096(%r15)`. \u2714MEASURED against GNU as 2.42: `movw $42, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [199], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm16.bytes" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Width 8: `movb $42, 4096(%r15)`. \u2714MEASURED against GNU as 2.42: `movb $42, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [198], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm8" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "\u2605\u2605\u2605 ZERO-EXTEND INTO A 32-BIT DESTINATION (`movzbl` / `movzwl`) \u2014 D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE. A width-EXTENDING move carries TWO widths, and on the TARGET side that is not one opcode with two guards: `movzbl` and `movzbq` read the same byte and write DIFFERENT-SIZED results (`0F B6` vs `REX.W 0F B6`), and one (opcode, operandKinds, width) triple cannot denote two machine instructions \u2014 `validate()` refuses the second as unreachable. So the destination width picks the OPCODE (exactly as `load` / `load_subreg` already split by what they write) and the SOURCE width stays the `guard.width` the LIR instruction carries. The DIALECT states both numbers on its row (`width` + `destWidth`) and the lowering checks each register against its own role, so `movzbl %cl, %rcx` is refused \u2014 which is gas's answer too. \u26a0 REACHABLE ONLY FROM ASSEMBLY, by construction: the C front end's widening goes through `zext` (whose REX.W forms write a 64-bit result), so nothing in MIR\u2192LIR can elect this opcode.",
+      "mnemonic": "zext32", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "Register source, width 8: `movzbl %cl, %ecx`. `forceRexPrefix` is a CORRECTNESS requirement: without a REX prefix the byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. \u2714MEASURED against GNU as 2.42: `movzbl %cl, %ecx`.",
+            "guard":    { "operandKinds": ["reg"], "width": 8 },
+            "template": { "opcode": [15, 182], "forceRexPrefix": true },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "Memory source, width 8: `movzbl 4096(%r15), %ecx`. No forceRexPrefix \u2014 the only registers wired here are the ADDRESS base and the (wide) destination, never a byte view. \u2714MEASURED against GNU as 2.42: `movzbl 4096(%r15), %ecx`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [15, 182] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Register source, width 16: `movzwl %cx, %ecx`. \u2714MEASURED against GNU as 2.42: `movzwl %cx, %ecx`.",
+            "guard":    { "operandKinds": ["reg"], "width": 16 },
+            "template": { "opcode": [15, 183] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "Memory source, width 16: `movzwl 4096(%r15), %ecx`. No forceRexPrefix \u2014 the only registers wired here are the ADDRESS base and the (wide) destination, never a byte view. \u2714MEASURED against GNU as 2.42: `movzwl 4096(%r15), %ecx`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "template": { "opcode": [15, 183] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "\u2605\u2605\u2605 SIGN-EXTEND INTO A 32-BIT DESTINATION (`movsbl` / `movswl`) \u2014 D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE. A width-EXTENDING move carries TWO widths, and on the TARGET side that is not one opcode with two guards: `movzbl` and `movzbq` read the same byte and write DIFFERENT-SIZED results (`0F B6` vs `REX.W 0F B6`), and one (opcode, operandKinds, width) triple cannot denote two machine instructions \u2014 `validate()` refuses the second as unreachable. So the destination width picks the OPCODE (exactly as `load` / `load_subreg` already split by what they write) and the SOURCE width stays the `guard.width` the LIR instruction carries. The DIALECT states both numbers on its row (`width` + `destWidth`) and the lowering checks each register against its own role, so `movzbl %cl, %rcx` is refused \u2014 which is gas's answer too. \u2605\u2605 THE 32-BIT DESTINATION IS NOT COSMETIC: `movsbl %cl, %ecx` sign-extends to 32 bits and then ZEROES bits 63:32, while `movsbq %cl, %rcx` sign-extends to 64 \u2014 for any negative byte those are DIFFERENT VALUES, so encoding one as the other is a wrong answer, not a longer one.",
+      "mnemonic": "sext32", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "Register source, width 8: `movsbl %cl, %ecx`. `forceRexPrefix` is a CORRECTNESS requirement: without a REX prefix the byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. \u2714MEASURED against GNU as 2.42: `movsbl %cl, %ecx`.",
+            "guard":    { "operandKinds": ["reg"], "width": 8 },
+            "template": { "opcode": [15, 190], "forceRexPrefix": true },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "Memory source, width 8: `movsbl 4096(%r15), %ecx`. No forceRexPrefix \u2014 the only registers wired here are the ADDRESS base and the (wide) destination, never a byte view. \u2714MEASURED against GNU as 2.42: `movsbl 4096(%r15), %ecx`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [15, 190] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Register source, width 16: `movswl %cx, %ecx`. \u2714MEASURED against GNU as 2.42: `movswl %cx, %ecx`.",
+            "guard":    { "operandKinds": ["reg"], "width": 16 },
+            "template": { "opcode": [15, 191] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "Memory source, width 16: `movswl 4096(%r15), %ecx`. No forceRexPrefix \u2014 the only registers wired here are the ADDRESS base and the (wide) destination, never a byte view. \u2714MEASURED against GNU as 2.42: `movswl 4096(%r15), %ecx`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "template": { "opcode": [15, 191] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "\u2605\u2605\u2605 ZERO-EXTEND INTO A 16-BIT DESTINATION (`movzbw`) \u2014 D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE. A width-EXTENDING move carries TWO widths, and on the TARGET side that is not one opcode with two guards: `movzbl` and `movzbq` read the same byte and write DIFFERENT-SIZED results (`0F B6` vs `REX.W 0F B6`), and one (opcode, operandKinds, width) triple cannot denote two machine instructions \u2014 `validate()` refuses the second as unreachable. So the destination width picks the OPCODE (exactly as `load` / `load_subreg` already split by what they write) and the SOURCE width stays the `guard.width` the LIR instruction carries. The DIALECT states both numbers on its row (`width` + `destWidth`) and the lowering checks each register against its own role, so `movzbl %cl, %rcx` is refused \u2014 which is gas's answer too. Declared because gas assembles it and accepting only the spellings gcc happens to emit would be the same one-directional conformance the bar rejects.",
+      "mnemonic": "zext16", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "Register source, width 8: `movzbw %cl, %cx`. `forceRexPrefix` is a CORRECTNESS requirement: without a REX prefix the byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. \u2714MEASURED against GNU as 2.42: `movzbw %cl, %cx`.",
+            "guard":    { "operandKinds": ["reg"], "width": 8 },
+            "template": { "mandatoryPrefix": [102], "opcode": [15, 182], "forceRexPrefix": true },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "Memory source, width 8: `movzbw 4096(%r15), %cx`. No forceRexPrefix \u2014 the only registers wired here are the ADDRESS base and the (wide) destination, never a byte view. \u2714MEASURED against GNU as 2.42: `movzbw 4096(%r15), %cx`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template": { "mandatoryPrefix": [102], "opcode": [15, 182] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "\u2605\u2605\u2605 SIGN-EXTEND INTO A 16-BIT DESTINATION (`movsbw`) \u2014 D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE. A width-EXTENDING move carries TWO widths, and on the TARGET side that is not one opcode with two guards: `movzbl` and `movzbq` read the same byte and write DIFFERENT-SIZED results (`0F B6` vs `REX.W 0F B6`), and one (opcode, operandKinds, width) triple cannot denote two machine instructions \u2014 `validate()` refuses the second as unreachable. So the destination width picks the OPCODE (exactly as `load` / `load_subreg` already split by what they write) and the SOURCE width stays the `guard.width` the LIR instruction carries. The DIALECT states both numbers on its row (`width` + `destWidth`) and the lowering checks each register against its own role, so `movzbl %cl, %rcx` is refused \u2014 which is gas's answer too.",
+      "mnemonic": "sext16", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "Register source, width 8: `movsbw %cl, %cx`. `forceRexPrefix` is a CORRECTNESS requirement: without a REX prefix the byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. \u2714MEASURED against GNU as 2.42: `movsbw %cl, %cx`.",
+            "guard":    { "operandKinds": ["reg"], "width": 8 },
+            "template": { "mandatoryPrefix": [102], "opcode": [15, 190], "forceRexPrefix": true },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "Memory source, width 8: `movsbw 4096(%r15), %cx`. No forceRexPrefix \u2014 the only registers wired here are the ADDRESS base and the (wide) destination, never a byte view. \u2714MEASURED against GNU as 2.42: `movsbw 4096(%r15), %cx`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template": { "mandatoryPrefix": [102], "opcode": [15, 190] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "\u2605\u2605 THREE-OPERAND IMUL WITH AN IMMEDIATE \u2014 `imul $imm, src, dst` (`69 /r id` and `66 69 /r iw`). D-ASM-X86-IMUL-IMMEDIATE-FORM-UNDECLARED. \u2714MEASURED at the CLI before this opcode existed: `imulq $300, %rcx, %rdx` and even the two-operand shorthand `imulq $300, %rax` were refused with `error[A0008] \u2026 no candidate target opcode encodes that shape`, at every width \u2014 `mul` declares only register and memory-source forms. gas 2.42 assembles all six spellings and gcc emits them for a multiply by a constant.\n\u2605\u2605\u2605 WHY A SECOND OPCODE RATHER THAN VARIANTS ON `mul`, and it is not bookkeeping: `mul` is `requires2Address: true` \u2014 its destination IS its first operand, which is what the 2-address legalizer guarantees and what its variants' `modrm.reg` wire depends on. The three-operand form writes a destination that is NEITHER source, so it declares a `resultSlot` and no 2-address requirement. One opcode cannot be both, and declaring the immediate variants on `mul` would have handed the legalizer an instruction whose operand 0 is an IMMEDIATE.\n\u26a0 BOTH WRITTEN SHAPES REACH IT, THROUGH THE ENGINE'S EXISTING TWO-ADDRESS RETRY: `imulq $300, %rcx, %rdx` builds `[imm32, reg]` and elects the 3-operand guard directly; the shorthand `imulq $300, %rax` builds `[imm32]`, matches nothing, and the retry prepends the destination to give `[reg, imm32]` \u2014 the second guard \u2014 which encodes `imul rax, rax, imm`, exactly what gas emits for it. \u26a0 NOT byte-identical to gas for a SMALL immediate: gas contracts to the sign-extended `6B /r ib` short form when the value fits a byte, and these rows always emit the long form. Same instruction, one extra immediate byte \u2014 the same deliberate difference the register-direct `mov`/ALU immediate rows already carry.",
+      "mnemonic": "mul_imm", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "Three-operand, width 64: `imulq $300, %rcx, %rdx`. Operand 0 is the immediate, operand 1 the multiplicand (ModR/M.rm); the result register is its own slot. \u2714MEASURED against GNU as 2.42.",
+            "guard":    { "operandKinds": ["imm32", "reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [105] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "imm32" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "The two-operand SHORTHAND, width 64: `imulq $300, %rax`, which gas expands to `imul dst, dst, imm`. Reached through the engine's two-address retry, which prepends the written destination \u2014 so operand 0 is the multiplicand AND the result. \u2714MEASURED against GNU as 2.42.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "template": { "rexW": true, "opcode": [105] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "Three-operand, width 32: `imull $300, %ecx, %edx`. Operand 0 is the immediate, operand 1 the multiplicand (ModR/M.rm); the result register is its own slot. \u2714MEASURED against GNU as 2.42.",
+            "guard":    { "operandKinds": ["imm32", "reg"], "width": 32 },
+            "template": { "opcode": [105] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "imm32" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "The two-operand SHORTHAND, width 32: `imull $300, %ecx`, which gas expands to `imul dst, dst, imm`. Reached through the engine's two-address retry, which prepends the written destination \u2014 so operand 0 is the multiplicand AND the result. \u2714MEASURED against GNU as 2.42.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [105] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "Three-operand, width 16: `imulw $300, %cx, %dx`. Operand 0 is the immediate, operand 1 the multiplicand (ModR/M.rm); the result register is its own slot. \u2714MEASURED against GNU as 2.42.",
+            "guard":    { "operandKinds": ["imm32", "reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [105] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "imm16.bytes" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "The two-operand SHORTHAND, width 16: `imulw $300, %cx`, which gas expands to `imul dst, dst, imm`. Reached through the engine's two-address retry, which prepends the written destination \u2014 so operand 0 is the multiplicand AND the result. \u2714MEASURED against GNU as 2.42.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [105] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm16.bytes" }
             ]
           }
         ]
@@ -373,7 +1464,7 @@
       "hasSideEffects": false,
       "requires2Address": true,
       "minOperands":   2,
-      "maxOperands":   2,
+      "maxOperands":   4,
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
@@ -394,6 +1485,48 @@
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg" },
               { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "imul r64, [base + disp32] — REX.W 0F AF /r. ★ THE MEMORY-SOURCE FORM IS THE ONLY MEMORY FORM THIS MNEMONIC HAS, AND THAT IS A MEASUREMENT RATHER THAN AN OMISSION: ✔GNU as 2.42 REJECTS `imulq %rax, -16(%rbp)` and `imulq $5, -16(%rbp)` — the two-operand IMUL writes a REGISTER, so there is no memory-destination `imul` to declare and no `mul_mem` sibling exists. Since 0F AF /r ALREADY places its destination in ModR/M.reg, the memory rows differ from the register rows only in the second operand's slot.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [15, 175] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "imul r32, [base + disp32] — 0F AF /r without REX.W.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [15, 175] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "`imulw %ax, %cx` \u2014 0x66 0x0F 0xAF /r. \u26a0 THERE IS DELIBERATELY NO WIDTH-8 SIBLING AND THAT IS A MEASUREMENT, NOT AN OMISSION: \u2714GNU as 2.42 REJECTS `imulb %al, %cl` \u2014 x86 has no two-operand byte IMUL (only the one-operand AL form), so declaring one would accept input no reference assembler takes. \u2714MEASURED against GNU as 2.42: `imulw %ax, %cx`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [15, 175] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "`imulw 4096(%r15), %ax` \u2014 the width-16 memory-source form. \u2714MEASURED against GNU as 2.42: `imulw 4096(%r15), %ax`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [15, 175] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
             ]
           }
         ]
@@ -871,7 +2004,7 @@
       "result":        "none",
       "hasSideEffects": false,
       "minOperands":   2,
-      "maxOperands":   2,
+      "maxOperands":   4,
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
@@ -909,6 +2042,174 @@
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "★★★ cmp [base + disp32], imm32 — REX.W 0x81 /7 (2026-08-23). ⚠⚠ THIS PARAGRAPH USED TO CALL THIS THE **ONLY** MEMORY FORM `cmp` CAN SAFELY DECLARE, AND IT CLOSED BY SAYING BOTH REGISTER-OPERAND SPELLINGS STAY REFUSED WITH `A0008 … no candidate target opcode encodes that shape`. BOTH HALVES WERE TRUE WHEN THEY WERE TYPED AND FALSE WHEN THE COMMIT LANDED, so they are CORRECTED in place rather than deleted — the reasoning beneath them is exactly why the fix had to exist (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED). ✔RE-MEASURED at the CLI 2026-08-24, x86_64:pe64-x86_64-windows-exec AND x86_64:elf64-x86_64-linux-exec, debug AND release: ONE program spelling BOTH directions — an `__asm__ goto` comparing an `\"m\"` operand against an `\"r\"` one as `cmpq %reg, mem` and then as `cmpq mem, %reg` — compiles rc=0 and RUNS returning 42, so each direction branches on the flags of the comparison it actually writes and neither encodes the other. [[D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE]] IS CLOSED; the register pair it named is DECLARED further down this same opcode, separated by `memoryDestination`, and the eight narrow spellings landed with it.\n★★★ WHAT SURVIVES THE CORRECTION IS THE MECHANISM, AND IT IS THE WHOLE REASON THAT AXIS HAD TO BE INVENTED. `AsmInstructionLowering::buildLirInst` builds the memory-DESTINATION list for `cmpq %r14, mem` and the memory-SOURCE list for `cmpq mem, %r14` as the SAME four kinds `[reg, reg, membase, memoffset]`, and the two mean `mem - r14` (0x39 /r) and `r14 - mem` (0x3B /r) — opposite operand orders, different flags for every signed comparison. Every other arithmetic mnemonic escapes that collision because it PRODUCES a value: its memory-destination direction lives on a `result: none` sibling (`add_mem`, `sub_mem`, …) elected from the consumer set while its memory-source direction is a variant on the producer, and the engine withholds the register-destination shape entirely while a memory operand is present AND the row lists a producer. `cmp` is ALREADY `result: none`, so it has no producer to trigger that withholding and no second candidate set to separate the directions — which is precisely why the direction could not be carried by the CANDIDATE SET here and had to be carried on the INSTRUCTION instead. ⚠ THE OPERATIONAL RULE THE CORRECTED SENTENCE WAS PROTECTING IS UNCHANGED AND STILL BINDING, which is why it is restated rather than dropped: a `[\"reg\", \"reg\", \"membase\", \"memoffset\"]` sibling added to this opcode WITHOUT `memoryDestination` on BOTH members of the pair is a silent miscompile, not a feature.\n★ THIS IMMEDIATE ROW IS SAFE FOR A REASON THAT IS CHECKABLE RATHER THAN ASSERTED: the memory-source list ALWAYS begins with the destination REGISTER, so it can never be `[imm32, …]`. The two shapes are distinguishable by their first operand kind, which is exactly what the register pair lacks. ✔MEASURED, gcc 13.3.0 emits this form (`cmpq $5, -16(%rbp)`) and GNU as 2.42 assembles it.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "cmp [base + disp32], imm32 at width 32 — 0x81 /7 without REX.W.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32"         },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT family: `cmpw %ax, %cx`. \u2714MEASURED against GNU as 2.42: `cmpw %ax, %cx`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [57] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "`cmpb %al, %cl`. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `cmpb %al, %cl`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 8 },
+            "template": { "opcode": [56], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `cmpw $300, %cx` \u2014 0x66 0x81 /7 iw. \u2714MEASURED against GNU as 2.42: `cmpw $300, %cx`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm16.bytes" }
+            ]
+          },
+          {
+            "$comment": "`cmpb $5, %cl` \u2014 0x80 /7 ib. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `cmpb $5, %cl`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 7, "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `cmpw $300, 4096(%r15)`. \u2714MEASURED against GNU as 2.42: `cmpw $300, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm16.bytes" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "`cmpb $5, 4096(%r15)` \u2014 0x80 /7 ib against memory. \u2714MEASURED against GNU as 2.42: `cmpb $5, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 7 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm8" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "\u2605\u2605\u2605 THE DIRECTION-KEYED PAIR \u2014 D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE. `cmpq %r14, 4096(%r15)` is 0x39. This variant and its sibling declare the SAME operandKinds at the SAME width and are separated ONLY by `memoryDestination`, because the two spellings build the BYTE-IDENTICAL LIR operand list `[reg, reg, membase, memoffset]` while meaning `mem - reg` and `reg - mem`. WITHOUT the axis, declaring either one would silently encode the other for the opposite spelling \u2014 which is why both stayed refused until the engine could carry the direction on the instruction. \u2714MEASURED against GNU as 2.42: `cmpq %r14, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64, "memoryDestination": true },
+            "template": { "rexW": true, "opcode": [57] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "\u2605\u2605\u2605 THE DIRECTION-KEYED PAIR \u2014 D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE. `cmpq 4096(%r15), %r14` is 0x3B. This variant and its sibling declare the SAME operandKinds at the SAME width and are separated ONLY by `memoryDestination`, because the two spellings build the BYTE-IDENTICAL LIR operand list `[reg, reg, membase, memoffset]` while meaning `mem - reg` and `reg - mem`. WITHOUT the axis, declaring either one would silently encode the other for the opposite spelling \u2014 which is why both stayed refused until the engine could carry the direction on the instruction. \u2714MEASURED against GNU as 2.42: `cmpq 4096(%r15), %r14`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64, "memoryDestination": false },
+            "template": { "rexW": true, "opcode": [59] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "\u2605\u2605\u2605 THE DIRECTION-KEYED PAIR \u2014 D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE. `cmpl %r14d, 4096(%r15)` is 0x39. This variant and its sibling declare the SAME operandKinds at the SAME width and are separated ONLY by `memoryDestination`, because the two spellings build the BYTE-IDENTICAL LIR operand list `[reg, reg, membase, memoffset]` while meaning `mem - reg` and `reg - mem`. WITHOUT the axis, declaring either one would silently encode the other for the opposite spelling \u2014 which is why both stayed refused until the engine could carry the direction on the instruction. \u2714MEASURED against GNU as 2.42: `cmpl %r14d, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32, "memoryDestination": true },
+            "template": { "opcode": [57] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "\u2605\u2605\u2605 THE DIRECTION-KEYED PAIR \u2014 D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE. `cmpl 4096(%r15), %r14d` is 0x3B. This variant and its sibling declare the SAME operandKinds at the SAME width and are separated ONLY by `memoryDestination`, because the two spellings build the BYTE-IDENTICAL LIR operand list `[reg, reg, membase, memoffset]` while meaning `mem - reg` and `reg - mem`. WITHOUT the axis, declaring either one would silently encode the other for the opposite spelling \u2014 which is why both stayed refused until the engine could carry the direction on the instruction. \u2714MEASURED against GNU as 2.42: `cmpl 4096(%r15), %r14d`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32, "memoryDestination": false },
+            "template": { "opcode": [59] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "\u2605\u2605\u2605 THE DIRECTION-KEYED PAIR \u2014 D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE. `cmpw %ax, 4096(%r15)` is 0x39. This variant and its sibling declare the SAME operandKinds at the SAME width and are separated ONLY by `memoryDestination`, because the two spellings build the BYTE-IDENTICAL LIR operand list `[reg, reg, membase, memoffset]` while meaning `mem - reg` and `reg - mem`. WITHOUT the axis, declaring either one would silently encode the other for the opposite spelling \u2014 which is why both stayed refused until the engine could carry the direction on the instruction. \u2714MEASURED against GNU as 2.42: `cmpw %ax, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16, "memoryDestination": true },
+            "template": { "mandatoryPrefix": [102], "opcode": [57] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "\u2605\u2605\u2605 THE DIRECTION-KEYED PAIR \u2014 D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE. `cmpw 4096(%r15), %ax` is 0x3B. This variant and its sibling declare the SAME operandKinds at the SAME width and are separated ONLY by `memoryDestination`, because the two spellings build the BYTE-IDENTICAL LIR operand list `[reg, reg, membase, memoffset]` while meaning `mem - reg` and `reg - mem`. WITHOUT the axis, declaring either one would silently encode the other for the opposite spelling \u2014 which is why both stayed refused until the engine could carry the direction on the instruction. \u2714MEASURED against GNU as 2.42: `cmpw 4096(%r15), %ax`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16, "memoryDestination": false },
+            "template": { "mandatoryPrefix": [102], "opcode": [59] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "\u2605\u2605\u2605 THE DIRECTION-KEYED PAIR \u2014 D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE. `cmpb %al, 4096(%r15)` is 0x38. This variant and its sibling declare the SAME operandKinds at the SAME width and are separated ONLY by `memoryDestination`, because the two spellings build the BYTE-IDENTICAL LIR operand list `[reg, reg, membase, memoffset]` while meaning `mem - reg` and `reg - mem`. WITHOUT the axis, declaring either one would silently encode the other for the opposite spelling \u2014 which is why both stayed refused until the engine could carry the direction on the instruction. \u2714MEASURED against GNU as 2.42: `cmpb %al, 4096(%r15)`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8, "memoryDestination": true },
+            "template": { "opcode": [56], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "\u2605\u2605\u2605 THE DIRECTION-KEYED PAIR \u2014 D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE. `cmpb 4096(%r15), %al` is 0x3A. This variant and its sibling declare the SAME operandKinds at the SAME width and are separated ONLY by `memoryDestination`, because the two spellings build the BYTE-IDENTICAL LIR operand list `[reg, reg, membase, memoffset]` while meaning `mem - reg` and `reg - mem`. WITHOUT the axis, declaring either one would silently encode the other for the opposite spelling \u2014 which is why both stayed refused until the engine could carry the direction on the instruction. \u2714MEASURED against GNU as 2.42: `cmpb 4096(%r15), %al`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8, "memoryDestination": false },
+            "template": { "opcode": [58], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
             ]
           }
         ]
@@ -1142,7 +2443,7 @@
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   3,
-      "maxOperands":   3,
+      "maxOperands":   4,
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
@@ -1214,6 +2515,43 @@
               { "index": 1, "slotKind": "sib.index"     },
               { "index": 2, "slotKind": "membase.scale" },
               { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "★★★ `load_subreg` — LOAD 1 OR 2 BYTES INTO A SUB-REGISTER, LEAVING THE REST OF THE DESTINATION UNCHANGED (D-ASM-SUB-NATIVE-OPERAND-UNUSABLE-IN-INLINE-ASM, 2026-08-23). This is what AT&T `movb (%rax), %cl` and `movw (%rax), %cx` MEAN, and it is a DIFFERENT INSTRUCTION from `load`'s width-8/width-16 rows: those are MOVZX (`0F B6` / `0F B7`), which ZERO the upper bits, and gas spells them `movzbl`/`movzwl`.\n★★★ WHY A SECOND OPCODE RATHER THAN A VARIANT ON `load`: `load` already binds `(reg, membase, memoffset)` at width 8 and at width 16 to the zero-extending forms, because the C front end's byte/half-word loads REQUIRE zero extension (their own row comments state why). A second variant with the same `operandKinds` AND the same `width` is refused at load — `validate()` says *first-match dispatch makes variant N unreachable* — and it SHOULD be: one (opcode, kinds, width) triple cannot denote two machine instructions. So the two meanings get two opcodes, which is the same answer `mov`/`load`/`store` already gives for one `movq` spelling.\n⚠ REACHABLE ONLY FROM ASSEMBLY, BY CONSTRUCTION: no MIR→LIR lowering emits it (the C `Load` path chooses `load`), so it is elected only when a template or a `.s` writes `movb`/`movw` with a memory SOURCE. `forceRexPrefix` on the byte row for the spl/bpl/sil/dil rationale stated on `mov`'s byte row.",
+      "mnemonic":      "load_subreg",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "mov r8, [base + disp32] — 0x8A /r. Writes bits 7:0 only.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "resultSlot": "modrm.reg",
+            "template":   { "opcode": [138], "forceRexPrefix": true },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "mov r16, [base + disp32] — 0x66 0x8B /r. Writes bits 15:0 only.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "resultSlot": "modrm.reg",
+            "template":   { "mandatoryPrefix": [102], "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
             ]
           }
         ]
@@ -1421,7 +2759,7 @@
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   1,
-      "maxOperands":   1,
+      "maxOperands": 3,
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
@@ -1447,6 +2785,39 @@
             "template":   { "rexW": true, "opcode": [15, 191] },
             "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "Memory source, width 8: `movsbq 4096(%r15), %rcx`. \u2714MEASURED against GNU as 2.42: `movsbq 4096(%r15), %rcx`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template": { "rexW": true, "opcode": [15, 190] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Memory source, width 16: `movswq 4096(%r15), %rcx`. \u2714MEASURED against GNU as 2.42: `movswq 4096(%r15), %rcx`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "template": { "rexW": true, "opcode": [15, 191] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Memory source, width 32: `movslq 4096(%r15), %rcx` \u2014 REX.W 0x63 /r. \u2714MEASURED against GNU as 2.42: `movslq 4096(%r15), %rcx`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "template": { "rexW": true, "opcode": [99] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
           }
         ]
       }
@@ -1457,7 +2828,7 @@
       "result":        "value",
       "hasSideEffects": false,
       "minOperands":   1,
-      "maxOperands":   1,
+      "maxOperands": 3,
       "minSuccessors": 0,
       "maxSuccessors": 0,
       "encoding": {
@@ -1491,6 +2862,28 @@
             "template":   { "rexW": true, "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "Memory source, width 8: `movzbq 4096(%r15), %rcx`. \u2714MEASURED against GNU as 2.42: `movzbq 4096(%r15), %rcx`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template": { "rexW": true, "opcode": [15, 182] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Memory source, width 16: `movzwq 4096(%r15), %rcx`. \u2714MEASURED against GNU as 2.42: `movzwq 4096(%r15), %rcx`.",
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "template": { "rexW": true, "opcode": [15, 183] },
+            "resultSlot": "modrm.reg",
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem" }
+            ]
           }
         ]
       }
@@ -1521,7 +2914,7 @@
       "mnemonic": "and", "result": "value",
       "hasSideEffects": false,
       "requires2Address": true,
-      "minOperands": 2, "maxOperands": 2,
+      "minOperands": 2, "maxOperands": 4,
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
@@ -1542,6 +2935,104 @@
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "modrm.reg" }
             ]
+          },
+          {
+            "$comment": "and reg-imm32 — REX.W 0x81 /4 imm32 (AND r/m64, imm32, sign-extended). Landed 2026-08-23 beside the memory rows: `andq $5, %rax` was refused while `addq $5, %rax` was not, and gas assembles both — a per-mnemonic hole in one width axis, not a capability gap.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "and r/m32, imm32 — 0x81 /4 without REX.W.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "and r64, [base + disp32] — REX.W 0x23 /r (AND r64, r/m64). Memory-SOURCE direction; the memory-DESTINATION direction is `and_mem`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [35] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "and r32, [base + disp32] — 0x23 /r without REX.W.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [35] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT family: `andw %ax, %cx` \u2014 the 32-bit opcode byte with the 0x66 operand-size prefix. \u2714MEASURED against GNU as 2.42: `andw %ax, %cx`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [33] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT family: `andb %al, %cl` \u2014 the byte opcode is the 32-bit one minus 1. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `andb %al, %cl`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 8 },
+            "template": { "opcode": [32], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `andw $300, %cx` \u2014 0x66 0x81 /4 iw. THE ROW THIS ANCHOR WAS NAMED FOR: the `imm16.bytes` slot is what makes the 2-byte immediate expressible; wiring `imm32` here would emit FOUR bytes where the instruction takes two. \u2714MEASURED against GNU as 2.42: `andw $300, %cx`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm16.bytes" }
+            ]
+          },
+          {
+            "$comment": "`andb $5, %cl` \u2014 0x80 /4 ib, the byte immediate group. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `andb $5, %cl`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 4, "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          },
+          {
+            "$comment": "Memory SOURCE, width 16: `andw 4096(%r15), %ax` \u2014 0x66 + the 32-bit memory-source opcode. \u2714MEASURED against GNU as 2.42: `andw 4096(%r15), %ax`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [35] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Memory SOURCE, width 8: `andb 4096(%r15), %al`. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `andb 4096(%r15), %al`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [34], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
           }
         ]
       }
@@ -1551,7 +3042,7 @@
       "mnemonic": "or",  "result": "value",
       "hasSideEffects": false,
       "requires2Address": true,
-      "minOperands": 2, "maxOperands": 2,
+      "minOperands": 2, "maxOperands": 4,
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
@@ -1572,6 +3063,104 @@
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "modrm.reg" }
             ]
+          },
+          {
+            "$comment": "or reg-imm32 — REX.W 0x81 /1 imm32 (OR r/m64, imm32, sign-extended). Same 2026-08-23 hole-filling as the `and` imm rows.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 1 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "or r/m32, imm32 — 0x81 /1 without REX.W.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 1 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "or r64, [base + disp32] — REX.W 0x0B /r (OR r64, r/m64). Memory-SOURCE direction; the memory-DESTINATION direction is `or_mem`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [11] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "or r32, [base + disp32] — 0x0B /r without REX.W.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [11] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT family: `orw %ax, %cx` \u2014 the 32-bit opcode byte with the 0x66 operand-size prefix. \u2714MEASURED against GNU as 2.42: `orw %ax, %cx`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [9] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT family: `orb %al, %cl` \u2014 the byte opcode is the 32-bit one minus 1. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `orb %al, %cl`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 8 },
+            "template": { "opcode": [8], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `orw $300, %cx` \u2014 0x66 0x81 /1 iw. THE ROW THIS ANCHOR WAS NAMED FOR: the `imm16.bytes` slot is what makes the 2-byte immediate expressible; wiring `imm32` here would emit FOUR bytes where the instruction takes two. \u2714MEASURED against GNU as 2.42: `orw $300, %cx`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 1 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm16.bytes" }
+            ]
+          },
+          {
+            "$comment": "`orb $5, %cl` \u2014 0x80 /1 ib, the byte immediate group. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `orb $5, %cl`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 1, "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          },
+          {
+            "$comment": "Memory SOURCE, width 16: `orw 4096(%r15), %ax` \u2014 0x66 + the 32-bit memory-source opcode. \u2714MEASURED against GNU as 2.42: `orw 4096(%r15), %ax`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [11] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Memory SOURCE, width 8: `orb 4096(%r15), %al`. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `orb 4096(%r15), %al`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [10], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
           }
         ]
       }
@@ -1581,7 +3170,7 @@
       "mnemonic": "xor", "result": "value",
       "hasSideEffects": false,
       "requires2Address": true,
-      "minOperands": 2, "maxOperands": 2,
+      "minOperands": 2, "maxOperands": 4,
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
@@ -1601,6 +3190,104 @@
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" },
               { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "xor reg-imm32 — REX.W 0x81 /6 imm32 (XOR r/m64, imm32, sign-extended). Same 2026-08-23 hole-filling as the `and`/`or` imm rows.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "template": { "rexW": true, "opcode": [129], "modrmRegExt": 6 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "xor r/m32, imm32 — 0x81 /6 without REX.W.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [129], "modrmRegExt": 6 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "$comment": "xor r64, [base + disp32] — REX.W 0x33 /r (XOR r64, r/m64). Memory-SOURCE direction; the memory-DESTINATION direction is `xor_mem`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [51] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "xor r32, [base + disp32] — 0x33 /r without REX.W.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [51] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT family: `xorw %ax, %cx` \u2014 the 32-bit opcode byte with the 0x66 operand-size prefix. \u2714MEASURED against GNU as 2.42: `xorw %ax, %cx`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [49] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT family: `xorb %al, %cl` \u2014 the byte opcode is the 32-bit one minus 1. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `xorb %al, %cl`.",
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 8 },
+            "template": { "opcode": [48], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "$comment": "D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: `xorw $300, %cx` \u2014 0x66 0x81 /6 iw. THE ROW THIS ANCHOR WAS NAMED FOR: the `imm16.bytes` slot is what makes the 2-byte immediate expressible; wiring `imm32` here would emit FOUR bytes where the instruction takes two. \u2714MEASURED against GNU as 2.42: `xorw $300, %cx`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [129], "modrmRegExt": 6 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm16.bytes" }
+            ]
+          },
+          {
+            "$comment": "`xorb $5, %cl` \u2014 0x80 /6 ib, the byte immediate group. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `xorb $5, %cl`.",
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 8 },
+            "template": { "opcode": [128], "modrmRegExt": 6, "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          },
+          {
+            "$comment": "Memory SOURCE, width 16: `xorw 4096(%r15), %ax` \u2014 0x66 + the 32-bit memory-source opcode. \u2714MEASURED against GNU as 2.42: `xorw 4096(%r15), %ax`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [51] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "$comment": "Memory SOURCE, width 8: `xorb 4096(%r15), %al`. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `xorb 4096(%r15), %al`.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [50], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
             ]
           }
         ]
@@ -1765,6 +3452,22 @@
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
+          },
+          {
+            "$comment": "`notw %cx` \u2014 0x66 0xF7 /2. \u2714MEASURED against GNU as 2.42: `notw %cx`.",
+            "guard":    { "operandKinds": ["reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [247], "modrmRegExt": 2 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "`notb %cl` \u2014 0xF6 /2. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `notb %cl`.",
+            "guard":    { "operandKinds": ["reg"], "width": 8 },
+            "template": { "opcode": [246], "modrmRegExt": 2, "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
           }
         ]
       }
@@ -1789,6 +3492,22 @@
             "$comment": "FC3 c2: neg r/m32 — 0xF7 /3 without REX.W (32-bit two's-complement, zero-extends).",
             "guard":    { "operandKinds": ["reg"], "width": 32 },
             "template": { "opcode": [247], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "`negw %cx` \u2014 0x66 0xF7 /3. \u2714MEASURED against GNU as 2.42: `negw %cx`.",
+            "guard":    { "operandKinds": ["reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [247], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "`negb %cl` \u2014 0xF6 /3. `forceRexPrefix` is a CORRECTNESS requirement, not a size choice: without a REX prefix, byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. Same rule setcc / store's byte row / mov's byte row carry. \u2714MEASURED against GNU as 2.42: `negb %cl`.",
+            "guard":    { "operandKinds": ["reg"], "width": 8 },
+            "template": { "opcode": [246], "modrmRegExt": 3, "forceRexPrefix": true },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -2407,7 +4126,7 @@
 
     { "name": "rflags", "class": "flags", "widthBytes": 8, "hwEncoding": 0, "dwarfNumber": 49 },
 
-    { "$comment": "★★ THE 32-BIT VIEWS — `subOf`'s FIRST REAL CONSUMER (2026-08-13). `subOf` has existed on `TargetRegisterInfo` since ML6, is loaded, is resolved-and-cycle-checked at validate() time, and BOTH allocator paths already skip a row that declares it — with ZERO rows using it. These are the rows. They exist so a hand-written `.s` can WRITE `%eax`: the assembly-text lowering resolves a narrow spelling to its PARENT ordinal (LIR names one register and carries the access width on the INSTRUCTION) and then enforces that the spelling's width matches the mnemonic's — gas rejects both `movl %rax,%ecx` and `movl %eax,%rcx`, and so does this. ⚠ THEY ARE NOT ALLOCATABLE AND CANNOT BECOME SO BY ACCIDENT, AND THE MECHANISM CHANGED ON 2026-08-13 — THIS SENTENCE USED TO NAME ONE THAT NO LONGER EXISTS. It said `buildFreeLists` (lir_regalloc.cpp) and `pickScratchRegs` (lir_rewrite.cpp) each `continue` on a non-empty `subOf`, and called cc-list absence 'the second, independent reason'. BOTH skips have been DELETED: ✔MEASURED, they were unreachable defence — `allocatable` is built EXCLUSIVELY from the six calling-convention lists (`lir_regalloc.cpp` buildFreeLists / `lir_rewrite.cpp` collectAllocatable), with no independent source, so a row absent from every cc list could never enter a pool for the skip to catch. What replaced them is a LOAD-TIME REJECTION: `TargetSchemaData::validate()`'s `checkRefs` refuses a calling convention that names a `subOf` register, with `C_MalformedJson` and a JSON path pointing at the offending element. ⇒ one config rule and one loud rejection, not two silent skips — and the rows below are safe because none of them appears in any cc list, which is now enforced rather than merely true. The 16-bit views (ax/cx/...) are still NOT declared, and the rule is unchanged: a row lands with its FIRST CONSUMER (D-TARGET-SUBREGISTER-ALIASES) — no shipped opcode form and no dialect spelling writes a 16-bit register yet. The 8-bit views DID get one; see the byte-view block below.",
+    { "$comment": "★★ THE 32-BIT VIEWS — `subOf`'s FIRST REAL CONSUMER (2026-08-13). `subOf` has existed on `TargetRegisterInfo` since ML6, is loaded, is resolved-and-cycle-checked at validate() time, and BOTH allocator paths already skip a row that declares it — with ZERO rows using it. These are the rows. They exist so a hand-written `.s` can WRITE `%eax`: the assembly-text lowering resolves a narrow spelling to its PARENT ordinal (LIR names one register and carries the access width on the INSTRUCTION) and then enforces that the spelling's width matches the mnemonic's — gas rejects both `movl %rax,%ecx` and `movl %eax,%rcx`, and so does this. ⚠ THEY ARE NOT ALLOCATABLE AND CANNOT BECOME SO BY ACCIDENT, AND THE MECHANISM CHANGED ON 2026-08-13 — THIS SENTENCE USED TO NAME ONE THAT NO LONGER EXISTS. It said `buildFreeLists` (lir_regalloc.cpp) and `pickScratchRegs` (lir_rewrite.cpp) each `continue` on a non-empty `subOf`, and called cc-list absence 'the second, independent reason'. BOTH skips have been DELETED: ✔MEASURED, they were unreachable defence — `allocatable` is built EXCLUSIVELY from the six calling-convention lists (`lir_regalloc.cpp` buildFreeLists / `lir_rewrite.cpp` collectAllocatable), with no independent source, so a row absent from every cc list could never enter a pool for the skip to catch. What replaced them is a LOAD-TIME REJECTION: `TargetSchemaData::validate()`'s `checkRefs` refuses a calling convention that names a `subOf` register, with `C_MalformedJson` and a JSON path pointing at the offending element. ⇒ one config rule and one loud rejection, not two silent skips — and the rows below are safe because none of them appears in any cc list, which is now enforced rather than merely true. ⚠ THIS PARAGRAPH USED TO END *\"the 16-bit views (ax/cx/...) are still NOT declared … no shipped opcode form and no dialect spelling writes a 16-bit register yet\"*. THAT TRIGGER FIRED ON 2026-08-23: the AT&T dialect now spells `movw`, and `mov`/`load_subreg`/`store` declare 16-bit forms for it, so the word-view block below landed under the SAME first-consumer rule (D-TARGET-SUBREGISTER-ALIASES) the 32-bit and 8-bit blocks did. The rule is unchanged; only its trigger state is.",
       "name": "eax",   "class": "gpr", "widthBytes": 4, "subOf": "rax",  "hwEncoding": 0 },
     { "name": "ecx",   "class": "gpr", "widthBytes": 4, "subOf": "rcx",  "hwEncoding": 1 },
     { "name": "edx",   "class": "gpr", "widthBytes": 4, "subOf": "rdx",  "hwEncoding": 2 },
@@ -2424,6 +4143,24 @@
     { "name": "r13d",  "class": "gpr", "widthBytes": 4, "subOf": "r13",  "hwEncoding": 13 },
     { "name": "r14d",  "class": "gpr", "widthBytes": 4, "subOf": "r14",  "hwEncoding": 14 },
     { "name": "r15d",  "class": "gpr", "widthBytes": 4, "subOf": "r15",  "hwEncoding": 15 },
+
+    { "$comment": "★★★ THE 16-BIT (WORD) VIEWS — landed 2026-08-23 with their FIRST CONSUMER, the AT&T `movw` spelling (D-ASM-SUB-NATIVE-OPERAND-UNUSABLE-IN-INLINE-ASM). Until that spelling existed no shipped opcode form and no dialect row could name a 16-bit register, which is why the 32-bit block above recorded them as deliberately absent.\n★ SAME MECHANISM AS THE 32-BIT AND 8-BIT BLOCKS, and deliberately no other: `subOf` names the 64-bit PARENT (one hop, not `eax`), the assembly-text lowering resolves a narrow spelling to the parent ordinal and carries the ACCESS WIDTH on the LIR instruction, and the width cross-check then refuses a spelling whose width disagrees with the mnemonic's suffix — gas rejects `movw %eax, %cx` and so does this.\n⚠ NOT ALLOCATABLE, by the mechanism the 32-bit block states: `TargetSchemaData::validate()` REFUSES a calling convention that names a `subOf` register, and the cc lists are the only source `allocatable` is built from.\n⚠ THE WORD VIEWS OF rsp/rbp/rsi/rdi ARE `sp`/`bp`/`si`/`di` — the SAME spellings AArch64 uses for its stack pointer, which is harmless because register names are resolved against THIS target's own table and never across targets. Unlike the byte views they need NO REX prefix: the high-byte alias hazard (`ah`/`ch`/`dh`/`bh`) is a BYTE-register-only property of the encoding, and 16-bit forms select their size with the 0x66 prefix instead.\n⚠ A `%N` OPERAND DOES NOT NEED THESE ROWS AND THE ROW THAT ASKED FOR THEM SAID OTHERWISE — ✔MEASURED by reading `TemplateHost::resolveRegister`: a bound operand's width comes from `AsmOperandBinding::widthBits`, never from a register NAME, so a `short` operand would substitute at width 16 with this block absent. What these rows buy is the HAND-WRITTEN spelling — `__asm__(\"movw %ax, %cx\")`, which gas accepts — and bidirectional conformance is why they land rather than being skipped as unnecessary.",
+      "name": "ax",    "class": "gpr", "widthBytes": 2, "subOf": "rax",  "hwEncoding": 0 },
+    { "name": "cx",    "class": "gpr", "widthBytes": 2, "subOf": "rcx",  "hwEncoding": 1 },
+    { "name": "dx",    "class": "gpr", "widthBytes": 2, "subOf": "rdx",  "hwEncoding": 2 },
+    { "name": "bx",    "class": "gpr", "widthBytes": 2, "subOf": "rbx",  "hwEncoding": 3 },
+    { "name": "sp",    "class": "gpr", "widthBytes": 2, "subOf": "rsp",  "hwEncoding": 4 },
+    { "name": "bp",    "class": "gpr", "widthBytes": 2, "subOf": "rbp",  "hwEncoding": 5 },
+    { "name": "si",    "class": "gpr", "widthBytes": 2, "subOf": "rsi",  "hwEncoding": 6 },
+    { "name": "di",    "class": "gpr", "widthBytes": 2, "subOf": "rdi",  "hwEncoding": 7 },
+    { "name": "r8w",   "class": "gpr", "widthBytes": 2, "subOf": "r8",   "hwEncoding": 8 },
+    { "name": "r9w",   "class": "gpr", "widthBytes": 2, "subOf": "r9",   "hwEncoding": 9 },
+    { "name": "r10w",  "class": "gpr", "widthBytes": 2, "subOf": "r10",  "hwEncoding": 10 },
+    { "name": "r11w",  "class": "gpr", "widthBytes": 2, "subOf": "r11",  "hwEncoding": 11 },
+    { "name": "r12w",  "class": "gpr", "widthBytes": 2, "subOf": "r12",  "hwEncoding": 12 },
+    { "name": "r13w",  "class": "gpr", "widthBytes": 2, "subOf": "r13",  "hwEncoding": 13 },
+    { "name": "r14w",  "class": "gpr", "widthBytes": 2, "subOf": "r14",  "hwEncoding": 14 },
+    { "name": "r15w",  "class": "gpr", "widthBytes": 2, "subOf": "r15",  "hwEncoding": 15 },
 
     { "$comment": "★★★ THE 8-BIT VIEWS — the row that made `sete %al` SPELLABLE (D-ASM-X86-NO-8BIT-REGISTER-FILE, 2026-08-13). Before them this file declared 49 registers with NO byte file, and the consequence was BIDIRECTIONAL non-conformance in the sense [[feedback_reference_compilers_are_the_spec]] means it: gas WRITES `sete %al` and DSS could not read it, while the only destination DSS could spell — `%rax` — is one gas REJECTS. Shipping a dialect row that accepts input no reference assembler takes is the same defect as refusing input they do accept.\n★ SAME MECHANISM AS THE 32-BIT BLOCK ABOVE, and deliberately no other: `subOf` names the 64-bit PARENT (not `eax` — a two-hop chain would load and resolve identically, and one hop is what the table already reads as 'these are views of that machine register'). The assembly-text lowering resolves a narrow spelling to the parent ordinal and carries the ACCESS WIDTH on the LIR instruction, so `al` and `rax` are one register with two spellings, exactly as `eax` and `rax` are.\n⚠ NOT ALLOCATABLE, by the mechanism the 32-bit block states: a calling convention naming a `subOf` register is REFUSED AT CONFIG LOAD (`TargetSchemaData::validate()`), and the cc lists are the only source `allocatable` is built from — so none of these names can reach a register pool.\n⚠⚠ THE LOW-BYTE NAMES OF rsp/rbp/rsi/rdi ARE `spl`/`bpl`/`sil`/`dil` AND REQUIRE A REX PREFIX — without one, encoding 4..7 in a byte-register slot names the LEGACY HIGH bytes `ah`/`ch`/`dh`/`bh`, i.e. a DIFFERENT physical register. `setcc`'s template already carries `forceRexPrefix: true` for exactly this reason (D-LIR-SETCC-WIDTH-CONTRACT), so these four are safe there. `ah`/`ch`/`dh`/`bh` are deliberately UNDECLARED: they are not sub-registers of rax..rbx in the `subOf` sense this table means (they alias bits 8..15, not 0..7), and declaring them with the same parent would make the narrow-spelling resolution silently read the wrong byte.",
       "name": "al",   "class": "gpr", "widthBytes": 1, "subOf": "rax",  "hwEncoding": 0 },
@@ -2458,7 +4195,7 @@
     { "letter": "x", "binds": "registerClass", "registerClass": "fpr"  },
     { "$comment": "The byte-addressable general registers. ✔MEASURED to admit 15 simultaneous live operands — the SAME count as `r` — because REX makes every GPR byte-addressable on x86_64; the i386 {a,b,c,d} subclass the letter's name remembers does not exist on this target, so `gpr` is EXACT here and not an approximation. Contrast `Q` (4), which is why that one is absent.",
       "letter": "q", "binds": "registerClass", "registerClass": "gpr"  },
-    { "$comment": "Operand FORM, not a register: `m` accepts a memory reference. Bound to `membase` — the HEAD of the (membase, memoffset) pair a LIR memory reference is built from; the displacement rides in the paired memoffset slot and needs no letter of its own. ✔MEASURED `\"m\"(*p)` → `(%rdi)`. ★ REALIZED END-TO-END, AND THAT SENTENCE IS NEW: the pipeline used to REFUSE this letter with `has no resolved register class — the constraint letter was never bound to a processor`, about the row you are reading. The CST→HIR resolution carried only two of `binds`’ three arms, so a DECLARED form-bound letter was byte-identical to an UNDECLARED one. The ADDRESS is what gets a register; the FORM decides what the template writes around it. (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED; witnessed by execution in `examples/c-subset/c_inline_asm_memory_operand`.) ⚠ The OUTPUT direction `\"=m\"` is a different mechanism — no register to capture, no result piece to anchor — and is still refused BY NAME (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED).",
+    { "$comment": "Operand FORM, not a register: `m` accepts a memory reference. Bound to `membase` — the HEAD of the (membase, memoffset) pair a LIR memory reference is built from; the displacement rides in the paired memoffset slot and needs no letter of its own. ✔MEASURED `\"m\"(*p)` → `(%rdi)`. ★ REALIZED END-TO-END, AND THAT SENTENCE IS NEW: the pipeline used to REFUSE this letter with `has no resolved register class — the constraint letter was never bound to a processor`, about the row you are reading. The CST→HIR resolution carried only two of `binds`’ three arms, so a DECLARED form-bound letter was byte-identical to an UNDECLARED one. The ADDRESS is what gets a register; the FORM decides what the template writes around it. (D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED; witnessed by execution in `examples/c-subset/c_inline_asm_memory_operand`.) ★ THE OUTPUT DIRECTION (`\"=m\"`, `\"+m\"`, `\"=&m\"`) IS REALIZED TOO, BY THE SAME CARRIAGE: the operand's ADDRESS in a register, with the direction living entirely inside the template's own instruction (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED; witnessed by execution in `examples/c-subset/c_inline_asm_memory_output_operand`). ⚠ THIS SENTENCE REPLACED ONE THAT SAID THE OPPOSITE and had gone stale one cycle after it was written (*\"a different mechanism — no register to capture, no result piece to anchor — and is still refused BY NAME\"*); a config comment that reads as evidence is worth exactly as much as its last re-measurement (D-CONFIG-ASM-CONSTRAINT-COMMENT-CLAIMS-A-REFUSAL-THAT-NO-LONGER-EXISTS). ⓘ WHAT THE TEMPLATE MAY SPELL AROUND A MEMORY OPERAND IS A SEPARATE, OPCODE-TABLE QUESTION, and this letter never answered it: the read-modify-write forms `addq $5, %0` / `subq %1, %0` and their memory-SOURCE twins landed 2026-08-23 in this file's `opcodes` array, not here (D-TARGET-X86-64-DECLARES-NO-MEMORY-DESTINATION-ARITHMETIC).",
       "letter": "m", "binds": "operandKind",   "operandKind":   "membase" },
     { "$comment": "✔MEASURED, gcc 13.3.0 `-O2 -S`: `\"i\"(7)` → `$7`. `imm32` is the JSON-side historical width label for OperandKindFilter::ImmInt — the SAME spelling the encoding variant guards use, deliberately reused rather than re-minted. ★ REALIZED END-TO-END, AND THAT SENTENCE IS NEW: the pipeline used to REFUSE this letter by name (`binds the operand form 'imm32', which this pipeline does not yet realize`) while this row correctly declared it. An immediate binds NO register — the number is written INTO the instruction — so the VALUE travels instead, as an ordinary MIR `Const`, and the tier that binds it reads the constant back out. (D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED; witnessed by execution in `examples/c-subset/c_inline_asm_immediate_operand`.) ⚠ THE OPERAND MUST BE AN INTEGER CONSTANT EXPRESSION AND IS PROVEN ONE, NOT ASSUMED: ✔MEASURED, gcc 13.3.0 at -O0 AND -O2, a runtime value here is `error: impossible constraint in 'asm'`, and DSS refuses it too. The accepted set is gcc's — `\"i\"(1+2)` → `$3`, `\"i\"(K)` for an enum constant → `$9`, `\"i\"(sizeof(int))` → `$4` — so folding is required, not optional. An `\"=i\"` OUTPUT is refused on both sides (gcc: `output number 0 not directly addressable`): a constant is a value, not a location.",
       "letter": "i", "binds": "operandKind",   "operandKind":   "imm32"   }

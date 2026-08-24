@@ -321,8 +321,8 @@ TEST(RelocatableObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
     EXPECT_TRUE(got.ok());
 }
 
-// TF-C54 hermetic 2-TU witness (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-
-// FOREIGN-COLLISION): the ON-DISK static-lib readback + merge path. Two
+// TF-C54 hermetic 2-TU witness (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION):
+// the ON-DISK static-lib readback + merge path. Two
 // SEPARATELY-compiled TUs each restart the SymbolId counter, so both define the
 // SAME synthetic names -- a `static` function `sym_100` AND a string-literal
 // rodata `sym_101` (neither in module.symbols). This is the hermetic,
@@ -1137,8 +1137,8 @@ TEST(RelocatableObjectReader, NonElfFormatSchemaFailsLoud) {
 }
 
 // ============================================================================
-// THE GEOMETRY FALLBACK ON ELF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
-// BLOCK-LABEL-NOT-ATOM, the third of the three readers (operator ruling
+// THE GEOMETRY FALLBACK ON ELF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM,
+// the third of the three readers (operator ruling
 // 2026-08-20: the fallback lands on all of them).
 //
 // ★★ ELF IS WHERE IT FIRES LEAST, AND SAYING SO PRECISELY IS THE POINT -- a

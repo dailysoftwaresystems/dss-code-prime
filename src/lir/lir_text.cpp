@@ -737,8 +737,8 @@ private:
     // every `mir_to_lir` and `asm_text_to_lir` `cond-br` carries exactly two,
     // and the ENCODER reads them for its displacements. This comment claimed
     // the opposite for the whole life of the file, and the code below acted on
-    // the claim by FILTERING them out (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-
-    // DROPPED). The real reason is that the header list is the AUTHORITATIVE
+    // the claim by FILTERING them out (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED).
+    // The real reason is that the header list is the AUTHORITATIVE
     // edge set: it is present on every terminator kind, including the ones whose
     // operands hold no BlockRef at all (`indirect-br`'s address register), so it
     // is the only channel that can drive the fork for all of them
@@ -1032,8 +1032,8 @@ private:
             if (!constraintNamesResolve(c)) continue;
             // ★★★ ...AND THE SAME IS NOW TRUE OF `outputs ⊆ clobbered`.
             // `regConstraintPoolAdd` gained an ABORT on that invariant
-            // (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-
-            // CLOBBERED), and its own message says a producer fed by USER
+            // (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED),
+            // and its own message says a producer fed by USER
             // text must pre-validate and REPORT. This is that producer:
             // every byte here came from a file. Without this check a
             // malformed `.dsslir` KILLS THE PROCESS instead of being
@@ -1827,8 +1827,8 @@ private:
             // takes 0 operands (e.g. a future void-only-return target).
             // Now the JSON declares it explicitly and the loader's
             // `validate()` enforces `isTerminator ↔ terminatorKind`.
-            // ★★★ `nonBlock` IS FOR `addReturn` AND NOTHING ELSE (D-LIR-TEXT-
-            // CONDBR-BLOCKREF-OPERANDS-DROPPED). It used to feed `addCondBr`
+            // ★★★ `nonBlock` IS FOR `addReturn` AND NOTHING ELSE
+            // (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED). It used to feed `addCondBr`
             // and `addIndirectBr` as well, on the strength of a comment saying
             // a CondBr carries no BlockRef operands — which is false for every
             // `cond-br` any producer in this tree emits. The effect was SILENT

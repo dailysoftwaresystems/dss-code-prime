@@ -58,8 +58,7 @@
 //      class) must NOT be inlined — but no shipped frontend emits any
 //      intrinsic today, so blanket admission is correct for the current
 //      model; per-intrinsic inline-safety gating is trigger-gated to the
-//      first frame-sensitive intrinsic — D-OPT7-INLINE-FRAME-SENSITIVE-
-//      INTRINSIC.
+//      first frame-sensitive intrinsic — D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.
 //
 // **NEVER DELETE a callee body in this pass.** OPT7 inlines call
 // SITES only. A now-dead callee is removed by a LATER DCE pass, which

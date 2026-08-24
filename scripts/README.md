@@ -51,6 +51,7 @@ python scripts/check-scripts-index/check-scripts-index.py --write
 | **`check-anchor-registry`** | `check-anchor-registry.ps1`, `check-anchor-registry.sh` | refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells. |
 | **`check-diagnostic-codes`** | `check-diagnostic-codes.py` | refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal. |
 | **`check-enum-name-table-guards`** | `check-enum-name-table-guards.py` | refuse an `EnumNameTable` vocabulary declared in `src/` without a `DSS_CHECK_ENUM_NAME_TABLE` well-formedness assert. |
+| **`check-guard-output-encoding`** | `check-guard-output-encoding.py` | refuse a Python script whose report cannot carry a non-cp1252 character through a pipe. |
 | **`check-line-endings`** | `check-line-endings.ps1`, `check-line-endings.sh` | refuse a tracked text blob that carries a CR. |
 | **`check-ninja-deps`** | `check-ninja-deps.py` | refuse a gate over a build directory whose objects recorded no header dependencies. |
 | **`check-no-abort-in-tests`** | `check-no-abort-in-tests.py` | refuse a new live `abort()` call site in test or test-support code. |
@@ -60,7 +61,9 @@ python scripts/check-scripts-index/check-scripts-index.py --write
 | **`check-retyped-closed-sets`** | `check-retyped-closed-sets.py` | census the diagnostics that RETYPE a closed vocabulary instead of projecting it. |
 | **`check-scripts-index`** | `check-scripts-index.py` | refuse a script that no index documents, and an index entry that no script backs. |
 | **`check-shell-portability`** | `check-shell-portability.py` | refuse a tracked shell script that cannot run on bash 3.2 without declaring it. |
+| **`check-stale-refusal-citations`** | `check-stale-refusal-citations.py` | refuse a new present-tense refusal sentence that cites an anchor row already marked CLOSED. |
 | **`check-wall-clock-in-tests`** | `check-wall-clock-in-tests.py` | refuse a new wall-clock duration literal in test code outside the shared measured budget. |
+| **`check-wrapped-anchor-ids`** | `check-wrapped-anchor-ids.py` | refuse a NEW anchor id split across a line break, which no grep can ever return. |
 | **`cmake-import`** | `cmake-import.ps1`, `cmake-import.py`, `cmake-import.sh` | convert a CMake project into a DSS `.dss-project.json` manifest. |
 | **`corpus-census`** | `corpus-census.ps1`, `corpus-census.py`, `corpus-census.sh` | census the real-example corpus into a run-identified report instead of one overwritten log. |
 | **`local-build`** | `local-build.ps1`, `local-build.sh` | build dss-code-prime incrementally on this host, and optionally run ctest. |

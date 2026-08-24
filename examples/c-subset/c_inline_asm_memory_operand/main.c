@@ -44,6 +44,52 @@
  * the shape that is expressible today. ✔MEASURED, not assumed: `%w0` is
  * refused, `%0` compiles and runs. When the modifier vocabulary lands, a `%w`
  * arm belongs beside this one.
+ *
+ * ★★★ AND THAT IS ONLY HALF THE FACT — THE MISSING HALF IS WHY `long` IS THE
+ * ONE WIDTH AT WHICH DSS AND THE REFERENCES AGREE ON THIS TARGET. The paragraph
+ * above records the MODIFIER being unsupported. It does not record that bare
+ * `%N` was given a DIFFERENT MEANING here than gcc and clang give it, which is
+ * what makes 64-bit operands not merely "expressible" but the only width whose
+ * template text means the same instruction under both. ✔MEASURED — the rule on
+ * each side, from emitted code, never from documentation:
+ *
+ *   DSS   — `%N` substitutes at the OPERAND'S OWN TYPE width, carried from the
+ *           C type by `MirToLir::widthFlagsForType` → `asmWidthBitsForType` →
+ *           `AsmOperandBinding::widthBits` and stamped on the instruction by
+ *           `AsmInstructionLowering::effectiveWidth`. `int` ⇒ a 32-bit form,
+ *           `long`/`long long`/pointer ⇒ 64-bit. ⚠ WHAT `char`/`short` DO IS
+ *           PER-TARGET, and the qualifier is the load-bearing half: the width
+ *           the operand asks for is target-independent, but whether the target
+ *           DECLARES an opcode at that width is not. ON aarch64 they are
+ *           refused — `error[A0008] … at width 8` / `… width 16` — because that
+ *           CPU declares no 8/16-bit GPR ALU forms at all, which is the case
+ *           this bullet is contrasting. ON x86_64 they WORK as of this commit
+ *           (D-ASM-SUB-NATIVE-OPERAND-UNUSABLE-IN-INLINE-ASM, closed for that
+ *           target only); ✔RE-MEASURED at the CLI on
+ *           x86_64:pe64-x86_64-windows-exec, a `char` and a `short` operand
+ *           each compile rc=0 and RUN, and the sibling example
+ *           `c_inline_asm_subnative_operand` is their runtime witness. An
+ *           earlier draft of this bullet stated the refusal with NO target
+ *           qualifier while the gcc/clang bullet below carried one, which made
+ *           a per-target fact read as a universal
+ *           (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+ *   gcc 13.3.0 and clang 19, aarch64 — bare `%N` on an `"r"` operand ALWAYS
+ *           renders the 64-bit `x` name, for EVERY integer type including
+ *           `char`; `%w` is how a 32-bit form is asked for. clang says so
+ *           itself: `-Wasm-operand-widths`, *"value size does not match
+ *           register size"*, fix-it *use constraint modifier "w"*.
+ *
+ * ⇒ on a 32-bit operand the SAME template text is a different instruction on
+ * each side, silently, with no diagnostic at either end. ✔MEASURED on this
+ * example's own sibling shape: `str %1, %0` with `"=m"` on an `int` and `"r"`
+ * on an `int` is `str w28, [x29]` under DSS and `str x1, [x0]` under gcc — a
+ * 4-byte store against an 8-byte one. `long` here sidesteps that entirely.
+ * Cross-target, this is aarch64-shaped: on x86_64 both references substitute at
+ * the operand's type width too (`%dil`/`%di`/`%edi`/`%rdi`), so DSS and the
+ * references already agree there, and the AT&T mnemonic suffix cross-check
+ * catches a disagreement anyway ([[D-ASM-DIALECT-WIDTH-SOURCE-IS-DIALECT-DEPENDENT]]).
+ * The fork is `D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE` — an operator
+ * decision, because adopting the reference rule respells this example.
  */
 
 volatile int dss_seed = 42;

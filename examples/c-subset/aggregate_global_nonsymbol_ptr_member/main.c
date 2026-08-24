@@ -20,8 +20,8 @@
  * Verification is by POINTER IDENTITY (64-bit Ptr compares): pUserData must
  * hold the stashed integer (Class A); zName must point AT its array global
  * (Class B, the precise check that the decay-ref relocation resolved correctly).
- * No char-width comparison (that would trip the unrelated arm64 D-CSUBSET-32BIT-
- * ALU-FORMS narrow-ICmp limit). RED-ON-DISABLE: revert either fix -> the member
+ * No char-width comparison (that would trip the unrelated arm64 D-CSUBSET-32BIT-ALU-FORMS
+ * narrow-ICmp limit). RED-ON-DISABLE: revert either fix -> the member
  * fails to classify -> the aggregate falls to runtime-init -> H_Unsupported-
  * LoweringForKind. gcc/clang compile this and exit 42.
  */

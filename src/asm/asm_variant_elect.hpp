@@ -39,7 +39,11 @@
 namespace dss::asm_elect {
 
 // FIRST-MATCH variant selection within ONE opcode. `instWidthBits` is the
-// instruction's operation width (`lirInstWidthBits(flags)`).
+// instruction's operation width (`lirInstWidthBits(flags)`) and
+// `memoryIsDestination` its memory-direction axis
+// (`lirInstMemoryIsDestination(flags)`) — BOTH read off the same `flags`
+// byte, which is what keeps the lowering's election and the encoder's
+// variant choice identical.
 //
 // Returns nullptr when no declared variant matches — which is exactly the
 // condition the encoders report as `A_NoMatchingEncodingVariant`, and exactly
@@ -47,9 +51,11 @@ namespace dss::asm_elect {
 [[nodiscard]] inline TargetEncodingVariant const*
 selectEncodingVariant(TargetOpcodeInfo const&     info,
                       std::span<LirOperand const> instOps,
-                      std::uint8_t                instWidthBits) noexcept {
+                      std::uint8_t                instWidthBits,
+                      bool memoryIsDestination = false) noexcept {
     for (auto const& v : info.encoding.variants) {
-        if (walker_util::variantMatchesInst(instOps, instWidthBits, v)) {
+        if (walker_util::variantMatchesInst(instOps, instWidthBits,
+                                            memoryIsDestination, v)) {
             return &v;
         }
     }
@@ -111,6 +117,7 @@ electOpcode(TargetSchema const&               target,
             std::span<std::string const>      candidateNames,
             std::span<LirOperand const>       instOps,
             std::uint8_t                      instWidthBits,
+            bool                              memoryIsDestination,
             std::vector<ElectionRejectionRow>* rejections,
             std::string*                       ambiguousWith) {
     std::optional<ElectedOpcode> winner;
@@ -132,7 +139,8 @@ electOpcode(TargetSchema const&               target,
             continue;
         }
         auto const* variant =
-            selectEncodingVariant(*info, instOps, instWidthBits);
+            selectEncodingVariant(*info, instOps, instWidthBits,
+                                  memoryIsDestination);
         if (variant == nullptr) {
             if (rejections != nullptr) {
                 rejections->push_back(

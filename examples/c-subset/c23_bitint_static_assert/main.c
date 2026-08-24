@@ -1,5 +1,5 @@
-/* C23 _BitInt wrap-aware CONST-FOLD in constant expressions (D-CSUBSET-BITINT-
- * CONSTFOLD-LARGE, C4b). Every `_Static_assert` below folds through the shared
+/* C23 _BitInt wrap-aware CONST-FOLD in constant expressions (D-CSUBSET-BITINT-CONSTFOLD-LARGE,
+ * C4b). Every `_Static_assert` below folds through the shared
  * host bignum at the TRUE C23 usual-arithmetic-conversion RESULT width — the
  * FILE-SCOPE asserts are the corpus pins, RED-ON-DISABLE (a wrong width or a
  * missing wrap turns one false and the translation unit fails to compile):

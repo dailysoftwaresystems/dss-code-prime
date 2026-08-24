@@ -127,8 +127,8 @@ fs::path writeSrc(fs::path const& dir, std::string_view name,
 } // namespace
 
 // ════════════════════════════════════════════════════════════════════════════
-// `ImageRequest` — the per-PROGRAM image knobs (D-SQLITE-PE64-FULL-TIER-
-// STACK-DEPTH), DERIVED by the driver from `--stack-reserve` / a project
+// `ImageRequest` — the per-PROGRAM image knobs (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH),
+// DERIVED by the driver from `--stack-reserve` / a project
 // manifest's `stackReserve` key.
 // ════════════════════════════════════════════════════════════════════════════
 //

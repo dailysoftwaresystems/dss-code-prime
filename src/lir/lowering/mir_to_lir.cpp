@@ -244,8 +244,8 @@ enum class MnemonicSlot : std::uint8_t {
     // Switch mid-lowering precedent). A target declaring neither fails loud;
     // a HALF-declared ldaxr/stlxr pair is a misdeclaration → fail loud.
     LockCmpxchg, Ldaxr, Stlxr,
-    // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-
-    // FCMP): float compare writing FLAGS, no register result — the
+    // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-FCMP):
+    // float compare writing FLAGS, no register result — the
     // float sibling of `cmp`. x86_64 binds UCOMISD (66 0F 2E, width
     // 64) / UCOMISS (0F 2E, width 32); arm64 binds FCMP D/S forms.
     // The width axis on the variants discriminates F64/F32 exactly
@@ -1128,8 +1128,8 @@ struct Lowerer {
             }
         }
 
-        // D-FFI-EXTERN-CALL-DISPATCH (was D-LK10-ENTRY-ML7-FRAME-BIAS-
-        // UNIFY 2nd-order audit fold): fail loud UPFRONT at construction
+        // D-FFI-EXTERN-CALL-DISPATCH (was D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY
+        // 2nd-order audit fold): fail loud UPFRONT at construction
         // if the module declares extern imports but the active object
         // FORMAT cannot dispatch an extern call — before any lowering
         // work. The extern-call shape is a property of the FORMAT (its
@@ -2879,6 +2879,14 @@ struct Lowerer {
         // the class comes from the SAME `regClassForType` map every other
         // pointer-valued LIR operand uses — config-driven, no letter and no
         // architecture named here.
+        // ⇒ ★★ AND THIS ONE ARM SERVES **BOTH SECTIONS**
+        // (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED). `hir_to_mir` files
+        // a memory-form OUTPUT (`"=m"`, `"+m"`) in `desc.inputs` as well,
+        // because such an operand produces no result piece — the template writes
+        // the object itself — and its one MIR operand IS its address. The
+        // machine carriage is therefore identical in both directions and the
+        // DIRECTION lives entirely in the template's own instruction, which is
+        // why realizing the output form needed no arm here at all.
         // ⚠ THE KIND TRAVELS TO THE ENGINE (`AsmBound::operandKind` →
         // `AsmOperandBinding::operandKind`), because "which register" and "what
         // does the template WRITE around it" are two facts: the engine turns a
@@ -3000,8 +3008,24 @@ struct Lowerer {
             out.cls    = regClassForType(valueType);
             out.reg    = lir.newVReg(out.cls);
             out.pinned = false;
-            // `&` is an OUTPUT promise and the memory form has no output arm
-            // here (`hir_to_mir` refuses `"=m"`), so there is nothing to stamp.
+            // ★★ `&` ON A MEMORY-FORM OPERAND ASKS FOR A PROPERTY THIS BINDING
+            // ALREADY HAS, WHICH IS WHY THERE IS NOTHING TO STAMP
+            // (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED). `&` promises
+            // the output is written BEFORE the inputs are read, so it must not
+            // share a register with any of them, and `stampEarlyClobberOutputs`
+            // realizes that by flagging the instruction that DEFINES a bound
+            // output's vreg. A memory-form operand binds no output register at
+            // all: the register it binds holds the object's ADDRESS, is
+            // materialised by the input loop BEFORE the template and is READ by
+            // the template, so its live range covers the template and overlaps
+            // every other operand's — and two overlapping ranges cannot receive
+            // one physical register. ✔MEASURED through the CLI on
+            // `"=&m"(a) : "r"(y)`: the address register and the input register
+            // come out distinct on both shipped targets, at debug and release.
+            // ⓘ `hir_to_mir` files a memory-form OUTPUT in `desc.inputs` (it
+            // produces no result piece), so `stampEarlyClobberOutputs` — which
+            // walks the bound OUTPUTS — never sees one either way. This line
+            // states the machine fact; the placement is what makes it moot.
             out.earlyClobber = false;
             return true;
         }
@@ -3097,6 +3121,15 @@ struct Lowerer {
     //     is conformance, not a gap. ⚠ clang is NOT installed on this machine,
     //     so it is deliberately not cited: the reference figure names the
     //     compiler the probe was actually run against.
+    //     ⓘ THE SAME VERDICT COVERS `"+m"` IN THE INPUT SECTION and reaches it
+    //     through this same arm: ✔MEASURED 2026-08-23 on gcc 13.3.0, BOTH
+    //     shipped targets, `"+m"` in the input section is the byte-identical
+    //     `error: input operand constraint contains '+'`. A `"+m"` written in
+    //     the OUTPUT section is a different statement and is REALIZED — it
+    //     carries no `isReadWrite` here at all, because a memory operand's read
+    //     and write halves are the same memory named by one address register,
+    //     so there is no second machine fact to tie
+    //     (D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED).
     //   * a read-write OUTPUT that NO input entry claims — the front end owes one
     //     per `+` output; without it the template would read a register only the
     //     template itself writes. ★ This is the original refusal's protective
@@ -3298,8 +3331,8 @@ struct Lowerer {
     }
 
     // ★★★ EVERY DIAGNOSTIC AN ASM EXPANSION RAISES NAMES THE EMBEDDING
-    // STATEMENT AS ITS PRIMARY LOCUS (D-ASM-TEMPLATE-DIAGNOSTIC-DOES-NOT-NAME-
-    // THE-C-STATEMENT). The template's own diagnostics point into the
+    // STATEMENT AS ITS PRIMARY LOCUS (D-ASM-TEMPLATE-DIAGNOSTIC-DOES-NOT-NAME-THE-C-STATEMENT).
+    // The template's own diagnostics point into the
     // mid-compile-minted `<inline asm>` buffer — they name the BYTE inside the
     // template but never the source statement, so a file with three `__asm__`
     // blocks cannot tell which one is being refused. ✔MEASURED, gcc 13.3 and
@@ -3778,18 +3811,24 @@ struct Lowerer {
             sealOrphanedAsmCaptureBlocks(captureBlocks);
             return false;
         }
-        // ★ THE ENGINE EMITS DIRECTLY INTO THE BUILDER, so `recordSource` never
-        // saw its instructions and `lirInstEverEmitted_` may still be false —
-        // in which case `nextLirInstIdValue()` below would report an empty
-        // module and the handle would never be attached. A template that
-        // carried at least one non-blank line and lowered without a refusal
-        // emitted at least one instruction, which is exactly the condition
-        // under which `lastInst()` becomes safe. Counting the lines here (with
-        // the dialect's OWN `lineRule`, never by scanning the text) is what
-        // makes the accounting exact instead of optimistic.
-        if (templateLineCount(*tree, dialect->assembly()) > 0) {
-            lirInstEverEmitted_ = true;
-        }
+        // ★★★ NOTHING IS ACCOUNTED FOR HERE ANY MORE, AND THAT IS THE FIX.
+        // The engine emits DIRECTLY into the builder, so `recordSource` never
+        // sees its instructions. This site used to compensate by setting a
+        // `lirInstEverEmitted_` mirror from the SHAPE OF THE INPUT — "did the
+        // template carry at least one non-blank line?" — on the argument that
+        // a line with content always lowers to at least one instruction. That
+        // argument ENUMERATED the exceptions it knew (a directive, a label,
+        // both already refusals), and a template can carry a line that emits
+        // nothing in ways the enumeration did not list: a comment, a bare
+        // newline, whitespace. Each set the mirror over an EMPTY arena, and
+        // `nextLirInstIdValue()` below then called `lastInst()` on it —
+        // ✔MEASURED rc=127, `dss::Lir fatal: LirBuilder::lastInst: no
+        // instruction has been appended`, no code and no source position, on
+        // five template shapes gcc 13.3.0 compiles and runs. Anchored at
+        // D-LIR-ASM-TEMPLATE-EMITTING-NO-INSTRUCTION-ABORTS-WITH-NO-DIAGNOSTIC
+        // ⇒ `nextLirInstIdValue()` now PROBES the arena (`hasAnyInst()`)
+        // instead of consulting a mirror, so the engine's emissions need no
+        // separate accounting and no proxy can be wrong about them.
         if (!stampEarlyClobberOutputs(id, outs, firstEmitted)) {
             sealOrphanedAsmCaptureBlocks(captureBlocks);
             return false;
@@ -4123,22 +4162,6 @@ struct Lowerer {
         return true;
     }
 
-    // How many NON-BLANK lines the template holds, read through the dialect's
-    // own `lineRule` rather than by looking at the text. A blank line has no
-    // visible children and contributes nothing; a line with any content lowered
-    // to at least one instruction, because the two shapes a template cannot
-    // carry (a directive, a label) are REFUSALS the engine already reported.
-    [[nodiscard]] static std::uint32_t
-    templateLineCount(Tree const& tree, AssemblyConfig const& cfg) {
-        std::uint32_t n = 0;
-        for (NodeId const line : asm_walk::visibleChildren(tree, tree.root())) {
-            if (tree.kind(line) != NodeKind::Internal) continue;
-            if (tree.rule(line).v != cfg.lineRule.v) continue;
-            if (!asm_walk::visibleChildren(tree, line).empty()) ++n;
-        }
-        return n;
-    }
-
     // ★★★ OUTPUT k's MIR VALUE TYPE — THE ONE QUESTION WHOSE ANSWER LIVES IN A
     // DIFFERENT PLACE FOR THE TWO ASM FORMS, WHICH IS WHY IT IS ASKED HERE
     // RATHER THAN INLINE.
@@ -4220,8 +4243,8 @@ struct Lowerer {
     // `asm goto` — the TERMINATOR form. Returns true iff the block was sealed.
     //
     // ★★★ THE REFUSAL THAT USED TO LIVE HERE IS GONE, AND WHAT RETIRED IT IS
-    // EXACTLY WHAT IT NAMED (D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-
-    // LONGER-EXISTS). ✔MEASURED, and worth keeping because it is the shape of a
+    // EXACTLY WHAT IT NAMED (D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-LONGER-EXISTS).
+    // ✔MEASURED, and worth keeping because it is the shape of a
     // correctly-scoped refusal: the message said a label target must resolve to
     // a BLOCK of the embedding function while `AsmOperandBinding` carried a
     // `LirReg` and no block, *"so no caller can bind one"* — and that it would
@@ -5651,8 +5674,8 @@ struct Lowerer {
                 poisonValue(id);
                 return;
             }
-            // Byte-EXACT for a Char load (D-CSUBSET-CHAR-STRING-VALUE-
-            // CODEGEN) exactly as the generic path below — a folded
+            // Byte-EXACT for a Char load (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN)
+            // exactly as the generic path below — a folded
             // [rip+sym] load of a 1-byte item must read 1 byte, not 8.
             // memAccessWidthFlags == the old FPR-width / GPR-0 ternary for
             // every non-Char type, so this is byte-identical pre-char.
@@ -6007,8 +6030,8 @@ struct Lowerer {
 
     // ── cycle 3e: Calls + GlobalAddr ─────────────────────────────────
 
-    // MIR GlobalAddr → LIR `lea result, [rip + sym]` (D-LK4-RODATA-
-    // PRODUCER 2026-06-02 — closes the prior `mov SymbolRef` gap).
+    // MIR GlobalAddr → LIR `lea result, [rip + sym]` (D-LK4-RODATA-PRODUCER
+    // 2026-06-02 — closes the prior `mov SymbolRef` gap).
     // The address materialization is a pure 7-byte RIP-relative
     // load-effective-address that emits a `rel32` Relocation
     // against the symbol. Cross-target shape: ARM64 will declare
@@ -7295,8 +7318,8 @@ struct Lowerer {
             return;
         }
         // FC3.5 c2: FPR width-exact like lowerLoad.
-        // Byte-EXACT for a Char first-field (D-CSUBSET-CHAR-STRING-VALUE-
-        // CODEGEN) exactly as lowerLoad — extracting a 1-byte field must
+        // Byte-EXACT for a Char first-field (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN)
+        // exactly as lowerLoad — extracting a 1-byte field must
         // read 1 byte. memAccessWidthFlags == the old FPR-width / GPR-0
         // ternary for every non-Char type (byte-identical pre-char).
         std::uint8_t const extWidthFlags =
@@ -7340,8 +7363,8 @@ struct Lowerer {
             reportMissingClassOp(cls, RegClassOp::Store, "MIR InsertValue");
             return;
         }
-        // Byte-EXACT for a Char first-field store (D-CSUBSET-CHAR-STRING-
-        // VALUE-CODEGEN) exactly as lowerStore — inserting a 1-byte field
+        // Byte-EXACT for a Char first-field store (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN)
+        // exactly as lowerStore — inserting a 1-byte field
         // must write 1 byte, not clobber 7 neighbours. memAccessWidthFlags
         // == the old FPR-width / GPR-0 ternary for non-Char (byte-identical
         // pre-char).
@@ -7696,8 +7719,8 @@ struct Lowerer {
     //     the SSA result is captured from the implicit output
     //     selected BY ROLE ("quotient" for div, "remainder" for mod)
     //     via the core op's `outputRoles` declaration — never by
-    //     positional index (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-
-    //     CONTRACT: a JSON reorder of `outputs` can no longer
+    //     positional index (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT:
+    //     a JSON reorder of `outputs` can no longer
     //     silently flip a quotient capture into a remainder capture).
     //     The dividend pin likewise resolves via `inputRoles` role
     //     "dividend". A HALF-declared pair (pre without core or vice
@@ -7910,8 +7933,8 @@ struct Lowerer {
             reportUnsupported(mir.instOpcode(id), id);
             return std::nullopt;
         }
-        // Role-based register resolution (D-CSUBSET-MOD-OP-CODEGEN-
-        // OUTPUT-INDEX-CONTRACT): the dividend pin and the captured
+        // Role-based register resolution (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT):
+        // the dividend pin and the captured
         // output are looked up BY ROLE from the core op's
         // inputRoles/outputRoles declarations — positional indexing
         // is gone from this projection path. An op missing the
@@ -9050,8 +9073,8 @@ struct Lowerer {
         // so the result is always a CLEAN 0/1 r64 — `cmp r64, 0`
         // / `cmp r64, r64` consumers downstream cannot read garbage.
         // The ICmp+CondBr fusion at `lowerCondBr` still elides the
-        // cmp-against-0 (the setcc + zext become "dead" via D-LIR-
-        // SETCC-DEAD-AFTER-FUSION DCE in 13.6), but non-adjacent
+        // cmp-against-0 (the setcc + zext become "dead" via
+        // D-LIR-SETCC-DEAD-AFTER-FUSION DCE in 13.6), but non-adjacent
         // ICmp uses (bool stored, bool returned, bool ternary) now
         // get correct width semantics for free. Clean SSA: setcc
         // defines `b8`; zext consumes `b8` AND defines `result`.
@@ -10626,7 +10649,6 @@ struct Lowerer {
     // `lirToMir` vector so `lirToMir[li.v]` is always the producer.
     void recordSource(LirInstId li) {
         if (!li.valid()) return;
-        lirInstEverEmitted_ = true;
         if (li.v >= lirToMir.size()) lirToMir.resize(li.v + 1);
         lirToMir[li.v] = currentMir;
     }
@@ -10638,15 +10660,18 @@ struct Lowerer {
     // inline-asm expansion reaches instructions the shared assembly ENGINE
     // emitted directly into the builder, bypassing the wrappers above.
     //
-    // ⚠ `lastInst()` ABORTS on a module with no instructions and `LirBuilder`
-    // exposes no count, so the empty case is TRACKED rather than probed.
-    // `lirInstEverEmitted_` is set by `recordSource`, i.e. by every emission
-    // this lowering makes; the engine's emissions are accounted for separately
-    // at the one site that needs it.
+    // ⚠ `lastInst()` ABORTS on a module with no instructions, so the empty
+    // case must be settled before asking. It is PROBED, not tracked: the
+    // sentence that used to stand here — "`LirBuilder` exposes no count, so
+    // the empty case is TRACKED rather than probed" — named the real cause
+    // of a crash, because the tracking `bool` was a MIRROR of the arena and
+    // the assembly engine emits without passing the site that set it. The
+    // missing count is now `LirBuilder::hasAnyInst()`, sharing its predicate
+    // with `lastInst()`'s own refusal, and the mirror is GONE rather than
+    // repaired.
     [[nodiscard]] std::uint32_t nextLirInstIdValue() {
-        return lirInstEverEmitted_ ? (lir.lastInst().v + 1u) : 1u;
+        return lir.hasAnyInst() ? (lir.lastInst().v + 1u) : 1u;
     }
-    bool lirInstEverEmitted_ = false;
 
     // Forwarding wrappers around `LirBuilder` emitters that AUTO-RECORD
     // the source MIR inst (via `currentMir`). Cycle 3e fix-up: every

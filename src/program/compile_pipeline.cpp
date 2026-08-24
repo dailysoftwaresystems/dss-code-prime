@@ -105,8 +105,8 @@ effectiveLongDoubleFormat([[maybe_unused]] TargetSchema const& target,
     return format.longDoubleFormat();
 }
 
-// ── NOT HERE: `effectiveCharIsUnsigned` (D-TARGET-CHAR-SIGNEDNESS-PER-
-// PLATFORM) ──────────────────────────────────────────────────────────────
+// ── NOT HERE: `effectiveCharIsUnsigned` (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM)
+// ──────────────────────────────────────────────────────────────
 // There is deliberately no third member of the `effective*` family for
 // bare-`char` signedness. This family exists because those axes have
 // contributions from BOTH schemas that must be RECONCILED — a genuine
@@ -425,8 +425,9 @@ static std::optional<CuMirModule> buildCuMirImpl(
     //      to it -- that needs the whole file.
     //
     //      ★ THE PROBE ALSO ANSWERS "IS THIS THE RIGHT FORMAT AT ALL", on the
-    //      SAME unconditional argument (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-
-    //      GUARD-IS-INCIDENTAL). A library whose object format is not this
+    //      SAME unconditional argument
+    //      (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL).
+    //      A library whose object format is not this
     //      target's can never bind correctly, the fact is knowable from the
     //      first 8 bytes without reading it, and the alternative is a check
     //      that only fires when this particular TU happens to reference a
@@ -832,8 +833,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
     mirCfg.aggregateLayout.bitFieldStrategy = effectiveBfStrategy;
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
-    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75 (D-TARGET-
-    // CHAR-SIGNEDNESS-PER-PLATFORM): thread the RESOLVED bare-`char` signedness
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75
+    // (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM): thread the RESOLVED bare-`char` signedness
     // so HIR→MIR picks ZExt vs SExt for the char→int promotion. The axis is
     // (processor × PLATFORM), not per-processor — the same arm64 CPU is
     // UNSIGNED under GNU/Linux and SIGNED under Darwin — and the TARGET
@@ -1917,8 +1918,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // THEN `optimizeModule`, whose verify covers all three; `synthesizeSehFunclets`
     // runs after it and is uncovered there too. Placing this verify at the same
     // point makes the two seams AGREE on what is verified instead of one silently
-    // checking less than the other (`D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-
-    // ASYMMETRY`).
+    // checking less than the other (`D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY`).
     //
     // ⚠ IT DELIBERATELY PRECEDES `synthesizeSehFunclets`, AND THAT RESIDUE IS
     // STATED, NOT HIDDEN. That pass RELAYOUTS parent blocks to make each `__try`
@@ -1969,8 +1969,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // through the FORMAT'S C mangling (`applyCMangling`: identity on ELF/PE, a
     // leading `_` on Mach-O). D-LK-OBJECT-EXTERN-SYMBOL-NAMES: this makes the
     // single-CU `ModuleSymbol.name` the SAME pre-mangled on-binary form the
-    // merge path already stores (program.cpp, via D-LK-MACHO-CROSSCU-MANGLE-
-    // MERGE-KEY / c118), so the object writers emit it VERBATIM with no per-
+    // merge path already stores (program.cpp, via D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY
+    // / c118), so the object writers emit it VERBATIM with no per-
     // path divergence and no double-mangle. Identity on ELF/PE → byte-identical
     // to the pre-fix output; adds the `_` on Mach-O only. A SymbolId with no
     // record (synthesized / out-of-range) yields "" — the LK11a symbol-table

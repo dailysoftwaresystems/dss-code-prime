@@ -1522,8 +1522,8 @@ namespace {
     c.inputNames      = {"rax", "rdx"};
     c.outputNames     = {"rax"};
     // ⚠ `rax` is an output, so it MUST also be clobbered — `LirBuilder::
-    // regConstraintPoolAdd` enforces `outputs ⊆ clobbered` (D-LIR-PER-
-    // INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED) and this
+    // regConstraintPoolAdd` enforces `outputs ⊆ clobbered`
+    // (D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED) and this
     // fixture goes through the real builder. `rcx` stays a clobber that
     // is NOT an output, so the round trip still carries a set where the
     // three arrays genuinely differ.
@@ -1802,3 +1802,60 @@ TEST(LirTextParser, VerifyOnLoadCatchesAnUnreferencedConstraintEntry) {
     EXPECT_TRUE(sawLost);
 }
 
+
+// ★★★ THE MEMORY-DIRECTION FLAG MUST SURVIVE THE TEXT ROUND TRIP, AND THIS PIN
+// EXISTS BECAUSE ITS WHOLE SOUNDNESS ARGUMENT IS THAT `flags` SURVIVES BY
+// CONSTRUCTION. `kLirInstFlagMemoryIsDestination` is what tells the ENCODER
+// which of two byte-identical `cmp` operand lists it is holding
+// (D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE). A rebuild that
+// dropped the bit would silently elect the OPPOSITE direction's variant — the
+// instruction would still assemble, still link, and compare its operands the
+// wrong way round.
+//
+// ⚠ THE ASSERTION IS ON THE PARSED FLAGS, NOT ON THE TEXT. `flags=17` appearing
+// in a string proves the emitter wrote a number; reading the bit back through
+// `lirInstMemoryIsDestination` proves the value the ENCODER will consult is the
+// value the builder set. And the flag is combined with a WIDTH bit on purpose:
+// the two share one byte, so a mask that clobbered either would show here.
+TEST(LirTextRoundTrip, MemoryDestinationFlagSurvivesWithItsWidthSibling) {
+    auto sch = shippedX86();
+    auto const cmpOp = sch->opcodeByMnemonic("cmp");
+    ASSERT_TRUE(cmpOp.has_value());
+    auto const retOp = sch->opcodeByMnemonic("ret");
+    LirBuilder b{*sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const rax = makePhysicalReg(0, LirRegClass::GPR);
+    LirReg const rcx = makePhysicalReg(1, LirRegClass::GPR);
+    std::array<LirOperand, 4> const ops{
+        LirOperand::makeReg(rax), LirOperand::makeReg(rcx),
+        LirOperand::makeMemBase(1), LirOperand::makeMemOffset(4096)};
+    std::uint8_t const flags = static_cast<std::uint8_t>(
+        kLirInstFlagMemoryIsDestination | kLirInstFlagWidth32);
+    b.addInst(*cmpOp, InvalidLirReg, ops, /*payload=*/0, flags);
+    b.addReturn(*retOp, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+    ASSERT_TRUE(lirInstMemoryIsDestination(
+        lir.instFlags(lir.blockInstAt(entry, 0))))
+        << "the builder did not carry the flag onto the instruction";
+
+    LirTextContext ctx;
+    DiagnosticReporter rep1, rep2;
+    std::string const text = emitLir(lir, *sch, ctx, rep1);
+    auto parsed = parseLir(text, *sch, rep2);
+    ASSERT_TRUE(parsed->ok) << text;
+    // ⚠ THE PARSED MODULE IS ITS OWN ARENA — a block id from the BUILDER's
+    // module is refused there (`LirBlockId from LirModuleId=1 used on
+    // LirModuleId=2`), which is the substrate doing exactly its job. Walk the
+    // parsed module to ITS entry block.
+    auto const reEntry =
+        parsed->lir.funcBlockAt(parsed->lir.funcAt(0), 0);
+    auto const reFlags =
+        parsed->lir.instFlags(parsed->lir.blockInstAt(reEntry, 0));
+    EXPECT_TRUE(lirInstMemoryIsDestination(reFlags))
+        << "the memory-direction bit did not survive the text round trip — the "
+           "encoder would elect the opposite direction's variant:\n" << text;
+    EXPECT_EQ(lirInstWidthBits(reFlags), 32u)
+        << "the width sibling in the same byte was disturbed";
+}

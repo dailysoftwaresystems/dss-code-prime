@@ -43,8 +43,8 @@
 // (Local-binding) function therefore falls through to the fallback — this is
 // the `may stay internal` name carve-out.
 //
-// NAME<->BINDING LOCKSTEP (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-
-// COLLISION, TF-C54): `definedBinding` is the exact binding companion of
+// NAME<->BINDING LOCKSTEP (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION,
+// TF-C54): `definedBinding` is the exact binding companion of
 // `definedName`. It runs the IDENTICAL `definedBySym_` lookup + the IDENTICAL
 // `!name.empty() && isExternallyVisible(...)` predicate, so a symbol that gets
 // the `<prefix><id>` fallback NAME is ALWAYS emitted with `SymbolBinding::Local`
@@ -138,8 +138,9 @@ public:
     // it exists because a RELOCATABLE object's `.symtab` names are a FOREIGN
     // LINKER'S RESOLUTION KEYS: exposing a `static` under its real name there
     // makes two TUs that both define `helper` collide at `ld` (`multiple
-    // definition`), which is the exact defect D-LK-INTERNAL-LINKAGE-FN-EMITTED-
-    // GLOBAL-FOREIGN-COLLISION closed. A FINAL IMAGE is never re-linked, so its
+    // definition`), which is the exact defect
+    // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION
+    // closed. A FINAL IMAGE is never re-linked, so its
     // `.symtab` resolves NOTHING -- it is read by debuggers, profilers and crash
     // reporters, for which a `static`'s real name is precisely the wanted
     // answer, and duplicate local names across CUs are normal and harmless
@@ -218,8 +219,8 @@ public:
     // D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB.
     //
     // ★ WHY THIS EXISTS. Since equal-offset defined symbols collapse to ONE
-    // atom with several names (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-
-    // ATOMS), `module.symbols` can carry several rows for one `SymbolId` --
+    // atom with several names (D-LINK-EQUAL-OFFSET-DEFINED-SYMBOLS-BECOME-TWIN-ATOMS),
+    // `module.symbols` can carry several rows for one `SymbolId` --
     // `strong_fn` GLOBAL and `weak_alias` WEAK at the same address is the shape
     // gcc emits for `__attribute__((weak, alias("strong_fn")))`. `definedName`
     // and `definedBinding` are FIRST-ROW-WINS by design (a symtab entry, an

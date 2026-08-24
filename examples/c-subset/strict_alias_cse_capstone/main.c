@@ -15,8 +15,8 @@
 // exception → Maybe) first, leaving no precision win observable
 // on the char path. The strict arm is the under-pinned one — no
 // compiled-binary differential existed for `strictAliasingOn
-// DistinctTypes` before this row. Cycle 10h's `D-CSUBSET-LONG-
-// PRIMITIVE` was the substrate pre-req: it added `long`→I64 to
+// DistinctTypes` before this row. Cycle 10h's `D-CSUBSET-LONG-PRIMITIVE`
+// was the substrate pre-req: it added `long`→I64 to
 // c-subset so a non-char distinct-primitive pair (`int*` vs
 // `long*`) became expressible.
 //

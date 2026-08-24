@@ -246,3 +246,27 @@ dss_add_test(NAME program/test_shipped_runtime_compiles
 # exit code — a build optimized at the unit schedule only still exits 42.
 dss_add_test(NAME program/test_driver_argument_supply
              SOURCES test_driver_argument_supply.cpp)
+
+# THE FOUR SOURCE-ARGUMENT SHAPES A USER CAN TYPE
+# (D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH).
+#
+# ★★★ DRIVER TIER BECAUSE THE SHAPE IS A PROPERTY OF THE INVOCATION, NOT OF AN
+# EXAMPLE. Both corpus runners construct an ABSOLUTE source path by
+# construction, so EVERY manifest exercises exactly one of the four shapes and
+# the other three are exercised by nothing. That is not a hypothetical hole: it
+# is how `dss --compile main.c` shipped unable to find a header sitting beside
+# `main.c` (D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH)
+# behind a green gate.
+#
+# ⓘ NOT tests/examples/: the manifest vocabulary is a CLOSED key set that both
+# runners refuse an unknown key from, so expressing a shape per example would
+# mean minting a schema key to serve exactly one manifest — the P24
+# invent-a-schema-key anti-pattern — and a new example would witness nothing,
+# because both runners would hand it an absolute path like every other one.
+#
+# ⓘ ITS CLI-SUBPROCESS COUNTERPART is `runSourceArgumentShapePin` on the
+# `integrated_tests/cli-surface` entry. A capability that exists on one tier and
+# not the other is [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]]; these two land
+# together.
+dss_add_test(NAME program/test_source_argument_shape
+             SOURCES test_source_argument_shape.cpp)

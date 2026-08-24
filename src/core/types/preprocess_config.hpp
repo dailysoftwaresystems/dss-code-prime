@@ -644,8 +644,21 @@ struct DSS_EXPORT PreprocessConfig {
 
     // The token kind that marks a VARIADIC function-like macro's
     // catch-all parameter (C's `...` -> "EllipsisOp"). The macro engine reads
-    // it to RECOGNISE `#define V(...)` in parameter position (today: fail loud,
-    // D-PP-VARIADIC-MACRO -- the `__VA_ARGS__` substitution is FC15-area). Like
+    // it to RECOGNISE `#define V(...)` in parameter position.
+    // WARNING: this parenthetical USED TO READ "(today: fail loud,
+    // D-PP-VARIADIC-MACRO -- the `__VA_ARGS__` substitution is FC15-area)", and
+    // BOTH of its halves WERE FALSE by the time the commit landed. It is
+    // corrected here instead of deleted because the failure mode is the point:
+    // a bare "today" is a claim with no date and no instrument, so it never
+    // stops being read as the present tense
+    // (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+    // MEASURED at the CLI 2026-08-24 on x86_64:pe64-x86_64-windows-exec, debug
+    // AND release: `#define SUM3(...) dssAdd(__VA_ARGS__)` called as
+    // `SUM3(20, 15, 7)` compiles rc=0 and the program RUNS returning 42 -- the
+    // form is accepted and the substitution happens. The row it cited IS
+    // CLOSED, and this header contradicted itself about it: `variadicArgsName`
+    // two fields below is the config knob FOR that substitution and its own
+    // comment describes the engine performing it. Like
     // every other PP-vocabulary token this is a per-language CONFIG lexeme, NOT
     // a hard-coded `...`: a second preprocess-opting language whose variadic
     // marker is spelled differently would otherwise have a word-like marker

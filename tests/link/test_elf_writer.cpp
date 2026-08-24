@@ -227,8 +227,8 @@ TEST(ElfWriter, SectionHeaderTableHasSevenEntriesNullThenTextThenRelocThenNoteLa
     EXPECT_EQ(readU32LE(bytes, shoff + 128 + 4), 4u);
     EXPECT_EQ(readU64LE(bytes, shoff + 128 + 56), 24u);
 
-    // Section header 6 (.note.GNU-stack, appended LAST — D-LK-OBJECT-EXTERN-
-    // SYMBOL-NAMES): SHT_PROGBITS(1), sh_flags=0 (NO SHF_EXECINSTR — the
+    // Section header 6 (.note.GNU-stack, appended LAST — D-LK-OBJECT-EXTERN-SYMBOL-NAMES):
+    // SHT_PROGBITS(1), sh_flags=0 (NO SHF_EXECINSTR — the
     // non-executable-stack marker), sh_size=0 (empty).
     std::uint64_t const noteShdr = shoff + 6 * 64;
     EXPECT_EQ(readU32LE(bytes, noteShdr + 4), 1u)  // sh_type

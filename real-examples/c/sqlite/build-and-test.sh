@@ -55,8 +55,8 @@
 #      prints its path, or says ABSENT when this run produced none.
 #   5. build dss-code-prime              (its default CMake-4 Release build)
 #   6. stage the third-party HEADERS DSS parses agnostically (the host's REAL tcl
-#      headers — whatever version it has — + zlib, NO descriptor — D-FFI-SHIPPED-
-#      LIBS-OS-ONLY; portable C, shared by EVERY leg) and resolve EACH LEG'S OWN
+#      headers — whatever version it has — + zlib, NO descriptor — D-FFI-SHIPPED-LIBS-OS-ONLY;
+#      portable C, shared by EVERY leg) and resolve EACH LEG'S OWN
 #      (tcl, z) library pair from the provider its catalogue entry declares
 #      (the closed set `harness_legs.py --library-providers` prints — this header
 #      does NOT re-type it, and the resolution loop's refusal does not either;
@@ -854,8 +854,8 @@ clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-
 #                             run decision, the Step-8 gate sequence, parse_segment,
 #                             the precondition discriminator (driven over real
 #                             ZERO-BYTE segment logs, so "one resume, not ten" is
-#                             asserted rather than described — D-HARNESS-
-#                             PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH),
+#                             asserted rather than described —
+#                             D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH),
 #                             acq_field and the target-keyed loader variable, each
 #                             with its red-on-disable mutation asserted to have
 #                             LANDED.
@@ -1320,8 +1320,8 @@ done
 # question — "may this host EXECUTE this leg?" — and the answer is `run.mode` off
 # the RESOLVED plan, never `if [[ $HOST_OS ]]`. It is a FUNCTION, and defined HERE
 # beside the plan it reads, so the two call sites cannot drift into two different
-# answers: that drift is what D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-
-# AVAILABLE is about, and the fix its registry row asked for is one resolver, both
+# answers: that drift is what D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-AVAILABLE
+# is about, and the fix its registry row asked for is one resolver, both
 # call sites.
 #
 # ⚠ NOTE FOR THE NEXT READER, because the obvious reading of that row is WRONG and
@@ -3753,8 +3753,8 @@ resolve_leg_target_cc() {       # resolve_leg_target_cc <leg>  -> 0 + LEG_CC set
   # It reuses this function's OWN refusal mechanism, the same one both failure
   # exits below use — set LEG_CC_WHY, leave LEG_CC[$leg] unset, return non-zero —
   # so the caller reports "no CONTROL compiler here" and CARRIES ON.
-  # ⚠ CORRECTED 2026-08-06 (D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-
-  # AVAILABLE): this note used to say the caller "records
+  # ⚠ CORRECTED 2026-08-06 (D-HARNESS-UNITS-SKIP-A-LEG-WHOSE-LAUNCHER-IT-SAYS-IS-AVAILABLE):
+  # this note used to say the caller "records
   # `skipped-build-input-missing` for THIS leg and CONTINUES" via
   # `leg_marks_missing`. That STOPPED BEING TRUE when the control became optional
   # — the caller's branch now records NO verdict in either direction, by design —
@@ -4898,8 +4898,8 @@ for leg in "${LEG_ORDER[@]}"; do
   # environment: one of its two staged header dirs could not be produced (a
   # ZINC-STAGE-FAIL or a CFG-STAGE-FAIL in Step 6). `poisoned`, named, and NO
   # fallback to a sibling stage's copy — that fallback IS
-  # D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED / D-HARNESS-MACHO-LEG-INHERITS-THE-
-  # DERIVING-LINUX-HOSTS-CONFIGURE-PROBES.
+  # D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED /
+  # D-HARNESS-MACHO-LEG-INHERITS-THE-DERIVING-LINUX-HOSTS-CONFIGURE-PROBES.
   if [[ -z "${LEG_INC_FILE[$leg]:-}" ]]; then
     LEG_VERDICT["$leg"]='poisoned'
     LEG_VERDICT_DETAIL["$leg"]="this leg has no include list: its staged zlib header dir 'zinc/${LEG_HEADER_STAGE_KEY[$leg]:-?}' (declared zconfGuards: ${LEG_ZCONF_GUARDS[$leg]:-none}) and/or its staged sqlite config dir 'cfg/${LEG_CONFIG_STAGE_KEY[$leg]:-?}' (declared configureAnswers: ${LEG_CONFIGURE_ANSWERS[$leg]:-none}) was NOT produced — see the ZINC-STAGE-FAIL / CFG-STAGE-FAIL line in Step 6. Compiling it against another target's zlib header, or against the DERIVING host's sqlite_cfg.h, is refused."
@@ -5937,8 +5937,8 @@ SQLITE_TESTDIR_SUBDIR="testdir"
 #
 # ★★★ WHO BUILDS IT, SINCE 2026-08-05: DSS ITSELF, FOR THE LEG'S DECLARED
 # `sharedLibFormat` — so this function no longer needs ANY third-party compiler and
-# no leg's corpus depends on one being installed here [D-HARNESS-CROSS-HOST-ANY-
-# TARGET]. The leg's verified target compiler is now the optional CONTROL arm
+# no leg's corpus depends on one being installed here [D-HARNESS-CROSS-HOST-ANY-TARGET].
+# The leg's verified target compiler is now the optional CONTROL arm
 # (Step 6), built beside the primary where it exists and STAGED only when the
 # operator asks (DSS_LOADEXT_HELPER=reference). A leg with neither used to record
 # `skipped-build-input-missing` and skip ~330,000 units; it now simply runs.
@@ -5965,8 +5965,7 @@ SQLITE_TESTDIR_SUBDIR="testdir"
 # project keeps paying for (a capability in one driver and not the other is a
 # silent harness bug), and it is why the .ps1 can finally stage a helper at all:
 # it never could, because it had no way to build one for a target its own host
-# has no compiler for [D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-
-# UNDECLARED].
+# has no compiler for [D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED].
 #
 # TWO FAILURE CLASSES, NOT ONE — this is why the return codes are 1 and 2:
 #   1  poisoned                    a REAL failure. The primary build produced no

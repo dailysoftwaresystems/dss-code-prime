@@ -50,14 +50,25 @@ using namespace dss::test_support;
 
 namespace {
 
-// The shipped x86_64 `xor`: `requires2Address: true`, two LIR operands, and —
-// ✔MEASURED over every two-address opcode in the document — one of only four
-// (`mul`, `and`, `or`, `xor`) whose EVERY encoding variant guards
-// `operandKinds: [reg, reg]`. That matters: `add`/`sub` also declare
-// `[reg, imm32]` variants, so a tie aimed at operand 1 is genuinely invalid
-// for them and the loader rejects it (correctly — the pass cannot copy from an
-// immediate). Picking a reg-reg-only opcode is what makes the mutant a
-// COHERENT declaration rather than a broken one.
+// The shipped x86_64 `xor`: `requires2Address: true` and two LIR operands.
+//
+// ★★★ THIS COMMENT USED TO SAY `xor` WAS ONE OF FOUR OPCODES WHOSE **EVERY**
+// VARIANT GUARDS `[reg, reg]`, AND THAT MEASUREMENT EXPIRED ON 2026-08-23. It
+// was true when written; then `and`/`or`/`xor` gained `[reg, imm32]` variants
+// and all four gained memory-source ones
+// (D-TARGET-X86-64-DECLARES-NO-MEMORY-DESTINATION-ARITHMETIC), so NO
+// two-address opcode in the document is reg-reg-only any more and the premise
+// this fixture rested on no longer holds for any choice of mnemonic.
+//
+// ★★ THE FIXTURE THEREFORE BUILDS THE COHERENT OPCODE RATHER THAN LOOKING FOR
+// ONE, and the reason the old premise mattered is unchanged: a tie aimed at
+// operand 1 is genuinely INVALID for a `[reg, imm32]` variant — the legalize
+// pass cannot copy from an immediate — and the loader rejects it, correctly.
+// So `schemaTiedToOperand` first DROPS every non-`[reg, reg]` variant, leaving
+// a reg-reg-only `xor` that a non-zero tie describes honestly. That is a
+// STRONGER mutant than the original, not a weaker one: it now asserts the
+// filter matched something, so a future variant-set change cannot silently
+// leave the fixture testing a schema it did not build.
 constexpr std::string_view kTiedMnemonic = "xor";
 
 // Point `xor`'s two-address tie at operand 1 instead of the default 0.
@@ -82,6 +93,22 @@ constexpr std::string_view kTiedMnemonic = "xor";
             if (!op.is_object()) continue;
             if (op.value("mnemonic", std::string{}) != kTiedMnemonic) continue;
             op["twoAddressSourceOperand"] = index;
+            // Keep ONLY the `[reg, reg]` variants — see the fixture banner.
+            nlohmann::json kept = nlohmann::json::array();
+            for (auto& v : op.at("encoding").at("variants")) {
+                auto const& kinds = v.at("guard").at("operandKinds");
+                if (kinds.size() != 2) continue;
+                if (kinds[0] != "reg" || kinds[1] != "reg") continue;
+                kept.push_back(v);
+            }
+            if (kept.empty()) {
+                throw std::runtime_error{
+                    "the reg-reg variant filter matched nothing on '"
+                    + std::string{kTiedMnemonic}
+                    + "' — the mutant would be an opcode with no encodings, "
+                      "and every pin downstream would assert nothing"};
+            }
+            op["encoding"]["variants"] = std::move(kept);
             for (auto& v : op.at("encoding").at("variants")) {
                 for (auto& w : v.at("wires")) {
                     w["slotKind"] = (w.at("index").get<unsigned>() == index)

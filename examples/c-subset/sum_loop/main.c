@@ -31,8 +31,7 @@
 //     wire[1] declares `prefixOpcodeBytes: [0xE9]` to bridge to
 //     the trailing unconditional jmp to operand[1]=fallthrough.
 //     A future optimizer pass elides the trailing jmp when
-//     ifFalse IS the next-laid-out block (anchored D-OPT-JCC-
-//     FALLTHROUGH).
+//     ifFalse IS the next-laid-out block (anchored D-OPT-JCC-FALLTHROUGH).
 //
 //   * MIR→LIR `lowerCondBr` passes BOTH successors as BlockRef
 //     operands (mirroring the existing `addBr` precedent which

@@ -44,8 +44,8 @@ target_link_libraries(lsp
 
 # ── `program` IS DELIBERATELY ABSENT FROM THE LIST ABOVE ────────────────────
 #
-# ✅ THE PROJECT-MANIFEST HALF IS FIXED (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-
-# CONSUMERS, closed 2026-08-13). `workspace_project.cpp` used to include
+# ✅ THE PROJECT-MANIFEST HALF IS FIXED (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS,
+# closed 2026-08-13). `workspace_project.cpp` used to include
 # `program/project_config.hpp`; the parser now lives at
 # `core/types/project_config.hpp` and is reached through the `core` edge already
 # declared above. Same ONE parser, reused rather than re-implemented — only the

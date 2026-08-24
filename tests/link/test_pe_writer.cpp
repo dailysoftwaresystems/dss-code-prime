@@ -252,8 +252,9 @@ TEST(PeWriter, SymbolRecordsAre18BytesPackedNoPadding) {
     EXPECT_EQ(readU16LE(bytes, symPtr + 14), 0x0020u);
     // StorageClass @ +16 = 3 (IMAGE_SYM_CLASS_STATIC) — this function has no
     // ModuleSymbol row, so it is not externally visible → `definedBinding` =
-    // Local → STATIC, not EXTERNAL (TF-C54, D-LK-INTERNAL-LINKAGE-FN-EMITTED-
-    // GLOBAL-FOREIGN-COLLISION; pre-fix it was hardcoded EXTERNAL = 2).
+    // Local → STATIC, not EXTERNAL (TF-C54,
+    // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION;
+    // pre-fix it was hardcoded EXTERNAL = 2).
     EXPECT_EQ(bytes[symPtr + 16], 3u);
     // NumberOfAuxSymbols @ +17 = 0
     EXPECT_EQ(bytes[symPtr + 17], 0u);
@@ -1788,8 +1789,8 @@ TEST(PeWriter, ObjectStaticDataItemIsClassStaticNotExternal) {
     EXPECT_EQ(bytes[s1 + 16], 3u)   // IMAGE_SYM_CLASS_STATIC — THE FIX
         << "static data emits IMAGE_SYM_CLASS_STATIC (3), not the pre-fix EXTERNAL (2)";
 
-    // ★★ THE DERIVED-TYPE HALF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
-    // BLOCK-LABEL-NOT-ATOM, the DATA twin of the block-symbol pin in
+    // ★★ THE DERIVED-TYPE HALF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM,
+    // the DATA twin of the block-symbol pin in
     // ObjJumpTableBlockSymbolIsStaticLocalDefinedNotUndefExtern. A COFF data
     // symbol is `notype` whatever its linkage, and the reader relies on that:
     // class STATIC + type 0 is the shape it must NOT promote to an atom. This
@@ -2031,8 +2032,8 @@ TEST(PeWriter, ObjJumpTableBlockSymbolIsStaticLocalDefinedNotUndefExtern) {
     EXPECT_EQ(readU32LE(bytes, s1 + 8), 4u)   // Value = text offset
         << "Value = funcTextStart + blockByteOffset (section-relative)";
 
-    // ★★ THE DERIVED-TYPE HALF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-
-    // BLOCK-LABEL-NOT-ATOM. The storage class above says LOCAL and says nothing
+    // ★★ THE DERIVED-TYPE HALF -- D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM.
+    // The storage class above says LOCAL and says nothing
     // more: a file-local FUNCTION is class STATIC too. What separates them is
     // IMAGE_SYMBOL.Type (+14) -- a function declares DTYPE_FUNCTION (0x20), a
     // block label declares 0 -- and the COFF reader now classifies atom

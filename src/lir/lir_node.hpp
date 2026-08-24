@@ -97,6 +97,47 @@ inline constexpr std::uint8_t kLirInstFlagWidth16 = 0x04;
 // does, `&` is still parsed, carried, and dropped.
 inline constexpr std::uint8_t kLirInstFlagEarlyClobberResult = 0x08;
 
+// ── THE MEMORY REFERENCE IS THE DESTINATION-POSITION OPERAND ─────────
+// D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE.
+//
+// "The memory reference this instruction names occupies its DESTINATION
+// position." For an instruction that writes, that is the operand it
+// writes; for a flag-setter it is the left-hand side of the operation.
+// Both are the same statement — which operand the destination position
+// names — and it is the one fact an operand list cannot carry.
+//
+// ★★★ WHY A FLAG AND NOT AN OPERAND SHAPE. ✔MEASURED by reading
+// `AsmInstructionLowering::buildLirInst`: `cmpq %r14, 4096(%r15)`
+// (memory destination, shape 3) and `cmpq 4096(%r15), %r14` (register
+// destination with a memory source, shape 2) build the BYTE-IDENTICAL
+// operand list `[reg, reg, MemBase, MemOffset]` while meaning
+// `mem - reg` (0x39 /r) and `reg - mem` (0x3B /r). Every other
+// arithmetic mnemonic escapes the collision because it PRODUCES a
+// value, so its two directions live on a producer and a consumer
+// elected from disjoint candidate sets; `cmp` produces nothing in
+// either direction and has no such split. Reordering the list is not
+// available either: shape 3's `sources + address tail` is exactly the
+// order the C front end's `store` already emits, on both shipped
+// targets.
+//
+// ★★ WHY IT RIDES `flags` AND NOT THE DIALECT. Two tiers ask "can this
+// opcode encode this shape?" through ONE function (`asm_variant_elect.hpp`,
+// operator ruling) — the text lowering to pick the opcode, the encoder to
+// pick the variant it emits — and they must agree byte-for-byte. An
+// election axis the ENCODER cannot see would let the two disagree with no
+// diagnostic. The dialect is likewise the wrong home: `assembly_config.hpp`
+// records that a dialect must say which opcodes are POSSIBLE and never
+// which one wins for a shape, on pain of becoming a drifting second copy
+// of the target's guard table. `flags` is the carrier that survives every
+// rebuilding pass by construction (see the width bits above).
+//
+// ⚠ ABSENCE OF A `memoryDestination` KEY ON A GUARD MEANS "DOES NOT
+// DISCRIMINATE", so every pre-existing variant is unaffected — including
+// `store`, which is reached through shape 3 on a destination-LAST dialect
+// (AT&T `movq %rax,(%rdi)`) and through shape 2 on a destination-FIRST one
+// (arm64 `str x1,[sp,#24]`) and must stay electable from both.
+inline constexpr std::uint8_t kLirInstFlagMemoryIsDestination = 0x10;
+
 // The instruction's operation width in bits, derived from its flags.
 [[nodiscard]] constexpr std::uint8_t
 lirInstWidthBits(std::uint8_t flags) noexcept {
@@ -112,6 +153,15 @@ lirInstWidthBits(std::uint8_t flags) noexcept {
 [[nodiscard]] constexpr bool
 lirInstResultIsEarlyClobber(std::uint8_t flags) noexcept {
     return (flags & kLirInstFlagEarlyClobberResult) != 0;
+}
+
+// True iff this instruction's memory reference occupies its
+// destination-position operand. Named rather than open-coded so the
+// producer (the assembly-text lowering's memory-destination shape) and the
+// consumer (the encoding-variant matcher) agree on the bit.
+[[nodiscard]] constexpr bool
+lirInstMemoryIsDestination(std::uint8_t flags) noexcept {
+    return (flags & kLirInstFlagMemoryIsDestination) != 0;
 }
 
 // Operand variant tag carried on each entry of the LIR operand pool.

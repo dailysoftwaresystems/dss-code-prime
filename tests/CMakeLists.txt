@@ -193,8 +193,8 @@ add_subdirectory(conformance)
 # tests/test_support/scratch_dir.hpp). MEASURED before that root existed: the two
 # entries clobbered each other's fixture files and `ctest -j 8` over just this
 # pair went red 1 run in 3. Any suite added to this arm inherits the obligation.
-# ── THE COST IS PER-LEG, SO THE REPEAT COUNT HAS TO BE TOO (D-TEST-SHUFFLE-ARM-
-# ── REPEAT-BUDGET-IS-PER-LEG) ──
+# ── THE COST IS PER-LEG, SO THE REPEAT COUNT HAS TO BE TOO
+# ── (D-TEST-SHUFFLE-ARM-REPEAT-BUDGET-IS-PER-LEG) ──
 #
 # Every N below was chosen against a cost that differs by ~28x between the legs
 # that run it, so no single global constant can be right on all of them. MEASURED,

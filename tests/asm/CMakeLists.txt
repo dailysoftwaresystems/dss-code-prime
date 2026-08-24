@@ -30,8 +30,8 @@ target_link_libraries(dss_asm_test_asm_arm64
 # ADD/ADD hi12/lo12 word pins + the Variant-I identity / tprel-row /
 # tlsAccess / TLSLE-native-id schema pins.
 dss_add_test(NAME asm/test_asm_arm64_tls      SOURCES test_asm_arm64_tls.cpp)
-# D-ASM-ARM64-BITWISE-W-FORMS-UNDECLARED + D-ARM64-C-PATH-32BIT-BITWISE-WIDENS-
-# TO-64: byte-exact AND/ORR/EOR W-form and X-form pins (measured against
+# D-ASM-ARM64-BITWISE-W-FORMS-UNDECLARED + D-ARM64-C-PATH-32BIT-BITWISE-WIDENS-TO-64:
+# byte-exact AND/ORR/EOR W-form and X-form pins (measured against
 # aarch64-linux-gnu-as 2.42), the C-path width-32 election pin, and the
 # strip-the-W-variant red-on-disable — which mutates the shipped arm64 JSON in
 # memory (nlohmann consumer), the `mutate_target_schema.hpp` posture.
@@ -132,3 +132,35 @@ target_link_libraries(dss_asm_test_asm_x86_tls
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_pipeline
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/lir)
+
+# D-TARGET-X86-64-DECLARES-NO-MEMORY-DESTINATION-ARITHMETIC +
+# D-ASM-SUB-NATIVE-OPERAND-UNUSABLE-IN-INLINE-ASM: the byte tier for arithmetic
+# whose operand is MEMORY (both directions) and for the `movb`/`movw` sub-native
+# moves. Drives the SHIPPED dialect and the SHIPPED target UNMUTATED, and every
+# memory-form expectation is GNU as 2.42's own measured output.
+# ⚠ ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL, so it MUST run through ctest —
+# `dss_add_test` sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would
+# read whichever tree the shell stands in
+# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_x86_memory_arithmetic
+             SOURCES test_asm_x86_memory_arithmetic.cpp)
+target_link_libraries(dss_asm_test_asm_x86_memory_arithmetic
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_x86_memory_arithmetic
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT + D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE
+# + D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE: the byte tier for the
+# three shapes gas accepts and DSS used to refuse. Drives the SHIPPED dialect and
+# the SHIPPED target UNMUTATED; every expectation is GNU as 2.42's own measured
+# output unless the comment beside it records the deliberate difference.
+# WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL, so it MUST run through
+# ctest -- dss_add_test sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd and
+# would read whichever tree the shell stands in
+# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_x86_width_and_direction
+             SOURCES test_asm_x86_width_and_direction.cpp)
+target_link_libraries(dss_asm_test_asm_x86_width_and_direction
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_x86_width_and_direction
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)

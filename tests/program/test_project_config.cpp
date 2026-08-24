@@ -2321,7 +2321,7 @@ TEST(CompileProjectManifestFlags, DefinesThreadToCompileExitCode) {
         auto const exe = scratch.path() / std::string{kHostExecFormat}
                        / std::string{kHostExecArtifact};
         ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
-        auto const r = runBinary(exe, std::chrono::milliseconds{5000});
+        auto const r = runBinary(exe);
         ASSERT_TRUE(r.spawned) << r.diagnostic;
         EXPECT_FALSE(r.timedOut);
         EXPECT_EQ(r.exitCode, 42u)
@@ -2339,7 +2339,7 @@ TEST(CompileProjectManifestFlags, DefinesThreadToCompileExitCode) {
         auto const exe = scratch.path() / std::string{kHostExecFormat}
                        / std::string{kHostExecArtifact};
         ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
-        auto const r = runBinary(exe, std::chrono::milliseconds{5000});
+        auto const r = runBinary(exe);
         ASSERT_TRUE(r.spawned) << r.diagnostic;
         EXPECT_FALSE(r.timedOut);
         EXPECT_EQ(r.exitCode, 7u)
@@ -2368,7 +2368,7 @@ TEST(CompileProjectManifestFlags, DefineValueSubstitutesExitCode) {
         auto const exe = scratch.path() / std::string{kHostExecFormat}
                        / std::string{kHostExecArtifact};
         ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
-        auto const r = runBinary(exe, std::chrono::milliseconds{5000});
+        auto const r = runBinary(exe);
         ASSERT_TRUE(r.spawned) << r.diagnostic;
         EXPECT_FALSE(r.timedOut);
         EXPECT_EQ(r.exitCode, 42u)
@@ -2447,7 +2447,7 @@ TEST(CompileProjectManifestFlags, ArtifactNameRoutesToPerFormatSubdir) {
         auto const flat = dir / (std::string{"myapp"} + std::string{kHostExecExt});
         EXPECT_FALSE(std::filesystem::exists(flat))
             << "a single-target PROJECT build must be under <formatName>/, not flat";
-        auto const r = runBinary(routed, std::chrono::milliseconds{5000});
+        auto const r = runBinary(routed);
         ASSERT_TRUE(r.spawned) << r.diagnostic;
         EXPECT_FALSE(r.timedOut);
         EXPECT_EQ(r.exitCode, 42u) << "the routed artifact must run → exit 42";
@@ -3395,7 +3395,7 @@ TEST(CompileProjectGlob, MultiCuGlobBuildsAndRunsBothTus) {
     auto const exe = dir / std::string{kGlobHostFormat}
                    / (std::string{"main"} + std::string{kGlobHostExt});
     ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
-    auto const r = runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)
@@ -3446,7 +3446,7 @@ TEST(CompileProjectGlob, OverlappingLiteralAndGlobDedupByNormalizedPath) {
     auto const exe = dir / std::string{kGlobHostFormat}
                    / (std::string{"main"} + std::string{kGlobHostExt});
     ASSERT_TRUE(std::filesystem::exists(exe)) << exe.string();
-    auto const r = runBinary(exe, std::chrono::milliseconds{5000});
+    auto const r = runBinary(exe);
     ASSERT_TRUE(r.spawned) << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
     EXPECT_EQ(r.exitCode, 42u)

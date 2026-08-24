@@ -1,5 +1,5 @@
-/* TF-C27 — shipped <stdio.h> `fileno` witness (D-SHIPPED-SYMBOL-PER-TARGET-
- * AVAILABILITY, the unistd.json fdatasync/fallocate precedent). `#include <stdio.h>`
+/* TF-C27 — shipped <stdio.h> `fileno` witness (D-SHIPPED-SYMBOL-PER-TARGET-AVAILABILITY,
+ * the unistd.json fdatasync/fallocate precedent). `#include <stdio.h>`
  * resolves to shippedLibs/stdio.json, which now ships `int fileno(FILE*)` gated
  * availableObjectFormats:[elf] (a real consumer landed: sqlite src/test_quota.c
  * calls fsync/ftruncate/fstat(fileno(p->f)) on its POSIX path).

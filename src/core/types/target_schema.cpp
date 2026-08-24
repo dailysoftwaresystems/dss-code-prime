@@ -218,6 +218,86 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "no value to sign-route on",
                                  o.mnemonic, vi));
             }
+            // ── D-TARGET-PRODUCER-VARIANT-WITHOUT-A-RESULT-SLOT-ENCODES-REGISTER-ZERO ──
+            // A VALUE-PRODUCING x86-variable variant that names no home for its
+            // result SILENTLY ENCODES REGISTER 0.
+            //
+            // ✔MEASURED 2026-08-23, on a variant written in this very cycle: a
+            // `mov` immediate row was authored without `resultSlot`, loaded clean,
+            // and every `movw $42, %cx` / `%dx` / `%r15w` emitted the SAME bytes
+            // `66 C7 C0 …` — ModR/M.rm = 0, i.e. `%ax` — because the walker's
+            // result wiring is guarded by `resultSlot.has_value()` and simply did
+            // not run. rc=0, no diagnostic, wrong register. The inverse rule
+            // (`result: none` + a resultSlot) has been enforced since the schema
+            // existed; this is its missing mirror, and the mirror is the DANGEROUS
+            // half — the enforced direction fails loud at encode time, this one
+            // ships a wrong register.
+            //
+            // ★ SCOPED TO THE `x86-variable` SHAPE, and that is an ENCODING-SHAPE
+            // fact rather than a target one (the same distinction `opcodeBytes`
+            // and `fixedWord` already carry in this function). On a variable-length
+            // shape EVERY register field comes from a slot — ModR/M, SIB, or the
+            // opcode byte — so a producer with no result slot has nowhere for its
+            // result to go. A `fixed32` template CAN bake a destination into its
+            // fixed word (arm64's 3-word `sub sp, sp, #imm` bakes sp=31), which is
+            // why that shape keeps its exemption.
+            //
+            // ⚠ EXACTLY TWO EXEMPTIONS, BOTH MEASURED AGAINST THE SHIPPED TABLES
+            // RATHER THAN ASSUMED: a CALL's result is the ABI return register and
+            // never an encoded field (x86_64 `call`, `call_indirect_via_extern`),
+            // and a `requires2Address` opcode's result IS its operand 0, already
+            // wired (99 of the 101 exempted producer variants).
+            //
+            // ⛔ A THIRD EXEMPTION WAS WRITTEN HERE AND REMOVED — DO NOT RE-ADD IT.
+            // It exempted an opcode declaring implicit OUTPUT registers, "for the
+            // call reason". ✔MEASURED 2026-08-24 by the independent step-10 audit,
+            // enumerating `x86_64.target.json`: all 7 opcodes that declare implicit
+            // outputs (`cqo`, `rdtsc`, `idiv_op`, `xor_rdx_zero`, `div_op`,
+            // `umul_op`, `lock_cmpxchg`) are `result: none`, so the SECOND conjunct
+            // above already excludes every one of them and the exemption was reached
+            // by NOTHING. ★★ It was not merely inert, it was inert and DANGEROUS:
+            // the one shape it could ever admit is a future `result: value` opcode
+            // that declares an implicit output AND encodes its result in a ModR/M
+            // field — which is precisely the register-field-0 miscompile this guard
+            // exists to stop. An exemption reached by nothing today, whose only
+            // future reach is the defect, is strictly worse than no exemption: drop
+            // it and let such an opcode red until its author declares the slot.
+            if (o.encoding.shape == TargetEncodingShape::X86Variable
+                && o.result != TargetResultRule::None
+                && !o.isCall
+                && !o.requires2Address.has_value()
+                && !v.resultSlot.has_value()
+                && v.extraResultSlots.empty()) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}", i, vi),
+                     std::format("opcode '{}' variant {}: the opcode produces a "
+                                 "value but this x86-variable variant declares no "
+                                 "`resultSlot` — the walker would emit register "
+                                 "field 0 for the result, silently encoding a "
+                                 "different register. Declare the slot the result "
+                                 "belongs in (`modrm.reg`, `modrm.rm` or "
+                                 "`opcode.reg`)",
+                                 o.mnemonic, vi));
+            }
+            // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE: the
+            // memory-DIRECTION axis requires a MEMORY operand to route on —
+            // the same coherence family as immMin/immMax and negValue. A
+            // variant with no `membase` in its operandKinds names no memory
+            // reference, so `memoryDestination` there would key on a fact the
+            // instruction cannot have and the variant would match nothing on
+            // one of its two values — silently, which is the whole hazard.
+            bool const hasMemoryOperand = std::any_of(
+                v.operandKinds.begin(), v.operandKinds.end(),
+                [](OperandKindFilter f) {
+                    return f == OperandKindFilter::MemBase;
+                });
+            if (v.memoryDestination.has_value() && !hasMemoryOperand) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
+                     std::format("opcode '{}' variant {}: declares "
+                                 "memoryDestination but its operandKinds carry "
+                                 "no 'membase' operand — there is no memory "
+                                 "reference whose direction could be routed",
+                                 o.mnemonic, vi));
+            }
             // `opcodeBytes` is meaningful only for the x86-variable
             // shape. fixed32 carries the analog as `fixedWord` (a
             // 32-bit base bit pattern). The "non-empty" rule
@@ -310,8 +390,8 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
 
             // ── Silent-failure M-1: fixed32 supported-operand guard ──
             // The fixed32 walker handles Reg (register slots), SymbolRef
-            // (the symbol-bearing Imm26 slot), and — since D-LK10-ENTRY-
-            // ARM64 (v0.0.2 V2-1) — ImmInt (the Imm16 immediate slot,
+            // (the symbol-bearing Imm26 slot), and — since D-LK10-ENTRY-ARM64
+            // (v0.0.2 V2-1) — ImmInt (the Imm16 immediate slot,
             // AArch64 MOVZ) plus MemBase + MemOffset (the unscaled
             // LDUR/STUR memory form: base reg → Rn, MemOffset → the
             // signed Imm9 slot, MemBase's scale validated == 1). Since
@@ -890,6 +970,22 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 // them ACROSS the sign boundary is meaningless, so skip the
                 // overlap check when the sign axis already separates them.
                 if (va.negValue != vb.negValue) continue;
+                // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE: the
+                // MEMORY-DIRECTION axis is a FOURTH disambiguator, and it is
+                // the ONLY one that separates the two `cmp` register-form
+                // memory variants — their operandKinds, width and immediate
+                // domain are all identical, because the two spellings build
+                // the byte-identical operand list. Two variants that declare
+                // OPPOSITE directions route on disjoint instructions, so
+                // neither shadows the other. ⚠ One declaring the axis and one
+                // omitting it is NOT disjoint (the omitting one matches both
+                // directions) and correctly falls through to the width check
+                // below.
+                if (va.memoryDestination.has_value()
+                    && vb.memoryDestination.has_value()
+                    && *va.memoryDestination != *vb.memoryDestination) {
+                    continue;
+                }
                 // Disjoint imm-ranges ⇒ value-distinguishable, never a
                 // shadow. `[loA,hiA]` and `[loB,hiB]` are disjoint iff
                 // hiA < loB or hiB < loA.

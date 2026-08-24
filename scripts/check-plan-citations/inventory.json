@@ -148,7 +148,6 @@
     "examples/c-subset/va_list_abstract_param_forward/main.c": 1,
     "examples/c-subset/zero_length_array_member/expected.json": 1,
     "examples/c-subset/zero_length_array_member/main.c": 1,
-    "integrated_tests/runner.cpp": 8,
     "real-examples/c/sqlite/base-harness.ps1": 1,
     "real-examples/c/sqlite/base-harness.sh": 6,
     "real-examples/c/sqlite/build-and-test.ps1": 11,

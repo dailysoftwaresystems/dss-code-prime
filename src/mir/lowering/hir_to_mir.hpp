@@ -93,8 +93,8 @@ struct DSS_EXPORT MirLoweringConfig {
     bool                  aggregateLayoutLoaded = false;
     DataModel             dataModel = DataModel::Lp64;
 
-    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75 (D-TARGET-
-    // CHAR-SIGNEDNESS-PER-PLATFORM): whether bare `char` (`TypeKind::Char`, NOT
+    // TF-C56 (D-CSUBSET-BARE-CHAR-SIGNEDNESS-PER-TARGET) + TF-C75
+    // (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM): whether bare `char` (`TypeKind::Char`, NOT
     // `signed char`/`unsigned char`) is UNSIGNED for this compilation. ALREADY
     // RESOLVED when it arrives here — the driver threads in
     // `TargetSchema::charIsUnsigned(format.kind())`, which folds the target's
