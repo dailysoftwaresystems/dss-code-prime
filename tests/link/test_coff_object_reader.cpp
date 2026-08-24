@@ -1373,7 +1373,7 @@ TEST(CoffForeignObjectNative, SingleClObjStaticLinkExitsFortyTwo) {
     p.setResolveLibraries(std::vector<std::filesystem::path>{dir / "foo.lib"});
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{(dir / "main.c").string()}, "c-subset",
+        std::vector<std::string>{(dir / "main.c").string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
     ASSERT_EQ(rc, 0) << "static-link against the real cl.exe `.lib` must succeed; errs="
                      << rep.errorCount();
@@ -1422,7 +1422,7 @@ TEST(CoffForeignObjectNative, MultiMemberComdatDedupExitsFortyTwo) {
     p.setResolveLibraries(std::vector<std::filesystem::path>{dir / "ab.lib"});
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{(dir / "main.c").string()}, "c-subset",
+        std::vector<std::string>{(dir / "main.c").string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
     ASSERT_EQ(rc, 0) << "both members pull + the shared_w COMDAT dedups; errs="
                      << rep.errorCount();
@@ -1481,7 +1481,7 @@ TEST(CoffLocalFunctionInArchive, DssBuiltLibMemberCallingAStaticHelperExitsForty
     DiagnosticReporter libRep;
     ASSERT_EQ(pLib.compileFiles(
                   std::vector<std::string>{(dir / "dsslocal.c").string()},
-                  "c-subset",
+                  "c",
                   std::vector<std::string>{"x86_64:pe64-x86_64-windows-staticlib"},
                   libRep),
               0)
@@ -1550,7 +1550,7 @@ TEST(CoffLocalFunctionInArchive, DssBuiltLibMemberCallingAStaticHelperExitsForty
     pMain.setResolveLibraries(std::vector<std::filesystem::path>{libPath});
     DiagnosticReporter rep;
     int const rc = pMain.compileFiles(
-        std::vector<std::string>{(dir / "main.c").string()}, "c-subset",
+        std::vector<std::string>{(dir / "main.c").string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
     ASSERT_EQ(rc, 0)
         << "linking an archive member that calls a file-local function must "
@@ -1622,7 +1622,7 @@ TEST(CoffForeignObjectNative, ClObjLibMemberCallingAStaticHelperExitsFortyTwo) {
     p.setResolveLibraries(std::vector<std::filesystem::path>{dir / "loc.lib"});
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{(dir / "main.c").string()}, "c-subset",
+        std::vector<std::string>{(dir / "main.c").string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
     ASSERT_EQ(rc, 0)
         << "a real cl.exe `.lib` member calling its own `static` helper must "
@@ -2817,7 +2817,7 @@ TEST(CoffWeakExternalNative, RealMingwWeakUndefinedReferenceIsRefusedNotDowngrad
 //
 // [[D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE]] declined to build this writer on
 // 2026-08-05, on a measured premise: zero consumers, plus a named front-end
-// blocker ([[D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE]] -- the c-subset
+// blocker ([[D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE]] -- the c
 // cannot express `__attribute__((alias(...)))`, so a writer would be a path
 // nothing could invoke). That premise CHANGED, and this test is the proof: the
 // consumer is not a front end at all. gcc writes the alias, DSS READS it, DSS

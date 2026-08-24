@@ -42,7 +42,7 @@ struct Built {
 [[nodiscard]] Built buildModuleWithExtern(TypeInterner& ti) {
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     constexpr std::uint32_t kExternSymV = 17;
     HirNodeId const ef =
         b.makeExternFunction(fnTy, /*symbol=*/kExternSymV, {});
@@ -230,7 +230,7 @@ TEST(MirLoweringExtern, ModuleWithoutExternsProducesEmptyExternImports) {
     // nodes produces an empty externImports vector — every
     // existing cycle-2a/2b/2c test path is unchanged.
     TypeInterner ti = makeInterner();
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const root = b.makeModule({});
     Hir hir = std::move(b).finish(root);
 
@@ -251,7 +251,7 @@ TEST(MirLoweringExtern, MissingSymbolIdFailsLoud) {
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const ef = b.makeExternFunction(fnTy, /*symbol=*/0, {});
     HirNodeId const root = b.makeModule(std::array{ef});
     Hir hir = std::move(b).finish(root);
@@ -281,7 +281,7 @@ TEST(MirLoweringExtern, ExternSymbolCollidesWithFunctionSymbolFailsLoud) {
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     constexpr std::uint32_t kSharedSym = 42;
     // Build a tiny function body so the Function node is well-
     // formed.
@@ -316,7 +316,7 @@ TEST(MirLoweringExtern, DuplicateExternSymbolFailsLoud) {
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     constexpr std::uint32_t kSym = 17;
     HirNodeId const ef1 = b.makeExternFunction(fnTy, kSym, {});
     HirNodeId const ef2 = b.makeExternFunction(fnTy, kSym, {});
@@ -345,7 +345,7 @@ TEST(MirLoweringExtern, InvalidExternSignatureFailsLoud) {
     // resolve. Symmetric with `collectFunctions`'s sig.valid()
     // guard.
     TypeInterner ti = makeInterner();
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const ef = b.makeExternFunction(InvalidType,
                                               /*symbol=*/17, {});
     HirNodeId const root = b.makeModule(std::array{ef});
@@ -376,7 +376,7 @@ TEST(MirLoweringExtern, MultipleExternsAcrossTwoLibrariesPropagateInOrder) {
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     constexpr std::uint32_t kSym1 = 17;
     constexpr std::uint32_t kSym2 = 18;
     HirNodeId const ef1 = b.makeExternFunction(fnTy, kSym1, {});
@@ -418,7 +418,7 @@ TEST(MirLoweringExtern, MultipleExternsAcrossTwoLibrariesPropagateInOrder) {
 TEST(MirLoweringExtern, ExternGlobalThreadLocalFlagReachesImportRow) {
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     constexpr std::uint32_t kTlsSym   = 41;
     constexpr std::uint32_t kPlainSym = 42;
     HirNodeId const tlsEg   = b.makeExternGlobal(i32, kTlsSym);
@@ -480,7 +480,7 @@ TEST(MirLoweringExtern, ExternGlobalCurrentlyFailsLoudPendingFeatureWork) {
     // audit; this test catches that exact silent-accept surface.
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     constexpr std::uint32_t kExternGlobalSymV = 31;
     HirNodeId const eg =
         b.makeExternGlobal(i32, /*symbol=*/kExternGlobalSymV);
@@ -544,7 +544,7 @@ struct SeamBuilt { Hir hir; std::uint32_t shimSymV; };
     TypeId const shimSig = ti.fnSig({}, i32, CallConv::CcSysV);   // the shim: fn()->i32
     TypeId const fSig    = ti.fnSig({}, i32, CallConv::CcSysV);
     constexpr std::uint32_t kShimSym = 99;   // NOT defined here, NOT an extern
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const callee = b.makeRef(shimSig, kShimSym);
     HirNodeId const call   = b.makeCall(callee, {}, i32);
     HirNodeId const ret    = b.makeReturn(call);

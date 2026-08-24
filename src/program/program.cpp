@@ -1193,7 +1193,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     }
 
     // Fresh host TypeLattice for the merged module: seeded with CU0's id + source
-    // language (cosmetic — the registry's sourceLanguage tags extension types; c-subset
+    // language (cosmetic — the registry's sourceLanguage tags extension types; c
     // has none). The merge re-interns ALL CUs (incl CU0) into this fresh host, so no
     // SemanticModel's lattice is mutated or moved — still "re-intern at merge", just a
     // fresh host rather than CU0's in-place. Agnostic: id + language string, no branch.
@@ -1316,7 +1316,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // pthread / thread_local example is single-source, so the claim pointed at a witness
     // that does not exist. The real coverage is: for <threads.h>, the unit test
     // `MirMerge.MultiCuThreadsShimRegistersAndSynthesizes`; for <stdio.h>, a genuine 2-TU
-    // runtime witness, `examples/c-subset/shipped_sprintf_ucrt_crosscu` (exit 42, release
+    // runtime witness, `examples/c/shipped_sprintf_ucrt_crosscu` (exit 42, release
     // arm, pe64) — which exercises THIS code path, and is red-on-disable proven: neutering
     // the va-leaf refusal in `opt/passes/inlining.cpp` fails it (exit 50) while the
     // single-source `shipped_sprintf_ucrt` still passes. That asymmetry matters because
@@ -1608,7 +1608,7 @@ struct CuBuildKey {
 //      outright, for every target, with no extension gate — naming the
 //      language IS the interface for "this file is written for one CPU", the
 //      analogue of `gcc -x`, and it is what `examples/asm/*/expected.json`
-//      uses. A caller who says `--language c-subset` and hands over a `.s` has
+//      uses. A caller who says `--language c` and hands over a `.s` has
 //      asked for that and gets it.
 //   2. Otherwise the TARGET's declared `defaultAssemblyLanguage` — a NAME the
 //      target file carries as vocabulary. Because it is read PER TARGET, one
@@ -1728,7 +1728,7 @@ struct CuBuildKey {
 // resolution the shipped-source units need, and the ONE place it lives.
 //
 // ★ THIS IS WHY THERE IS NO LANGUAGE SEGMENT IN THE RUNTIME TREE AND NO UNIT
-// MANIFEST. `sources/c-subset.lang.json` declares `"fileExtensions": [".c",
+// MANIFEST. `sources/c.lang.json` declares `"fileExtensions": [".c",
 // ".h"]`, and `.c` is claimed by that language ALONE; restating "these files are
 // C" in a path segment or a JSON key would be a second owner of a fact the
 // language configs already hold, free to drift from them the moment either side
@@ -3397,7 +3397,7 @@ int Program::compileFiles(
     // type-name oracle reparse) recurses over the expression tree on the
     // thread stack (the parser's residual paren/postfix arm), so a deeply-
     // nested-but-legal expression that the config-driven parser cap
-    // (`parser.maxExpressionDepth`, c-subset = 1024) admits would overflow the
+    // (`parser.maxExpressionDepth`, c = 1024) admits would overflow the
     // host's ~1 MB main stack here — symmetric to the downstream `analyze`
     // overflow. Run it on the same 64 MiB worker stack (synchronous join) so
     // parse and analysis are BOTH deep-safe and the cap is a real semantic

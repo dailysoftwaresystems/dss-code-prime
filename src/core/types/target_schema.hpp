@@ -2520,7 +2520,7 @@ struct DSS_EXPORT ProcessExit {
 //                     that stack address itself (no copy exists
 //                     anywhere else). envp follows argv's NULL
 //                     terminator; it is NOT materialized (the
-//                     c-subset entry signature is
+//                     c entry signature is
 //                     `(int, char**)` — envp is reachable via
 //                     libc `environ` for programs that need it).
 //   * `None`        — default-constructed sentinel. "No mechanism"
@@ -3490,7 +3490,7 @@ struct DSS_EXPORT TargetSchemaData {
     // `parsePredefinedMacroArray`). This lives on the TARGET, not the
     // language, because it is per-CPU-architecture semantics — exactly like
     // `charIsUnsigned` / `aggregateLayout` / `tls` above. The alternative
-    // (a language-side arch filter) would force `c-subset.lang.json` to
+    // (a language-side arch filter) would force `c.lang.json` to
     // enumerate CPU architectures: a layering inversion.
     //
     // Merged with the language list at preprocess time

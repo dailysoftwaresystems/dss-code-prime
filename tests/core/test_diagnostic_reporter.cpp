@@ -879,7 +879,7 @@ TEST(ReporterFormat, MultiCharSpanProducesMultiCaretUnderline) {
 //
 // RED-ON-DISABLE: revert the closer emit and the underline becomes `^^^^`.
 TEST(ReporterFormat, CaretWidthOverRealStringLiteralCoversTheClosingQuote) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
 
@@ -942,7 +942,7 @@ TEST(ReporterFormat, CaretWidthOverRealStringLiteralCoversTheClosingQuote) {
 // lexer mode and a different grammar rule, so the string pin above does not
 // cover it. 3 bytes → 3 carets; the pre-fix defect would render 2.
 TEST(ReporterFormat, CaretWidthOverRealCharLiteralCoversTheClosingQuote) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
 

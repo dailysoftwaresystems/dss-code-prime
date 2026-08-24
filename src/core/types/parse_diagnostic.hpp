@@ -989,7 +989,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   • with `constexpr` (C23 6.7.1: constexpr may pair only with auto /
     //     register / static — never thread_local);
     //   • with `register` (6.7.1p2 admits only static / extern beside
-    //     thread_local; the c-subset parses `register` as an inert
+    //     thread_local; the c parses `register` as an inert
     //     storage-class specifier, so the pairing must reject here).
     // (`typedef thread_local` cannot co-occur grammatically — typedefDecl
     // has no storage-specifier prefix — so it stays a loud parse error.)
@@ -1786,7 +1786,7 @@ enum class DiagnosticCode : std::uint16_t {
     D_DuplicateFile               = 0xD003,
     // Import resolution (08-compilation-unit-plan §2.8, CU4). A reference to
     // another translation unit could not be resolved within the CU:
-    //   D_UnresolvedImport    — a c-subset `#include "x.h"` whose file was not
+    //   D_UnresolvedImport    — a c `#include "x.h"` whose file was not
     //                           found in the including dir or any include dir.
     //   D_UnresolvedReference — a tsql table reference (qualifiedName in table
     //                           position) with no matching CREATE TABLE in the CU.
@@ -1880,7 +1880,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   (one logical failure — "the requested profile is not in the
     //   supported set"; the message discriminates):
     //     * the language declares a non-empty set that excludes the
-    //       requested profile (e.g. c-subset declares {cli,lib,
+    //       requested profile (e.g. c declares {cli,lib,
     //       staticlib} and the project asks for "gui");
     //     * the language declares NO profiles at all (empty set) — a
     //       fail-CLOSED reject, aligning with §2.1's trajectory toward
@@ -2819,7 +2819,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   subtree — the language config IS correct (kindByChild
     //   present), but `descend(childPath)` returned invalid or a
     //   non-Internal node for this particular instance. Today's
-    //   c-subset short-circuits at semantic-error time, so this arm
+    //   c short-circuits at semantic-error time, so this arm
     //   is structurally unreachable through shipped grammars — but
     //   a future grammar permitting recovery shapes that reach
     //   lowering would trip it. D-FF2 H2 audit fold (post-fold
@@ -4071,7 +4071,7 @@ enum class DiagnosticCode : std::uint16_t {
     // API bug) from "shipped grammar broken" (build/install bug)
     // from "header syntax error" (user source bug).
     //
-    // F_HeaderParseFailed: c-subset frontend rejected the header text
+    // F_HeaderParseFailed: c frontend rejected the header text
     //   (tokenize / parse / semantic / lowering diagnostics).
     //   Remediation: fix the source header.
     // F_HeaderHasFunctionBody: a non-extern function DEFINITION (with
@@ -4087,7 +4087,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   row downstream would be unlinkable). Remediation: caller
     //   supplies a non-empty library identity (`"libc.so.6"`,
     //   `"msvcrt.dll"`, etc.).
-    // F_HeaderGrammarLoadFailed: the shipped c-subset grammar JSON
+    // F_HeaderGrammarLoadFailed: the shipped c grammar JSON
     //   failed to load. Remediation: ship the grammar artifact /
     //   investigate the underlying C_* diagnostics also reported.
     // F_HeaderHasUnsupportedTopLevel: a top-level HIR kind reached the
@@ -4111,7 +4111,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   issue. Remediation: file a bug.
     // (D-FF2-3 CLOSED 2026-06-01 via `H_ExternHasInitializer`
     // (0xF00A) at the lowering tier — the FFI walker reuses the
-    // c-subset frontend, so the reject reaches it through the
+    // c frontend, so the reject reaches it through the
     // shared lowering pipeline; no separate F_* code needed.)
     F_HeaderParseFailed            = 0x5008,
     F_HeaderHasFunctionBody        = 0x5009,

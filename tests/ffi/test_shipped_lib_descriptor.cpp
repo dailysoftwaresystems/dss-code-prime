@@ -1104,7 +1104,7 @@ TEST(ShippedLibDescriptor, ReadShippedLibMacrosEmptyForTypedOnly) {
 // macros-only read's) reads its macros WITHOUT a new error. RED-ON-DISABLE: a
 // `header` gate here re-breaks the angle-include preprocess path for any
 // symbols-only descriptor — exactly the ImportResolver regression this guards
-// (CSubsetAngleIncludeResolvesToDescriptorOnSystemDir uses a header-less api.json
+// (CAngleIncludeResolvesToDescriptorOnSystemDir uses a header-less api.json
 // that the preprocessor now reads for macros while splicing).
 TEST(ShippedLibDescriptor, ReadShippedLibMacrosHeaderlessIsLenient) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
@@ -2004,7 +2004,7 @@ TEST(ShippedLibDescriptor, StructVariantEagerDecodeMalformedInactiveFailsLoud) {
 
 // NO-MATCH → NOT INJECTED (gate 7; closure gate 7). Variants present but NONE match
 // the active target → the struct is simply not injected (no `S` in `desc->structs`).
-// A c-subset program referencing `struct S` would then emit S_UnknownType (the same
+// A c program referencing `struct S` would then emit S_UnknownType (the same
 // behavior as any undeclared struct) — never a silent wrong layout. The read itself
 // SUCCEEDS (no error): a header that doesn't define a struct for this target is not
 // an error here; the absence becomes loud at the USE site.
@@ -4653,7 +4653,7 @@ TEST(ShippedLibDescriptor, RealStddefWcharPerFormatWidth) {
 //       draft declaring _byteswap_* as symbols crashed the loader with
 //       STATUS_ENTRYPOINT_NOT_FOUND 0xC0000139 — the windows.json
 //       InterlockedCompareExchange trap, twice-proven). The intrinsics are
-//       always-on BUILTINS (c-subset.lang.json), never descriptor symbols.
+//       always-on BUILTINS (c.lang.json), never descriptor symbols.
 //   (3) the honest non-empty payload = the size_t→u64 typedef (MSVC's real
 //       intrin.h makes size_t visible; the string/stdio.json convention).
 // RED-on-disable: widen the gate / re-add a symbol / drop the typedef.
@@ -5541,7 +5541,7 @@ TEST(ShippedLibDescriptor, SetjmpPeMacroExpandsToUnderscoreSetjmp) {
 // `_crt_atexit` registers handlers that only the ucrtbase `exit` path drains, so
 // pe64-x86_64-windows-exec.format.json's `processExit` had to be repointed off kernel32
 // `ExitProcess` in the SAME commit (tests/link/test_object_format_schema.cpp pins that
-// row; examples/c-subset/shipped_atexit is the byte-exact runtime witness).
+// row; examples/c/shipped_atexit is the byte-exact runtime witness).
 //
 // RED-ON-DISABLE: adding "elf" to atexit's set (the naive "fix" for an elf atexit user),
 // re-widening it back to include "pe" (the naive "fix" for a pe atexit user, which would
@@ -5751,7 +5751,7 @@ TEST(ShippedLibDescriptor, TypedefDataModelVariantSelectsAndFailsLoud) {
 // IOC_*/_IOC_* direction vocabulary → the deliberate-omission EXPECTs fail (that
 // line is a decision recorded in the descriptor's `$comment`, not an oversight,
 // so re-crossing it must be a conscious edit). The VALUE side is pinned
-// end-to-end by `examples/c-subset/shipped_ioctl_iowr_macho/`, which
+// end-to-end by `examples/c/shipped_ioctl_iowr_macho/`, which
 // `_Static_assert`s the encoded numbers (0xc0207a17 &c.) that were measured
 // against the real SDK sys/ioccom.h.
 TEST(ShippedLibDescriptor, RealIoctlRequestEncodingMacrosPerFormat) {
@@ -6173,7 +6173,7 @@ TEST(ShippedLibDescriptor, RealStdlibJsonMallocZoneMachoOnly) {
 // The language schema no longer guesses a per-name import library
 // (`externLibraryByFormat` is gone), so the shipped-descriptor corpus is the SINGLE
 // owner of realization and a bare `extern char *setlocale(int, const char *)` binds
-// ONLY through a row like this one. examples/c-subset/setlocale_c is the consumer and
+// ONLY through a row like this one. examples/c/setlocale_c is the consumer and
 // it spans pe AND elf AND macho across five targets, which is exactly why a SOURCE-side
 // per-symbol library override cannot serve it: that syntax carries ONE library string
 // and would project one image under every format key.
@@ -6526,7 +6526,7 @@ TEST(ShippedLibDescriptor, RealUnistdJsonUuidTMachoOnlyTypedef) {
 // number that is internally consistent but points at the WRONG kernel node is
 // invisible here — asserting CTL_HW == 6 beside a row that says 6 proves only
 // that both were typed the same way. That check requires the kernel and lives
-// in examples/c-subset/shipped_sysctl_mib_hw_macho, which cross-checks each MIB
+// in examples/c/shipped_sysctl_mib_hw_macho, which cross-checks each MIB
 // against the sysctlbyname NAME form of the same node on a real Mac.
 // MEASURED by demonstration: perturbing HW_MEMSIZE 24 -> 3 still BUILDS
 // (rc 0) and the example then exits 15 instead of 42.
@@ -6657,7 +6657,7 @@ TEST(ShippedLibDescriptor, RealSysSysctlJsonMibConstantDomains) {
 // unexplained assignment error. The cross-ORIGIN half of the anchor (a SOURCE
 // declaration of the same tag shadowing the injected one) is not visible at this
 // tier at all; it is pinned in
-// tests/analysis/semantic/test_semantic_analyzer_c_subset.cpp.
+// tests/analysis/semantic/test_semantic_analyzer_c.cpp.
 //
 // RED-ON-DISABLE (MEASURED by demonstration): change either descriptor's
 // `tv_sec` to `i64 "long"` and both the tag EQ and the member EQ go red.

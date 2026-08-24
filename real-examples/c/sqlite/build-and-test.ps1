@@ -77,7 +77,7 @@
 #      leg, run continues, exit != 0 — because nothing about this machine could
 #      have changed it. Both drivers answer that condition identically; the
 #      decision itself is the mirrored `dss:unknown-library-provider` region.
-#   7. PER LEG, generate a `.dss-project.json` (language c-subset / profile cli /
+#   7. PER LEG, generate a `.dss-project.json` (language c / profile cli /
 #      the leg's target spec / artifactName testfixture / the 185 TUs as absolute
 #      `sources` / the sqlite+tcl+zlib include dirs / the recipe defines / that
 #      leg's two libraries as resolveLibraries — each carrying the leg's DECLARED
@@ -128,10 +128,10 @@
 #       MSVC alias `_declspec` is not neutralized. Under DSS's pe profile
 #       (_MSC_VER=1943, __GNUC__ undefined) tcl.h picks
 #       `#define TCL_NORETURN _declspec(noreturn)` (tcl.h ~line 159); DSS
-#       neutralizes `__declspec` (double underscore, c-subset.lang.json:67) but
+#       neutralizes `__declspec` (double underscore, c.lang.json:67) but
 #       NOT `_declspec`, so it leaks as raw tokens and derails the parser at the
 #       first EXTERN declaration. FIX: add a `_declspec` pe predefine mirroring
-#       `__declspec` in src/dss-config/sources/c-subset.lang.json:
+#       `__declspec` in src/dss-config/sources/c.lang.json:
 #         { "name": "_declspec", "kind": "constant", "value": "",
 #           "params": ["x"], "availableObjectFormats": ["pe"] }
 #

@@ -721,7 +721,7 @@ struct DSS_EXPORT PreprocessConfig {
     // `#` -> "HashOp", C 6.10.3.2). In a function-like macro's REPLACEMENT list,
     // a `#` immediately followed by a parameter stringizes that parameter's RAW
     // (un-pre-expanded) argument into a single string literal. The macro engine
-    // detects it by this token KIND -- which, in c-subset, is the SAME `HashOp`
+    // detects it by this token KIND -- which, in c, is the SAME `HashOp`
     // as `directiveIntroToken`: directives are peeled at top level (firstOnLine)
     // BEFORE expansion, so every `#` a replacement list carries IS a stringize
     // operator (no ambiguity). Per-language CONFIG kind, never a hard-coded `#`:

@@ -9,7 +9,7 @@
 // 64-bit instruction for an operation the source declared 32 bits wide. Their
 // siblings did not: `not`/`neg`/`shl`/`shr_l`/`shr_a`/`sdiv`/`udiv`/`msub` were
 // all width-keyed and all emitted W-forms for the same `int`. ✔MEASURED in ONE
-// binary (examples/c-subset/core_bitwise, arm64 debug, before the fix):
+// binary (examples/c/core_bitwise, arm64 debug, before the fix):
 //     b_not: 2a3d03fd  mvn w29, w29        ← W-form (`not` declared width:32)
 //     b_shl: 1adc23bc  lsl w28, w29, w28   ← W-form (`shl` declared width:32)
 //     b_and: 8a1c03bc  and x28, x29, x28   ← X-form — THE DEFECT

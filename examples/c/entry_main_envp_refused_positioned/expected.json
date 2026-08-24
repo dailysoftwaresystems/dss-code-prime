@@ -1,0 +1,17 @@
+{
+  "$comment": "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: a 3-parameter `main` is refused AT ITS DECLARATOR with a REAL SPAN. WHAT IT REFUSES, MEASURED 2026-08-10 on HEAD 3e86a187 (build-dbg): this source compiled rc=0 with ZERO diagnostics on BOTH pe64-x86_64-windows-exec and elf64-x86_64-linux-exec and both images FAULT -- observed argc=3 argv=0x...7D10 envp=0x0000000000000004, dereferencing envp gives 0xC0000005 on pe and SIGSEGV (rc=139) on elf, while gcc compiles the identical source and it works. (The ORIGIN of the 0x4 is UNDETERMINED; the 'argc left in a register' explanation is REFUTED -- that run had argc=3 with envp still 0x4.) * C23 5.1.2.2.1 permits main in an implementation-defined manner, so supporting the shape is conforming AND refusing it is conforming -- accepting it and faulting is the one outcome ruled out, and that was shipped. 3.4.1 makes the config declaration the documentation artifact. * THE SPAN IS THE POINT, hence `positioned: true` with an exact line:col: the predecessor check ran at the MIR tier where `Mir` carries no BufferId/SourceSpan for a function, so it could only name the entry by symbol name. If the check ever regresses to a span-less tier this example goes RED even though the same code is still emitted -- that is what `positioned: true` buys. * DIVERGENCE, RECORDED NOT MINIMISED: gcc, clang AND MSVC all accept the 3-parameter form; refusing it is a real divergence while the anchor is open, accepted because a loud refusal beats a faulting binary, and it denies no C23 facility (getenv ships on every format). * THE CHECK IS FORMAT-INDEPENDENT, so a relocatable .o is refused too. * RED-ON-DISABLE: add a third \"ptr-ptr-char\" to `main`'s argc-argv row in c.lang.json and this stops erroring -- and the loader's verb/signature coherence rule refuses that edit first.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "S_EntryShapeNotDeclared",
+      "line": 48,
+      "col": 5
+    }
+  ]
+}

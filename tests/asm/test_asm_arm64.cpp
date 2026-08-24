@@ -187,7 +187,7 @@ TEST(Arm64Encoder, UnreachableEncodesD4200000) {
 // Rd=Rn=sp=31), NOT the shifted-register SUB (0xCB000000) where reg 31
 // = XZR would compute `sp - 0` and silently discard the size. A byte
 // regression here is a silent stack miscompile the qemu run also
-// catches (examples/c-subset/c99_vla) — this is the host-independent
+// catches (examples/c/c99_vla) — this is the host-independent
 // red-on-disable pin.
 
 TEST(Arm64Encoder, SubSpRegEncodesExtendedRegisterWord) {

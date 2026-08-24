@@ -13,7 +13,7 @@
     "kind": "pe"
   },
 
-  "$dataModelComment": "FC3 c1: 64-bit Windows is LLP64 (int 32, long 32, long long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I32 here, the literal ladder + descriptor signatureByDataModel resolve their LLP64 arms. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
+  "$dataModelComment": "FC3 c1: 64-bit Windows is LLP64 (int 32, long 32, long long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c long binds I32 here, the literal ladder + descriptor signatureByDataModel resolve their LLP64 arms. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LLP64",
   "$headerNameMatchingComment": "D-PP-HEADER-CASE-INSENSITIVE-PE: Windows filesystems (NTFS, FAT) match file names case-INSENSITIVELY, and the Windows SDK depends on it -- sqlite3.c:67322 spells `#include <Windows.h>` with a capital W while the shipped descriptor is `windows.json`. REQUIRED closed-enum field. DSS ASCII-folds the comparison ITSELF per path component (core/types/include_path_resolve.cpp) instead of asking fs::exists, so this resolves identically whether the build host is NTFS or ext4 -- MEASURED before the axis existed: rc=0 through /mnt/c, rc=1 error[F001A] on ext4, SAME binary, SAME commit.",
   "headerNameMatching": "case-insensitive",
@@ -25,7 +25,7 @@
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: MSVC x64 bit-field packing (byte-ABI-exact to cl.exe). The strategy is OS/format-determined (x86_64 serves both PE and ELF), so it lives on the format, not the target. See pe64-x86_64-windows-exec for the full rule.",
   "bitFieldStrategy": "msvc_straddle",
 
-  "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: MSVC x64 `long double` IS `double` (64-bit IEEE, 8/8) — the f64 axis collapses the c-subset `long double` row to F64. See pe64-x86_64-windows-exec for the full rationale.",
+  "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: MSVC x64 `long double` IS `double` (64-bit IEEE, 8/8) — the f64 axis collapses the c `long double` row to F64. See pe64-x86_64-windows-exec for the full rationale.",
   "longDoubleFormat": "f64",
   "$externCallDispatchComment": "D-LK-OBJECT-EXTERN-CALL-RELOCATABLE (PE/COFF arm, c148 — the PE analog of the ELF c141 + Mach-O c146 closures): extern FUNCTION calls lower into this relocatable .obj as a plain direct `call rel32` (E8 disp32, zero patch bytes) + an IMAGE_REL_AMD64_REL32 relocation against an UNDEFINED COFF symbol (SectionNumber=0, StorageClass=EXTERNAL) carrying its REAL import name — PE x64 C mangling is IDENTITY (applyCMangling adds no leading underscore, unlike Mach-O), so `puts` is emitted verbatim. That rel32-CALL-against-undefined-symbol shape is the standard COFF contract: the FINAL linker (link.exe / lld-link) resolves it either directly to a same-link definition or through an import thunk it synthesizes for a DLL import — DSS never builds a stub/thunk inside a `.obj` (thunk synthesis is the EXEC walker's job, D-FFI-PE-IMPORT-THUNK). `direct-plt` is the declared verb because the call-site byte shape is the direct-call form (the ELF/Mach-O relocatable formats declare the same value for the same reason).",
   "externCallDispatch": "direct-plt",

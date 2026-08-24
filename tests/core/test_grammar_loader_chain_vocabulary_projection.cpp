@@ -127,7 +127,7 @@ objectsWithKey(nlohmann::json const& doc, std::string_view key) {
 
 // The pointers whose OWN pointer text contains `needle` — for the keys whose
 // spelling is overloaded across the schema. `kind` names a token kind at 245
-// pointers in `c-subset` and a type-extension parameter kind at two in
+// pointers in `c` and a type-extension parameter kind at two in
 // `tsql-subset`; without this the probe would perturb a token declaration and
 // assert against a diagnostic from an unrelated subsystem.
 [[nodiscard]] std::vector<std::string>
@@ -193,13 +193,13 @@ struct VocabularyCase {
 // different claim from "the message names the set".
 [[nodiscard]] std::vector<VocabularyCase> vocabularies() {
     std::vector<VocabularyCase> v;
-    v.push_back({"modeOp", "c-subset", "modeOp",
+    v.push_back({"modeOp", "c", "modeOp",
                  {"pushMode", "popMode", "replaceMode"}, 3,
                  {"modeOp"}, RefusalPath::KeyChild, plainKey("modeOp"), true});
-    v.push_back({"escapeKind", "c-subset", "escapeKind",
+    v.push_back({"escapeKind", "c", "escapeKind",
                  {"none", "char", "doubled-delimiter"}, 3,
                  {"escapeKind"}, RefusalPath::KeyChild, plainKey("escapeKind"), true});
-    v.push_back({"unterminatedAs", "c-subset", "unterminatedAs",
+    v.push_back({"unterminatedAs", "c", "unterminatedAs",
                  {"string", "comment", "generic"}, 3,
                  {"unterminatedAs"}, RefusalPath::KeyChild,
                  plainKey("unterminatedAs"), true});
@@ -207,18 +207,18 @@ struct VocabularyCase {
                  {"strict", "contextual"}, 2,
                  {"reservedWordPolicy"}, RefusalPath::KeyChild,
                  plainKey("reservedWordPolicy"), true});
-    v.push_back({"commitRequiresTypeName.polarity", "c-subset", "polarity",
+    v.push_back({"commitRequiresTypeName.polarity", "c", "polarity",
                  {"preferType", "requireKnownType"}, 2,
                  {"polarity", "commitRequiresTypeName.polarity"},
                  RefusalPath::KeyChild, plainKey("polarity"), true});
-    v.push_back({"imports.strategy", "c-subset", "strategy",
+    v.push_back({"imports.strategy", "c", "strategy",
                  {"none", "include-following", "name-matching"}, 3,
                  {"strategy", "imports.strategy"}, RefusalPath::KeyChild,
                  keyUnder("strategy", "/imports"), true});
-    v.push_back({"nameMatch", "c-subset", "nameMatch",
+    v.push_back({"nameMatch", "c", "nameMatch",
                  {"self", "lastIdentifier"}, 2,
                  {"nameMatch"}, RefusalPath::KeyChild, plainKey("nameMatch"), true});
-    v.push_back({"typeShapes[].constructor", "c-subset", "constructor",
+    v.push_back({"typeShapes[].constructor", "c", "constructor",
                  {"pointer", "reference", "nullable", "optional", "slice"}, 5,
                  {"constructor"}, RefusalPath::KeyChild,
                  // No shipped document declares a `typeShapes` block, so this
@@ -233,17 +233,17 @@ struct VocabularyCase {
                      return {"/semantics/typeShapes/0"};
                  },
                  false});
-    v.push_back({"arithmeticConversions.shiftResult", "c-subset", "shiftResult",
+    v.push_back({"arithmeticConversions.shiftResult", "c", "shiftResult",
                  {"promotedLeft", "commonType"}, 2,
                  {"shiftResult"}, RefusalPath::KeyChild, plainKey("shiftResult"), true});
     v.push_back({"childGathering[].lower", "tsql-subset", "lower",
                  {"expr", "flatExpr", "ext", "ref", "varDecl"}, 5,
                  {"lower"}, RefusalPath::KeyChild, plainKey("lower"), true});
-    v.push_back({"operators[].associativity", "c-subset", "associativity",
+    v.push_back({"operators[].associativity", "c", "associativity",
                  {"none", "left", "right"}, 3,
                  {"associativity"}, RefusalPath::ObjectItself,
                  plainKey("associativity"), true});
-    v.push_back({"operators[].arity", "c-subset", "arity",
+    v.push_back({"operators[].arity", "c", "arity",
                  {"infix", "prefix", "postfix", "ternary"}, 4,
                  {"arity"}, RefusalPath::ObjectItself, plainKey("arity"), true});
     v.push_back({"typeExtensions[].parameters[].kind", "tsql-subset", "kind",
@@ -484,12 +484,12 @@ TEST(GrammarLoaderChainVocabulary, ModeOpSentinelResolvesButIsRefused) {
     EXPECT_FALSE(isDeclarableModeOp(*sentinel));
     EXPECT_EQ(modeOpName(ModeOp::None), "none");
 
-    auto       doc      = shippedLanguageDoc("c-subset");
+    auto       doc      = shippedLanguageDoc("c");
     auto const pointers = objectsWithKey(doc, "modeOp");
     ASSERT_FALSE(pointers.empty());
     at(doc, pointers.front(), "modeOp / sentinel")["modeOp"] = "none";
     auto const text = doc.dump();
-    auto       r    = GrammarSchema::loadFromText(text, "c-subset");
+    auto       r    = GrammarSchema::loadFromText(text, "c");
     ASSERT_FALSE(r.has_value())
         << "`modeOp: \"none\"` must FAIL the load — the table resolves the "
            "spelling and the loader refuses it, which is the whole reason "
@@ -531,14 +531,14 @@ TEST(GrammarLoaderChainVocabulary, ModeOpSentinelResolvesButIsRefused) {
 TEST(GrammarLoaderChainVocabulary, SynthesizedTypeRolesAreNamedAndDispatched) {
     constexpr std::string_view kRoles[] = {"sizeof", "alignof",
                                            "pointerDifference"};
-    auto doc = shippedLanguageDoc("c-subset");
+    auto doc = shippedLanguageDoc("c");
     ASSERT_TRUE(doc.at("semantics").contains("synthesizedTypes"))
         << "the shipped document must declare the block, or this pin probes "
            "nothing";
 
     // Each declared role must actually REACH a config member. Proven the only
     // non-circular way: load the shipped document and read the results back.
-    auto const clean = GrammarSchema::loadFromText(doc.dump(), "c-subset");
+    auto const clean = GrammarSchema::loadFromText(doc.dump(), "c");
     ASSERT_TRUE(clean.has_value()) << summarize(clean.error());
     auto const& sem = (*clean)->semantics();
     EXPECT_FALSE(sem.sizeofResultType.byDataModel.empty())
@@ -553,7 +553,7 @@ TEST(GrammarLoaderChainVocabulary, SynthesizedTypeRolesAreNamedAndDispatched) {
     // And the unknown-key refusal names every role, projected from the same
     // table the dispatch walks.
     doc["semantics"]["synthesizedTypes"][kBadSpelling] = nlohmann::json::object();
-    auto r = GrammarSchema::loadFromText(doc.dump(), "c-subset");
+    auto r = GrammarSchema::loadFromText(doc.dump(), "c");
     ASSERT_FALSE(r.has_value()) << "an unknown synthesizedTypes role must FAIL";
     auto const found = messageAt(
         r.error(), std::string{"/semantics/synthesizedTypes/"} + kBadSpelling);
@@ -595,7 +595,7 @@ TEST(GrammarLoaderChainVocabulary, FlagListRefusesAnUnknownSpelling) {
         return std::string{};
     };
 
-    auto const doc = shippedLanguageDoc("c-subset");
+    auto const doc = shippedLanguageDoc("c");
     auto const ptr = pointerOfSomeFlagArray(doc);
     ASSERT_FALSE(ptr.empty())
         << "no shipped object carries a 'flags' array, so this pin probes "
@@ -608,7 +608,7 @@ TEST(GrammarLoaderChainVocabulary, FlagListRefusesAnUnknownSpelling) {
         auto bad = doc;
         at(bad, ptr, "flags / unknown")["flags"] =
             nlohmann::json::array({"EmptySpace", kBadSpelling});
-        auto r = GrammarSchema::loadFromText(bad.dump(), "c-subset");
+        auto r = GrammarSchema::loadFromText(bad.dump(), "c");
         ASSERT_FALSE(r.has_value())
             << "an unknown node flag must FAIL the load — ignoring it leaves "
                "the behaviour it names switched off with no diagnostic, which "
@@ -654,7 +654,7 @@ TEST(GrammarLoaderChainVocabulary, FlagListRefusesAnUnknownSpelling) {
         auto ok = doc;
         at(ok, ptr, "flags / accepted")["flags"] =
             nlohmann::json::array({std::string{n}});
-        auto r = GrammarSchema::loadFromText(ok.dump(), "c-subset");
+        auto r = GrammarSchema::loadFromText(ok.dump(), "c");
         if (r.has_value()) continue;
         for (auto const& d : r.error()) {
             EXPECT_TRUE(d.path.find("/flags") == std::string::npos)

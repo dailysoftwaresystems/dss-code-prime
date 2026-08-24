@@ -8,7 +8,7 @@
 #
 # Tier (a) — `Preprocessor.TfC85NoUnclaimedPragmaUnderAnyPredefineClass` plus
 # its non-vacuity twin — is ALWAYS ON in ctest, over the in-repo fixture
-# `tests/corpus/c-subset/pragma_profile_census.c`. It is the guard that cannot
+# `tests/corpus/c/pragma_profile_census.c`. It is the guard that cannot
 # rot.
 #
 # Tier (b) is THIS: the same census over the REAL 189-TU sqlite corpus. It is
@@ -165,13 +165,13 @@ def disarm_config(scratch: Path) -> Path:
     itself. The repo's own config is never modified."""
     dst = scratch / "src"
     shutil.copytree(REPO_ROOT / "src", dst)
-    lang = dst / "dss-config" / "sources" / "c-subset.lang.json"
+    lang = dst / "dss-config" / "sources" / "c.lang.json"
     if not lang.is_file():
-        die("no c-subset.lang.json in the scratch copy")
+        die("no c.lang.json in the scratch copy")
     doc = json.loads(lang.read_text())
     pp = doc.get("preprocess")
     if pp is None or "pragmaEffects" not in pp:
-        die("c-subset.lang.json no longer has preprocess.pragmaEffects")
+        die("c.lang.json no longer has preprocess.pragmaEffects")
     pp["pragmaEffects"] = []             # claim NOTHING
     pp["unknownPragmaIsError"] = True    # so every reached pragma names itself
     lang.write_text(json.dumps(doc, indent=2, ensure_ascii=False))

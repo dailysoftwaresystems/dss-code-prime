@@ -70,7 +70,7 @@
   },
 
   "lexerModes": {
-    "$comment": "The two comment bodies, verbatim in shape from the AT&T dialect (which took them verbatim from `c-subset.lang.json`): every character inside becomes an `EmptySpace` CommentChar, and an unterminated body is reported as a comment rather than as a wall of stray tokens. The `endsAtExclusive` on `//` above is what keeps the terminating `LineEnd` OUTSIDE the comment body — without it a comment-terminated line loses its terminator and merges with the next.",
+    "$comment": "The two comment bodies, verbatim in shape from the AT&T dialect (which took them verbatim from `c.lang.json`): every character inside becomes an `EmptySpace` CommentChar, and an unterminated body is reported as a comment rather than as a wall of stray tokens. The `endsAtExclusive` on `//` above is what keeps the terminating `LineEnd` OUTSIDE the comment body — without it a comment-terminated line loses its terminator and merges with the next.",
     "line-comment":  { "defaultToken": { "kind": "CommentChar", "flags": ["EmptySpace"] }, "unterminatedAs": "comment" },
     "block-comment": { "defaultToken": { "kind": "CommentChar", "flags": ["EmptySpace"] }, "unterminatedAs": "comment" },
 

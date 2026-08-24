@@ -441,8 +441,8 @@ TEST(StringStyleLoader, ToyConfigStillLoads) {
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
 }
 
-TEST(StringStyleLoader, CSubsetConfigStillLoads) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+TEST(StringStyleLoader, CConfigStillLoads) {
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value())
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
 }

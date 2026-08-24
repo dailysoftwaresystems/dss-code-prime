@@ -524,7 +524,7 @@ collectImplicitClobberPositions(Lir const& lir, TargetSchema const& schema,
 // destroyed by CQO before IDIV read it, producing IDIV by
 // (sign-extension-of-RAX) which traps with STATUS_INTEGER_DIVIDE_
 // BY_ZERO when the dividend happens to be a small positive value.
-// Caught by `examples/c-subset/division/` exiting with the OS's
+// Caught by `examples/c/division/` exiting with the OS's
 // trap signature instead of 47.
 //
 // The fix: use "covers position P" semantics — exclude clobbers

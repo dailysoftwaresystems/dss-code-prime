@@ -25,7 +25,7 @@
 //   * IDEMPOTENT: running the prune twice is a no-op on the second run.
 //
 // FC5 (goto/labels) LANDED 2026-06-15 — `goto`/labels now lower end-to-end. The
-// goto-dead-block prune is exercised at runtime by `examples/c-subset/goto_cleanup`
+// goto-dead-block prune is exercised at runtime by `examples/c/goto_cleanup`
 // (a forward goto over a cleanup block leaves it unreachable → pruned; exit 42 with
 // + without the optimizer) and `goto_infinite_escape` (the `while(1){…goto out…}`
 // wrap's no-pred Unreachable is dropped by this prune). The hand-built MIR shape
@@ -67,8 +67,8 @@ using namespace dss;
 
 namespace {
 
-// Drive: c-subset source → CompilationUnit → SemanticModel → HIR → MIR.
-// Mirrors tests/mir/test_mir_lowering_c_subset.cpp's `lowerCSubset` — the
+// Drive: c source → CompilationUnit → SemanticModel → HIR → MIR.
+// Mirrors tests/mir/test_mir_lowering_c.cpp's `lowerC` — the
 // canonical way to build AUTHENTIC eager-continuation MIR (the prune's
 // real input) from C source.
 struct Lowered {
@@ -79,9 +79,9 @@ struct Lowered {
     DiagnosticReporter              mirReporter;
 };
 
-[[nodiscard]] Lowered lowerCSubset(std::string src) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+[[nodiscard]] Lowered lowerC(std::string src) {
+    auto loaded = GrammarSchema::loadShipped("c");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
     UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -163,7 +163,7 @@ struct Lowered {
 // strongest provable property: if the frontend's eager-continuation shape
 // ever changes, this pin moves with intent, not silently).
 void expectSealedConstructPruned(std::string src, std::size_t expectedOrphans) {
-    auto L = lowerCSubset(std::move(src));
+    auto L = lowerC(std::move(src));
     ASSERT_FALSE(L.model.hasErrors())
         << "semantic: " << (L.model.diagnostics().all().empty()
             ? "" : L.model.diagnostics().all()[0].actual);
@@ -431,7 +431,7 @@ TEST(PruneUnreachable, RuntimeInitGlobalStillPrunedNotCarvedOut) {
 
 // ── IDEMPOTENT — a second prune over an already-pruned module is a no-op. ─
 TEST(PruneUnreachable, IdempotentSecondRunIsNoOp) {
-    auto L = lowerCSubset(
+    auto L = lowerC(
         "int main(){ int c=1; if(c){ return 1; } else { return 2; } }");
     ASSERT_TRUE(L.mir.ok);
     Mir& mir = L.mir.mir;

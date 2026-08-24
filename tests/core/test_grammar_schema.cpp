@@ -316,20 +316,20 @@ TEST(GrammarSchema, LoadShippedToy) {
 // name to that list by hand — deliberately.
 
 
-// The shipped c-subset config must load cleanly and round-trip every rule
+// The shipped c config must load cleanly and round-trip every rule
 // the JSON declares. Pins three layers: (a) loader accepts the file, (b)
 // each named shape resolves via `rules().find(...)` so a typo in any
 // shape key wouldn't slip through as "loaded but unusable at first call",
 // (c) representative tokens and keywords carry the right meanings.
-TEST(GrammarSchema, LoadShippedCSubset) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+TEST(GrammarSchema, LoadShippedC) {
+    auto result = GrammarSchema::loadShipped("c");
     if (!result.has_value()) {
-        FAIL() << "loadShipped c-subset failed: " << result.error()[0].message
+        FAIL() << "loadShipped c failed: " << result.error()[0].message
                << " (cwd=" << std::filesystem::current_path().string() << ")";
     }
     auto const& schema = **result;
 
-    EXPECT_EQ(schema.name(), "CSubset");
+    EXPECT_EQ(schema.name(), "C");
     EXPECT_EQ(schema.schemaVersion(), 4u);
 
     // Every shape name declared in the JSON must resolve. A typo would
@@ -369,7 +369,7 @@ TEST(GrammarSchema, LoadShippedCSubset) {
                                   "operand",
                                   // Pratt-walker wrapper rules auto-interned
                                   // by the loader when the schema declares
-                                  // any `expr` shape. c-subset's `expression`
+                                  // any `expr` shape. c's `expression`
                                   // rule is `expr`-kind, so these must be
                                   // present in the rule interner.
                                   "binaryExpr", "unaryExpr", "postfixExpr"}) {
@@ -410,13 +410,13 @@ TEST(GrammarSchema, LoadShippedCSubset) {
     EXPECT_EQ(schema.schemaTokens().name(typedefKw[0].id), "TypedefKeyword");
 }
 
-// Pin the `expr`-shape accessors on c-subset. `expression` is the
+// Pin the `expr`-shape accessors on c. `expression` is the
 // only `expr`-kind rule in the shipped grammar; `operand` is its atom.
 // Other rules return false / Invalid / 0.
-TEST(GrammarSchema, ExprShapeAccessorsOnCSubset) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+TEST(GrammarSchema, ExprShapeAccessorsOnC) {
+    auto result = GrammarSchema::loadShipped("c");
     if (!result.has_value()) {
-        FAIL() << "loadShipped c-subset failed: " << result.error()[0].message;
+        FAIL() << "loadShipped c failed: " << result.error()[0].message;
     }
     auto const& schema = **result;
 
@@ -515,14 +515,14 @@ TEST(GrammarSchema, LoaderRejectsReservedWrapperShapeName) {
 // would silently never fire at runtime (the cursor-advance gate
 // skips body-default kinds), so surface the misuse at load time.
 // PA3: `followSetOf(rule)` walks the position graph at load time.
-// Verify the textbook FOLLOW computation: for c-subset's `expression`
+// Verify the textbook FOLLOW computation: for c's `expression`
 // rule, FOLLOW must include the tokens that can legitimately appear
 // AFTER an expression — `;` (EndStatement) at statement boundary, `)`
 // (ParenClose) at paren-wrapped sub-expression boundary, `,` (Comma)
 // in argument-list-like positions if any. These are the resync points
 // the parser's panic-mode uses for `expr`-kind rules.
 TEST(GrammarSchema, FollowSetOfExpressionIncludesStatementEnders) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+    auto result = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(result.has_value());
     auto const& schema = **result;
 
@@ -629,7 +629,7 @@ TEST(GrammarSchema, FollowSetConvergesOnSelfRecursiveRule) {
 // parser's `canEndSource` check is what authorizes EOF — no implicit
 // EOF in FOLLOW(root).
 TEST(GrammarSchema, FollowSetOfRootIsEmpty) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+    auto result = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(result.has_value());
     auto const& schema = **result;
     const auto root = schema.rules().find("root");
@@ -640,7 +640,7 @@ TEST(GrammarSchema, FollowSetOfRootIsEmpty) {
 // PA3: `syncTokens` field round-trips. Loader rejects unknown kind
 // names, Eof, and Error (each with its own loader diagnostic shape).
 TEST(GrammarSchema, SyncTokensRoundTrip) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+    auto result = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(result.has_value());
     auto const& schema = **result;
     const auto sync = schema.syncTokens();
@@ -830,12 +830,12 @@ TEST(GrammarSchema, ExprRuleFirstSetIncludesPrefixOperators) {
 // prefix, trailing const via the `{opt ConstKeyword}` east-const) AND `volatile`
 // in the head — a strict superset of the retired typeRef's const-only leading
 // qualifier. Real C allows double-const only with intervening type modifiers; the
-// c-subset is deliberately more permissive. Pinned so a future PR doesn't tighten
+// c is deliberately more permissive. Pinned so a future PR doesn't tighten
 // this without intent.
-TEST(GrammarSchema, CSubsetExternHeadAllowsDoubleConst) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+TEST(GrammarSchema, CExternHeadAllowsDoubleConst) {
+    auto result = GrammarSchema::loadShipped("c");
     if (!result.has_value()) {
-        FAIL() << "loadShipped c-subset failed: " << result.error()[0].message;
+        FAIL() << "loadShipped c failed: " << result.error()[0].message;
     }
     EXPECT_TRUE((*result)->rules().find("typeRefAllowingStruct").valid());
     EXPECT_FALSE((*result)->rules().find("typeRef").valid())
@@ -905,7 +905,7 @@ namespace {
 
 // Every ERROR-severity diagnostic, one per line. ★ Use this instead of
 // `diags[0].message` when reporting why a load failed: the list is in emission
-// order and its FIRST entry is routinely a WARNING (the shipped c-subset opens
+// order and its FIRST entry is routinely a WARNING (the shipped c opens
 // with a `defaultToken`-without-`tokens` mode warning), so `[0]` regularly
 // names something entirely unrelated to the failure and sends the reader
 // chasing it.
@@ -1021,7 +1021,7 @@ TEST(GrammarSchema, TypeExtensionParametersNotArrayReportsMismatch) {
 TEST(GrammarSchema, ImportsIncludeFollowingLoadsAndPopulates) {
     auto result = GrammarSchema::loadFromText(R"JSON({
         "dssSchemaVersion": 4,
-        "language": { "name": "CSubset", "version": "0.1.0" },
+        "language": { "name": "C", "version": "0.1.0" },
         "tokens": { "#": [ { "kind": "IncludeKeyword" } ],
                     "\"": [ { "kind": "StringStart" } ] },
         "shapes": {
@@ -1039,7 +1039,7 @@ TEST(GrammarSchema, ImportsIncludeFollowingLoadsAndPopulates) {
 TEST(GrammarSchema, ImportsIncludeFollowingFieldsParse) {
     auto result = GrammarSchema::loadFromText(R"JSON({
         "dssSchemaVersion": 4,
-        "language": { "name": "CSubset", "version": "0.1.0" },
+        "language": { "name": "C", "version": "0.1.0" },
         "imports": { "strategy": "include-following",
                      "directiveRule": "includeDirective", "pathToken": "StringStart" },
         "tokens": { "#": [ { "kind": "IncludeKeyword" } ],
@@ -1322,7 +1322,7 @@ TEST(GrammarSchema, ExprShapeWithPartialWrapperRulesIsRejected) {
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_MissingWrapperRules));
 }
 
-// Happy-path: distinct (non-c-subset) wrapper-rule names load cleanly,
+// Happy-path: distinct (non-c) wrapper-rule names load cleanly,
 // the parser-side schema lookup returns the right RuleIds. Genericity
 // pin: the engine has NO hardcoded `binaryExpr`/`unaryExpr`/`postfixExpr`
 // names — any names work.
@@ -1574,7 +1574,7 @@ TEST(GrammarSchema, IdentifierClassExtraContinueLoads) {
 // ★ A LANGUAGE THAT DECLARES NOTHING GETS THE UNIVERSAL RULE — and the accessor
 // answers rather than returning a null the hot path must branch on.
 TEST(GrammarSchema, IdentifierClassAbsentMeansTheUniversalRule) {
-    auto result = GrammarSchema::loadShipped("c-subset");
+    auto result = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
     EXPECT_TRUE((*result)->identifierClass().extraContinue.empty());
     EXPECT_FALSE((*result)->identifierClass().continuesIdentifier('.'))
@@ -2276,7 +2276,7 @@ TEST(GrammarSchema, AttributeArgRuleUnknownShapeReportsInvalid) {
 }
 
 // (The shipped-config regression wall for this vocabulary lives at the end
-// of the file, next to the helper that locates c-subset.lang.json.)
+// of the file, next to the helper that locates c.lang.json.)
 
 // ── TF-C73: the attribute NAME vocabulary — `effect: "align"`, and the
 //    loader's ABI-neutral-hint DRIFT cross-check ─────────────────────────────
@@ -2803,17 +2803,17 @@ TEST(GrammarSchema, AttributeEffectAppliesToMultiKindSetReachesConfig) {
 // naming the eight rows individually, so it keeps holding as the table grows.
 //
 // ⚠ ROWS ≠ VERBS, and the distinction is why the count below is a `_GE` on ROWS.
-// c-subset ships EIGHT declaration-attached rows carrying SEVEN distinct effect
+// c ships EIGHT declaration-attached rows carrying SEVEN distinct effect
 // verbs: `warnOnDiscard` is spelled by TWO rows (`nodiscard` and its GNU twin
 // `warn_unused_result`), because the two names share one effect but have DIFFERENT
 // applicability sets — `nodiscard` is function-only per C23 6.7.13.3 while clang
 // enumerates typedefs among the valid positions for the GNU spelling. That split
 // is the whole reason a row-count and a verb-count diverge here, so counting verbs
 // would under-count the table by one and hide a lost row.
-TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedCSubset) {
-    auto r = GrammarSchema::loadShipped("c-subset");
+TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedC) {
+    auto r = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(r.has_value())
-        << "the shipped c-subset config must satisfy its own `appliesTo` rule";
+        << "the shipped c config must satisfy its own `appliesTo` rule";
     std::size_t declAttached = 0;
     for (auto const& row : (*r)->semantics().attributeEffects) {
         if (row.effect == AttributeEffect::None) {
@@ -2829,7 +2829,7 @@ TEST(GrammarSchema, AppliesToIsPresentOnEveryDeclAttachedRowOfShippedCSubset) {
             << (row.names.empty() ? "<none>" : row.names[0]) << "' does not";
     }
     EXPECT_GE(declAttached, 8u)
-        << "c-subset ships EIGHT declaration-attached effect ROWS carrying SEVEN "
+        << "c ships EIGHT declaration-attached effect ROWS carrying SEVEN "
            "distinct effect VERBS — suppressUnused / warnOnUse / warnOnDiscard "
            "(TWO rows: `nodiscard` and the GNU `warn_unused_result`, one verb but "
            "two applicability sets) / align / noInline / alwaysInline / "
@@ -2885,7 +2885,7 @@ TEST(GrammarSchema, AttributeVocabularyDriftedIgnoreListReportsInvalid) {
 // CLAUSE B, INERT NAMES STAY EXEMPT. The same drifted shape but with the name
 // carrying `effect: "none"` must still load. This is the pin that keeps the
 // cross-check from becoming the over-broad "every effects name must be
-// ignored everywhere" rule, which would reject the shipped c-subset (whose
+// ignored everywhere" rule, which would reject the shipped c (whose
 // `fallthrough`/`likely`/`packed` rows are deliberately not ignore-listed).
 TEST(GrammarSchema, AttributeVocabularyInertEffectNeedsNoIgnoreEntry) {
     auto const cfg = attrVocabSchema(
@@ -2952,7 +2952,7 @@ TEST(GrammarSchema, AttributeVocabularyWholeIgnoredNamesKeyDeletedReportsInvalid
 // `effect != None` shape.
 //
 // ★ WHY A DEDICATED CASE FOR THIS VERB RATHER THAN TRUSTING THE GENERIC GATE. The
-// shipped c-subset config needed THREE coordinated edits for this attribute (the
+// shipped c config needed THREE coordinated edits for this attribute (the
 // `effects` row plus BOTH declaration rows' `linkageSpecifierIgnoredNames`), and the
 // only thing that makes forgetting one of them impossible is this cross-check. Its
 // generality is a property of the current implementation, not of the contract — a
@@ -2996,7 +2996,7 @@ TEST(GrammarSchema, NoSanitizeThreadEffectRequiresTheIgnoredNameToo) {
         << errorDiags(rBad.error());
 
     // (b) both halves present — must load clean. This is the shape the shipped
-    // c-subset config uses on BOTH its topLevelDecl and externDecl rows.
+    // c config uses on BOTH its topLevelDecl and externDecl rows.
     auto const consistent = attrVocabSchema(
         kEffects, R"("linkageSpecifierIgnoredNames": ["no_sanitize_thread"],)", "");
     auto rGood = GrammarSchema::loadFromText(consistent);
@@ -3009,13 +3009,13 @@ TEST(GrammarSchema, NoSanitizeThreadEffectRequiresTheIgnoredNameToo) {
 // (i-b) TIER 3 — a row that mentions NO attribute rule at all and ignores
 // nothing by name stays EXEMPT, and that limit is DELIBERATE, not an oversight.
 // The loader holds only a name↔id rule table; it cannot see whether such a
-// row's prefix grammar admits an attribute clause at all, and c-subset's
+// row's prefix grammar admits an attribute clause at all, and c's
 // `externDecl` is exactly this shape (its specifier prefix is `extern` plus the
 // thread-local twins, so no attribute identifier can occur there).
 //
 // ★ Pinning the limit is the honest alternative to pretending it is closed. It
 // is also the reason (i) uses the RULES signal rather than simply dropping the
-// old gate: dropping it outright was MEASURED to reject the shipped c-subset on
+// old gate: dropping it outright was MEASURED to reject the shipped c on
 // this very row.
 TEST(GrammarSchema, AttributeVocabularyRowClaimingNothingAboutAttrsIsExempt) {
     auto const cfg = attrVocabSchema(kConsistentEffects, "", "");
@@ -3034,7 +3034,7 @@ TEST(GrammarSchema, AttributeVocabularyRowClaimingNothingAboutAttrsIsExempt) {
 // change its behavior.
 //
 // ★ Without this, the check is wrong in the OTHER direction, and wrong in a way
-// that pushes config the wrong way. MEASURED on the shipped c-subset: adding
+// that pushes config the wrong way. MEASURED on the shipped c: adding
 // ONE unrelated name to `varDecl` — a row that already ignores `attrSpec` and
 // `stdAttr` wholesale — flipped the old gate on and demanded six more names be
 // added to a silence list that could never be consulted. A guard whose remedy
@@ -3377,7 +3377,7 @@ TEST(GrammarSchema, SemanticsDefinesWhenChildUnknownChildRuleReportsUnknownShape
 // no-head-no-infer C_MissingField gate staying intact (the relaxation must
 // not have widened it). Each uses the minimal synthetic declarator language
 // (the test_declarator_engine shapes, trimmed) so the pins are independent
-// of the shipped c-subset config.
+// of the shipped c config.
 
 namespace {
 // The shared skeleton: tokens + declarator shapes + the `declarators` role
@@ -4137,7 +4137,7 @@ TEST(GrammarSchema, PerModeTokensMapDollarLexemeIsHonored) {
 // matched against `tree().text(token)`), so it gets the same treatment — the
 // audit listed it as a missing carve-out, and it is deliberately absent.
 // Documentation for that map goes on a `$`-prefixed sibling of the declaration
-// ROW's keys, which IS the loader's own vocabulary; the shipped c-subset's
+// ROW's keys, which IS the loader's own vocabulary; the shipped c's
 // `$linkageSpecifiersComment` already does exactly that.
 TEST(GrammarSchema, LinkageSpecifiersMapDollarKeyIsASpecifierNotAComment) {
     auto cfg = attrVocabSchema(kConsistentEffects, kIgnoresDeprecated, "");
@@ -4314,7 +4314,7 @@ TEST(GrammarSchema, TypeNameCommitGuardDollarPrefixedKeyIsExempt) {
 // inside an individual shape BODY — but NOT as a sibling of the rule names in
 // the `shapes` map, where the key was read as a SHAPE DEFINITION and its prose
 // value as a rule REFERENCE. The whole load failed with the paragraph printed
-// back as if it were a rule name. Hit for real while authoring c-subset.
+// back as if it were a rule name. Hit for real while authoring c.
 
 namespace {
 // One extra entry spliced into the `shapes` map at %X%, ahead of `root`.
@@ -4546,7 +4546,7 @@ TEST(GrammarSchema, SemanticsImplicitReturnZeroNonStringElementReportsInvalid) {
 // cycle 10g). A typo'd sub-key (e.g. `strictAliasng` missing 'i' or
 // `charTypeAliasAll` missing 's') would otherwise silently fall back
 // to the default and flip the language's optimization polarity —
-// strict-aliasing silently disabled for c-subset / char-exception
+// strict-aliasing silently disabled for c / char-exception
 // silently disabled for a hypothetical Rust frontend.
 TEST(GrammarSchema, SemanticsPointerAliasingUnknownKeyReportsInvalid) {
     constexpr std::string_view kCfg = R"JSON({
@@ -4662,10 +4662,10 @@ TEST(GrammarSchema, SemanticsImplicitReturnZeroEmptyStringElementReportsInvalid)
 
 // Positive pin: multi-name lists load cleanly and preserve order +
 // identity. The substrate accepts an arbitrary-length vector, but
-// c-subset's shipped config declares only `["main"]`, so the
+// c's shipped config declares only `["main"]`, so the
 // multi-element path has zero in-shipped-config coverage. A
 // regression that silently truncated the list to the first element
-// would pass every negative test + every e2e test (c-subset's single
+// would pass every negative test + every e2e test (c's single
 // "main" entry still works). Code-architect Q10-A4 FOLD-NOW on
 // 39897eb's 3rd-order audit.
 TEST(GrammarSchema, SemanticsImplicitReturnZeroMultiNameListLoadsCleanly) {
@@ -6070,9 +6070,9 @@ TEST(GrammarSchema, ShippedConfigsDeclareArtifactProfiles) {
         EXPECT_EQ(p[0], "cli");
     }
 
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     if (!c.has_value()) {
-        FAIL() << "loadShipped c-subset failed: " << c.error()[0].message;
+        FAIL() << "loadShipped c failed: " << c.error()[0].message;
     }
     {
         auto p = (*c)->artifactProfiles();
@@ -6080,7 +6080,7 @@ TEST(GrammarSchema, ShippedConfigsDeclareArtifactProfiles) {
         EXPECT_EQ(p[0], "cli");
         EXPECT_EQ(p[1], "lib");
         EXPECT_EQ(p[2], "staticlib");
-        // `module` (SourceMerge) — c-subset is the only shipped language that
+        // `module` (SourceMerge) — c is the only shipped language that
         // declares it; toy and tsql-subset deliberately do NOT, which is what
         // the two sibling blocks in this test pin.
         EXPECT_EQ(p[3], "module");
@@ -6381,7 +6381,7 @@ TEST(GrammarSchema, ParserMaxExpressionDepthWrongTypeReportsCode) {
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_ConflictingField));
 }
 
-// C11/C23 6.4.5: the shipped c-subset text with `stringLiteralPrefixes`, for
+// C11/C23 6.4.5: the shipped c text with `stringLiteralPrefixes`, for
 // mutation-based validation of the `elementCoreByFormat` per-format core map.
 namespace {
 // Located through the ONE test-side resolver (`repo_root.hpp`:
@@ -6392,13 +6392,13 @@ namespace {
 // unresolvable root — GoogleTest reports that as a failure of the one running
 // test, never an `abort()` that would cost this binary's other tests their
 // verdicts.
-[[nodiscard]] std::string shippedCSubsetTextForPrefixTest() {
+[[nodiscard]] std::string shippedCTextForPrefixTest() {
     namespace fs = std::filesystem;
     fs::path const cand =
-        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+        dss::test::configRoot() / "sources" / "c.lang.json";
     std::ifstream in{cand, std::ios::binary};
     if (!in) {
-        ADD_FAILURE() << "cannot open shipped c-subset.lang.json at "
+        ADD_FAILURE() << "cannot open shipped c.lang.json at "
                       << cand.string();
         return {};
     }
@@ -6410,11 +6410,11 @@ namespace {
 TEST(GrammarSchema, StringPrefixUnknownFormatKeyReportsCode) {
     // An unknown object-format key in `elementCoreByFormat` must FAIL LOUD (a typo'd
     // format would otherwise silently never override, baking the wrong wchar width).
-    std::string text = shippedCSubsetTextForPrefixTest();
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     // Baseline: the unmutated shipped config loads clean.
     ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c-subset must load clean before mutation";
+        << "shipped c must load clean before mutation";
     // Swap the WideStringStart row's valid `"pe"` key for a bogus format name.
     std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
     auto const pos = text.find(needle);
@@ -6437,10 +6437,10 @@ TEST(GrammarSchema, StringPrefixUnknownFormatKeyReportsCode) {
 // RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in the
 // `elementCoreByFormat` loop and the mutated config loads clean.
 TEST(GrammarSchema, StringPrefixSentinelFormatKeyReportsCode) {
-    std::string text = shippedCSubsetTextForPrefixTest();
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c-subset must load clean before mutation";
+        << "shipped c must load clean before mutation";
     std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
     auto const pos = text.find(needle);
     ASSERT_NE(pos, std::string::npos)
@@ -6460,7 +6460,7 @@ TEST(GrammarSchema, StringPrefixSentinelFormatKeyReportsCode) {
 
 TEST(GrammarSchema, StringPrefixUnknownElementCoreReportsCode) {
     // A per-format value that is not a known TypeKind must FAIL LOUD.
-    std::string text = shippedCSubsetTextForPrefixTest();
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
     auto const pos = text.find(needle);
@@ -6477,10 +6477,10 @@ TEST(GrammarSchema, StringPrefixUnknownElementCoreReportsCode) {
 // format key to prove the char table is parsed + closed-key-validated too (a typo'd
 // char wchar format would otherwise silently bake the wrong char width).
 TEST(GrammarSchema, CharPrefixUnknownFormatKeyReportsCode) {
-    std::string text = shippedCSubsetTextForPrefixTest();
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c-subset must load clean before mutation";
+        << "shipped c must load clean before mutation";
     // The WideCharStart row's `elementCoreByFormat` (the SECOND such snippet — the
     // first belongs to WideStringStart).
     std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
@@ -6496,15 +6496,15 @@ TEST(GrammarSchema, CharPrefixUnknownFormatKeyReportsCode) {
 }
 
 // The regression wall for the CLOSED `semantics` key vocabulary: every key
-// the shipped c-subset config actually uses must survive it. An over-narrow
+// the shipped c config actually uses must survive it. An over-narrow
 // allowed-key list would reject the real config — and the fix is always the
 // list, never the config.
-TEST(GrammarSchema, SemanticsClosedKeysAcceptShippedCSubset) {
-    std::string const text = shippedCSubsetTextForPrefixTest();
+TEST(GrammarSchema, SemanticsClosedKeysAcceptShippedC) {
+    std::string const text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     auto result = GrammarSchema::loadFromText(text);
     ASSERT_TRUE(result.has_value())
-        << "the shipped c-subset config must still load under the closed "
+        << "the shipped c config must still load under the closed "
            "'semantics' key vocabulary: "
         << (result.error().empty() ? "<no diagnostics>"
                                    : result.error()[0].message);
@@ -6514,18 +6514,18 @@ TEST(GrammarSchema, SemanticsClosedKeysAcceptShippedCSubset) {
 //
 // Two halves, and both are needed.
 //
-// (1) THE WALL. The shipped c-subset's three ABI-neutral name lists are 18 /
+// (1) THE WALL. The shipped c's three ABI-neutral name lists are 18 /
 //     12 / 2 entries with a pairwise overlap of only 6 — they answer different
 //     questions and must NOT be merged. A cross-check that mistook them for
 //     three copies of one set would reject the real config, and the fix would
 //     always be the check, never the config. This is the pin that keeps the
 //     rule honest about that.
-TEST(GrammarSchema, AttributeVocabularyCrossCheckAcceptsShippedCSubset) {
-    std::string const text = shippedCSubsetTextForPrefixTest();
+TEST(GrammarSchema, AttributeVocabularyCrossCheckAcceptsShippedC) {
+    std::string const text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     auto result = GrammarSchema::loadFromText(text);
     ASSERT_TRUE(result.has_value())
-        << "the shipped c-subset config must still load under the attribute-"
+        << "the shipped c config must still load under the attribute-"
            "vocabulary drift cross-check — the three lists are deliberately "
            "different and a check that demanded they agree would be wrong: "
         << errorDiags(result.error());
@@ -6536,11 +6536,11 @@ TEST(GrammarSchema, AttributeVocabularyCrossCheckAcceptsShippedCSubset) {
 //     `topLevelDecl`'s ignore list while its `warnOnUse` effects row stays —
 //     and the load must FAIL. Without this, a cross-check that silently
 //     no-ops on the shipped config would look identical to one that works.
-TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnDriftedShippedCSubset) {
-    std::string text = shippedCSubsetTextForPrefixTest();
+TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnDriftedShippedC) {
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c-subset must load clean before mutation";
+        << "shipped c must load clean before mutation";
     std::string const needle = R"("linkageSpecifierIgnoredNames": ["noreturn", "deprecated",)";
     auto const pos = text.find(needle);
     ASSERT_NE(pos, std::string::npos)
@@ -6562,11 +6562,11 @@ TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnDriftedShippedCSubset) {
 //     large one, and it used to be the one that escaped — the gate exempted any
 //     row whose list was empty, so emptying the list disarmed the check for that
 //     row. Same config, same drift, one keystroke further.
-TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnWholeKeyDeletedFromShippedCSubset) {
-    std::string text = shippedCSubsetTextForPrefixTest();
+TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnWholeKeyDeletedFromShippedC) {
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c-subset must load clean before mutation";
+        << "shipped c must load clean before mutation";
     // `topLevelDecl`'s list — the row that does NOT ignore `attrSpec`
     // wholesale, so its per-name opt-in is the only thing keeping a leading
     // `__attribute__((deprecated))` from failing H_UnknownLinkageSpecifier.
@@ -6597,7 +6597,7 @@ TEST(GrammarSchema, AttributeVocabularyCrossCheckFiresOnWholeKeyDeletedFromShipp
 //     names to the silence list" pushes config in the wrong direction, and it
 //     does so most convincingly when the guard is otherwise correct.
 TEST(GrammarSchema, AttributeVocabularyCrossCheckStaysQuietOnWholesaleIgnoringShippedRow) {
-    std::string text = shippedCSubsetTextForPrefixTest();
+    std::string text = shippedCTextForPrefixTest();
     ASSERT_FALSE(text.empty());
     std::string const needle =
         R"("linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr", "alignasSpec"] },

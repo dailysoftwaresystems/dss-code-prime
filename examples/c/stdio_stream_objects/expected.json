@@ -1,0 +1,52 @@
+{
+  "$comment": "D-LK-EXTERN-DATA-IMPORT: stdout/stderr/stdin ship from stdio.json as extern DATA objects (kind:object, FILE*, availableObjectFormats:[elf]) and bind GOT-INDIRECT on EVERY format now — the ELF exec walker reserves one GOT slot per stream, emits one R_X86_64_GLOB_DAT(6)/R_AARCH64_GLOB_DAT(1025) against it, ld.so writes the LIBRARY object's address into the slot at load, and the shared GotIndirect lowering (lea-of-slot + deref) reads it; the exec DEFINES NOTHING — its data-import dynsym rows stay UNDEF with st_size 0. ⓘ These three USED to bind by ELF COPY RELOCATION (an exec-local .bss copy slot + a DEFINED OBJECT dynsym + R_*_COPY, ld-linux memcpy'ing libc's FILE* values in before entry). That mechanism is DELETED, not merely unused: its convergence-on-one-storage is NAME-SCOPED, so it SPLIT any imported object that has ALIASES (D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET — glibc exports ONE environment object under environ/_environ/__environ, and an exec claiming one spelling left a third-party .so reading another an EMPTY object with NO diagnostic). ✔MEASURED, and it is exactly why THIS example never caught that bug: each of stdout/stderr/stdin is a SINGLE exported name (_IO_2_1_stdout_ is a DIFFERENT object, not an alias), so these three were never exposed — the whole exposure was one symbol. The object-identity property is witnessed by examples/c/environ_alias_object_identity, which loads a gcc-built .so to get the SECOND image such a property requires. The runner's capture MERGES the child's stderr into capturedStdout, so expectedStdout asserts BOTH streams' bytes in a DETERMINISTIC order (stdout explicitly fflush'd before the stderr write; C 7.21.3p7 keeps stderr un-fully-buffered) — proving both FILE* slots bind the real libc streams; the 1>/2> SEPARATION is asserted by the manual WSL validation (a merged capture cannot express it). Both fprintf return values (22 chars each) feed the exit code; the three slots must be non-null + pairwise-distinct. ★ c117 (D-LK-EXTERN-DATA-IMPORT, the got-indirect half): the MACHO ARM now runs — Darwin stdout/stderr/stdin ship as extern DATA objects (__stdoutp/__stderrp/__stdinp; macho macro rewrites the stdin/stdout/stderr tokens) bound via Mach-O __got NON-LAZY POINTERS (macho.format.json dataImportBinding:got-indirect) — the SAME model the elf arms declare now. The macho leg runs NATIVELY on the macos-latest (Apple-Silicon) CI leg + local ctest on a Mac — the same fprintf/stream-distinctness assertions prove the got-indirect address materialization (lea-of-__got-slot + deref) binds the REAL libSystem streams. PE still stays S0001 for the raw objects (its __imp_ data-thunk model is unbuilt; pe routes stdout through the __iob_func accessor macro instead). RED-ON-DISABLE witnessed: un-ship the objects -> S0001; drop dataImportBinding from the format -> K_FormatLacksImportSupport at link; neuter the got-indirect deref (bare lea) -> the load reads the __got slot ADDRESS as the FILE* -> crash/garbage. gcc/clang -std=c17 cross-checked (exit 42, identical stream bytes).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "streamobj:stdout-live\nstreamobj:stderr-live\n",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": [
+        "ConstFold",
+        "Mem2Reg",
+        "CopyProp",
+        "Cse",
+        "Licm",
+        "SimplifyCfg",
+        "Dce"
+      ],
+      "mustDifferFromBaseline": true
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

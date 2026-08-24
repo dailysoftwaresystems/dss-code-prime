@@ -9,7 +9,7 @@
 #include <cstdint>
 
 // Header-only type-relation rules over `TypeInterner const&`. SE1 ships
-// the minimum the toy/c-subset/tsql tests need: assignability, the
+// the minimum the toy/c/tsql tests need: assignability, the
 // numeric-widening lattice, and a simple `unify` that returns the
 // widening top of two arithmetic types or InvalidType when no
 // unification exists. SE2+ extend per need.
@@ -125,7 +125,7 @@ namespace detail::type_rules {
 //   their config (typeShapes / numeric-promotion table) rather than
 //   getting silent C-style implicit conversions.
 //   NOTE (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT ✅ + D-CSUBSET-INT-SAME-SIGN-NARROW ✅):
-//   c-subset's C-conformant integer implicit conversions are config opt-ins
+//   c's C-conformant integer implicit conversions are config opt-ins
 //   following the charConvertsToArith/enumConvertsToArith pattern, NOT silent
 //   relaxations baked into this strict default. Two gates together complete the
 //   C 6.3.1.3 integer-conversion matrix (both needed for SQLite's int/unsigned/
@@ -591,7 +591,7 @@ namespace detail::type_rules {
                 // NON-void side is a FUNCTION pointer (`Ptr<FnSig> -> void*`),
                 // the whole fn<->void* class routes through the SINGLE
                 // authoritative `allowVoidPtrFnConvert` gate — NOT the generic
-                // object-pointer `implicitToVoidPtr`. For c-subset all three
+                // object-pointer `implicitToVoidPtr`. For c all three
                 // flags are true (identical behavior); the split lets a
                 // language keep ISO-strict function-pointer typing while still
                 // admitting object `T* -> void*`. An object pointee still uses
@@ -662,7 +662,7 @@ namespace detail::type_rules {
     // at HIR, so NO post-coerce verifier surface.
     //
     // nullptr → BOOL (C23 §6.3.2.3.2 says nullptr converts to bool, yielding false)
-    // is DEFERRED (D-CSUBSET-NULLPTR-BOOL-CONVERSION): the c-subset has no scalar→bool
+    // is DEFERRED (D-CSUBSET-NULLPTR-BOOL-CONVERSION): the c has no scalar→bool
     // conversion at all (`bool b = 0;` is itself S_TypeMismatch), and admitting only
     // nullptr→bool would be inconsistent AND hit the unrealized Trunc→Bool codegen
     // form. `nullptr` in a CONTROLLING expression (`if(nullptr)`, `nullptr ? a : b`,

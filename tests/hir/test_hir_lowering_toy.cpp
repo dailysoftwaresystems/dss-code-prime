@@ -1,6 +1,6 @@
 // HR9 CST→HIR lowering tests for the enriched `toy` language. The point of
 // this file is genericity-by-demonstration: the SAME generic engine that
-// lowers c-subset (test_hir_lowering_toy's sibling) lowers toy with zero
+// lowers c (test_hir_lowering_toy's sibling) lowers toy with zero
 // toy-specific C++ — only `toy.lang.json`'s `hirLowering` block differs.
 // Toy is a smaller, assignment-free language (only `var` binds), so it
 // exercises the engine on a deliberately different grammar shape:

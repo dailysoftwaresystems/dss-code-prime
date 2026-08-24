@@ -2393,7 +2393,7 @@ TEST(ElfRelWriter, ExternDataImportNoLongerFailsLoudOnEtRel) {
 // .rodata section content/placement IS the deliverable, fully
 // decidable from the wire image; not a runtime claim). Runtime
 // behavior (`int g=42; return g;` → exit 42) is the corpus
-// `examples/c-subset/global_int`'s ELF arms on the Linux + native-
+// `examples/c/global_int`'s ELF arms on the Linux + native-
 // arm64 CI legs.
 namespace {
 
@@ -2448,7 +2448,7 @@ constexpr std::size_t kShdrSize = 64;
 // exec holds a GOT slot ld.so fills), so the slot gets a SYMBOL-BASED absolute
 // dynamic relocation and ld.so writes the real address at load. ✔MEASURED: the
 // first cut of the deletion baked `symbolVa[extern]` — the GOT SLOT — and
-// `examples/c-subset/extern_data_addr_static_init` went red at exit 1, a
+// `examples/c/extern_data_addr_static_init` went red at exit 1, a
 // pointer one indirection off with no diagnostic.
 //
 // A load-time write cannot reach a READ-ONLY page. The normal C shapes never
@@ -3061,7 +3061,7 @@ TEST(ElfExecWriter, ElfExecAnonymousRodataItemsDoNotCollide) {
 // the single-thread examples green while PT_TLS disappears, the
 // SHF_TLS headers vanish, and the patched disp32s become VAs instead
 // of the hand-derived tpoffs — turning every EXPECT below red. The
-// runnable 2-thread discriminator is examples/c-subset/
+// runnable 2-thread discriminator is examples/c/
 // thread_local_pthread (each worker must observe the TEMPLATE value).
 // ═════════════════════════════════════════════════════════════════
 

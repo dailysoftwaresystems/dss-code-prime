@@ -1,6 +1,6 @@
 // FC13 cycle 1 unit tests for the config-selected C preprocessor
 // (src/analysis/preprocess/preprocessor.{hpp,cpp}). These exercise the engine
-// DIRECTLY (build a SourceBuffer + the shipped c-subset schema, call
+// DIRECTLY (build a SourceBuffer + the shipped c schema, call
 // preprocess, inspect the resulting token stream) so each guard is pinned in
 // isolation. Every assertion is the STRONGEST provable property and is
 // RED-ON-DISABLE (reverting the backing impl line fails the test).
@@ -109,16 +109,16 @@ using namespace dss;
 // `GrammarSchema const` so mutation is ill-formed; no test asserts on pointer
 // identity, `use_count()`, or freshness; nothing here writes to
 // `src/dss-config/`, so the shipped config cannot change mid-process; and
-// `reboundCSubset()` — the one helper that DOES need a per-call variant — builds
+// `reboundC()` — the one helper that DOES need a per-call variant — builds
 // its own schema via `loadFromText` and never calls this function.
 //
 // The 34 `auto schema = cSubset();` call sites are unaffected: `auto` deduces
 // `shared_ptr` BY VALUE from a `const&`, i.e. a refcount bump.
 [[nodiscard]] std::shared_ptr<GrammarSchema const> const& cSubset() {
     static std::shared_ptr<GrammarSchema const> const schema = [] {
-        auto loaded = GrammarSchema::loadShipped("c-subset");
+        auto loaded = GrammarSchema::loadShipped("c");
         if (!loaded.has_value()) {
-            ADD_FAILURE() << "loadShipped(c-subset) failed";
+            ADD_FAILURE() << "loadShipped(c) failed";
             std::abort();
         }
         return *loaded;
@@ -181,7 +181,7 @@ static_assert(std::is_reference_v<decltype(cSubset())>,
     return std::nullopt;
 }
 
-// Read the shipped c-subset config TEXT so a test can REBIND a single config
+// Read the shipped c config TEXT so a test can REBIND a single config
 // field and reload, proving the engine reads that field from config rather than
 // hard-coding a lexeme. Returns "" if not found — the ~14 callers each already
 // assert non-empty, so that contract is UNCHANGED; what is new is that the
@@ -194,17 +194,17 @@ static_assert(std::is_reference_v<decltype(cSubset())>,
 // out of tree the cwd has no `src/dss-config` in its ancestry, so BOTH copies
 // missed and every rebind test in this file went red at once, for a reason none
 // of them named.
-[[nodiscard]] std::string loadShippedCSubsetText() {
+[[nodiscard]] std::string loadShippedCText() {
     auto const root = dss::test::findRepoRoot();
     if (!root) {
         ADD_FAILURE() << dss::test::repoRootDiagnostic();
         return {};
     }
     std::filesystem::path const cand =
-        *root / "src" / "dss-config" / "sources" / "c-subset.lang.json";
+        *root / "src" / "dss-config" / "sources" / "c.lang.json";
     std::ifstream in(cand, std::ios::binary);
     if (!in) {
-        ADD_FAILURE() << "cannot read the shipped c-subset config: "
+        ADD_FAILURE() << "cannot read the shipped c config: "
                       << cand.string();
         return {};
     }
@@ -972,10 +972,10 @@ TEST(Preprocessor, NonDirectiveInputIsIdentity) {
 
 // MULTI-LANGUAGE NO-OP at the config level: a language WITHOUT a preprocess
 // block (toy, tsql-subset) reports preprocess().enabled == false, so the
-// pipeline gate skips the pass; c-subset (which declares the block) reports
-// true. RED-ON-DISABLE: removing the c-subset block flips its expectation.
+// pipeline gate skips the pass; c (which declares the block) reports
+// true. RED-ON-DISABLE: removing the c block flips its expectation.
 TEST(Preprocessor, EnabledIsConfigDrivenPerLanguage) {
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(c.has_value());
     EXPECT_TRUE((*c)->preprocess().enabled);
 
@@ -990,7 +990,7 @@ TEST(Preprocessor, EnabledIsConfigDrivenPerLanguage) {
 
 // FIX 1 (RED-on-disable): the function-like-macro `(` opener is CONFIG-DRIVEN
 // (`preprocess.functionLikeOpenToken`), NOT a hard-coded "ParenOpen". We prove
-// it by loading the shipped c-subset config TEXT with `functionLikeOpenToken`
+// it by loading the shipped c config TEXT with `functionLikeOpenToken`
 // rebound to a DIFFERENT real token (`BlockOpen` = `{`). Now `#define F(x)`
 // must be treated as an OBJECT-like macro (the `(` is no longer the configured
 // function-like opener), so it must NOT emit P_PreprocessorUnsupported.
@@ -1000,27 +1000,27 @@ TEST(Preprocessor, EnabledIsConfigDrivenPerLanguage) {
 // opener is read from config, so a language whose paren token is named
 // differently is handled correctly.)
 TEST(Preprocessor, FunctionLikeOpenTokenIsConfigDrivenNotHardcoded) {
-    auto loadedText = GrammarSchema::loadShipped("c-subset");
+    auto loadedText = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loadedText.has_value());
-    // Read the shipped c-subset config text. This WAS a byte-for-byte copy of
-    // the cwd walk `loadShippedCSubsetText()` used to carry; the copy is gone,
+    // Read the shipped c config text. This WAS a byte-for-byte copy of
+    // the cwd walk `loadShippedCText()` used to carry; the copy is gone,
     // because a second implementation is a second place to forget when the
     // resolution rules change — which is precisely what an out-of-tree build
     // exposed (neither copy read $DSS_CONFIG_ROOT, so both missed together).
     namespace fs = std::filesystem;
-    std::string text = loadShippedCSubsetText();
-    ASSERT_FALSE(text.empty()) << "could not locate shipped c-subset config";
+    std::string text = loadShippedCText();
+    ASSERT_FALSE(text.empty()) << "could not locate shipped c config";
     // Rebind ONLY the function-like opener to `BlockOpen` (a real, declared
-    // c-subset token). The token name must resolve (validated at load), so this
+    // c token). The token name must resolve (validated at load), so this
     // is a well-formed schema -- just one where `(` is no longer the opener.
     const std::string from = "\"functionLikeOpenToken\": \"ParenOpen\"";
     const std::string to   = "\"functionLikeOpenToken\": \"BlockOpen\"";
     auto const pos = text.find(from);
     ASSERT_NE(pos, std::string::npos)
-        << "shipped c-subset config no longer carries functionLikeOpenToken=ParenOpen";
+        << "shipped c config no longer carries functionLikeOpenToken=ParenOpen";
     text.replace(pos, from.size(), to);
 
-    auto loaded = GrammarSchema::loadFromText(text, "<rebound-paren-c-subset>");
+    auto loaded = GrammarSchema::loadFromText(text, "<rebound-paren-c>");
     ASSERT_TRUE(loaded.has_value())
         << "rebound schema should still load: "
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
@@ -1052,20 +1052,20 @@ TEST(Preprocessor, FunctionLikeOpenTokenIsConfigDrivenNotHardcoded) {
 // (Agnosticism: a second preprocess-opting language whose variadic marker is
 // spelled differently is parsed by config kind, not the C `...` text.)
 TEST(Preprocessor, VariadicMarkerIsConfigDrivenNotHardcoded) {
-    std::string text = loadShippedCSubsetText();
-    ASSERT_FALSE(text.empty()) << "could not locate shipped c-subset config";
-    // Rebind ONLY the variadic marker to `TildeOp` (a real, declared c-subset
+    std::string text = loadShippedCText();
+    ASSERT_FALSE(text.empty()) << "could not locate shipped c config";
+    // Rebind ONLY the variadic marker to `TildeOp` (a real, declared c
     // token that is NOT `...`). Still a well-formed schema -- just one where the
     // ellipsis is no longer the variadic marker.
     const std::string from = "\"variadicMarkerToken\": \"EllipsisOp\"";
     const std::string to   = "\"variadicMarkerToken\": \"TildeOp\"";
     auto const pos = text.find(from);
     ASSERT_NE(pos, std::string::npos)
-        << "shipped c-subset config no longer carries variadicMarkerToken=EllipsisOp";
+        << "shipped c config no longer carries variadicMarkerToken=EllipsisOp";
     text.replace(pos, from.size(), to);
 
     auto loaded =
-        GrammarSchema::loadFromText(text, "<rebound-variadic-c-subset>");
+        GrammarSchema::loadFromText(text, "<rebound-variadic-c>");
     ASSERT_TRUE(loaded.has_value())
         << "rebound schema should still load: "
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
@@ -1099,19 +1099,19 @@ TEST(Preprocessor, VariadicMarkerIsConfigDrivenNotHardcoded) {
 // other two. Each sub-case rebinds ONE token to a different real punctuation
 // token and asserts the macro machinery changes behavior accordingly.
 //
-// Helper: load the shipped c-subset text with ONE `from`->`to` field rebind.
+// Helper: load the shipped c text with ONE `from`->`to` field rebind.
 namespace {
 [[nodiscard]] std::shared_ptr<GrammarSchema const>
-reboundCSubset(std::string const& from, std::string const& to,
+reboundC(std::string const& from, std::string const& to,
                std::string const& label) {
-    std::string text = loadShippedCSubsetText();
+    std::string text = loadShippedCText();
     if (text.empty()) {
-        ADD_FAILURE() << "could not locate shipped c-subset config";
+        ADD_FAILURE() << "could not locate shipped c config";
         return nullptr;
     }
     auto const pos = text.find(from);
     if (pos == std::string::npos) {
-        ADD_FAILURE() << "shipped c-subset config no longer carries: " << from;
+        ADD_FAILURE() << "shipped c config no longer carries: " << from;
         return nullptr;
     }
     text.replace(pos, from.size(), to);
@@ -1136,16 +1136,16 @@ reboundCSubset(std::string const& from, std::string const& to,
 // Each sub-case rebinds the shipped config and asserts the load REJECTS.
 namespace {
 [[nodiscard]] std::vector<ConfigDiagnostic>
-loadCSubsetExpectingFailure(std::string const& from, std::string const& to,
+loadCExpectingFailure(std::string const& from, std::string const& to,
                             std::string const& label) {
-    std::string text = loadShippedCSubsetText();
+    std::string text = loadShippedCText();
     if (text.empty()) {
-        ADD_FAILURE() << "could not locate shipped c-subset config";
+        ADD_FAILURE() << "could not locate shipped c config";
         return {};
     }
     auto const pos = text.find(from);
     if (pos == std::string::npos) {
-        ADD_FAILURE() << "shipped c-subset config no longer carries: " << from;
+        ADD_FAILURE() << "shipped c config no longer carries: " << from;
         return {};
     }
     text.replace(pos, from.size(), to);
@@ -1170,7 +1170,7 @@ TEST(Preprocessor, TfC82PragmaEffectsLoaderRejectsUnknownVerb) {
     // on a vocabulary change is the test working as designed.
     constexpr std::string_view kVerbs[] = {"diagnosticsOnly", "annotationOnly",
                                            "structPacking", "unsupported"};
-    auto const ds = loadCSubsetExpectingFailure(
+    auto const ds = loadCExpectingFailure(
         "\"effect\": \"structPacking\" }", "\"effect\": \"strcutPacking\" }",
         "<bad-pragma-verb>");
     EXPECT_TRUE(hasCode(ds, DiagnosticCode::C_InvalidPreprocess))
@@ -1197,7 +1197,7 @@ TEST(Preprocessor, TfC82PragmaEffectsLoaderRejectsDuplicateAndEmptyPrefix) {
         // DUPLICATE: two rows claiming `pack`. Which wins would be decided by
         // consumer iteration order, and here that is `structPacking` (a real
         // layout) versus `unsupported` (a refusal) — never a cosmetic ambiguity.
-        auto const ds = loadCSubsetExpectingFailure(
+        auto const ds = loadCExpectingFailure(
             "\"prefix\": [\"once\"],                  \"effect\": \"includeOnce\" },",
             "\"prefix\": [\"pack\"],                  \"effect\": \"unsupported\" },",
             "<dup-pragma-prefix>");
@@ -1207,7 +1207,7 @@ TEST(Preprocessor, TfC82PragmaEffectsLoaderRejectsDuplicateAndEmptyPrefix) {
     {
         // EMPTY: `[]` is a prefix of EVERY pragma, so one such row silently
         // turns the whole registry into a catch-all and disarms the loudness.
-        auto const ds = loadCSubsetExpectingFailure(
+        auto const ds = loadCExpectingFailure(
             "\"prefix\": [\"once\"],                  \"effect\": \"includeOnce\" },",
             "\"prefix\": [],                        \"effect\": \"unsupported\" },",
             "<empty-pragma-prefix>");
@@ -1220,7 +1220,7 @@ TEST(Preprocessor, TfC82PragmaEffectsLoaderRequiresASurface) {
     // A registry with no `pragmaDirective` AND no `pragmaOperator` is an
     // incomplete contract: every row would read as configured and never fire —
     // the knob-that-lies this loader rejects everywhere else.
-    std::string text = loadShippedCSubsetText();
+    std::string text = loadShippedCText();
     ASSERT_FALSE(text.empty());
     for (char const* key : {"\"pragmaDirective\":          \"pragma\",",
                             "\"pragmaOperator\":           \"_Pragma\","}) {
@@ -1248,10 +1248,10 @@ TEST(Preprocessor, FunctionLikeCloseAndSeparatorAreConfigDrivenNotHardcoded) {
     // RED-ON-DISABLE: hard-coding the close as `find("ParenClose")` ignores the
     // rebind, the define parses, NO diagnostic fires, and this EXPECT fails.
     {
-        auto schema = reboundCSubset(
+        auto schema = reboundC(
             "\"functionLikeCloseToken\": \"ParenClose\"",
             "\"functionLikeCloseToken\": \"BracketClose\"",
-            "<rebound-close-c-subset>");
+            "<rebound-close-c>");
         ASSERT_NE(schema, nullptr);
         ASSERT_EQ(schema->preprocess().functionLikeCloseToken, "BracketClose");
         auto buf = SourceBuffer::fromString(
@@ -1277,10 +1277,10 @@ TEST(Preprocessor, FunctionLikeCloseAndSeparatorAreConfigDrivenNotHardcoded) {
     // separator as `find("Comma")` ignores the rebind, the `,` still splits
     // into two args, the arity error fires, and this EXPECT_FALSE fails.
     {
-        auto schema = reboundCSubset(
+        auto schema = reboundC(
             "\"functionLikeArgSeparatorToken\": \"Comma\"",
             "\"functionLikeArgSeparatorToken\": \"Colon\"",
-            "<rebound-separator-c-subset>");
+            "<rebound-separator-c>");
         ASSERT_NE(schema, nullptr);
         ASSERT_EQ(schema->preprocess().functionLikeArgSeparatorToken, "Colon");
         auto buf = SourceBuffer::fromString(
@@ -1305,9 +1305,9 @@ TEST(Preprocessor, FunctionLikeCloseAndSeparatorAreConfigDrivenNotHardcoded) {
 // be treated as the catch-all.
 TEST(Preprocessor, VaArgsNameIsConfigDrivenNotHardcoded) {
     auto schema =
-        reboundCSubset("\"variadicArgsName\": \"__VA_ARGS__\"",
+        reboundC("\"variadicArgsName\": \"__VA_ARGS__\"",
                        "\"variadicArgsName\": \"__REST__\"",
-                       "<rebound-vaargs-c-subset>");
+                       "<rebound-vaargs-c>");
     ASSERT_NE(schema, nullptr);
     ASSERT_EQ(schema->preprocess().variadicArgsName, "__REST__");
 
@@ -1426,7 +1426,7 @@ TEST(Preprocessor, HeaderOriginDiagnosticAttributesToHeader) {
     auto dir = ppScratchRoot() / "dss_pp_linemap_test";
     fs::create_directories(dir);
     // The header contains a malformed construct (a stray `@` is an illegal
-    // char in c-subset) so the parser/lexer emits a diagnostic whose span
+    // char in c) so the parser/lexer emits a diagnostic whose span
     // lands inside the header's inlined text.
     {
         std::ofstream(dir / "bad.h", std::ios::binary)
@@ -1463,7 +1463,7 @@ TEST(Preprocessor, HeaderOriginDiagnosticAttributesToHeader) {
     fs::remove_all(dir, ec);
 }
 
-// FIX 4 (RED-on-disable): the headline cycle-1 lexer change (c-subset
+// FIX 4 (RED-on-disable): the headline cycle-1 lexer change (c
 // `directive` mode no longer overrides `<` -> HeaderStart) is what lets a
 // `<<` shift operator survive inside a NON-include directive like `#define`.
 // Preprocess `#define SHIFT (1 << 2)` + a use, and assert the EXPANSION lexes
@@ -1498,7 +1498,7 @@ TEST(Preprocessor, ShiftOperatorInDefineIsNotMisLexedAsHeader) {
     const SchemaTokenId headerPath =
         schema->schemaTokens().find("HeaderPath");
     ASSERT_TRUE(headerStart.valid() && headerPath.valid())
-        << "c-subset must declare HeaderStart/HeaderPath for this pin to mean "
+        << "c must declare HeaderStart/HeaderPath for this pin to mean "
            "anything";
     for (Token const& t : r.tokens) {
         EXPECT_NE(t.schemaKind, headerStart)
@@ -1949,9 +1949,9 @@ TEST(Preprocessor, ConditionalDirectiveWordIsConfigDrivenNotHardcoded) {
     namespace fs = std::filesystem;
     std::vector<fs::path> noDirs;
 
-    auto schema = reboundCSubset("\"ifDirective\":         \"if\"",
+    auto schema = reboundC("\"ifDirective\":         \"if\"",
                                  "\"ifDirective\":         \"whenever\"",
-                                 "<rebound-if-c-subset>");
+                                 "<rebound-if-c>");
     ASSERT_NE(schema, nullptr);
     ASSERT_EQ(schema->preprocess().ifDirective, "whenever");
 
@@ -2208,9 +2208,9 @@ TEST(Preprocessor, FC15aStringizePasteAreOptOutPerLanguage) {
     EXPECT_TRUE((*tsql)->preprocess().pasteToken.empty());
 }
 
-// CONFIG-READ: c-subset declares the `#`/`##` operator kinds from config.
+// CONFIG-READ: c declares the `#`/`##` operator kinds from config.
 TEST(Preprocessor, FC15aStringizePasteTokensAreConfigRead) {
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(c.has_value());
     EXPECT_EQ((*c)->preprocess().stringizeToken, "HashOp");
     EXPECT_EQ((*c)->preprocess().pasteToken, "HashHashOp");
@@ -2678,9 +2678,9 @@ TEST(Preprocessor, FC15bPredefinedNameIsConfigDrivenNotHardcoded) {
     std::vector<fs::path> noDirs;
     // Rebind ONLY the name token of the `line` entry (a minimal, unambiguous
     // substring -- `"name": "__LINE__"` appears exactly once in the config).
-    auto schema = reboundCSubset("\"name\": \"__LINE__\"",
+    auto schema = reboundC("\"name\": \"__LINE__\"",
                                  "\"name\": \"__CURLINE__\"",
-                                 "<rebound-line-c-subset>");
+                                 "<rebound-line-c>");
     ASSERT_NE(schema, nullptr);
 
     // (1) The REBOUND name resolves to its invocation line.
@@ -2723,7 +2723,7 @@ TEST(Preprocessor, FC15bPredefinedNameIsConfigDrivenNotHardcoded) {
 
 // AGNOSTICISM (opt-OUT): a language with NO preprocess block declares NO
 // predefined macros, so `__LINE__` &c. stay ordinary identifiers (zero behavior
-// change for toy / tsql-subset). c-subset, by contrast, declares the 7 UNGATED
+// change for toy / tsql-subset). c, by contrast, declares the 7 UNGATED
 // C 6.10.8 macros PLUS (c95) the pe-gated Windows-selection macros — `_WIN32` /
 // `_WIN64` (value 1) and the ABI qualifiers `__stdcall` / `__cdecl` /
 // `__fastcall` / `WINAPI` (empty value → erased). The per-format filter lives in
@@ -2740,7 +2740,7 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     ASSERT_TRUE(tsql.has_value());
     EXPECT_TRUE((*tsql)->preprocess().predefinedMacros.empty());
 
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(c.has_value());
     auto const& pms = (*c)->preprocess().predefinedMacros;
     // 11 ungated (the 7 C 6.10.8 core + the `_BitInt` C1 `__BITINT_MAXWIDTH__` line,
@@ -2798,7 +2798,7 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // gave pe the <unistd.h>/<dirent.h> surface those three promise;
     // D-LANG-PE64-HAS-NO-POSIX-DIRECTORY-API).
     EXPECT_EQ(pms.size(), 35u)
-        << "c-subset declares 19 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
+        << "c declares 19 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -2868,7 +2868,7 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
 // the load FAILS (C_InvalidPreprocess via objectFormatKindFromName). RED-ON-
 // DISABLE: without the loader validation this parses and the macro is dead.
 TEST(Preprocessor, FC15bPredefinedMacroBadObjectFormatIsLoadError) {
-    std::string text = loadShippedCSubsetText();
+    std::string text = loadShippedCText();
     ASSERT_FALSE(text.empty());
     // ANCHORED ON THE ROW, MUTATING ONLY THE FIELD UNDER TEST. The first cut
     // matched the WHOLE `_WIN32` entry verbatim, which made this pin fail every
@@ -2891,7 +2891,7 @@ TEST(Preprocessor, FC15bPredefinedMacroBadObjectFormatIsLoadError) {
         << "_WIN32 must still carry availableObjectFormats [\"pe\"] -- if it does "
            "not, this test is mutating some LATER row and proves nothing about _WIN32";
     text.replace(pos, from.size(), to);
-    auto loaded = GrammarSchema::loadFromText(text, "<bad-objfmt-c-subset>");
+    auto loaded = GrammarSchema::loadFromText(text, "<bad-objfmt-c>");
     EXPECT_FALSE(loaded.has_value())
         << "an unknown availableObjectFormats name ('pee') must be a load error";
 }
@@ -2913,7 +2913,7 @@ TEST(Preprocessor, FC15bPredefinedMacroBadObjectFormatIsLoadError) {
 // presence-only test while yielding GCC_VERSION 4000000 instead of the truthful
 // 4002001 that sqliteInt.h computes.
 TEST(Preprocessor, TFC83IdentityPredefineValuesMatchClang) {
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(c.has_value());
     std::map<std::string, std::string> got;
     for (auto const& pm : (*c)->preprocess().predefinedMacros) {
@@ -3046,7 +3046,7 @@ TEST(Preprocessor, TFC83VersionKindLoadFailures) {
          "\"componentWeights\": [1000000, 1000, 1]"},
     };
     for (auto const& c : cases) {
-        std::string text = loadShippedCSubsetText();
+        std::string text = loadShippedCText();
         ASSERT_FALSE(text.empty());
         auto const pos = text.find(good);
         ASSERT_NE(pos, std::string::npos)
@@ -3057,9 +3057,9 @@ TEST(Preprocessor, TFC83VersionKindLoadFailures) {
     }
     // Control: the UNMODIFIED text still loads, so the cases above fail for the
     // reason claimed and not because the fixture text is stale.
-    auto ok = GrammarSchema::loadFromText(loadShippedCSubsetText(),
+    auto ok = GrammarSchema::loadFromText(loadShippedCText(),
                                           "<tfc83-version-control>");
-    EXPECT_TRUE(ok.has_value()) << "the shipped c-subset text must still load";
+    EXPECT_TRUE(ok.has_value()) << "the shipped c text must still load";
 }
 
 // AGNOSTICISM: not one of these macro spellings may appear in engine C++. The
@@ -3210,9 +3210,9 @@ TEST(Preprocessor, TfC82RegisteredInertPragmaIsSilentUnknownIsLoud) {
 // baked into the engine. Without this pin, "loud" and "hard-coded" would be
 // indistinguishable from the outside.
 TEST(Preprocessor, TfC82UnknownPragmaIsErrorFalseRestoresSilence) {
-    auto schema = reboundCSubset("\"unknownPragmaIsError\":     true,",
+    auto schema = reboundC("\"unknownPragmaIsError\":     true,",
                                  "\"unknownPragmaIsError\":     false,",
-                                 "<silent-pragma-c-subset>");
+                                 "<silent-pragma-c>");
     ASSERT_NE(schema, nullptr);
     ASSERT_FALSE(schema->preprocess().unknownPragmaIsError)
         << "the rebound schema must declare the silent posture";
@@ -3351,9 +3351,9 @@ TEST(Preprocessor, TfC82PragmaOperatorDestringizesPerC6109) {
 // The rebind proves the engine reads the CONFIG word rather than knowing the
 // spelling `_Pragma`.
 TEST(Preprocessor, TfC82PragmaOperatorIsConfigDrivenOrdinaryIdentifierWhenAbsent) {
-    auto schema = reboundCSubset("\"pragmaOperator\":           \"_Pragma\",",
+    auto schema = reboundC("\"pragmaOperator\":           \"_Pragma\",",
                                  "",
-                                 "<no-pragma-operator-c-subset>");
+                                 "<no-pragma-operator-c>");
     ASSERT_NE(schema, nullptr);
     ASSERT_TRUE(schema->preprocess().pragmaOperator.empty())
         << "the rebound schema must declare no pragma operator";
@@ -3408,9 +3408,9 @@ TEST(Preprocessor, TfC82PragmaPackFormsBuiltAndRefused) {
 // the red-on-disable for that pair, and the proof the engine never compares a
 // token to a literal `"push"`.
 TEST(Preprocessor, TfC82PragmaPackPushWordIsConfigDriven) {
-    auto schema = reboundCSubset("\"pragmaPackPushWord\":       \"push\",",
+    auto schema = reboundC("\"pragmaPackPushWord\":       \"push\",",
                                  "",
-                                 "<no-pack-push-c-subset>");
+                                 "<no-pack-push-c>");
     ASSERT_NE(schema, nullptr);
     ASSERT_TRUE(schema->preprocess().pragmaPackPushWord.empty());
     std::vector<std::filesystem::path> noDirs;
@@ -3488,9 +3488,9 @@ TEST(Preprocessor, TfC85WarningPragmaIsInertInEveryReachedShape) {
 // ★ RED-ON-DISABLE for the `["warning"]` row: rename the PREFIX (the structural
 // key, never the prose) and the same pragmas go loud again.
 TEST(Preprocessor, TfC85WarningRowIsWhatMakesTheWarningPragmaSilent) {
-    auto schema = reboundCSubset("\"prefix\": [\"warning\"]",
+    auto schema = reboundC("\"prefix\": [\"warning\"]",
                                  "\"prefix\": [\"warningXX\"]",
-                                 "<no-warning-row-c-subset>");
+                                 "<no-warning-row-c>");
     ASSERT_NE(schema, nullptr);
     std::vector<std::filesystem::path> noDirs;
     auto buf = SourceBuffer::fromString(
@@ -3530,9 +3530,9 @@ TEST(Preprocessor, TfC85IntrinsicPragmaIsInertForAnyNameList) {
 }
 
 TEST(Preprocessor, TfC85IntrinsicRowIsWhatMakesTheIntrinsicPragmaSilent) {
-    auto schema = reboundCSubset("\"prefix\": [\"intrinsic\"]",
+    auto schema = reboundC("\"prefix\": [\"intrinsic\"]",
                                  "\"prefix\": [\"intrinsicXX\"]",
-                                 "<no-intrinsic-row-c-subset>");
+                                 "<no-intrinsic-row-c>");
     ASSERT_NE(schema, nullptr);
     std::vector<std::filesystem::path> noDirs;
     auto buf = SourceBuffer::fromString(
@@ -3613,9 +3613,9 @@ TEST(Preprocessor, TfC85OptimizeUnbuiltFormsAreRefusedNotGuessed) {
 // ★ RED-ON-DISABLE for the `optimizerControl` sink AND for its config words.
 TEST(Preprocessor, TfC85OptimizeRowAndItsStateWordsAreConfigDriven) {
     {   // no row -> the pragma is unregistered -> loud
-        auto schema = reboundCSubset("\"prefix\": [\"optimize\"]",
+        auto schema = reboundC("\"prefix\": [\"optimize\"]",
                                      "\"prefix\": [\"optimizeXX\"]",
-                                     "<no-optimize-row-c-subset>");
+                                     "<no-optimize-row-c>");
         ASSERT_NE(schema, nullptr);
         std::vector<std::filesystem::path> noDirs;
         auto buf = SourceBuffer::fromString(
@@ -3626,9 +3626,9 @@ TEST(Preprocessor, TfC85OptimizeRowAndItsStateWordsAreConfigDriven) {
             << "and nothing is stamped — the sink is inert without its row";
     }
     {   // row present, but the OFF word undeclared -> the form is unbuilt -> loud
-        auto schema = reboundCSubset("\"pragmaOptimizeOffWord\":    \"off\",",
+        auto schema = reboundC("\"pragmaOptimizeOffWord\":    \"off\",",
                                      "",
-                                     "<no-optimize-off-word-c-subset>");
+                                     "<no-optimize-off-word-c>");
         ASSERT_NE(schema, nullptr);
         ASSERT_TRUE(schema->preprocess().pragmaOptimizeOffWord.empty());
         std::vector<std::filesystem::path> noDirs;
@@ -3667,7 +3667,7 @@ TEST(Preprocessor, TfC85OptimizeRowAndItsStateWordsAreConfigDriven) {
 TEST(Preprocessor, TfC85NoUnclaimedPragmaUnderAnyPredefineClass) {
     namespace fs = std::filesystem;
     fs::path const fixture =
-        test_support::findCorpusRoot() / "c-subset" / "pragma_profile_census.c";
+        test_support::findCorpusRoot() / "c" / "pragma_profile_census.c";
     ASSERT_TRUE(fs::exists(fixture))
         << "the profile-census fixture must exist: " << fixture.string();
     auto const text = test_support::readFile(fixture);
@@ -3714,7 +3714,7 @@ TEST(Preprocessor, TfC85NoUnclaimedPragmaUnderAnyPredefineClass) {
 // unchanged in strength: same two legs, same stamping witness.
 TEST(Preprocessor, TfC85ProfileCensusFixtureActuallyReachesTheProfileGatedRows) {
     auto const text = test_support::readFile(
-        test_support::findCorpusRoot() / "c-subset" / "pragma_profile_census.c");
+        test_support::findCorpusRoot() / "c" / "pragma_profile_census.c");
     ASSERT_FALSE(text.empty());
     {   // pe: `_WIN32` is defined, so the MSVC arm is LIVE and its
         // `#pragma optimize("", off)` region actually stamps a token.
@@ -3787,9 +3787,9 @@ TEST(Preprocessor, FC15cPragmaInDeadBranchIsSilent) {
 TEST(Preprocessor, FC15cPragmaIsConfigDrivenFailsLoudWhenStripped) {
     namespace fs = std::filesystem;
     // Remove the pragmaDirective line entirely (so the field defaults to empty).
-    auto schema = reboundCSubset("\"pragmaDirective\":          \"pragma\",",
+    auto schema = reboundC("\"pragmaDirective\":          \"pragma\",",
                                  "",
-                                 "<no-pragma-c-subset>");
+                                 "<no-pragma-c>");
     ASSERT_NE(schema, nullptr);
     ASSERT_TRUE(schema->preprocess().pragmaDirective.empty())
         << "the rebound schema must declare no pragma directive";
@@ -4187,7 +4187,7 @@ TEST(Preprocessor, FC15cHasIncludeIsConfigDrivenOptOut) {
     // Strip the operator declaration; the angle tokens go too (the loader
     // requires them only WHEN the operator is declared, so removing all three
     // keeps the schema self-consistent).
-    std::string text = loadShippedCSubsetText();
+    std::string text = loadShippedCText();
     ASSERT_FALSE(text.empty());
     for (std::string const& line :
          {std::string{"\"hasIncludeOperator\":       \"__has_include\",\n"},
@@ -4197,7 +4197,7 @@ TEST(Preprocessor, FC15cHasIncludeIsConfigDrivenOptOut) {
         ASSERT_NE(pos, std::string::npos) << "config no longer carries: " << line;
         text.erase(pos, line.size());
     }
-    auto loaded = GrammarSchema::loadFromText(text, "<no-has-include-c-subset>");
+    auto loaded = GrammarSchema::loadFromText(text, "<no-has-include-c>");
     ASSERT_TRUE(loaded.has_value())
         << "stripping the operator + its angle tokens must still load: "
         << (loaded.error().empty() ? "<none>" : loaded.error()[0].message);
@@ -4228,11 +4228,11 @@ TEST(Preprocessor, FC15cHasIncludeIsConfigDrivenOptOut) {
         << "a stripped __has_include folds to 0 -> the #else branch";
 }
 
-// CONFIG-READ pins: the shipped c-subset declares the operator names + the angle
+// CONFIG-READ pins: the shipped c declares the operator names + the angle
 // token KINDS; toy / tsql declare none. The angle delimiters being CONFIG token
 // names (not the `<`/`>` bytes) is the make-or-break agnosticism property.
 TEST(Preprocessor, FC15cOperatorNamesAndAngleTokensAreConfigDeclared) {
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(c.has_value());
     EXPECT_EQ((*c)->preprocess().pragmaDirective, "pragma");
     EXPECT_EQ((*c)->preprocess().hasIncludeOperator, "__has_include");
@@ -4262,9 +4262,9 @@ TEST(Preprocessor, FC15cOperatorNamesAndAngleTokensAreConfigDeclared) {
 TEST(Preprocessor, FC15cAngleDelimiterIsConfigKindNotByte) {
     namespace fs = std::filesystem;
     // Rebind the angle OPEN token to a real token that is NOT `<` (`TildeOp`=`~`).
-    auto schema = reboundCSubset("\"hasIncludeAngleOpenToken\":  \"LtOp\"",
+    auto schema = reboundC("\"hasIncludeAngleOpenToken\":  \"LtOp\"",
                                  "\"hasIncludeAngleOpenToken\":  \"TildeOp\"",
-                                 "<rebound-angle-open-c-subset>");
+                                 "<rebound-angle-open-c>");
     ASSERT_NE(schema, nullptr);
     ASSERT_EQ(schema->preprocess().hasIncludeAngleOpenToken, "TildeOp");
     // `__has_include(<stdio.h>)`: the `<` is no longer the configured angle
@@ -4285,13 +4285,13 @@ TEST(Preprocessor, FC15cAngleDelimiterIsConfigKindNotByte) {
 // -> C_InvalidPreprocess at load. We strip ONLY the angle-open token, leaving the
 // operator declared, and assert the load FAILS.
 TEST(Preprocessor, FC15cHasIncludeWithoutAngleTokensIsLoadError) {
-    std::string text = loadShippedCSubsetText();
+    std::string text = loadShippedCText();
     ASSERT_FALSE(text.empty());
     const std::string line = "\"hasIncludeAngleOpenToken\":  \"LtOp\",\n";
     auto const pos = text.find(line);
     ASSERT_NE(pos, std::string::npos);
     text.erase(pos, line.size());
-    auto loaded = GrammarSchema::loadFromText(text, "<bad-has-include-c-subset>");
+    auto loaded = GrammarSchema::loadFromText(text, "<bad-has-include-c>");
     EXPECT_FALSE(loaded.has_value())
         << "declaring hasIncludeOperator without both angle tokens must be a "
            "load error (C_InvalidPreprocess)";
@@ -4300,14 +4300,14 @@ TEST(Preprocessor, FC15cHasIncludeWithoutAngleTokensIsLoadError) {
 // LOADER: a malformed `knownCAttributes` entry (a non-positive version) ->
 // C_InvalidPreprocess at load.
 TEST(Preprocessor, FC15cKnownCAttributeBadVersionIsLoadError) {
-    std::string text = loadShippedCSubsetText();
+    std::string text = loadShippedCText();
     ASSERT_FALSE(text.empty());
     const std::string from = "{ \"name\": \"deprecated\",   \"version\": 202311 }";
     const std::string to   = "{ \"name\": \"deprecated\",   \"version\": 0 }";
     auto const pos = text.find(from);
     ASSERT_NE(pos, std::string::npos);
     text.replace(pos, from.size(), to);
-    auto loaded = GrammarSchema::loadFromText(text, "<bad-attr-c-subset>");
+    auto loaded = GrammarSchema::loadFromText(text, "<bad-attr-c>");
     EXPECT_FALSE(loaded.has_value())
         << "a knownCAttributes entry with version <= 0 must be a load error";
 }
@@ -4455,18 +4455,18 @@ TEST(Preprocessor, FC15PasteEmptyVaArgsIsPlacemarkerNotDangling) {
 }
 
 // (11) AGNOSTICISM pin: comma-elision is CONFIG-driven. Rebind the shipped
-// c-subset's `variadicCommaElision` to false and re-preprocess: the comma now
+// c's `variadicCommaElision` to false and re-preprocess: the comma now
 // SURVIVES (standard placemarker) -> `f ( 42 , )`. RED-ON-DISABLE: if the engine
 // hardcoded the elision (ignoring the flag), the comma would vanish even at false.
 TEST(Preprocessor, FC15GnuCommaElisionIsConfigDriven) {
-    std::string text = loadShippedCSubsetText();
+    std::string text = loadShippedCText();
     ASSERT_FALSE(text.empty());
     const std::string from = "\"variadicCommaElision\": true";
     const std::string to   = "\"variadicCommaElision\": false";
     auto const pos = text.find(from);
     ASSERT_NE(pos, std::string::npos) << "config no longer carries the flag";
     text.replace(pos, from.size(), to);
-    auto loaded = GrammarSchema::loadFromText(text, "<no-elision-c-subset>");
+    auto loaded = GrammarSchema::loadFromText(text, "<no-elision-c>");
     ASSERT_TRUE(loaded.has_value())
         << (loaded.error().empty() ? "<none>" : loaded.error()[0].message);
     ASSERT_FALSE((*loaded)->preprocess().variadicCommaElision);
@@ -4581,10 +4581,10 @@ TEST(Preprocessor, ActiveIllegalCharOnDefineLineStillErrors) {
 }
 
 // (4c) FIX-1 (the `#`-stringize variant): an illegal char in a STRINGIZED macro
-// argument still errors. c-subset declares `#` (HashOp), so `#define S(x) #x` +
+// argument still errors. c declares `#` (HashOp), so `#define S(x) #x` +
 // `S($)` consumes the `$` into a `#`-product string -- the original `$` token
 // does NOT survive, so again only the dead-region (byte-liveness) oracle catches
-// it. RED-ON-DISABLE: the survival oracle drops it. (If `#` were out of c-subset
+// it. RED-ON-DISABLE: the survival oracle drops it. (If `#` were out of c
 // scope this case would be covered generically by the same byte-liveness
 // predicate and could be skipped.)
 TEST(Preprocessor, ActiveIllegalCharInStringizedArgStillErrors) {
@@ -5127,7 +5127,7 @@ TEST(Preprocessor, CommandLineDefineValuePrefixNotEmittedIntoSynthText) {
 // the missing header errors. Before C21 the pre-scan folded __STDC_VERSION__ to 0
 // -> 0 >= 201112L is false -> dead -> the include was conservatively skipped (the
 // exact residual this anchor tracked). The value comes from the OBJECT-like
-// predefined subset of the prefix (c-subset __STDC_VERSION__ = 202311L).
+// predefined subset of the prefix (c __STDC_VERSION__ = 202311L).
 TEST(Preprocessor, PredefinedValueGuardMakesIncludeLive) {
     auto schema = cSubset();
     auto buf = SourceBuffer::fromString(
@@ -5162,7 +5162,7 @@ TEST(Preprocessor, PredefinedValueGuardFalseKeepsIncludeDead) {
 // EXACTLY as in the authoritative pass; value-seeding it would make the pre-scan
 // MORE-live -> a silent P0016 re-open. The prefix builder therefore SKIPS
 // `isFunctionLike` predefines (mirroring the MacroExpander ctor + the <built-in>
-// prologue). NOTE: the c-subset schema's function-like predefines are `_declspec` (B1) +
+// prologue). NOTE: the c schema's function-like predefines are `_declspec` (B1) +
 // `__declspec` (pe-only, value ""), a WEAK red-on-disable witness -- wrongly
 // value-seeding it yields an object-like EMPTY macro, so `#if __declspec` -> empty
 // operand -> uncertain -> conservative skip -> NO error, the SAME outcome as the
@@ -5454,7 +5454,7 @@ TEST(Preprocessor, AngleIncludeCyclicIncludesTerminate) {
 TEST(Preprocessor, DeadBranchIncludeSkipIsConfigDrivenNotHardcoded) {
     namespace fs = std::filesystem;
     std::vector<fs::path> noDirs;
-    auto schema = reboundCSubset("\"ifDirective\":         \"if\"",
+    auto schema = reboundC("\"ifDirective\":         \"if\"",
                                  "\"ifDirective\":         \"whenever\"",
                                  "<rebound-if-c17>");
     ASSERT_NE(schema, nullptr);
@@ -5622,7 +5622,7 @@ TEST(Preprocessor, UnevaluableGuardSkipsIncludeConservatively) {
 TEST(Preprocessor, DeadRegionCloseUsesConfigEndifWordNotHardcoded) {
     namespace fs = std::filesystem;
     std::vector<fs::path> noDirs;
-    auto schema = reboundCSubset("\"endifDirective\":      \"endif\"",
+    auto schema = reboundC("\"endifDirective\":      \"endif\"",
                                  "\"endifDirective\":      \"endwhile\"",
                                  "<rebound-endif-c17>");
     ASSERT_NE(schema, nullptr);
@@ -5898,7 +5898,7 @@ TEST(Preprocessor, FunctionLikePredefineErasesArgsOnPe) {
 // ALL legs — thrd_create/call_once/thrd_join land on elf (libc FFI), pe64 (kernel32 synth)
 // AND macho (libSystem pthread synth: pthread_create/pthread_once/pthread_join). So a
 // conforming impl must NOT define `__STDC_NO_THREADS__` on ANY target (C11 6.10.8.3 /
-// C23 6.10.9.3) — the macro is REMOVED from c-subset.lang.json entirely. RED-on-disable:
+// C23 6.10.9.3) — the macro is REMOVED from c.lang.json entirely. RED-on-disable:
 // re-add the macro (any gating) → the corresponding arm flips to the no_threads
 // (conformance-lie) branch.
 TEST(Preprocessor, ThreadsCompleteStdcNoThreadsRemovedAllLegs) {
@@ -5954,7 +5954,7 @@ TEST(Preprocessor, Int64PredefineExpandsToLongLongOnPe) {
 namespace {
 // Extract non-trivia lexemes from a PreprocessResult produced with a CUSTOM
 // (rebound/stripped) schema -- the config-driven tests below can't use
-// `ppLexemes` (which loads the shipped c-subset).
+// `ppLexemes` (which loads the shipped c).
 [[nodiscard]] std::vector<std::string> lexemesOf(PreprocessResult const& r) {
     std::vector<std::string> lexs;
     for (Token const& t : r.tokens) {
@@ -6141,7 +6141,7 @@ TEST(Preprocessor, ElifdefOperandIsNotMacroExpanded) {
 TEST(Preprocessor, ElifdefWordIsConfigDrivenNotHardcoded) {
     namespace fs = std::filesystem;
     std::vector<fs::path> noDirs;
-    auto schema = reboundCSubset("\"elifdefDirective\":    \"elifdef\",",
+    auto schema = reboundC("\"elifdefDirective\":    \"elifdef\",",
                                  "\"elifdefDirective\":    \"elifwhendef\",",
                                  "<rebound-elifdef>");
     ASSERT_NE(schema, nullptr);
@@ -6178,8 +6178,8 @@ TEST(Preprocessor, ElifdefWordIsConfigDrivenNotHardcoded) {
 // pragma opt-out pin (Finding 3: absent config is provably inert).
 TEST(Preprocessor, ElifdefIsConfigDrivenFailsLoudWhenStripped) {
     namespace fs = std::filesystem;
-    auto schema = reboundCSubset("\"elifdefDirective\":    \"elifdef\",", "",
-                                 "<no-elifdef-c-subset>");
+    auto schema = reboundC("\"elifdefDirective\":    \"elifdef\",", "",
+                                 "<no-elifdef-c>");
     ASSERT_NE(schema, nullptr);
     ASSERT_TRUE(schema->preprocess().elifdefDirective.empty())
         << "the rebound schema must declare no elifdef directive";
@@ -6591,7 +6591,7 @@ TEST(Preprocessor, FC179EmbedStdcMacrosAreProtectedPredefines) {
 // unknown directive (P0015) and `#embad "..."` drives the embed handler
 // (P_PreprocessorEmbed). RED-ON-DISABLE: a hard-coded "embed" ignores the rebind.
 TEST(Preprocessor, FC179EmbedDirectiveIsConfigDrivenNotHardcoded) {
-    auto schema = reboundCSubset("\"embed\"", "\"embad\"", "<rebound-embed>");
+    auto schema = reboundC("\"embed\"", "\"embad\"", "<rebound-embed>");
     ASSERT_TRUE(schema != nullptr);
     ASSERT_EQ(schema->preprocess().embedDirective, "embad");
     namespace fs = std::filesystem;
@@ -6779,8 +6779,8 @@ namespace {
     return nullptr;
 }
 
-// Rebind ONE `"<key>": "<word>"` string field of the shipped c-subset config to
-// `newWord` and reload. Unlike handing `reboundCSubset` a literal key-value
+// Rebind ONE `"<key>": "<word>"` string field of the shipped c config to
+// `newWord` and reload. Unlike handing `reboundC` a literal key-value
 // spelling, this LOCATES the value (key -> `:` -> the quoted value), so the
 // rebind survives any re-alignment of the config's columns. A missing key is an
 // ADD_FAILURE, never a silent no-op: a rebind whose `from` stopped matching
@@ -6789,15 +6789,15 @@ namespace {
 [[nodiscard]] std::shared_ptr<GrammarSchema const>
 reboundPreprocessWord(std::string const& key, std::string const& newWord,
                       std::string const& label) {
-    std::string const text = loadShippedCSubsetText();
+    std::string const text = loadShippedCText();
     if (text.empty()) {
-        ADD_FAILURE() << "could not locate shipped c-subset config";
+        ADD_FAILURE() << "could not locate shipped c config";
         return nullptr;
     }
     std::string const quotedKey = "\"" + key + "\"";
     auto const keyPos = text.find(quotedKey);
     if (keyPos == std::string::npos) {
-        ADD_FAILURE() << "shipped c-subset config declares no " << quotedKey;
+        ADD_FAILURE() << "shipped c config declares no " << quotedKey;
         return nullptr;
     }
     auto const colon = text.find(':', keyPos + quotedKey.size());
@@ -6811,7 +6811,7 @@ reboundPreprocessWord(std::string const& key, std::string const& newWord,
         ADD_FAILURE() << quotedKey << " is not a `\"key\": \"value\"` pair";
         return nullptr;
     }
-    return reboundCSubset(text.substr(keyPos, closeQ + 1 - keyPos),
+    return reboundC(text.substr(keyPos, closeQ + 1 - keyPos),
                           quotedKey + ": \"" + newWord + "\"", label);
 }
 
@@ -7763,7 +7763,7 @@ TEST(Preprocessor, TFC74TargetPredefineHonoursAvailableObjectFormats) {
 // `tests/link/test_object_format_schema.cpp` pin the other two, because "the
 // shared parser gained a rule" is a claim about all of its callers.
 //
-// ★ DRIVEN THROUGH THE REAL INPUT PATH — the SHIPPED c-subset document,
+// ★ DRIVEN THROUGH THE REAL INPUT PATH — the SHIPPED c document,
 // spliced, never a hand-typed minimal stub. That matters twice over. The
 // pristine arm is the INVERSE-FAILURE guard: a vocabulary enumerated from what
 // the code READS rather than from what the shipped documents CONTAIN is
@@ -7772,12 +7772,12 @@ TEST(Preprocessor, TFC74TargetPredefineHonoursAvailableObjectFormats) {
 // — seven times — so the `$`-prefix carve-out is witnessed on real data.
 namespace {
 
-// The shipped c-subset text with ONE extra entry spliced into the FRONT of its
+// The shipped c text with ONE extra entry spliced into the FRONT of its
 // `predefinedMacros` array. A whole extra entry (rather than a corrupted
 // existing one) keeps the splice independent of the file's hand-aligned
 // formatting, and keeps the probe's own name out of every other assertion.
 [[nodiscard]] std::string cSubsetWithExtraMacroKey(std::string_view extraKey) {
-    std::string       text  = loadShippedCSubsetText();
+    std::string       text  = loadShippedCText();
     const std::string anchor = "\"predefinedMacros\": [";
     const auto        pos    = text.find(anchor);
     if (pos == std::string::npos) return {};
@@ -7803,9 +7803,9 @@ namespace {
 } // namespace
 
 TEST(Preprocessor, PredefinedMacroEntryPristineShippedDocumentStillLoads) {
-    const std::string text = loadShippedCSubsetText();
-    ASSERT_FALSE(text.empty()) << "could not locate shipped c-subset config";
-    auto loaded = GrammarSchema::loadFromText(text, "<pristine-c-subset>");
+    const std::string text = loadShippedCText();
+    ASSERT_FALSE(text.empty()) << "could not locate shipped c config";
+    auto loaded = GrammarSchema::loadFromText(text, "<pristine-c>");
     ASSERT_TRUE(loaded.has_value())
         << "the closed entry vocabulary must admit every key the SHIPPED "
            "document declares — including the seven `$comment`s inside macro "
@@ -7817,9 +7817,9 @@ TEST(Preprocessor, PredefinedMacroEntryPristineShippedDocumentStillLoads) {
 // this load succeeds — which is the silent no-op the gate exists to stop.
 TEST(Preprocessor, PredefinedMacroEntryUnknownKeyRejectedAndNamed) {
     const std::string text = cSubsetWithExtraMacroKey("vaule");
-    ASSERT_FALSE(text.empty()) << "shipped c-subset config no longer carries a "
+    ASSERT_FALSE(text.empty()) << "shipped c config no longer carries a "
                                   "`predefinedMacros` array to splice";
-    auto loaded = GrammarSchema::loadFromText(text, "<typo-c-subset>");
+    auto loaded = GrammarSchema::loadFromText(text, "<typo-c>");
     ASSERT_FALSE(loaded.has_value())
         << "a misspelled entry key must be REFUSED — silently dropping it "
            "ships the macro with the very default the key was overriding";
@@ -7840,7 +7840,7 @@ TEST(Preprocessor, PredefinedMacroEntryUnknownKeyRejectedAndNamed) {
 TEST(Preprocessor, PredefinedMacroEntryDollarPrefixedKeyStillAccepted) {
     const std::string text = cSubsetWithExtraMacroKey("$valueComment");
     ASSERT_FALSE(text.empty());
-    auto loaded = GrammarSchema::loadFromText(text, "<documented-c-subset>");
+    auto loaded = GrammarSchema::loadFromText(text, "<documented-c>");
     ASSERT_TRUE(loaded.has_value())
         << "`$`-prefixed keys are the codebase-wide documentation convention "
            "and must survive the typo discriminator — and the carve-out must "
@@ -7854,7 +7854,7 @@ TEST(Preprocessor, PredefinedMacroEntryDollarPrefixedKeyStillAccepted) {
 // picking either quietly is a wrong-value miscompile with no diagnostic.
 TEST(Preprocessor, TFC74CollidingPredefineFailsLoudNamingBothPaths) {
     auto schema = cSubset();
-    // `__LINE__` is declared by the shipped c-subset language config.
+    // `__LINE__` is declared by the shipped c language config.
     std::vector<PredefinedMacroDef> tms{targetMacro("__LINE__", "1")};
     auto buf = SourceBuffer::fromString("int x = 1;\n", "main.c");
     std::vector<std::filesystem::path> noDirs;
@@ -7883,7 +7883,7 @@ TEST(Preprocessor, TFC74CollidingPredefineFailsLoudNamingBothPaths) {
 }
 
 // ★ The collision scan runs BEFORE the format filter. `_WIN32` is declared
-// pe-GATED by the shipped c-subset language config, so on an ELF target the
+// pe-GATED by the shipped c language config, so on an ELF target the
 // language entry is filtered OUT — yet an ungated TARGET `_WIN32` must STILL
 // collide. Otherwise a maintainer could ship the conflict and only ever see it
 // on the one leg where both entries survive the filter.
@@ -8140,11 +8140,11 @@ namespace {
 // is a statement about EVERY target DSS ships, present and future, not about
 // pe64. The pe64 instance is merely the one that was caught in the field.
 TEST(Preprocessor, PeIdentityNoShippedTargetFormatCoDefinesAnExclusiveGroup) {
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(c.has_value());
     auto const& groups = (*c)->preprocess().mutuallyExclusivePredefinedMacros;
     ASSERT_FALSE(groups.empty())
-        << "c-subset must declare at least one mutual-exclusion group — with "
+        << "c must declare at least one mutual-exclusion group — with "
            "none, every assertion below is vacuous and the pin is disarmed";
 
     auto const targets = shippedStems("targets", ".target.json");
@@ -8203,7 +8203,7 @@ TEST(Preprocessor, PeIdentityNoShippedTargetFormatCoDefinesAnExclusiveGroup) {
 // that exact spelling to the shipped text and requires the group to FIRE. Misspell
 // it in the group and that test goes red, because arm 1 demands a conflict.
 TEST(Preprocessor, PeIdentityEveryExclusionGroupIsAnchoredToADeclaredMacro) {
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(c.has_value());
     auto const& groups = (*c)->preprocess().mutuallyExclusivePredefinedMacros;
     ASSERT_FALSE(groups.empty());
@@ -8280,7 +8280,7 @@ TEST(Preprocessor, PeIdentityCoDefinitionIsRefusedAndNamesTheFormat) {
 }
 
 // ★★ RED-ON-DISABLE, at the CONFIG level and against the SHIPPED text. Re-add
-// the deleted `_MSC_VER` row to the real c-subset config: WITH the group the
+// the deleted `_MSC_VER` row to the real c config: WITH the group the
 // pe leg is refused, and with the group ALSO removed the impossible identity is
 // silently accepted again — which is exactly the state this cycle found.
 TEST(Preprocessor, PeIdentityRedOnDisableRemovingTheGroupReadmitsTheCoDefinition) {
@@ -8308,7 +8308,7 @@ TEST(Preprocessor, PeIdentityRedOnDisableRemovingTheGroupReadmitsTheCoDefinition
         + winRowOpen;
 
     {   // ARM 1 — group PRESENT: the co-definition is REFUSED on pe.
-        auto schema = reboundCSubset(winRowOpen, withMsc, "<msc-ver-readded>");
+        auto schema = reboundC(winRowOpen, withMsc, "<msc-ver-readded>");
         ASSERT_NE(schema, nullptr);
         auto const& groups = schema->preprocess().mutuallyExclusivePredefinedMacros;
         ASSERT_FALSE(groups.empty()) << "arm 1 must still carry the group";
@@ -8325,7 +8325,7 @@ TEST(Preprocessor, PeIdentityRedOnDisableRemovingTheGroupReadmitsTheCoDefinition
     {   // ARM 2 — group REMOVED: the SAME config is silently accepted. This is
         // the disable arm; if it ever starts failing, the check has grown a
         // second, un-configured source of truth and is no longer config-driven.
-        std::string text = loadShippedCSubsetText();
+        std::string text = loadShippedCText();
         ASSERT_FALSE(text.empty());
         auto const wpos = text.find(winRowOpen);
         ASSERT_NE(wpos, std::string::npos);
@@ -8368,7 +8368,7 @@ TEST(Preprocessor, PeIdentityRedOnDisableRemovingTheGroupReadmitsTheCoDefinition
 // cycle actually made and the thing a well-meaning "restore MSVC compatibility"
 // edit would undo.
 TEST(Preprocessor, PeIdentityShippedConfigIsGnuOnWindowsNotMsvc) {
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(c.has_value());
     for (ObjectFormatKind k : {ObjectFormatKind::Pe, ObjectFormatKind::Elf,
                                ObjectFormatKind::MachO}) {
@@ -8421,7 +8421,7 @@ TEST(Preprocessor, PeIdentityExclusionGroupShapeIsValidatedAtLoad) {
                           Case{"duplicate name",
                                "\"mutuallyExclusivePredefinedMacros\": ["
                                "{\"reason\":\"r\",\"macros\":[\"A\",\"A\"]}],\"$x\": ["}}) {
-        std::string text = loadShippedCSubsetText();
+        std::string text = loadShippedCText();
         ASSERT_FALSE(text.empty());
         auto const pos = text.find(good);
         ASSERT_NE(pos, std::string::npos);
@@ -8437,7 +8437,7 @@ TEST(Preprocessor, PeIdentityExclusionGroupShapeIsValidatedAtLoad) {
 // The EFFECTIVE arch-identity set a real macho/elf build sees. EXACT SETS, not
 // counts — the whole point of the cycle is which SPELLINGS reach the source.
 TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(c.has_value());
     auto arm = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(arm.has_value());
@@ -8539,7 +8539,7 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
 //       BEFORE the little-endian arm, so a stray row silently selects
 //       byte-swapping macros on a little-endian machine.
 TEST(Preprocessor, TFC115EndiannessPredefinesCrossLayerCoherence) {
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(c.has_value());
     for (char const* arch : {"arm64", "x86_64"}) {
         auto t = TargetSchema::loadShipped(arch);
@@ -8603,7 +8603,7 @@ TEST(Preprocessor, TFC115EndiannessPredefinesCrossLayerCoherence) {
 // both `#define` and `#undef` refusals, plus the config opt-out.
 // ════════════════════════════════════════════════════════════════════════════
 
-// The three spellings the shipped c-subset declares. Read from CONFIG, so a
+// The three spellings the shipped c declares. Read from CONFIG, so a
 // grammar that renames one is covered and this test cannot drift from the
 // engine's own notion of the set.
 namespace {
@@ -8631,7 +8631,7 @@ namespace {
 TEST(Preprocessor, TFC86ConditionalInclusionOperatorsAreDefinedEveryForm) {
     auto const ops = tfc86DeclaredOperators();
     ASSERT_EQ(ops.size(), 3u)
-        << "the shipped c-subset must declare all three operators; if one was "
+        << "the shipped c must declare all three operators; if one was "
            "removed this test is measuring less than it claims";
     for (std::string const& op : ops) {
         {   // FORM 1 — #ifdef NAME -> taken
@@ -8835,7 +8835,7 @@ TEST(Preprocessor, TFC86OperatorNameRefusalIsUnsuppressable) {
 // `isConditionalInclusionOperator` -> the stripped grammar still reports it
 // defined -> `no`.
 TEST(Preprocessor, TFC86OperatorDefinednessIsConfigDrivenNotHardcoded) {
-    std::string text = loadShippedCSubsetText();
+    std::string text = loadShippedCText();
     ASSERT_FALSE(text.empty());
     for (std::string const& line :
          {std::string{"\"hasIncludeOperator\":       \"__has_include\",\n"},
@@ -8845,7 +8845,7 @@ TEST(Preprocessor, TFC86OperatorDefinednessIsConfigDrivenNotHardcoded) {
         ASSERT_NE(pos, std::string::npos) << "config no longer carries: " << line;
         text.erase(pos, line.size());
     }
-    auto loaded = GrammarSchema::loadFromText(text, "<no-has-include-c-subset>");
+    auto loaded = GrammarSchema::loadFromText(text, "<no-has-include-c>");
     ASSERT_TRUE(loaded.has_value());
     std::shared_ptr<GrammarSchema const> schema = *loaded;
     ASSERT_TRUE(schema->preprocess().hasIncludeOperator.empty());
@@ -9437,17 +9437,17 @@ TEST(Preprocessor, Tf87ReentryPermittedThroughTheAngleSourceIncludeArm) {
 // rebound guard goes unrecognised and the back-edge is refused.
 TEST(Preprocessor, Tf87GuardDetectionReadsIfndefSpellingFromConfigNotHardcoded) {
     namespace fs = std::filesystem;
-    std::string cfgText = loadShippedCSubsetText();
-    ASSERT_FALSE(cfgText.empty()) << "could not locate the shipped c-subset JSON";
+    std::string cfgText = loadShippedCText();
+    ASSERT_FALSE(cfgText.empty()) << "could not locate the shipped c JSON";
     const std::string from = "\"ifndefDirective\":     \"ifndef\"";
     const std::string to   = "\"ifndefDirective\":     \"unlesseth\"";
     auto const at = cfgText.find(from);
     ASSERT_NE(at, std::string::npos)
-        << "shipped c-subset config no longer carries ifndefDirective=ifndef";
+        << "shipped c config no longer carries ifndefDirective=ifndef";
     cfgText.replace(at, from.size(), to);
 
     auto loaded =
-        GrammarSchema::loadFromText(cfgText, "<rebound-ifndef-c-subset>");
+        GrammarSchema::loadFromText(cfgText, "<rebound-ifndef-c>");
     ASSERT_TRUE(loaded.has_value())
         << "the rebound config must still load — otherwise this test proves "
            "nothing about the detector";
@@ -9639,7 +9639,7 @@ TEST(Preprocessor, TFC97CollisionCoversEveryPairOfTheThreeFamilies) {
                           noDefines, tgt, fmt);
     };
 
-    // (1) LANGUAGE × FORMAT. `__LINE__` is declared by the shipped c-subset
+    // (1) LANGUAGE × FORMAT. `__LINE__` is declared by the shipped c
     // language config.
     {
         std::vector<PredefinedMacroDef> fms{targetMacro("__LINE__", "1")};
@@ -9778,7 +9778,7 @@ TEST(Preprocessor, TFC97EmptyFormatSpanIsByteIdenticalToLegacy) {
 // The expectation is keyed on the loaded schema's `dataModel()`, never on a
 // format name — the same discipline the config author applied.
 TEST(Preprocessor, TFC97ShippedFormatsGiveACoherentDataModelWorld) {
-    auto c = GrammarSchema::loadShipped("c-subset");
+    auto c = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(c.has_value());
     auto arm = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(arm.has_value());
@@ -10656,16 +10656,16 @@ TEST(PreprocessorVaOpt, DefineOrUndefOfTheReservedNameFailsLoud) {
 // the joined output would not contain `w`), while `__VA_OPT__` would be treated
 // as a construct in a config that never declared one.
 TEST(PreprocessorVaOpt, VaOptNameIsConfigDrivenNotHardcoded) {
-    std::string text = loadShippedCSubsetText();
-    ASSERT_FALSE(text.empty()) << "could not locate shipped c-subset config";
+    std::string text = loadShippedCText();
+    ASSERT_FALSE(text.empty()) << "could not locate shipped c config";
     const std::string from = "\"vaOptName\": \"__VA_OPT__\"";
     const std::string to   = "\"vaOptName\": \"DSS_OPT\"";
     auto const pos = text.find(from);
     ASSERT_NE(pos, std::string::npos)
-        << "shipped c-subset config no longer carries vaOptName=__VA_OPT__";
+        << "shipped c config no longer carries vaOptName=__VA_OPT__";
     text.replace(pos, from.size(), to);
 
-    auto loaded = GrammarSchema::loadFromText(text, "<rebound-vaopt-c-subset>");
+    auto loaded = GrammarSchema::loadFromText(text, "<rebound-vaopt-c>");
     ASSERT_TRUE(loaded.has_value())
         << "rebound schema should still load: "
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);

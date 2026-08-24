@@ -40,7 +40,7 @@
 #include <vector>
 
 using namespace dss;
-using dss::test_support::lowerCSubsetToLir;
+using dss::test_support::lowerCToLir;
 
 namespace {
 
@@ -71,7 +71,7 @@ lowerThroughRewrite(std::string src, std::uint16_t ccIndex = 0,
     // FC12b: the MIR config + analyze() va_list strategy must come from the SAME CC
     // the regalloc uses (ccIndex) — otherwise a ccIndex=1 (ms_x64) regalloc would run
     // over MIR lowered for cc0 (SysV), mixing ABIs. Thread ccIndex into the fixture.
-    RewrittenBundle out{lowerCSubsetToLir(std::move(src), std::move(targetName),
+    RewrittenBundle out{lowerCToLir(std::move(src), std::move(targetName),
                                           ccIndex)};
     if (!out.lowered.lir.ok) return out;
     out.liveness = analyzeLiveness(out.lowered.lir.lir);
@@ -729,7 +729,7 @@ TEST(LirCallconv, Aarch64FrameBeyond16MiBPrologueMaterializesIntoX16) {
 // dependent spill frame) and exercises the chokepoint directly. The pin asserts
 // a scaled load appears in the materialized arm64 module — host-independent, so
 // it guards the selection on EVERY CI leg (the qemu RUN witness is the separate
-// examples/c-subset/large_spill_frame_arm64 corpus). RED-on-disable: revert the
+// examples/c/large_spill_frame_arm64 corpus). RED-on-disable: revert the
 // chokepoint swap (keep unscaled `load`) → the count drops to 0 here AND the
 // module fails to assemble (A_ImmediateOperandOutOfRange on the high-param load).
 TEST(LirCallconv, Aarch64HighStackParamUsesScaledImm12FrameLoad) {
@@ -1354,7 +1354,7 @@ TEST(LirCallconvAbi, SysVCcDeclaresVariadicVectorCountReg) {
     // pre-call `mov <countReg>, <fpCount>` and printf reads garbage
     // from AL on hardened glibcs. The end-to-end emission + runtime
     // behavior is pinned at the runnable-example tier
-    // (`examples/c-subset/hello_printf`); this test pins the
+    // (`examples/c/hello_printf`); this test pins the
     // SCHEMA tier so a CC-config regression surfaces as a target-
     // schema fail-loud here, not as a runtime garbage in printf.
     auto target = TargetSchema::loadShipped("x86_64");
@@ -3564,7 +3564,7 @@ TEST(LirCallconvVariadic, VaStartFunctionPrologueSpillsArgRegsIntoSaveArea) {
         "  va_end(ap);\n"
         "  return t;\n"
         "}\n");
-    ASSERT_TRUE(bundle.lowered.lir.ok) << "c-subset → LIR failed";
+    ASSERT_TRUE(bundle.lowered.lir.ok) << "c → LIR failed";
     ASSERT_TRUE(bundle.rewritten.ok) << "regalloc rewrite failed";
     DiagnosticReporter ccRep;
     auto result = materializeCallingConvention(bundle.rewritten.lir,
@@ -3778,7 +3778,7 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VariadicCalleeReservesAndSpillsSaveArea) {
 // scratch avoid-set so the picker chooses x9. RED-ON-DISABLE: revert that avoid-set
 // addition in emitVariadicPrologueSpill (lir_callconv.cpp) → the scratch becomes x8
 // and this test fails (it asserts the save-area `add` base is NOT x8 and NOT an arg
-// GPR). The witness corpus examples/c-subset/varargs_aapcs64_sret/ runs the same
+// GPR). The witness corpus examples/c/varargs_aapcs64_sret/ runs the same
 // composition end-to-end under qemu.
 TEST(LirCallconvVariadicFC12c, Aapcs64VariadicStructReturnPrologueScratchAvoidsX8) {
     // `Big` is 24B (>16B) → AAPCS64 returns it via the x8 sret pointer; `make` is also
@@ -4450,7 +4450,7 @@ TEST(LirCallconvAbi, SysVByValueStackAggRegisterExhaustionSplitWholeStructToOver
 // argGpr that is only an arg-move DEST is written AFTER the copy stores to memory, so the
 // copy's transient write to it is dead; blanket-rejecting the whole argGpr pool would
 // falsely fail-loud on the legitimate register-exhaustion carrier — see
-// examples/c-subset/varargs_struct_split — so the fix and this pin both track only the
+// examples/c/varargs_struct_split — so the fix and this pin both track only the
 // live SOURCE set.)
 //
 // RED-ON-DISABLE: revert the avoid-set extension in lir_callconv.cpp (the `liveArgSrc`

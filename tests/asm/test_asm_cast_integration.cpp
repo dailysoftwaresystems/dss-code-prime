@@ -1,7 +1,7 @@
 // FC2 Part A ⇄ Part B integration: the SOURCE-LEVEL C cast drives the
 // SSE lowering end-to-end.
 //
-// `int main() { return (int)(1.7 + 2.5); }` — c-subset SOURCE — through
+// `int main() { return (int)(1.7 + 2.5); }` — c SOURCE — through
 // the REAL pipeline: parse → semantic (the explicit cast is what makes
 // the F64→I32 conversion legal; the implicit form is rejected) → CST→HIR
 // (castExpr → HirKind::Cast, explicit flags) → HIR→MIR (mapCast F64→I32
@@ -73,7 +73,7 @@ void dumpDiagnostics(DiagnosticReporter const& rep) {
 
 TEST(CastIntegration, SourceLevelFloatToIntCastEncodesCvttsdsi) {
     // ── front half: source → semantic → HIR → MIR ──
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory("int main() { return (int)(1.7 + 2.5); }\n", "<cast-e2e>");
@@ -85,7 +85,7 @@ TEST(CastIntegration, SourceLevelFloatToIntCastEncodesCvttsdsi) {
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     ASSERT_FALSE(model.hasErrors())
         << "semantic must accept the EXPLICIT cast (the implicit form is "
-           "rejected — see SemanticAnalyzerCSubset."
+           "rejected — see SemanticAnalyzerC."
            "ExplicitFloatToIntCastAcceptedWhereImplicitRejected): "
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);

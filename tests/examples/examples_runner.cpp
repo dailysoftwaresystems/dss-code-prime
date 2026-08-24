@@ -3523,7 +3523,7 @@ TEST(ExamplesCorpusLint, OnlyDeclaredExamplesMayDivergeFromTheirBaseline) {
     // The COMPLETE set of examples licensed to have an optimized arm whose exit
     // code differs from its baseline, each with the clause that licenses it.
     std::vector<std::pair<std::string, std::string>> const kExpected{
-        {"c-subset/inline_c99_inline_definition_crosscu", "C99 6.7.4p7"},
+        {"c/inline_c99_inline_definition_crosscu", "C99 6.7.4p7"},
     };
 
     std::vector<std::pair<std::string, std::string>> found;

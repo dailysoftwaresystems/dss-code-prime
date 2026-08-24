@@ -91,7 +91,7 @@ struct MemOpcodeIds {
 // on HAND-BUILT test modules. A rule whose only subjects are synthesised by
 // the same author who wrote the rule cannot discover what the shipped path
 // emits — it can only re-state its author's belief. That is why the
-// accept-arm pin for this rule lowers real c-subset source through the real
+// accept-arm pin for this rule lowers real c source through the real
 // `lowerToLir` instead of assembling a module out of arenas.
 //
 // ⚠ THE TWO FORMS ARE ASSERTED DISJOINT, WHICH IS WHAT KEEPS THIS FROM
@@ -488,7 +488,7 @@ void checkStoreRegClassMatchesMirType(
                 TypeKind const valueKind = interner.kind(valueTy);
                 // ⚠ THE WIDE FLOATS ARE MEMORY-RESIDENT AND THEIR VALUE
                 // OPERAND IS A GPR **WORD**, BY DESIGN — not a violation.
-                // ✔MEASURED 2026-08-15 (`examples/c-subset/c_long_double`,
+                // ✔MEASURED 2026-08-15 (`examples/c/c_long_double`,
                 // `…_constfold`, the last 2 of the 265 this rule set reddened):
                 // `lowerF80Store` / `lowerF128Store`
                 // (D-CSUBSET-LONG-DOUBLE-X87-ARITH / -IEEE128-ARITH) lower a

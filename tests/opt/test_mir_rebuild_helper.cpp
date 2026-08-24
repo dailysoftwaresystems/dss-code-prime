@@ -395,7 +395,7 @@ TEST(MirRebuildHelper, RebuildFunctionPreservesNoInline) {
 // the chain is broken but not which hop broke it. For `alwaysInline` the
 // situation is STRICTLY WORSE and it was MEASURED, not assumed: dropping
 // `src_.funcAlwaysInline(oldFn)` below leaves the end-to-end pin
-// `MirLoweringCSubsetLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
+// `MirLoweringCLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
 // COMPLETELY GREEN. The end-to-end test is BLIND to this hop.
 //
 // Why the asymmetry: `noInline` must keep REFUSING on every iteration, so a
@@ -652,7 +652,7 @@ TEST(MirRebuildHelper, RebuildFunctionPreservesNoOptimize) {
 // `src_.funcNoSanitizeThread(oldFn)` argument at `mir_rebuild_helper.cpp`'s
 // `addFunction` (let the 8th parameter default to false) and the first EXPECT_TRUE
 // below fails, together with the post-optimize MIR-text assertions in
-// `MirLoweringCSubsetLinkage.NoSanitizeThreadSurvivesShippedReleasePipeline`.
+// `MirLoweringCLinkage.NoSanitizeThreadSurvivesShippedReleasePipeline`.
 // Nothing else in the suite moves.
 TEST(MirRebuildHelper, RebuildFunctionPreservesNoSanitizeThread) {
     TypeInterner interner{CompilationUnitId{1}};

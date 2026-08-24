@@ -143,7 +143,7 @@ TEST(BakedRootOnly, RealCorpusHelperResolvesAndReadsAFile) {
     const auto corpus = dss::test_support::findCorpusRoot();
     ASSERT_TRUE(fs::is_directory(corpus)) << corpus.string();
 
-    const auto sample = corpus / "c-subset" / "mini_calc.c";
+    const auto sample = corpus / "c" / "mini_calc.c";
     ASSERT_TRUE(fs::exists(sample))
         << "corpus resolved to " << corpus.string()
         << " but the sample file is missing — resolution returned a path that "
@@ -155,6 +155,6 @@ TEST(BakedRootOnly, RealCorpusHelperResolvesAndReadsAFile) {
 // to a directory that merely exists.
 TEST(BakedRootOnly, ConfigRootResolvesAShippedConfigFile) {
     const auto shipped =
-        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+        dss::test::configRoot() / "sources" / "c.lang.json";
     EXPECT_TRUE(fs::exists(shipped)) << shipped.string();
 }

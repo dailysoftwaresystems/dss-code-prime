@@ -948,7 +948,7 @@ TEST_F(HarnessLegs, TheDriversAreNotHostKeyed) {
 // Linux), and requiring the corpus to match those would be a different — and
 // much larger — change than this one.
 TEST_F(HarnessLegs, LauncherSpellingsAgreeWithTheExamplesCorpus) {
-    auto const examples = repoRoot() / "examples" / "c-subset";
+    auto const examples = repoRoot() / "examples" / "c";
     ASSERT_TRUE(fs::exists(examples)) << examples;
 
     // (targetArch, runOn-OS) -> emulator spelling, from the corpus.

@@ -6,14 +6,14 @@ answer to "what functions does `<stdio.h>` provide, and what are their
 signatures?" — the analogue of a C system header, but expressed once, in a
 form every source language can consume.
 
-When a c-subset program writes `#include <stdio.h>` with **no** inline
+When a c program writes `#include <stdio.h>` with **no** inline
 `extern`, the angle-include resolver maps the header stem to the matching
 `*.json` here (on the `semantics.shippedLibDirs` system search path), the
 semantic analyzer injects the descriptor's symbols into scope before name
 resolution, and the linker resolves them against the runtime image for the
 active compilation target's object format — exactly like real C. See
-`examples/c-subset/shipped_include_puts/` (stdio) and
-`examples/c-subset/shipped_include_abs/` (stdlib) for end-to-end proofs.
+`examples/c/shipped_include_puts/` (stdio) and
+`examples/c/shipped_include_abs/` (stdlib) for end-to-end proofs.
 
 **Model 3 (2026-06-09)** — descriptors are **platform-neutral**: ONE descriptor
 per header (`<stem>.json`, at the header's own path — no per-platform
@@ -311,7 +311,7 @@ each was load-bearing and each was wrong:
   `grep -rwq -e _snprintf $SDK/usr/lib/libSystem.B.tbd` reports **PRESENT**, as
   do `_vsnprintf _popen _pclose _fileno _sysctl _sysctlbyname _exit _fstat64`
   in the same pass. The row is `["elf","macho"]` and the darwin arm of
-  `examples/c-subset/shipped_snprintf_ucrt` is restored — in the SAME edit,
+  `examples/c/shipped_snprintf_ucrt` is restored — in the SAME edit,
   because either half alone is red. ⚠ **The closing instrument this file and
   the anchor both pinned — `nm -gU /usr/lib/libSystem.B.dylib | grep
   ' _snprintf$'` — is BROKEN. Do not re-run it.** ✔MEASURED on that same host:
@@ -345,7 +345,7 @@ still fails LOUD at the reference, never silently.
 
 ## Per-target library selection (Model 3)
 
-The active c-subset config (`src/dss-config/sources/c-subset.lang.json`) sets
+The active c config (`src/dss-config/sources/c.lang.json`) sets
 `"shippedLibDirs": ["shippedLibs"]` — the single neutral directory. There is no
 per-platform directory to choose: every target reads the SAME descriptors, and
 each descriptor's `library` MAP names the runtime image per object format. At
@@ -362,7 +362,7 @@ descriptor + per-format map design throughout — agnostic, no `if(format)` in
 shared substrate, and it dissolved the former `D-FFI-SHIPPED-LIB-PLATFORM-SELECT`
 deferral entirely (a single descriptor set serves all targets).
 
-`examples/c-subset/shipped_include_puts` proves it end to end: `#include
+`examples/c/shipped_include_puts` proves it end to end: `#include
 <stdio.h>` + `puts("hello")` links `puts` against ucrtbase.dll on Windows-PE
 (msvcrt.dll until the TF-C111 CRT migration), libc.so.6 on Linux-ELF (x86_64 +
 arm64), and libSystem on macOS-Mach-O — from the one `stdio.json`.
@@ -494,7 +494,7 @@ a platform provides and what POSIX declares — mingw-w64 names its equivalent
 `libmingwex`, *extensions*, for exactly that reason) and would make every pe binary
 carry every future unit, or force dead-stripping to undo it.
 
-`examples/c-subset/shipped_dirent_readdir` proves it end to end, and it is a
+`examples/c/shipped_dirent_readdir` proves it end to end, and it is a
 differential over the realization axis rather than over the source: the SAME
 `main.c` binds three libc imports on elf/macho and links a DSS-compiled body on
 pe, and all four legs answer 42.
@@ -521,7 +521,7 @@ pe, and all four legs answer 42.
    — `ucrtbase.dll` for a pe libc surface, not `msvcrt.dll`); `standard` is
    optional provenance.
 4. `AllShippedDescriptorsDecode` will validate the new file decodes and every
-   signature parses. Add an end-to-end corpus under `examples/c-subset/` if it
+   signature parses. Add an end-to-end corpus under `examples/c/` if it
    introduces a runtime-observable path not yet exercised.
 
 A descriptor with a signature the codec cannot decode is a hard error

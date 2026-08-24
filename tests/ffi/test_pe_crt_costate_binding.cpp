@@ -311,7 +311,7 @@ struct PeBinding {
 // Note what a grant does NOT excuse: naming an image that the runtime does not
 // actually export. That failure is loud by construction — DSS eagerly imports
 // every declared symbol (D-FFI-DESCRIPTOR-EAGER-IMPORT), so the LOADER rejects
-// the binary (0xC0000139) and the runtime witnesses in examples/c-subset fail to
+// the binary (0xC0000139) and the runtime witnesses in examples/c fail to
 // start. This table is about the SILENT hazard only.
 struct DeclaredCrossRuntimeSymbol {
     char const* stem;

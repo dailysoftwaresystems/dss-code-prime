@@ -38,7 +38,7 @@
 //     unreachable while still costing a load-time binding).
 // The RUNTIME object-identity property itself is witnessed where it can only be
 // witnessed — across an image boundary, by
-// `examples/c-subset/environ_alias_object_identity`, which loads a gcc-built
+// `examples/c/environ_alias_object_identity`, which loads a gcc-built
 // `.so` that reads the UN-PREFIXED name. A descriptor-shape test like this one
 // cannot see identity at all, and must not claim to.
 //

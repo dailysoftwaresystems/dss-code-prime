@@ -57,7 +57,7 @@ BinderSketch::BinderSketch(GrammarSchema const& schema) {
         if (sc.rule.valid()) scopeRules_.insert(sc.rule.v);
     }
     // A scope rule that ALSO carries a non-Type `declarations` row opens a
-    // DECLARATOR-DOMINATOR scope (e.g. c-subset's topLevelDecl — a variable/
+    // DECLARATOR-DOMINATOR scope (e.g. c's topLevelDecl — a variable/
     // function declaration that opens a scope only to dominate its params).
     // A composite-TYPE-body scope rule (c25's unified structSpec, isType) is NOT
     // a dominator (its tag is recorded for it, then floats past any enclosing

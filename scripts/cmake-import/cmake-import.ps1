@@ -17,7 +17,7 @@
 # Options:
 #   --target <spec>        DSS "<targetName>:<formatName>" (repeatable).
 #                          Default = the host-native spec.
-#   --language <name>      DSS language name.        Default: c-subset
+#   --language <name>      DSS language name.        Default: c
 #   --profile <name>       DSS artifactProfile.      Default: cli
 #   --artifact-name <name> binary base name (no path separators).
 #                          Default: the root dir's basename (sanitized).
@@ -85,7 +85,7 @@ function Get-HostSpec {
 # ─────────────────────────────────────────────────────────────────────────────
 # argument parsing
 # ─────────────────────────────────────────────────────────────────────────────
-$language = 'c-subset'
+$language = 'c'
 $profile  = 'cli'
 $artifact = ''            # explicit --artifact-name; empty => derive
 $targets  = [System.Collections.Generic.List[string]]::new()

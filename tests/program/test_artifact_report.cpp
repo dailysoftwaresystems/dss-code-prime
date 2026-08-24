@@ -159,7 +159,7 @@ TEST(ArtifactReport, ReportsTheExactFileItWroteForEveryTargetSuffix) {
         int                rc = 1;
         {
             CerrCapture cap;
-            rc       = prog.compileFiles({src.generic_string()}, "c-subset",
+            rc       = prog.compileFiles({src.generic_string()}, "c",
                                          {c.spec}, rep);
             captured = cap.text();
         }
@@ -207,7 +207,7 @@ TEST(ArtifactReport, TheReportedPathIsAbsoluteEvenWhenOutputWasRelative) {
     int                rc = 1;
     {
         CerrCapture cap;
-        rc = prog.compileFiles({src.generic_string()}, "c-subset",
+        rc = prog.compileFiles({src.generic_string()}, "c",
                                {"x86_64:pe64-x86_64-windows-exec"}, rep);
         captured = cap.text();
     }
@@ -238,7 +238,7 @@ TEST(ArtifactReport, AMultiTargetBuildReportsEveryArtifactTaggedByItsTarget) {
     int                rc = 1;
     {
         CerrCapture cap;
-        rc = prog.compileFiles({src.generic_string()}, "c-subset",
+        rc = prog.compileFiles({src.generic_string()}, "c",
                                {"x86_64:pe64-x86_64-windows-exec",
                                 "x86_64:elf64-x86_64-linux-exec"},
                                rep);
@@ -278,7 +278,7 @@ TEST(ArtifactReport, AFrontEndFailureReportsNoArtifact) {
     int                rc = 0;
     {
         CerrCapture cap;
-        rc = prog.compileFiles({src.generic_string()}, "c-subset",
+        rc = prog.compileFiles({src.generic_string()}, "c",
                                {"x86_64:pe64-x86_64-windows-exec"}, rep);
         captured = cap.text();
     }
@@ -308,7 +308,7 @@ TEST(ArtifactReport, ALinkFailureAfterThePathIsKnownReportsNoArtifact) {
     int                rc = 0;
     {
         CerrCapture cap;
-        rc = prog.compileFiles({src.generic_string()}, "c-subset",
+        rc = prog.compileFiles({src.generic_string()}, "c",
                                {"x86_64:pe64-x86_64-windows-exec"}, rep);
         captured = cap.text();
     }

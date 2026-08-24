@@ -6,7 +6,7 @@
 
 # Test-corpus source inputs parsed end-to-end by `test_corpus.cpp`. Forcing
 # LF prevents `core.autocrlf` from injecting CR bytes the shipped schemas
-# need to declare explicitly as `Whitespace` lexemes (see e.g. c-subset.lang.json).
+# need to declare explicitly as `Whitespace` lexemes (see e.g. c.lang.json).
 tests/corpus/** text eol=lf
 
 # Shipped language + target config JSONs. Pinned to LF for the same reason
@@ -155,7 +155,7 @@ CMakeLists.txt text eol=lf
 tests/**/data/** binary
 
 # Binary EXAMPLE fixtures: prebuilt shared libraries a runnable example loads.
-# `examples/c-subset/environ_alias_object_identity/` ships two gcc-built `.so`s
+# `examples/c/environ_alias_object_identity/` ships two gcc-built `.so`s
 # (x86_64 + aarch64) because an OBJECT-IDENTITY property cannot be witnessed by
 # ONE image — the example needs a second image DSS did not build, and shipping
 # it prebuilt means the corpus needs no host cross-compiler at test time

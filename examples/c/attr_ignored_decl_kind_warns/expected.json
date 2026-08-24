@@ -1,0 +1,33 @@
+{
+  "$comment": "TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT) — the decl-kind gate REPORTS WITHOUT CHANGING BEHAVIOUR, proven end-to-end. Six misplaced attributes fire `warning[S005F]` S_AttributeIgnoredForDeclarationKind across all FOUR axes of the class (`noinline` / `always_inline` / `no_sanitize_thread` on data objects, `warn_unused_result` on a data object, `noinline` on a TYPEDEF, `always_inline` on a BLOCK-SCOPE local) and the binary still links and still RUNS correctly — exit 42. MEASURED with the shipped CLI on all four targets × both arms: RC=0, 0 errors, exactly 6 S005F. ★ WHY IT IS NOT REDUNDANT WITH THE UNIT PINS: every unit test on this axis asserts a semantic-tier DIAGNOSTIC COUNT; none proves that a warning is NOT an error, that the warned declarations still lower to correct bytes, or that the gate survives the shipped optimizer. This drags the new gate through the real compile → link → spawn → exit-code sequence on every CI leg. The runner asserts rc==0 AND errorCount()==0, and errorCount() counts ONLY Error severity (diagnostic_reporter.cpp:56-59), so a Warning is tolerated BY CONSTRUCTION — that is the property this example rides on, and if the gate ever became an error this test goes red with no binary at all. ★ LOAD-BEARING, not decorative: each warned declaration is READ and gated against a volatile-seeded twin, so a dropped initializer / a global in the wrong section / a typedef that stops naming `int` / an unallocated block-scope local flips t1..t7 and the exit code is no longer 42; a correctly-placed function attribute that corrupted its callee's arithmetic flips t8..t10. Also carries the row-split CONTRAST in runnable form: `warn_unused_result` on a TYPEDEF is SILENT on purpose (clang's applicability text enumerates typedefs), and it too must still compute. ⚠ NOT claimed: that `noinline` refuses inlining or `always_inline` bypasses the cost model — those are MIR-level facts with their own pins, and the debug pipeline is `Identity` (no inliner), so an exit code cannot observe them; what IS pinned is that honoring them never changes the computed result in EITHER arm. Every operand is volatile-seeded (the c23_bitint_wide_muldiv device) so no const-fold / mem2reg / CSE can pre-evaluate a term and mask a broken declaration. Portable — nothing here is platform-specific — so it runs on every leg.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

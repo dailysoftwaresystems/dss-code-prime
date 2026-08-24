@@ -1,0 +1,34 @@
+{
+  "$comment": "`__int128` / `unsigned __int128` — the 128-bit STANDARD-RANK integer type (D-CSUBSET-UINT128-TYPE). The runnable twin of the `_BitInt(128)` corpus: same 2-limb by-address substrate, DIFFERENT type identity and DIFFERENT alignment (16, not the psABI's bit-precise 8). Re-implements the ACTUAL shapes of sqlite's `sqlite3Multiply128` / `sqlite3Multiply160` (sqlite/src/util.c, the SQLITE_USE_UINT128 arm) — which is what the corpus probe broke on. Every operand is a RUNTIME value (volatile-seeded) so no const-fold pre-evaluates the wide arithmetic, and every product is chosen to have a NON-ZERO HIGH WORD (a product that fits in 64 bits passes even with a completely dead high limb). RED-ON-DISABLE: t1 — a `return (u64)(r>>64);` from a HELPER function that drops the wide→narrow truncation, or reads limb 0 where limb 1 is meant; t2 — the Multiply160 shape, whose wide `+=` must carry INTO the high limb, whose `>>32` middle word is truncated to u32 THROUGH A POINTER, and whose wide→u64 return is IMPLICIT (a narrowing applied only at explicit `(T)` casts breaks it); t3 — a BY-VALUE 128-bit param and 128-bit return, an array element and a struct member (a one-register by-value arg, or an aggregate-width Load/Store, keeps only the low 8 bytes); t4 — truncating casts to u64 AND u32 off limb 0, >>32 and >>64; t5 — the SIGNED counterpart: negative value, `/`, `%` taking the DIVIDEND's sign (C99 6.5.5p6), an ARITHMETIC (sign-propagating) `>>`, and `<`; t6 — the width probes in NON-VACUOUS form, since `(__uint128_t)-1 == 0xFFFFFFFFFFFFFFFFull` is MEASURED to pass with the type mistyped as u64 (it is kept only as an explicitly-labelled NEGATIVE control, asserted FALSE); t7 — the four 64-bit C SPELLINGS (`unsigned long long`, `unsigned long`, `long long`, `long`) each narrowed in a HELPER RETURN, which is exactly the class that regressed: C spells four distinct 64-bit type names over only two kinds, so a narrowing typed from the KIND instead of the DECLARED TypeId walls with I_TerminatorTypeMismatch — and the sub-64-bit widths do NOT cover it, because C gives those kinds one spelling each and their declared TypeId happens to BE the canonical primitive. Each term is boolean-gated ⇒ the sum is 42 only when every one holds. Data-model agnostic: the `long` / `unsigned long` expectations are written as CASTS of the full 64-bit constant, so the LLP64 (32-bit `long`) and LP64 legs both hold. The COMPILE-TIME `_Static_assert` block (sizeof 16, _Alignof 16 — THE discriminator against a `_BitInt(128)` binding, which is align 8 and must stay 8 — and `sizeof(struct N)==528`, whose `_BitInt(128)` twin is MEASURED at 520) is deliberately NOT wired into the exit code: a failed static assert aborts translation, so a term computed from one could never report a runtime failure. 128-bit arithmetic is materialized by ADDRESS (never a bare SSA aggregate), so the release arm's mem2reg/const-fold preserve the multiply carry chains and still exit 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

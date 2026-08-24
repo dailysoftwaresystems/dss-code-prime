@@ -483,7 +483,7 @@ struct DSS_EXPORT AssembledModule {
     // D-CSUBSET-MULTI-FN-WIN64-CC (step 13.5 cycle 2 post-fold,
     // 2026-06-03): explicit USER entry-function symbol — set by the
     // compile pipeline based on the source language's entry-function
-    // name config (e.g. c-subset's "main"). Distinct from
+    // name config (e.g. c's "main"). Distinct from
     // `imageEntryOverride` which names the IMAGE entry (= the
     // injected trampoline at functions[0]); this field names the
     // FUNCTION the trampoline calls.

@@ -17,7 +17,7 @@ dss_add_test(NAME mir/test_mir_text         SOURCES test_mir_text.cpp)
 dss_add_test(NAME mir/test_mir_inline_asm SOURCES test_mir_inline_asm.cpp)
 
 # ML2 lowering tests.
-dss_add_test(NAME mir/test_mir_lowering_c_subset SOURCES test_mir_lowering_c_subset.cpp)
+dss_add_test(NAME mir/test_mir_lowering_c SOURCES test_mir_lowering_c.cpp)
 
 # LK6 cycle 2d — HIR ExternFunction → MIR.externImports thread-through.
 dss_add_test(NAME mir/test_mir_lowering_extern SOURCES test_mir_lowering_extern.cpp)

@@ -181,7 +181,7 @@ public:
 
 private:
     // True iff `tree` was built from THIS resolver's schema. In a multi-language
-    // CU each resolver processes only its own language's trees (a c-subset
+    // CU each resolver processes only its own language's trees (a c
     // resolver's `directiveRule` RuleId means nothing in a tsql tree), so every
     // tree-iterating pass below gates on this. Homogeneous CU: always true.
     [[nodiscard]] bool owns(Tree const& tree) const {

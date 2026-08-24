@@ -264,8 +264,8 @@ void expectShapeBuildsAndRuns(ShapeFixture const& fx, std::string_view prefix,
     // The CU count IS the route: one source takes `compileFiles`, more than one
     // takes `compileUnits` and reaches the merged lower.
     int const rc = (sources.size() == 1)
-                       ? prog.compileFiles(sources, "c-subset", {spec}, rep)
-                       : prog.compileUnits(sources, "c-subset", {spec}, rep);
+                       ? prog.compileFiles(sources, "c", {spec}, rep)
+                       : prog.compileUnits(sources, "c", {spec}, rep);
 
     ASSERT_EQ(rc, 0)
         << "the driver must accept this source-argument shape. A refusal here "

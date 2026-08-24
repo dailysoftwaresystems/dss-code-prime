@@ -1970,7 +1970,7 @@ inline void expectDiagContains(DiagnosticReporter const& rep, std::string_view n
 //
 // OWNER OF THE COVERAGE, VERIFIED PRESENT RATHER THAN ASSUMED:
 // `S_EntryShapeNotDeclared`, emitted from src/analysis/semantic/semantic_analyzer.cpp
-// and pinned END-TO-END by examples/c-subset/entry_main_envp_refused_positioned --
+// and pinned END-TO-END by examples/c/entry_main_envp_refused_positioned --
 // this same 3-parameter source, expecting that code with `positioned: true` at an
 // EXACT line:col. That example asserts strictly MORE than the test deleted here
 // could: the span it demands is exactly what the MIR tier cannot supply, so if the
@@ -2446,7 +2446,7 @@ TEST(RealizeEntryShape, CrtImportNamesAreCMangledForTheFormat) {
 // ms_x64 funclet, reduces the parent's filter block to a `[Const; SehFilterReturn]`
 // stub, and records the scope range. These pins assert that shape HOST-
 // INDEPENDENTLY (every leg), complementing the Windows-only AV→42 runtime witness
-// (examples/c-subset/seh_catch_av):
+// (examples/c/seh_catch_av):
 //   * ExtractsFilterFuncletAndStubsParent — a single-`__try` parent gains ONE
 //     appended funclet fn, the __C_specific_handler personality import, one scope
 //     record; the funclet READS arg0 + RETURNS; the parent keeps NO SehException*
@@ -3763,7 +3763,7 @@ TEST(MirMerge, MergePreservesVocabularyIdentityAcrossCus) {
 //     signal, and (c) the ONLY thing making the inliner refuse to splice the shim into a
 //     caller (src/opt/passes/inlining.cpp). Under the MULTI-CU driver the shim is
 //     synthesized PRE-optimize, so the release pipeline's Inlining pass really is offered
-//     this body — see examples/c-subset/shipped_sprintf_ucrt_crosscu for the end-to-end
+//     this body — see examples/c/shipped_sprintf_ucrt_crosscu for the end-to-end
 //     runtime witness of that seam.
 
 namespace {

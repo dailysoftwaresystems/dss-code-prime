@@ -137,12 +137,12 @@ TEST(CompilationUnit, BuildSingleTreeMatchesContract) {
 // `compilation_unit.cpp::parseAndAdd_`, or drop the
 // `establishResultContract(...)` call from `preprocess()`'s single exit.
 TEST(CompilationUnit, TFC115CollidingPredefineDiagnosesInsteadOfCrashing) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     std::shared_ptr<GrammarSchema const> schema = *loaded;
     ASSERT_TRUE(schema->preprocess().enabled);
 
-    // Collide with a name the SHIPPED c-subset language config owns. The row is
+    // Collide with a name the SHIPPED c language config owns. The row is
     // built HERE, in the fixture — never added to a shipped config, which must
     // stay valid.
     PredefinedMacroDef clash;
@@ -277,7 +277,7 @@ TEST(CompilationUnit, MoveAssignmentTransfersOwnership) {
 }
 
 TEST(CompilationUnit, CrossRefsEmptyForToy) {
-    // CU4 landed: the ImportResolver now populates crossRefs for c-subset
+    // CU4 landed: the ImportResolver now populates crossRefs for c
     // (#include) and tsql-subset (table refs). toy is the identity resolver
     // (no import syntax), so a toy CU still has zero cross-refs — this remains
     // a valid, intentional assertion. Cross-language population is exercised in
@@ -513,10 +513,10 @@ TEST(CompilationUnitCU2DeathTest, AddFileAfterFinishAborts) {
 // ── FC13 D-PP-FATAL-HALTS-PARSE: parser gated on a FATAL PP truncation ──
 
 namespace {
-[[nodiscard]] std::shared_ptr<GrammarSchema const> loadCSubsetSchema() {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+[[nodiscard]] std::shared_ptr<GrammarSchema const> loadCSchema() {
+    auto loaded = GrammarSchema::loadShipped("c");
     if (!loaded) {
-        ADD_FAILURE() << "loadShipped(\"c-subset\") failed";
+        ADD_FAILURE() << "loadShipped(\"c\") failed";
         std::abort();
     }
     return *loaded;
@@ -530,7 +530,7 @@ namespace {
 // Pre-fix this fed the truncated deep-paren stream to the parser and
 // drove the expression recursion into a stack overflow / hang.
 TEST(CompilationUnitPPGate, FatalMacroNestingTruncationGatesParser) {
-    auto schema = loadCSubsetSchema();
+    auto schema = loadCSchema();
     ASSERT_TRUE(schema->preprocess().enabled);
 
     // F(F(F(...F(0)...))) nested 300 deep > the PP's 256 backstop.
@@ -566,7 +566,7 @@ TEST(CompilationUnitPPGate, FatalMacroNestingTruncationGatesParser) {
 // recoverable diagnostic) this clean compile would still parse, but an
 // unresolved-include sibling case (below) would wrongly gate.
 TEST(CompilationUnitPPGate, OrdinaryMacroCompileIsNotGated) {
-    auto schema = loadCSubsetSchema();
+    auto schema = loadCSchema();
     UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addInMemory("#define Z 0\nint main(void){ return Z; }\n", "<ok>");
     auto cu = std::move(b).finish();
@@ -583,7 +583,7 @@ TEST(CompilationUnitPPGate, OrdinaryMacroCompileIsNotGated) {
 // surface. RED-on-disable for the over-broad `hasErrors()` gate (which
 // would swallow the whole file on the include error).
 TEST(CompilationUnitPPGate, UnresolvedIncludeStillParsesRestOfFile) {
-    auto schema = loadCSubsetSchema();
+    auto schema = loadCSchema();
     UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addInMemory("#include \"nonexistent_zzz.h\"\nint f(void){ return 0; }\n",
                   "<missing-inc>");

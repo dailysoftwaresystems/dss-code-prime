@@ -335,7 +335,7 @@ TEST(TypeKindVocabulary, TheCoreFieldAcceptsExactlyTheTwentyPrimitiveSpellings) 
         << "the two halves must partition the lattice's spellings, or one of "
            "them is silently not being tested";
 
-    auto doc = shippedLanguageDoc("c-subset");
+    auto doc = shippedLanguageDoc("c");
     // The pointer must RESOLVE, or both halves below probe nothing.
     auto& core = at(doc, kCorePointer, "semantics.builtinTypes[0].core");
     ASSERT_TRUE(core.is_string())
@@ -345,7 +345,7 @@ TEST(TypeKindVocabulary, TheCoreFieldAcceptsExactlyTheTwentyPrimitiveSpellings) 
     // The document must load CLEAN before any mutation, otherwise a refusal
     // below could be about something else entirely.
     {
-        auto const clean = GrammarSchema::loadFromText(doc.dump(), "c-subset");
+        auto const clean = GrammarSchema::loadFromText(doc.dump(), "c");
         ASSERT_TRUE(clean.has_value()) << summarize(clean.error());
     }
 
@@ -353,7 +353,7 @@ TEST(TypeKindVocabulary, TheCoreFieldAcceptsExactlyTheTwentyPrimitiveSpellings) 
     for (auto const& name : kPrimitiveTypeKindNames) {
         SCOPED_TRACE(std::string{"accepted: "} + std::string{name});
         at(doc, kCorePointer, "core") = std::string{name};
-        auto const r = GrammarSchema::loadFromText(doc.dump(), "c-subset");
+        auto const r = GrammarSchema::loadFromText(doc.dump(), "c");
         ASSERT_TRUE(r.has_value())
             << "the loader refused '" << name
             << "', a spelling its own refusal advertises:\n"
@@ -365,7 +365,7 @@ TEST(TypeKindVocabulary, TheCoreFieldAcceptsExactlyTheTwentyPrimitiveSpellings) 
     for (auto const& name : kNonPrimitiveTypeKindNames) {
         SCOPED_TRACE(std::string{"refused: "} + std::string{name});
         at(doc, kCorePointer, "core") = std::string{name};
-        auto const r = GrammarSchema::loadFromText(doc.dump(), "c-subset");
+        auto const r = GrammarSchema::loadFromText(doc.dump(), "c");
         ASSERT_FALSE(r.has_value())
             << "the loader ACCEPTED '" << name
             << "'. It is a `TypeKind` the lattice names but not one "
@@ -381,9 +381,9 @@ TEST(TypeKindVocabulary, TheCoreFieldAcceptsExactlyTheTwentyPrimitiveSpellings) 
 
 // ── (E) BOTH REFUSALS STATE THEIR OWN ACCEPTED SET ───────────────────────
 TEST(TypeKindVocabulary, TheLangJsonCoreRefusalNamesItsTwentyAndNoOthers) {
-    auto doc = shippedLanguageDoc("c-subset");
+    auto doc = shippedLanguageDoc("c");
     at(doc, kCorePointer, "semantics.builtinTypes[0].core") = kBadSpelling;
-    auto const r = GrammarSchema::loadFromText(doc.dump(), "c-subset");
+    auto const r = GrammarSchema::loadFromText(doc.dump(), "c");
     ASSERT_FALSE(r.has_value()) << "an unknown `core` spelling must FAIL";
     auto const msg = messageAt(r.error(), kCorePointer);
     ASSERT_TRUE(msg.has_value()) << summarize(r.error());

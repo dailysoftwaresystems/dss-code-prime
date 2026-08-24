@@ -64,7 +64,7 @@ scripts/cmake-import/cmake-import.ps1 <root-cmake-dir> <output-project-file> [op
 | Option | Default | Meaning |
 |---|---|---|
 | `--target <spec>`       | host-native spec (below) | DSS `"<targetName>:<formatName>"`. **Repeatable** — one artifact per target. |
-| `--language <name>`     | `c-subset` | DSS language. |
+| `--language <name>`     | `c` | DSS language. |
 | `--profile <name>`      | `cli`      | DSS `artifactProfile`. |
 | `--artifact-name <name>`| root dir's basename (sanitized) | Binary base name — a bare name, no path separators. |
 | `-h`, `--help`          |            | Show help and exit. |
@@ -129,7 +129,7 @@ The generated `demo.dss-project.json` (paths relative to the project root):
 
 ```json
 {
-  "language": "c-subset",
+  "language": "c",
   "artifactProfile": "cli",
   "targets": [
     "x86_64:elf64-x86_64-linux-exec"

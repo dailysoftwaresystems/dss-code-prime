@@ -632,8 +632,8 @@ struct Lowerer {
         // permitted by C and C++; `void* → T*` (lhs is T*, rhs is
         // void*, this is the `ck == Void` arm) is unsafe narrowing,
         // permitted by C but FORBIDDEN by C++ (requires explicit
-        // cast). c-subset declares both true in
-        // `c-subset.lang.json`; default-constructed
+        // cast). c declares both true in
+        // `c.lang.json`; default-constructed
         // `PointerConversionRules` has both false (strict typing).
         //
         // Sister rule in `type_rules.hpp::isAssignable` — the
@@ -1228,7 +1228,7 @@ struct Lowerer {
     // the two-answers-one-grammar drift the shared gatherer exists to end.
 
     // ── declaration-specifier prefix (D-DECL-SPECIFIER-PREFIX-SUBSTRATE consumer)
-    // The c-subset's `static`/`__attribute__` prefix rides as an OPTIONAL leading
+    // The c's `static`/`__attribute__` prefix rides as an OPTIONAL leading
     // child of a declaration. CST→HIR resolves positional declaration children
     // via the SHARED strip-aware helpers in `core/types/decl_prefix_strip.hpp`
     // (`declRoleChildren` / `descendVisibleDecl` / `specifierPrefixChild` —
@@ -1507,7 +1507,7 @@ struct Lowerer {
         // String-literal token kinds (from the language's hirLowering
         // literal config) drive the COMPOSITE form: a specifier identifier
         // immediately followed by a parenthesized string literal forms the
-        // lookup key `<identifier>:<decoded-body>` — c-subset's
+        // lookup key `<identifier>:<decoded-body>` — c's
         // `__attribute__((visibility("hidden")))` resolves the declared
         // facet key "visibility:hidden". Generic: ANY attr-with-string-arg
         // works; an unknown composite fails loud with the composite key.
@@ -1518,7 +1518,7 @@ struct Lowerer {
         // tokens (`(`, opener, body, closer) + `)`, not three. This scan must know
         // the third string piece exactly as it already knows the first two.
         //
-        // ★ Resolved from the SCHEMA, and THIS is the guard. The three c-subset
+        // ★ Resolved from the SCHEMA, and THIS is the guard. The three c
         // `linkageSpecifierIgnoredKinds` rows that also list `StringEnd` are
         // DEFENCE-IN-DEPTH, not the mechanism — keep them (they document the
         // closer's structural role at the config surface, and they are what a
@@ -1867,7 +1867,7 @@ struct Lowerer {
                     // rejected visibility must not also DROP an orthogonal axis
                     // the same key might carry: no shipped row pairs
                     // `visibility` with `staticStorage` today, so this is inert
-                    // in c-subset, but a `continue` would make a future pairing
+                    // in c, but a `continue` would make a future pairing
                     // silently lose the storage fact — the exact class this
                     // anchor exists to close.
                 }
@@ -3791,7 +3791,7 @@ struct Lowerer {
     // Shared callee-signature resolution (FC4 c2, plan-lock MUST-FIX 3):
     // a callee expression carries either the FnSig directly (a direct /
     // paren-wrapped designator) or `Ptr<FnSig>` (a function-pointer
-    // value — the canonical c-subset fn-ptr type). Unwrap ONE pointer
+    // value — the canonical c fn-ptr type). Unwrap ONE pointer
     // level, mirroring hir_verifier.cpp's checkCallArguments. Feeds
     // BOTH call arms' param COERCION + inferred result type — without
     // it, indirect-call arguments would silently skip coercion (the
@@ -5183,7 +5183,7 @@ struct Lowerer {
                 rest.push_back(c);
             }
         }
-        // Locate the field-name token inside the follower subtree (c-subset's
+        // Locate the field-name token inside the follower subtree (c's
         // `memberFollower = {sequence: [Identifier]}`). Robust against a future
         // schema that wraps the name: scan for a real token first, fall back to
         // the first visible child if the follower is all Internal.
@@ -5662,7 +5662,7 @@ struct Lowerer {
             // ★ UNREACHABLE-FROM-THE-DRIVER IS NOT UNREACHABLE. ✔MEASURED that the
             // semantic gate holds — `compile_pipeline.cpp` and `c_header_parser.cpp`
             // both bail on `hasErrors()` before lowering — but a THIRD caller,
-            // `tests/mir/test_mir_lowering_c_subset.cpp`'s `lowerCSubset`, calls
+            // `tests/mir/test_mir_lowering_c.cpp`'s `lowerC`, calls
             // `lowerToHir` with NO such guard, deliberately, so a lowering bug
             // cannot hide behind a semantic diagnostic. That is why the refusals
             // here are real diagnostics rather than assertions, and why they stay
@@ -6386,7 +6386,7 @@ struct Lowerer {
     // READ MORE THAN ONCE with no observable effect, which is what lets
     // compound-assignment and ++/-- lower by duplicating it. Returns (symbol,
     // type); nullopt for a complex lvalue (index / deref / call — those would
-    // need once-only evaluation HIR can't express, and c-subset can't form them).
+    // need once-only evaluation HIR can't express, and c can't form them).
     [[nodiscard]] std::optional<std::pair<SymbolId, TypeId>> simpleLvalue(NodeId exprCst) {
         NodeId core = peelToCore(exprCst);
         if (tree().kind(core) != NodeKind::Internal || tree().rule(core).v != cfg.operandRule.v)
@@ -6695,7 +6695,7 @@ struct Lowerer {
     // D5-FU3: peel wrapper-rule layers off `n` UNTIL reaching one of the
     // recognized designator-leaf rules (designatedFieldRule /
     // designatedIndexRule), or until no more sole-meaningful descents
-    // are possible. The c-subset grammar's `designator: alt[...]` parses
+    // are possible. The c grammar's `designator: alt[...]` parses
     // to an auto-interned alt-wrapper whose rule isn't either leaf rule;
     // callers that need to recognize a designator-leaf in initElement
     // position use this peel rather than `peelToCore` (which over-peels
@@ -9279,7 +9279,7 @@ struct Lowerer {
         // anon-composite path (`enum {V=16};` — a row with NO named declarator at
         // all, whose type is stamped on the declaration node itself).
         bool emittedPerDeclarator = false;
-        // FC4 c1: declarator-mode type rows (c-subset typedefDecl) carry the
+        // FC4 c1: declarator-mode type rows (c typedefDecl) carry the
         // declared name inside the declarator — the shared walk finds it.
         if (decl && decl->isDeclaratorMode() && sem.declarators.has_value()) {
             auto const carrier = decl->declaratorListChild.has_value()
@@ -9376,7 +9376,7 @@ struct Lowerer {
     }
 
     // DFS for the first descendant of `root` whose rule is a composite
-    // (fieldChildren) TYPE DEFINITION — c-subset's unified structSpec / unionSpec
+    // (fieldChildren) TYPE DEFINITION — c's unified structSpec / unionSpec
     // / enumSpec (which REPLACED the *SpecifierBody rules). Used to recover the
     // type-declaring node of a no-object top-level declaration (`struct P { … };`),
     // which — since the bare top-level structDecl/unionDecl/enumDecl rules were
@@ -9904,7 +9904,7 @@ struct Lowerer {
     }
 
     // A function declared by a DEDICATED rule (e.g. toy's `funcDef`), as opposed
-    // to c-subset's dual-purpose `topLevelDecl`+kindByChild. Reads the params/body
+    // to c's dual-purpose `topLevelDecl`+kindByChild. Reads the params/body
     // subtrees from the semantic DeclarationRule's `paramsChild`/`bodyChild`
     // visible-child indices.
     // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN (source-agnostic): if the
@@ -9915,7 +9915,7 @@ struct Lowerer {
     // original children + a synthetic `return <zero>`. Otherwise
     // return `body` unchanged. Shared between `lowerFunctionDecl`
     // (dedicated-rule front-ends like toy) and `lowerFunction`
-    // (kindByChild dispatch like c-subset's `topLevelDecl`) — both
+    // (kindByChild dispatch like c's `topLevelDecl`) — both
     // call this AFTER lowering the body and BEFORE handing it to
     // `builder.makeFunction`.
     [[nodiscard]] HirNodeId
@@ -10151,7 +10151,7 @@ struct Lowerer {
         // D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3): the OPTIONAL trailing
         // `stringLiteralExpr` after the declarator list is a DSS per-declaration
         // import-library override (`extern void* GetStdHandle(int) "kernel32.dll";`
-        // — examples/c-subset/hello_writefile). Decode it ONCE and apply the same
+        // — examples/c/hello_writefile). Decode it ONCE and apply the same
         // map to EVERY declarator's import row (a source override is format-
         // independent → projected under every object-format key by uniformLibraryMap;
         // the compile-pipeline fold reads the active format's key). Absent → empty
@@ -10439,7 +10439,7 @@ struct Lowerer {
     // (specifier prefix stripped — D-DECL-PREFIX-STRIP-SHARED-HELPER), so an
     // expr-shaped specifier argument (e.g. a future
     // `__attribute__((aligned(8)))`) can never be mistaken for the global's
-    // initializer. A no-op for every shipped prefix today (c-subset's
+    // initializer. A no-op for every shipped prefix today (c's
     // specifiers contain no expr-rule nodes).
     [[nodiscard]] std::vector<NodeId>
     descendantsForInit(NodeId node, RuleId skipRule = {},

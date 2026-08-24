@@ -109,7 +109,7 @@ optPassIdName(PassId id) noexcept {
 // inlineThreshold` defaults to this when the pipeline JSON omits the
 // key (and a programmatic `OptPipeline{}` construction inherits it).
 // 50 MIR instructions is a conservative size cap — large enough to
-// inline the small leaf/helper callees the c-subset frontend emits,
+// inline the small leaf/helper callees the c frontend emits,
 // small enough that shipping `Inlining` in `release.pipeline.json`
 // cannot blow up code size on a big callee. A size-based bloat bound;
 // the SOPHISTICATED cost model (call-site hotness, growth-vs-benefit)

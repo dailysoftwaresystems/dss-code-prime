@@ -104,7 +104,7 @@ struct LiteralKinds {
             lk.floating.insert(tok);
         } else {
             // Char / I8 / U8 / Bool / I16 / I32 / ... -> integer literal.
-            // (c-subset maps CharLiteral -> I32, so a char constant in `#if` is
+            // (c maps CharLiteral -> I32, so a char constant in `#if` is
             // an integer per C 6.4.4.4 -- but its VALUE decode is the char
             // path; for now a non-integer-LITERAL token text reaching
             // decodeInteger fails the malformed-literal fail-loud, which is the
@@ -273,7 +273,7 @@ private:
     // `sizeof(int)` shape then fails loud as a malformed expression (a trailing
     // `(` with no operator) -- exactly as a real C preprocessor reports it.
     // Recognising `sizeof` by a hard-coded token NAME would also break
-    // agnosticism (the name is c-subset-specific), so the float/string rejection
+    // agnosticism (the name is c-specific), so the float/string rejection
     // below is keyed on the CONFIG `literalTypes` kinds, never a token name.
     [[nodiscard]] bool rejectIfUnsupported(Token const& t) {
         if (lits_.floating.count(t.schemaKind.v) != 0) {

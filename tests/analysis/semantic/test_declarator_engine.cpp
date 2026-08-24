@@ -621,7 +621,7 @@ TEST(DeclaratorInversion, ZeroArrayLengthFailsLoud) {
 // S_RedeclaredSymbol. This `vdecl` rule has `kind: variable`, binds at the file/CU
 // scope, and the synthetic grammar has NO initializer production — so every
 // declarator here is necessarily tentative. (A genuine two-REAL-definitions
-// collision needs an initializer, exercised by the c-subset semantic suite where
+// collision needs an initializer, exercised by the c semantic suite where
 // `int x = 1; int x = 2;` still reports S_RedeclaredSymbol.)
 TEST(DeclaratorInversion, SameNameTwiceTentativeDefinitionsMerge) {
     auto cu = buildDeclCu("base x, x;");

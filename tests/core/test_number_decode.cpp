@@ -22,7 +22,7 @@ using namespace dss;
 
 namespace {
 
-// The c-subset-shaped style (mirrors c-subset.lang.json's numberStyle).
+// The c-shaped style (mirrors c.lang.json's numberStyle).
 [[nodiscard]] NumberStyle cStyle() {
     NumberStyle s;
     s.decimal = true;

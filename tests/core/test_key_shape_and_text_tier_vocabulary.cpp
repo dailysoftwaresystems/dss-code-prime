@@ -233,10 +233,10 @@ struct KeyShapeBlock {
 // `objectAt` re-validates every one on every run, so a row that goes stale FAILS
 // rather than passing vacuously.
 constexpr KeyShapeBlock kKeyShapeBlocks[] = {
-    {"c-subset", "/shapes/expression/expr/wrapperRules",
+    {"c", "/shapes/expression/expr/wrapperRules",
      "a 'wrapperRules' object", "'wrapperRules' must be an object",
      "wrapperRules"},
-    {"c-subset", "/numberStyle/integerPrefixes/0/float",
+    {"c", "/numberStyle/integerPrefixes/0/float",
      "a prefix's 'float' block", "'float' must be an object", "float"},
     {"asm-arm64-gas", "/numberStyle/emitKind",
      "the 'emitKind' block", "'numberStyle.emitKind' is required",
@@ -244,9 +244,9 @@ constexpr KeyShapeBlock kKeyShapeBlocks[] = {
     // The linkage effect is the one block whose sentence carries NO self-quote:
     // the object is keyed by specifier SOURCE TEXT, so it has no fixed name to
     // open with. The empty string here is a measured fact, not a placeholder.
-    {"c-subset", "/semantics/declarations/0/linkageSpecifiers/static",
+    {"c", "/semantics/declarations/0/linkageSpecifiers/static",
      "a linkage effect", "linkage effect must be an object", ""},
-    {"c-subset", "/requires", "the 'requires' block",
+    {"c", "/requires", "the 'requires' block",
      "'requires' must be an object", "requires", /*created=*/true},
 };
 
@@ -270,7 +270,7 @@ constexpr KeyShapeBlock kKeyShapeBlocks[] = {
 // The positive control. Without it, a loader that refused EVERYTHING would turn
 // every probe below green.
 TEST(KeyShapeSentences, EveryProbedShippedDocumentLoadsCleanly) {
-    for (char const* lang : {"c-subset", "asm-arm64-gas"}) {
+    for (char const* lang : {"c", "asm-arm64-gas"}) {
         auto const doc = shippedLanguageDoc(lang);
         auto       r   = GrammarSchema::loadFromText(doc.dump(), lang);
         ASSERT_TRUE(r.has_value())
@@ -494,14 +494,14 @@ struct HirAttrVocabulary {
 // `Bool/I*/U*/F*/Char/Byte/Void` and omitted `NullptrT`.
 TEST(TextTierVocabulary, CoreTypeRefusalNamesEverySpellingTheLoaderAccepts) {
     expectEveryAdvertisedValueIsAccepted(
-        "c-subset", "/semantics/builtinTypes/0/core", "unknown core TypeKind",
+        "c", "/semantics/builtinTypes/0/core", "unknown core TypeKind",
         20, "semantics.builtinTypes[0].core");
 }
 
 // The `builtinFunctions[].lowering` refusal — thirty verbs, and it named none.
 TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
     expectEveryAdvertisedValueIsAccepted(
-        "c-subset", "/semantics/builtinFunctions/0/lowering",
+        "c", "/semantics/builtinFunctions/0/lowering",
         "unknown builtin lowering", 30, "semantics.builtinFunctions[0].lowering");
 }
 

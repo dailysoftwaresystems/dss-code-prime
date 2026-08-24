@@ -5,7 +5,7 @@
 //
 // ★★★ WHAT THIS FILE PINS, AND WHY IT IS HIR→MIR RATHER THAN THE EMIT. The
 // emitted INSTRUCTION is pinned end to end and BY EXECUTION in
-// `examples/c-subset/c_inline_asm_immediate_operand` (four targets, a `release`
+// `examples/c/c_inline_asm_immediate_operand` (four targets, a `release`
 // arm, four shapes with four distinct exit codes). What that example cannot
 // isolate are the two facts THIS tier owns and nothing below it can recover:
 //
@@ -69,7 +69,7 @@ constexpr char const* kArm = "arm64";
 struct Lowered {
     // ⚠ DECLARED FIRST SO IT IS DESTROYED LAST — `analyze` takes the target
     // NON-OWNING and `SemanticModel` republishes it, so the schema must outlive
-    // the model. This is the ordering `test_mir_lowering_c_subset.cpp` states in
+    // the model. This is the ordering `test_mir_lowering_c.cpp` states in
     // full; it is repeated here because members destroy in reverse declaration
     // order and getting it wrong dangles silently rather than loudly.
     std::shared_ptr<TargetSchema const> target;
@@ -85,7 +85,7 @@ struct Lowered {
     }
 };
 
-// c-subset source → CompilationUnit → SemanticModel → HIR → MIR, with `target`
+// c source → CompilationUnit → SemanticModel → HIR → MIR, with `target`
 // in scope at BOTH the semantic pass (where a constraint letter is resolved
 // against `asmConstraints`) and the MIR config (where the layout engine that
 // folds `sizeof` comes from). A driver that threaded neither would make every
@@ -97,9 +97,9 @@ struct Lowered {
     Lowered out;
     out.target = std::move(target);
 
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     if (!loaded) {
-        ADD_FAILURE() << "GrammarSchema::loadShipped(c-subset) failed";
+        ADD_FAILURE() << "GrammarSchema::loadShipped(c) failed";
         return out;
     }
     UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};

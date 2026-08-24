@@ -244,7 +244,7 @@ bool checkKeysAgainst(json const& obj, std::span<std::string_view const> known,
 // moment `languageReferences` folds a second document's shapes in, the same
 // pointer names a location the reader cannot open: `/shapes/asmOperand` is a
 // perfectly good pointer into `asm.lang.json` and a dangling one into
-// `c-subset.lang.json`, and the diagnostic does not say which.
+// `c.lang.json`, and the diagnostic does not say which.
 //
 // This is the ONE place that answers it. A foreign shape is quoted as
 //     asm.lang.json#/shapes/asmOperand
@@ -1449,7 +1449,7 @@ void validateTypeNameCommitGuards(GrammarSchemaData& data, Collector& coll) {
 // compared.
 //
 // ✔MEASURED, AND THIS GUARD EXISTS BECAUSE OF THE MEASUREMENT. Deleting ONLY the
-// `semantics.inlineAsm` object from a throwaway copy of `c-subset.lang.json` —
+// `semantics.inlineAsm` object from a throwaway copy of `c.lang.json` —
 // leaving the asm GRAMMAR and its `asmStmt → InlineAsm` lowering row untouched —
 // made `__asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));` compile **rc=0 with
 // ZERO diagnostics** on `elf64-x86_64-linux-exec`: the statement parsed, no
@@ -2589,7 +2589,7 @@ void checkDocumentKeys(json const& doc, std::string_view docLabel,
 // `hostRefAtoms` check in `mergeLanguageReferences`), and it is DATED rather
 // than hypothetical: `asm.lang.json`'s own header states that its STANDALONE
 // half lands a `tokens` block (plan 29 P2.5), and `asm` is referenced by
-// `c-subset` today — so the day that block is written it would quietly do
+// `c` today — so the day that block is written it would quietly do
 // nothing for every host that references the document. The refusal is what
 // forces P2.5 to decide (teach the merge, or keep the block out of the
 // referenced surface) instead of discovering the silence downstream.
@@ -3882,7 +3882,7 @@ void synthesizeInlineAsmTemplateLexemeRows(
         }
     }
     // No capability ⇒ nothing to synthesize, and that is the ORDINARY case for
-    // a host language: `c-subset.lang.json` carries the role set (its analyzer
+    // a host language: `c.lang.json` carries the role set (its analyzer
     // SCANS templates) and declares no `assembly` block at all (it never LEXES
     // one — the dialect does, at MIR→LIR).
     if (modeName.empty()) return;
@@ -4382,7 +4382,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     // merged document and are correct by construction.
     //
     // The short label (filename, not full path) is what diagnostics quote on
-    // BOTH sides of a collision, so `c-subset.lang.json` and `asm.lang.json` read
+    // BOTH sides of a collision, so `c.lang.json` and `asm.lang.json` read
     // as peers rather than one being an absolute path and the other a name.
     const std::string hostLabel = [&] {
         auto leaf = std::filesystem::path{sourceLabel}.filename().string();
@@ -4950,7 +4950,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             //
             // ✔MEASURED — the old condition's true firing set is all 14
             // `defaultToken`-and-no-`tokens` modes in the shipped corpus
-            // (c-subset 5: string/charBody/header-body/line-comment/
+            // (c 5: string/charBody/header-body/line-comment/
             // block-comment · tsql-subset 5: bracket-id/single-string/
             // unicode-string/line-comment/block-comment · asm-x86_64-att 2 ·
             // asm-arm64-gas 2), and EVERY ONE of them is the canonical body
@@ -5690,7 +5690,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     // check before `shapes` keeps the HOST-attributed message first — Pass B
     // below would also catch an unresolvable name, but it would quote the
     // REFERENCED document's shape (the substitution already happened there),
-    // blaming `asm.lang.json` for a typo in `c-subset.lang.json`'s binding table.
+    // blaming `asm.lang.json` for a typo in `c.lang.json`'s binding table.
     // Both fire; this one names the file you have to edit.
     for (auto const& ref : languageRefs) {
         for (auto const& [hole, tokenName] : ref.tokens) {
@@ -8468,7 +8468,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 // a legal spelling. Documentation for this map goes
                                 // on a `$`-prefixed sibling of the ROW's own keys,
                                 // which IS the loader's vocabulary — the shipped
-                                // c-subset's `$linkageSpecifiersComment` does that.
+                                // c's `$linkageSpecifiersComment` does that.
                                 for (auto it = ls.begin(); it != ls.end(); ++it) {
                                     auto const& specText = it.key();
                                     auto const& eff = it.value();
@@ -9143,7 +9143,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // D-CSUBSET-EXTERN-DEFINITION-MERGE: optional
                         // `nonDefiningDeclaration` flag (default false). A
                         // declaration that announces a symbol defined elsewhere
-                        // (c-subset's `externDecl`); it merges with an in-TU
+                        // (c's `externDecl`); it merges with an in-TU
                         // definition of the same name (the definition wins).
                         if (entry.contains("nonDefiningDeclaration")) {
                             if (!entry.at("nonDefiningDeclaration").is_boolean()) {
@@ -10438,7 +10438,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         m.core = *k;
                         // FC3 c1: optional per-data-model width override
-                        // (c-subset: long → I64 base, LLP64 → I32).
+                        // (c: long → I64 base, LLP64 → I32).
                         if (!readCoreByDataModel(entry, path, m.coreByDataModel)) {
                             continue;
                         }
@@ -11851,7 +11851,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
                         // Optional `operatorToken` gate. Mirrors
                         // AssignmentRule's gating — needed when a single
-                        // shape (e.g. c-subset's `postfixExpr`) covers
+                        // shape (e.g. c's `postfixExpr`) covers
                         // call AND non-call postfix forms.
                         if (entry.contains("operatorToken")) {
                             if (!entry.at("operatorToken").is_string()) {
@@ -12408,7 +12408,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // ── thread-local storage class (TLS C1, D-CSUBSET-THREAD-LOCAL) ──
             // `{ incompatibleSpecifierTokens }` — storage-class specifier TOKEN
             // kinds that may not pair with a thread-storage specifier (C11/C23
-            // 6.7.1p2 — c-subset lists `RegisterKeyword`). Each entry resolves
+            // 6.7.1p2 — c lists `RegisterKeyword`). Each entry resolves
             // like a gatedMarker token (unknown name → C_UnknownToken — a typo
             // can never silently disarm the combination reject). The
             // thread-storage vocabulary itself rides the declaration rows'
@@ -12459,7 +12459,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // ── predefined function-name identifiers (FC17.5,
             //    D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99 6.4.2.2) ──
             // `{ identifiers }` — the predefined function-name spellings
-            // (`__func__` + the GNU `__FUNCTION__` alias for c-subset). Pass 1
+            // (`__func__` + the GNU `__FUNCTION__` alias for c). Pass 1
             // binds one synthetic const Array<char-core, len+1> symbol per
             // spelling into each function definition's own scope; HIR folds a
             // read to a string-literal constant. `identifiers` is REQUIRED when
@@ -12774,7 +12774,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             // ★ A `none` row is EXEMPT, and must be: that verb
                             // bundles function-only, type-only, statement-only and
                             // elsewhere-consumed names in ONE row, so no single
-                            // kind set is correct for it. See the c-subset row's
+                            // kind set is correct for it. See the c row's
                             // own `$comment` for what closing that half costs (a
                             // ROW SPLIT by applicable kind, not another key) and
                             // for the measured bound on the residual silence.
@@ -14083,13 +14083,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // D-LANG-VOIDPTR-FN-CONVERT (C 6.3.2.3): implicit
                     // function-pointer <-> void* (incl. the bare function
                     // designator -> void* gcc/POSIX dlsym / Tcl ClientData
-                    // idiom). Default false = ISO-strict; c-subset opts in.
+                    // idiom). Default false = ISO-strict; c opts in.
                     readBool("allowVoidPtrFnConvert",
                              cfg.pointerConversions.allowVoidPtrFnConvert);
                     // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: at a shipped-FFI-
                     // descriptor call-arg boundary, admit a real C integer pointer
                     // into a same-representation descriptor `ptr<i64>`-style param.
-                    // Default false = ISO-strict; c-subset opts in.
+                    // Default false = ISO-strict; c opts in.
                     readBool("directCallIntPointeeCompat",
                              cfg.pointerConversions.directCallIntPointeeCompat);
                     // D-CSUBSET-NULLPTR: `nullptr` lowers to the integer-0 null
@@ -14346,7 +14346,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             //       names does a DEDICATED scan consume?"
             // Their pairwise intersections are small and that is CORRECT — they
             // are not three copies of one set and MERGING them would be wrong
-            // (measured: the c-subset lists are 18 / 12 / 2 with a 3-way overlap
+            // (measured: the c lists are 18 / 12 / 2 with a 3-way overlap
             // of just `noreturn`). What they can do is DRIFT, silently. The two
             // clauses below are the subset relations that are actually IMPLIED
             // by the lists' own definitions, so they can be enforced without
@@ -14360,7 +14360,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             //     a TYPE), so they never reach a declaration's specifier prefix
             //     and requiring their ignore entries would reject correct config.
             // (b) Whether an attribute clause can even REACH a given row's scan
-            //     depends on that row's prefix GRAMMAR (c-subset's `externDecl`
+            //     depends on that row's prefix GRAMMAR (c's `externDecl`
             //     prefix admits only `extern` + the thread-local twins, so no
             //     attribute identifier can occur there), and the semantic loader
             //     holds only a name↔id `RuleInterner` — the shape graph is not
@@ -14470,7 +14470,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 //     No attribute identifier can reach this row's name lookup,
                 //     so no per-name entry could change its behavior. Demanding
                 //     names of it is the false positive that made a guard whose
-                //     remedy is "silence more things" — MEASURED on c-subset's
+                //     remedy is "silence more things" — MEASURED on c's
                 //     `varDecl`, which ignores `attrSpec`+`stdAttr` wholesale:
                 //     adding ONE unrelated name to it demanded six more.
                 //  2. Ignores SOME attribute rule but not all ⇒ CHECKED. The row
@@ -14482,11 +14482,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 //     so deleting the ENTIRE `linkageSpecifierIgnoredNames` key
                 //     — the larger and more plausible edit, and previously the
                 //     one that escaped by emptying the list the gate keyed on —
-                //     still fires. (c-subset's `topLevelDecl` is this tier.)
+                //     still fires. (c's `topLevelDecl` is this tier.)
                 //  3. Mentions NO attribute rule at all ⇒ checked only if it
                 //     ignores something BY NAME. Such a row makes no visible
                 //     claim about attribute syntax either way, and its prefix
-                //     grammar may legitimately admit none (c-subset's
+                //     grammar may legitimately admit none (c's
                 //     `externDecl`, whose specifier prefix is `extern` plus the
                 //     thread-local twins). Retaining the name-list signal here
                 //     keeps every case the older gate caught; what changed is

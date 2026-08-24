@@ -1,0 +1,22 @@
+{
+  "$comment": "UCRT-P4 (D-FFI-PE-ABORT-BEHAVIOR-NOOP-MACRO-STALE-AFTER-UCRT-FLIP): the run witness that stdlib.json's `_set_abort_behavior` is a REAL ucrtbase.dll binding (PE ordinal 1771) rather than the pe-gated no-op MACRO `(0u)` it shipped as while `library.pe` was msvcrt.dll. That no-op was HONEST under msvcrt (no such export; msvcrt's abort raises no UCRT WER dialog) and became a real suppression GAP at TF-C111's flip, whose failure mode is a HANG, not a diagnostic. WHY exitCode 3 IS A WITNESS AND NOT A RESTATEMENT OF `abort() was called`: 3 appears ONLY once `_CALL_REPORTFAULT` is CLEARED — leave that bit set and UCRT fast-fails 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN). THE EXIT CODE IS THE ASSERTION and the wall clock is corroborating evidence, reported as such. MEASURED on DSS-emitted pe64 exes by a CONTROLLED A/B — one source built twice differing ONLY in whether `_CALL_REPORTFAULT` is left set, runs INTERLEAVED 20x each so both arms share the same machine load, timed with a .NET Process stopwatch: cleared -> exit 3, min/median/max 14.4/53.4/132.8 ms; set -> exit -1073740791 = 0xC0000409, 151.7/337.2/690.2 ms. Separated with no overlap, ~6x at the median. The ABSOLUTE figures are LOAD-DEPENDENT (an idle-machine pair measured 4.2-7.3 vs 52.9-77.9 ms), so the separation is the invariant and this manifest asserts NO millisecond threshold — only exitCode 3. ⚠ Do NOT re-measure with PowerShell `Start-Process -Wait`: it has a ~1 s floor on this host that swallowed the entire effect and reported both arms at ~1.0 s. THE DEFAULT IS 2 (`_CALL_REPORTFAULT` alone), NOT 3 — measured `prev=2`; debug ucrtbased returns 1, the opposite bit — so no assertion here reads the default, only transitions this program caused. `_WRITE_ABORT_MSG` is behaviourally INERT on release UCRT (flags=1 emits no abort text at all), so it is witnessed by VALUE and by bit-independence, never by abort TEXT. No expectedStdout: the program prints nothing, so there is no CRLF/LF divergence to pin. BOUNDED TIME IS THE POINT — the runner spawns through runBinary(kRunBudget=5000 ms) and a timeout is a hard failure, so a host where the clear failed and WER raised UI REDS at the budget instead of hanging ctest, which a plain exit-code test cannot deliver. pe64-only is not a gap: this is a pe/UCRT spelling with no elf or macho analogue (hence availableObjectFormats [pe] on the symbol row); on non-Windows hosts the arm BUILDS and records skipped-by-runOn, a STRUCTURAL skip that strict mode never promotes. RED-ON-DISABLE, both measured: restore the `(0u)` macro -> the mask=0 pure query answers 0 -> exit 20; revert the whole fix (macro back, symbol + constants gone) -> the constants are undeclared and the TU does not compile, and the emitted image stops importing `_set_abort_behavior` (pinned host-independently by tests/ffi/test_pe_abort_behavior_binding.cpp).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 3,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

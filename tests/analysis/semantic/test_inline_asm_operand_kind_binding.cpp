@@ -20,7 +20,7 @@
 //
 // ★★ WHAT THIS FILE PINS, AND WHY IT IS THE FRONT END RATHER THAN THE EMIT.
 // The emitted INSTRUCTION is pinned end-to-end and BY EXECUTION in
-// `examples/c-subset/c_inline_asm_memory_operand` (four targets, a `release`
+// `examples/c/c_inline_asm_memory_operand` (four targets, a `release`
 // arm, an exit code that is a function of the memory operand reaching the
 // template). What that example CANNOT isolate is the fact whose absence caused
 // the defect: that the FORM the target declared was carried out of the
@@ -67,7 +67,7 @@ struct Lowered {
     std::unique_ptr<CstToHirResult>        hir;
 };
 
-// Analyze + lower ONE c-subset source with `arch` in scope. The target is what
+// Analyze + lower ONE c source with `arch` in scope. The target is what
 // makes this a test of the resolution rather than of the parse: with no target
 // the letters are deliberately left unresolved and every arm reads false.
 [[nodiscard]] std::unique_ptr<Lowered> lowerFor(std::string_view arch,
@@ -79,7 +79,7 @@ struct Lowered {
         return out;
     }
     out->target = *loaded;
-    out->cu     = buildShippedUnit("c-subset", {std::move(src)});
+    out->cu     = buildShippedUnit("c", {std::move(src)});
     out->model.emplace(analyze(out->cu, DiagnosticBudget::libraryDefault(),
                                DataModel::Lp64, std::nullopt, std::nullopt,
                                std::nullopt, arch, LongDoubleFormat::None,
@@ -219,7 +219,7 @@ TEST(InlineAsmOperandKindBinding, ImmediateLetterResolvesToItsOwnFormNotMembase)
 // than the loud one.
 TEST(InlineAsmOperandKindBinding, NoTargetInScopeLeavesBothArmsUnresolved) {
     auto cu = buildShippedUnit(
-        "c-subset", {wrap(R"(__asm__("nop %1" : "=r"(r) : "m"(*p));)")});
+        "c", {wrap(R"(__asm__("nop %1" : "=r"(r) : "m"(*p));)")});
     SemanticModel model =
         analyze(cu, DiagnosticBudget::libraryDefault());
     DiagnosticReporter rep;

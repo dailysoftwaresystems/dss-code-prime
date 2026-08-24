@@ -216,7 +216,7 @@ makeRequest(fs::path const&  configRoot,
     request.siblingFormatName = "elf64-aarch64-linux-staticlib";
     request.configName        = std::string{configName};
     request.loadedDocuments   = {
-        {"language", "languages/c-subset.lang.json",
+        {"language", "languages/c.lang.json",
          std::string{kLanguageDigest}},
         {"format", "object-formats/elf64-aarch64-linux-exec.format.json",
          std::string{kFormatDigest}},
@@ -591,7 +591,7 @@ TEST(RuntimeObjectCacheKey, DocumentHasTheExactLineShapeAndOrder) {
     EXPECT_EQ(lines[10],
               "doc=format:object-formats/elf64-aarch64-linux-exec.format.json:"
                   + std::string{kFormatDigest});
-    EXPECT_EQ(lines[11], "doc=language:languages/c-subset.lang.json:"
+    EXPECT_EQ(lines[11], "doc=language:languages/c.lang.json:"
                              + std::string{kLanguageDigest});
 
     // The digest is the SHA-256 of exactly those bytes — no side channel.
@@ -789,7 +789,7 @@ TEST(RuntimeObjectCacheKey, EmptyLoadedDocumentDigestRefusesNamingLabelAndPath) 
     // Label AND path, both quoted — `language` is a prefix of `languages/...`,
     // so a bare substring test would be satisfied by the path alone.
     EXPECT_TRUE(contains(key.error(),
-                         "'language' at 'languages/c-subset.lang.json'"))
+                         "'language' at 'languages/c.lang.json'"))
         << key.error();
     EXPECT_TRUE(contains(key.error(), "EMPTY")) << key.error();
 }
@@ -806,7 +806,7 @@ TEST(RuntimeObjectCacheKey, MalformedLoadedDocumentDigestRefuses) {
         auto const key = computeRuntimeObjectKey(request);
         ASSERT_FALSE(key.has_value());
         EXPECT_TRUE(contains(key.error(),
-                             "'language' at 'languages/c-subset.lang.json'"))
+                             "'language' at 'languages/c.lang.json'"))
             << key.error();
         EXPECT_TRUE(contains(key.error(), "MALFORMED")) << key.error();
     }

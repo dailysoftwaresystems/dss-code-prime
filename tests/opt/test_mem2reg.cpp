@@ -17,7 +17,7 @@
 //      `copy_prop_across_join` shape generalized.
 //
 //   3. DIFFERENTIAL-EXECUTION CORRECTNESS: covered by the corpus pin
-//      `examples/c-subset/copy_prop_across_join` whose
+//      `examples/c/copy_prop_across_join` whose
 //      `optimizedPipelines: [mem2reg-only]` arm re-spawns the OS
 //      process under Mem2Reg + diff-asserts vs the baseline.
 //

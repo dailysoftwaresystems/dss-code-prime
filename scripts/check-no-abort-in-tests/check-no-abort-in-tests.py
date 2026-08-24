@@ -129,7 +129,7 @@ INVENTORY: dict[str, int] = {
     'tests/asm/test_asm_x86_variable.cpp': 1,
     'tests/core/e2e_harness.hpp': 1,
     'tests/core/test_diagnostic_budget_threading.cpp': 1,
-    'tests/hir/test_hir_lowering_c_subset.cpp': 11,
+    'tests/hir/test_hir_lowering_c.cpp': 11,
     'tests/hir/test_hir_lowering_multi_lang.cpp': 1,
     'tests/hir/test_hir_lowering_toy.cpp': 2,
     'tests/hir/test_hir_lowering_tsql.cpp': 2,
@@ -141,7 +141,7 @@ INVENTORY: dict[str, int] = {
     'tests/lir/test_lir_verifier.cpp': 2,
     'tests/lir/test_mir_to_lir.cpp': 2,
     'tests/mir/test_mir.cpp': 2,
-    'tests/mir/test_mir_lowering_c_subset.cpp': 5,
+    'tests/mir/test_mir_lowering_c.cpp': 5,
     'tests/opt/test_prune_unreachable.cpp': 1,
     'tests/test_support/run_binary.hpp': 1,
 }

@@ -62,7 +62,7 @@ struct Built {
 [[nodiscard]] Built buildModuleWithExtern(TypeInterner& ti) {
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     constexpr std::uint32_t kExternSymV = 17;
     HirNodeId const ef =
         b.makeExternFunction(fnTy, /*symbol=*/kExternSymV, {});
@@ -576,7 +576,7 @@ TEST(FfiIngest, MultipleExternsAllMatchedGetAnnotated) {
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const ef1 = b.makeExternFunction(fnTy, /*symbol=*/100, {});
     HirNodeId const ef2 = b.makeExternFunction(fnTy, /*symbol=*/101, {});
     HirNodeId const root = b.makeModule(std::array{ef1, ef2});
@@ -1116,7 +1116,7 @@ TEST(FfiSynthesize, OperandStackAbiModelShortCircuitsWithDedicatedCode) {
 
 TEST(FfiSynthesize, MultipleExternsAllReceiveSameLibrary) {
     // All externs in one synthesis call share the per-format
-    // library — the typical c-subset shape (every extern in a
+    // library — the typical c shape (every extern in a
     // single TU resolves to the same runtime DLL). Pin distinct
     // per-extern mangledNames + identical importLibrary so a
     // refactor that accidentally cross-binds the library trips
@@ -1124,7 +1124,7 @@ TEST(FfiSynthesize, MultipleExternsAllReceiveSameLibrary) {
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const ef1 = b.makeExternFunction(fnTy, /*symbol=*/200, {});
     HirNodeId const ef2 = b.makeExternFunction(fnTy, /*symbol=*/201, {});
     HirNodeId const root = b.makeModule(std::array{ef1, ef2});
@@ -1195,7 +1195,7 @@ TEST(FfiSynthesize, ELFFormatNoLeadingUnderscore) {
 TEST(FfiSynthesize, ExternGlobalAlsoReceivesMangling) {
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     constexpr std::uint32_t kSymV = 300;
     HirNodeId const eg = b.makeExternGlobal(i32, /*symbol=*/kSymV);
     HirNodeId const root = b.makeModule(std::array{eg});
@@ -1232,7 +1232,7 @@ TEST(FfiSynthesize, MixedValidityPartialAnnotation) {
     TypeInterner ti = makeInterner();
     TypeId const i32  = ti.primitive(TypeKind::I32);
     TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const efBad  = b.makeExternFunction(fnTy, /*sym=*/400, {});
     HirNodeId const efGood = b.makeExternFunction(fnTy, /*sym=*/401, {});
     HirNodeId const root = b.makeModule(std::array{efBad, efGood});

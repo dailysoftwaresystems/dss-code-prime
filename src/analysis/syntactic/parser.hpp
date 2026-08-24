@@ -86,7 +86,7 @@ struct DSS_EXPORT ParserConfig {
     //
     // The cap is a real SEMANTIC limit on nesting depth, not a host-stack
     // artifact. Both former blockers to a high cap are resolved:
-    // (1) the c-subset `operand` rule's speculative cast-vs-paren probe is
+    // (1) the c `operand` rule's speculative cast-vs-paren probe is
     // no longer super-linear — a config-driven LL(k) predictive prune makes
     // the parse O(N) in nesting depth (D-PARSE-SPECULATION-OPERAND-QUADRATIC,
     // closed), so the guard is reached promptly even at this cap; (2) the
@@ -100,13 +100,13 @@ struct DSS_EXPORT ParserConfig {
     // CONFIG-DRIVEN (plan-24 Stage 7): this is the FALLBACK default. The CU
     // build OVERRIDES it from the language's `.lang.json`
     // (`parser.maxExpressionDepth`) via `parserConfigFor` in
-    // compilation_unit.cpp — c-subset declares 1024; a language that omits the
+    // compilation_unit.cpp — c declares 1024; a language that omits the
     // key keeps this 256 fallback. The value is BOUNDED, not unbounded,
     // because ONE recursion remains: the parser's paren/postfix-body arm (the
     // deferred plan-24 Stage 5b) still costs a host frame per nested `(` on the
     // 64 MiB worker. The cap is the fail-loud SAFETY BACKSTOP for that arm — it
     // must trip BEFORE the worker overflows on the worst supported build (the
-    // measured paren-crash floor is ~3000 on MSVC Debug; c-subset's 1024 sits
+    // measured paren-crash floor is ~3000 on MSVC Debug; c's 1024 sits
     // ~3x below it). A nest past the configured cap emits a positioned
     // `P_ExpressionTooDeep` with graceful recovery — NEVER a raw stack overflow.
     std::size_t maxExpressionDepth = 256;

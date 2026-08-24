@@ -28,13 +28,13 @@ dss_add_test(NAME lir/test_lir_earlyclobber SOURCES test_lir_earlyclobber.cpp)
 dss_add_test(NAME lir/test_lir_two_address_tie SOURCES test_lir_two_address_tie.cpp)
 target_link_libraries(dss_lir_test_lir_two_address_tie PRIVATE nlohmann_json::nlohmann_json)
 # D-LIR-TIED-OPERAND-NOT-EXPRESSIBLE (the asm half): a `"+r"` operand's two
-# halves bind to ONE register. Drives the REAL c-subset → HIR → MIR → LIR
+# halves bind to ONE register. Drives the REAL c → HIR → MIR → LIR
 # lowering for the positive claim and its untied control, and hand-builds the
 # two descriptor shapes that must still REFUSE.
 dss_add_test(NAME lir/test_lir_asm_tied_operand SOURCES test_lir_asm_tied_operand.cpp)
 # D-LIR-ASM-GOTO-REFUSAL-NAMES-A-CONFIG-GAP-THAT-NO-LONGER-EXISTS (P20): the
 # `asm goto` label edge, the fall-through edge, result piece 0 and the two
-# refusals that must NOT become acceptance. Drives the REAL c-subset → HIR →
+# refusals that must NOT become acceptance. Drives the REAL c → HIR →
 # MIR → LIR lowering, because the property is a relation between what the front
 # end minted (the spellings) and what this tier bound (the blocks).
 dss_add_test(NAME lir/test_lir_asm_goto_labels SOURCES test_lir_asm_goto_labels.cpp)
@@ -88,13 +88,13 @@ dss_add_test(NAME lir/test_lir_frame_slot_stride
 # D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND + D-TARGET-NO-CROSS-CLASS-MOVE-VERB: the
 # inline-asm operand materialisation used ONE module-wide integer `mov` for
 # every operand whatever class it bound — a live silent miscompile on both
-# shipped targets. Drives the REAL c-subset -> HIR -> MIR -> LIR lowering.
+# shipped targets. Drives the REAL c -> HIR -> MIR -> LIR lowering.
 dss_add_test(NAME lir/test_lir_asm_operand_move_class
              SOURCES test_lir_asm_operand_move_class.cpp)
 
 # D-ASM-MEMORY-CONSTRAINT-OUTPUT-FORM-NOT-REALIZED: a memory-form constraint in
 # the OUTPUT section (`"=m"`, `"+m"`, `"=&m"`) is carried as the object's
-# ADDRESS and mints no result piece. Drives the REAL c-subset -> HIR -> MIR ->
+# ADDRESS and mints no result piece. Drives the REAL c -> HIR -> MIR ->
 # LIR lowering on BOTH shipped targets, because the property is a relation
 # between the source's output SECTION and the descriptor's result-piece list.
 dss_add_test(NAME lir/test_lir_asm_memory_output

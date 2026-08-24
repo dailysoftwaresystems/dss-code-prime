@@ -1,0 +1,54 @@
+{
+  "$comment": "c85 (shell.c `atexit(abnormalExit)`): the per-format MACRO/SYMBOL SPLIT (the errno.json pattern, pure config, zero engine change). elf: glibc exports no dynamic `atexit` (import fails at LOAD, witnessed c82) -> `atexit(f)` is a function-like macro (C 7.1.4p1) expanding to `__cxa_atexit((void (*)(void *))(f), 0, 0)` — glibc's own shim semantics (dso_handle=NULL = main-program registration); __cxa_atexit is the import (T, single-version, both arches). pe (REWRITTEN BY TF-C111, and the text it replaces is recorded because it was load-bearing and is now FALSE — it read: 'no macro variant (0-match => un-injected) — `atexit` is the direct msvcrt.dll export (objdump-verified [1068]); ExitProcess runs msvcrt's onexit table at its CRT DLL-detach'): pe gets a MACRO TOO — `atexit` -> `_crt_atexit`, a PLAIN RENAME (object-like, no parameter list; the two signatures are BYTE-IDENTICAL `fn(ptr<fn() -> void>) -> i32`, so no adapter, unlike the elf arm's 3-argument reshape). ✔MEASURED on two instruments (`objdump -p` + a direct PE export-directory parse, both at OrdinalBase=1): ucrtbase.dll exports NO `atexit` AT ALL — UCRT's is a static-lib shim over the exported `_crt_atexit` (ordinal 203), the same shape as glibc's libc_nonshared.a shim over `__cxa_atexit`; msvcrt.dll does export `atexit` (ordinal 1069) and NO `_crt_atexit`, so the old claim was true of msvcrt and died when `library.pe` became ucrtbase.dll. THE DELIVERY MECHANISM MOVED IN THE SAME COMMIT and that pair is what makes this example load-bearing: `_crt_atexit` registers fine but its callbacks NEVER FIRE on return-from-main under the old spine, because DSS terminated via kernel32 `ExitProcess` and ucrtbase's DLL-detach flushes streams WITHOUT running the app's onexit table (msvcrt's detach DID run it — the regression the migration would otherwise have introduced SILENTLY). So pe64-x86_64-windows-exec.format.json's `processExit` is now the ucrtbase `exit` import, uniform with elf's libc `exit` and macho's libSystem `_exit`. THE RUN PROVES THE HANDLER FIRES AT EXIT: main writes+flushes its marker then returns 42 (≡ exit(42), C 5.1.2.2.3); exit runs handlers BEFORE stream close (7.22.4.4) so the handler's line lands second; the handler prints ONLY if it observed main's last write (mainRan==1) — the strict two-line stdout + exit-42 assertion fails on a dropped, early, or spurious registration. macho: the DIRECT `atexit` symbol — Darwin's libSystem exports `_atexit` (c117), so `atexit(f)` resolves to libSystem `_atexit` and NEITHER macro variant matches (0-match/un-injected on macho); ⚠ the SYMBOL row is gated [\"macho\"] ALONE now, not [pe,macho] as an earlier revision of this clause said — pe moved to the macro arm above at TF-C111 and the symbol narrowed in the same edit. LF stdout (no UCRT text-mode \\r\\n). RED-ON-DISABLE witnessed: drop this format's arm — the MACRO variant on elf OR on pe, or the [\"macho\"] SYMBOL row -> S0001 `got atexit`. On pe there is a SECOND, independent half: reverting `processExit` to kernel32 `ExitProcess` while keeping the macro compiles and links CLEAN and merely drops the handler's line, so the byte-exact stdout pin below is the only thing that catches it. gcc -std=c17 cross-checked in WSL (exit 42, identical stdout). Line endings follow the adjacent_string_concat convention: the pe CRT's text-mode stdout emits \\r\\n (ucrtbase since TF-C111, msvcrt before it — the translation is identical, so the pin did not move), so the manifest-level pin is the pe form and each elf/macho target overrides with the \\n form.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "atexit:main-done\r\natexit:handler-ran\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "expectedStdout": "atexit:main-done\natexit:handler-ran\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "atexit:main-done\natexit:handler-ran\n"
+    },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "", "expectedStdout": "atexit:main-done\natexit:handler-ran\n" }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": [
+        "ConstFold",
+        "Mem2Reg",
+        "CopyProp",
+        "Cse",
+        "Licm",
+        "SimplifyCfg",
+        "Dce"
+      ],
+      "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: arm64:elf64-aarch64-linux-exec, x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST: the work this example pins happens behind an EXTERN call the pipeline cannot see through, so no pass has a body to transform on this side of the call. Every observable step is an extern libc call (`atexit`, `puts`, `fflush`). Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in."
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: arm64:elf64-aarch64-linux-exec, x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST: the work this example pins happens behind an EXTERN call the pipeline cannot see through, so no pass has a body to transform on this side of the call. Every observable step is an extern libc call (`atexit`, `puts`, `fflush`). Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in."
+    }
+  ]
+}

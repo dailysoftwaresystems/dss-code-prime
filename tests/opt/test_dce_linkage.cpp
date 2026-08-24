@@ -9,7 +9,7 @@
 //   * PE .exe emits zero IMAGE_SYMBOL table (`pe.cpp`).
 //     A corpus-runner symbol-table-inspection check would need
 //     FF1-PE for .exe (not shipped — FF1-PE is anchored).
-//   * c-subset has no `static` keyword (no parser path produces
+//   * c has no `static` keyword (no parser path produces
 //     SymbolBinding::Local). The MIR-tier fixture must be hand-built.
 //   * MIR-tier inspection is format-blind + works on every host.
 //     The `isExternallyVisible(funcBinding, funcVisibility)` predicate

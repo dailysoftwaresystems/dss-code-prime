@@ -136,7 +136,7 @@ struct Schemas {
     auto r = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin");
     auto e = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-exec");
     auto l = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-staticlib");
-    auto g = GrammarSchema::loadShipped("c-subset");
+    auto g = GrammarSchema::loadShipped("c");
     if (!t || !r || !e || !l || !g) {
         ADD_FAILURE() << "macho x86_64 schema load failed";
         return s;
@@ -161,7 +161,7 @@ void loadStaticlibSchema(Schemas& s, std::string_view name) {
     auto t = TargetSchema::loadShipped("x86_64");
     auto r = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
     auto e = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
-    auto g = GrammarSchema::loadShipped("c-subset");
+    auto g = GrammarSchema::loadShipped("c");
     if (!t || !r || !e || !g) { ADD_FAILURE() << "schema load failed"; return s; }
     s.target = std::move(t).value();
     s.reloc  = std::move(r).value();
@@ -179,7 +179,7 @@ void loadStaticlibSchema(Schemas& s, std::string_view name) {
     auto t = TargetSchema::loadShipped("arm64");
     auto r = ObjectFormatSchema::loadShipped("macho64-arm64-darwin");
     auto e = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
-    auto g = GrammarSchema::loadShipped("c-subset");
+    auto g = GrammarSchema::loadShipped("c");
     if (!t || !r || !e || !g) { ADD_FAILURE() << "macho schema load failed"; return s; }
     s.target = std::move(t).value();
     s.reloc  = std::move(r).value();
@@ -196,7 +196,7 @@ void loadStaticlibSchema(Schemas& s, std::string_view name) {
     auto t = TargetSchema::loadShipped("x86_64");
     auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
     auto e = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
-    auto g = GrammarSchema::loadShipped("c-subset");
+    auto g = GrammarSchema::loadShipped("c");
     if (!t || !r || !e || !g) { ADD_FAILURE() << "coff schema load failed"; return s; }
     s.target = std::move(t).value();
     s.reloc  = std::move(r).value();
@@ -214,7 +214,7 @@ void loadStaticlibSchema(Schemas& s, std::string_view name) {
     return static_cast<std::uint16_t>(std::distance(span.data(), abi->cc));
 }
 
-// Compile one c-subset source string to an AssembledModule for `format`.
+// Compile one c source string to an AssembledModule for `format`.
 [[nodiscard]] std::optional<AssembledModule>
 assembleFromSource(std::string src, std::string label, Schemas const& s,
                    ObjectFormatSchema const& format, DiagnosticReporter& rep) {
@@ -541,7 +541,7 @@ TEST(StaticLink, DriverStaticLinkBuildsSelfContainedExec) {
     p.setResolveLibraries(std::vector<fs::path>{archive});
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{mainSrc.string()}, "c-subset",
+        std::vector<std::string>{mainSrc.string()}, "c",
         std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"}, rep);
     ASSERT_EQ(rc, 0) << "static-link build must succeed; errs=" << rep.errorCount();
     auto const mainPath = dir / "main";
@@ -597,7 +597,7 @@ TEST(StaticLink, DriverStaticLinkBuildsSelfContainedExec) {
     Program pNo;
     pNo.setOutputDir(dirNo);
     DiagnosticReporter repNo;
-    EXPECT_NE(pNo.compileFiles(std::vector<std::string>{mainNo.string()}, "c-subset",
+    EXPECT_NE(pNo.compileFiles(std::vector<std::string>{mainNo.string()}, "c",
                   std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"}, repNo), 0)
         << "without the static pull, the unresolved reference to dss_lib_answer "
            "must FAIL THE BUILD -- never quietly become a dynamic import of a "
@@ -670,7 +670,7 @@ TEST(StaticLink, RealGccSectionRelativeJumpTableLibExitsFortyTwo) {
     p.setResolveLibraries(std::vector<fs::path>{archive});
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{mainSrc.string()}, "c-subset",
+        std::vector<std::string>{mainSrc.string()}, "c",
         std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"}, rep);
     ASSERT_EQ(rc, 0)
         << "static-link of the real gcc jump-table lib must succeed (the reader must "
@@ -791,7 +791,7 @@ TEST(StaticLink, MachODriverStaticLinkBuildsSelfContainedExec) {
     p.setResolveLibraries(std::vector<fs::path>{archive});
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{mainSrc.string()}, "c-subset",
+        std::vector<std::string>{mainSrc.string()}, "c",
         std::vector<std::string>{"arm64:macho64-arm64-darwin-exec"}, rep);
     ASSERT_EQ(rc, 0) << "Mach-O static-link build must succeed; errs=" << rep.errorCount();
     auto const mainPath = dir / "main";
@@ -886,7 +886,7 @@ TEST(StaticLink, CoffDriverStaticLinkExitsFortyTwo) {
     p.setResolveLibraries(std::vector<fs::path>{archive});
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{mainSrc.string()}, "c-subset",
+        std::vector<std::string>{mainSrc.string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
     ASSERT_EQ(rc, 0) << "COFF static-link build must succeed; errs=" << rep.errorCount();
     auto mainPath = dir / "main.exe";
@@ -932,7 +932,7 @@ TEST(StaticLink, DISABLED_RealLibcWitnessArtifactDrop) {
     p.setOutputDir(outDir);
     p.setResolveLibraries(std::vector<fs::path>{archive});
     DiagnosticReporter rep;
-    ASSERT_EQ(p.compileFiles(std::vector<std::string>{mainSrc.string()}, "c-subset",
+    ASSERT_EQ(p.compileFiles(std::vector<std::string>{mainSrc.string()}, "c",
                   std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"}, rep), 0)
         << "errs=" << rep.errorCount();
     std::cout << "[witness] wrote " << archive.string() << "\n";
@@ -951,7 +951,7 @@ TEST(StaticLink, DISABLED_RealLibcWitnessArtifactDrop) {
 // EXACT member count + armap symbol set, its member bytes a real ET_REL.
 
 namespace {
-// A single 2-function c-subset source -> ONE CU -> ONE archive member exporting
+// A single 2-function c source -> ONE CU -> ONE archive member exporting
 // BOTH `dss_add` + `dss_sub`. (Shared by the ELF / PE / Mach-O driver witnesses.)
 constexpr std::string_view kTwoFnLibSrc =
     "int dss_add(int a,int b){ return a+b; }\n"
@@ -967,7 +967,7 @@ TEST(StaticLink, ElfStaticLibDriverEmitsArchiveWithArmap) {
     p.setOutputDir(dir);
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{src.string()}, "c-subset",
+        std::vector<std::string>{src.string()}, "c",
         std::vector<std::string>{"x86_64:elf64-x86_64-linux-staticlib"}, rep);
     ASSERT_EQ(rc, 0) << "ELF staticlib build must succeed; errs=" << rep.errorCount();
 
@@ -1021,7 +1021,7 @@ TEST(StaticLink, PeStaticLibDriverEmitsCoffLibWithSecondLinkerMember) {
     p.setOutputDir(dir);
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{src.string()}, "c-subset",
+        std::vector<std::string>{src.string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-staticlib"}, rep);
     ASSERT_EQ(rc, 0) << "PE staticlib build must succeed; errs=" << rep.errorCount();
 
@@ -1080,7 +1080,7 @@ TEST(StaticLink, StaticLibDriverMergesInputStaticArchive) {
     p.setResolveLibraries(std::vector<fs::path>{inputArchive});
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{src.string()}, "c-subset",
+        std::vector<std::string>{src.string()}, "c",
         std::vector<std::string>{"x86_64:elf64-x86_64-linux-staticlib"}, rep);
     ASSERT_EQ(rc, 0) << "fat-archive staticlib build must succeed; errs="
                      << rep.errorCount();
@@ -1147,7 +1147,7 @@ TEST(StaticLink, StaticLibFatArchiveExecRunsFortyTwo) {
     pLib.setResolveLibraries(std::vector<fs::path>{inputArchive});
     DiagnosticReporter repLib;
     ASSERT_EQ(pLib.compileFiles(
-                  std::vector<std::string>{libSrc.string()}, "c-subset",
+                  std::vector<std::string>{libSrc.string()}, "c",
                   std::vector<std::string>{"x86_64:elf64-x86_64-linux-staticlib"},
                   repLib),
               0) << "fat lib build must succeed; errs=" << repLib.errorCount();
@@ -1162,7 +1162,7 @@ TEST(StaticLink, StaticLibFatArchiveExecRunsFortyTwo) {
     pMain.setResolveLibraries(std::vector<fs::path>{fatLib});
     DiagnosticReporter repMain;
     int const rc = pMain.compileFiles(
-        std::vector<std::string>{mainSrc.string()}, "c-subset",
+        std::vector<std::string>{mainSrc.string()}, "c",
         std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"}, repMain);
     ASSERT_EQ(rc, 0) << "link against the fat lib must succeed; errs="
                      << repMain.errorCount();
@@ -1215,7 +1215,7 @@ TEST(StaticLink, PeFatArchiveSequentialInProcessMergeExecRunsFortyTwo) {
     pInput.setOutputDir(dir);
     DiagnosticReporter repInput;
     ASSERT_EQ(pInput.compileFiles(
-                  std::vector<std::string>{inputSrc.string()}, "c-subset",
+                  std::vector<std::string>{inputSrc.string()}, "c",
                   std::vector<std::string>{kStaticlibSpec}, repInput),
               0) << "input.lib build must succeed; errs=" << repInput.errorCount();
     auto const inputLib = dir / "input.lib";
@@ -1230,7 +1230,7 @@ TEST(StaticLink, PeFatArchiveSequentialInProcessMergeExecRunsFortyTwo) {
     pFat.setResolveLibraries(std::vector<fs::path>{inputLib});
     DiagnosticReporter repFat;
     int const rcFat = pFat.compileFiles(
-        std::vector<std::string>{fatSrc.string()}, "c-subset",
+        std::vector<std::string>{fatSrc.string()}, "c",
         std::vector<std::string>{kStaticlibSpec}, repFat);
     ASSERT_EQ(rcFat, 0) << "fat-archive staticlib build (the MERGE) must succeed; "
                            "errs=" << repFat.errorCount();
@@ -1264,7 +1264,7 @@ TEST(StaticLink, PeFatArchiveSequentialInProcessMergeExecRunsFortyTwo) {
     pMain.setResolveLibraries(std::vector<fs::path>{fatLib});
     DiagnosticReporter repMain;
     int const rcMain = pMain.compileFiles(
-        std::vector<std::string>{mainSrc.string()}, "c-subset",
+        std::vector<std::string>{mainSrc.string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, repMain);
     ASSERT_EQ(rcMain, 0) << "link against the fat lib must succeed; errs="
                          << repMain.errorCount();
@@ -1298,7 +1298,7 @@ TEST(StaticLink, MachoStaticLibDriverEmitsArchive) {
     p.setOutputDir(dir);
     DiagnosticReporter rep;
     int const rc = p.compileFiles(
-        std::vector<std::string>{src.string()}, "c-subset",
+        std::vector<std::string>{src.string()}, "c",
         std::vector<std::string>{"arm64:macho64-arm64-darwin-staticlib"}, rep);
     ASSERT_EQ(rc, 0) << "Mach-O staticlib build must succeed; errs=" << rep.errorCount();
 
@@ -1360,7 +1360,7 @@ TEST(StaticArchive, ReleaseMemberIsProgramStageOptimized) {
         prog.setOutputDir(outDir);
         DiagnosticReporter rep;
         int const rc = prog.compileUnits(
-            files, "c-subset", {"x86_64:elf64-x86_64-linux-staticlib"}, rep);
+            files, "c", {"x86_64:elf64-x86_64-linux-staticlib"}, rep);
         EXPECT_EQ(rc, 0) << label << " build must succeed";
         if (rc != 0) return std::vector<std::uint8_t>{};
         fs::path artifact = outDir / (std::string{label} + ".a");
@@ -1406,7 +1406,7 @@ TEST(StaticArchive, ReleaseMemberIsProgramStageOptimized) {
         std::vector<std::string> files;
         files.push_back(srcPath.generic_string());
         ASSERT_EQ(prog.compileUnits(
-                      files, "c-subset",
+                      files, "c",
                       {"x86_64:elf64-x86_64-linux-staticlib"}, rep), 0);
     }
     EXPECT_EQ(substrate::PhaseTimers::read(substrate::CompilePhase::Optimize)
@@ -2621,7 +2621,7 @@ TEST(StaticLink, PeArchiveMemberBindsAnOperatorNamedLibraryThroughTheDriver) {
     pDyn.setOutputDir(dir);
     DiagnosticReporter repDyn;
     ASSERT_EQ(pDyn.compileFiles(
-                  std::vector<std::string>{dynSrc.string()}, "c-subset",
+                  std::vector<std::string>{dynSrc.string()}, "c",
                   std::vector<std::string>{"x86_64:pe64-x86_64-windows-dll"},
                   repDyn),
               0) << "dynsrc.dll build must succeed; errs=" << repDyn.errorCount();
@@ -2638,7 +2638,7 @@ TEST(StaticLink, PeArchiveMemberBindsAnOperatorNamedLibraryThroughTheDriver) {
     pLib.setResolveLibraries(std::vector<fs::path>{dynDll});
     DiagnosticReporter repLib;
     ASSERT_EQ(pLib.compileFiles(
-                  std::vector<std::string>{usesSrc.string()}, "c-subset",
+                  std::vector<std::string>{usesSrc.string()}, "c",
                   std::vector<std::string>{"x86_64:pe64-x86_64-windows-staticlib"},
                   repLib),
               0) << "usesdyn.lib build must succeed; errs=" << repLib.errorCount();
@@ -2652,7 +2652,7 @@ TEST(StaticLink, PeArchiveMemberBindsAnOperatorNamedLibraryThroughTheDriver) {
     pClient.setResolveLibraries(std::vector<fs::path>{dynDll, usesLib});
     DiagnosticReporter repClient;
     int const rcClient = pClient.compileFiles(
-        std::vector<std::string>{clientSrc.string()}, "c-subset",
+        std::vector<std::string>{clientSrc.string()}, "c",
         std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, repClient);
     EXPECT_EQ(countCode(repClient, DiagnosticCode::K_SymbolUndefined), 0u)
         << "the pulled member's dss_dyn_answer must bind to the library the "

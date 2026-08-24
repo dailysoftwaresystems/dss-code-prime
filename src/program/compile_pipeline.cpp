@@ -276,7 +276,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
 // explicit work-stacks (O(1) host-stack per level), so their OWN recursion no
 // longer drives stack depth; the worker is RETAINED (BC-1) because the parser's
 // residual paren/postfix arm can still build a deep tree (bounded by the
-// config-driven cap, c-subset = 1024) and as defense-in-depth for any not-yet-
+// config-driven cap, c = 1024) and as defense-in-depth for any not-yet-
 // proven-flat recursion these stages reach. HIR/MIR run inline on the caller's
 // thread AFTER `analyze`'s own worker has joined, so the WHOLE BUILD half runs
 // on a 64 MiB worker stack (synchronous join — no concurrency). NOTE: `analyze`
@@ -1593,7 +1593,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     //     init thunk. Never referenced across CUs by name; resolved intra-module by id.
     //   * (single-CU) a SymbolId with no SemanticModel record at all — `nameOf`'s
     //     `recordFor(s) ? name : ""` returns "" exactly as the old `rec == nullptr`
-    //     skip did. Byte-identical: every REAL c-subset func/global has a non-empty
+    //     skip did. Byte-identical: every REAL c func/global has a non-empty
     //     declared name, so only synthesized symbols hit the "" skip in the corpus.
     // (The pre-Cycle-25 monolith ALSO had an `empty-name && non-Local` fail-loud arm;
     // it required a symbol with a record but an empty name — a state the semantic

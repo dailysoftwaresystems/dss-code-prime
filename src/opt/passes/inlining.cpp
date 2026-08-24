@@ -307,7 +307,7 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // safety attribute and is EMPTY through every real compile (no
             // sema/lowering path registers or emits an intrinsic; only the
             // HIR text format can, in tests). That precondition is pinned by
-            // a fail-loud tripwire (the c-subset lowering test asserting an
+            // a fail-loud tripwire (the c lowering test asserting an
             // empty registry), so blanket admission is correct for the
             // current intrinsic model. Gating on a per-intrinsic inline-
             // safety attribute is trigger-gated to the first frame-sensitive

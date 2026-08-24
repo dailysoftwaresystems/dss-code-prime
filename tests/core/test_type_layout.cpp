@@ -1658,7 +1658,7 @@ TEST(TypeLayout, WideBitIntTypeShapePredicates) {
 // and a SIZE but NOT a LAYOUT, and the whole 128-bit design depends on those two facts
 // staying independent. `_BitInt(128)` is 16/8 — size 16, align EIGHT — because the
 // x86-64 psABI aligns a bit-precise type to its limb, not its size (computeLayout's
-// BitInt arm hardcodes alignBytes=8 for N>64, and examples/c-subset/c23_bitint_wide
+// BitInt arm hardcodes alignBytes=8 for N>64, and examples/c/c23_bitint_wide
 // pins it from real C). U128 is 16/16 — the ordinary natural-alignment rule applied to
 // a 16-byte scalar via scalarByteSize. MEASURED against the shipped consumer: the pe/
 // x86_64 `jmp_buf` is `arr<u128,16>` (shippedLibs/setjmp.json), sizeof 256, _Alignof 16
@@ -1695,7 +1695,7 @@ TEST(TypeLayout, Int128AndBitInt128AreIndependentLayouts) {
 
 // ★ D-CSUBSET-UINT128-TYPE: the align-16 fact PROPAGATED THROUGH A REAL AGGREGATE, and
 // the C++ twin of the `_Static_assert(sizeof(struct N) == 528)` in
-// examples/c-subset/c_int128_arith/main.c. Two reasons this lives here as well:
+// examples/c/c_int128_arith/main.c. Two reasons this lives here as well:
 //
 //  1. UN-MASKABLE. A failed `_Static_assert` ABORTS translation, so if the example's
 //     compile-time block ever turns red it takes every runtime pin in that file with

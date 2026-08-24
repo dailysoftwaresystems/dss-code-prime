@@ -975,7 +975,7 @@ TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallCo
     // pre-13.4 callers (30+ sites in semantic / hir / mir / lir / ffi
     // not yet ported to the 4-arg overload). The 2-slot form opts in
     // to variadic encoding only at sites that explicitly declare it
-    // — c-subset's `...` paramList tail is the only declarer today.
+    // — c's `...` paramList tail is the only declarer today.
     // Decoder `fnIsVariadic` handles both forms (false for legacy).
     std::vector<TypeId> ops;
     ops.reserve(params.size() + 1);

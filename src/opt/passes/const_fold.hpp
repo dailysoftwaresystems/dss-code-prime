@@ -3,7 +3,7 @@
 // MIR-tier constant-folding pass.
 //
 // Scope: integer + bool + bitwise + integer-comparison fold. Float and
-// cast opcodes are deferred (no Float arithmetic in c-subset today;
+// cast opcodes are deferred (no Float arithmetic in c today;
 // Cast-arm dispatch lands when needed). Folds pure-functional opcodes
 // whose operands all resolve to `Const` instructions at compile time,
 // replacing the result with a new `Const` emitted into the rebuilt

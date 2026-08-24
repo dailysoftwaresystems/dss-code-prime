@@ -1106,7 +1106,7 @@ void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {
             // no cast at all (6.3.2.3p1).
             //
             // MEASURED at TF-C112, and this is the shape that forced it: for
-            // `int vsum(int, va_list)` (examples/c-subset/va_list_param_forward),
+            // `int vsum(int, va_list)` (examples/c/va_list_param_forward),
             // the BASELINE module passes `ap` as a `Load` of the slot, typed
             // with the declared `va_list` (= `ptr<i8>` under Win64) — an exact
             // match. Running **Mem2Reg** (isolated: the diagnostic appears

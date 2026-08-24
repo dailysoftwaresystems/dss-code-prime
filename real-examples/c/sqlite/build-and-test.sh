@@ -77,7 +77,7 @@
 #   7. build the full-source `testfixture` with dss-code-prime, once PER LEG,
 #      from a generated `.dss-project.json` manifest (dss --project mode). Every
 #      declared leg is attempted, on every host. Each leg's manifest declares
-#      c-subset / cli / the leg's <targetName>:<formatName> target / the ~185 TUs
+#      c / cli / the leg's <targetName>:<formatName> target / the ~185 TUs
 #      (absolute `sources`) / the sqlite+tcl+zlib include dirs / the recipe defines
 #      (transformed per the leg's declared `recipeTransform`) / the leg's own
 #      resolveLibraries / its declared `stackReserve`; the build routes the binary
@@ -142,7 +142,7 @@ SRC_DIR="${SRC_DIR:-$HOME/src/dss-code-prime}"
 SQLITE_DIR="${SQLITE_DIR:-$HOME/src/sqlite}"
 OUT_DIR="${OUT_DIR:-$SRC_DIR/build/real-examples/c/sqlite}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
-LANGUAGE="c-subset"
+LANGUAGE="c"
 MIN_CMAKE_MAJOR=4
 # ── WHICH dss-code-prime IS UNDER TEST — declared, not inferred ───────────────
 # D-HARNESS-SH-SRC-DIR-GIT-REQUIRED-VS-RSYNC-GATE. Step 2 used to decide this from

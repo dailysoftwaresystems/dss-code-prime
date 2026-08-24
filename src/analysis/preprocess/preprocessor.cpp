@@ -6268,8 +6268,8 @@ TranslationTimestamp translationTimestamp() {
     // `__TIME__` at the same instant read a buffer the other is overwriting —
     // a silent wrong-spelling race, not a crash. Since D-PERF-4 the driver
     // builds the front half of every TU on a thread pool, so that is a real
-    // interleaving rather than a theoretical one, and c-subset declares BOTH
-    // macros (`c-subset.lang.json`), so the path is live for every C compile.
+    // interleaving rather than a theoretical one, and c declares BOTH
+    // macros (`c.lang.json`), so the path is live for every C compile.
     // The reentrant spelling fills a CALLER-OWNED `tm`; the `_WIN32` / POSIX
     // split is pure host portability (which name the host libc gives the
     // reentrant function), never a target or format identity.

@@ -1436,7 +1436,7 @@ struct CliArmOutcome {
 // be satisfied by a build that never received the flag.
 //
 // ✔MEASURED 2026-08-17 (the control experiment that makes this sound, run before
-// the instrument was written): compiling `examples/c-subset/array_decay/main.c`
+// the instrument was written): compiling `examples/c/array_decay/main.c`
 // for `x86_64:pe64-x86_64-windows-exec` TWICE into two DIFFERENT output
 // directories produced BYTE-IDENTICAL images, and the same source at
 // `--config=release` produced a DIFFERENT one (first difference at byte 401).
@@ -1549,7 +1549,7 @@ std::size_t dependencyImagesDiffered  = 0;
     // mirrors every regular file except the manifest into its scratch dir and
     // then makes that dir the CWD; this runner did neither, so an example that
     // needs a file AT RUN TIME passed in-process and failed here. Measured on
-    // exactly that: `examples/c-subset/environ_alias_object_identity` ships a
+    // exactly that: `examples/c/environ_alias_object_identity` ships a
     // prebuilt gcc-built `.so` it dlopens as `./libdss_env_probe_<arch>.so`
     // (an OBJECT-IDENTITY property cannot be witnessed by one image, so the
     // example needs a second image DSS did not build) — green in-process,
@@ -3772,7 +3772,7 @@ void runSourceArgumentShapePin(std::string const& compiler,
         auto const cliLog = outDir / "cli.log";
         std::string const cmd = quote(compiler)
             + " --compile "  + quote(argument)
-            + " --language c-subset"
+            + " --language c"
             + " --target "   + spec
             + " --output "   + quote(outDir.string())
             + " > " + quote(cliLog.string()) + " 2>&1";

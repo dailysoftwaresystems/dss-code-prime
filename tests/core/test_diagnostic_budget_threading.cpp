@@ -124,7 +124,7 @@ TEST(DiagnosticBudgetThreading, UnitBuilderSingleSchemaCtorGivesDriverReporterTh
 // ── SITE 2: UnitBuilder(vector<schema>, budget) → driverDiagnostics_ ────────
 TEST(DiagnosticBudgetThreading, UnitBuilderMultiSchemaCtorGivesDriverReporterTheBudget) {
     std::vector<std::shared_ptr<GrammarSchema const>> schemas{shipped("toy"),
-                                                              shipped("c-subset")};
+                                                              shipped("c")};
     UnitBuilder b{schemas, raisedBudget()};
     auto cu = std::move(b).finish();
     auto const& cfg = cu.driverDiagnostics().config();
@@ -183,7 +183,7 @@ TEST(DiagnosticBudgetThreading, UnitBuilderNonPreprocessTokenizerHonoursTheRaise
 
 // ── SITE 6: preprocessor.cpp `preprocessRun` → result.diagnostics ──────────
 TEST(DiagnosticBudgetThreading, PreprocessResultDiagnosticsCarriesTheBudget) {
-    auto schema = shipped("c-subset");
+    auto schema = shipped("c");
     auto src    = SourceBuffer::fromString("int main(void){return 0;}\n", "<inline>");
     PreprocessResult pp = preprocess(src, schema, {}, kDefaultHeaderNameMatching,
                                      raisedBudget());
@@ -200,7 +200,7 @@ TEST(DiagnosticBudgetThreading, PreprocessResultDiagnosticsCarriesTheBudget) {
 // the budget; `SourceEnumeration` below names each of the two sites
 // individually.
 TEST(DiagnosticBudgetThreading, PreprocessTokenizeChainHonoursTheRaisedPerCodeCap) {
-    auto schema = shipped("c-subset");
+    auto schema = shipped("c");
     auto src    = SourceBuffer::fromString(illegalCharSource(kIllegalCharLines),
                                            "<inline>");
     PreprocessResult pp = preprocess(src, schema, {}, kDefaultHeaderNameMatching,
@@ -217,7 +217,7 @@ TEST(DiagnosticBudgetThreading, PreprocessTokenizeChainHonoursTheRaisedPerCodeCa
 // The tier MEASURED producing `reporter cap of 1000` under
 // `--max-diagnostics=100000`.
 TEST(DiagnosticBudgetThreading, AnalyzeGivesTheSemanticModelTheBudget) {
-    UnitBuilder b{shipped("c-subset"), DiagnosticBudget::libraryDefault()};
+    UnitBuilder b{shipped("c"), DiagnosticBudget::libraryDefault()};
     b.addInMemory("int main(void){return 0;}\n", "<mem>");
     auto cu = std::make_shared<CompilationUnit const>(std::move(b).finish());
     SemanticModel model = analyze(cu, raisedBudget());

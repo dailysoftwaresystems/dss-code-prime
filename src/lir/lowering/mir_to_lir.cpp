@@ -1507,7 +1507,7 @@ struct Lowerer {
     // widths 64+32 since FC3.5 sweep-c2 — added for the composed-FCmp
     // materialization, which also un-walled source-level `&`/`|`;
     // arm64 AND/ORR X-form, width-absent variants) — witnessed by
-    // examples/c-subset/bitwise_and_or. The REMAINING walls, per
+    // examples/c/bitwise_and_or. The REMAINING walls, per
     // target: x86 declares xor/not WITHOUT encodings (they pass this
     // gate, lower, and fail loud at the assembler —
     // A_NoEncodingDeclared); arm64 ENCODES xor (EOR) but declares no
@@ -1746,7 +1746,7 @@ struct Lowerer {
             // that "proves" them by asserting a user program is refused would be
             // asserting the opposite of the measurement — the MIR-tier unit test
             // (tests/lir/test_mir_to_lir.cpp) drives them directly instead.
-            // Verified end-to-end on the pe leg by examples/c-subset/setjmp_longjmp,
+            // Verified end-to-end on the pe leg by examples/c/setjmp_longjmp,
             // which still builds and runs.
             case MirOpcode::Load: case MirOpcode::Const:
             case MirOpcode::Bitcast: {
@@ -3909,7 +3909,7 @@ struct Lowerer {
         // return-register read rather than the register the `"=r"` constraint
         // named.
         // ✔MEASURED 2026-08-19 by publishing from 1 and rebuilding
-        // `examples/c-subset/asm_goto_labels`: it does NOT reach a wrong answer
+        // `examples/c/asm_goto_labels`: it does NOT reach a wrong answer
         // — `lir_callconv`'s *"ret_piece … is not adjacent to its
         // struct-returning call"* refusal fires first, at both configs, because
         // an `asm goto`'s pieces LEAD a landing block and nothing calls
@@ -10092,7 +10092,7 @@ struct Lowerer {
             // (D-CSUBSET-32BIT-ALU-FORMS). Pinned (audit-residue sweep
             // c1, D-AUDIT-FUSED-CMP-WIDTH-PIN): the Fused{I32,I64}…
             // width pins in tests/lir/test_mir_to_lir.cpp + the
-            // examples/c-subset/fused_negative_compare runtime witness
+            // examples/c/fused_negative_compare runtime witness
             // (width-64 here flips its exit 42 → 7: a zero-extended
             // negative I32 reads as positive).
             emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps,

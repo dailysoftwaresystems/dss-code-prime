@@ -675,7 +675,7 @@ inline void expectRejectedAtPath(std::string_view jsonText,
 //
 // RED-on-disable: revert pe64-x86_64-windows-exec.format.json's processExit
 // to kernel32/ExitProcess and BOTH string EXPECTs fail here — plus
-// examples/c-subset/shipped_atexit goes red end-to-end on the Windows leg,
+// examples/c/shipped_atexit goes red end-to-end on the Windows leg,
 // which is the runtime witness this unit pin stands in for.
 TEST(LK10EntrySliceB, ShippedPeExecHasByNameImportProcessExit) {
     auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");

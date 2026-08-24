@@ -1,8 +1,8 @@
 // Pratt-walker unit pins. The walker drives operator-precedence climbing
 // for `expr`-shape rules. Tests here construct inline schemas with
 // targeted operator tables so each axis (left/right assoc, prefix,
-// postfix, mixed precedence) is covered in isolation. The c-subset
-// end-to-end pin lives in test_parser_c_subset_smoke.cpp; this file
+// postfix, mixed precedence) is covered in isolation. The c
+// end-to-end pin lives in test_parser_c_smoke.cpp; this file
 // pins the walker's structural output on minimal grammars where the
 // tree shape isn't obscured by surrounding syntax.
 
@@ -36,9 +36,9 @@ namespace {
 
 // Inline schema with left-assoc `+` and `*` (`*` binds tighter), plus
 // a right-assoc `=` (lowest precedence) and a prefix `-` (highest).
-// Mirrors the c-subset table for the operators it includes; tests pin
+// Mirrors the c table for the operators it includes; tests pin
 // the walker's output against this minimal grammar to avoid the
-// surrounding c-subset machinery (function decls, blocks, etc.).
+// surrounding c machinery (function decls, blocks, etc.).
 constexpr std::string_view kInfixSchema = R"JSON({
   "dssSchemaVersion": 4,
   "language": { "name": "PrattInfix", "version": "0.1.0" },
@@ -124,7 +124,7 @@ constexpr std::string_view kParenSchema = R"JSON({
   }
 })JSON";
 
-// Inline schema with a RIGHT-assoc ternary `?:` (mirrors c-subset's
+// Inline schema with a RIGHT-assoc ternary `?:` (mirrors c's
 // operator-table shape). The ternary else-clause descends at the
 // operator's own precedence via the iterative exprWorkStack driver (a
 // heap-stack push, not host recursion) — the path a deep `a?b:a?b:...:c`
@@ -164,7 +164,7 @@ constexpr std::string_view kTernarySchema = R"JSON({
 
 // Inline schema with a single postfix operator `?`. C-subset ships its
 // own postfix ops (`++ -- ( [ . ->`), but this minimal grammar pins
-// the SIMPLE single-token postfix arm in isolation (c-subset's are
+// the SIMPLE single-token postfix arm in isolation (c's are
 // grouped/follower forms wrapped in surrounding declaration syntax).
 constexpr std::string_view kPostfixSchema = R"JSON({
   "dssSchemaVersion": 4,
@@ -942,7 +942,7 @@ TEST(PrattWalker, DeepTernaryChainDiagnosesAndRecovers) {
 // ── 08.55: wrapperRules genericity pin ─────────────────────────────────────
 //
 // Drive the Pratt walker against a schema whose wrapperRules name the
-// frames `bExpr`/`uExpr`/`pExpr` — distinct from the c-subset names. The
+// frames `bExpr`/`uExpr`/`pExpr` — distinct from the c names. The
 // walker reads the names from the schema's `expr.wrapperRules` block;
 // any hardcoded `binaryExpr`/`unaryExpr`/`postfixExpr` somewhere would
 // make this test fail because the wrapper frames in the resulting tree

@@ -4436,9 +4436,9 @@ def loadext_helper_name(leg):
 # have caught the failure mode the reference build was silently standing in for.
 
 # The `--language` the helper is compiled as. The SAME name the fixture's own
-# manifest generator writes (gen-pe64-manifest.py, `"language": "c-subset"`), so
+# manifest generator writes (gen-pe64-manifest.py, `"language": "c"`), so
 # the helper and the fixture cannot come to be parsed by two different front ends.
-LOADEXT_HELPER_LANGUAGE = "c-subset"
+LOADEXT_HELPER_LANGUAGE = "c"
 
 # The file `--compile` is pointed at, relative to the staged sqlite tree's `src/`.
 # Named here rather than in two drivers for the same reason the helper's OUTPUT

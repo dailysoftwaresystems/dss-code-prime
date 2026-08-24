@@ -164,7 +164,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   three count `PhaseTimers::read(Optimize).runs`, which is EXACT rather than a
 //   proxy — the phase scope opens INSIDE `optimizeModule`, so the count IS the
 //   invocation count. `externImports` is witnessed by the corpus:
-//   `examples/c-subset/inline_c99_undefined_error` (N==1) and
+//   `examples/c/inline_c99_undefined_error` (N==1) and
 //   `inline_c99_inline_definition_crosscu` (merged).
 //   ⚠⚠ `Program_WholeProgramMerge.ShippedStageRoutingInlinesCrossCuAtProgramStage`
 //   and `Program_WholeProgramMerge.UnitStageRunsTheUnitDocumentNotTheConfigDoc`
@@ -181,7 +181,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   `string_view` (any string compiles). PINNED: `processArgs` by
 //   `program/test_entry_argv_run` `EntryArgvRun.RealCommandLineReachesMainByteExact`
 //   (a nullopt makes the entry read register garbage); `entryVerbs` on this
-//   route by the corpus pair `examples/c-subset/entry_wmain_only_refused_elf` /
+//   route by the corpus pair `examples/c/entry_wmain_only_refused_elf` /
 //   `entry_wmain_only_refused_macho`.
 //
 // `resolveProgramEntry` (1, merged route) — `formatVerbs`. ★★★ THE WORST

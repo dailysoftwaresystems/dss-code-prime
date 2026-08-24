@@ -156,7 +156,7 @@ TEST(FfiCHeaderParser, ParseFailurePropagatesUnderlyingDiagnostics) {
 
 TEST(FfiCHeaderParser, IncompatibleExternRedeclarationRejectedByFrontend) {
     // pr-test-analyzer P8 fold: an INCOMPATIBLE same-symbol redeclaration must
-    // propagate the c-subset frontend's S_* / P_* code (here S_IncompatibleRe-
+    // propagate the c frontend's S_* / P_* code (here S_IncompatibleRe-
     // declaration), not be silently accepted. RE-DECIDED 2026-07-18
     // (D-CSUBSET-EXTERN-MULTI-DECLARATOR): externDecl became a declarator-mode declaration,
     // so a COMPATIBLE (identical) extern redeclaration now MERGES cleanly — the

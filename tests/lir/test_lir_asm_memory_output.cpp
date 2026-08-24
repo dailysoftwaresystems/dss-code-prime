@@ -20,7 +20,7 @@
 // the memory the template already wrote.
 //
 // ⚠ THE RUNTIME WITNESS IS THE CORPUS EXAMPLE, NOT THIS FILE.
-// `examples/c-subset/c_inline_asm_memory_output_operand` asserts a RESULT by
+// `examples/c/c_inline_asm_memory_output_operand` asserts a RESULT by
 // EXECUTION on every runnable cell at both configs, because the defect this
 // feature can regress into — lowering the operand's VALUE where its ADDRESS
 // belongs — still compiles rc=0, still emits a memory form and still assembles.
@@ -170,7 +170,7 @@ constexpr Arch kArm{
 // ── (A) `"=m"` REACHES LIR CLEAN ON BOTH SHIPPED TARGETS ────────────────────
 TEST(LirAsmMemoryOutput, MemoryFormOutputIsLoweredOnBothShippedTargets) {
     for (Arch const& a : {kX86, kArm}) {
-        auto r = lowerCSubsetToLir(
+        auto r = lowerCToLir(
             std::string{"void f(int *p, int v){ __asm__(\""} + a.store
                 + "\" : \"=m\"(*p) : \"r\"(v)); }",
             a.target);
@@ -189,7 +189,7 @@ TEST(LirAsmMemoryOutput, MemoryFormOutputIsLoweredOnBothShippedTargets) {
 // that travelled only on the positional row would be red here alone.
 TEST(LirAsmMemoryOutput, TheSymbolicSpellingReachesTheSameBinding) {
     for (Arch const& a : {kX86, kArm}) {
-        auto r = lowerCSubsetToLir(
+        auto r = lowerCToLir(
             std::string{"void f(int *p, int v){ __asm__(\""} + a.storeSym
                 + "\" : [dst]\"=m\"(*p) : [src]\"r\"(v)); }",
             a.target);
@@ -202,7 +202,7 @@ TEST(LirAsmMemoryOutput, TheSymbolicSpellingReachesTheSameBinding) {
 // ── (B) THE CARRIAGE: AN ADDRESS OPERAND, NO RESULT PIECE ───────────────────
 TEST(LirAsmMemoryOutput, MemoryFormOutputCarriesAnAddressAndMintsNoResultPiece) {
     for (Arch const& a : {kX86, kArm}) {
-        auto r = lowerCSubsetToLir(
+        auto r = lowerCToLir(
             std::string{"void f(int *p, int v){ __asm__(\""} + a.store
                 + "\" : \"=m\"(*p) : \"r\"(v)); }",
             a.target);
@@ -267,7 +267,7 @@ TEST(LirAsmMemoryOutput, MemoryFormOutputCarriesAnAddressAndMintsNoResultPiece) 
 // ── (C) `"+m"` NEEDS NO TIED READ HALF ──────────────────────────────────────
 TEST(LirAsmMemoryOutput, ReadWriteMemoryOutputSynthesizesNoTiedReadHalf) {
     for (Arch const& a : {kX86, kArm}) {
-        auto r = lowerCSubsetToLir(
+        auto r = lowerCToLir(
             std::string{"long long f(long long x){ long long t; __asm__(\""}
                 + a.rmw + "\" : \"+m\"(x), \"=&r\"(t)); return x; }",
             a.target);
@@ -313,7 +313,7 @@ TEST(LirAsmMemoryOutput, ReadWriteMemoryOutputSynthesizesNoTiedReadHalf) {
 TEST(LirAsmMemoryOutput, ReadWriteInTheInputSectionIsStillRefused) {
     for (Arch const& a : {kX86, kArm}) {
         for (char const* letter : {"+m", "+r"}) {
-            auto r = lowerCSubsetToLir(
+            auto r = lowerCToLir(
                 std::string{"void f(int *p, int v){ __asm__(\""} + a.store
                     + "\" : : \"" + letter + "\"(*p), \"r\"(v)); }",
                 a.target);
@@ -332,7 +332,7 @@ TEST(LirAsmMemoryOutput, ReadWriteInTheInputSectionIsStillRefused) {
 // ── (E) THE RESULT PIECE'S TYPE IS THE REGISTER OUTPUT'S ────────────────────
 TEST(LirAsmMemoryOutput, ResultPieceTypeComesFromTheRegisterOutput) {
     for (Arch const& a : {kX86, kArm}) {
-        auto r = lowerCSubsetToLir(
+        auto r = lowerCToLir(
             std::string{"long long f(int n, long long w){ int m; long long o; "
                         "__asm__(\""}
                 + a.mixed
@@ -374,7 +374,7 @@ TEST(LirAsmMemoryOutput, ResultPieceTypeComesFromTheRegisterOutput) {
 // ── (F) `"=&m"` IS ACCEPTED ─────────────────────────────────────────────────
 TEST(LirAsmMemoryOutput, EarlyClobberOnTheMemoryFormIsAccepted) {
     for (Arch const& a : {kX86, kArm}) {
-        auto r = lowerCSubsetToLir(
+        auto r = lowerCToLir(
             std::string{"void f(int *p, int v){ __asm__(\""} + a.store
                 + "\" : \"=&m\"(*p) : \"r\"(v)); }",
             a.target);
@@ -394,7 +394,7 @@ TEST(LirAsmMemoryOutput, EarlyClobberOnTheMemoryFormIsAccepted) {
 // ── (G) TWO MEMORY-FORM OUTPUTS IN ONE STATEMENT ────────────────────────────
 TEST(LirAsmMemoryOutput, TwoMemoryOutputsGetTwoOperandsAndStillNoResultPiece) {
     for (Arch const& a : {kX86, kArm}) {
-        auto r = lowerCSubsetToLir(
+        auto r = lowerCToLir(
             std::string{"void f(int *p, int *q, int u, int v){ __asm__(\""}
                 + a.twoOut
                 + "\" : \"=m\"(*p), \"=m\"(*q) : \"r\"(u), \"r\"(v)); }",

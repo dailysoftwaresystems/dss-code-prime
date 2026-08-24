@@ -207,7 +207,7 @@ struct DSS_EXPORT HirLoweringConfig {
     SchemaTokenId forClauseSeparator{};  std::string forClauseSeparatorName;
 
     // Rules that are explicitly NOT lowered yet (deferred to a later plan, e.g.
-    // c-subset's `arrayDeclSuffix` — arrays need an Array type the lattice/
+    // c's `arrayDeclSuffix` — arrays need an Array type the lattice/
     // semantic phase don't resolve). When a declaration's subtree contains one,
     // the engine fails loud (H_UnsupportedLoweringForKind) rather than silently
     // miscompiling (e.g. lowering `int a[10]` to a scalar with `10` as the init).

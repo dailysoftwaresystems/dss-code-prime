@@ -211,7 +211,7 @@ add_subdirectory(conformance)
 # Apple clang). The sanitizer column is what the SAME arms actually cost on the leg
 # this file calls the stronger instrument. That leg's Test step is budgeted 30 min
 # (pipeline-pr.yml), needed ~31.5 min, and so was KILLED at 687/773 — every test it
-# reached PASSED. The 86 it never reached were all examples/c-subset, t* through z*,
+# reached PASSED. The 86 it never reached were all examples/c, t* through z*,
 # so they took ZERO sanitizer coverage, every run, always the same tail.
 #
 # WHY TRIMMING HERE RAISES TOTAL DETECTION INSTEAD OF LOWERING IT. These arms are
@@ -303,11 +303,11 @@ dss_add_shuffle_arm(NAME analysis/preprocess/test_preprocessor REPEAT 20)
 # on the same binary is, because reverting to a constant path reddens the gate here
 # instead of passing quietly. MEASURED pre-fix under exactly this overlap: import
 # resolver 6/6 rounds red plus 4 SIGSEGVs, type-name oracle 6/6 red, hir / schema
-# cache / c-subset red with DIVERGENT per-instance failure counts. Post-fix all
+# cache / c red with DIVERGENT per-instance failure counts. Post-fix all
 # green with counts identical between the two instances.
 #
 # REPEAT is measured, not guessed — single-run wall time on this host was 0.06-0.17 s
-# for the five small binaries and 4.13 s for the c-subset one, so 20x and 3x keep the
+# for the five small binaries and 4.13 s for the c one, so 20x and 3x keep the
 # whole set near ~23 s of added work spread over six entries that ctest -j overlaps.
 # ⚠ THAT ~23 s IS AN UNINSTRUMENTED PRICE. The same eight arms measured 3311.5 s on
 # the Debug+ASan+UBSan leg — 44% of that leg's entire budget, and enough to run it
@@ -341,7 +341,7 @@ dss_add_shuffle_arm(NAME analysis/compilation_unit/test_import_resolver REPEAT 2
 dss_add_shuffle_arm(NAME analysis/compilation_unit/test_compilation_unit REPEAT 20)
 dss_add_shuffle_arm(NAME hir/test_hir_lowering_multi_lang REPEAT 20)
 dss_add_shuffle_arm(NAME lsp/test_schema_cache REPEAT 20)
-dss_add_shuffle_arm(NAME analysis/semantic/test_semantic_analyzer_c_subset REPEAT 3)
+dss_add_shuffle_arm(NAME analysis/semantic/test_semantic_analyzer_c REPEAT 3)
 dss_add_shuffle_arm(NAME analysis/semantic/test_fc3_width_semantics REPEAT 20)
 
 # ── TF-C118 — THE OUT-OF-TREE REGRESSION GUARD ──────────────────────────────
@@ -419,7 +419,7 @@ endforeach()
 # to do with the test-side resolver, and the arm would be red forever.
 # MEASURED, from the no-repo cwd with the variable unset:
 # `dss_analysis_syntactic_test_corpus` fails at golden_file.hpp — and would go
-# on to fail `loadShipped("c-subset")` even with the corpus root resolved.
+# on to fail `loadShipped("c")` even with the corpus root resolved.
 # So the guard suite is itself the representative consumer: BakedRootOnly drives
 # `dss::test_support::findCorpusRoot()` — the exact entry point the twelve
 # suites that used to abort() go through — and resolves a real file under both

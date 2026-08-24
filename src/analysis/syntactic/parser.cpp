@@ -1137,7 +1137,7 @@ struct Parser::Impl {
     // token-id-keyed `contextualKinds` set from the per-LexemeMeaning `contextual`
     // flags, the query that didn't exist before). So the prune never drops a
     // candidate a contextual demotion would match. EMPTY contextualKinds for a
-    // non-contextual grammar (every shipped c-subset speculative alt) ⇒ the
+    // non-contextual grammar (every shipped c speculative alt) ⇒ the
     // deep-nest O(N) win is unaffected. Pinned by the synthetic contextual-keyword
     // speculative-alt schemas in test_parser_speculation.cpp (RED-on-disable).
     [[nodiscard]] bool
@@ -1506,7 +1506,7 @@ struct Parser::Impl {
         const bool committed = [&]() -> bool {
         SpeculationProbe probe{*this};
 
-        // FC4 c1: an `expr`-shape BRANCH (e.g. c-subset forInitAmbig's
+        // FC4 c1: an `expr`-shape BRANCH (e.g. c forInitAmbig's
         // `expression`) must hand off to the Pratt walker exactly like the
         // RuleLeaf dispatch does — `openExprFrame` would compile the branch
         // as its transparent atom reference, parse ONLY the first operand,
@@ -1989,7 +1989,7 @@ struct Parser::Impl {
                 // REPLAY the declared-LAST candidate non-speculatively so
                 // its precise diagnostics land where the user can act on
                 // them — the declared order makes the last branch the
-                // language's fallback reading (c-subset declOrExprStmt's
+                // language's fallback reading (c declOrExprStmt's
                 // exprStmt), and pre-FC4 that reading was a direct alt
                 // branch whose errors surfaced directly. Pure rollback
                 // would bury the real error (`a ? b ;` → "missing ':'")
@@ -2047,7 +2047,7 @@ struct Parser::Impl {
                 // `BrokenPath_TokenNotInAnyFirstSet` (toy: `;` at
                 // root, where FIRST(statement) lacks EndCommand and
                 // post-skip would be end-of-root anyway — but `;` is
-                // not EOF, so emit + consume) vs. c-subset's
+                // not EOF, so emit + consume) vs. c's
                 // legitimate `int x = 5;` shape (optional pointer-spec
                 // skipped to land on a real downstream slot).
                 if (walker.nullableTail()

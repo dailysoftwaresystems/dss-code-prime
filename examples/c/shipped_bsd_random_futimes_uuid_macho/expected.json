@@ -1,0 +1,12 @@
+{
+  "$comment": "D-CSUBSET-DARWIN-BSD-SYMBOL-CLUSTER — random/srandomdev (stdlib.json), futimes (sys/time.json) and the uuid_t typedef (unistd.json, arr<u8, 16> via a macho-only variants arm), the sqlite os_unix.c proxy/AFP consumers at :3197/:6169/:7883/:7600 under __APPLE__ && SQLITE_ENABLE_LOCKING_STYLE. Deterministic exit without constraining any runtime value: (int)sizeof(uuid_t) + (int)(r - r) + 26 = 16 + 0 + 26 = 42 — r - r is 0 for ANY value while the random() call still executes (extern call, never DCE'd), futimes(-1, 0) is a safe EBADF no-op that still crosses the ABI, and sizeof(uuid_t) = 16 is the deterministic witness that the typedef decoded as the 16-byte unsigned-char array (PROXY_HOSTIDLEN identity, os_unix.c:7607). RED-ON-DISABLE: delete a symbol row → S0001 at its call; delete the uuid_t macho variant → S0006 at the declaration (tests/ffi RealStdlibJsonRandomSrandomdevMachoOnly / RealSysTimeJsonFutimesMachoOnly / RealUnistdJsonUuidTMachoOnlyTypedef are the structural twins). Single arm64-macho target → the macos-latest CI leg; the release arm re-runs the same calls under the optimizer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

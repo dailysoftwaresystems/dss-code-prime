@@ -84,7 +84,7 @@ void writeFile(fs::path const& dir, std::string_view name, std::string_view body
 // these fixtures are manifests a human would actually commit.
 [[nodiscard]] std::string manifest(std::string_view targetsJsonArray) {
     return std::string{R"({
-  "language": "c-subset",
+  "language": "c",
   "artifactProfile": "cli",
   "targets": )"} + std::string{targetsJsonArray} + R"(,
   "sources": ["main.c"]
@@ -202,7 +202,7 @@ TEST(WorkspaceProject, PreferenceDoesNotPerturbAnUnambiguousExtension) {
     SchemaCache cache;
     auto r = cache.resolveByExtension(".c", pref->languages);
     ASSERT_TRUE(r.has_value()) << "exactly one shipped language claims .c";
-    EXPECT_EQ((*r)->name(), "CSubset");
+    EXPECT_EQ((*r)->name(), "C");
 }
 
 // ★ TWO TARGETS THAT DISAGREE LEAVE THE TIE UNBROKEN. This is the case a
@@ -305,7 +305,7 @@ TEST(WorkspaceProject, ManifestNamingNoTargetIsRejectedByTheSharedParser) {
 TEST(WorkspaceProject, UnknownManifestKeyIsRejectedByTheSharedParser) {
     ScratchDir ws{Location::Temp, "lsp-ws-badkey"};
     writeFile(ws.path(), "app.dss-project.json", R"({
-  "language": "c-subset",
+  "language": "c",
   "artifactProfile": "cli",
   "targets": ["x86_64:elf64-x86_64-linux-exec"],
   "sources": ["main.c"],
@@ -348,7 +348,7 @@ TEST(WorkspaceProject, LspAndDriverParseAManifestThroughTheSameLoader) {
     ScratchDir ws{Location::Temp, "lsp-ws-sameparser"};
     // Valid to a `targets`-only reader; rejected by the shared loader.
     writeFile(ws.path(), "app.dss-project.json", R"({
-  "language": "c-subset",
+  "language": "c",
   "artifactProfile": "cli",
   "targets": ["arm64:elf64-aarch64-linux-exec"],
   "sources": ["main.c"],

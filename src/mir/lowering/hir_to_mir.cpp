@@ -9450,7 +9450,7 @@ struct Lowerer {
 
         // SHAPE 1 — the bare barrier. No descriptor, no operands, no clobbers, and
         // no pool needed by construction. Byte-identical to the pre-P5 emit, which
-        // is what keeps every pool-free caller (and `examples/c-subset/c_inline_asm`,
+        // is what keeps every pool-free caller (and `examples/c/c_inline_asm`,
         // nine barrier spellings) unchanged.
         if (handle == kNoInlineAsmDescriptor) {
             mir.addInst(MirOpcode::CompilerBarrier, {}, InvalidType);
@@ -9477,8 +9477,8 @@ struct Lowerer {
         // The children ARE the operand values and the pool entry describes them, so a
         // count mismatch means the two halves disagree about what this statement is.
         // `HirVerifier::checkInlineAsm` pins children == operands, but this lowering
-        // must not DEPEND on the verifier having run: `test_mir_lowering_c_subset`'s
-        // `lowerCSubset` reaches here with no verifier and no semantic gate, and that
+        // must not DEPEND on the verifier having run: `test_mir_lowering_c`'s
+        // `lowerC` reaches here with no verifier and no semantic gate, and that
         // is deliberate so a lowering bug cannot hide behind another tier's refusal.
         auto const kids = hir.children(node);
         if (kids.size() != src.operands.size()) {
@@ -12366,7 +12366,7 @@ struct Lowerer {
             // FfiMetadata population is the caller's responsibility:
             // - CST→HIR (today, cycle 2d): not yet populating;
             //   tests build the FFI map manually until plan 11 FF5
-            //   lands the c-subset attribution syntax.
+            //   lands the c attribution syntax.
             // - FF5 binary ingestion: populates from .so/.dll
             //   reads.
             // - Missing/empty `mangledName` (the linker-visible

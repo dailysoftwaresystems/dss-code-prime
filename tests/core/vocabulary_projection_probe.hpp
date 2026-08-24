@@ -12,7 +12,7 @@
 // they had ALREADY DRIFTED when they were merged here:
 //
 //   * `shippedLanguageDoc` existed in TWO of the three, with DIFFERENT
-//     signatures — one hard-wired `"c-subset"` and took no argument, the other
+//     signatures — one hard-wired `"c"` and took no argument, the other
 //     took the language name. The parameterised one is kept: a probe that can
 //     only ever read one document cannot state which document it read.
 //   * `at()` existed in the same TWO, also with different signatures, and only

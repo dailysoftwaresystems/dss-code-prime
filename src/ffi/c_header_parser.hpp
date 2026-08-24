@@ -15,7 +15,7 @@
 // Plan 11 FF2 — C header parser ("header mode"). Reads a pre-reduced
 // C header from disk OR in-memory text + returns the symbol surface
 // as `ImportSurface` rows — uniform with FF1's binary readers. Thin
-// orchestration over the c-subset frontend (tokenize + parse +
+// orchestration over the c frontend (tokenize + parse +
 // semantic-analyze + lower-to-HIR); typedefs are absorbed into the
 // type system, everything else either yields a row or fails loud.
 //
@@ -35,11 +35,11 @@ namespace dss::ffi {
 // row-aligned.
 enum class HeaderReadErrorKind : std::uint8_t {
     FileOpenFailed               = 0,  // path doesn't exist / permission / I/O
-    HeaderParseFailed            = 1,  // c-subset frontend (tokenize/parse/semantic/lower) errors
+    HeaderParseFailed            = 1,  // c frontend (tokenize/parse/semantic/lower) errors
     HeaderHasFunctionBody        = 2,  // a non-extern function DEFINITION at top level
     HeaderHasNonExternDecl       = 3,  // a non-extern non-typedef global definition
     EmptyImportLibrary           = 4,  // caller passed empty importLibrary — caller-API bug
-    GrammarLoadFailed            = 5,  // shipped c-subset grammar JSON could not load
+    GrammarLoadFailed            = 5,  // shipped c grammar JSON could not load
     HeaderHasUnsupportedTopLevel = 6,  // ImportGroup (#include), future HirKind, etc.
     InternalInvariant            = 7,  // compiler-bug surface — file a bug
 };
@@ -75,7 +75,7 @@ struct DSS_EXPORT HeaderReadError {
 // entry with `EmptyImportLibrary` (silent-failure surface: a row
 // downstream with no library identity would be unlinkable).
 //
-// Diagnostics from the c-subset frontend pipe through `reporter`
+// Diagnostics from the c frontend pipe through `reporter`
 // (P_*/L_*/S_*/H_*) AND the FF2-layer F_* verdict; `--suppress` /
 // `--warnings-as-errors` apply. Underlying causes that were
 // suppressed by user policy are inlined into the wrap message so

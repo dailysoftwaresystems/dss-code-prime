@@ -474,8 +474,8 @@ TEST(LexerModesLoader, ToyConfigStillLoadsAndHasMainMode) {
     EXPECT_FALSE(varInMain.empty());
 }
 
-TEST(LexerModesLoader, CSubsetConfigStillLoadsAndHasMainMode) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+TEST(LexerModesLoader, CConfigStillLoadsAndHasMainMode) {
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value())
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
     auto const& s = **loaded;
@@ -877,7 +877,7 @@ TEST(LexerModesLoader, EveryShippedConfigLoadsWithoutWarnings) {
     // the HOST document's collector — so the two `asm-*` dialect rows below are
     // what carries them.
     constexpr std::string_view kShipped[] = {
-        "c-subset", "tsql-subset", "toy",
+        "c", "tsql-subset", "toy",
         "asm-x86_64-att", "asm-arm64-gas",
     };
     for (auto const name : kShipped) {
@@ -1226,7 +1226,7 @@ TEST(LexerModesLoader, ShippedCoalescedModesDeclareValidDistinctCloseTokens) {
     struct Expect { std::string_view mode, body, closer; };
     struct Cfg { std::string_view name; std::vector<Expect> modes; };
     std::vector<Cfg> const shipped{
-        {"c-subset", {{"string",         "StringLiteral", "StringEnd"},
+        {"c", {{"string",         "StringLiteral", "StringEnd"},
                       {"charBody",       "CharLiteral",   "CharEnd"},
                       {"header-body",    "HeaderPath",    "HeaderEnd"}}},
         {"tsql-subset", {{"single-string",  "StringLiteral", "StringEnd"},

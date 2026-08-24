@@ -106,7 +106,7 @@ void requireFrontEndClean(LoweredLir const& r) {
 
 // ── (A) THE CROSS-CLASS REFUSAL FIRES ───────────────────────────────────────
 TEST(LirAsmOperandMoveClass, ABindingWhoseClassDiffersFromItsValueIsRefused) {
-    auto r = lowerCSubsetToLir(
+    auto r = lowerCToLir(
         R"(double f(double x){ double y = x; __asm__("nop" : "+r"(y)); return y; })",
         "arm64");
     requireFrontEndClean(r);
@@ -135,7 +135,7 @@ TEST(LirAsmOperandMoveClass, ABindingWhoseClassDiffersFromItsValueIsRefused) {
 // x86_64's `"x"` binds the `fpr` class, which is where a `double`'s value
 // already lives — the legal case, and the one whose INSTRUCTION was wrong.
 TEST(LirAsmOperandMoveClass, ABindingWhoseClassMatchesItsValueStillLowers) {
-    auto r = lowerCSubsetToLir(
+    auto r = lowerCToLir(
         R"(double f(double v){ double y = v; __asm__("nop" : "+x"(y)); return y; })",
         "x86_64");
     requireFrontEndClean(r);
@@ -183,7 +183,7 @@ TEST(LirAsmOperandMoveClass, ABindingWhoseClassMatchesItsValueStillLowers) {
 TEST(LirAsmOperandMoveClass, AnIntegerOperandBoundWithRStillLowers) {
     for (char const* const t : {"x86_64", "arm64"}) {
         SCOPED_TRACE(t);
-        auto r = lowerCSubsetToLir(
+        auto r = lowerCToLir(
             R"(int f(int a){ int y = a; __asm__("nop" : "+r"(y)); return y; })", t);
         requireFrontEndClean(r);
     EXPECT_FALSE(r.lirReporter.hasErrors())

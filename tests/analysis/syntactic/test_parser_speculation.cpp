@@ -162,7 +162,7 @@ TEST(ParserSpeculation, SpeculativeAltAcceptsTokenLeafBranches) {
 // `GrammarSchema::isAutoInternedWrapperRule` and suppresses the
 // latch while any ancestor frame is a wrap, fixing the latch's
 // behavioral contract ("real grammar mismatch ONLY"). Empirical
-// reproducer at c-subset level: `(f(a))` fails (✗) without the fix,
+// reproducer at c level: `(f(a))` fails (✗) without the fix,
 // passes (✓) with it. This synthetic test pins the substrate
 // behavior in isolation from any specific language schema.
 constexpr std::string_view kSpecOverExprPostfix = R"JSON({
@@ -531,8 +531,8 @@ TEST(ParserSpeculation, ProbeOrderIsDeclaredOrderNotInternerOrder) {
            "alt's declared branch list";
 }
 
-TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
-    // FC2 order-preservation pin over the SHIPPED c-subset grammar:
+TEST(ParserSpeculation, COperandAltBranchesAreInDeclaredOrder) {
+    // FC2 order-preservation pin over the SHIPPED c grammar:
     // `operand`'s speculative alt declares its RULE branches as
     // [stringLiteralExpr, charLiteralExpr, compoundLiteralExpr,
     // castExpr, parenExpr] (the alt's leading entries are token-leaf
@@ -544,12 +544,12 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
     // [castExpr, charLiteralExpr, compoundLiteralExpr, parenExpr,
     // stringLiteralExpr] — silently re-prioritizing castExpr ahead of
     // compoundLiteralExpr for every `(`-led operand probe.
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     auto const& schema = **loaded;
 
     const RuleId operand = schema.rules().find("operand");
-    ASSERT_TRUE(operand.valid()) << "c-subset must declare an `operand` rule";
+    ASSERT_TRUE(operand.valid()) << "c must declare an `operand` rule";
     const SchemaCursor altCur = schema.enterRule(operand);
     ASSERT_EQ(schema.slotKind(altCur), SlotKind::AltChoice)
         << "`operand`'s body must compile to an AltChoice entry position";
@@ -575,7 +575,7 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
     };
     EXPECT_EQ(names, declared)
         << "operand's speculative rule branches must surface in the "
-           "JSON-array order declared in c-subset.lang.json";
+           "JSON-array order declared in c.lang.json";
 }
 
 // ── Deep-nest predictive-prune O(N) pin (D-PARSE-SPECULATION-OPERAND-QUADRATIC)
@@ -593,7 +593,7 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
 // `parenExpr` (no commit-triage) is descended into directly — no per-level
 // speculation probe. Net: O(N).
 //
-// This pin parses the REAL shipped c-subset grammar at a high
+// This pin parses the REAL shipped c grammar at a high
 // `maxExpressionDepth` (so the parse runs to completion instead of tripping
 // the low default cap) and asserts (a) a CLEAN parse — no diagnostics, no
 // `P_BacktrackFailed` — proving the prune kept the valid `parenExpr` reading
@@ -625,7 +625,7 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
 // stack + strided unwind), NOT an algorithmic term. It is bounded/moot in
 // practice by the grammar's own configured `maxExpressionDepth` backstop —
 // NAMED rather than quoted, because this note previously carried the literal
-// `256` and c-subset.lang.json has since raised it — and the residual is
+// `256` and c.lang.json has since raised it — and the residual is
 // documented as D-PARSE-DEEP-NEST-RECURSION-MEMORY; the 8× bound is sized to
 // absorb it while still catching an O(N²) speculation regression (orders of
 // magnitude over).
@@ -640,7 +640,7 @@ namespace {
     return s;
 }
 
-// Parse `((…0…))` nested `depth` deep through the SHIPPED c-subset grammar
+// Parse `((…0…))` nested `depth` deep through the SHIPPED c grammar
 // at a raised expression-depth cap; return the wall-clock parse duration.
 // Fails the calling test (via gtest macros) on any parse diagnostic.
 //
@@ -689,7 +689,7 @@ TEST(ParserSpeculation, DeepNestCastVsParenIsLinear) {
 
     // Load the shipped grammar ONCE; reuse it across every timed parse so the
     // measured region is the parse alone, not a per-call schema reload.
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
 
@@ -963,7 +963,7 @@ flatChainParseMetrics(std::shared_ptr<GrammarSchema const> const& schema,
 // status word in prose is a measurement with no instrument attached, which is
 // how this sentence rotted in the first place.
 TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
 
@@ -997,7 +997,7 @@ TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {
 // and BACKTRACKS to the sibling continuation when the clause doesn't match —
 // the generic capability the C23 `enum E : T { … }` feature rides (the `enum
 // <tag> :` prefix is shared with the anonymous enum-typed bit-field `enum C :
-// 4;`). This synthetic schema pins the substrate in isolation from c-subset.
+// 4;`). This synthetic schema pins the substrate in isolation from c.
 //
 //   stmt        = widgetDecl Semi                (the `;`-terminated wrapper,
 //                                                 mirroring enumSpec inside a

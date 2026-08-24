@@ -117,13 +117,13 @@ struct SchemaIndexes {
     std::unordered_map<std::uint32_t, std::size_t> declByRule;
     std::unordered_map<std::uint32_t, std::size_t> refByRule;
     // D5.1: member-access rules (`obj.field` and `ptr->field`). Multi-entry
-    // per rule when multiple shapes share the same rule (e.g. c-subset's
+    // per rule when multiple shapes share the same rule (e.g. c's
     // single `postfixExpr` covers BOTH `.` and `->`); each is distinguished
     // by `MemberAccessRule.operatorToken`, just like `assignByRule`.
     std::unordered_map<std::uint32_t, std::vector<std::size_t>> memberAccessByRule;
     std::unordered_map<std::uint32_t, std::size_t> typeShapeByRule;
     std::unordered_map<std::uint32_t, bool>        scopeByRule;
-    // Multiple assignment entries may share one rule (e.g. c-subset's
+    // Multiple assignment entries may share one rule (e.g. c's
     // operator-table `binaryExpr` reused for `=` AND every compound-assign
     // operator `+=`/`<<=`/…). Each entry is distinguished by its
     // `operatorToken`, so the index maps a rule to ALL its entries and the
@@ -755,7 +755,7 @@ nodeOpensChildScope(EngineState const& s, SemanticConfig const& cfg,
 // Follow a path of visible-child indices from `start`. Returns
 // InvalidNode if any step indexes out of range. Used by the kindByChild
 // facet to resolve params/body paths through a discriminator sub-rule
-// (e.g. c-subset's `funcDefTail → [funcParams, block]`).
+// (e.g. c's `funcDefTail → [funcParams, block]`).
 [[nodiscard]] NodeId
 descendVisible(Tree const& tree, NodeId start,
                std::vector<std::uint32_t> const& path) {
@@ -1276,7 +1276,7 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
             continue;
         }
         // FC3 c1: the ACTIVE data model's override (if declared) wins —
-        // c-subset's `long` is I64 base / I32 under LLP64. The vocabulary tag
+        // c's `long` is I64 base / I32 under LLP64. The vocabulary tag
         // (loader-DERIVED from the matching typeSpecifiers row) supplies the
         // IDENTITY, so the text-keyed path and the keyword path intern the
         // SAME TypeId for `long` (D-LANG-TYPE-IDENTITY-VOCABULARY).
@@ -3161,7 +3161,7 @@ scanSpecifierPrefixStorage(Tree const& tree, NodeId declNode,
 
 // TLS C1 (D-CSUBSET-THREAD-LOCAL): the first specifier-prefix TOKEN whose kind
 // is in `kinds` (the language's `threadLocal.incompatibleSpecifierTokens` —
-// c-subset: RegisterKeyword), or InvalidNode. Anchors the
+// c: RegisterKeyword), or InvalidNode. Anchors the
 // S_ThreadLocalInvalidCombination diagnostic at the offending specifier.
 [[nodiscard]] NodeId
 firstPrefixTokenOfKinds(Tree const& tree, NodeId declNode,
@@ -3272,7 +3272,7 @@ struct AttributeSemanticsFacts {
 // folding) and `scanCompositePacked` (the composite `packed` scan) — so a grammar
 // reshape that moves attributes cannot fix one consumer and silently leave the
 // other reading the old shape. Tolerates a WRAPPER between `root` and the
-// attribute node (c-subset's `compositeAttr` alt), since it descends until it
+// attribute node (c's `compositeAttr` alt), since it descends until it
 // matches rather than reading a fixed child.
 void collectAttrNodes(SemanticConfig const& cfg, Tree const& tree, NodeId root,
                       std::vector<NodeId>& out) {
@@ -3720,13 +3720,13 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 // on a clause ARGUMENT VALUE, which no verb does; sqlite writes
                 // only the bare `no_sanitize_thread` spelling, so the loud refusal
                 // is the correct residue, not a gap. TF-C92 fold: PINNED, no
-                // longer prose-only — HirLoweringCSubset
+                // longer prose-only — HirLoweringC
                 // .NoSanitizeStringArgumentFormIsRefusedLoud asserts exactly one
                 // H_UnknownLinkageSpecifier naming the composite key, for BOTH
                 // `("thread")` and `("address")`. The same statement in the file a
                 // config author reads is the `★ THE STRING-ARGUMENT SPELLING`
                 // paragraph of this effect's own row `$comment` in
-                // `semantics.attributeSemantics.effects` (c-subset.lang.json,
+                // `semantics.attributeSemantics.effects` (c.lang.json,
                 // `"names": ["no_sanitize_thread"]`) — there is deliberately no
                 // separate `$noSanitizeStringFormComment` key, which an earlier
                 // draft of THIS comment cited by name and which never existed.
@@ -4415,7 +4415,7 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
     if (isFnSuffixRule(r, dc)) {
         // The param harvest is the SHARED `collectParamTypes` walker (one
         // chokepoint with the legacy function-decl path): it descends
-        // wrapper rules (c-subset's `paramOrEllipsis` alt wrapper),
+        // wrapper rules (c's `paramOrEllipsis` alt wrapper),
         // resolves each declaration-rule node via `declRowDeclaredType`
         // (declarator-mode aware), and stops at each param (a nested
         // fn-ptr param's inner params never leak into THIS signature).
@@ -4882,7 +4882,7 @@ findTokenInSubtree(Tree const& tree, NodeId node, SchemaTokenId kind,
 // a struct/union/enum TAG, and an enum's enumerators, declared as a type
 // specifier belong to the enclosing block or file scope, NOT a transient
 // interior declaration scope. Some declaration rules open such a scope purely to
-// dominate a later sibling (c-subset's topLevelDecl opens one so a function's
+// dominate a later sibling (c's topLevelDecl opens one so a function's
 // params — living inside its declarator's fnSuffix — reach the body block); a
 // tag/enumerator minted from a specifier in that scope would VANISH when it pops
 // (invisible to the next declaration). Driven by declByRule/fieldChildren
@@ -5058,7 +5058,7 @@ readAsmLabel(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // discipline: Pass 2, after Pass 1.5 resolved the declared type, so the FnSig
 // test sees the real signature). Runs from BOTH pass2Post declaration paths —
 // the declarator-mode per-declarator loop (topLevelDecl / varDecl /
-// autoInferred*) and the positional-name arm (c-subset's externDecl). Every
+// autoInferred*) and the positional-name arm (c's externDecl). Every
 // arm fails loud; a thread_local declaration NEVER silently degrades to a
 // plain (process-shared or automatic) object:
 //   * unresolved declared type    → return (cascade — already diagnosed);
@@ -5069,7 +5069,7 @@ readAsmLabel(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 //     6.7.1: constexpr pairs only with auto/register/static — read off the
 //     Pass-1 isConstexpr mark, so both specifier orders are caught);
 //   * a `threadLocal.incompatibleSpecifierTokens` token in the prefix
-//     (c-subset: `register`)      → S_ThreadLocalInvalidCombination
+//     (c: `register`)      → S_ThreadLocalInvalidCombination
 //     (6.7.1p2 admits only static/extern beside thread_local), anchored at
 //     the offending specifier token;
 //   * BLOCK scope without `static`(-storage specifier) or `extern`
@@ -5078,7 +5078,7 @@ readAsmLabel(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 //     the lowering routes on (scanSpecifierPrefixStorage), so the check and
 //     the routing cannot disagree; the extern test is the record's
 //     isExternDeclaration (block-scope extern objects do not parse in the
-//     c-subset grammar today — the file-scope externDecl form is the only
+//     c grammar today — the file-scope externDecl form is the only
 //     extern surface — but the record test keeps the validator correct for
 //     any grammar that admits them). File scope returns clean (static
 //     storage is implicit — 6.2.4p3).
@@ -5299,7 +5299,7 @@ void validateVlaDeclarator(EngineState& s, SemanticConfig const& cfg,
 //
 // Shared by BOTH Pass-1 minting paths (declarator-mode and legacy positional) so a
 // proto/extern and its definition merge regardless of which path mints each — e.g.
-// c-subset's `extern` (positional) and its definition (declarator-mode topLevelDecl).
+// c's `extern` (positional) and its definition (declarator-mode topLevelDecl).
 // Both paths mint `newId` with its final `kind`/`isProtoDeclaration` BEFORE this call,
 // so the category is read directly from each record. `newNonDef` = the new decl is
 // non-defining (proto or extern).
@@ -5566,7 +5566,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 
             // Evaluate the kindByChild discriminator (if any) BEFORE
             // minting the symbol so its `kind` reflects the structural
-            // choice in the tree (e.g. c-subset's topLevelDecl with a
+            // choice in the tree (e.g. c's topLevelDecl with a
             // funcDefTail descendant mints a Function, not a Variable).
             DeclarationKind effectiveKind = decl.kind;
             if (decl.kindByChild.has_value()) {
@@ -5898,7 +5898,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         rec.isProtoDeclaration = isProto;
                         rec.maybeFnTypedefProto = maybeFnTypedefProto;
                         // D-CSUBSET-EXTERN-DEFINITION-MERGE: a non-defining
-                        // declaration (c-subset's `extern`) — config-driven, no
+                        // declaration (c's `extern`) — config-driven, no
                         // rule-name identity. Like a prototype it is a non-defining
                         // declaration that MERGES with an in-TU definition.
                         // D-CSUBSET-EXTERN-FN-DEFINITION (§B 2026-07-21): an
@@ -6076,7 +6076,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // C11 6.2.1 tag scope: a struct/union/enum TAG declared as
                     // a type specifier belongs to the nearest enclosing block
                     // or file scope — never an interior DECLARATOR-DOMINATOR
-                    // scope (e.g. c-subset's topLevelDecl, which opens a scope
+                    // scope (e.g. c's topLevelDecl, which opens a scope
                     // only to dominate a function's params). A tag minted from a
                     // file-scope `struct P {…} v;` / `struct Q g;` specifier
                     // would otherwise bind into that transient scope and VANISH
@@ -6143,7 +6143,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // SE4: const-marking. Scan the type subtree (or the
                     // whole decl subtree when no typeChild) for the
                     // language's const-marker token.
-                    // c36 (D-CSUBSET-MUTABLE-POINTER-TO-CONST): in c-subset NO
+                    // c36 (D-CSUBSET-MUTABLE-POINTER-TO-CONST): in c NO
                     // positional-name row sets constMarker (the const-bearing
                     // rows — varDecl/identVarDecl/forDecl/forIdentDecl/param/
                     // topLevelDecl — all take the declarator-mode path above,
@@ -6168,14 +6168,14 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // here (it could not distinguish a volatile OBJECT from a
                     // volatile POINTEE). `isConst` keeps its scan above.
 
-                    // D-CSUBSET-EXTERN-DEFINITION-MERGE: c-subset's `extern`
+                    // D-CSUBSET-EXTERN-DEFINITION-MERGE: c's `extern`
                     // declaration mints through THIS legacy positional path (it
                     // declares a positional `name`, not declarator-mode). Mark it
                     // non-defining so it merges with an in-TU definition of the same
                     // name (handled below via the shared mergeOrCollideRedeclaration).
                     rec.isExternDeclaration = decl.nonDefiningDeclaration;
                     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the positional-path mirror
-                    // of the declarator-mode thread-storage mint — c-subset's
+                    // of the declarator-mode thread-storage mint — c's
                     // `extern thread_local int e;` mints HERE (externDecl's
                     // externSpecifiers prefix carries the specifier). Same facet,
                     // same scan; Pass 2 + the merge own the consequences.
@@ -6278,7 +6278,7 @@ childScopeFor(EngineState& s, Tree const& tree, NodeId node, ScopeId current) {
 
 // GAP A: find the scope (anywhere in the tree) whose anchor IS `node` —
 // used to key a function's result type on the scope its body opens. The
-// body scope can be nested under an intermediate scope (e.g. c-subset's
+// body scope can be nested under an intermediate scope (e.g. c's
 // `block` sits inside the `funcDefTail` scope), so a parent-children scan
 // (as in `childScopeFor`) is insufficient; this scans all scopes for the
 // matching anchor. Returns InvalidScope if none.
@@ -7296,7 +7296,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         //
                         // ★★ TF-C94 — THE GATE ADMITS `Ptr<FnSig>` AS WELL AS
                         // `FnSig`, AND THAT WIDENING IS WHAT MAKES THE LEADING
-                        // MEMBER ATTRIBUTE POSITION (c-subset's
+                        // MEMBER ATTRIBUTE POSITION (c's
                         // `structMemberDeclSpecifier`) HONORED RATHER THAN
                         // PARSED-AND-DROPPED. A struct/union member can NEVER be a
                         // FnSig — MEASURED, `struct T { __attribute__((noreturn))
@@ -8877,7 +8877,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // D-LANG-VARIADIC (step 13.4): scan the params
                         // subtree for the declaration's configured
                         // variadic-marker token (e.g. `EllipsisOp` for
-                        // c-subset). When present, build a variadic
+                        // c). When present, build a variadic
                         // FnSig (scalars=[cc, 1]); otherwise build the
                         // standard non-variadic FnSig (scalars=[cc]).
                         // The walker stops descent at any nested decl-
@@ -9280,7 +9280,7 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
             // FC3.5 sweep-c2: float-literal suffix typing (C 6.4.4.2).
             // When the language declares `floatLiteralTyping` AND this
             // token is the numberStyle's FLOAT literal kind, the
-            // suffix selects the type (c-subset: `1.5f` → F32, `1.5`
+            // suffix selects the type (c: `1.5f` → F32, `1.5`
             // → F64) — the SAME shared rule the CST→HIR tier runs.
             // Languages without the block keep the token-kind map
             // exactly (toy / tsql — pinned).
@@ -9757,7 +9757,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // leaf is genuinely a name-bearing leaf (the config's
                 // `identifierToken` OR, when set, its `bracketIdentifierToken`
                 // — GAP D). Reference rules can structurally cover non-name
-                // leaves (e.g. c-subset's `operand` covers IntLiteral too);
+                // leaves (e.g. c's `operand` covers IntLiteral too);
                 // resolving those as names would emit phantom
                 // S_UndeclaredIdentifier diagnostics.
                 bool isIdentifier = false;
@@ -10193,7 +10193,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = declRoleChildren(tree, node, decl);
             // TLS C1 (D-CSUBSET-THREAD-LOCAL): the POSITIONAL-name mirror of
-            // the declarator-loop thread-storage hook below — c-subset's
+            // the declarator-loop thread-storage hook below — c's
             // externDecl declares a positional `name`, never a declarator
             // list, so its `extern thread_local int e;` / the 6.7.1p4 reject
             // `extern thread_local int f(void);` (S_ThreadLocalOnFunction)
@@ -11021,7 +11021,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // castTypeRef is resolved through the SAME resolver casts/sizeof/va_arg use
     // (a VALUE in type position fails loud S_UnknownType). The controlling type
     // is lvalue-converted (top-level volatile stripped — the isAssignable
-    // precedent; C 6.3.2.1 also drops the qualifiers, and c-subset does not
+    // precedent; C 6.3.2.1 also drops the qualifiers, and c does not
     // materialize const). A typed association MATCHES when its resolved type is
     // COMPATIBLE with the controlling type — interned TypeId equality (`sameType`)
     // after stripping each association type's own top-level volatile. C 6.5.1.1p2
@@ -11476,7 +11476,7 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // operatorToken gate (when set): the rule only counts as a call when
     // one of its visible children is a token of that kind. Lets a single
     // postfix-expression shape cover both call and non-call forms (e.g.
-    // c-subset's `postfixExpr` covers `f(...)`, `a[i]`, AND `i++`).
+    // c's `postfixExpr` covers `f(...)`, `a[i]`, AND `i++`).
     if (call.operatorToken.has_value()) {
         bool gated = false;
         for (auto kid : kids) {
@@ -11685,7 +11685,7 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // text as `actual`.
         //
         // BUT: if a `references` rule structurally COVERS the callee
-        // subtree (e.g. c-subset's `operand` is both the references-rule
+        // subtree (e.g. c's `operand` is both the references-rule
         // and the postfixExpr's callee child), Pass 2's ref-rule visit
         // of that very same subtree has ALREADY emitted the
         // S_UndeclaredIdentifier for this identifier. Emitting again
@@ -12989,7 +12989,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     // (JOIN-synchronous — no concurrency) so a deeply-nested-but-legal
     // expression tree does not overflow the host's ~1 MB main thread stack.
     // This is what lets `ParserConfig::maxExpressionDepth` be a real
-    // semantic cap (config-driven: c-subset = 1024) rather than a host-stack
+    // semantic cap (config-driven: c = 1024) rather than a host-stack
     // artifact (`D-PARSE-DEEP-FRONTEND-STACK`). The null-CU + every other contract
     // check lives in `analyzeImpl`, which runs on the worker; any exception
     // it throws is re-thrown here by `callOnLargeStack`.
@@ -13146,7 +13146,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     // schema's config-declared builtin functions, and a tree's root scope parents
     // to ITS language's builtin scope. So builtins are visible within their own
     // language (and shadowable by user decls) but DON'T leak across languages — a
-    // c-subset file must not resolve tsql's COALESCE; a genuine cross-language
+    // c file must not resolve tsql's COALESCE; a genuine cross-language
     // call is the FFI plan's job, not a silent builtin hit. Homogeneous CU: one
     // builtin scope, identical to CU1-CU4.
     ScopeId const cuRoot = s.scopes.root();
@@ -13371,7 +13371,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 // them (the tag-namespace lookup misses → S_UnknownType). That
                 // is an INTENTIONAL fail-loud boundary, not a tag-namespace
                 // bug: these are synthesized typedef-NAMES, not C tags, and no
-                // c-subset source spells `struct __va_list_tag` (the type is
+                // c source spells `struct __va_list_tag` (the type is
                 // reached only through the `va_list` typedef alias). If a real
                 // tagged builtin is ever needed, bind it with
                 // SymbolNamespace::Tag instead.

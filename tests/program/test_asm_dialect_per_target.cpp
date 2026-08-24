@@ -380,7 +380,7 @@ TEST(AsmDialectPerTarget, DirectoryBuildCollectsAnAssemblyFile) {
 }
 
 // ★ AND THE NAMED-LANGUAGE CASE IS DELIBERATELY UNCHANGED. `--language
-// c-subset` over a directory holding a `.s` must NOT sweep the assembly file
+// c` over a directory holding a `.s` must NOT sweep the assembly file
 // in: one CU carries one grammar to codegen, so widening here would trade a
 // silent skip for a silent MIS-PARSE (the `.s` read as C). The scan reports the
 // honest "no matching files" instead.
@@ -394,12 +394,12 @@ TEST(AsmDialectPerTarget, DirectoryBuildWithANamedLanguageIgnoresForeignFiles) {
     writeFile(srcDir, "only.s", kArmMarkedAsm);
 
     Program prog;
-    int const rc = prog.compileDirectory(srcDir.generic_string(), "c-subset",
+    int const rc = prog.compileDirectory(srcDir.generic_string(), "c",
                                          {std::string{kX86Spec}},
                                          InputResolver::Mode::Recursive);
     EXPECT_NE(rc, 0)
-        << "a c-subset directory build must not silently adopt a .s; with no "
-           "c-subset file present the scan must report an empty input";
+        << "a c directory build must not silently adopt a .s; with no "
+           "c file present the scan must report an empty input";
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -458,7 +458,7 @@ TEST(AsmDialectPerTarget, OneRegisteredClaimantStillRoutesByExtension) {
     scratch.useAsCwd();
     auto const src = writeFile(scratch.path(), "single.s", kUnmarkedAsm);
 
-    auto c   = GrammarSchema::loadShipped("c-subset");
+    auto c   = GrammarSchema::loadShipped("c");
     auto att = GrammarSchema::loadShipped("asm-x86_64-att");
     ASSERT_TRUE(c.has_value());
     ASSERT_TRUE(att.has_value());

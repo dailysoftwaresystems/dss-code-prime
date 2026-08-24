@@ -61,7 +61,7 @@ DSS Code Prime already compiles and runs **real, unmodified, production software
 
 | Capability | Status |
 |---|---|
-| **Source languages** | `c-subset` (→ full C23, in progress), `tsql-subset`, `toy` — each a `.lang.json` |
+| **Source languages** | `c` (→ full C23, in progress), `tsql-subset`, `toy` — each a `.lang.json` |
 | **CPU targets** | `x86_64`, `arm64` — shipped end-to-end (encoder + round-trip oracle) |
 | **Object formats** | ELF, PE, Mach-O — shipped (executables + dynamic linking); WASM, SPIR-V — skeletons |
 | **Real-world corpus** | [`real-examples/`](real-examples/) — the registry of **known real-world repositories DSS compiles from unmodified upstream source and then runs their own test suites against**. Today: [`c/sqlite`](real-examples/c/sqlite) — full source (189 TUs), ~1.06 M unit assertions per `full`-tier run. Each entry ships `build-and-test.sh` + `build-and-test.ps1`, which clone upstream, build, run the project's own suite and classify every failure against a reference build |
@@ -124,7 +124,7 @@ The compiler exposes a **program API** with three input modes.
 
 ```jsonc
 {
-  "language":        "c-subset",
+  "language":        "c",
   "artifactProfile": "cli",
   "targets":         ["x86_64:elf64-x86_64-linux-exec", "x86_64:pe64-x86_64-windows-exec"],
   "sources":         ["src/main.c"],
@@ -139,21 +139,21 @@ dss-code-prime --project myapp.dss-project.json
 **File list:**
 
 ```bash
-dss-code-prime --compile src/main.c src/utils.c --language c-subset \
+dss-code-prime --compile src/main.c src/utils.c --language c \
   --target x86_64:elf64-x86_64-linux-exec --target x86_64:pe64-x86_64-windows-exec
 ```
 
 **Directory scan** (recurses for the language's configured extensions):
 
 ```bash
-dss-code-prime --dir ./src/ --language c-subset --target x86_64:elf64-x86_64-linux-exec
+dss-code-prime --dir ./src/ --language c --target x86_64:elf64-x86_64-linux-exec
 ```
 
 ## Defining a language or target
 
 Everything the engine needs is declared in JSON — there is no per-language or per-target C++ to write.
 
-- **A source language** is a `.lang.json` under `src/dss-config/sources/`, declaring its lexer (`tokens`), grammar (`keywords` / `scopes` / `shapes`), semantics (symbol table + type system), and HIR lowering. Shipped references: `c-subset` (a substantial C subset en route to full C23), `tsql-subset` (T-SQL DDL + DML), and `toy` (a small typed language used as a genericity oracle).
+- **A source language** is a `.lang.json` under `src/dss-config/sources/`, declaring its lexer (`tokens`), grammar (`keywords` / `scopes` / `shapes`), semantics (symbol table + type system), and HIR lowering. Shipped references: `c` (a substantial C subset en route to full C23), `tsql-subset` (T-SQL DDL + DML), and `toy` (a small typed language used as a genericity oracle).
 - **A target** is a `.target.json` under `src/dss-config/targets/`, declaring its opcode set, register file, calling conventions, terminator kinds, encoding shapes, and relocation taxonomy. Shipped: `x86_64`, `arm64`.
 - **An object format** is declared as an `ObjectFormatSchema` the linker walks. Shipped: ELF, PE, Mach-O (WASM and SPIR-V are skeletons).
 

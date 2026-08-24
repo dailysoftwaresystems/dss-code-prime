@@ -51,7 +51,7 @@ TEST(Mir, BuildsAndReadsModuleGlobals) {
     // This substrate test exercises function-init + zero-init globals, which
     // is enough to pin the addGlobal builder shape; constant-init via the
     // literal pool is exercised by the ML2-globals lowering tests in the
-    // mir_lowering_c_subset binary.
+    // mir_lowering_c binary.
     // First, build a synthetic init function whose body just returns.
     MirFuncId const init = b.addFunction(kFnSig, SymbolId{100});
     MirBlockId const ie  = b.createBlock(StructCfMarker::EntryBlock);

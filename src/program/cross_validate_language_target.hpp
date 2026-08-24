@@ -69,7 +69,7 @@ languageTargetIsaCompatible(GrammarSchema const& language,
 //
 // `languageName` is the name the manifest/CLI used to select the grammar —
 // the string the operator can act on — rather than the grammar's internal
-// `language.name`, which is a different spelling (`c-subset` vs `CSubset`).
+// `language.name`, which is a different spelling (`c` vs `C`).
 //
 // `subject` prefixes the message to say WHOSE pairing is being refused. Empty
 // for a root build; the resolver passes `"dependency '<manifest path>'"` so a

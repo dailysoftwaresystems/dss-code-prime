@@ -251,7 +251,7 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     // the time a cleared flag could matter.
     //
     // MEASURED CONSEQUENCE: dropping this argument leaves
-    // `MirLoweringCSubsetLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
+    // `MirLoweringCLinkage.AlwaysInlineBypassesThresholdInShippedRelease`
     // GREEN — the end-to-end pin CANNOT detect this hop. Only the dedicated
     // flag-survival assertions catch it
     // (`MirRebuildHelper.RebuildFunctionPreservesAlwaysInline` and the

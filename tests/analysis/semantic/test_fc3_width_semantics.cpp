@@ -6,7 +6,7 @@
 // resolution, and the toy/tsql typing-unchanged pins.
 //
 // Discipline: every engine behavior here is driven by the SHIPPED
-// c-subset config (the vocabulary lives in JSON; the tests perturb the
+// c config (the vocabulary lives in JSON; the tests perturb the
 // JSON to prove the loader rejects), and the dataModel differential is
 // asserted by analyzing the SAME source under BOTH models — the
 // signature-threading makes that directly testable.
@@ -51,10 +51,10 @@ using namespace dss::sem_test;
 
 namespace {
 
-// Analyze one c-subset source under an explicit data model.
-[[nodiscard]] SemanticModel analyzeCSubset(std::string src,
+// Analyze one c source under an explicit data model.
+[[nodiscard]] SemanticModel analyzeC(std::string src,
                                            DataModel dm = DataModel::Lp64) {
-    auto cu = buildShippedUnit("c-subset", {std::move(src)});
+    auto cu = buildShippedUnit("c", {std::move(src)});
     assertNoBuilderErrors(*cu);
     return analyze(cu, DiagnosticBudget::libraryDefault(), dm);
 }
@@ -97,7 +97,7 @@ namespace {
     return TypeKind::Void;
 }
 
-// The shipped c-subset JSON text (for loader perturbation tests). The directory
+// The shipped c JSON text (for loader perturbation tests). The directory
 // now comes from the ONE test-side resolver (`repo_root.hpp`: $DSS_CONFIG_ROOT →
 // the repo root CMake bakes in → a cwd ancestor walk) rather than the private
 // 12-hop cwd walk this used to carry, which read neither of the first two
@@ -105,22 +105,22 @@ namespace {
 // ancestry, missed every time.
 //
 // It THROWS rather than returning `{}`: the sole consumer that could not check
-// (`loadShippedCSubsetJson` below) fed the empty path to `json::parse`, turning
+// (`loadShippedCJson` below) fed the empty path to `json::parse`, turning
 // "I cannot find the config" into a parse error about an unopened stream. A
 // throw is reported by GoogleTest as a failure of the ONE running test, and
 // carries either the resolver's three-source diagnostic (root unresolvable) or
 // the path it did resolve and could not find (config missing).
 [[nodiscard]] std::filesystem::path findShippedSourceConfig() {
     std::filesystem::path const path =
-        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+        dss::test::configRoot() / "sources" / "c.lang.json";
     if (!std::filesystem::exists(path)) {
-        throw std::runtime_error("shipped c-subset.lang.json is missing: " +
+        throw std::runtime_error("shipped c.lang.json is missing: " +
                                  path.string());
     }
     return path;
 }
 
-[[nodiscard]] nlohmann::json loadShippedCSubsetJson() {
+[[nodiscard]] nlohmann::json loadShippedCJson() {
     auto const path = findShippedSourceConfig();
     std::ifstream in{path, std::ios::binary};
     EXPECT_TRUE(in.good());
@@ -133,13 +133,13 @@ namespace {
     return r.has_value();
 }
 
-// Analyze a c-subset source under a schema whose `arithmeticConversions`
+// Analyze a c source under a schema whose `arithmeticConversions`
 // block is `mutate`d in place first — the perturbation that proves a config
 // verb is LIVE (the engine reads it, so flipping it changes a typed result).
 [[nodiscard]] SemanticModel analyzeWithArithMutation(
     std::string src, std::function<void(nlohmann::json&)> mutate,
     DataModel dm = DataModel::Lp64) {
-    nlohmann::json doc = loadShippedCSubsetJson();
+    nlohmann::json doc = loadShippedCJson();
     mutate(doc["semantics"]["arithmeticConversions"]);
     auto schema = GrammarSchema::loadFromText(doc.dump(), "<arith-perturbed>");
     if (!schema) {
@@ -180,7 +180,7 @@ namespace {
 // ── P1: the specifier multiset table ────────────────────────────────────
 
 TEST(Fc3WidthSemantics, UnsignedIntTypesU32) {
-    auto m = analyzeCSubset("int main() { unsigned int x; x = 1u; return 0; }\n");
+    auto m = analyzeC("int main() { unsigned int x; x = 1u; return 0; }\n");
     EXPECT_EQ(kindOf(m, "x"), TypeKind::U32);
 }
 
@@ -193,7 +193,7 @@ TEST(Fc3WidthSemantics, SpecifierMultisetIsOrderFree) {
              "int main() { long long unsigned int x; x = 1; return 0; }\n",
              "int main() { long unsigned long x; x = 1; return 0; }\n",
          }) {
-        auto m = analyzeCSubset(src);
+        auto m = analyzeC(src);
         EXPECT_EQ(kindOf(m, "x"), TypeKind::U64) << src;
         EXPECT_FALSE(m.hasErrors()) << src;
     }
@@ -217,7 +217,7 @@ TEST(Fc3WidthSemantics, FullSpecifierSurfaceResolvesDeclaredCores) {
         {"double s;",             TypeKind::F64},
     };
     for (auto const& r : rows) {
-        auto m = analyzeCSubset(std::string{"int main() { "} + r.decl
+        auto m = analyzeC(std::string{"int main() { "} + r.decl
                                 + " return 0; }\n");
         EXPECT_EQ(kindOf(m, "s"), r.want) << r.decl;
     }
@@ -231,12 +231,12 @@ TEST(Fc3WidthSemantics, InvalidSpecifierComboFailsLoudOnceByAbsence) {
     // LEFT this list with FC17.9(e) (D-CSUBSET-LONG-DOUBLE): it is now a
     // VALID row carrying the per-format axis — under an undeclared axis it
     // takes the precise S_LongDoubleFormatUndeclared instead (pinned by
-    // SemanticAnalyzerCSubset.LongDoubleUndeclaredAxisFailsLoud).
+    // SemanticAnalyzerC.LongDoubleUndeclaredAxisFailsLoud).
     for (auto const* src : {
              "int main() { unsigned float x; return 0; }\n",
              "int main() { short long x; return 0; }\n",
          }) {
-        auto m = analyzeCSubset(src);
+        auto m = analyzeC(src);
         EXPECT_EQ(countCode(m.diagnostics(),
                             DiagnosticCode::S_InvalidTypeSpecifierCombination),
                   1u)
@@ -247,7 +247,7 @@ TEST(Fc3WidthSemantics, InvalidSpecifierComboFailsLoudOnceByAbsence) {
 }
 
 TEST(Fc3WidthSemantics, BoolKeywordLiteralsTypeBool) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int main() { bool t; t = true; bool f; f = false; return 0; }\n");
     EXPECT_EQ(kindOf(m, "t"), TypeKind::Bool);
     EXPECT_EQ(kindOf(m, "f"), TypeKind::Bool);
@@ -258,16 +258,16 @@ TEST(Fc3WidthSemantics, BoolKeywordLiteralsTypeBool) {
 
 TEST(Fc3WidthSemantics, LongIsI64OnLp64AndI32OnLlp64) {
     char const* src = "int main() { long x; x = 1l; return 0; }\n";
-    auto lp = analyzeCSubset(src, DataModel::Lp64);
+    auto lp = analyzeC(src, DataModel::Lp64);
     EXPECT_EQ(kindOf(lp, "x"), TypeKind::I64);
-    auto llp = analyzeCSubset(src, DataModel::Llp64);
+    auto llp = analyzeC(src, DataModel::Llp64);
     EXPECT_EQ(kindOf(llp, "x"), TypeKind::I32);
 }
 
 TEST(Fc3WidthSemantics, UnsignedLongFollowsDataModel) {
     char const* src = "int main() { unsigned long x; x = 1ul; return 0; }\n";
-    EXPECT_EQ(kindOf(analyzeCSubset(src, DataModel::Lp64), "x"), TypeKind::U64);
-    EXPECT_EQ(kindOf(analyzeCSubset(src, DataModel::Llp64), "x"), TypeKind::U32);
+    EXPECT_EQ(kindOf(analyzeC(src, DataModel::Lp64), "x"), TypeKind::U64);
+    EXPECT_EQ(kindOf(analyzeC(src, DataModel::Llp64), "x"), TypeKind::U32);
 }
 
 TEST(Fc3WidthSemantics, NarrowingLongLiteralNowAdmittedOnBothModels) {
@@ -279,15 +279,15 @@ TEST(Fc3WidthSemantics, NarrowingLongLiteralNowAdmittedOnBothModels) {
     // differential is still witnessed elsewhere — at the type level by
     // UnsignedLongFollowsDataModel, and at RUNTIME by the datamodel_long_width_llp64
     // corpus (the truncation flips the sign → exit 7 vs the LP64 sibling's 42).
-    // RED-ON-DISABLE: turn intSameSignednessNarrows off in c-subset and the LLP64
+    // RED-ON-DISABLE: turn intSameSignednessNarrows off in c and the LLP64
     // arm flips back to one S_TypeMismatch.
     char const* src =
         "long pick(long v) { return v; }\n"
         "int main() { long r; r = pick(2147483648l); return 0; }\n";
-    auto lp = analyzeCSubset(src, DataModel::Lp64);
+    auto lp = analyzeC(src, DataModel::Lp64);
     EXPECT_EQ(countCode(lp.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
     EXPECT_FALSE(lp.hasErrors());
-    auto llp = analyzeCSubset(src, DataModel::Llp64);
+    auto llp = analyzeC(src, DataModel::Llp64);
     EXPECT_EQ(countCode(llp.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
     EXPECT_FALSE(llp.hasErrors());
 }
@@ -295,14 +295,14 @@ TEST(Fc3WidthSemantics, NarrowingLongLiteralNowAdmittedOnBothModels) {
 TEST(Fc3WidthSemantics, Ilp32SelectionFailsLoud) {
     // ILP32 is declared-only (wasm/spirv skeletons) — selecting it must
     // fail loud rather than silently run an untested width path.
-    auto m = analyzeCSubset("int main() { return 0; }\n", DataModel::Ilp32);
+    auto m = analyzeC("int main() { return 0; }\n", DataModel::Ilp32);
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_UnsupportedDataModel), 1u);
     EXPECT_TRUE(m.hasErrors());
 }
 
 TEST(Fc3WidthSemantics, ModelCarriesTheAnalysisDataModel) {
-    EXPECT_EQ(analyzeCSubset("int main() { return 0; }\n",
+    EXPECT_EQ(analyzeC("int main() { return 0; }\n",
                              DataModel::Llp64).dataModel(),
               DataModel::Llp64);
 }
@@ -315,7 +315,7 @@ namespace {
 // assertion: the literal's *actual decoded type* (width AND signedness), not
 // an assignability proxy.
 //
-// This supersedes the prior cross-signedness-mismatch proxy. The c-subset
+// This supersedes the prior cross-signedness-mismatch proxy. The c
 // `intCrossSignednessConverts` opt-in (D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT,
 // C 6.3.1.3) admits signed<->unsigned ASSIGNMENT, so an opposite-signedness
 // parameter no longer mismatches — signedness became unobservable through
@@ -324,7 +324,7 @@ namespace {
 void expectLiteralTypes(std::string const& literal, TypeKind want,
                         DataModel dm = DataModel::Lp64) {
     auto cu = buildShippedUnit(
-        "c-subset", {std::string{"int main() { "} + literal + "; return 0; }\n"});
+        "c", {std::string{"int main() { "} + literal + "; return 0; }\n"});
     assertNoBuilderErrors(*cu);
     auto m = analyze(cu, DiagnosticBudget::libraryDefault(), dm);
     EXPECT_FALSE(m.hasErrors()) << literal << " should analyze without error";
@@ -381,14 +381,14 @@ TEST(Fc3WidthSemantics, SuffixesSelectTheirLadderRules) {
 TEST(Fc3WidthSemantics, LiteralBeyondEveryCandidateFailsLoud) {
     // 2^64 exceeds unsigned long long — decode-tier overflow → the same
     // user-facing S_IntegerLiteralTooLarge as ladder exhaustion.
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int main() { unsigned long long x; x = 18446744073709551616ull; "
         "return 0; }\n");
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_IntegerLiteralTooLarge), 1u);
     // Ladder exhaustion (decodable, but beyond every SIGNED decimal
     // candidate): 2^63 has no decimal-unsuffixed candidate in C.
-    auto m2 = analyzeCSubset(
+    auto m2 = analyzeC(
         "int main() { long long x; x = 9223372036854775808; return 0; }\n");
     EXPECT_EQ(countCode(m2.diagnostics(),
                         DiagnosticCode::S_IntegerLiteralTooLarge), 1u);
@@ -407,14 +407,14 @@ TEST(Fc3WidthSemantics, FloatSuffixedLiteralTypesF32) {
     // (narrowing — assignability admits only widening), while `1.5f`
     // into `float` is clean. That asymmetry proves the suffix
     // selected F32, not merely "something float".
-    auto cleanF32 = analyzeCSubset(
+    auto cleanF32 = analyzeC(
         "int take(float v) { return 0; }\n"
         "int main() { int r; r = take(1.5f); return 0; }\n");
     EXPECT_EQ(countCode(cleanF32.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "1.5f must pass cleanly into a float param (types F32)";
     EXPECT_FALSE(cleanF32.hasErrors());
-    auto widen = analyzeCSubset(
+    auto widen = analyzeC(
         "int take(double v) { return 0; }\n"
         "int main() { int r; r = take(1.5f); return 0; }\n");
     EXPECT_EQ(countCode(widen.diagnostics(),
@@ -430,7 +430,7 @@ TEST(Fc3WidthSemantics, FloatSuffixedLiteralTypesF32) {
     // typed the literal. selectedGenericArms observes the winning arm at the semantic
     // tier — no const-fold. RED-ON-DISABLE of the SUFFIX: were 1.5f typed F64 it would
     // select the double arm ("2") instead of "1".)
-    auto suffixTypes = analyzeCSubset(
+    auto suffixTypes = analyzeC(
         "int main() {\n"
         "  _Generic(1.5f, float: 1, double: 2, default: 0);\n"
         "  _Generic(1.5,  float: 3, double: 4, default: 0);\n"
@@ -449,7 +449,7 @@ TEST(Fc3WidthSemantics, FloatTypingUncoveredSuffixRejectsAtLoad) {
     // Remove the f/F rule: numberStyle.floatSuffixes still declares
     // them → the lexer would admit a literal the typing map cannot
     // type. Must reject at LOAD, never silently fall back.
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     auto& rules = doc["semantics"]["floatLiteralTyping"];
     rules.erase(
         std::remove_if(rules.begin(), rules.end(),
@@ -463,14 +463,14 @@ TEST(Fc3WidthSemantics, FloatTypingUncoveredSuffixRejectsAtLoad) {
 
 TEST(Fc3WidthSemantics, FloatTypingUnknownSuffixRejectsAtLoad) {
     // A rule naming a suffix the lexer does not admit is dead config.
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     doc["semantics"]["floatLiteralTyping"].push_back(
         {{"suffixes", {"q"}}, {"type", "double"}});
     EXPECT_FALSE(schemaLoads(doc));
 }
 
 TEST(Fc3WidthSemantics, FloatTypingNonFloatTypeRejectsAtLoad) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     for (auto& r : doc["semantics"]["floatLiteralTyping"]) {
         if (r.contains("suffixes") && r["suffixes"].empty()) {
             r["type"] = "int";
@@ -480,7 +480,7 @@ TEST(Fc3WidthSemantics, FloatTypingNonFloatTypeRejectsAtLoad) {
 }
 
 TEST(Fc3WidthSemantics, FloatTypingMissingUnsuffixedRuleRejectsAtLoad) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     auto& rules = doc["semantics"]["floatLiteralTyping"];
     rules.erase(
         std::remove_if(rules.begin(), rules.end(),
@@ -493,7 +493,7 @@ TEST(Fc3WidthSemantics, FloatTypingMissingUnsuffixedRuleRejectsAtLoad) {
 }
 
 TEST(Fc3WidthSemantics, FloatTypingDuplicateSuffixClaimRejectsAtLoad) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     doc["semantics"]["floatLiteralTyping"].push_back(
         {{"suffixes", {"f"}}, {"type", "double"}});
     EXPECT_FALSE(schemaLoads(doc));
@@ -544,12 +544,12 @@ TEST(Fc3WidthSemantics, TsqlTypingIsDataModelInvariantAndUnchanged) {
 
 // ── Loader fail-louds (shipped JSON, surgically perturbed) ──────────────
 
-TEST(Fc3LoaderRejects, ShippedCSubsetLoadsClean) {
-    EXPECT_TRUE(schemaLoads(loadShippedCSubsetJson()));
+TEST(Fc3LoaderRejects, ShippedCLoadsClean) {
+    EXPECT_TRUE(schemaLoads(loadShippedCJson()));
 }
 
 TEST(Fc3LoaderRejects, DuplicateSpecifierMultisetRejects) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     // `unsigned int` is already declared; a REORDERED duplicate must
     // reject (resolution would silently shadow one row).
     doc["semantics"]["typeSpecifiers"].push_back(
@@ -558,20 +558,20 @@ TEST(Fc3LoaderRejects, DuplicateSpecifierMultisetRejects) {
 }
 
 TEST(Fc3LoaderRejects, UnknownCoreNameRejects) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     doc["semantics"]["typeSpecifiers"][0]["core"] = "I31";
     EXPECT_FALSE(schemaLoads(doc));
 }
 
 TEST(Fc3LoaderRejects, UnknownTokenKindRejects) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     doc["semantics"]["typeSpecifiers"].push_back(
         {{"tokens", {"NoSuchKeyword"}}, {"core", "I32"}});
     EXPECT_FALSE(schemaLoads(doc));
 }
 
 TEST(Fc3LoaderRejects, UnknownDataModelKeyRejects) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     // A typo'd model name would otherwise silently never override —
     // the exact knob-that-lies the closed key set forecloses.
     doc["semantics"]["builtinTypes"][1]["coreByDataModel"] =
@@ -580,7 +580,7 @@ TEST(Fc3LoaderRejects, UnknownDataModelKeyRejects) {
 }
 
 TEST(Fc3LoaderRejects, UnknownTypeSpecifierFieldRejects) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     doc["semantics"]["typeSpecifiers"][0]["coar"] = "I32";
     EXPECT_FALSE(schemaLoads(doc));
 }
@@ -590,7 +590,7 @@ TEST(Fc3LoaderRejects, UnknownTypeSpecifierFieldRejects) {
 // would bind base F64 on every walled format = the knob-that-lies), and a
 // typo'd core value has no meaning at all.
 TEST(Fc3LoaderRejects, UnknownLongDoubleFormatKeyRejects) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     doc["semantics"]["typeSpecifiers"].push_back(
         {{"tokens", {"LongKeyword", "FloatKeyword"}},
          {"core", "F64"},
@@ -599,7 +599,7 @@ TEST(Fc3LoaderRejects, UnknownLongDoubleFormatKeyRejects) {
 }
 
 TEST(Fc3LoaderRejects, UnknownLongDoubleFormatValueRejects) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     doc["semantics"]["typeSpecifiers"].push_back(
         {{"tokens", {"LongKeyword", "FloatKeyword"}},
          {"core", "F64"},
@@ -608,7 +608,7 @@ TEST(Fc3LoaderRejects, UnknownLongDoubleFormatValueRejects) {
 }
 
 TEST(Fc3LoaderRejects, UnknownMixedSignednessVerbRejects) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     doc["semantics"]["arithmeticConversions"]["mixedSignedness"] =
         "rank-prefer-signed";
     EXPECT_FALSE(schemaLoads(doc));
@@ -617,13 +617,13 @@ TEST(Fc3LoaderRejects, UnknownMixedSignednessVerbRejects) {
 TEST(Fc3LoaderRejects, UnknownShiftResultVerbRejects) {
     // `shiftResult` (C 6.5.7) is a CLOSED verb — a typo'd spelling must fail
     // loud at load, never silently fall back to a default discipline.
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     doc["semantics"]["arithmeticConversions"]["shiftResult"] = "promotedRight";
     EXPECT_FALSE(schemaLoads(doc));
 }
 
 TEST(Fc3LoaderRejects, UnknownLadderTypeNameRejects) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     doc["semantics"]["integerLiteralTyping"][0]["decimal"][0] =
         "no such type";
     EXPECT_FALSE(schemaLoads(doc));
@@ -632,7 +632,7 @@ TEST(Fc3LoaderRejects, UnknownLadderTypeNameRejects) {
 TEST(Fc3LoaderRejects, LadderMustCoverEveryDeclaredSuffix) {
     // Drop the `u`-group rule: the lexer still admits `42u`, so the
     // ladder could never type it — a silent config hole; reject.
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     auto& ladder = doc["semantics"]["integerLiteralTyping"];
     for (std::size_t i = 0; i < ladder.size(); ++i) {
         auto const& sfx = ladder[i]["suffixes"];
@@ -645,7 +645,7 @@ TEST(Fc3LoaderRejects, LadderMustCoverEveryDeclaredSuffix) {
 }
 
 TEST(Fc3LoaderRejects, LadderRequiresExactlyOneUnsuffixedRule) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     auto& ladder = doc["semantics"]["integerLiteralTyping"];
     for (std::size_t i = 0; i < ladder.size(); ++i) {
         if (ladder[i]["suffixes"].empty()) {
@@ -657,7 +657,7 @@ TEST(Fc3LoaderRejects, LadderRequiresExactlyOneUnsuffixedRule) {
 }
 
 TEST(Fc3LoaderRejects, NonIntegerLadderCandidateRejects) {
-    auto doc = loadShippedCSubsetJson();
+    auto doc = loadShippedCJson();
     doc["semantics"]["integerLiteralTyping"][0]["decimal"][0] = "double";
     EXPECT_FALSE(schemaLoads(doc));
 }
@@ -671,10 +671,10 @@ TEST(Fc3LoaderRejects, NonIntegerLadderCandidateRejects) {
 // LEFT operand `int` → dim 4; `commonType` → the usual-arithmetic common type
 // `long long` → dim 8. The 4↔8 flip when ONLY the verb changes IS the red-on-
 // disable proof — a dead knob would peg both arms at 4. (Variable operands, not
-// literals: c-subset's `sizeof` of a value expression folds through `subtreeType`
+// literals: c's `sizeof` of a value expression folds through `subtreeType`
 // — which routes the shift through the same `shiftResultType` chokepoint — so
 // this is the SEMANTIC tier's behavioral pin; the sibling cst_to_hir site is in
-// test_hir_lowering_c_subset.cpp and the chokepoint unit pin in test_type_rules.)
+// test_hir_lowering_c.cpp and the chokepoint unit pin in test_type_rules.)
 
 TEST(Fc3ShiftResult, PromotedLeftSizesByLeftOperand) {
     auto m = analyzeWithArithMutation(
@@ -780,7 +780,7 @@ TEST(Fc3ComparisonResult, GenericControllingExprSelectsIntArm) {
     // `subtreeType` types a `_Generic` controlling expression (pass2Post too); a
     // comparison controls as `int`, selecting the `int:` association (C 6.5.1.1).
     // Pre-fix it controlled as Bool → no int match → the `default:` arm ("0").
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int main(void){ return _Generic((1 < 2), int: 7, default: 0); }\n");
     EXPECT_FALSE(m.hasErrors());
     EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"7"}))
@@ -1159,7 +1159,7 @@ static void expectStdbit5WayCleanUnder(DataModel dm) {
               + "\n       + " + stdbitGeneric5Way("count_ones", "c", dm)
               + "\n       + " + stdbitGeneric5Way("count_ones", "d", dm)
               + "\n       + " + stdbitGeneric5Way("count_ones", "e", dm) + ";\n}\n";
-    auto m = analyzeCSubset(src, dm);
+    auto m = analyzeC(src, dm);
     EXPECT_FALSE(m.hasErrors()) << "the 5-way _Generic must compile clean";
     EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_GenericSelectionAmbiguous), 0u)
         << "all five unsigned vocabulary entries are DISTINCT types — never ambiguous";
@@ -1210,7 +1210,7 @@ TEST(Fc3Stdbit, GenericUnsignedLongRoutesByDataModel) {
     };
     for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64}) {
         SCOPED_TRACE(dm == DataModel::Lp64 ? "LP64" : "LLP64");
-        auto m = analyzeCSubset(srcFor(dm), dm);
+        auto m = analyzeC(srcFor(dm), dm);
         ASSERT_FALSE(m.hasErrors());
         EXPECT_EQ(countCode(m.diagnostics(),
                             DiagnosticCode::S_GenericSelectionAmbiguous), 0u);
@@ -1262,7 +1262,7 @@ TEST(Fc3GenericResultType, SizeofFoldsSelectedNotControlling) {
 // The `auto` binding takes the winner's type. `long` controlling → `long:` arm
 // → `(short)1` → the object is `short` (I16), not the controlling `long` (I64).
 TEST(Fc3GenericResultType, AutoBindsSelectedArmType) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(long x){ auto r = _Generic((x), long: (short)1, default: (double)2);"
         " return (int)sizeof(r); }\n");
     EXPECT_FALSE(m.hasErrors());
@@ -1277,7 +1277,7 @@ TEST(Fc3GenericResultType, AutoBindsSelectedArmType) {
 // double literal `1.0` (F64). Pre-fix the whole selection collapses to the
 // controlling `long` (I64).
 TEST(Fc3GenericResultType, AutoBindsWinnerResultNotControllingWhenDistinct) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(long x){ auto r = _Generic((x), int: 1.0f, long: 1.0, default: (char)1);"
         " return (int)r; }\n");
     EXPECT_FALSE(m.hasErrors());
@@ -1293,7 +1293,7 @@ TEST(Fc3GenericResultType, AutoBindsWinnerResultNotControllingWhenDistinct) {
 // innermost controlling `long` (I64). Exercises `subtreeType` driving a
 // `_Generic` in controlling position AND the work-stack result drive.
 TEST(Fc3GenericResultType, NestedGenericInControllingPosition) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(long x){ auto r = _Generic(\n"
         "    _Generic((x), long: (signed char)1, default: (double)2),\n"
         "    signed char: (short)7, long: (double)9, default: (int)0);\n"
@@ -1325,7 +1325,7 @@ TEST(Fc3GenericResultType, GenericResultFeedsSizeofInOuterControllingExpr) {
 // diagnostics. GREEN before AND after the fix (pass2Post owns these) — they fail
 // only if the refactor drops the diagnostic path.
 TEST(Fc3GenericResultType, NoMatchStillDiagnosesFromPass2) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(double d){ return _Generic((d), int: 1, char: 2); }\n");
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_GenericSelectionNoMatch), 1u);
@@ -1335,7 +1335,7 @@ TEST(Fc3GenericResultType, NoMatchStillDiagnosesFromPass2) {
 
 TEST(Fc3GenericResultType, AmbiguousStillDiagnosesFromPass2) {
     // Two associations naming the SAME type both match the int controlling type.
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(int v){ return _Generic((v), int: 1, int: 2); }\n");
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_GenericSelectionAmbiguous), 1u);
@@ -1348,14 +1348,14 @@ TEST(Fc3GenericResultType, AmbiguousStillDiagnosesFromPass2) {
 // moved the S_Generic* emits into the shared (dual-called) helper, these would
 // double. Red-on-disable guards for the diagnostic-ownership boundary.
 TEST(Fc3GenericResultType, AutoNoMatchDiagnosesExactlyOnce) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(long x){ auto r = _Generic((x), int: 1, char: 2); return 0; }\n");
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_GenericSelectionNoMatch), 1u);
 }
 
 TEST(Fc3GenericResultType, AutoAmbiguousDiagnosesExactlyOnce) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(double d){ auto r = _Generic((d), double: 1, double: 2); return 0; }\n");
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_GenericSelectionAmbiguous), 1u);
@@ -1369,7 +1369,7 @@ TEST(Fc3GenericResultType, AutoAmbiguousDiagnosesExactlyOnce) {
 // selection: without the helper's snapshot/rollback that is 2 emits (non-auto)
 // or 3 (auto). It must be EXACTLY 1: only pass2Post's stamp-loop resolve emits.
 TEST(Fc3GenericResultType, BitIntAssocDiagnosesExactlyOnceNonAuto) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(int v){ return _Generic((v), int: 1, _BitInt(0): 2); }\n");
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_BitIntWidthNotPositive), 1u)
@@ -1377,7 +1377,7 @@ TEST(Fc3GenericResultType, BitIntAssocDiagnosesExactlyOnceNonAuto) {
 }
 
 TEST(Fc3GenericResultType, BitIntAssocDiagnosesExactlyOnceAuto) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(int v){ auto r = _Generic((v), int: 1, _BitInt(0): 2); return r; }\n");
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_BitIntWidthNotPositive), 1u)
@@ -1410,7 +1410,7 @@ TEST(Fc3GenericResultType, ControllingNestedGenericDeepStaysFlat) {
     for (int level = 0; level < kDepth; ++level) {
         expr = "_Generic(" + expr + ", int: 1, default: 0)";
     }
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(int x){ auto r = " + expr + "; return r; }\n");
     EXPECT_FALSE(m.hasErrors());
     EXPECT_EQ(kindOf(m, "r"), TypeKind::I32)
@@ -1424,7 +1424,7 @@ TEST(Fc3GenericResultType, ControllingNestedGenericDeepStaysFlat) {
 // collapses through the transparent-wrapper fallback to the controlling `long`
 // (I64), so the winner-nested type is lost exactly like the controlling case.
 TEST(Fc3GenericResultType, WinnerNestedGenericTypesAsInnerWinner) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(long x){ auto r = _Generic((x), "
         "long: _Generic((x), long: (short)7, default: (int)9), default: (double)2);"
         " return (int)r; }\n");
@@ -1442,7 +1442,7 @@ TEST(Fc3GenericResultType, WinnerNestedGenericTypesAsInnerWinner) {
 // resolve), leaving the Pass-2 arm the SOLE emitter. RED-on-disable: 2 without the
 // rollback (the Pass-1.5 arm's own unsuppressable emit) → 1 with it.
 TEST(Fc3ReTypingBitInt, CastBitIntZeroDiagnosesExactlyOnce) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(int x){ auto r = (_BitInt(0))x; return 0; }\n");
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_BitIntWidthNotPositive), 1u)
@@ -1450,7 +1450,7 @@ TEST(Fc3ReTypingBitInt, CastBitIntZeroDiagnosesExactlyOnce) {
 }
 
 TEST(Fc3ReTypingBitInt, CompoundLiteralBitIntZeroDiagnosesExactlyOnce) {
-    auto m = analyzeCSubset(
+    auto m = analyzeC(
         "int f(void){ auto r = (_BitInt(0)){0}; return 0; }\n");
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_BitIntWidthNotPositive), 1u)

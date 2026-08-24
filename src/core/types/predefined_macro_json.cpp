@@ -329,7 +329,7 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
         //
         // `$`-prefixed keys are PROSE (the codebase-wide convention) and are
         // exempt via the shared predicate, never a literal `"$comment"`
-        // compare — the shipped `c-subset.lang.json` uses `$comment` INSIDE
+        // compare — the shipped `c.lang.json` uses `$comment` INSIDE
         // macro entries, and a literal compare would still reject a
         // `$valueComment`.
         //

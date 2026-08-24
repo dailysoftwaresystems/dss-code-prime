@@ -137,7 +137,7 @@ int buildOne(fs::path const& outDir,
     p.setOutputDir(outDir);
     if (!resolveLibs.empty()) p.setResolveLibraries(resolveLibs);
     return p.compileFiles(std::vector<std::string>{srcPath},
-                          "c-subset", std::vector<std::string>{target}, rep);
+                          "c", std::vector<std::string>{target}, rep);
 }
 
 // Same as `buildOne`, but each `--resolve-library` entry also STATES the
@@ -153,7 +153,7 @@ int buildOneWithSpecs(fs::path const& outDir,
     p.setOutputDir(outDir);
     if (!resolveLibs.empty()) p.setResolveLibraries(resolveLibs);
     return p.compileFiles(std::vector<std::string>{srcPath},
-                          "c-subset", std::vector<std::string>{target}, rep);
+                          "c", std::vector<std::string>{target}, rep);
 }
 
 // The emitted image's bytes, for the dependency-table extractors.
@@ -697,7 +697,7 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDefinitionResolvesUnderResolveLibrary)
     // would fold both into ONE multi-file CU, a different link model).
     int const rc = p.compileUnits(
         std::vector<std::string>{declSrc.string(), defSrc.string()},
-        "c-subset", std::vector<std::string>{execTarget}, rep);
+        "c", std::vector<std::string>{execTarget}, rep);
     ASSERT_EQ(rc, 0)
         << "an extern DEFINED BY A SIBLING TU must not fail resolve-library "
            "validation (the TF-C66 false-positive)";
@@ -763,7 +763,7 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDataDefinitionResolvesUnderResolveLibr
     p.setResolveLibraries({libPath});
     int const rc = p.compileUnits(
         std::vector<std::string>{declSrc.string(), defSrc.string()},
-        "c-subset", std::vector<std::string>{execTarget}, rep);
+        "c", std::vector<std::string>{execTarget}, rep);
     ASSERT_EQ(rc, 0)
         << "an unbound DATA extern DEFINED BY A SIBLING TU must lower + link "
            "(no H0009, no MirBuilder abort) -- the TF-C67 ExternGlobal exemption";
@@ -1408,7 +1408,7 @@ TEST(FfiResolveLibraryPerTarget, EachTargetLinksOnlyItsOwnAddedLibraries) {
            "can only have come through the per-target channel";
 
     DiagnosticReporter rep;
-    ASSERT_EQ(prog.compileFiles({mainSrc.string()}, "c-subset",
+    ASSERT_EQ(prog.compileFiles({mainSrc.string()}, "c",
                                 {kX64Exec, kArmExec}, rep), 0)
         << (rep.all().empty() ? "" : rep.all().front().actual);
 
@@ -1467,7 +1467,7 @@ TEST(FfiResolveLibraryPerTarget, AdditionKeyedToAnUnbuiltTargetFailsLoud) {
         {kAbsentSpec, {ResolveLibrarySpec{libPath, "dsslib.so"}}},
     });
     DiagnosticReporter rep;
-    int const rc = prog.compileFiles({mainSrc.string()}, "c-subset",
+    int const rc = prog.compileFiles({mainSrc.string()}, "c",
                                      {kBuiltSpec}, rep);
     EXPECT_NE(rc, 0)
         << "additions for a target the build never compiles must abandon the "

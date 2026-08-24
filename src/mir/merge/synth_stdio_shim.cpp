@@ -69,7 +69,7 @@ constexpr std::uint64_t kOptLegacyVsprintfNullTermination = 1ull << 0;
 // ★ THIS BIT IS THE WHOLE C99 CONTRACT OF `snprintf`, not a tuning knob, and the two
 // behaviours it selects between are BOTH silent — neither errors, neither fails to link,
 // so the only way to tell them apart is to observe a TRUNCATING call at runtime. That is
-// what `examples/c-subset/shipped_snprintf_ucrt` exists to do, and it is also why the older
+// what `examples/c/shipped_snprintf_ucrt` exists to do, and it is also why the older
 // `sprintf`-only witness could not pin `_Options` at all: with `_BufferCount = (size_t)-1`
 // no truncation is reachable, so bits 0/1/2 are observationally identical there.
 //

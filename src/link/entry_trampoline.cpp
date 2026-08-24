@@ -90,7 +90,7 @@ struct EntryResolution {
     // D-CSUBSET-MULTI-FN-WIN64-CC (step 13.5 cycle 2 post-fold,
     // 2026-06-03): when the compile pipeline plumbed an explicit
     // user-entry symbol from the source language's entry-function
-    // name config (c-subset's `implicitReturnZeroForFunctionNames`),
+    // name config (c's `implicitReturnZeroForFunctionNames`),
     // verify it resolves to a defined function in the module and
     // use it. Pre-fix, multi-function modules whose entry wasn't
     // declared first in source order silently called the wrong

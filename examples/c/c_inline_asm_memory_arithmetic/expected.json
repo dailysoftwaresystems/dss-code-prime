@@ -1,0 +1,32 @@
+{
+  "$comment": "D-TARGET-X86-64-DECLARES-NO-MEMORY-DESTINATION-ARITHMETIC: the first runnable witness that an arithmetic instruction can name MEMORY as its destination (and as its source) inside a GNU extended-asm template. ★★★ THIS EXAMPLE WAS BORN RED. ✔MEASURED through the real CLI on a clean HEAD build, x86_64:pe64-x86_64-windows-exec and x86_64:elf64-x86_64-linux-exec at debug AND release: `__asm__(\"addq $5, %0\" : \"+m\"(m))` was refused with `error[A0008] 'addq' produced 4 LIR operand(s) at width 64, and no candidate target opcode encodes that shape`, and so were the `sub`/`and`/`or`/`xor`/`not`/`neg` twins at both widths and the memory-SOURCE direction of every one of them. ✔MEASURED that it was NOT a property of `\"+m\"`: the identical refusal came through the already-shipped `\"m\"` INPUT form, which is the control that makes it a target-table gap rather than a constraint defect. ★★★ THE REFERENCE DISJUNCTION, MEASURED PER SPELLING (bar §A.3b): GNU as 2.42 accepts a memory DESTINATION for `mov`, `add`, `sub`, `and`, `or`, `xor`, `cmp` (immediate or register source) and for the unary `not`/`neg`, and REJECTS one for `imul` and `lea`; gcc 13.3.0 compiles AND RUNS all eleven shapes below at -O0 and -O2, exit 42. ★★★ WHY EVERY SHAPE ASSERTS A VALUE: a memory-destination encoding differs from its memory-SOURCE twin in ONE opcode byte — `subq %rax, (%r15)` is `29 /r` (`mem := mem - rax`) and `subq (%r15), %rax` is `2B /r` (`rax := rax - mem`). Both assemble, both run, and a swap is a wrong ANSWER with no diagnostic; shapes 2, 7 and 8 are the non-commutative ones that read the difference. ★★ ELEVEN SHAPES, EACH ITS OWN EXIT CODE: (1) immediate into memory at width 64 — the `addq $5, %0` gcc emits for `\"+m\"`; (2) register into memory, non-commutative (7-5=2, a swapped encoding gives -2); (3) immediate into memory at WIDTH 32, a distinct encoding row (same opcode byte, no REX.W); (4) OR at width 32; (5) XOR at width 32 with a register source; (6) the UNARY memory form, whose operand is both the only operand and the destination; (7) unary negate at width 32; (8) memory as the SOURCE with a register destination — the SAME two numbers as shape 2 with the opposite answer (-2), which is what makes the pair a direction test rather than two arithmetic tests; (9) memory source for `imul`, the one mnemonic with no memory-destination form; (10) a GLOBAL, whose address is a relocated symbol rather than a frame offset; (11) a COMPARE whose operand is memory, acted on by an `__asm__ goto` branch so a dropped compare falls through to exit 11 rather than passing. ⚠⚠ THIS SENTENCE SHIPPED FALSE AND IS CORRECTED IN PLACE RATHER THAN DELETED, BECAUSE THE SHAPE IS THE REUSABLE PART: it said `cmp` against memory LANDED ONLY HALFWAY and that BOTH register directions STAY REFUSED FAIL-LOUD, citing a row a sibling lane closed IN THE SAME COMMIT. The diagnosis it gave was right and is worth keeping — `cmp` produces no value, so its row lists no producer, so the engine hands the SAME candidate set to the memory-destination and memory-source operand lists, and for the REGISTER form those are byte-identical while meaning opposite operand orders, so declaring either ALONE would silently encode the other for the opposite spelling. Only the tense was wrong: the fix put the axis on the INSTRUCTION (`kLirInstFlagMemoryIsDestination` + the `guard.memoryDestination` variant key), which both the text lowering and the encoder can read, and D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE is CLOSED. ✔RE-MEASURED at the CLI on x86_64:pe64-x86_64-windows-exec at debug AND release: `cmpq %reg, mem` and `cmpq mem, %reg` both compile rc=0 and both RUN, and a probe written so the two directions give OPPOSITE answers returns the right one for each. The IMMEDIATE form never had the twin — a memory-source list always begins with the destination REGISTER and can never be `[imm32, …]` — and it is what shape (11) runs, witnessed by a BRANCH because a compare writes only flags and `__asm__ goto` is the only way a corpus example can read one; the REGISTER directions are witnessed in the sibling example `c_inline_asm_width_and_direction`. ⇒ a cross-lane citation of an OPEN row is a claim with an expiry date, and the fold is when it expires (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED). Its aarch64 arm loads first, which is what gcc emits there. ⚠ THE aarch64 ARMS ARE NOT A TRANSLATION — that ISA has NO memory-destination arithmetic, and gcc emits load/operate/store there for the identical `\"+m\"` operand (✔MEASURED at -O0 and -O2), so each arm spells its own machine's answer and both are held to the same result. Every aarch64 arm uses REGISTER-form operands even for the constants, because ✔`arm64.target.json` declares an immediate variant for `add`/`sub` only at width 64 and none for `and`/`orr`/`eor`. ⚠ The `volatile` seeds are load-bearing: without them the release pipeline folds the values before lowering and silently changes which mechanism each arm tests.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

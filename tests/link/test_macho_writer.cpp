@@ -516,7 +516,7 @@ TEST(MachOWriter, ObjectWeakDefinedFunctionEmitsNWeakDefAndNoHeaderFlag) {
     mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_strongfn",
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
-    // The `__attribute__((weak))` shape c-subset.lang.json produces;
+    // The `__attribute__((weak))` shape c.lang.json produces;
     // `definedBinding` returns Weak for it.
     mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "_weakfn",
                                        SymbolBinding::Weak,

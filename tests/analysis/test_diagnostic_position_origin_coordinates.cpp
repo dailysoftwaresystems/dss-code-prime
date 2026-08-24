@@ -100,7 +100,7 @@ namespace fs = std::filesystem;
 // temporary (D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE).
 [[nodiscard]] std::shared_ptr<GrammarSchema const> const& cSubset() {
     static std::shared_ptr<GrammarSchema const> const schema = [] {
-        auto loaded = GrammarSchema::loadShipped("c-subset");
+        auto loaded = GrammarSchema::loadShipped("c");
         if (!loaded.has_value()) {
             // THROW, never `std::abort()`: abort kills the whole test
             // BINARY, so every sibling test in this executable loses its
@@ -109,7 +109,7 @@ namespace fs = std::filesystem;
             // The rule and its measurement live in
             // tests/test_support/repo_root.hpp; it is machine-checked by
             // check-no-abort-in-tests, whose ratchet this had breached.
-            throw std::runtime_error{"loadShipped(c-subset) failed"};
+            throw std::runtime_error{"loadShipped(c) failed"};
         }
         return *loaded;
     }();
@@ -434,7 +434,7 @@ TEST(DriverPerTargetCompilePositionRemap, AsmTierDiagnosticUnderUserDefinesRepor
     {
         CapturedStderr const cap;
         DiagnosticReporter rep{DiagnosticBudget::libraryDefault().asConfig()};
-        (void)prog.compileFiles({main.string()}, "c-subset",
+        (void)prog.compileFiles({main.string()}, "c",
                                 {"x86_64:elf64-x86_64-linux-exec"}, rep);
         captured = cap.text();
     }
@@ -475,7 +475,7 @@ TEST(DriverPerTargetCompilePositionRemap, AsmTierDiagnosticInsideAnIncludedHeade
     {
         CapturedStderr const cap;
         DiagnosticReporter rep{DiagnosticBudget::libraryDefault().asConfig()};
-        (void)prog.compileFiles({main.string()}, "c-subset",
+        (void)prog.compileFiles({main.string()}, "c",
                                 {"x86_64:elf64-x86_64-linux-exec"}, rep);
         captured = cap.text();
     }

@@ -56,7 +56,7 @@ class @CLASSNAME@ < Formula
     else
       Hardware::CPU.arm? ? "arm64:elf64-aarch64-linux-exec" : "x86_64:elf64-x86_64-linux-exec"
     end
-    system bin/"dsscp", "--compile", "hello.c", "--language", "c-subset",
+    system bin/"dsscp", "--compile", "hello.c", "--language", "c",
                         "--target", spec, "--output", testpath
   end
 end

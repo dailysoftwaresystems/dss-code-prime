@@ -1,0 +1,38 @@
+{
+  "$comment": "TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): every `*.format.json` now carries a `predefinedMacros` root key -- the C-visible face of that file's own `dataModel` -- merged with the language's `preprocess.predefinedMacros` and the target's `predefinedMacros`, format-filtered exactly ONCE, and fatal on a name collision across ANY of the three families. This is the runnable end-to-end pin on every shipped (architecture x object-format) leg: preprocess -> parse -> lower -> codegen -> LINK -> spawn -> stdout + exit code. WHAT IT CLOSES, MEASURED before the change on arm64:macho64-arm64-darwin-staticlib: `__arm64__` defined, `__APPLE__` defined, `__LP64__` NOT defined, yet sizeof(long)==8 and sizeof(void*)==8 -- LP64 widths compiled against ILP32 header arms. The macOS SDK gates 234 occurrences across 91 headers on __LP64__, so $SDK/usr/include/mach/port.h:113-114 asserted the user32 struct size 12 instead of user64's 16: sqlite mem1.c's three error[S0029]. STRUCTURE: four independently falsifiable compile-time legs (the two spellings agree / the row's VALUE is 1 / the selected arm agrees with sizeof(long) and sizeof(void*) / the same coherence on a long-bearing AGGREGATE) plus a runtime arm that recomputes the widths through a real call boundary. Both routes are arithmetically compensated to exit 42 (8+8+26 == 4+8+30 == 42) BECAUSE THE POINT IS THAT A COHERENT WORLD EXITS 42 WHICHEVER DATA MODEL IT HAS -- so the exit code alone cannot tell the routes apart, and each route also `puts` a distinct tag pinned per target below. THAT tag is what proves the pe64 leg took the NEGATIVE arm instead of quietly taking the LP64 one. ★ WHY ALL FOUR TARGETS AND NOT ONLY MACHO (which the directory is named for -- it is named for the leg whose defect it closes, not for its coverage): the defect was FOUND on macho, but the REASON the channel lives on the OBJECT FORMAT rather than the target is the pe64 leg -- x86_64 is LP64 under elf64/macho64 and LLP64 under pe64, so the SAME CPU must answer differently. A macho-only example would stay green if a maintainer pasted the rows into pe64-*.format.json, which is the miscompile (Windows headers taking their LP64 arms against a 32-bit `long`) the format-layer decision exists to prevent. The pe64 leg therefore asserts __LP64__ is NOT defined and that `long` is 4 bytes, and exits 42 only if BOTH hold -- the stronger direction. CLANG GROUND TRUTH (MEASURED 2026-07-30, `/usr/bin/clang -dM -E -x c /dev/null -target <triple>`, Apple clang 21.0.0): __LP64__ 1 AND _LP64 1 on arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu and x86_64-unknown-linux-gnu; NEITHER on x86_64-pc-windows-msvc -- so the shipped LP64 formats and the shipped LLP64 formats each match clang exactly. `/usr/bin/clang -fsyntax-only -Wall -Wextra` is CLEAN (rc 0) on arm64-apple-darwin and x86_64-apple-darwin with the real SDK, and (with `#include <stdio.h>` replaced by a `puts` prototype, since this host has no cross-SDK headers) also clean under aarch64-linux-gnu, x86_64-unknown-linux-gnu AND x86_64-pc-windows-msvc -- i.e. clang's own data models satisfy every _Static_assert here, including the LLP64 one. The clang-built native binary on this arm64-darwin host prints `model=lp64` and exits 42, byte-for-byte what DSS produces for arm64:macho64. RED-ON-DISABLE, OBSERVED not asserted, by compiling against a PATCHED COPY of src/dss-config reached through DSS_CONFIG_ROOT (the live checkout stayed byte-identical -- verified by a SORTED sha256 over every *.format.json before and after, 74a850beb02ae2a45214ec813490c869b78ce742 both times; sort the file list, an unsorted `find | shasum` pipeline is not reproducible across runs and would be a digest that lies): deleting the `predefinedMacros` key from the 18 LP64 format files makes arm64:macho64 fail with `error[S0029] ... \"TF-C97 leg 3: the selected __LP64__ arm disagrees with sizeof(long) ...\" (folded: 8 Eq 4)` and emit no artifact -- the SAME diagnostic code, and the same 8-vs-4 shape, as the sqlite mem1.c failure this cycle closed. The SAME patch was replayed over the real sqlite census manifest for src/mem1.c (all flags verbatim): 3x error[S0029] WITH the key stripped, 1x error[S0002] with it shipped -- the cost this lands with, a legal-C11 repeat typedef of `malloc_zone_t` that the ILP32 arm was masking (see D-CSUBSET-REPEAT-TYPEDEF-SAME-TYPE). KNOWN BLIND SPOT, reported not papered over: no C source can observe WHICH format file supplied a macro, so this example cannot distinguish 'the macho file declared it' from 'some other LP64 file's rows leaked onto the macho leg'. That axis is the CU cache key, widened this cycle to carry the format NAME (not only the kind); it is pinned in C++ by tests/link/test_object_format_schema.cpp (per-file rows, keyed on each schema's own dataModel) and tests/analysis/preprocess/test_preprocessor.cpp, not here. FOLD-RESISTANCE: a `volatile` seed keeps both widths runtime values and all three operands cross a real call boundary, so the baseline arm keeps a live add instead of one folded immediate; the optimizedPipelines `release` arm runs the SHIPPED release pipeline over the same source, so optimizer x feature composition is witnessed rather than assumed.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "model=lp64\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "expectedStdout": "model=not-lp64\r\n"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "model=lp64\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "model=lp64\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "model=lp64\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

@@ -835,7 +835,7 @@ TEST(X86Sse, FullPipelineMsX64FprPrologueSpillsViaMovsdStore) {
     // L_RequiredLirOpcodeMissing ("callconv: prologue saved-reg
     // store") and the callconv stage fails — this test cannot even
     // assemble, the exact pre-fix failure compiling ANY float-using
-    // c-subset program for x86_64 Windows PE.
+    // c program for x86_64 Windows PE.
     TypeInterner interner{CompilationUnitId{1}};
     auto const f64 = interner.primitive(TypeKind::F64);
     auto const i32 = interner.primitive(TypeKind::I32);

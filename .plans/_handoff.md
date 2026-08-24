@@ -551,11 +551,35 @@ document — landed with **zero** changes to `mir_to_lir.cpp`. ✔Also measured:
 an `"m"` or `"i"` binding is accepted and IGNORED by gcc, so refusing it would refuse what both
 references accept.
 
+### ✅ THE RENAME LANDED — `c-subset` → `c`, its own commit, on a clean tree
+
+✔MEASURED: **1,433 path renames and 5,993 content substitutions across 964 files**;
+`c-subset.lang.json` → `c.lang.json`, `examples/c-subset/` → `examples/c/` (608 entries),
+`CSubset` → `C` in 72 files of C++ identifiers. Gate **1584/1584 in 437.33 s** — the SAME
+test count as before the rename, which is the check that nothing was silently dropped from a glob.
+✔`--language c` loads and reports `language=c`. ✔The 426 frozen `D-CSUBSET-*` ids survive
+at 6,560 citations (every substitution is case-SENSITIVE, so the frozen `CSUBSET` spelling is
+structurally out of reach — asserted per-file anyway).
+
+★★ **`.plans/**` AND `.claude/**` WERE EXCLUDED FROM THE CONTENT SUBSTITUTION, AND THE
+REASON IS THAT THE RENAME WOULD OTHERWISE HAVE DESTROYED ITS OWN DOCUMENTATION** — plan 23's
+FC20 section states it as `` `c-subset` → `c` ``, which substitutes to `` `c` → `c` ``.
+This follows the precedent this file already carries for the scripts consolidation: *“any path
+spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not
+stale”*. A row records what was true when it was written; rewriting it makes it lie about its
+own date.
+⚠⚠ **THE COST IS REAL AND IS OWED, NOT ABSOLVED: 40 documentary files still name the old
+token, and any passage among them giving a LIVE INSTRUCTION** — *“edit
+`c-subset.lang.json` to…”* — **is now wrong.** Distinguishing a historical mention
+from a live instruction cannot be done by grep; it needs reading. That sweep is the next cycle's
+work and it is listed below.
+
 ### ⚠ WHAT THIS CYCLE OWES THE NEXT ONE
 
-1. **THE RENAME `c-subset` → `c`, AS ITS OWN COMMIT, ON A CLEAN TREE** — see §0's item 8.
-   It is the bottleneck for the whole conformance queue: 17 of the 18 direction-A divergences are GNU
-   extensions requiring edits to the very language document the rename moves.
+1. **SWEEP THE 40 DOCUMENTARY FILES THAT STILL SAY `c-subset`** — separating HISTORICAL
+   mentions (which stay, and are correct) from LIVE INSTRUCTIONS naming a path that no longer
+   exists (which are now wrong). ⚠ Not greppable: the same string is right in one sentence and
+   wrong in the next, so this is a read, not a substitution.
 2. **The seven rows this cycle opened**, per the standing order's own refinement. The two largest are
    [[D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED]] (needs a MIXED-COMPILER witness — no
    single-compiler test can distinguish the two conventions) and
@@ -830,7 +854,7 @@ copies and re-run three times under four new rules.
    ⚠ TWO MEASURED CONSTRAINTS: transitive references are currently REFUSED (one hop only, by design),
    and **exactly one document may claim `.c`/`.h`** or every extension-resolved compile refuses.
 
-8. **THE RENAME IS THE BOTTLENECK FOR THE WHOLE CONFORMANCE QUEUE, and it needs an EMPTY TREE.**
+8. **✅ DONE 2026-08-24 — THE RENAME LANDED AND THE CONFORMANCE QUEUE IS UNBLOCKED.** (Kept for its reasoning, which stays true of the next large mechanical change.) **It was the bottleneck for the whole conformance queue, and it needed an EMPTY TREE.**
    ✔MEASURED: **1,429 path renames and 7,583 content substitutions across 1,002 files**
    (`c-subset`→`c` · `c_subset`→`c` · `CSubset`→`C` · `csubset`→`c`), with
    `CSUBSET` — the 6,547 citations of the 426 frozen `D-CSUBSET-*` ids — structurally out of reach

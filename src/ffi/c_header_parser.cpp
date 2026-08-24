@@ -108,7 +108,7 @@ emitAndReturn(HeaderReadErrorKind kind, std::string detail,
     return err;
 }
 
-// Post-fold #7 silent-failure F2: when the c-subset frontend (parse /
+// Post-fold #7 silent-failure F2: when the c frontend (parse /
 // semantic / lowering) rejects, the underlying diagnostic carries a
 // (buffer, span) pointing at the offending construct — but the FF2
 // wrap kind (HeaderParseFailed) is the same across "no span possible"
@@ -263,7 +263,7 @@ readCHeaderFromText(std::string_view    text,
             reporter));
     }
 
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     if (!loaded) {
         // Forward C_* diagnostics so they reach the reporter (subject
         // to user `--suppress` policy). Inline the first cause into
@@ -273,7 +273,7 @@ readCHeaderFromText(std::string_view    text,
         forwardConfigDiagnostics(loaded.error(), reporter);
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::GrammarLoadFailed,
-            std::string{"FFI header reader could not load shipped c-subset "
+            std::string{"FFI header reader could not load shipped c "
                         "grammar"} + (cause.empty() ? "" : ": " + cause)
                 + ".",
             reporter));
@@ -344,7 +344,7 @@ readCHeaderFromText(std::string_view    text,
     if (model.hasErrors()) {
         return std::unexpected(emitWithFirstReportedCause(
             HeaderReadErrorKind::HeaderParseFailed,
-            std::string{"c-subset frontend rejected header '"}
+            std::string{"c frontend rejected header '"}
                 + std::string{headerPathLabel} + "' — see preceding diagnostics.",
             diagsSince(reporter, errStart),
             reporter));
@@ -439,7 +439,7 @@ readCHeaderFromText(std::string_view    text,
                         + "' contains an #include / import group — FF2 v1 "
                           "does not yet follow includes. Copy declarations "
                           "directly into the curated header, or anchor a "
-                          "follow-up to extend the c-subset import resolver.",
+                          "follow-up to extend the c import resolver.",
                     reporter, &loc));
             case HirKind::Error:
                 return std::unexpected(emitAndReturn(

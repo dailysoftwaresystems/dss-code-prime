@@ -1,0 +1,7 @@
+{
+  "$comment": "D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS (negative): the assignment STATEMENT `p = q;` (int* <- char*, distinct typed pointers) fails loud with a positioned S_TypeMismatch at the RHS (26:9), the SAME check the init/call-arg/return sites run. A valid `p = z;` statement on the line above is unaffected, so exactly ONE diagnostic fires. (Swapped off the original int<-float pair: D-CSUBSET-INT-FLOAT-CONVERSION made int<->float an admitted conversion in c, so a distinct-typed-pointer pair is the stable always-rejected witness.) RED-ON-DISABLE: remove the assignment-statement isAssignable arm (restore the bypass) -> `p = q;` is silently accepted and the diagnostic set is empty -> mismatch.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:elf64-x86_64-linux-exec" } ],
+  "expectDiagnostics": [ { "code": "S_TypeMismatch", "line": 26, "col": 9 } ]
+}

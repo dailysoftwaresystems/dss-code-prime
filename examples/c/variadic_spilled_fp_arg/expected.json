@@ -1,0 +1,43 @@
+{
+  "$comment": "D-OPT-SQLITE-FPCONV1-RELEASE-FP-MISCOMPILE runtime witness (the minimized sqlite fpconv1 `dtostr` shape). A double promoted by Mem2Reg + SPILLED across an external call (atoi) is passed as a variadic printf arg; on SysV AMD64 the spilled FP vararg is a SpillSlotRef (c77 D-AS-REGALLOC-DIRECT-ARG-RELOAD). The reload into xmm0 was always correct; the bug was the AL vector-count (SysV §3.5.7) — step-13.4 re-scanned post-regalloc operands for LirRegClass::FPR and skipped the non-Reg SpillSlotRef, stamping AL=0, so glibc's variadic prologue (test al,al) skipped saving xmm0-7 and %f read garbage (printed 0.000). FIX (lir_callconv.cpp materializeOneFunc): count the vector-count at the arg-PLACEMENT decision (residency-independent), so a spilled FP vararg counts identically to a live FPR Reg. The RELEASE arm is load-bearing: only Mem2Reg makes r span the call + spill (debug keeps r in memory). RED-ON-DISABLE (x86_64 elf, release): the residency re-scan prints 0.000 (AL=0). arm64 (AAPCS64, no AL) + ms_x64 (FP-dup, no AL) + debug legs already print 3.125; gcc -std=c17 cross-checked.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "3.125\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "expectedStdout": "3.125\r\n"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "3.125\n"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-pie",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "3.125\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "3.125\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "expectedStdout": "3.125\n"
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

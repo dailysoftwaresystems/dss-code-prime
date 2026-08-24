@@ -214,7 +214,7 @@ def main(argv=None):
     p.add_argument("--target", required=True, action="append", metavar="SPEC",
                    help="DSS <targetName>:<formatName> spec (repeatable)")
     p.add_argument("--language", required=True, metavar="NAME",
-                   help="DSS language name (e.g. c-subset)")
+                   help="DSS language name (e.g. c)")
     p.add_argument("--profile", required=True, metavar="NAME",
                    help="DSS artifactProfile (e.g. cli)")
     p.add_argument("--artifact-name", metavar="NAME", default=None,

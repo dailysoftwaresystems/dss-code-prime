@@ -43,7 +43,7 @@ body:
       label: Command line
       description: The exact invocation — language, target, and any flags.
       render: shell
-      placeholder: dss-code-prime --compile main.c --language c-subset --target x86_64:pe64-x86_64-windows-exec --output out
+      placeholder: dss-code-prime --compile main.c --language c --target x86_64:pe64-x86_64-windows-exec --output out
     validations:
       required: true
   - type: dropdown

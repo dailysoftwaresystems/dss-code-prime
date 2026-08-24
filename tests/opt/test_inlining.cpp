@@ -3472,7 +3472,7 @@ TEST(Inlining, CalleePhiPredMisremapGoesVerifierRed) {
 // ── MANDATORY SHAPE (3, unit mirror of the runtime witness): an
 // argument-keyed value-ternary callee inlines, Phi cloned + paired. ──
 // pick(k){ return k ? 7 : 9; } — the EXACT corpus witness shape
-// (examples/c-subset/phi_inline). Hand-built in its pre-Mem2Reg Phi form
+// (examples/c/phi_inline). Hand-built in its pre-Mem2Reg Phi form
 // (a value-producing ternary lowers to a join-Phi). main calls pick(0).
 // We assert the cloned Phi is correctly value↔pred paired (structural),
 // so the post-inline fold over k==0 would read the `9` arm. The runtime

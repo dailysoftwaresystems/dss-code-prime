@@ -161,7 +161,7 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheImageRequest) {
         Program prog;
         prog.setOutputDir(scratch.path() / "merged_ok");
         DiagnosticReporter rep;
-        ASSERT_EQ(prog.compileUnits(files, "c-subset",
+        ASSERT_EQ(prog.compileUnits(files, "c",
                                     {std::string{kPeExecSpec}}, rep), 0)
             << "control arm: the N>1 merged route must build with no request; "
                "a red here means the FIXTURE is broken, not the pin\n"
@@ -173,7 +173,7 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheImageRequest) {
     prog.setOutputDir(scratch.path() / "merged_req");
     prog.setStackReserveBytes(kBelowEveryMinimum);
     DiagnosticReporter rep;
-    int const rc = prog.compileUnits(files, "c-subset",
+    int const rc = prog.compileUnits(files, "c",
                                      {std::string{kPeExecSpec}}, rep);
     EXPECT_NE(rc, 0)
         << "the N>1 merged route must REFUSE an out-of-range stack reserve; a "
@@ -207,7 +207,7 @@ TEST(DriverArgumentSupply, StaticArchiveRouteSuppliesTheImageRequest) {
         Program prog;
         prog.setOutputDir(scratch.path() / "lib_ok");
         DiagnosticReporter rep;
-        ASSERT_EQ(prog.compileUnits(files, "c-subset",
+        ASSERT_EQ(prog.compileUnits(files, "c",
                                     {std::string{kElfStaticLibSpec}}, rep), 0)
             << "control arm: the staticlib route must build with no request\n"
             << allDiagnosticText(rep);
@@ -217,7 +217,7 @@ TEST(DriverArgumentSupply, StaticArchiveRouteSuppliesTheImageRequest) {
     prog.setOutputDir(scratch.path() / "lib_req");
     prog.setStackReserveBytes(kBelowEveryMinimum);
     DiagnosticReporter rep;
-    int const rc = prog.compileUnits(files, "c-subset",
+    int const rc = prog.compileUnits(files, "c",
                                      {std::string{kElfStaticLibSpec}}, rep);
     EXPECT_NE(rc, 0)
         << "the staticlib route must REFUSE a stack reserve it cannot carry; a "
@@ -322,7 +322,7 @@ TEST(DriverArgumentSupply, SingleCuRouteRunsTheProgramStageOptimize) {
     prog.setCompileConfig(CompileConfig::Release);
     prog.setOutputDir(scratch.path() / "solecu_out");
     DiagnosticReporter rep;
-    ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c-subset",
+    ASSERT_EQ(prog.compileFiles({src.generic_string()}, "c",
                                 {std::string{kPeExecSpec}}, rep), 0)
         << allDiagnosticText(rep);
 
@@ -353,7 +353,7 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteRunsTheProgramStageOptimize) {
     prog.setOutputDir(scratch.path() / "merged_stage_out");
     DiagnosticReporter rep;
     ASSERT_EQ(prog.compileUnits({a.generic_string(), b.generic_string()},
-                                "c-subset", {std::string{kPeExecSpec}}, rep), 0)
+                                "c", {std::string{kPeExecSpec}}, rep), 0)
         << allDiagnosticText(rep);
 
     EXPECT_EQ(dss::substrate::PhaseTimers::read(
@@ -409,7 +409,7 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsEntryVerbs) {
     prog.setOutputDir(scratch.path() / "entry_out");
     DiagnosticReporter rep;
     int const rc = prog.compileUnits({a.generic_string(), b.generic_string()},
-                                     "c-subset", {std::string{kPeExecSpec}},
+                                     "c", {std::string{kPeExecSpec}},
                                      rep);
     EXPECT_NE(rc, 0)
         << "two realizable program entries in one pe64 program must be "
@@ -548,7 +548,7 @@ findAll(std::vector<std::uint8_t> const& hay,
     Program prog;
     prog.setOutputDir(outDir);
     return prog.compileUnits({a.generic_string(), b.generic_string()},
-                             "c-subset", {std::string{targetSpec}}, rep);
+                             "c", {std::string{targetSpec}}, rep);
 }
 
 // ── ELF64: count relocations of one wire type ──────────────────────────────
@@ -956,7 +956,7 @@ TEST(DriverArgumentSupply,
 // object's. ✔MEASURED 2026-08-20: with the mutant the pe64 `.text` shrank by
 // exactly the deref instruction, rc was 0, there were ZERO diagnostics, and the
 // binary exited 4 instead of 42 — it is the shipped example
-// `examples/c-subset/extern_data_import_pe`'s exit-4 rung, reached on the
+// `examples/c/extern_data_import_pe`'s exit-4 rung, reached on the
 // MERGED route, which that single-CU example cannot reach.
 //
 // ★ THE ORACLE IS UCRT'S OWN ACCESSOR, NOT A MAGIC ADDRESS — the same design as

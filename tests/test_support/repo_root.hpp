@@ -124,7 +124,7 @@ namespace detail {
     // (3) the ancestor walk these helpers used to do individually.
     // 12 hops, not 8: the sites being consolidated here used BOTH bounds (8 in
     // golden_file.hpp / test_import_resolver, 12 in test_header_name_matching /
-    // test_hir_lowering_c_subset / test_pe_crt_costate_binding), and narrowing a
+    // test_hir_lowering_c / test_pe_crt_costate_binding), and narrowing a
     // 12-hop site to 8 would delete reach it has today. Widening an 8-hop site
     // can only add hops that were previously a hard failure, so the superset is
     // the direction that cannot regress anyone.

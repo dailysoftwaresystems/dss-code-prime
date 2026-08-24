@@ -307,20 +307,20 @@ TEST(LinkWriter, RejectsPathIsADirectory) {
     EXPECT_TRUE(sawCode);
 }
 
-// ── End-to-end pipeline: c-subset source → ELF .o on disk ───────────
+// ── End-to-end pipeline: c source → ELF .o on disk ───────────
 
 TEST(LinkWriter, EndToEndAssembleLinkWriteToDisk) {
     // The LK10 cycle 1 acceptance pin: prove the
     // AssembledModule → link → writeImage chain hits disk
     // without a system linker. Uses a hand-constructed module
     // (matches the existing ELF test pattern in
-    // test_elf_writer.cpp) rather than the full c-subset CST
+    // test_elf_writer.cpp) rather than the full c CST
     // pipeline — the latter requires ML7 callconv lowering of
     // the virtual `arg` pseudo-op to mov-from-arg-register
     // sequences that the x86_64 assembler can encode. `ret` IS
     // declared at `x86_64.target.json` (opcode 0xC3); `arg`
     // is intentionally a virtual op without an encoding block
-    // (line 22 of the same JSON documents this). The c-subset →
+    // (line 22 of the same JSON documents this). The c →
     // ELF link chain is exercised end-to-end at LK10 cycle 2
     // once ML7 callconv lowering wires through the driver.
     auto target = TargetSchema::loadShipped("x86_64");

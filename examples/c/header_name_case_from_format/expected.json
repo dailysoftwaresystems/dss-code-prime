@@ -1,0 +1,35 @@
+{
+  "$comment": "D-PP-HEADER-CASE-INSENSITIVE-PE (2026-08-04): the `#include` header-NAME case rule is declared by the OBJECT FORMAT (`headerNameMatching` in `*.format.json`) and applied by DSS itself, never by the build host's filesystem. TWO probes, one per direction — see main.c. ★ THE PER-TARGET EXIT CODES ARE THE PIN: pe + macho fold header names so `__has_include(<Stdio.h>)` is 1 and they exit 42; elf matches byte-exact so it is 0 and elf exits 7. `stdio.json` declares NO `availableObjectFormats`, so the declared case rule is the ONLY thing that can make those arms differ — revert the axis and every arm returns 42, which reds the two elf arms. (An earlier cut probed only `<Windows.h>`, whose descriptor IS pe-gated, so availability alone already forced the elf answer to 0; that probe pins the WRONG-REJECT direction only and is kept for exactly that.) ★ THE CROSS-HOST GATE: the runner COMPILES every declared arm on every host and only skips the RUN step for a foreign one, so the pe64 arm is compiled on the LINUX leg — on ext4, where `#include <Windows.h>` (capital W, byte-for-byte how sqlite3.c:67322 spells it) against the shipped `windows.json` was rc=1 `error[F001A]` before this axis existed and rc=0 through /mnt/c with the SAME binary and SAME commit (MEASURED). The pe arm derives its 42 from `MAX_PATH`, so it cannot pass unless the header really arrived — which is also what holds `__has_include` and `#include` in agreement. RED-ON-DISABLE (MEASURED 2026-08-04): flipping `pe64-x86_64-windows-exec.format.json` to \"case-sensitive\" reproduces the pre-fix rule and the pe arm fails to resolve `<Windows.h>` on ext4. Unit-level pins: tests/core/test_header_name_matching.cpp.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "exitCode": 7
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "exitCode": 7
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: arm64:elf64-aarch64-linux-exec, x86_64:elf64-x86_64-linux-exec. It DIFFERED on: x86_64:pe64-x86_64-windows-exec, so identity here is target-dependent and an arm-level opt-in (which applies to every target at once) would red the spec where it is identical. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST, AND FORMAT-DEPENDENT: this example's source is platform-conditional, and identity was MEASURED to disagree between legs for exactly that reason. The key is per-ARM and applies to EVERY target at once, so arming it on the strength of the leg where it differs would red the leg where it does not. The selected branch depends on which shipped headers the target's format offers. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in."}
+  ]
+}

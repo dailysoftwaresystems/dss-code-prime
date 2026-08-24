@@ -40,7 +40,7 @@
 #include <vector>
 
 using namespace dss;
-using dss::test_support::lowerCSubsetToLir;
+using dss::test_support::lowerCToLir;
 
 namespace {
 
@@ -135,7 +135,7 @@ TEST(LirRegAlloc, CcIndex1RecordsThroughToFuncAllocation) {
     // on every LirFuncAllocation. Without this pin a regression
     // that drops the threaded index back to 0 would silently
     // re-emit SysV register assignments on PE+x86_64 targets.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) { return x + x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -153,7 +153,7 @@ TEST(LirRegAlloc, CcIndexOutOfRangeFailsLoud) {
     // x86_64 ships 2 cc rows; ccIndex=99 must trip
     // R_CallingConventionLookupFailed per allocateOneFunc's
     // defensive arm.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) { return x + x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -171,7 +171,7 @@ TEST(LirRegAlloc, CcIndexOutOfRangeFailsLoud) {
 }
 
 TEST(LirRegAlloc, StraightLineFunctionAssignsAllPhys) {
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) { return x + x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -217,7 +217,7 @@ TEST(LirRegAlloc, FactoryRejectsSpillInvalidSlot) {
 }
 
 TEST(LirRegAlloc, ForVRegFindsAssignment) {
-    auto lowered = lowerCSubsetToLir("int f(int x) { return x; }");
+    auto lowered = lowerCToLir("int f(int x) { return x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
@@ -239,7 +239,7 @@ TEST(LirRegAlloc, ForVRegFindsAssignment) {
 }
 
 TEST(LirRegAlloc, ForFuncResolvesByFuncId) {
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int g(int a) { return a + 1; }\n"
         "int f(int x) { int y = g(x); return y; }\n");
     ASSERT_TRUE(lowered.lir.ok);
@@ -258,7 +258,7 @@ TEST(LirRegAlloc, ForFuncResolvesByFuncId) {
 TEST(LirRegAlloc, Requires2AddressResultExcludesOpsOneThroughN) {
     // D-CSUBSET-BINOP-RIGHT-CLOBBER mechanism pin (2026-06-02).
     //
-    // The end-to-end example pins (examples/c-subset/arithmetic +
+    // The end-to-end example pins (examples/c/arithmetic +
     // subtraction + register_pressure) prove the bug-class is
     // closed AT THE EXIT-CODE LEVEL, but a refactor that "got
     // lucky" with the chosen inputs would pass those examples
@@ -278,7 +278,7 @@ TEST(LirRegAlloc, Requires2AddressResultExcludesOpsOneThroughN) {
     // exclusion-blind again (silent-failure HIGH-1 fold), would
     // re-introduce result==ops[k] aliasing — and THIS test would
     // catch it independently of the end-to-end examples.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x, int y) {\n"
         "    return x * y;\n"
         "}\n");
@@ -354,7 +354,7 @@ TEST(LirRegAlloc, AllPhysicalAssignmentsAreDistinctAtAnyPoint) {
     // simultaneously-live vregs cannot share a physical register.
     // Probe: across all live ranges, no two overlapping ranges of the
     // same class share a physical reg ordinal.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x, int y, int z) {\n"
         "    int a = x + y;\n"
         "    int b = a * z;\n"
@@ -458,7 +458,7 @@ TEST(LirRegAlloc, DivisorVregExcludesImplicitClobberSet) {
     // the use site we want to verify NEVER lands in RAX (ord 0)
     // or RDX (ord 2) — the compound-div implicit-input + clobber
     // set. Returns the quotient.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int q(int a, int b) { return a / b; }\n");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -572,7 +572,7 @@ TEST(LirRegAlloc, PressuredShiftResultExcludesImplicitInputAndClobberSet) {
         }
         src += ";\n}\n";
 
-        auto lowered = lowerCSubsetToLir(src);
+        auto lowered = lowerCToLir(src);
         ASSERT_TRUE(lowered.lir.ok) << "nLive=" << nLive;
         LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
         DiagnosticReporter regallocRep;
@@ -678,7 +678,7 @@ TEST(LirRegAlloc, PressuredShiftResultExcludesImplicitInputAndClobberSet) {
 // excludedScratch)` consultation in lir_regalloc.cpp's
 // allocateOneFunc → covering ranges land on rdx/rax at the drained
 // sweep points → this pin goes RED (and the pressured corpus arm
-// `examples/c-subset/division/` exits wrong). Agnostic: discovery
+// `examples/c/division/` exits wrong). Agnostic: discovery
 // probes the schema's declared implicitRegisters; no mnemonic list,
 // no register names in the assertion.
 TEST(LirRegAlloc, PressuredDivCoveringVregsExcludeImplicitInputAndClobberSet) {
@@ -702,7 +702,7 @@ TEST(LirRegAlloc, PressuredDivCoveringVregsExcludeImplicitInputAndClobberSet) {
         }
         src += ";\n}\n";
 
-        auto lowered = lowerCSubsetToLir(src);
+        auto lowered = lowerCToLir(src);
         ASSERT_TRUE(lowered.lir.ok) << "nLive=" << nLive;
         LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
         DiagnosticReporter regallocRep;
@@ -850,7 +850,7 @@ TEST(LirRegAlloc, PressuredIndirectCalleeExcludesArgRegs) {
         for (int i = 0; i < 8; ++i) src += " + c" + std::to_string(i);
         src += ";\n}\n";
 
-        auto lowered = lowerCSubsetToLir(src);
+        auto lowered = lowerCToLir(src);
         ASSERT_FALSE(lowered.model.hasErrors()) << "k=" << k;
         ASSERT_TRUE(lowered.lir.ok) << "k=" << k;
         Lir const& lir = lowered.lir.lir;
@@ -988,7 +988,7 @@ TEST(LirRegAlloc, ExclusionUnionBeyondFixedBufferAllocatesAndExcludesAll) {
     ASSERT_TRUE(mutated.has_value())
         << "mutated x86_64 schema failed to load";
 
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int q(int a, int b) { return a / b; }\n", *mutated);
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -1066,7 +1066,7 @@ TEST(LirRegAlloc, ResultDefExclusionUnionBeyondFixedBufferAllocatesAndExcludesAl
     ASSERT_TRUE(mutated.has_value())
         << "mutated x86_64 schema failed to load";
 
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x, int n) { return x << n; }\n", *mutated);
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -1156,7 +1156,7 @@ TEST(LirRegAlloc, CrossCallRangesLandInCalleeSavedOrSpill) {
     // local no longer produces a cross-call range. The params `a..h` below are each
     // used as a call argument (before the call) AND in the post-call sum, so each
     // genuinely spans the call — remat-independent pressure.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int g(int v) { return v + 1; }\n"
         "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
         "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
@@ -1382,7 +1382,7 @@ TEST(LirRegAlloc, ReservedStackPointerNeverAllocated) {
 // `if (reservedFramePointer.has_value() && i == *reservedFramePointer)
 // continue;` from buildFreeLists left regalloc 29/29 AND callconv 85/85
 // green — the only thing that noticed was the runtime example
-// `examples/c-subset/c99_vla_spill` segfaulting instead of exiting 42.
+// `examples/c/c99_vla_spill` segfaulting instead of exiting 42.
 // That example STAYS as the end-to-end witness; this is the unit pin, and
 // the two are kept separately on purpose.
 //
@@ -1407,7 +1407,7 @@ TEST(LirRegAlloc, FramePointerReservedOnlyForFunctionsWithAVla) {
     src += "a[0];\n}\n"
            "int noVla(int n) { return n + 1; }\n";
 
-    auto lowered = lowerCSubsetToLir(src);
+    auto lowered = lowerCToLir(src);
     ASSERT_TRUE(lowered.lir.ok) << "VLA fixture failed to lower";
     auto const& sch = *lowered.target;
     Lir const&  lir = lowered.lir.lir;
@@ -1520,7 +1520,7 @@ TEST(LirRegAlloc, FprClassRangesGetFprRegisters) {
 }
 
 TEST(LirRegAlloc, LoopFunctionAllocatesWithoutCrash) {
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int n) {\n"
         "    int i = 0; int acc = 0;\n"
         "    while (i < n) { acc = acc + i; i = i + 1; }\n"
@@ -1536,7 +1536,7 @@ TEST(LirRegAlloc, LoopFunctionAllocatesWithoutCrash) {
 }
 
 TEST(LirRegAlloc, SwitchFunctionAllocatesWithoutCrash) {
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) {\n"
         "    switch (x) {\n"
         "        case 1: return 10;\n"
@@ -1644,7 +1644,7 @@ TEST(LirRegAlloc, OkPropagationOnCleanRun) {
     // Pin the contract: on a clean run, ok() returns true and every
     // per-function ok flag is true. Info-severity diagnostics
     // (R_Spilled* summaries) do NOT flip ok.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x) { return x + x; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -1660,7 +1660,7 @@ TEST(LirRegAlloc, AssignmentVRegMatchesIndexId) {
     // The substrate contract: assignments[i].vreg.id == i for every
     // non-sentinel slot. Regression pin against future refactors that
     // might desync the indexing.
-    auto lowered = lowerCSubsetToLir(
+    auto lowered = lowerCToLir(
         "int f(int x, int y) { return x + y; }");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
@@ -1689,7 +1689,7 @@ TEST(LirRegAlloc, AssignmentVRegMatchesIndexId) {
 // crossing locals drain the callee-saved pool, the k arg locals drain the
 // caller-saved LIFO toward x8; the post-call re-read keeps fp's vreg live across
 // the call. Host-independent structural pin (the end-to-end qemu witness is
-// examples/c-subset/struct_byval_indirect_aapcs64). RED-ON-DISABLE (demonstrated
+// examples/c/struct_byval_indirect_aapcs64). RED-ON-DISABLE (demonstrated
 // 2026-06-23 + restored): comment out the indirect-result block in
 // allocateOneFunc's indirect-callee consumer -> the callee lands on x8 at a
 // drained sweep point -> this pin goes RED. Agnostic: the forbidden ordinal is
@@ -1736,7 +1736,7 @@ TEST(LirRegAlloc, Aapcs64PressuredIndirectStructReturnCalleeExcludesX8) {
         for (int i = 0; i < 16; ++i) src += " + c" + std::to_string(i);
         src += ";\n}\n";
 
-        auto lowered = lowerCSubsetToLir(src, "arm64", /*mirCcIndex=*/0);
+        auto lowered = lowerCToLir(src, "arm64", /*mirCcIndex=*/0);
         ASSERT_FALSE(lowered.model.hasErrors()) << "k=" << k;
         ASSERT_TRUE(lowered.lir.ok) << "k=" << k << ": "
             << (lowered.lirReporter.all().empty()

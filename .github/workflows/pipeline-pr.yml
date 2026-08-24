@@ -228,7 +228,7 @@ jobs:
         run: |
           set -e
           # libtcl8.6: REPO-SPECIFIC addition (not in the DSS.DevOps template).
-          # The examples/c-subset/shipped_tcl_eval RUN witness (SQLite testfixture
+          # The examples/c/shipped_tcl_eval RUN witness (SQLite testfixture
           # arc, D-FFI-TCL-DESCRIPTOR) compiles a DSS binary that links
           # libtcl8.6.so and evaluates a real TCL expression at load; the x86_64
           # ubuntu legs execute it, so the runtime lib must be present. (The
@@ -413,7 +413,7 @@ jobs:
         # ⚠ THE "WELL UNDER THE 30-MIN BUDGET" CLAIM THAT USED TO SIT HERE WAS
         # MEASURED AT 620 CASES AND WENT STALE. At 773 cases the ASan+UBSan leg
         # needed ~31.5 min and was KILLED at 687/773 (every test that ran passed),
-        # costing 86 examples/c-subset fixtures all of their sanitizer coverage.
+        # costing 86 examples/c fixtures all of their sanitizer coverage.
         # The repair was NOT a bigger budget: the shuffle arms were 44% of the leg
         # while being the weaker instrument on it, and now scale per-leg at the
         # dss_add_shuffle_arm chokepoint in tests/CMakeLists.txt. Projected ~20.2 min.

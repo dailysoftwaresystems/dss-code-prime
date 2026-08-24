@@ -1,7 +1,7 @@
 #pragma once
 
 // Synthetic single-block MIR-function builder used by LIR tests that
-// need to exercise specific MIR opcodes the c-subset frontend doesn't
+// need to exercise specific MIR opcodes the c frontend doesn't
 // emit naturally (e.g. bitwise/float arithmetic, reverse Bitcast,
 // liveness-shape probes). Promoted to a shared header in ML6 cycle 1
 // (cycle-3e deferral D-3e.7) so multiple test binaries — `test_mir_to_lir`

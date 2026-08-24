@@ -14,7 +14,7 @@
 
 ```jsonc
 {
-  "language":         "c-subset",                       // required — resolves to a shipped .lang.json
+  "language":         "c",                       // required — resolves to a shipped .lang.json
   "artifactProfile":  "cli",                            // required — one profile (see §3)
   "targets":          ["x86_64:elf64-x86_64-linux-exec"], // required — ≥1 "<targetName>:<formatName>" spec
   "sources":          ["src/**/*.c"],                   // required — ≥1 source path OR glob pattern (§2)
@@ -726,7 +726,7 @@ The two codes are **remediation-distinct**: `D0010` means the *language* can't p
 `D0011` means the *chosen format* can't. Note that the format gate is **per target**, so `D0011` is
 also how you learn that a perfectly serviceable profile was paired with the wrong format: `lib` is
 served by 5 shipped formats (§3), but not by `elf64-x86_64-linux-exec`. A profile the language
-declares that **no** shipped format serves (e.g. `c-subset` + `module`, or `tsql-subset` + `script`)
+declares that **no** shipped format serves (e.g. `c` + `module`, or `tsql-subset` + `script`)
 passes AP2 and is caught by AP3 for **every** target.
 
 An empty declared/served set ⇒ **reject** (fail-closed): a language or format that claims no profiles
@@ -874,23 +874,23 @@ does not over-promise:
 A console executable from one C source, for Linux x86-64:
 
 ```jsonc
-{ "language": "c-subset", "artifactProfile": "cli",
+{ "language": "c", "artifactProfile": "cli",
   "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"] }
 ```
 
 Multi-target (one profile, several formats — one artifact each):
 
 ```jsonc
-{ "language": "c-subset", "artifactProfile": "cli",
+{ "language": "c", "artifactProfile": "cli",
   "targets": ["x86_64:elf64-x86_64-linux-exec", "x86_64:pe64-x86_64-windows-exec"],
   "sources": ["a.c", "b.c"] }
 ```
 
-A rejected request (lands on `D0011`): `c-subset` *declares* `lib`, and shipped formats *do* serve
+A rejected request (lands on `D0011`): `c` *declares* `lib`, and shipped formats *do* serve
 it (§3) — but not this one. The fix is the **target**, not the profile:
 
 ```jsonc
-{ "language": "c-subset", "artifactProfile": "lib",
+{ "language": "c", "artifactProfile": "lib",
   "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"] }
 // → D_ArtifactProfileFormatMismatch: artifact profile 'lib' is not served by object format 'elf64-x86_64-linux-exec' (serves: cli).
 // Fix: target `x86_64:elf64-x86_64-linux-dyn`, which serves `lib`.
@@ -900,7 +900,7 @@ A pre-build hook that generates the sources a glob then matches, plus a signing 
 on a successful Windows build:
 
 ```jsonc
-{ "language": "c-subset", "artifactProfile": "cli",
+{ "language": "c", "artifactProfile": "cli",
   "targets": ["x86_64:pe64-x86_64-windows-exec"],
   "sources": ["src/**/*.c"],
   "stackReserve": 8388608,
@@ -912,7 +912,7 @@ Both composition arms in one manifest (§2.6) — the `module` dependency contri
 this compilation, the `staticlib` one is **built separately** and linked in:
 
 ```jsonc
-{ "language": "c-subset", "artifactProfile": "cli",
+{ "language": "c", "artifactProfile": "cli",
   "targets": ["arm64:elf64-aarch64-linux-exec"],
   "sources": ["main.c"],                       // ← the ROOT's own sources come FIRST in the merged
                                                //   list: `main` names the binary, and prepending a

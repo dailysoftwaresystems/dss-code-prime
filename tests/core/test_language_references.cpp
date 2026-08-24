@@ -10,7 +10,7 @@
 // this file existed it was measured once by hand and then reverted, leaving the
 // headline claim asserted rather than guarded.
 //
-// ★★ WHY THE HOST IS SYNTHETIC AND LIVES INSIDE THIS FILE. `c-subset` is the
+// ★★ WHY THE HOST IS SYNTHETIC AND LIVES INSIDE THIS FILE. `c` is the
 // mechanism's FIRST consumer; the second one does not exist yet. Testing the
 // substrate through its only consumer proves that consumer works, not that the
 // substrate is reusable — the two are different claims, and this project's
@@ -22,7 +22,7 @@
 // experimental ships, and no shipped `.lang.json` is touched.
 //
 // ★★ THE HOST IS DELIBERATELY NOT C-SHAPED. Every token kind, every keyword
-// spelling and every rule name below is alien to `c-subset` (`EMIT` not `asm`,
+// spelling and every rule name below is alien to `c` (`EMIT` not `asm`,
 // `|`/`||` not `:`/`::`, `<<`/`>>` not `(`/`)`, `hostValue` not `expression`).
 // `AsmHostProbeIsNotCShaped` pins that: a mechanism that only works for a host
 // that happens to look like C is a file split, not a reuse mechanism, and this
@@ -140,7 +140,7 @@ constexpr std::string_view kAsmReferenceBlock = R"(
   },
 )";
 
-// Not one lexeme, keyword or kind here is spelled the way `c-subset` spells it.
+// Not one lexeme, keyword or kind here is spelled the way `c` spells it.
 constexpr std::string_view kTokensAndKeywords = R"(
   "tokens": {
     " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
@@ -378,7 +378,7 @@ TEST(LanguageReferences, HostSpelledAsmBarrierWalksTheMergedRuleToCompletion) {
     // here re-implements the grammar; it only supplies tokens and checks that
     // each one is accepted. Subject: the empty-template barrier, host-spelled
     //     EMIT << ` >> !
-    // which is `__asm__ ("");` in c-subset's vocabulary and shares not one
+    // which is `__asm__ ("");` in c's vocabulary and shares not one
     // token kind with it.
     auto schema = loadOk(makeHostDoc(HostVariant::WithReference));
     ASSERT_NE(schema, nullptr);
@@ -523,7 +523,7 @@ TEST(LanguageReferences, HostInheritsAsmSemanticInlineAsmFacet) {
 // was compiled (`computeFirstAndNullable` produces nothing otherwise); and the
 // KINDS in it are asserted to be THIS host's — `BraceOpen` for the optional
 // `[name]` prefix and `TickText` for the constraint string, neither of which
-// `c-subset` spells. A facet that merged as text rather than as grammar would
+// `c` spells. A facet that merged as text rather than as grammar would
 // pass a name check and fail both of these.
 TEST(LanguageReferences, InheritedOperandRuleIsCompiledAndReboundToTheHostsKinds) {
     auto schema = loadOk(makeHostDoc(HostVariant::WithReference));
@@ -690,14 +690,14 @@ TEST(LanguageReferences, ReachingAsmWithoutTheReferenceFailsLoud) {
 
 TEST(LanguageReferences, AsmHostProbeIsNotCShaped) {
     // Guards against the whole suite passing merely because the synthetic host
-    // happened to reuse `c-subset`'s vocabulary — in which case it would be
+    // happened to reuse `c`'s vocabulary — in which case it would be
     // testing one consumer twice rather than the substrate once.
     auto schema = loadOk(makeHostDoc(HostVariant::WithReference));
     ASSERT_NE(schema, nullptr);
     EXPECT_EQ(schema->name(), "AsmHostProbe");
 
     // ⚠ THE CLAIM IS A CONJUNCTION AND BOTH HALVES BELONG IN ONE TEST: this
-    // host has NONE of c-subset's vocabulary AND has all twelve asm rules
+    // host has NONE of c's vocabulary AND has all twelve asm rules
     // anyway. Asserting only the first half leaves the test green when the
     // merge stops entirely — MEASURED: pointed at the reference-less host it
     // was one of two arms that did not go red.
@@ -706,7 +706,7 @@ TEST(LanguageReferences, AsmHostProbeIsNotCShaped) {
             << "a non-C-shaped host did NOT inherit '" << asmRule << "'";
     }
 
-    // c-subset's bindings for TWELVE of the thirteen token roles: none of them
+    // c's bindings for TWELVE of the thirteen token roles: none of them
     // exist here, yet all twelve asm rules do. The thirteenth binding —
     // `symbolName` -> `Identifier` — is deliberately NOT asserted absent: a
     // spelling that generic proves nothing about independence, since a host may
@@ -719,11 +719,11 @@ TEST(LanguageReferences, AsmHostProbeIsNotCShaped) {
                               "ParenOpen", "ParenClose", "BracketOpen",
                               "BracketClose", "EndStatement"}) {
         EXPECT_FALSE(schema->schemaTokens().contains(cKind))
-            << "the synthetic host declares c-subset's token kind '" << cKind
+            << "the synthetic host declares c's token kind '" << cKind
             << "' — it is no longer an independent second consumer";
     }
-    // c-subset's TWO rule-role bindings (`expression` <- operandExpr,
-    // `stringLiteralExpr` <- templateText), plus two further c-subset rules that
+    // c's TWO rule-role bindings (`expression` <- operandExpr,
+    // `stringLiteralExpr` <- templateText), plus two further c rules that
     // are NOT role bindings at all (`statement`, `assignmentExpr`) — four names,
     // asserted absent for the same independence reason. (Spelled out because the
     // count differs from `kAsmRuleHoles.size()`; an earlier revision said "the two
@@ -731,7 +731,7 @@ TEST(LanguageReferences, AsmHostProbeIsNotCShaped) {
     for (auto const& cRule : {"expression", "stringLiteralExpr", "statement",
                               "assignmentExpr"}) {
         EXPECT_FALSE(schema->rules().contains(cRule))
-            << "the synthetic host declares c-subset's rule '" << cRule << "'";
+            << "the synthetic host declares c's rule '" << cRule << "'";
     }
     // The host's own alien vocabulary IS there.
     for (auto const& hostKind : {"EmitWord", "LoudWord", "TightWord",
@@ -1332,7 +1332,7 @@ TEST(LanguageReferenceRefusals, InlineAsmFacetWithNoLoweringRowFailsLoud) {
 
 TEST(LanguageReferenceRefusals, InlineAsmFacetWithASkipLoweringRowFailsLoud) {
     // ★ THIS IS THE EXACT CONFIGURATION THE OLD RED-ON-DISABLE RECIPE IN
-    // `tests/mir/test_mir_lowering_c_subset.cpp` PRESCRIBED ("flip the asmStmt
+    // `tests/mir/test_mir_lowering_c.cpp` PRESCRIBED ("flip the asmStmt
     // row to Skip; the schema still loads"). Clause (c) closed that path, which
     // is why the recipe there had to be rewritten — and this arm is the standing
     // record of WHY, so the two facts cannot drift apart.

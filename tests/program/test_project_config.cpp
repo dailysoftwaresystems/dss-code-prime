@@ -9,15 +9,15 @@
 //     unsupported case AND the empty-set case both emit exactly one
 //     D_ArtifactProfileNotSupported.  ← the RED-on-disable levers: make
 //     artifactProfileSupported() always return true and the
-//     Unsupported*/EmptySet*/CSubsetRejectsGui pins all go green.
-//   * Integration (real shipped c-subset grammar): cli accepted, gui
+//     Unsupported*/EmptySet*/CRejectsGui pins all go green.
+//   * Integration (real shipped c grammar): cli accepted, gui
 //     rejected — proves the real grammar's declared span flows through.
 //   * Routing (routesToMultiUnit): the shared >1 threshold.
 //   * Diagnostic-code name/prefix round-trip.
 //
 // Plan 06 AP4 — per-language ONBOARDING matrix (appended at the end).
-// AP2/AP3 exercised the gates with c-subset ONLY; AP4 completes the
-// matrix across ALL THREE shipped languages (toy / c-subset / tsql-
+// AP2/AP3 exercised the gates with c ONLY; AP4 completes the
+// matrix across ALL THREE shipped languages (toy / c / tsql-
 // subset) and adds the single real end-to-end emit through
 // compileProject. See the "AP4" banner below for the scope + honesty
 // notes (no shipped format serves a non-cli profile; the profile does
@@ -86,7 +86,7 @@ std::span<std::string const> asSpan(std::vector<std::string> const& v) {
 
 // A complete, well-formed project config.
 constexpr std::string_view kValidJson = R"({
-  "language": "c-subset",
+  "language": "c",
   "artifactProfile": "cli",
   "targets": ["x86_64:elf64-x86_64-linux-exec"],
   "sources": ["main.c"],
@@ -102,7 +102,7 @@ TEST(ProjectConfigLoader, ValidConfigParsesAllFields) {
     auto pc = parseProjectConfig(kValidJson, "p.json", rep);
     ASSERT_TRUE(pc.has_value());
     EXPECT_EQ(rep.errorCount(), 0u);
-    EXPECT_EQ(pc->language, "c-subset");
+    EXPECT_EQ(pc->language, "c");
     EXPECT_EQ(pc->artifactProfile, "cli");
     ASSERT_EQ(pc->targets.size(), 1u);
     EXPECT_EQ(pc->targets[0], "x86_64:elf64-x86_64-linux-exec");
@@ -115,7 +115,7 @@ TEST(ProjectConfigLoader, ValidConfigParsesAllFields) {
 TEST(ProjectConfigLoader, ValidConfigWithoutOutputParses) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["a.c", "b.c"]
     })", "p.json", rep);
     ASSERT_TRUE(pc.has_value());
@@ -138,7 +138,7 @@ TEST(ProjectConfigLoader, MissingLanguageFailsLoud) {
 TEST(ProjectConfigLoader, MissingArtifactProfileFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "targets": ["t:f"], "sources": ["a.c"]
+      "language": "c", "targets": ["t:f"], "sources": ["a.c"]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
     EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 1u);
@@ -147,7 +147,7 @@ TEST(ProjectConfigLoader, MissingArtifactProfileFailsLoud) {
 TEST(ProjectConfigLoader, MissingTargetsFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli", "sources": ["a.c"]
+      "language": "c", "artifactProfile": "cli", "sources": ["a.c"]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
     EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 1u);
@@ -156,7 +156,7 @@ TEST(ProjectConfigLoader, MissingTargetsFailsLoud) {
 TEST(ProjectConfigLoader, EmptyTargetsFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": [], "sources": ["a.c"]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -166,7 +166,7 @@ TEST(ProjectConfigLoader, EmptyTargetsFailsLoud) {
 TEST(ProjectConfigLoader, MissingSourcesFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli", "targets": ["t:f"]
+      "language": "c", "artifactProfile": "cli", "targets": ["t:f"]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
     EXPECT_EQ(countCode(rep, DiagnosticCode::C_MissingField), 1u);
@@ -175,7 +175,7 @@ TEST(ProjectConfigLoader, MissingSourcesFailsLoud) {
 TEST(ProjectConfigLoader, EmptySourcesFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": []
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -221,7 +221,7 @@ TEST(ProjectConfigLoader, WrongTypeLanguageFailsLoud) {
 TEST(ProjectConfigLoader, WrongTypeTargetsFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": "not-an-array", "sources": ["a.c"]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -231,7 +231,7 @@ TEST(ProjectConfigLoader, WrongTypeTargetsFailsLoud) {
 TEST(ProjectConfigLoader, NonStringTargetEntryFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": [42], "sources": ["a.c"]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -241,7 +241,7 @@ TEST(ProjectConfigLoader, NonStringTargetEntryFailsLoud) {
 TEST(ProjectConfigLoader, WrongTypeOutputFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "output": 42
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -251,7 +251,7 @@ TEST(ProjectConfigLoader, WrongTypeOutputFailsLoud) {
 TEST(ProjectConfigLoader, EmptyOutputStringFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "output": ""
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -266,7 +266,7 @@ TEST(ProjectConfigLoader, EmptyOutputStringFailsLoud) {
 TEST(ProjectConfigLoader, ArtifactNamePresentParses) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
       "artifactName": "myapp"
     })", "p.json", rep);
@@ -279,7 +279,7 @@ TEST(ProjectConfigLoader, ArtifactNamePresentParses) {
 TEST(ProjectConfigLoader, ArtifactNameAbsentIsNullopt) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
     })", "p.json", rep);
     ASSERT_TRUE(pc.has_value());
@@ -290,7 +290,7 @@ TEST(ProjectConfigLoader, ArtifactNameAbsentIsNullopt) {
 TEST(ProjectConfigLoader, EmptyArtifactNameFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "artifactName": ""
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -300,7 +300,7 @@ TEST(ProjectConfigLoader, EmptyArtifactNameFailsLoud) {
 TEST(ProjectConfigLoader, WrongTypeArtifactNameFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "artifactName": 42
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -313,7 +313,7 @@ TEST(ProjectConfigLoader, WrongTypeArtifactNameFailsLoud) {
 TEST(ProjectConfigLoader, ArtifactNameWithForwardSlashFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "artifactName": "foo/bar"
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -323,7 +323,7 @@ TEST(ProjectConfigLoader, ArtifactNameWithForwardSlashFailsLoud) {
 TEST(ProjectConfigLoader, ArtifactNameWithBackslashFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "artifactName": "a\\b"
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -339,7 +339,7 @@ TEST(ProjectConfigLoader, ArtifactNameWithBackslashFailsLoud) {
 TEST(ProjectConfigLoader, FlagArraysPopulatedParseExactly) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
       "includes": ["inc", "vendor/include"],
       "defines": ["NDEBUG", "MAX=64"],
@@ -366,7 +366,7 @@ TEST(ProjectConfigLoader, FlagArraysPopulatedParseExactly) {
 TEST(ProjectConfigLoader, FlagArraysAbsentAreEmpty) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
     })", "p.json", rep);
     ASSERT_TRUE(pc.has_value());
@@ -381,7 +381,7 @@ TEST(ProjectConfigLoader, FlagArraysAbsentAreEmpty) {
 TEST(ProjectConfigLoader, FlagArraysEmptyBracketsAllowedNoDiagnostic) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
       "includes": [], "defines": [], "resolveLibraries": []
     })", "p.json", rep);
@@ -396,7 +396,7 @@ TEST(ProjectConfigLoader, FlagArraysEmptyBracketsAllowedNoDiagnostic) {
 TEST(ProjectConfigLoader, NonArrayIncludesFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "includes": "not-an-array"
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -407,7 +407,7 @@ TEST(ProjectConfigLoader, NonArrayIncludesFailsLoud) {
 TEST(ProjectConfigLoader, NonStringDefineEntryFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "defines": [1]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -418,7 +418,7 @@ TEST(ProjectConfigLoader, NonStringDefineEntryFailsLoud) {
 TEST(ProjectConfigLoader, EmptyStringIncludeEntryFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "includes": [""]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -429,7 +429,7 @@ TEST(ProjectConfigLoader, EmptyStringIncludeEntryFailsLoud) {
 TEST(ProjectConfigLoader, NonArrayResolveLibrariesFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "resolveLibraries": 42
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -452,7 +452,7 @@ TEST(ProjectConfigLoader, ResolveLibrariesMixedPlainAndExtendedEntriesParse) {
     // and the object entry fails C_MalformedJson instead of parsing.
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["arm64:macho64-arm64-darwin-exec"], "sources": ["main.c"],
       "resolveLibraries": [
         "libplain.so",
@@ -485,7 +485,7 @@ TEST(ProjectConfigLoader, ResolveLibrariesExtendedEntryMissingImportNameFailsLou
     // per meaning — the degenerate variant rejects rather than aliasing.
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "resolveLibraries": [{"path": "libfoo.so"}]
     })", "p.json", rep);
@@ -497,7 +497,7 @@ TEST(ProjectConfigLoader, ResolveLibrariesExtendedEntryMissingPathFailsLoud) {
     // An identity for NO file reads no export surface at all.
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "resolveLibraries": [{"importName": "libfoo.so.1"}]
     })", "p.json", rep);
@@ -511,7 +511,7 @@ TEST(ProjectConfigLoader, ResolveLibrariesExtendedEntryEmptyMemberFailsLoud) {
     // load. Same rule as the plain form's empty-string reject.
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "resolveLibraries": [{"path": "libfoo.so", "importName": ""}]
     })", "p.json", rep);
@@ -526,7 +526,7 @@ TEST(ProjectConfigLoader, ResolveLibrariesExtendedEntryUnknownMemberFailsLoud) {
     // embedded soname with no diagnostic at all.
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "resolveLibraries": [{"path": "libfoo.so", "importname": "libfoo.so.1"}]
     })", "p.json", rep);
@@ -538,7 +538,7 @@ TEST(ProjectConfigLoader, ResolveLibrariesNonStringNonObjectEntryFailsLoud) {
     // Neither shape ⇒ reject. Never a silent skip of the entry.
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "resolveLibraries": [42]
     })", "p.json", rep);
@@ -550,7 +550,7 @@ TEST(ProjectConfigLoader, ResolveLibrariesEmptyPlainStringEntryFailsLoud) {
     // The plain form's own degenerate case, unchanged by the extension.
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "resolveLibraries": [""]
     })", "p.json", rep);
@@ -564,7 +564,7 @@ TEST(ProjectConfigLoader, ResolveLibrariesEmptyPlainStringEntryFailsLoud) {
 TEST(ProjectConfigLoader, UnknownKeyStillRejected) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "includ": ["x"]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -582,7 +582,7 @@ TEST(ProjectConfigLoader, UnknownKeyStillRejected) {
 TEST(ProjectConfigLoader, StackReservePresentParsesExactValue) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
       "stackReserve": 4194304
     })", "p.json", rep);
@@ -598,7 +598,7 @@ TEST(ProjectConfigLoader, StackReservePresentParsesExactValue) {
 TEST(ProjectConfigLoader, StackReserveAboveFourGiBRoundTripsExactly) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
       "stackReserve": 8589934592
     })", "p.json", rep);
@@ -611,7 +611,7 @@ TEST(ProjectConfigLoader, StackReserveAboveFourGiBRoundTripsExactly) {
 TEST(ProjectConfigLoader, StackReserveAbsentIsNullopt) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
     })", "p.json", rep);
     ASSERT_TRUE(pc.has_value());
@@ -625,7 +625,7 @@ TEST(ProjectConfigLoader, StackReserveAbsentIsNullopt) {
 TEST(ProjectConfigLoader, ZeroStackReserveFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "stackReserve": 0
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -638,7 +638,7 @@ TEST(ProjectConfigLoader, ZeroStackReserveFailsLoud) {
 TEST(ProjectConfigLoader, NegativeStackReserveFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "stackReserve": -4096
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -650,7 +650,7 @@ TEST(ProjectConfigLoader, NegativeStackReserveFailsLoud) {
 TEST(ProjectConfigLoader, FloatStackReserveFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "stackReserve": 4096.5
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -663,7 +663,7 @@ TEST(ProjectConfigLoader, FloatStackReserveFailsLoud) {
 TEST(ProjectConfigLoader, StringStackReserveFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "stackReserve": "4096"
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -679,7 +679,7 @@ TEST(ProjectConfigLoader, StringStackReserveFailsLoud) {
 TEST(ProjectConfigLoader, UnknownKeyStillRejectedAndMessageNamesStackReserve) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "stackReserv": 4194304
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -719,7 +719,7 @@ TEST(ProjectConfigLoader, UnknownKeyStillRejectedAndMessageNamesStackReserve) {
 TEST(ProjectConfigLoader, ScriptArraysPopulatedParseToExactStructs) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
       "preBuildScripts": [
         {"run": ["bash", "gen.sh"], "runOn": ["linux", "darwin"]},
@@ -764,7 +764,7 @@ TEST(ProjectConfigLoader, ScriptAndDependencyFieldsAbsentAreEmptyNotAnError) {
 TEST(ProjectConfigLoader, ScriptAndDependencyEmptyBracketsAllowedNoDiagnostic) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "preBuildScripts": [], "postBuildScripts": [], "dependsOn": []
     })", "p.json", rep);
@@ -782,7 +782,7 @@ TEST(ProjectConfigLoader, ScriptAndDependencyEmptyBracketsAllowedNoDiagnostic) {
 TEST(ProjectConfigLoader, ScriptEntryMissingRunFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "preBuildScripts": [{"runOn": ["linux"]}]
     })", "p.json", rep);
@@ -800,7 +800,7 @@ TEST(ProjectConfigLoader, ScriptEntryMissingRunFailsLoud) {
 TEST(ProjectConfigLoader, ScriptEntryEmptyRunArrayFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "preBuildScripts": [{"run": []}]
     })", "p.json", rep);
@@ -818,7 +818,7 @@ TEST(ProjectConfigLoader, ScriptEntryEmptyRunArrayFailsLoud) {
 TEST(ProjectConfigLoader, ScriptEntryNonStringRunElementFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "preBuildScripts": [{"run": ["bash", 7]}]
     })", "p.json", rep);
@@ -837,7 +837,7 @@ TEST(ProjectConfigLoader, ScriptEntryNonStringRunElementFailsLoud) {
 TEST(ProjectConfigLoader, ScriptEntryEmptyStringRunElementFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "preBuildScripts": [{"run": ["bash", ""]}]
     })", "p.json", rep);
@@ -874,7 +874,7 @@ TEST(ProjectConfigLoader, ScriptEntryEmptyStringRunElementFailsLoud) {
 TEST(ProjectConfigLoader, ScriptEntryRunWordWithEmbeddedNulFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(
-        "{\"language\": \"c-subset\", \"artifactProfile\": \"cli\","
+        "{\"language\": \"c\", \"artifactProfile\": \"cli\","
         " \"targets\": [\"t:f\"], \"sources\": [\"a.c\"],"
         " \"preBuildScripts\": [{\"run\": [\"gen\", \"--out=a\\u0000b\"]}]}",
         "p.json", rep);
@@ -908,7 +908,7 @@ TEST(ProjectConfigLoader, ScriptEntryRunWordWithEmbeddedNulFailsLoud) {
 TEST(ProjectConfigLoader, ScriptEntryRunProgramWithEmbeddedNulFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(
-        "{\"language\": \"c-subset\", \"artifactProfile\": \"cli\","
+        "{\"language\": \"c\", \"artifactProfile\": \"cli\","
         " \"targets\": [\"t:f\"], \"sources\": [\"a.c\"],"
         " \"postBuildScripts\": [{\"run\": [\"pack\\u0000-signed\"]}]}",
         "p.json", rep);
@@ -931,7 +931,7 @@ TEST(ProjectConfigLoader, ScriptEntryRunProgramWithEmbeddedNulFailsLoud) {
 TEST(ProjectConfigLoader, ScriptEntryUnknownMemberFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "preBuildScripts": [{"run": ["bash", "gen.sh"], "runon": ["linux"]}]
     })", "p.json", rep);
@@ -950,7 +950,7 @@ TEST(ProjectConfigLoader, ScriptEntryUnknownMemberFailsLoud) {
 TEST(ProjectConfigLoader, ScriptEntryEmptyRunOnArrayFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "preBuildScripts": [{"run": ["bash", "gen.sh"], "runOn": []}]
     })", "p.json", rep);
@@ -972,7 +972,7 @@ TEST(ProjectConfigLoader, ScriptEntryEmptyRunOnArrayFailsLoud) {
 TEST(ProjectConfigLoader, ScriptEntryInvalidRunOnTokenFailsLoudNamingTokenAndVocabulary) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "postBuildScripts": [{"run": ["pack.sh"], "runOn": ["linux", "macos"]}]
     })", "p.json", rep);
@@ -1000,7 +1000,7 @@ TEST(ProjectConfigLoader, ScriptEntryInvalidRunOnTokenFailsLoudNamingTokenAndVoc
 TEST(ProjectConfigLoader, ScriptEntryNonStringRunOnElementFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "preBuildScripts": [{"run": ["gen.sh"], "runOn": [true]}]
     })", "p.json", rep);
@@ -1019,7 +1019,7 @@ TEST(ProjectConfigLoader, ScriptEntryNonStringRunOnElementFailsLoud) {
 TEST(ProjectConfigLoader, ScriptEntryRunAsShellStringFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "preBuildScripts": [{"run": "bash gen.sh"}]
     })", "p.json", rep);
@@ -1037,7 +1037,7 @@ TEST(ProjectConfigLoader, ScriptEntryRunAsShellStringFailsLoud) {
 TEST(ProjectConfigLoader, ScriptEntryRunOnAsBareStringFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "preBuildScripts": [{"run": ["gen.sh"], "runOn": "linux"}]
     })", "p.json", rep);
@@ -1055,7 +1055,7 @@ TEST(ProjectConfigLoader, ScriptEntryRunOnAsBareStringFailsLoud) {
 TEST(ProjectConfigLoader, NonArrayPreBuildScriptsFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "preBuildScripts": "gen.sh"
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -1072,7 +1072,7 @@ TEST(ProjectConfigLoader, NonArrayPreBuildScriptsFailsLoud) {
 TEST(ProjectConfigLoader, NonArrayPostBuildScriptsFailsLoudNamingItsOwnField) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "postBuildScripts": 42
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -1089,7 +1089,7 @@ TEST(ProjectConfigLoader, NonArrayPostBuildScriptsFailsLoudNamingItsOwnField) {
 TEST(ProjectConfigLoader, ScriptEntryNonObjectFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "preBuildScripts": ["gen.sh"]
     })", "p.json", rep);
@@ -1110,7 +1110,7 @@ TEST(ProjectConfigLoader, ScriptEntryNonObjectFailsLoud) {
 TEST(ProjectConfigLoader, DependsOnPopulatedParsesToExactStructs) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
       "dependsOn": [
         {"path": "../libfoo"},
@@ -1139,7 +1139,7 @@ TEST(ProjectConfigLoader, DependsOnPopulatedParsesToExactStructs) {
 TEST(ProjectConfigLoader, DependsOnBothPathAndGitFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "dependsOn": [{"path": "../libfoo", "git": "git@github.com:org/bar.git"}]
     })", "p.json", rep);
@@ -1157,7 +1157,7 @@ TEST(ProjectConfigLoader, DependsOnBothPathAndGitFailsLoud) {
 TEST(ProjectConfigLoader, DependsOnNeitherPathNorGitFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "dependsOn": [{}]
     })", "p.json", rep);
@@ -1177,7 +1177,7 @@ TEST(ProjectConfigLoader, DependsOnNeitherPathNorGitFailsLoud) {
 TEST(ProjectConfigLoader, DependsOnRefWithoutGitFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "dependsOn": [{"path": "../libfoo", "ref": "v1.2.0"}]
     })", "p.json", rep);
@@ -1196,7 +1196,7 @@ TEST(ProjectConfigLoader, DependsOnRefWithoutGitFailsLoud) {
 TEST(ProjectConfigLoader, DependsOnUnknownMemberFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "dependsOn": [{"url": "https://example.invalid/baz.git"}]
     })", "p.json", rep);
@@ -1213,7 +1213,7 @@ TEST(ProjectConfigLoader, DependsOnUnknownMemberFailsLoud) {
 TEST(ProjectConfigLoader, DependsOnNonStringMemberFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "dependsOn": [{"path": ["../libfoo"]}]
     })", "p.json", rep);
@@ -1231,7 +1231,7 @@ TEST(ProjectConfigLoader, DependsOnNonStringMemberFailsLoud) {
 TEST(ProjectConfigLoader, DependsOnEmptyStringMemberFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "dependsOn": [{"git": "git@github.com:org/bar.git", "ref": ""}]
     })", "p.json", rep);
@@ -1248,7 +1248,7 @@ TEST(ProjectConfigLoader, DependsOnEmptyStringMemberFailsLoud) {
 TEST(ProjectConfigLoader, NonArrayDependsOnFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "dependsOn": {"path": "../libfoo"}
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -1266,7 +1266,7 @@ TEST(ProjectConfigLoader, NonArrayDependsOnFailsLoud) {
 TEST(ProjectConfigLoader, DependsOnNonObjectEntryFailsLoud) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "dependsOn": ["../libfoo"]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -1303,7 +1303,7 @@ TEST(ProjectConfigLoader, DollarPrefixedDocumentationKeysParseClean) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
       "$comment": "these CLI builds are --project builds, not harness-leg builds",
-      "language": "c-subset",
+      "language": "c",
       "artifactProfile": "cli",
       "$sourcesComment": "pinned sqlite vintage 3.45.0",
       "targets": ["x86_64:elf64-x86_64-linux-exec"],
@@ -1313,7 +1313,7 @@ TEST(ProjectConfigLoader, DollarPrefixedDocumentationKeysParseClean) {
     ASSERT_TRUE(pc.has_value());
     EXPECT_EQ(rep.errorCount(), 0u);
     // The prose keys are SKIPPED, not absorbed — every real field still lands.
-    EXPECT_EQ(pc->language, "c-subset");
+    EXPECT_EQ(pc->language, "c");
     EXPECT_EQ(pc->artifactProfile, "cli");
     EXPECT_EQ(pc->targets, std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"});
     EXPECT_EQ(pc->sources, std::vector<std::string>{"main.c"});
@@ -1328,7 +1328,7 @@ TEST(ProjectConfigLoader, NonDollarTypoStillFailsLoudAfterCommentCarveOut) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
       "comment": "no leading $ — this is an ordinary unknown key",
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"]
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -1347,7 +1347,7 @@ TEST(ProjectConfigLoader, NonDollarTypoStillFailsLoudAfterCommentCarveOut) {
 TEST(ProjectConfigLoader, DollarPrefixedKeysAlsoAcceptedInsideEveryNestedEntry) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"],
       "resolveLibraries": [
         {"$comment": "stand-in; real soname stated below",
@@ -1409,7 +1409,7 @@ TEST(ProjectConfigLoader, UnknownKeyMessageIsDerivedFromTheRealKnownKeyTable) {
     //     message (the old silent drift) reds here.
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["t:f"], "sources": ["a.c"], "preBuildScript": []
     })", "p.json", rep);
     EXPECT_FALSE(pc.has_value());
@@ -1448,7 +1448,7 @@ TEST(ArtifactProfilePredicate, EmptySetRejectsAnyProfile) {
 TEST(EnforceArtifactProfile, AcceptsSupportedProfileSilently) {
     std::vector<std::string> declared = {"cli", "lib", "staticlib"};
     DiagnosticReporter rep;
-    EXPECT_TRUE(enforceArtifactProfile(asSpan(declared), "cli", "c-subset", rep));
+    EXPECT_TRUE(enforceArtifactProfile(asSpan(declared), "cli", "c", rep));
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_FALSE(sawCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported));
 }
@@ -1458,7 +1458,7 @@ TEST(EnforceArtifactProfile, AcceptsSupportedProfileSilently) {
 TEST(EnforceArtifactProfile, RejectsUnsupportedProfileFailLoud) {
     std::vector<std::string> declared = {"cli", "lib", "staticlib"};
     DiagnosticReporter rep;
-    EXPECT_FALSE(enforceArtifactProfile(asSpan(declared), "gui", "c-subset", rep));
+    EXPECT_FALSE(enforceArtifactProfile(asSpan(declared), "gui", "c", rep));
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 1u);
 }
 
@@ -1470,25 +1470,25 @@ TEST(EnforceArtifactProfile, RejectsEmptySetFailLoud) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 1u);
 }
 
-// ── Integration: the real shipped c-subset grammar ──────────────
-// c-subset declares ["cli","lib","staticlib"] (AP1). Proves the real
+// ── Integration: the real shipped c grammar ──────────────
+// c declares ["cli","lib","staticlib"] (AP1). Proves the real
 // grammar's artifactProfiles() span flows through the gate.
 
-TEST(EnforceArtifactProfileShipped, CSubsetAcceptsCli) {
-    auto g = GrammarSchema::loadShipped("c-subset");
+TEST(EnforceArtifactProfileShipped, CAcceptsCli) {
+    auto g = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(g.has_value());
     DiagnosticReporter rep;
-    EXPECT_TRUE(enforceArtifactProfile((*g)->artifactProfiles(), "cli", "c-subset", rep));
+    EXPECT_TRUE(enforceArtifactProfile((*g)->artifactProfiles(), "cli", "c", rep));
     EXPECT_EQ(rep.errorCount(), 0u);
 }
 
-TEST(EnforceArtifactProfileShipped, CSubsetRejectsGui) {
-    auto g = GrammarSchema::loadShipped("c-subset");
+TEST(EnforceArtifactProfileShipped, CRejectsGui) {
+    auto g = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(g.has_value());
     // Sanity: the real grammar declares a non-empty set excluding gui.
     EXPECT_FALSE((*g)->artifactProfiles().empty());
     DiagnosticReporter rep;
-    EXPECT_FALSE(enforceArtifactProfile((*g)->artifactProfiles(), "gui", "c-subset", rep));
+    EXPECT_FALSE(enforceArtifactProfile((*g)->artifactProfiles(), "gui", "c", rep));
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 1u);
 }
 
@@ -1528,13 +1528,13 @@ TEST(CompileProjectIntegration, MalformedConfigFailsLoud) {
 }
 
 // The AP2 deliverable end-to-end: a real project config requesting a
-// profile c-subset doesn't declare → D_ArtifactProfileNotSupported,
+// profile c doesn't declare → D_ArtifactProfileNotSupported,
 // rejected BEFORE any compile (the source path need not exist).
 TEST(CompileProjectIntegration, UnsupportedProfileRejectedBeforeCompile) {
     dss::test_support::ScratchDir scratch{
         dss::test_support::Location::Temp, "program"};
     auto path = writeProjectFile(scratch.path(), R"({
-      "language": "c-subset", "artifactProfile": "gui",
+      "language": "c", "artifactProfile": "gui",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
     })");
     Program prog;
@@ -1552,7 +1552,7 @@ TEST(CompileProjectIntegration, SupportedProfileProceedsPastGate) {
     dss::test_support::ScratchDir scratch{
         dss::test_support::Location::Temp, "program"};
     auto path = writeProjectFile(scratch.path(), R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["nonexistent-src.c"]
     })");
     Program prog;
@@ -1650,7 +1650,7 @@ TEST(CompileProjectIntegration, CliProfilePassesFormatGate) {
     dss::test_support::ScratchDir scratch{
         dss::test_support::Location::Temp, "program"};
     auto path = writeProjectFile(scratch.path(), R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["nonexistent-src.c"]
     })");
     Program prog;
@@ -1661,15 +1661,15 @@ TEST(CompileProjectIntegration, CliProfilePassesFormatGate) {
 }
 
 // The AP3 deliverable end-to-end: a profile the LANGUAGE declares (lib ∈
-// c-subset) but the CHOSEN FORMAT (an executable) does NOT serve →
+// c) but the CHOSEN FORMAT (an executable) does NOT serve →
 // D_ArtifactProfileFormatMismatch, rejected before any compile. The AP2
-// language gate must NOT fire (lib is declared by c-subset) — proving the two
+// language gate must NOT fire (lib is declared by c) — proving the two
 // gates are distinct.
 TEST(CompileProjectIntegration, LibProfileOnExecFormatMismatch) {
     dss::test_support::ScratchDir scratch{
         dss::test_support::Location::Temp, "program"};
     auto path = writeProjectFile(scratch.path(), R"({
-      "language": "c-subset", "artifactProfile": "lib",
+      "language": "c", "artifactProfile": "lib",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
     })");
     Program prog;
@@ -1689,7 +1689,7 @@ TEST(CompileProjectIntegration, MultiTargetOneMismatchFailsLoud) {
     dss::test_support::ScratchDir scratch{
         dss::test_support::Location::Temp, "program"};
     auto path = writeProjectFile(scratch.path(), R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec", "x86_64:elf64-x86_64-linux"],
       "sources": ["main.c"]
     })");
@@ -1779,7 +1779,7 @@ TEST(CompileProjectIntegration, TheServingFormatListIsMeasuredFromTheShippedSet)
     dss::test_support::ScratchDir scratch{
         dss::test_support::Location::Temp, "program"};
     auto path = writeProjectFile(scratch.path(), R"({
-      "language": "c-subset", "artifactProfile": "lib",
+      "language": "c", "artifactProfile": "lib",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
     })");
     Program prog;
@@ -1842,7 +1842,7 @@ TEST(ProjectConfigDiagnostics, DArtifactProfileNotSupportedRoundTrip) {
 // AP4 — per-language onboarding matrix (plan 06 §5 AP4 / §7)
 // ════════════════════════════════════════════════════════════════
 //
-// AP2/AP3 exercised the two driver gates with c-subset ONLY. AP4
+// AP2/AP3 exercised the two driver gates with c ONLY. AP4
 // completes the per-language matrix: each shipped language driven
 // through `compileProject` across its declared / undeclared profiles
 // and the served / unserved format axis. The shipped declared SETS
@@ -1877,7 +1877,7 @@ TEST(ProjectConfigDiagnostics, DArtifactProfileNotSupportedRoundTrip) {
 //     positive cell with ZERO gate-code change (the gate is generic
 //     set-membership, never a format-name branch).
 //   * toy & tsql-subset are onboarded here in the GATE sense only —
-//     they emit no artifact in this matrix. c-subset is the sole real
+//     they emit no artifact in this matrix. c is the sole real
 //     end-to-end emit (`RealCliProjectEmitsElfExecutable`, last test).
 //   * The profile does NOT yet drive artifact SHAPE (entry-symbol /
 //     PE subsystem / extension); that codegen-threading is deferred
@@ -1955,17 +1955,17 @@ TEST(ArtifactProfileMatrix, ToyLibRejectedByLanguageGate) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u);
 }
 
-// ── c-subset: declares ["cli","lib","staticlib"] ────────────────
+// ── c: declares ["cli","lib","staticlib"] ────────────────
 // (AP2/AP3 already cover cli-passes + lib-mismatch; AP4 adds staticlib
 //  + the §7-#3 actionable-message pin.)
 
-TEST(ArtifactProfileMatrix, CSubsetStaticlibMismatchByFormatGate) {
+TEST(ArtifactProfileMatrix, CStaticlibMismatchByFormatGate) {
     DiagnosticReporter rep;
-    int const rc = runMatrixCell("c-subset", "staticlib", kExecTarget, rep);
+    int const rc = runMatrixCell("c", "staticlib", kExecTarget, rep);
     EXPECT_EQ(rc, 1);
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 1u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u)
-        << "staticlib IS declared by c-subset — the LANGUAGE gate must not fire";
+        << "staticlib IS declared by c — the LANGUAGE gate must not fire";
     // The OTHER side of the split: `staticlib` IS served (by the archive
     // formats), so this cell must keep the genuine-mismatch code. The pair of
     // cells — this one and TsqlScript… above — is what proves the driver is
@@ -1977,13 +1977,13 @@ TEST(ArtifactProfileMatrix, CSubsetStaticlibMismatchByFormatGate) {
 // LIST the supported set (actionable remediation) — not just a code.
 // (red-on-disable: if enforceArtifactProfile dropped the list, the
 // "staticlib" find() fails.)
-TEST(ArtifactProfileMatrix, CSubsetGuiMessageNamesLanguageAndSupportedSet) {
+TEST(ArtifactProfileMatrix, CGuiMessageNamesLanguageAndSupportedSet) {
     DiagnosticReporter rep;
-    (void) runMatrixCell("c-subset", "gui", kExecTarget, rep);
+    (void) runMatrixCell("c", "gui", kExecTarget, rep);
     ASSERT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 1u);
     std::string const m =
         firstMessageForCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported);
-    EXPECT_NE(m.find("c-subset"), std::string::npos)
+    EXPECT_NE(m.find("c"), std::string::npos)
         << "message must name the language; got: " << m;
     EXPECT_NE(m.find("staticlib"), std::string::npos)
         << "message must list the supported profiles; got: " << m;
@@ -2044,7 +2044,7 @@ TEST(ArtifactProfileMatrix, TsqlCliRejectedByLanguageGate) {
 // ── the ONE real end-to-end emit through compileProject ─────────
 // Every other compileProject test (AP2/AP3 + the matrix above) uses an
 // ABSENT source and asserts only gate behavior. This one proves the
-// project-config path actually COMPILES + EMITS: a real cli c-subset
+// project-config path actually COMPILES + EMITS: a real cli c
 // program → a real ELF executable on disk. Host-agnostic — DSS cross-
 // emits, so we assert the bytes (ELF magic), never RUN. It is also the
 // positive cli FORMAT-gate cell, end-to-end. Uses Location::InsideRepo
@@ -2058,7 +2058,7 @@ TEST(CompileProjectIntegration, RealCliProjectEmitsElfExecutable) {
         f << "int main() { return 42; }\n";
     }
     auto path = writeProjectFile(scratch.path(), R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"]
     })");
     scratch.useAsCwd();
@@ -2067,7 +2067,7 @@ TEST(CompileProjectIntegration, RealCliProjectEmitsElfExecutable) {
     DiagnosticReporter rep;
     int const rc = prog.compileProject(path.string(), rep);
     ASSERT_EQ(rc, 0)
-        << "a real cli c-subset project must compile + emit via compileProject";
+        << "a real cli c project must compile + emit via compileProject";
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileNotSupported), 0u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::D_ArtifactProfileFormatMismatch), 0u);
 
@@ -2120,7 +2120,7 @@ TEST(ModuleIsALibrary, StandaloneModuleBuildEmitsAnArchive) {
     // spec says "in an archive container" — the same division `lib` and
     // `staticlib` already use, so `module` needed no new mechanism.
     auto path = writeProjectFile(scratch.path(), R"({
-      "language": "c-subset", "artifactProfile": "module",
+      "language": "c", "artifactProfile": "module",
       "targets": ["x86_64:elf64-x86_64-linux-staticlib"], "sources": ["scale.c"]
     })");
     scratch.useAsCwd();
@@ -2171,7 +2171,7 @@ TEST(ModuleIsALibrary, ConsumedModuleMergesSourcesAndEmitsNoSecondArtifact) {
     write(dep / "scale.c", "int dss_scale(int n) { return n * 7; }\n");
     // The SAME manifest shape as the standalone pin above — targets and all.
     write(dep / ".dss-project.json", R"({
-      "language": "c-subset", "artifactProfile": "module",
+      "language": "c", "artifactProfile": "module",
       "targets": ["x86_64:elf64-x86_64-linux-staticlib"], "sources": ["scale.c"]
     })");
     write(dir / "main.c",
@@ -2179,7 +2179,7 @@ TEST(ModuleIsALibrary, ConsumedModuleMergesSourcesAndEmitsNoSecondArtifact) {
           "int main(void){ return dss_scale(6); }\n");
     auto const proj = dir / "app.dss-project.json";
     write(proj, R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["main.c"],
       "dependsOn": [{ "path": "scalemod" }]
     })");
@@ -2293,7 +2293,7 @@ int buildDefineProject(std::filesystem::path const& dir,
     auto const srcPath = dir / "gate.c";
     writeText(srcPath, src);
     std::string const manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + std::string{kHostExecSpec} + "\"],\n"
         + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
@@ -2396,7 +2396,7 @@ int buildRoutingProject(std::filesystem::path const& dir,
     auto const srcPath = dir / "app.c";
     writeText(srcPath, "int main(void){ return 42; }\n");
     std::string manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + std::string{kHostExecSpec} + "\"],\n"
         + "  \"sources\": [\"" + srcPath.generic_string() + "\"]";
@@ -2497,7 +2497,7 @@ TEST(CompileProjectManifestFlags, CliSingleTargetStaysFlatNotSubdir) {
     Program prog;
     prog.setOutputDir(outDir);   // NO setPerFormatOutputSubdir / setArtifactName
     DiagnosticReporter rep;
-    int const rc = prog.compileFiles({srcPath.string()}, "c-subset", {target}, rep);
+    int const rc = prog.compileFiles({srcPath.string()}, "c", {target}, rep);
     ASSERT_EQ(rc, 0) << "the CLI single-target compile must succeed";
     // FLAT: <outDir>/cliflat (source stem, no <formatName>/ subdir interposed).
     EXPECT_TRUE(std::filesystem::exists(outDir / "cliflat"))
@@ -2535,7 +2535,7 @@ TEST(CompileProjectManifestFlags, ArtifactNameDotDotEscapeFailsLoud) {
     writeText(srcPath, "int main(void){ return 0; }\n");
     auto const outDir = dir / "out";
     std::string const manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + target + "\"],\n"
         + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
@@ -2582,7 +2582,7 @@ TEST(CompileProjectManifestFlags, IncludesThreadToCompile) {
               "#include \"gate_hdr.h\"\nint main(void){ return ANSWER; }\n");
 
     auto manifest = [&](std::vector<std::string> const& includes) {
-        return std::string{"{\n  \"language\": \"c-subset\",\n"}
+        return std::string{"{\n  \"language\": \"c\",\n"}
             + "  \"artifactProfile\": \"cli\",\n"
             + "  \"targets\": [\"" + target + "\"],\n"
             + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
@@ -2634,7 +2634,7 @@ TEST(CompileProjectManifestFlags, ResolveLibrariesThreadToCompile) {
     auto const missing = dir / "does_not_exist_lib.bin";  // never created
 
     auto manifest = [&](std::vector<std::string> const& libs) {
-        return std::string{"{\n  \"language\": \"c-subset\",\n"}
+        return std::string{"{\n  \"language\": \"c\",\n"}
             + "  \"artifactProfile\": \"cli\",\n"
             + "  \"targets\": [\"" + target + "\"],\n"
             + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
@@ -2703,7 +2703,7 @@ TEST(CompileProjectManifestFlags, IncludesMergeComposesPreexistingWithManifest) 
               "int main(void){ return A_OK + B_OK - 2; }\n");
 
     auto manifest = [&](std::vector<std::string> const& includes) {
-        return std::string{"{\n  \"language\": \"c-subset\",\n"}
+        return std::string{"{\n  \"language\": \"c\",\n"}
             + "  \"artifactProfile\": \"cli\",\n"
             + "  \"targets\": [\"" + target + "\"],\n"
             + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
@@ -2758,7 +2758,7 @@ TEST(CompileProjectManifestFlags, DefinesMergeComposesPreexistingWithManifest) {
     writeText(srcPath, "int main(void){ return CLI_ONE + MANIFEST_TWO - 3; }\n");
 
     auto manifest = [&](std::vector<std::string> const& defines) {
-        return std::string{"{\n  \"language\": \"c-subset\",\n"}
+        return std::string{"{\n  \"language\": \"c\",\n"}
             + "  \"artifactProfile\": \"cli\",\n"
             + "  \"targets\": [\"" + target + "\"],\n"
             + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
@@ -2813,7 +2813,7 @@ TEST(CompileProjectManifestFlags, ResolveLibrariesMergeComposesPreexistingWithMa
     auto const manifestLib = dir / "manifest_only_lib.bin";  // never created
 
     std::string const manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + target + "\"],\n"
         + "  \"sources\": [\"" + srcPath.generic_string() + "\"],\n"
@@ -2883,7 +2883,7 @@ int buildStackReserveProject(std::filesystem::path const& dir,
     auto const srcPath = dir / "stack.c";
     writeText(srcPath, "int main(void){ return 0; }\n");
     std::string manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + target + "\"],\n"
         + "  \"sources\": [\"" + srcPath.generic_string() + "\"]";
@@ -3004,7 +3004,7 @@ TEST(CompileProjectManifestFlags, StackReserveAbsentEverywhereCompilesClean) {
 TEST(ProjectConfigLoader, GlobSourceStringKeptVerbatim) {
     DiagnosticReporter rep;
     auto pc = parseProjectConfig(R"({
-      "language": "c-subset", "artifactProfile": "cli",
+      "language": "c", "artifactProfile": "cli",
       "targets": ["x86_64:elf64-x86_64-linux-exec"], "sources": ["src/**/*.c"]
     })", "p.json", rep);
     ASSERT_TRUE(pc.has_value());
@@ -3232,7 +3232,7 @@ TEST(CompileProjectGlob, ZeroMatchPatternFailsLoud) {
     auto const dir = scratch.path();
     writeText(dir / "real.c", "int main(void){return 0;}\n");  // exists, but no *.zzz
     std::string const manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + target + "\"],\n"
         + "  \"sources\": [\"" + (dir / "*.zzz").generic_string() + "\"]\n}";
@@ -3259,7 +3259,7 @@ TEST(CompileProjectGlob, LiteralEntryUnchanged) {
     auto const src = dir / "solo.c";
     writeText(src, "int main(void){return 0;}\n");
     std::string const manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + target + "\"],\n"
         + "  \"sources\": [\"" + src.generic_string() + "\"]\n}";  // literal, no metachar
@@ -3293,7 +3293,7 @@ TEST(CompileProjectGlob, RecursiveGlobExpandsAndCompiles) {
     std::filesystem::create_directories(dir / "sub");
     writeText(dir / "sub" / "other.c", "int other(void){ return 42; }\n");
     std::string const manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + target + "\"],\n"
         + "  \"sources\": [\"" + (dir / "**" / "*.c").generic_string() + "\"]\n}";
@@ -3327,7 +3327,7 @@ TEST(CompileProjectGlob, MixLiteralAndGlobCombine) {
     std::filesystem::create_directories(dir / "lib");
     writeText(dir / "lib" / "helper.c", "int helper(void){ return 42; }\n");
     std::string const manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + target + "\"],\n"
         + "  \"sources\": [\"" + (dir / "main.c").generic_string() + "\", \""
@@ -3380,7 +3380,7 @@ TEST(CompileProjectGlob, MultiCuGlobBuildsAndRunsBothTus) {
     writeText(dir / "README.txt", "not a source\n");  // the *.c glob must exclude it
 
     std::string const manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + std::string{kGlobHostSpec} + "\"],\n"
         + "  \"sources\": [\"" + (dir / "*.c").generic_string() + "\"]\n}";
@@ -3429,7 +3429,7 @@ TEST(CompileProjectGlob, OverlappingLiteralAndGlobDedupByNormalizedPath) {
     // Entry 1: a glob matching BOTH main.c and other.c (emits normalized paths).
     std::string const literalDotMain = dir.generic_string() + "/./main.c";
     std::string const manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + std::string{kGlobHostSpec} + "\"],\n"
         + "  \"sources\": [\"" + literalDotMain + "\", \""
@@ -3639,7 +3639,7 @@ std::string hookManifest(std::string_view targetSpec,
                          std::string_view preArrayJson       = {},
                          std::string_view postArrayJson      = {},
                          std::string_view dependsOnArrayJson = {}) {
-    std::string m = "{\n  \"language\": \"c-subset\",\n";
+    std::string m = "{\n  \"language\": \"c\",\n";
     m += "  \"artifactProfile\": \"cli\",\n";
     m += "  \"targets\": [" + jsonQuote(targetSpec) + "],\n";
     m += "  \"sources\": " + std::string{sourcesArrayJson};
@@ -3990,7 +3990,7 @@ TEST(CompileProjectHooks, ResolvableDependsOnBuildsAndContributesItsSources) {
                        << mkEc.message();
     writeText(dep / "helper.c", "int helper_answer(void){ return 11; }\n");
     writeText(dep / ".dss-project.json",
-              R"({"language":"c-subset","artifactProfile":"module",)"
+              R"({"language":"c","artifactProfile":"module",)"
               R"("targets":[")" + std::string{kHookElfSpec}
                   + R"("],"sources":["helper.c"]})");
     writeText(dir / "main.c",
@@ -4365,7 +4365,7 @@ TEST(ProgramArtifactPaths, IndexParallelToTargetsAndEqualToTheFilesOnDisk) {
     auto const dir = scratch.path();
     writeText(dir / "twoway.c", "int main(void){ return 0; }\n");
     std::string const manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"x86_64:elf64-x86_64-linux-exec\", "
           "\"x86_64:pe64-x86_64-windows-exec\"],\n"
@@ -4422,7 +4422,7 @@ TEST(ProgramArtifactPaths, FailedTargetLeavesNulloptWhileItsSiblingSucceeds) {
     DiagnosticReporter rep;
     // PE first, ELF second: PE declares stackReserveControl, ELF does not.
     int const rc = prog.compileFiles(
-        {(dir / "halffail.c").generic_string()}, "c-subset",
+        {(dir / "halffail.c").generic_string()}, "c",
         {"x86_64:pe64-x86_64-windows-exec", "x86_64:elf64-x86_64-linux-exec"},
         rep);
     EXPECT_NE(rc, 0) << "the ELF target must refuse the reserve it cannot carry";
@@ -4454,7 +4454,7 @@ TEST(ProgramArtifactPaths, WithoutOutputDirTheBaseIsCwdSlashTarget) {
 
     Program prog;   // deliberately NO setOutputDir
     DiagnosticReporter rep;
-    ASSERT_EQ(prog.compileFiles({"defaulted.c"}, "c-subset",
+    ASSERT_EQ(prog.compileFiles({"defaulted.c"}, "c",
                                 {"x86_64:elf64-x86_64-linux-exec"}, rep), 0);
     auto const& paths = prog.artifactPaths();
     ASSERT_EQ(paths.size(), 1u);
@@ -4480,13 +4480,13 @@ TEST(ProgramArtifactPaths, ARejectedSecondRunClearsThePreviousRunsPaths) {
     Program prog;
     prog.setOutputDir(dir / "out");
     DiagnosticReporter rep1;
-    ASSERT_EQ(prog.compileFiles({(dir / "once.c").generic_string()}, "c-subset",
+    ASSERT_EQ(prog.compileFiles({(dir / "once.c").generic_string()}, "c",
                                 {"x86_64:elf64-x86_64-linux-exec"}, rep1), 0);
     ASSERT_EQ(prog.artifactPaths().size(), 1u);
     ASSERT_TRUE(prog.artifactPaths()[0].has_value());
 
     DiagnosticReporter rep2;
-    EXPECT_NE(prog.compileFiles({}, "c-subset",
+    EXPECT_NE(prog.compileFiles({}, "c",
                                 {"x86_64:elf64-x86_64-linux-exec"}, rep2), 0);
     EXPECT_TRUE(prog.artifactPaths().empty())
         << "a run that never reached a target reports NO artifacts — stale "
@@ -4522,7 +4522,7 @@ TEST(CompileProjectArtifactName, FollowsTheManifestsOwnFirstSourceNotSortOrder) 
               "int helper(void);\nint main(void){ return helper(); }\n");
     writeText(dir / "alpha.c", "int helper(void){ return 0; }\n");
     std::string const manifest =
-        std::string{"{\n  \"language\": \"c-subset\",\n"}
+        std::string{"{\n  \"language\": \"c\",\n"}
         + "  \"artifactProfile\": \"cli\",\n"
         + "  \"targets\": [\"" + target + "\"],\n"
         + "  \"sources\": [\"" + (dir / "zeta.c").generic_string() + "\", \""

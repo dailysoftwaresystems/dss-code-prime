@@ -27,7 +27,7 @@ The bulk of this spec covers `sources/<lang>.lang.json` — the grammar config �
 
 | Config type | Location (under `src/dss-config/`) | Purpose |
 |---|---|---|
-| Source language | `sources/<lang>.lang.json` | A source language's grammar + lexer + keywords + scopes + shapes (+ v3 `typeExtensions`, v4 `imports`, semantics, and HIR-lowering data). The subject of the rest of this spec. Shipped: `c-subset`, `toy`, `tsql-subset`. |
+| Source language | `sources/<lang>.lang.json` | A source language's grammar + lexer + keywords + scopes + shapes (+ v3 `typeExtensions`, v4 `imports`, semantics, and HIR-lowering data). The subject of the rest of this spec. Shipped: `c`, `toy`, `tsql-subset`. |
 | Target | `targets/<arch>.target.json` | Per-CPU backend data: instruction encoding, registers, calling conventions, and relocation kinds. Shipped: `x86_64`, `arm64`. |
 | Object format | `object-formats/<fmt>.format.json` | Per-object-format layout/relocation/process-exit data (section layout, relocation mapping, entry/exit conventions). Shipped: PE, ELF (x86-64 + aarch64), Mach-O, SPIR-V, WASM variants. |
 | Pipeline | `pipelines/<name>.pipeline.json` | An optimizer pass SCHEDULE: `passes` elements are pass-name leaves or `{"repeat":{count,passes}}` / `{"fixpoint":{max,passes}}` combinator nodes (a closed grammar — no seq/conditional/parallel/per-step params), plus tuning knobs (`inlineThreshold`, `verifyEveryPass`). A FLAT pass list plus top-level `maxIterations` remains valid and desugars at load to one top-level `fixpoint` — but a document using any structural node refuses `maxIterations` (one spelling per document). Load-time budgets, fail-loud: count/max ∈ [1,32], nesting depth ≤ 8, total worst-case unrolled invocations ≤ 4096, no empty node bodies. **Two-stage LTO topology (P10):** an optional top-level `"unitPipeline": "<name>"` names the pipeline document that runs at the per-CU (unit) stage instead of this one — the link-time schedule is always this document; absent key = both stages run this document (what `debug` ships); the key resolves exactly ONE hop (a unit document that itself declares it is refused). Shipped: `debug`, `release`, `release-unit` (the per-CU schedule `release`'s key names). |
@@ -145,7 +145,7 @@ You can shadow a built-in name in `tokens` if you need different flags or scope 
 
 **MANY `word`s MAY MAP TO ONE `kind` — that is the alias facility, and it is how you add an alternate SPELLING.** The `word` must be unique (two rows for the same lexeme is a config error), but the `kind` need not be: the loader appends each row into a per-lexeme vector, so N spellings collapse onto one token kind and every consumer downstream — grammar slots, `semantics` marker rows, the type-specifier multisets — sees the single kind and cannot tell which spelling was written. That is exactly the property an alias needs, and it means **an alternate spelling costs keyword rows and nothing else**: no new kind, no grammar change, no C++.
 
-The shipped `c-subset` config relies on this nine times over: `inline`/`__inline`/`__inline__` → `InlineKeyword`; `__asm__`/`__asm` → `AsmKeyword`; `typeof`/`__typeof__`/`__typeof` → `TypeofKeyword`; `_Alignof`/`__alignof__`/`__alignof` → `AlignofKeyword`; and the GNU `__`-wrapped qualifier/specifier spellings `volatile`/`__volatile__`/`__volatile`, `const`/`__const__`/`__const`, `signed`/`__signed__`/`__signed`, `restrict`/`__restrict__`/`__restrict`, `_Complex`/`__complex__`/`__complex`.
+The shipped `c` config relies on this nine times over: `inline`/`__inline`/`__inline__` → `InlineKeyword`; `__asm__`/`__asm` → `AsmKeyword`; `typeof`/`__typeof__`/`__typeof` → `TypeofKeyword`; `_Alignof`/`__alignof__`/`__alignof` → `AlignofKeyword`; and the GNU `__`-wrapped qualifier/specifier spellings `volatile`/`__volatile__`/`__volatile`, `const`/`__const__`/`__const`, `signed`/`__signed__`/`__signed`, `restrict`/`__restrict__`/`__restrict`, `_Complex`/`__complex__`/`__complex`.
 
 > ⚠ This paragraph previously read *"Same `kind` value can appear once."* That was **false**, and it was false in the direction that costs the most: a reader who believed it would conclude an alternate spelling needs a new token kind (and therefore new grammar and new C++) when it needs one more row. It was already contradicted four times over by the shipped config and by the loader itself — see `src/core/types/grammar_schema_json.cpp`, where the keyword pass ends in `data.lexemeTable[word].push_back(meaning)`, an append into a per-spelling vector, not an assignment.
 
@@ -549,7 +549,7 @@ Two generic strategies ship (plus `none`):
 // include-following — e.g. C-style `#include "x.h"`
 {
   "dssSchemaVersion": 4,
-  "language": { "name": "CSubset", "version": "0.1.0" },
+  "language": { "name": "C", "version": "0.1.0" },
 
   "imports": {
     "strategy":      "include-following",
@@ -679,7 +679,7 @@ An **optional** top-level array naming the **artifact profiles** a language can 
 ```jsonc
 {
   "dssSchemaVersion": 4,
-  "language": { "name": "CSubset", "version": "0.1.0", "fileExtensions": [".c", ".h"] },
+  "language": { "name": "C", "version": "0.1.0", "fileExtensions": [".c", ".h"] },
 
   "artifactProfiles": ["cli", "lib", "staticlib"],   // ← this language's supported outputs
 
@@ -691,7 +691,7 @@ An **optional** top-level array naming the **artifact profiles** a language can 
 - **Optional.** Absent ⇒ the language declares no profiles (`artifactProfiles()` returns an empty span); the config still loads cleanly.
 - Each entry must be a name in the **registered profile set**: `cli`, `gui`, `lib`, `staticlib`, `script`, `sproc`, `transpile`, `shader`, `hdl` (plan 06 §3). The set is loader-owned vocabulary, not a config-authored name — a new profile arrives with the backend plan that introduces it.
 - An unknown name → `C_UnknownArtifactProfile`. A malformed block (not an array, or a non-string entry) → the same `C_UnknownArtifactProfile`. A duplicate entry → `C_ConflictingField` and the load **hard-fails** (matching the `typeExtensions` duplicate-name precedent — a duplicate is an authoring error, not silently dropped).
-- The shipped languages declare: `toy` → `["cli"]`; `c-subset` → `["cli", "lib", "staticlib"]`; `tsql-subset` → `["script", "sproc"]`.
+- The shipped languages declare: `toy` → `["cli"]`; `c` → `["cli", "lib", "staticlib"]`; `tsql-subset` → `["script", "sproc"]`.
 
 | Symptom | Likely fix |
 |---|---|
@@ -706,7 +706,7 @@ Three coupled surfaces let a language declare a C-style cast `(type)expr` whose 
 - **`semantics.casts`** (array of `{rule, typeChild, operandChild}`): pass 2 resolves the type child like any type node (typedefs included), stamps it and the cast node with the **target type**, and validates explicit-castability (scalar↔scalar incl. float↔int, pointer↔pointer, pointer↔integer; struct/union values, `void`, float↔pointer reject with `S_InvalidCast`).
 - **`hirLowering.castRule`**: the HIR lowering arm — the stamped target type + the lowered operand become an explicit `Cast` node (the compound-literal stamped-type-probe precedent).
 
-c-subset declares `castExpr` = `[ParenOpen, castTypeRef, ParenClose, castOperand]` as a speculative `operand` alternative, with `castOperand` a second `expr`-entry rule at `minPrecedence` 90 so the cast binds at unary tier (`(int)a + b` casts only `a`; postfix binds inside the operand).
+c declares `castExpr` = `[ParenOpen, castTypeRef, ParenClose, castOperand]` as a speculative `operand` alternative, with `castOperand` a second `expr`-entry rule at `minPrecedence` 90 so the cast binds at unary tier (`(int)a + b` casts only `a`; postfix binds inside the operand).
 
 ---
 
@@ -718,7 +718,7 @@ c-subset declares `castExpr` = `[ParenOpen, castTypeRef, ParenClose, castOperand
 
 A shipped system library — libc / `msvcrt.dll`, `kernel32`, `libSystem`, … — exports symbols (`puts`, `malloc`, `GetStdHandle`) that programs call without ever defining them. To call one in C you `#include <stdio.h>` and the header carries the prototype; you never re-declare `puts` yourself.
 
-DSS Code Prime ships those prototypes **once**, language-neutrally, as a JSON descriptor under `src/dss-config/shippedLibs/<lib>.json` (one neutral set — per-target library names resolve via the per-format `library` map, §12.5). A program does an angle/system include (`#include <stdio.h>`, or whatever import form the source language declares) and the symbols become visible to the call — with **no inline `extern` re-declaration** in the program. Because the descriptor is neutral JSON (not per-language source), one `stdio.json` serves c-subset and any other language that imports it; a second language reuses the same descriptors with zero engine change.
+DSS Code Prime ships those prototypes **once**, language-neutrally, as a JSON descriptor under `src/dss-config/shippedLibs/<lib>.json` (one neutral set — per-target library names resolve via the per-format `library` map, §12.5). A program does an angle/system include (`#include <stdio.h>`, or whatever import form the source language declares) and the symbols become visible to the call — with **no inline `extern` re-declaration** in the program. Because the descriptor is neutral JSON (not per-language source), one `stdio.json` serves c and any other language that imports it; a second language reuses the same descriptors with zero engine change.
 
 The reader is `dss::ffi::readShippedLibDescriptor` ([`src/ffi/shipped_lib_descriptor.hpp`](../src/ffi/shipped_lib_descriptor.hpp)). It is a pure function of `(path, interner, typeReg, reporter)` — it branches on no source language, no CPU target, no object format. Every type it builds is interned through the caller's `TypeInterner`.
 

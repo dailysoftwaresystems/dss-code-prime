@@ -39,7 +39,7 @@ struct LinkageAttr {
     // ★ WHY IT IS A STRUCT FIELD AND NOT A LOCAL IN `linkageFrom`. The
     // `binding` axis needs no such bit because `SymbolBinding::Global` is
     // UNWRITABLE from config (MEASURED: zero `"binding": "global"` rows in
-    // `c-subset.lang.json`), so `binding != Global` already means "a binding was
+    // `c.lang.json`), so `binding != Global` already means "a binding was
     // specified". `SymbolVisibility::Default = 0` is BOTH the unspecified
     // sentinel AND a writable config value (`visibility:default`, added TF-C92),
     // so `visibility != Default` CANNOT distinguish the two — and a guard keyed

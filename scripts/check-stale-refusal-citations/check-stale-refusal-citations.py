@@ -95,7 +95,7 @@ sentence citing a CLOSED row, because **the row closed a SUBSET of what the
 sentence refuses**. `large_frame_arm64/main.c` says a frame **> 16 MiB** stays
 fail-loud while the row it cites closed by implementing frames **up to** 16 MiB;
 `hir_to_mir.cpp` says **any OTHER** lvalue kind is still unsupported;
-`test_mir_lowering_c_subset.cpp` says a width **EXCEEDING** the 64-bit base stays
+`test_mir_lowering_c.cpp` says a width **EXCEEDING** the 64-bit base stays
 rejected. Nothing is stale in any of them. The tell is structural -- the claim's
 SUBJECT carries a threshold or an exception quantifier -- which is why this is a
 narrowing rather than eight inventory lines with no argument behind them.
@@ -314,7 +314,7 @@ def sentences(text):
     ±6-line predicate over the same tree: a 2 KB JSON `$comment` is ONE PHYSICAL
     LINE, so a line window swallows the whole paragraph, and one occurrence of a
     past-tense word anywhere in those 2 KB suppressed a hit that was real --
-    `examples/c-subset/c_inline_asm_memory_arithmetic/expected.json`, which this
+    `examples/c/c_inline_asm_memory_arithmetic/expected.json`, which this
     guard reported and the line-window predicate did not. A line is a formatting
     artefact; a claim is a sentence.
 
@@ -376,7 +376,7 @@ CLAIM = re.compile(r"\b(?:%s)\b[^.;!?]{0,%d}?\b(?:%s)\b|%s"
 
 # ★★★ A REFUSAL SCOPED TO A **BOUNDARY OUTSIDE WHAT THE ROW CLOSED** IS TRUE, NOT
 # STALE, AND IT IS THE LARGEST FALSE-POSITIVE CLASS THIS GUARD HAS.
-# ✔MEASURED 2026-08-24: `examples/c-subset/large_frame_arm64/main.c` says a frame
+# ✔MEASURED 2026-08-24: `examples/c/large_frame_arm64/main.c` says a frame
 # **> 16 MiB** stays fail-loud while the row it cites closed by implementing frames
 # **up to** 16 MiB. The sentence is TRUE, the citation is CORRECT, and the row
 # closed a SUBSET of what the sentence refuses. Eight of the twenty-one live sites

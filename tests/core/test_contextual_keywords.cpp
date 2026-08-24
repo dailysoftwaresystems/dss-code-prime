@@ -545,14 +545,14 @@ TEST(ContextualKeywords, ToyConfigReloadsUnchanged) {
     EXPECT_FALSE(schema.lookupLexeme("if")[0].contextual);
 }
 
-TEST(ContextualKeywords, CSubsetIntDeclEmitsNoContextualResolution) {
-    // Smoke pin: under c-subset's default Strict reservedWordPolicy, a
+TEST(ContextualKeywords, CIntDeclEmitsNoContextualResolution) {
+    // Smoke pin: under c's default Strict reservedWordPolicy, a
     // clean `int x;` parse must not emit any P_ContextualKeywordResolution
     // — there are no contextual keywords to demote.
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
-    auto src = SourceBuffer::fromString("int x;", "<csubset-smoke>");
+    auto src = SourceBuffer::fromString("int x;", "<c-smoke>");
 
     TreeBuilder b{src, schema, DiagnosticBudget::libraryDefault()};
     {
@@ -585,10 +585,10 @@ TEST(ContextualKeywords, CSubsetIntDeclEmitsNoContextualResolution) {
     EXPECT_FALSE(t.diagnostics().hasErrors());
 }
 
-TEST(ContextualKeywords, CSubsetConfigReloadsUnchanged) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+TEST(ContextualKeywords, CConfigReloadsUnchanged) {
+    auto loaded = GrammarSchema::loadShipped("c");
     if (!loaded.has_value()) {
-        FAIL() << "loadShipped(\"c-subset\") failed: "
+        FAIL() << "loadShipped(\"c\") failed: "
                << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
     }
     auto const& schema = **loaded;

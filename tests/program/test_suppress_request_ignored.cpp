@@ -424,7 +424,7 @@ TEST(SuppressRequestIgnored, PolicyFlagsAreRefusedInModesThatBuildNoReporter) {
     };
     for (auto const& m : kModes) {
         for (auto const* flag : kPolicyFlags) {
-            Argv a{"dss-code-prime", m.mode, "--language", "c-subset",
+            Argv a{"dss-code-prime", m.mode, "--language", "c",
                    "--target=x86_64:elf64-x86_64-linux", flag};
             auto r = parseCliArgs(a.argc(), a.argv());
             ASSERT_FALSE(r.has_value())

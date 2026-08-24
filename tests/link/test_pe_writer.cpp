@@ -470,8 +470,8 @@ constexpr std::uint8_t  kImageSymClassWeakExternal = 105;
 }
 
 // A module with one STRONG and one WEAK defined function. The weak one is the
-// `__attribute__((weak))` shape c-subset.lang.json produces
-// (examples/c-subset/attributes_syntax's `weak_helper`); `definedBinding`
+// `__attribute__((weak))` shape c.lang.json produces
+// (examples/c/attributes_syntax's `weak_helper`); `definedBinding`
 // returns Weak for it.
 [[nodiscard]] AssembledModule strongPlusWeakFunctionModule() {
     AssembledModule mod;
@@ -3558,7 +3558,7 @@ TEST(PeExecWriter, IntraModuleRel32CallAppliedByteForByte) {
 // RVA-vs-VA distinction — the .reloc entry carries an RVA, the slot value carries a VA — the
 // single highest-risk arithmetic in the cross-CU feature. It runs CROSS-PLATFORM and purely
 // in memory (no process spawn), so Linux CI catches a base-reloc regression that the
-// Windows-only `examples/c-subset/cross_cu_call` run cannot.
+// Windows-only `examples/c/cross_cu_call` run cannot.
 TEST(PeExecWriter, Abs64RodataSlotEmitsDir64BaseRelocation) {
     auto loaded = loadShippedExec();
     ASSERT_TRUE(loaded.target && loaded.format);

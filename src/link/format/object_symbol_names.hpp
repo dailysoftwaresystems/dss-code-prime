@@ -194,9 +194,9 @@ public:
     // def resolves here to Local, so it emits STB_LOCAL (name already carved to
     // `<prefix><id>` by `definedName` — this only aligns the binding). gcc keeps
     // it STB_GLOBAL + STV_HIDDEN (resolvable during a static link, hidden from
-    // the dynamic export). The c-subset CAN form a Global+Hidden symbol
+    // the dynamic export). The c CAN form a Global+Hidden symbol
     // (`__attribute__((visibility("hidden")))` on a NON-static fn -- e.g.
-    // examples/c-subset/attributes_syntax's `dead_helper`), but none is routed
+    // examples/c/attributes_syntax's `dead_helper`), but none is routed
     // to a relocatable writer LIVE: it is DCE-eliminated (an unused hidden
     // helper), or reaches an EXEC writer where `isExec` forces Global -- so the
     // Local-emission trap never fires at the ET_REL/COFF/Mach-O symtab. Closing

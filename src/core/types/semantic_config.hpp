@@ -74,7 +74,7 @@ enum class DeclarationKind : std::uint8_t {
 // declares an attribute applies to, and nothing in the engine names an
 // attribute or an effect verb.
 //
-// `Table` is spellable but unwritten by c-subset (no SQL-style table
+// `Table` is spellable but unwritten by c (no SQL-style table
 // declarations there); that is inert config of exactly the same shape as
 // `kSymbolVisibilityTable` accepting `protected`/`internal` for formats that
 // have no such visibility. The table's ORDER also fixes `name()`'s fall-back
@@ -130,7 +130,7 @@ nameMatchModeFromName(std::string_view s) noexcept {
 
 // A kind-discriminator facet: lets a single declaration shape decide its
 // effective `kind` at analysis time by inspecting a child sub-rule. Used
-// by grammars (like c-subset's `topLevelDecl`) that factor the common
+// by grammars (like c's `topLevelDecl`) that factor the common
 // prefix of variables and functions into one declaration rule and only
 // disambiguate via a trailing alt (`topLevelDeclTail = alt[funcDefTail,
 // varDeclTail]`). The structural info "funcDefTail present ⇒ Function"
@@ -144,7 +144,7 @@ nameMatchModeFromName(std::string_view s) noexcept {
 // resolve the params and body subtrees. Otherwise the DeclarationRule's
 // static `kind` field is used.
 //
-// E.g. c-subset's `topLevelDecl → [typeRef, Identifier, topLevelDeclTail]`
+// E.g. c's `topLevelDecl → [typeRef, Identifier, topLevelDeclTail]`
 // with `topLevelDeclTail → alt[funcDefTail, varDeclTail]`. The schema
 // declares:
 //   childPath: [2, 0]            → descend to topLevelDeclTail's child
@@ -426,7 +426,7 @@ struct DSS_EXPORT DeclaratorConfig {
     // unspecified-size array-suffix rule (`arrayStarSuffix`) — a prototype-form
     // VLA-parameter marker. A DISTINCT CST rule from `arraySuffixRule` so the
     // flat bound-locator / lengthChild / captureVlaSize sites are untouched.
-    // `nullopt` ⇒ the language has no `[*]` suffix (toy/tsql, and c-subset
+    // `nullopt` ⇒ the language has no `[*]` suffix (toy/tsql, and c
     // before this landed) — the declarator engine simply never matches it.
     std::optional<RuleId> arrayStarSuffixRule;
     RuleId        initDeclaratorRule{};
@@ -437,7 +437,7 @@ struct DSS_EXPORT DeclaratorConfig {
     // init-detection scans (which read the "first non-declarator visible child"
     // as the initializer) MUST skip these, else the attribute is mis-lowered as
     // the initializer value (S_TypeMismatch). EMPTY ⇒ the language declares no
-    // after-declarator attribute suffix (toy/tsql, and c-subset before this) —
+    // after-declarator attribute suffix (toy/tsql, and c before this) —
     // the scans behave exactly as before.
     std::vector<RuleId>      afterDeclaratorAttrRules;
     std::vector<std::string> afterDeclaratorAttrRuleNames;
@@ -457,7 +457,7 @@ struct DSS_EXPORT DeclaratorConfig {
     std::optional<RuleId> memberListRule;
     // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): the OPTIONAL THIRD list shape —
     // a comma-separated run of BARE `declaratorRule` nodes, with NO per-slot
-    // wrapper, NO initializer slot and NO attribute run (c-subset's
+    // wrapper, NO initializer slot and NO attribute run (c's
     // `typedefDeclaratorList`). `collectDeclarators` yields its `declaratorRule`
     // children directly. It is a SEPARATE role rather than a second spelling of
     // `listRule` because the three list shapes carry genuinely different per-slot
@@ -466,7 +466,7 @@ struct DSS_EXPORT DeclaratorConfig {
     // this one owns neither — which is exactly what keeps `typedef int T = 5;` a
     // LOUD parse error and keeps a typedef's honored trailing attribute run from
     // being swallowed by an unhonored per-slot one. `nullopt` ⇒ the language has
-    // no such list (toy/tsql, and c-subset before this) ⇒ zero behavior change.
+    // no such list (toy/tsql, and c before this) ⇒ zero behavior change.
     std::optional<RuleId> plainListRule;
     // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL, GCC 6.47.5): the OPTIONAL rule carrying an
     // explicit ASSEMBLER NAME for the declarator it follows (`int f(void)
@@ -635,7 +635,7 @@ struct DSS_EXPORT DeclarationRule {
     // token at FnSig-build time and passes `isVariadic=true` to the
     // 4-arg `TypeInterner::fnSig()` overload when present. Source-
     // language agnostic: each language declares its own marker token
-    // (c-subset: `EllipsisOp`; future Rust would declare none; etc.).
+    // (c: `EllipsisOp`; future Rust would declare none; etc.).
     // `nullopt` ⇒ the language has no variadic-marker for this
     // declaration form (the FnSig is always non-variadic).
     std::optional<SchemaTokenId> variadicMarker;
@@ -659,7 +659,7 @@ struct DSS_EXPORT DeclarationRule {
     // the resolved `LinkageAttr` is attached to the HIR Function/Global node and
     // threaded to the MirFunc/MirGlobal binding+visibility (the DCE-protect
     // input). Empty ⇒ this declaration form derives no linkage from specifiers
-    // (every shipped decl before c-subset `static` landed). Source/target/linker
+    // (every shipped decl before c `static` landed). Source/target/linker
     // agnostic: the VALUES reuse the shared `SymbolBinding`/`SymbolVisibility`
     // vocabulary; the token→effect MAP is per-language config.
     std::unordered_map<std::string, LinkageSpecifierEffect> linkageSpecifiers;
@@ -698,7 +698,7 @@ struct DSS_EXPORT DeclarationRule {
     // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE): the ATTRIBUTE SLOTS of this declaration
     // form — the rules whose DIRECT-CHILD instances on a node of this row carry
     // attribute specifiers. A declaration can decorate in several structurally
-    // distinct positions (c-subset `typedefDecl`: the `typedefDeclSpecifiers`
+    // distinct positions (c `typedefDecl`: the `typedefDeclSpecifiers`
     // prefix, plus the two `typedefAttrRun` slots that bracket the declarator),
     // and only the prefix is reachable through `specifierPrefixRule`. The
     // semantic attribute scan reads THIS list to find the others, so honoring a
@@ -768,7 +768,7 @@ struct DSS_EXPORT DeclarationRule {
     // definition WINS the binding and this non-defining declaration is absorbed
     // (its HIR ExternFunction/ExternGlobal node is suppressed). Two non-defining
     // declarations of the same name are idempotent; two definitions still collide
-    // (S_RedeclaredSymbol). Per-declaration opt-in (c-subset's `externDecl`),
+    // (S_RedeclaredSymbol). Per-declaration opt-in (c's `externDecl`),
     // source-agnostic — the engine never hardcodes a rule name. Default false ⇒
     // an ordinary defining declaration (a redeclaration collides as before).
     bool            nonDefiningDeclaration = false;
@@ -792,7 +792,7 @@ struct DSS_EXPORT DeclarationRule {
     //       symbol — ld's behavior).
     // false ⇒ the pre-c86 shape: an unabsorbed proto emits nothing and a call to
     // it fails loud at HIR→MIR (H0009 Ref to unbound symbol). Per-declaration
-    // opt-in (c-subset's `topLevelDecl` + `varDecl`), source-agnostic — the
+    // opt-in (c's `topLevelDecl` + `varDecl`), source-agnostic — the
     // engine reads only this flag, never a rule name. Internal-linkage (`static`)
     // and weak protos never synthesize (their reference must NOT bind another
     // TU's public symbol); they keep the loud H0009. Default false.
@@ -909,7 +909,7 @@ struct DSS_EXPORT DeclarationRule {
     // Ptr<element> at both resolution sites (the definitive Pass-1.5 visit that
     // binds the symbol, and the FnSig param harvest), so the bound symbol, the
     // FnSig, and every call site agree on the adjusted pointer. Only declaration
-    // forms with C parameter semantics set this (c-subset's `param` row); the
+    // forms with C parameter semantics set this (c's `param` row); the
     // engine never hard-codes "parameter". Inner array dimensions are untouched
     // (`int a[][5]` → Ptr<Array<int,5>>), and an inner ABSENT dimension still
     // fails loud via the incomplete-element-in-aggregate guard.
@@ -926,7 +926,7 @@ struct DSS_EXPORT DeclarationRule {
     // definition (it mints nothing, opens no scope, binds no tag) — it is instead
     // a pure REFERENCE, resolved through a SEPARATE `references[]` row declared on
     // the SAME grammar rule. This lets ONE grammar rule (C's unified
-    // `struct-or-union-specifier` — c-subset's `structSpec`/`unionSpec`/`enumSpec`,
+    // `struct-or-union-specifier` — c's `structSpec`/`unionSpec`/`enumSpec`,
     // shaped `Kw {opt tag} {opt body}`) serve BOTH the type-definition form
     // (`struct P { … }` — a `structBody` child present) and the bare tag-reference
     // form (`struct P` — absent), so the parser can treat it as the SOLE candidate
@@ -994,7 +994,7 @@ struct DSS_EXPORT CallRule {
     // Optional gating token kind. When set, the rule only counts as a
     // call when one of its visible children IS a token of this kind —
     // analogous to AssignmentRule's `operatorToken`. Used by languages
-    // (e.g. c-subset) whose `postfixExpr` is shared across `++`/`--`/`[]`
+    // (e.g. c) whose `postfixExpr` is shared across `++`/`--`/`[]`
     // AND call shapes; the call site is the one with `(`.
     std::optional<SchemaTokenId> operatorToken;
     std::string   ruleName;
@@ -1269,7 +1269,7 @@ struct DSS_EXPORT MemberAccessRule {
     std::uint32_t nameChild = 0;       // visible-child index of the field-name token
     bool          dereferences = false; // true ⇒ `p->x` (deref the LHS pointer first)
     // Optional gating token kind — when multiple entries share the same `rule`
-    // (e.g. c-subset's `postfixExpr` covers both `.` and `->` shapes), each
+    // (e.g. c's `postfixExpr` covers both `.` and `->` shapes), each
     // entry is distinguished by the operator token present in the node's
     // visible children. Pass 2 picks the FIRST matching entry. Parallels
     // `AssignmentRule.operatorToken` and `CallRule.operatorToken`. An ungated
@@ -1339,7 +1339,7 @@ struct DSS_EXPORT ReferenceRule {
     // is NOT an error). When `hardParents` is non-empty, an unresolved reference
     // emits S_UndeclaredIdentifier ONLY when its parent node's rule is in the
     // list; elsewhere it stays soft (sym 0, name recoverable from provenance).
-    // Empty (the default) ⇒ hard everywhere (c-subset / toy lexical resolution).
+    // Empty (the default) ⇒ hard everywhere (c / toy lexical resolution).
     // A resolvable name always binds regardless of position.
     std::vector<RuleId>      hardParents;
     std::vector<std::string> hardParentNames;   // source names, for diagnostics
@@ -1352,7 +1352,7 @@ struct DSS_EXPORT ReferenceRule {
     // (`typedef struct Pair {…} Pair;`) resolve independently. Default false —
     // every reference rule resolves Ordinary unless a language opts a
     // tag-reference rule in. Engine-generic: WHICH rule is a tag reference is
-    // per-language config (c-subset's structTypeRef/unionTypeRef/enumTypeRef),
+    // per-language config (c's structTypeRef/unionTypeRef/enumTypeRef),
     // never a hardcoded keyword.
     bool isTagReference = false;
     // D-CSUBSET-FORWARD-STRUCT-DECLARATION (c35): the composite kind this tag
@@ -1370,7 +1370,7 @@ struct DSS_EXPORT ReferenceRule {
 };
 
 // Source built-in type name → lattice type mapping. Used during
-// type-position resolution. e.g. `int` in c-subset's typeRef → I32.
+// type-position resolution. e.g. `int` in c's typeRef → I32.
 //
 // A mapping resolves to EITHER a core primitive (`core`, the common case)
 // OR a registered type-extension (`extension`, naming a `typeExtensions[]`
@@ -1387,7 +1387,7 @@ struct DSS_EXPORT BuiltinTypeMapping {
     std::optional<std::string> extension;  // language-qualified extension name, when set
     // FC3 c1 (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH): per-data-model
     // core override. `core` is the BASE mapping; a key for the ACTIVE
-    // format's `DataModel` replaces it (c-subset: long → I64, LLP64 → I32).
+    // format's `DataModel` replaces it (c: long → I64, LLP64 → I32).
     // Loader rejects unknown data-model keys + non-core values; mutually
     // exclusive with `extension` (an extension type has no width to vary).
     std::unordered_map<DataModel, TypeKind> coreByDataModel;
@@ -1412,7 +1412,7 @@ struct DSS_EXPORT BuiltinTypeMapping {
 // C 6.7.2 declares type specifiers as an order-free MULTISET: `unsigned
 // long long int` ≡ `long long unsigned int` ≡ `long unsigned long`. A
 // language whose grammar produces a specifier-keyword run in type
-// position (c-subset's `typeSpecifierSeq`) declares here which multisets
+// position (c's `typeSpecifierSeq`) declares here which multisets
 // are valid and what core type each resolves to. The ENGINE collects the
 // run's keyword token KINDS, canonicalizes (sorts) them, and looks the
 // multiset up — an undeclared combination (`unsigned float`, `short
@@ -1652,7 +1652,7 @@ struct DSS_EXPORT IntegerLiteralTypingRule {
 // and every type resolving to a FLOAT kind under every data model.
 // Languages WITHOUT the block keep the `literalTypes` token-kind core
 // exactly (toy / tsql — pinned). (D-CSUBSET-F32-CODEGEN closure: this
-// block is what flips c-subset's `1.5f` from the interim F64 pin to
+// block is what flips c's `1.5f` from the interim F64 pin to
 // its C-correct F32.)
 struct DSS_EXPORT FloatLiteralTypingRule {
     std::vector<std::string> suffixes;  // exact spellings; empty = unsuffixed
@@ -1670,7 +1670,7 @@ struct DSS_EXPORT FloatLiteralTypingRule {
 //   * `integerPromotion.minRankType` — operands of integer rank BELOW
 //     this type's rank promote to it before the conversion (C: `int`).
 //   * `integerPromotion.alsoPromote` — type names OUTSIDE the integer
-//     rank lattice that join promotion (c-subset: "char", "bool" — C
+//     rank lattice that join promotion (c: "char", "bool" — C
 //     promotes both to int; the engine never hardcodes C's view of
 //     char). Resolved per data model like every other name here.
 //   * `mixedSignedness` — closed verb for the cross-signedness rule.
@@ -1895,7 +1895,7 @@ enum class AttributeEffect : std::uint8_t {
     // other direction. GCC and clang honour `always_inline` at `-O0` because
     // their inliner always runs; DSS's does not, so the claim this verb makes is
     // stated as "exempt from the threshold wherever the inliner runs", never as
-    // "always inlined". See the `c-subset.lang.json` row, which says so in the
+    // "always inlined". See the `c.lang.json` row, which says so in the
     // config the user reads.
     AlwaysInline,
     // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD): the declared function is EXCLUDED
@@ -1933,7 +1933,7 @@ enum class AttributeEffect : std::uint8_t {
     // PROVENANCE: sqlite `src/wal.c` `# define SQLITE_NO_TSAN
     // __attribute__((no_sanitize_thread))`, guarded on the CLANG-IDENTITY
     // predefine together with `!defined(SQLITE_NO_TSAN)` — a guard DSS honestly opens,
-    // because it ships that identity predefine from `c-subset.lang.json`. Two use
+    // because it ships that identity predefine from `c.lang.json`. Two use
     // sites in `wal.c`, both `static <attr> T f(…)`: `walIndexWriteHdr` and
     // `walIndexTryHdr`.
     //
@@ -2426,7 +2426,7 @@ struct DSS_EXPORT SemanticConfig {
     std::optional<SchemaTokenId> constexprKeywordToken;
     // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the C99 6.7.4 `inline`
     // FUNCTION-specifier KEYWORD token. ONE kind carries every spelling the
-    // language declares for it (c-subset maps `inline`, `__inline` and
+    // language declares for it (c maps `inline`, `__inline` and
     // `__inline__` to a single `InlineKeyword`) — MEASURED against clang, the
     // spellings are exact synonyms, and the C99-vs-GNU89 divergence rides the
     // language mode and the `gnu_inline` attribute rather than the spelling.
@@ -2442,14 +2442,14 @@ struct DSS_EXPORT SemanticConfig {
     // definition (providing no external definition) only when every file-scope
     // declaration of the function "include[s] the inline function specifier
     // WITHOUT extern" — so `extern` beside `inline` means the opposite thing
-    // from `inline` alone. c-subset lists `ExternKeyword`. EMPTY ⇒ no
+    // from `inline` alone. c lists `ExternKeyword`. EMPTY ⇒ no
     // cancellation (a language whose `inline` has no such interaction).
     // Source-AGNOSTIC: WHICH kinds are per-language config.
     std::vector<SchemaTokenId>   inlineExternSpecifierTokens;
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): storage-class specifier TOKENS that may
     // NOT be combined with a thread-storage specifier in one declaration
     // (C11/C23 6.7.1p2 admits only `static`/`extern` beside `thread_local`;
-    // c-subset lists `RegisterKeyword` — `register` parses as an inert
+    // c lists `RegisterKeyword` — `register` parses as an inert
     // storage-class specifier, so `register thread_local int x;` must reject
     // rather than silently drop one specifier). Pass 2's
     // `validateThreadLocalDeclarator` scans the declaration's specifier
@@ -2464,7 +2464,7 @@ struct DSS_EXPORT SemanticConfig {
     std::vector<SchemaTokenId>   threadLocalIncompatibleTokens;
     // FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): the C99 6.4.2.2 predefined
     // function-name identifier spellings (`__func__` + the GNU `__FUNCTION__`
-    // alias for c-subset). Pass 1 binds, for EACH spelling, one synthetic
+    // alias for c). Pass 1 binds, for EACH spelling, one synthetic
     // SymbolRecord into a function DEFINITION's own (param/body) scope BEFORE
     // the params are visited: kind=Variable, isConst=true (SE4's const check
     // then catches `__func__ = x` / `+=` → S_ConstViolation),
@@ -2494,7 +2494,7 @@ struct DSS_EXPORT SemanticConfig {
     RuleId stdAttrRule{};           std::string stdAttrRuleName;
     RuleId attrBareStatementRule{}; std::string attrBareStatementRuleName;
     // D-CSUBSET-GNU-ATTRIBUTE-LEADING-ARG-SOUP: the attribute-ARGUMENT group rule
-    // (c-subset `attrArgs` — the balanced `( … )` holding one clause's arguments,
+    // (c `attrArgs` — the balanced `( … )` holding one clause's arguments,
     // NESTED arg groups included). `linkageFrom` flags every token reached THROUGH
     // such a node and skips the flagged ones for the linkage-specifier KEY LOOKUP,
     // so `__attribute__((format(printf,1,2)))`'s `printf`/`1`/`2` are not read as
@@ -2510,7 +2510,7 @@ struct DSS_EXPORT SemanticConfig {
     // OPTIONAL (unlike the three rules above): a language may declare an attribute
     // surface with no argument grammar at all. INVALID ⇒ no token is ever flagged
     // and the scan behaves exactly as it did before this key existed (toy/tsql, and
-    // c-subset before TF-C73) — never a silent behavior change. Source-AGNOSTIC:
+    // c before TF-C73) — never a silent behavior change. Source-AGNOSTIC:
     // WHICH rule is per-language config; the engine never names `attrArgs`.
     RuleId attributeArgRule{};      std::string attributeArgRuleName;
     std::vector<AttributeSemanticsRow> attributeEffects;
@@ -2640,7 +2640,7 @@ struct DSS_EXPORT SemanticConfig {
     // declarators (function pointers, arrays-of-pointers) stay future surface.
     std::optional<SchemaTokenId>    pointerToken;
     // c27 (D-CSUBSET-VOLATILE-POINTEE): the language's `volatile`-class qualifier
-    // token (c-subset: `VolatileKeyword`). Used by the type-position resolver's
+    // token (c: `VolatileKeyword`). Used by the type-position resolver's
     // CO-LOCATED arm (`typeRefAllowingStruct` / `castTypeRef`, where the qualifier +
     // stars are siblings of ONE node, AND the split-form head `volatile <base>`) to
     // BUILD a VolatileQual: a `volatileMarker` token BEFORE the first `pointerToken`
@@ -2653,7 +2653,7 @@ struct DSS_EXPORT SemanticConfig {
     // token name.
     std::optional<SchemaTokenId>    volatileMarker;
     // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the language's `_Atomic`-class qualifier
-    // token (c-subset: `AtomicKeyword`). The LIVE driver of the atomic type-qualifier
+    // token (c: `AtomicKeyword`). The LIVE driver of the atomic type-qualifier
     // wrap, EXACTLY parallel to `volatileMarker` above and read at the SAME two resolver
     // arms: a `atomicMarker` token BEFORE the first `pointerToken` qualifies the base
     // (innermost pointee) ⇒ wrap base via `atomicQualified` so `_Atomic int *` =
@@ -2700,7 +2700,7 @@ struct DSS_EXPORT SemanticConfig {
     // into semantic scope BEFORE Pass 2 (the `builtinFunctions` seam) so a
     // call resolves with NO inline `extern`, then synthesized as externs
     // flowing through FF5 `synthesizeFfiFromSourceDecls` like a program's
-    // own. (Pre-v0.0.2 a header here was a c-subset SOURCE `.h` parsed +
+    // own. (Pre-v0.0.2 a header here was a c SOURCE `.h` parsed +
     // tree-merged; that source-tree path is retired for shipped descriptors.)
     // Empty ⇒ the language ships no system headers (the angle form, if
     // declared, resolves nothing and hard-fails on use).
@@ -2723,7 +2723,7 @@ struct DSS_EXPORT SemanticConfig {
     // and force a known-future-split when C++ frontend lands.
     //
     // Shipped values:
-    //   * c-subset (C semantics): BOTH true (C-standard §6.3.2.3:
+    //   * c (C semantics): BOTH true (C-standard §6.3.2.3:
     //     `void*` converts implicitly to/from any object-pointer type).
     //   * (Future) c++-subset: `{implicitToVoidPtr: true,
     //     implicitFromVoidPtr: false}` — matching ISO C++ §7.11.
@@ -2750,7 +2750,7 @@ struct DSS_EXPORT SemanticConfig {
     //   * `D-LANG-VOIDPTR-ARITH-REJECT`: pointer arithmetic on void*
     //     is undefined in standard C (sizeof(void) is invalid); GCC
     //     permits it as an extension treating void as 1-byte. When
-    //     c-subset gains pointer arithmetic, the void* arm rejects by
+    //     c gains pointer arithmetic, the void* arm rejects by
     //     default; a `allowVoidPtrArithmetic: bool` opt-in field
     //     extends this struct.
     //   * `D-LANG-VOIDPTR-FN-CONVERT`: `void* ↔ fn-pointer` is
@@ -2759,7 +2759,7 @@ struct DSS_EXPORT SemanticConfig {
     //     declarators + indirect calls). LANDED: the `allowVoidPtrFnConvert`
     //     opt-in below now gates the whole fn<->void* class (Option B, the
     //     single authoritative gate) for the gcc/POSIX dlsym / Tcl ClientData
-    //     idiom; c-subset opts in, default false stays ISO-strict.
+    //     idiom; c opts in, default false stays ISO-strict.
     //   * `D-LANG-VOIDPTR-PREDICATE-GATE` (type-design analyst,
     //     step 13.2 audit fold): if a future language needs
     //     per-element-type predicates ("only T* → void* when T ∈
@@ -2814,7 +2814,7 @@ struct DSS_EXPORT SemanticConfig {
         // inert. Only C23+ declares it true (alongside
         // `nullPointerConstantFromIntegerZero`, since the `0`-form remains valid in
         // C23). nullptr→BOOL is DEFERRED (D-CSUBSET-NULLPTR-BOOL-CONVERSION): the
-        // c-subset has no scalar→bool conversion yet; nullptr in a controlling
+        // c has no scalar→bool conversion yet; nullptr in a controlling
         // expression still works via the HIR condition lowering, so nothing real is
         // lost.
         bool nullPointerConstantFromNullptrT = false;
@@ -2883,7 +2883,7 @@ struct DSS_EXPORT SemanticConfig {
         // `intPointeeSameRepresentationCompat` arg, passed true ONLY by
         // `checkCallAgainstSig` at a DIRECT callee) and by `cst_to_hir.cpp::coerce`
         // (realize — the node-mark-gated Ptr→Ptr bitcast), in lockstep. Default
-        // FALSE = strict; only c-subset opts in. The boundary stays SCOPED:
+        // FALSE = strict; only c opts in. The boundary stays SCOPED:
         // init/assign/return and the fn-pointer/indirect call paths ALL remain
         // strict, and identity is NEVER merged (a compat admission, not a
         // canonicalization — `_Generic(long:,long long:)` still distinguishes).

@@ -1,0 +1,24 @@
+{
+  "$comment": "PROJECT-MANIFEST BUILD with a preBuildScripts hook that GENERATES the source it then compiles. This is the corpus's runtime witness for the whole chain -- script spawn -> file written -> sources glob expanded -> compile -> link -> spawn -> exit code -- and every link in it is load-bearing: `sources` names NO file that exists in git, only the pattern `generated_*.c`, and Program::compileProject treats a zero-match pattern as a hard D_FileNotFound rather than an empty build. So a hook that does not run, runs in the wrong directory, or writes the wrong name cannot produce a green run. A hook that merely TOUCHED a file would prove none of that.",
+  "$commentPlatformArms": "Two arms over the closed windows/linux/darwin runOn vocabulary, producing byte-identical C. windows spawns `powershell -File gen_answer_source.ps1`; linux and darwin spawn `/bin/sh gen_answer_source.sh`. Both interpreters are argv[0] and are spawned DIRECTLY -- there is no shell in between -- so the script file travels as an ARGUMENT and needs no executable bit, which is what lets it survive the corpus runners' fs::copy_file mirroring. Each script file states its own PATH assumption for its leg.",
+  "$commentArtifactRouting": "artifactName pins the binary's base name so it does not follow the generated source's stem. Program::compileProject forces setPerFormatOutputSubdir(true), so each target's artifact lands at <output>/<formatName>/prebuild_codegen<ext> -- which is why the expected.json target entries are read with a per-format subdirectory by both runners.",
+  "language": "c",
+  "artifactProfile": "cli",
+  "artifactName": "prebuild_codegen",
+  "targets": [
+    "x86_64:pe64-x86_64-windows-exec",
+    "x86_64:elf64-x86_64-linux-exec",
+    "arm64:macho64-arm64-darwin-exec"
+  ],
+  "sources": ["generated_*.c"],
+  "preBuildScripts": [
+    {
+      "run": ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "gen_answer_source.ps1"],
+      "runOn": ["windows"]
+    },
+    {
+      "run": ["/bin/sh", "gen_answer_source.sh"],
+      "runOn": ["linux", "darwin"]
+    }
+  ]
+}

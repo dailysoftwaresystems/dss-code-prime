@@ -17,7 +17,7 @@
 // target.
 //
 // ★★ WHAT THIS FILE GUARDS THAT NOTHING ELSE CAN. The end-to-end proof lives in
-// `examples/c-subset/shipped_dirent_readdir` — it compiles and RUNS the pe64 arm,
+// `examples/c/shipped_dirent_readdir` — it compiles and RUNS the pe64 arm,
 // and it is the strongest evidence the mechanism works. But an example can only
 // witness the configuration that EXISTS. The refusals here are about
 // configurations that must never be accepted, and three of them are invisible to

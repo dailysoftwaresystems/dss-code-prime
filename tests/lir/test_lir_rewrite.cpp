@@ -33,7 +33,7 @@
 #include <vector>
 
 using namespace dss;
-using dss::test_support::lowerCSubsetToLir;
+using dss::test_support::lowerCToLir;
 
 namespace {
 
@@ -51,7 +51,7 @@ struct AllocatedLir {
 
 [[nodiscard]] AllocatedLir
 lowerAndAllocate(std::string src) {
-    AllocatedLir out{lowerCSubsetToLir(std::move(src))};
+    AllocatedLir out{lowerCToLir(std::move(src))};
     if (!out.lowered.lir.ok) return out;
     out.liveness = analyzeLiveness(out.lowered.lir.lir);
     out.alloc = allocateRegisters(out.lowered.lir.lir,
@@ -234,7 +234,7 @@ TEST(LirRewrite, ExhaustedClassEmitsLoudFailureNotSilentClobber) {
 TEST(LirRewrite, Arm64HighFprSpillScratchPoolHandlesOrdinalsBeyond64) {
     // 9 doubles → the 9th overflows v0..v7 to __stack; the materialization pressure
     // allocates an FPR up into d31 (global ordinal 64). The named `n` is an int (x0).
-    auto out = AllocatedLir{lowerCSubsetToLir(
+    auto out = AllocatedLir{lowerCToLir(
         "double sum_d(int n, ...) {\n"
         "    va_list ap; va_start(ap, n);\n"
         "    double t = 0.0;\n"
@@ -246,7 +246,7 @@ TEST(LirRewrite, Arm64HighFprSpillScratchPoolHandlesOrdinalsBeyond64) {
         "    return (int)sum_d(9, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0);\n"
         "}\n",
         "arm64", /*mirCcIndex=*/0)};
-    ASSERT_TRUE(out.lowered.lir.ok) << "arm64 c-subset → LIR failed";
+    ASSERT_TRUE(out.lowered.lir.ok) << "arm64 c → LIR failed";
     out.liveness = analyzeLiveness(out.lowered.lir.lir);
     out.alloc = allocateRegisters(out.lowered.lir.lir, *out.lowered.target,
                                   out.liveness, /*ccIndex=*/0, out.regallocRep);

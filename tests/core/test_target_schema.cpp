@@ -1832,7 +1832,7 @@ TEST(TargetSchema, ArgVrsReturnVrsParseResolveAndValidateVrClass) {
 // The macros that tell the preprocessor which CPU it is compiling for live on
 // the TARGET, next to the other per-target language-affecting semantics
 // (`charIsUnsigned`, `aggregateLayout`, `tls`, `callingConventions`) — putting
-// them on the language would force `c-subset.lang.json` to enumerate CPU
+// them on the language would force `c.lang.json` to enumerate CPU
 // architectures. Entry grammar is the SHARED parser the language loader uses.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2054,7 +2054,7 @@ TEST(TargetSchema, PredefinedMacroEntryUnknownKeyRejectedAndNamed) {
 }
 
 // The `$`-prefix carve-out inside an ENTRY (the root-key carve-out is pinned
-// separately). Both shipped targets and the shipped c-subset language put prose
+// separately). Both shipped targets and the shipped c language put prose
 // inside these rows, so without this the gate would reject them at load — the
 // inverse failure, and the one that actually fires.
 TEST(TargetSchema, PredefinedMacroEntryDollarPrefixedKeyStillAccepted) {

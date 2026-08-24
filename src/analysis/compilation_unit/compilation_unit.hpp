@@ -152,7 +152,7 @@ public:
     [[nodiscard]] std::span<Tree const>          trees()             const noexcept;
 
     // HR11: the CU's DISTINCT per-tree source-language names joined in tree
-    // order ("CSubset+TsqlSubset"); a homogeneous CU yields its one name. A
+    // order ("C+TsqlSubset"); a homogeneous CU yields its one name. A
     // best-effort informational label for downstream module / type-lattice
     // `sourceLanguage` tags — purely descriptive, never a dispatch key.
     [[nodiscard]] std::string                    compositeSourceLanguage() const;
@@ -369,7 +369,7 @@ public:
     void addInMemory(std::string source, std::string label,
                      std::shared_ptr<GrammarSchema const> schema);
 
-    // Declare a directory the c-subset import resolver searches for
+    // Declare a directory the c import resolver searches for
     // `#include "x.h"` targets (in addition to the including file's own
     // directory). The full `.dss-project.json` include-path layer is AP2's
     // job; this is the minimal hook CU4 needs. Aborts if called after finish().

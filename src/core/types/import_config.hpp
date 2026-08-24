@@ -67,7 +67,7 @@ struct DSS_EXPORT ImportConfig {
                                  // form's path-opener token. Searched on
                                  // the including file's dir + includeDirs.
     // Optional SYSTEM (angle) form's path-opener token (e.g. "HeaderStart"
-    // for c-subset's `#include <h>`). When a directive carries THIS token
+    // for c's `#include <h>`). When a directive carries THIS token
     // instead of `pathToken`, the resolver searches the SYSTEM path
     // (SemanticConfig.shippedLibDirs, the analogue of C's /usr/include)
     // and HARD-FAILS (F_ShippedHeaderNotFound) on a miss — a missing

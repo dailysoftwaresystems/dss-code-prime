@@ -12,7 +12,7 @@
 //            records an AmbiguousTypeNameCandidate on the ParseResult.
 //
 // Every shape assertion pins the EXACT subtree nesting via
-// `prettyPrintSubtree` (the house pattern from test_parser_c_subset_smoke)
+// `prettyPrintSubtree` (the house pattern from test_parser_c_smoke)
 // rather than "rule appears somewhere".
 
 #include "analysis/syntactic/parser.hpp"
@@ -38,9 +38,9 @@ using namespace dss;
 
 namespace {
 
-[[nodiscard]] ParseResult parseCSubset(std::string source,
+[[nodiscard]] ParseResult parseC(std::string source,
                                        ParserConfig config = {}) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     EXPECT_TRUE(loaded.has_value());
     auto schema = *loaded;
     auto src = SourceBuffer::fromString(std::move(source), "<cast-expr-test>");
@@ -110,7 +110,7 @@ namespace {
 // `(int)x` — the canonical keyword cast: castExpr with the type-ref and
 // the castOperand wrapping the identifier. Exact nesting pinned.
 TEST(ParserCastExpr, KeywordCastExactShape) {
-    auto r = parseCSubset("int main() { return (int)x; }");
+    auto r = parseC("int main() { return (int)x; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId cast = findFirstNodeWithRule(t, "castExpr");
@@ -131,7 +131,7 @@ TEST(ParserCastExpr, KeywordCastExactShape) {
 // `(char*)p` — pointer star in the type → triage rule 1 (not a lone
 // identifier) commits without consulting the sketch.
 TEST(ParserCastExpr, PointerCastParses) {
-    auto r = parseCSubset("int main() { return (char*)p; }");
+    auto r = parseC("int main() { return (char*)p; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId cast = findFirstNodeWithRule(t, "castExpr");
@@ -164,7 +164,7 @@ TEST(ParserCastExpr, PointerCastParses) {
 // from the type-name base, this fires instead of the cast silently re-reading as a
 // parenthesized value.
 TEST(ParserCastExpr, StructPointerCastParses) {
-    auto r = parseCSubset("int main() { return (struct S*)q; }");
+    auto r = parseC("int main() { return (struct S*)q; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId cast = findFirstNodeWithRule(t, "castExpr");
@@ -177,7 +177,7 @@ TEST(ParserCastExpr, StructPointerCastParses) {
 // cast is a constraint violation downstream (a cast target must be scalar), so this
 // pins PARSE structure only, which is precisely the tier the gap lived at.
 TEST(ParserCastExpr, SizeofAnonymousStructDefinitionParses) {
-    auto r = parseCSubset("int main() { return (int)sizeof(struct { int dummy; }); }");
+    auto r = parseC("int main() { return (int)sizeof(struct { int dummy; }); }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_NE(findFirstNodeWithRule(t, "sizeofType"), InvalidNode);
@@ -188,14 +188,14 @@ TEST(ParserCastExpr, SizeofAnonymousStructDefinitionParses) {
 
 // `(const long)v` — const-qualified keyword base.
 TEST(ParserCastExpr, ConstQualifiedCastParses) {
-    auto r = parseCSubset("int main() { return (const long)v; }");
+    auto r = parseC("int main() { return (const long)v; }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
     EXPECT_TRUE(findFirstNodeWithRule(r.tree, "castExpr").valid());
 }
 
 // `-(int)x` — prefix minus OUTSIDE the cast: unaryExpr wraps the cast.
 TEST(ParserCastExpr, PrefixMinusBindsOutsideCast) {
-    auto r = parseCSubset("int main() { return -(int)x; }");
+    auto r = parseC("int main() { return -(int)x; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId unary = findFirstNodeWithRule(t, "unaryExpr");
@@ -219,7 +219,7 @@ TEST(ParserCastExpr, PrefixMinusBindsOutsideCast) {
 // `(int)(long)x` — casts chain right-to-left: the outer castOperand
 // contains the inner castExpr.
 TEST(ParserCastExpr, NestedCastChains) {
-    auto r = parseCSubset("int main() { return (int)(long)x; }");
+    auto r = parseC("int main() { return (int)(long)x; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_EQ(countNodesWithRule(t, "castExpr"), 2u);
@@ -249,7 +249,7 @@ TEST(ParserCastExpr, NestedCastChains) {
 // `(int)x[2]` == (int)(x[2]) — postfix indexing binds INSIDE the cast
 // operand (precedence 100 ≥ the castOperand's minPrecedence 90).
 TEST(ParserCastExpr, PostfixIndexBindsInsideCast) {
-    auto r = parseCSubset("int main() { return (int)x[2]; }");
+    auto r = parseC("int main() { return (int)x[2]; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId cast = findFirstNodeWithRule(t, "castExpr");
@@ -275,7 +275,7 @@ TEST(ParserCastExpr, PostfixIndexBindsInsideCast) {
 
 // `(int)f(a)` — a call binds inside the cast operand too.
 TEST(ParserCastExpr, PostfixCallBindsInsideCast) {
-    auto r = parseCSubset("int main() { return (int)f(a); }");
+    auto r = parseC("int main() { return (int)f(a); }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId cast = findFirstNodeWithRule(t, "castExpr");
@@ -292,7 +292,7 @@ TEST(ParserCastExpr, PostfixCallBindsInsideCast) {
 // stops the cast operand: the binaryExpr's LHS operand holds the cast,
 // its RHS holds `b`.
 TEST(ParserCastExpr, BinaryPlusBindsOutsideCast) {
-    auto r = parseCSubset("int main() { return (int)a + b; }");
+    auto r = parseC("int main() { return (int)a + b; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId bin = findFirstNodeWithRule(t, "binaryExpr");
@@ -318,7 +318,7 @@ TEST(ParserCastExpr, BinaryPlusBindsOutsideCast) {
 // `(int){ 1 }` — the compound literal still wins its probe (the cast
 // probe fails structurally on `{`, which no expression operand starts).
 TEST(ParserCastExpr, CompoundLiteralStillParses) {
-    auto r = parseCSubset("int main() { int x = (int){ 1 }; return x; }");
+    auto r = parseC("int main() { int x = (int){ 1 }; return x; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(findFirstNodeWithRule(t, "compoundLiteralExpr").valid());
@@ -328,7 +328,7 @@ TEST(ParserCastExpr, CompoundLiteralStillParses) {
 // `(x)` with nothing castable after the closer — plain parenthesized
 // expression (the cast probe fails structurally: `;` starts no operand).
 TEST(ParserCastExpr, PlainParenStaysParenExpr) {
-    auto r = parseCSubset("int main() { return (x); }");
+    auto r = parseC("int main() { return (x); }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(findFirstNodeWithRule(t, "parenExpr").valid());
@@ -343,7 +343,7 @@ TEST(ParserCastExpr, PlainParenStaysParenExpr) {
 // the speculation records `a` as a type-name candidate for the cross-file oracle.
 // (Before unary `+` existed this recorded NO candidate — `+` was binary-only.)
 TEST(ParserCastExpr, ParenPlusStaysValueReadingButRecordsCandidate) {
-    auto r = parseCSubset("int main() { return (a) + b; }");
+    auto r = parseC("int main() { return (a) + b; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(findFirstNodeWithRule(t, "parenExpr").valid());
@@ -363,7 +363,7 @@ TEST(ParserCastExpr, LongCastOperandSurvivesProbeBudget) {
         expr += " + a" + std::to_string(i);
     }
     expr += ")";
-    auto r = parseCSubset("int main() { return " + expr + "; }");
+    auto r = parseC("int main() { return " + expr + "; }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
     EXPECT_TRUE(findFirstNodeWithRule(r.tree, "castExpr").valid());
 }
@@ -373,7 +373,7 @@ TEST(ParserCastExpr, LongCastOperandSurvivesProbeBudget) {
 // Rule 2: a file-scope typedef name is KNOWN TYPE → `(T)-x` commits the
 // cast (the `-x` parses as the cast operand's unary minus).
 TEST(ParserCastExpr, TypedefNameCastCommits) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "typedef int T;\n"
         "int main() { return (T)-x; }");
     auto const& t = r.tree;
@@ -398,7 +398,7 @@ TEST(ParserCastExpr, TypedefNameCastCommits) {
 // Rule 3: a local VARIABLE of the same shape is KNOWN VALUE → `(a)-b`
 // stays subtraction (parenExpr LHS, minus, b).
 TEST(ParserCastExpr, KnownValueStaysSubtraction) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "int main() { int a; return (a)-b; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
@@ -425,7 +425,7 @@ TEST(ParserCastExpr, KnownValueStaysSubtraction) {
 // operator-viable token rolls back to the value reading AND records the
 // candidate for the cross-file oracle.
 TEST(ParserCastExpr, UnknownNameWithOperatorFollowerRecordsCandidate) {
-    auto r = parseCSubset("int main() { return (q)-x; }");
+    auto r = parseC("int main() { return (q)-x; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(findFirstNodeWithRule(t, "castExpr").valid());
@@ -440,7 +440,7 @@ TEST(ParserCastExpr, UnknownNameWithOperatorFollowerRecordsCandidate) {
 // continue (`z` after `(q)` is no operator), so the CAST is the only
 // viable parse and commits; semantic later diagnoses if `q` isn't a type.
 TEST(ParserCastExpr, UnknownNameWithNonOperatorFollowerCommitsCast) {
-    auto r = parseCSubset("int main() { (q) z; }");
+    auto r = parseC("int main() { (q) z; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(findFirstNodeWithRule(t, "castExpr").valid());
@@ -450,7 +450,7 @@ TEST(ParserCastExpr, UnknownNameWithNonOperatorFollowerCommitsCast) {
 // `(T)(x)` cast-vs-call, type direction: T is a typedef → cast of the
 // parenthesized expression.
 TEST(ParserCastExpr, TypedefThenParensIsCast) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "typedef int T;\n"
         "int main() { return (T)(x); }");
     auto const& t = r.tree;
@@ -468,7 +468,7 @@ TEST(ParserCastExpr, TypedefThenParensIsCast) {
 // `(f)(x)` cast-vs-call, value direction: f is a known variable → the
 // value reading (a call shape: postfixExpr with `(` ... `)`).
 TEST(ParserCastExpr, KnownValueThenParensIsCall) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "int main() { int f; return (f)(x); }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
@@ -484,7 +484,7 @@ TEST(ParserCastExpr, KnownValueThenParensIsCall) {
 // the shadow, `(T)-1` is the VALUE reading (subtraction), exactly like
 // the analyzer's scope chain would resolve it.
 TEST(ParserCastExpr, LocalValueShadowsFileScopeTypedef) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "typedef int T;\n"
         "int main() { int T; return (T)-1; }");
     auto const& t = r.tree;
@@ -497,7 +497,7 @@ TEST(ParserCastExpr, LocalValueShadowsFileScopeTypedef) {
 // (funcDefTail opens one scope over params + body), so a param named T
 // shadows the file-scope typedef INSIDE the body.
 TEST(ParserCastExpr, ParamShadowsFileScopeTypedefInsideBody) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "typedef int T;\n"
         "int f(int T) { return (T)-1; }");
     auto const& t = r.tree;
@@ -509,7 +509,7 @@ TEST(ParserCastExpr, ParamShadowsFileScopeTypedefInsideBody) {
 // Scope exit: a shadow inside a CLOSED inner block does not leak — after
 // the block, T is the typedef again and the cast commits.
 TEST(ParserCastExpr, ShadowDiesWithItsScope) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "typedef int T;\n"
         "int main() { { int T; } return (T)-1; }");
     auto const& t = r.tree;
@@ -521,7 +521,7 @@ TEST(ParserCastExpr, ShadowDiesWithItsScope) {
 // visible at the use — `(T)-1` before the typedef line reads T as
 // unknown, follower `-` is an operator → value reading + candidate.
 TEST(ParserCastExpr, TypedefAfterUseSiteIsNotVisible) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "int main() { return (T)-1; }\n"
         "typedef int T;");
     auto const& t = r.tree;
@@ -536,7 +536,7 @@ TEST(ParserCastExpr, TypedefAfterUseSiteIsNotVisible) {
 // The global-scope TYPE export surface: typedefs + struct/union/enum
 // tags at file scope, in binding order. (The CU oracle harvests this.)
 TEST(ParserCastExpr, GlobalTypeNamesExported) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "typedef int MyT;\n"
         "struct S { int x; };\n"
         "int g;\n"
@@ -553,7 +553,7 @@ TEST(ParserCastExpr, GlobalTypeNamesExported) {
 TEST(ParserCastExpr, SeededTypeNameFlipsCandidateSiteToCast) {
     ParserConfig cfg;
     cfg.seedGlobalTypeNames.push_back("q");
-    auto r = parseCSubset("int main() { return (q)-x; }", std::move(cfg));
+    auto r = parseC("int main() { return (q)-x; }", std::move(cfg));
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(findFirstNodeWithRule(t, "castExpr").valid());
@@ -588,7 +588,7 @@ TEST(ParserCastExpr, BinderlessLanguageHasEmptySidecars) {
 // (This pins the probe snapshot/restore + record-after-rollback
 // interplay; a leak would double-count.)
 TEST(ParserCastExpr, NestedProbesYieldExactlyOneCandidate) {
-    auto r = parseCSubset("int main() { return ((q)-x); }");
+    auto r = parseC("int main() { return ((q)-x); }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
     ASSERT_EQ(r.typeNameCandidates.size(), 1u);
     EXPECT_EQ(r.typeNameCandidates[0].name, "q");
@@ -598,7 +598,7 @@ TEST(ParserCastExpr, NestedProbesYieldExactlyOneCandidate) {
 // above the `(q)` primary (wrap-in-place — the ambiguous site is
 // parsed exactly once) — still exactly one candidate.
 TEST(ParserCastExpr, ClimbChainDoesNotDuplicateCandidates) {
-    auto r = parseCSubset("int main() { return (q)-x-y; }");
+    auto r = parseC("int main() { return (q)-x-y; }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
     ASSERT_EQ(r.typeNameCandidates.size(), 1u);
     EXPECT_EQ(r.typeNameCandidates[0].name, "q");
@@ -606,7 +606,7 @@ TEST(ParserCastExpr, ClimbChainDoesNotDuplicateCandidates) {
 
 // Two genuinely distinct ambiguous sites stay two candidates.
 TEST(ParserCastExpr, TwoDistinctSitesRecordTwoCandidates) {
-    auto r = parseCSubset("int main() { return (q)-x + (r)-y; }");
+    auto r = parseC("int main() { return (q)-x + (r)-y; }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
     ASSERT_EQ(r.typeNameCandidates.size(), 2u);
     EXPECT_EQ(r.typeNameCandidates[0].name, "q");
@@ -619,7 +619,7 @@ TEST(ParserCastExpr, TwoDistinctSitesRecordTwoCandidates) {
 // (if the probe leaked or truncated state, the second `(a)-c` would
 // flip its reading).
 TEST(ParserCastExpr, RolledBackProbeLeaksNoSketchState) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "int main() { int a; int s = (a)-b; return (a)-c; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
@@ -668,7 +668,7 @@ TEST(ParserCastExpr, DeepSpeculativeCastRollsBackAndResumesCorrectly) {
     deep.append(kDepth, '(');
     deep += "x";
     deep.append(kDepth, ')');
-    auto r = parseCSubset(
+    auto r = parseC(
         "int main() { return (q)-" + deep + "-z; }");
     auto const& t = r.tree;
 
@@ -711,7 +711,7 @@ TEST(ParserCastExpr, DeepSpeculativeCastRollsBackAndResumesCorrectly) {
 // whose parenDeclarator holds the abstract `(*)` and whose fnSuffix holds
 // `(void)`.
 TEST(ParserCastExpr, AbstractFnPtrCastExactShape) {
-    auto r = parseCSubset("int main() { return (int(*)(void))p; }");
+    auto r = parseC("int main() { return (int(*)(void))p; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId cast = findFirstNodeWithRule(t, "castExpr");
@@ -747,7 +747,7 @@ TEST(ParserCastExpr, AbstractFnPtrCastExactShape) {
 // `(int(*)(int))p` — a non-void param list flows through identically; the
 // param's declHeadForParam carries `int`.
 TEST(ParserCastExpr, AbstractFnPtrCastWithIntParamParses) {
-    auto r = parseCSubset("int main() { return (int(*)(int))p; }");
+    auto r = parseC("int main() { return (int(*)(int))p; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId cast = findFirstNodeWithRule(t, "castExpr");
@@ -769,7 +769,7 @@ TEST(ParserCastExpr, AbstractFnPtrCastWithIntParamParses) {
 // `sizeof(int(*)(void))` — the SAME castTypeRef tail under sizeofType (shared
 // rule). The abstractDirectDeclarator nesting must appear below the type child.
 TEST(ParserCastExpr, AbstractFnPtrSizeofExactShape) {
-    auto r = parseCSubset("int main() { return sizeof(int(*)(void)); }");
+    auto r = parseC("int main() { return sizeof(int(*)(void)); }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId so = findFirstNodeWithRule(t, "sizeofType");
@@ -804,7 +804,7 @@ TEST(ParserCastExpr, AbstractFnPtrSizeofExactShape) {
 // the abstract fn-ptr type then the brace init. The abstractDirectDeclarator
 // must nest under the compoundLiteralExpr's castTypeRef child.
 TEST(ParserCastExpr, AbstractFnPtrCompoundLiteralParses) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "int main() { return (int(*)(void)){0} != 0; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
@@ -825,7 +825,7 @@ TEST(ParserCastExpr, AbstractFnPtrCompoundLiteralParses) {
 // abstract fn-ptr type as the second (type) argument. (`ap` is an ordinary
 // identifier operand here — parsing the TYPE arg is what this pins.)
 TEST(ParserCastExpr, AbstractFnPtrVaArgParses) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "int f(int n, ...) {\n"
         "  return va_arg(n, int(*)(void)) != 0;\n"
         "}\n");
@@ -850,7 +850,7 @@ TEST(ParserCastExpr, AbstractFnPtrVaArgParses) {
 // optional sees the closing `)` and matches nothing). Pins the cast subtree
 // EXACTLY (the tree-wide declarator count is unusable — every decl has one).
 TEST(ParserCastExpr, PointerCastTypeRefHasNoDeclaratorTail) {
-    auto r = parseCSubset("int main() { return (int*)p; }");
+    auto r = parseC("int main() { return (int*)p; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId cast = findFirstNodeWithRule(t, "castExpr");
@@ -880,7 +880,7 @@ TEST(ParserCastExpr, PointerCastTypeRefHasNoDeclaratorTail) {
 // and this flips to a (mis-parsed) castExpr. Mirrors the zext_u32_to_u64 corpus
 // example's `(c * c) * (c * c)`.
 TEST(ParserCastExpr, ParenMultiplicationIsNotAnAbstractCast) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "unsigned long long f(unsigned long long c) {\n"
         "  return (c * c) * (c * c);\n"
         "}\n");
@@ -900,7 +900,7 @@ TEST(ParserCastExpr, ParenMultiplicationIsNotAnAbstractCast) {
 // `arrayDeclSuffix` to abstractDirectDeclarator's base alt and `sizeof(b[0])`
 // flips to a (mis-typed) sizeofType. Mirrors the sizeof_value_array_dim corpus.
 TEST(ParserCastExpr, SizeofIndexValueIsNotAnAbstractArrayTypeName) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "int run() {\n"
         "  int b[8];\n"
         "  return (int)(sizeof(b) / sizeof(b[0]));\n"
@@ -915,7 +915,7 @@ TEST(ParserCastExpr, SizeofIndexValueIsNotAnAbstractArrayTypeName) {
 
 // east-const `(char const *)` stays base+const+star with no declarator tail.
 TEST(ParserCastExpr, EastConstPointerCastTypeRefHasNoDeclaratorTail) {
-    auto r = parseCSubset("int main() { return (char const *)p; }");
+    auto r = parseC("int main() { return (char const *)p; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId cast = findFirstNodeWithRule(t, "castExpr");
@@ -936,7 +936,7 @@ TEST(ParserCastExpr, EastConstPointerCastTypeRefHasNoDeclaratorTail) {
 // const/volatile rides INSIDE the layer (present only WITH a star → no
 // zero-star adjacency, the c11 ambiguity). Milestone-1 verifies the schema
 // still LOADS clean (no C_AmbiguousAlternatives — a load failure trips the
-// EXPECT_TRUE(loaded) inside parseCSubset) and the post-star qualifier PARSES.
+// EXPECT_TRUE(loaded) inside parseC) and the post-star qualifier PARSES.
 // ─────────────────────────────────────────────────────────────────────────
 
 // The frontier form: `(const u8 * const)pKey1` — a west const, a star, a POST-star
@@ -944,7 +944,7 @@ TEST(ParserCastExpr, EastConstPointerCastTypeRefHasNoDeclaratorTail) {
 // commits via triage rule 1 (the star). EXACT shape: headQualifier(const),
 // castTypeBase(u8), then a pointerLayer wrapping the star AND its ptrQualifier(const).
 TEST(ParserCastExpr, PostStarConstCastExactShape) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "typedef unsigned char u8;\n"
         "int main() { return (const u8 * const)pKey1; }\n");
     auto const& t = r.tree;
@@ -976,7 +976,7 @@ TEST(ParserCastExpr, PostStarConstCastExactShape) {
 // `(unsigned char * const)&x` — the same post-star const with a multi-word
 // keyword base (no typedef). Parses; the post-star const is in the layer.
 TEST(ParserCastExpr, PostStarConstKeywordBaseCastParses) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "int main() { unsigned char x = 0;\n"
         "             const unsigned char *p = (unsigned char * const)&x;\n"
         "             return *p; }\n");
@@ -990,7 +990,7 @@ TEST(ParserCastExpr, PostStarConstKeywordBaseCastParses) {
 // parse layer — pinned semantically in the semantic-analyzer test). Here: it PARSES
 // and the volatile lands inside the pointerLayer.
 TEST(ParserCastExpr, PostStarVolatileCastParses) {
-    auto r = parseCSubset(
+    auto r = parseC(
         "typedef unsigned int u32;\n"
         "int main() { return (u32 * volatile)p; }\n");
     auto const& t = r.tree;
@@ -1009,12 +1009,12 @@ TEST(ParserCastExpr, PostStarVolatileCastParses) {
 // Milestone-1 regression battery: the SAME castTypeRef rule must still parse the
 // PRE-c29 cast forms after the `{repeat StarOp}` → `{repeat pointerLayer}` swap.
 // If the swap re-introduced C_AmbiguousAlternatives the schema would fail to load
-// and EVERY parseCSubset here would trip its internal EXPECT_TRUE(loaded). These
+// and EVERY parseC here would trip its internal EXPECT_TRUE(loaded). These
 // pin the four shapes the prompt names as must-stay-green.
 TEST(ParserCastExpr, PostStarSwapKeepsExistingCastsParsing) {
     // (int*)x — bare pointer cast.
     {
-        auto r = parseCSubset("int main() { return (int*)x; }");
+        auto r = parseC("int main() { return (int*)x; }");
         ASSERT_FALSE(r.tree.diagnostics().hasErrors()) << "(int*)x";
         EXPECT_TRUE(findFirstNodeWithRule(r.tree, "castExpr").valid());
         // The star now nests in a pointerLayer (the shape change).
@@ -1025,13 +1025,13 @@ TEST(ParserCastExpr, PostStarSwapKeepsExistingCastsParsing) {
     }
     // (char const *)x — east-const cast (c11).
     {
-        auto r = parseCSubset("int main() { return (char const *)x; }");
+        auto r = parseC("int main() { return (char const *)x; }");
         ASSERT_FALSE(r.tree.diagnostics().hasErrors()) << "(char const *)x";
         EXPECT_TRUE(findFirstNodeWithRule(r.tree, "castExpr").valid());
     }
     // (struct S)x — struct-tag base, zero stars (no pointerLayer at all).
     {
-        auto r = parseCSubset("struct S { int a; };\n"
+        auto r = parseC("struct S { int a; };\n"
                               "int main() { struct S s; return (struct S)s.a; }");
         ASSERT_FALSE(r.tree.diagnostics().hasErrors()) << "(struct S)x";
         EXPECT_TRUE(findFirstNodeWithRule(r.tree, "castExpr").valid());
@@ -1039,7 +1039,7 @@ TEST(ParserCastExpr, PostStarSwapKeepsExistingCastsParsing) {
     // (int(*)(void))p — c26 abstract fn-ptr declarator (the abstract tail still
     // follows the (now-empty) pointerLayer repeat).
     {
-        auto r = parseCSubset("int main() { return (int(*)(void))p; }");
+        auto r = parseC("int main() { return (int(*)(void))p; }");
         ASSERT_FALSE(r.tree.diagnostics().hasErrors()) << "(int(*)(void))p";
         EXPECT_TRUE(findFirstNodeWithRule(r.tree, "castExpr").valid());
         EXPECT_TRUE(
@@ -1047,7 +1047,7 @@ TEST(ParserCastExpr, PostStarSwapKeepsExistingCastsParsing) {
     }
     // (volatile u32 **)p — c27 pre-stars volatile pointee (two pointerLayers).
     {
-        auto r = parseCSubset("typedef unsigned int u32;\n"
+        auto r = parseC("typedef unsigned int u32;\n"
                               "int main() { return (volatile u32 **)p; }");
         ASSERT_FALSE(r.tree.diagnostics().hasErrors()) << "(volatile u32 **)p";
         EXPECT_TRUE(findFirstNodeWithRule(r.tree, "castExpr").valid());

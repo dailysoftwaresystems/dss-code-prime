@@ -14,7 +14,7 @@ Arrays reach here via FILES (tus.txt / includes.txt / defines.txt, one entry per
 line — never argv) so ~185 paths can't overflow the Windows command line, and
 PowerShell never has to escape `$`/quotes through a python body.
 
-Manifest fields: language c-subset / profile cli / one target / artifactName /
+Manifest fields: language c / profile cli / one target / artifactName /
 the TU set as `sources` / the `includes` dirs / the `defines` (a defensive
 leading `-D` stripped; an empty `SQLITE_PRIVATE=` value preserved) / the
 (tcl, z) libraries as `resolveLibraries` / an optional `stackReserve`.
@@ -256,7 +256,7 @@ def main(argv=None):
     # refused outright rather than silently dropped. The four POSIX-target legs
     # declare `stackReserveBytes: 0` in legs.json precisely to mean "omit".
     manifest = {
-        "language":         "c-subset",
+        "language":         "c",
         "artifactProfile":  "cli",
         "targets":          [args.target],
         "artifactName":     args.artifact_name,

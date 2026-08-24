@@ -866,7 +866,7 @@ TEST(LirPassUtil, LiteralPoolStillSurvivesEachRebuildPassAfterTheRename) {
 // function that genuinely carries a wide literal through regalloc,
 // rewrite and callconv can.
 TEST(LirPassUtil, RealPipelineRebuildsPreserveEverySideStructureReference) {
-    auto lowered = test_support::lowerCSubsetToLir(
+    auto lowered = test_support::lowerCToLir(
         "long long f(long long x) { return x + 0x1122334455667788LL; }");
     ASSERT_TRUE(lowered.lir.ok);
     Lir const& src = lowered.lir.lir;

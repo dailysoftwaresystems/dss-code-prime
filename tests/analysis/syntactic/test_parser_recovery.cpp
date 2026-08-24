@@ -370,7 +370,7 @@ TEST(ParserRecovery, BodyCodepointsAbsorbedCleanlyOnHappyPath) {
 // stray token or routes the diagnostic to the wrong span would slip
 // through every happy-path corpus test.
 TEST(ParserRecovery, ExternTailUnexpectedTokenIsDiagnosed) {
-    auto h = loadShipped("c-subset", "extern int foo bar;");
+    auto h = loadShipped("c", "extern int foo bar;");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
@@ -429,7 +429,7 @@ namespace {
 // missing `initValue` and lets `varDeclHead` consume the `;`, the block consume
 // + scope-close its `}`, and `return undefined_thing;` parse normally.
 TEST(ParserRecovery, MissingInitializerExpressionRecoversCleanly) {
-    auto h = loadShipped("c-subset",
+    auto h = loadShipped("c",
         "int main() {\n    int x = ;\n    return undefined_thing;\n}\n");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
@@ -468,7 +468,7 @@ TEST(ParserRecovery, MissingInitializerExpressionRecoversCleanly) {
 // that the one-diagnostic-per-region suppression collapses only a CONTIGUOUS
 // recovery run, never two genuinely-distinct errors separated by clean parse.
 TEST(ParserRecovery, MissingInitDiagnosticsAreNotSuppressedAcrossCleanParse) {
-    auto h = loadShipped("c-subset",
+    auto h = loadShipped("c",
         "int main() {\n    int x = ;\n    int y = ;\n    return 0;\n}\n");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
@@ -485,7 +485,7 @@ TEST(ParserRecovery, MissingInitDiagnosticsAreNotSuppressedAcrossCleanParse) {
 // (tests/analysis/test_diagnostic_corpus.cpp): the SAME grammar-driven fix
 // (isStopPoint = schema `syncTokens` + FOLLOW; synthesize the missing
 // RuleLeaf) fires for THREE shipped grammars with no engine identity branch —
-// c-subset (`missing_init.c`, the scope-bearing block case above), toy
+// c (`missing_init.c`, the scope-bearing block case above), toy
 // (`unknown_token.toy`), and tsql-subset (`broken_select.sql`), whose goldens
 // each shed the pre-fix spurious EOF cascade. The garbage path (a non-stop-
 // point bad token still panic-scans, NOT synthesize-and-skip) is held by the

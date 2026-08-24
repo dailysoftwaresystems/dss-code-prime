@@ -210,14 +210,14 @@ namespace fs = std::filesystem;
         {"main.c",
          "int main(void) { return 42; }\n"},
         {"dep_module/.dss-project.json",
-         "{\"language\":\"c-subset\",\"sources\":[\"src/*.c\"]}\n"},
+         "{\"language\":\"c\",\"sources\":[\"src/*.c\"]}\n"},
         {"dep_module/src/lib.c",
          "int dep_answer(void) { return 7; }\n"},
         {"dep_module/data/expected.json",
          "{\"note\":\"example DATA two levels down, not the manifest\"}\n"},
     };
     static constexpr char const* kManifestBody =
-        "{\"language\":\"c-subset\",\"source\":\"main.c\",\"exitCode\":42}\n";
+        "{\"language\":\"c\",\"source\":\"main.c\",\"exitCode\":42}\n";
 
     std::string findings;
     std::size_t findingCount = 0;

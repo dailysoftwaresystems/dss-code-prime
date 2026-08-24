@@ -41,7 +41,7 @@
 //
 // ★★★ THIS FILE CAUGHT WHAT THE CORPUS EXAMPLE MISSED, AND THAT IS THE ARGUMENT
 // FOR KEEPING BOTH TIERS. ✔MEASURED 2026-08-17: the FIRST version of
-// `examples/c-subset/asm_tied_operand` used a single `"+r"` operand and stayed
+// `examples/c/asm_tied_operand` used a single `"+r"` operand and stayed
 // GREEN over a live mutant on BOTH the baseline and the release arm — under the
 // mutant the read half's `mov` targets a dead vreg emitted immediately before
 // the template, the template's result vreg starts its range right after it, the
@@ -148,7 +148,7 @@ findDefBefore(Lir const& lir, LirReg reg, LirInstId before) {
 // the one that returned rc=1 with `L_UnsupportedLoweringForOpcode` until the
 // blanket `isReadWrite` refusal was replaced by a read of `tiedOutput`.
 TEST(LirAsmTiedOperand, ReadWriteOperandBindsBothHalvesToTheOutputsRegister) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "void f(void){ int x; x = 40; __asm__(\"addl $2, %0\" : \"+r\"(x)); }",
         "x86_64");
     ASSERT_FALSE(L.model.hasErrors())
@@ -224,7 +224,7 @@ TEST(LirAsmTiedOperand, ReadWriteOperandBindsBothHalvesToTheOutputsRegister) {
 // Two source operands ⇒ TWO registers. Without this arm, ARM 1 would also pass
 // against a lowering that gave every asm operand the same register.
 TEST(LirAsmTiedOperand, UntiedOutputAndInputBindToDifferentRegisters) {
-    auto L = lowerCSubsetToLir(
+    auto L = lowerCToLir(
         "void f(void){ int x; int y; x = 40; y = 0; "
         "__asm__(\"movl %1, %0\" : \"=r\"(y) : \"r\"(x)); }",
         "x86_64");

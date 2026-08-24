@@ -18,7 +18,7 @@
 // policy, an unsuppressed abort can raise a modal dialog and block
 // indefinitely. Nothing about that is visible in a compile log, and a plain
 // exit-code assertion cannot express it — which is why the run half of this
-// fix lives in examples/c-subset/shipped_set_abort_behavior, where the runner
+// fix lives in examples/c/shipped_set_abort_behavior, where the runner
 // spawns under `kRunBudget` and a timeout is a hard failure.
 //
 // WHAT THIS FILE PINS, AND WHY IT IS THE HOST-INDEPENDENT HALF
@@ -222,12 +222,12 @@ constexpr std::int64_t kCallReportValue = 2;
                                      std::istreambuf_iterator<char>());
 }
 
-// Compile one c-subset source to one target through the real production driver.
+// Compile one c source to one target through the real production driver.
 [[nodiscard]] int buildOne(fs::path const& outDir, fs::path const& src,
                            std::string const& target, DiagnosticReporter& rep) {
     Program p;
     p.setOutputDir(outDir);
-    return p.compileFiles(std::vector<std::string>{src.string()}, "c-subset",
+    return p.compileFiles(std::vector<std::string>{src.string()}, "c",
                           std::vector<std::string>{target}, rep);
 }
 

@@ -861,7 +861,7 @@ struct DSS_EXPORT AssemblyConfig {
     std::vector<AsmInstructionSpelling> instructions;
     std::vector<AsmDirectiveSpelling>   directives;
 
-    // Label names that START A PROGRAM. ★ IT IS THE SAME FACT `c-subset.lang.json`
+    // Label names that START A PROGRAM. ★ IT IS THE SAME FACT `c.lang.json`
     // states as `semantics.declarations[].entryFunctions`, stated at a tier that
     // has no declarations: the `encode` path runs no semantic analysis, so there
     // is no declaration row for an entry SHAPE to hang off, and a `.s` label

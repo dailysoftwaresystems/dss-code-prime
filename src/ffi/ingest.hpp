@@ -29,7 +29,7 @@
 // (HirNodeId, canonicalName) extern declarations — never inspects
 // the HIR tree, never reads SemanticModel. Caller pre-resolves
 // names from whatever source language produced the externs.
-// Header-source ingest is c-subset-only today (FF2's grammar);
+// Header-source ingest is c-only today (FF2's grammar);
 // binary-source ingest is format-blind (FF1 dispatches on magic
 // bytes).
 // Target-blind: takes a TargetSchema + ObjectFormatSchema; uses FF3

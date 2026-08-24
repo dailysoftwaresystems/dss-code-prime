@@ -1,7 +1,7 @@
 // macOS-ARM64 runnable backend — host-independent byte-pins
 // (D-LK10-ENTRY-MACHO-EXIT, v0.0.3).
 //
-// The `examples/c-subset/macho_arm64_exit` corpus is the END-TO-END
+// The `examples/c/macho_arm64_exit` corpus is the END-TO-END
 // runtime proof, but it only SPAWNS on the macos-latest (= Apple
 // Silicon) CI leg. These byte-pins are the ALWAYS-ON guard: they run on
 // EVERY leg (Windows / Linux included) and regression-catch the arm64
@@ -779,7 +779,7 @@ TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
 
 // ── __TEXT,__const read-only data section (D-LK1-MACHO-EXEC-DATA-SECTIONS)
 //
-// The parallel of the ELF `.rodata` cycle: a c-subset `int answer=42;`
+// The parallel of the ELF `.rodata` cycle: a c `int answer=42;`
 // global reaches a loadable __const folded into the R+X __TEXT segment.
 // These host-independent pins run on EVERY CI leg (the runtime "exit 42"
 // proof only spawns on macos-latest).

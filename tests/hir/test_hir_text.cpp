@@ -338,7 +338,7 @@ TEST(HirText, RoundTripExternWithFfi) {
     TypeId byteP = in.pointer(in.primitive(TypeKind::Byte));
     TypeId sig = in.fnSig(std::vector<TypeId>{u64}, byteP, CallConv::CcSysV);
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId param = b.makeVarDecl(u64, 2);
     HirNodeId ext = b.makeExternFunction(sig, 1, std::vector<HirNodeId>{param});
     HirNodeId root = b.makeModule(std::vector<HirNodeId>{ext});
@@ -367,7 +367,7 @@ TEST(HirText, RoundTripVariadicFnSig) {
     TypeId sig = in.fnSig(std::vector<TypeId>{byteP, i32}, i32, CallConv::CcSysV, /*isVariadic=*/true);
     ASSERT_TRUE(in.fnIsVariadic(sig));
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId p0 = b.makeVarDecl(byteP, 2);
     HirNodeId p1 = b.makeVarDecl(i32, 3);
     HirNodeId ext = b.makeExternFunction(sig, 1, std::vector<HirNodeId>{p0, p1});
@@ -1101,7 +1101,7 @@ TEST(HirText, InlineAsmBareBarrierStillRendersAsALoneKeyword) {
     TypeId const i64 = in.primitive(TypeKind::I64);
     TypeId const sig = in.fnSig({}, i64, CallConv::CcSysV);
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm);
     HirNodeId const ret  = b.makeReturn(b.makeLiteral(i64, 0));
     HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN, ret});
@@ -1202,7 +1202,7 @@ TEST(HirText, InlineAsmDescriptorRoundTripsWithEveryField) {
                              "sentinel and cannot be produced by add()";
 
     HirLiteralPool lits;
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     std::vector<HirNodeId> const kids{b.makeRef(i64, /*symbol=*/2),
                                       b.makeRef(i64, /*symbol=*/3),
                                       b.makeRef(i64, /*symbol=*/3)};
@@ -1315,7 +1315,7 @@ TEST(HirText, InlineAsmLabelsWithNoSpellingsStillRoundTripOneGroupPerOrdinal) {
     d.labelSpellings = {{}, {}};
     std::uint32_t const handle = asmPool.add(std::move(d));
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm, InvalidType, handle);
     HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN});
     HirNodeId const root = b.makeModule(std::vector<HirNodeId>{body});
@@ -1345,7 +1345,7 @@ TEST(HirText, InlineAsmLabelsWithNoSpellingsStillRoundTripOneGroupPerOrdinal) {
 // BARRIER -- a different program. So the writer emits an explicit handle form
 // AND reports.
 TEST(HirText, InlineAsmWithNoPoolReportsRatherThanRenderingABarrier) {
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm, InvalidType, /*payload=*/4);
     HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN});
     HirNodeId const root = b.makeModule(std::vector<HirNodeId>{body});
@@ -1382,7 +1382,7 @@ TEST(HirText, InlineAsmDoesNotSwallowAFollowingGotoStatement) {
     d.templateText = "nop";          // NO flags and NO sections: the bare tail
     std::uint32_t const handle = asmPool.add(std::move(d));
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const asmN  = b.addLeaf(HirKind::InlineAsm, InvalidType, handle);
     HirNodeId const gotoN = b.makeGotoStmt(1);
     HirNodeId const lbl   = b.makeLabelStmt(1, b.makeReturn(std::nullopt));
@@ -1422,7 +1422,7 @@ TEST(HirText, InlineAsmTemplateWithANewlineStillRoundTripsByteIdentically) {
     d.templateText = "nop\n\tnop";
     std::uint32_t const handle = asmPool.add(std::move(d));
 
-    HirBuilder b{"c-subset"};
+    HirBuilder b{"c"};
     HirNodeId const asmN = b.addLeaf(HirKind::InlineAsm, InvalidType, handle);
     HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{asmN});
     HirNodeId const root = b.makeModule(std::vector<HirNodeId>{body});

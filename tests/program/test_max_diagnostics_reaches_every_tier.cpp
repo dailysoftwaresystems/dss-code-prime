@@ -81,7 +81,7 @@ constexpr std::size_t kOrdinaryLines       = 60;
 [[nodiscard]] std::string compileAndCapture(fs::path const& srcFile,
                                             DiagnosticReporter& rep) {
     Program prog;
-    (void)prog.compileFiles({srcFile.generic_string()}, "c-subset",
+    (void)prog.compileFiles({srcFile.generic_string()}, "c",
                             {"x86_64:elf64-x86_64-linux"}, rep);
     auto const notice = capNotice(rep);
     return notice ? *notice : std::string{"<NO CAP NOTICE>"};
@@ -184,7 +184,7 @@ TEST(MaxDiagnosticsReachesEveryTier, RaisedPerCodeBudgetReachesTheCompilationUni
     DiagnosticReporter rep{cfg};
 
     Program prog;
-    (void)prog.compileFiles({src.generic_string()}, "c-subset",
+    (void)prog.compileFiles({src.generic_string()}, "c",
                             {"x86_64:elf64-x86_64-linux"}, rep);
 
     std::size_t illegal = 0;

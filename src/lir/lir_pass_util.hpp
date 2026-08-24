@@ -182,7 +182,7 @@ carryInstSideData(Lir const& src, LirInstId srcInst, LirBuilder& dst);
 // DOMAIN NOTE (pre-existing, unreached — preserved byte-for-byte from the
 // pre-hoist collector): a non-FPR result class resolves through `argGprs`, so a
 // VR-class (vector) param would protect a GPR ordinal rather than its v-register.
-// Unreached by the c-subset (no vector params; AAPCS64 F128 aliases the FPR
+// Unreached by the c (no vector params; AAPCS64 F128 aliases the FPR
 // d-view). If a vector-param ABI ever ships, add its arg-vector pool arm here.
 enum class IncomingArgRegKind : std::uint8_t {
     Register,          // arrives in a physical register (ordinal below)

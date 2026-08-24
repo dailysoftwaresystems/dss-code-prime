@@ -43,15 +43,15 @@ namespace {
 // vocabulary for that (arch, runOn) pair.
 [[nodiscard]] std::vector<DeclaredArm> corpusWithConsistentEmulators() {
     return {
-        {"c-subset/a", "x86_64:elf64-x86_64-linux-exec", "linux", ""},
-        {"c-subset/a", "arm64:elf64-aarch64-linux-exec", "linux", "qemu-aarch64"},
-        {"c-subset/b", "x86_64:elf64-x86_64-linux-exec", "linux", ""},
-        {"c-subset/b", "arm64:elf64-aarch64-linux-exec", "linux", "qemu-aarch64"},
+        {"c/a", "x86_64:elf64-x86_64-linux-exec", "linux", ""},
+        {"c/a", "arm64:elf64-aarch64-linux-exec", "linux", "qemu-aarch64"},
+        {"c/b", "x86_64:elf64-x86_64-linux-exec", "linux", ""},
+        {"c/b", "arm64:elf64-aarch64-linux-exec", "linux", "qemu-aarch64"},
         // An (arch, runOn) pair for which NO emulator has ever been declared —
         // the arm64-darwin shape. The lint must stay silent here: there is no
         // emulator to name, and demanding one would be demanding a lie.
-        {"c-subset/c", "arm64:macho64-arm64-darwin-exec", "darwin", ""},
-        {"c-subset/d", "arm64:macho64-arm64-darwin-exec", "darwin", ""},
+        {"c/c", "arm64:macho64-arm64-darwin-exec", "darwin", ""},
+        {"c/d", "arm64:macho64-arm64-darwin-exec", "darwin", ""},
     };
 }
 
@@ -128,7 +128,7 @@ TEST(ArmVerdict, EveryVerdictIsAccountedForByExactlyOneReportedBucket) {
 TEST(ArmVerdictLedgerTest, TheCountsLineAccountsForEveryRecordedVerdict) {
     ArmVerdictLedger ledger;
     for (ArmVerdict const v : kAllArmVerdicts) {
-        ledger.record("c-subset/x", "spec", "baseline", v, "");
+        ledger.record("c/x", "spec", "baseline", v, "");
     }
     ASSERT_EQ(ledger.total(), dss::test_support::kArmVerdictCount);
     EXPECT_EQ(ledger.accountedCount(), ledger.total())
@@ -208,21 +208,21 @@ TEST(ArmVerdict, TheEnvironmentalSkipsAreExactlyTheMachineSuppliedOnes) {
 
 TEST(ArmVerdictLedgerTest, CountsSeparateVerifiedFromEveryFlavourOfSkip) {
     ArmVerdictLedger ledger;
-    ledger.record("c-subset/x", "spec-a", "baseline", ArmVerdict::Ran, "");
-    ledger.record("c-subset/x", "spec-a", "release",  ArmVerdict::Ran, "");
-    ledger.record("c-subset/y", "spec-b", "expect-error",
+    ledger.record("c/x", "spec-a", "baseline", ArmVerdict::Ran, "");
+    ledger.record("c/x", "spec-a", "release",  ArmVerdict::Ran, "");
+    ledger.record("c/y", "spec-b", "expect-error",
                   ArmVerdict::ExpectErrorAsserted, "");
-    ledger.record("c-subset/z", "spec-c", "baseline",
+    ledger.record("c/z", "spec-c", "baseline",
                   ArmVerdict::SkippedByRunOn, "runOn=[linux] excludes host=windows");
-    ledger.record("c-subset/z", "spec-d", "baseline",
+    ledger.record("c/z", "spec-d", "baseline",
                   ArmVerdict::SkippedNoEmulatorDeclared, "no emulator");
-    ledger.record("c-subset/z", "spec-e", "baseline",
+    ledger.record("c/z", "spec-e", "baseline",
                   ArmVerdict::SkippedEmulatorMissing, "qemu-aarch64 not on PATH");
     ledger.record("sqlite-harness/pe64-x86_64", "spec-h", "baseline",
                   ArmVerdict::SkippedBuildInputMissing, "tcl86.dll not found");
-    ledger.record("c-subset/z", "spec-f", "cli",
+    ledger.record("c/z", "spec-f", "cli",
                   ArmVerdict::NotSelectedByRunner, "first-match binding");
-    ledger.record("c-subset/w", "spec-g", "baseline", ArmVerdict::Poisoned,
+    ledger.record("c/w", "spec-g", "baseline", ArmVerdict::Poisoned,
                   "compile failed");
 
     EXPECT_EQ(ledger.total(), 9u);
@@ -241,12 +241,12 @@ TEST(ArmVerdictLedgerTest, CountsSeparateVerifiedFromEveryFlavourOfSkip) {
 // widen `environmentalSkips()` to any skip and the size assertion fails.
 TEST(ArmVerdictLedgerTest, EnvironmentalSkipsAreTheOnlyStrictModeInput) {
     ArmVerdictLedger ledger;
-    ledger.record("c-subset/x", "spec-a", "baseline", ArmVerdict::SkippedByRunOn, "a");
-    ledger.record("c-subset/x", "spec-b", "baseline",
+    ledger.record("c/x", "spec-a", "baseline", ArmVerdict::SkippedByRunOn, "a");
+    ledger.record("c/x", "spec-b", "baseline",
                   ArmVerdict::SkippedNoEmulatorDeclared, "b");
-    ledger.record("c-subset/x", "spec-c", "baseline",
+    ledger.record("c/x", "spec-c", "baseline",
                   ArmVerdict::SkippedEmulatorMissing, "qemu-aarch64 not on PATH");
-    ledger.record("c-subset/x", "spec-d", "cli", ArmVerdict::NotSelectedByRunner, "d");
+    ledger.record("c/x", "spec-d", "cli", ArmVerdict::NotSelectedByRunner, "d");
     ledger.record("sqlite-harness/pe64-x86_64", "spec-e", "baseline",
                   ArmVerdict::SkippedBuildInputMissing, "tcl86.dll not found");
 
@@ -264,8 +264,8 @@ TEST(ArmVerdictLedgerTest, EnvironmentalSkipsAreTheOnlyStrictModeInput) {
 // re-creates the conflation the ledger exists to end, so the wording is pinned.
 TEST(ArmVerdictLedgerTest, CountsLineNamesEverySkipClass) {
     ArmVerdictLedger ledger;
-    ledger.record("c-subset/x", "spec-a", "baseline", ArmVerdict::Ran, "");
-    ledger.record("c-subset/x", "spec-b", "baseline",
+    ledger.record("c/x", "spec-a", "baseline", ArmVerdict::Ran, "");
+    ledger.record("c/x", "spec-b", "baseline",
                   ArmVerdict::SkippedEmulatorMissing, "missing");
     auto const line = ledger.renderCountsLine();
     for (char const* needle : {"verified", "ran", "expect-error", "by-runOn",
@@ -282,10 +282,10 @@ TEST(ArmVerdictLedgerTest, CountsLineNamesEverySkipClass) {
 // structural filter drops only the structural rows, never the counts.
 TEST(ArmVerdictLedgerTest, SkipDetailNamesTheArmAndHonoursTheStructuralFilter) {
     ArmVerdictLedger ledger;
-    ledger.record("c-subset/x", "spec-ran", "baseline", ArmVerdict::Ran, "");
-    ledger.record("c-subset/x", "spec-runon", "baseline",
+    ledger.record("c/x", "spec-ran", "baseline", ArmVerdict::Ran, "");
+    ledger.record("c/x", "spec-runon", "baseline",
                   ArmVerdict::SkippedByRunOn, "runOn=[linux] excludes host=windows");
-    ledger.record("c-subset/x", "spec-emu", "baseline",
+    ledger.record("c/x", "spec-emu", "baseline",
                   ArmVerdict::SkippedEmulatorMissing, "qemu-aarch64 is not on PATH");
 
     auto const full = ledger.renderSkipDetail("  ", /*includeStructural=*/true);
@@ -369,11 +369,11 @@ TEST(EmulatorLint, SilentOnAConsistentCorpus) {
 // disable: delete rule (2) in `lintDeclaredEmulators` and this goes green.
 TEST(EmulatorLint, FlagsTheArmThatOmitsItsSiblingsEmulator) {
     auto arms = corpusWithConsistentEmulators();
-    arms.push_back({"c-subset/offender", "arm64:elf64-aarch64-linux-exec",
+    arms.push_back({"c/offender", "arm64:elf64-aarch64-linux-exec",
                     "linux", ""});
     auto const findings = lintDeclaredEmulators(arms);
     ASSERT_EQ(findings.size(), 1u);
-    EXPECT_EQ(findings.front().manifest, "c-subset/offender");
+    EXPECT_EQ(findings.front().manifest, "c/offender");
     EXPECT_EQ(findings.front().arch, "arm64");
     EXPECT_EQ(findings.front().runOnOs, "linux");
     // The message must NAME the emulator the arm should have declared —
@@ -388,7 +388,7 @@ TEST(EmulatorLint, FlagsTheArmThatOmitsItsSiblingsEmulator) {
 // mention, and is not conditioned on, this host.
 TEST(EmulatorLint, IsHostIndependent) {
     auto arms = corpusWithConsistentEmulators();
-    arms.push_back({"c-subset/offender", "arm64:elf64-aarch64-linux-exec",
+    arms.push_back({"c/offender", "arm64:elf64-aarch64-linux-exec",
                     "linux", ""});
     // The offending arm is arm64/linux. On an arm64 Linux host a HOST-RELATIVE
     // rule would stay silent (the arm runs natively); this one must not.
@@ -403,8 +403,8 @@ TEST(EmulatorLint, IsHostIndependent) {
 // fails with 2 findings.
 TEST(EmulatorLint, SilentWhereNoEmulatorHasEverBeenDeclaredForThePair) {
     std::vector<DeclaredArm> const arms = {
-        {"c-subset/c", "arm64:macho64-arm64-darwin-exec", "darwin", ""},
-        {"c-subset/d", "arm64:macho64-arm64-darwin-exec", "darwin", ""},
+        {"c/c", "arm64:macho64-arm64-darwin-exec", "darwin", ""},
+        {"c/d", "arm64:macho64-arm64-darwin-exec", "darwin", ""},
     };
     EXPECT_TRUE(lintDeclaredEmulators(arms).empty());
 }
@@ -413,8 +413,8 @@ TEST(EmulatorLint, SilentWhereNoEmulatorHasEverBeenDeclaredForThePair) {
 // arm what it is missing, so the ambiguity itself is the finding.
 TEST(EmulatorLint, FlagsAnAmbiguousEmulatorVocabulary) {
     std::vector<DeclaredArm> const arms = {
-        {"c-subset/a", "arm64:elf64-aarch64-linux-exec", "linux", "qemu-aarch64"},
-        {"c-subset/b", "arm64:elf64-aarch64-linux-exec", "linux", "qemu-arm64"},
+        {"c/a", "arm64:elf64-aarch64-linux-exec", "linux", "qemu-aarch64"},
+        {"c/b", "arm64:elf64-aarch64-linux-exec", "linux", "qemu-arm64"},
     };
     auto const findings = lintDeclaredEmulators(arms);
     ASSERT_EQ(findings.size(), 1u);
@@ -429,8 +429,8 @@ TEST(EmulatorLint, FlagsAnAmbiguousEmulatorVocabulary) {
 // the lint on arch alone and this reports a spurious finding for the darwin arm.
 TEST(EmulatorLint, KeysOnTheArchAndTheRunOnOsTogether) {
     std::vector<DeclaredArm> const arms = {
-        {"c-subset/a", "arm64:elf64-aarch64-linux-exec", "linux", "qemu-aarch64"},
-        {"c-subset/b", "arm64:macho64-arm64-darwin-exec", "darwin", ""},
+        {"c/a", "arm64:elf64-aarch64-linux-exec", "linux", "qemu-aarch64"},
+        {"c/b", "arm64:macho64-arm64-darwin-exec", "darwin", ""},
     };
     EXPECT_TRUE(lintDeclaredEmulators(arms).empty());
 }

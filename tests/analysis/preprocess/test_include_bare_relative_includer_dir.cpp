@@ -85,7 +85,7 @@ constexpr std::string_view kNestedName  = "h29.h";
 // in both harnesses instead of only under ctest.
 [[nodiscard]] std::shared_ptr<GrammarSchema const> const& cSubsetSchema() {
     static std::shared_ptr<GrammarSchema const> const schema = [] {
-        auto loaded = GrammarSchema::loadShipped("c-subset");
+        auto loaded = GrammarSchema::loadShipped("c");
         if (!loaded.has_value()) {
             // THROW, never `std::abort()`: abort kills the whole test
             // BINARY, so every sibling test in this executable loses its
@@ -94,7 +94,7 @@ constexpr std::string_view kNestedName  = "h29.h";
             // The rule and its measurement live in
             // tests/test_support/repo_root.hpp; it is machine-checked by
             // check-no-abort-in-tests, whose ratchet this had breached.
-            throw std::runtime_error{"loadShipped(c-subset) failed"};
+            throw std::runtime_error{"loadShipped(c) failed"};
         }
         return *loaded;
     }();
@@ -330,19 +330,19 @@ TEST(IncluderDirectory, EmbedResolvesAResourceBesideABareRelativeSource) {
 // UNPINNED. `ImportResolver` skips the QUOTE form entirely when the
 // config-selected preprocessor is enabled (the PP owns quote includes end to
 // end and already diagnosed any failure; re-reporting would double-diagnose).
-// ✔MEASURED over `src/dss-config/sources/*.lang.json`: `c-subset` is the only
+// ✔MEASURED over `src/dss-config/sources/*.lang.json`: `c` is the only
 // shipped language declaring an include directive at all, and it enables the
 // preprocessor — so the two conditions are exactly complementary and the arm
 // never runs today. A language with includes and NO preprocessor is a
 // perfectly legal config, so the arm is live code with no live caller; the
 // schema below is that caller, built by flipping ONE key of the shipped
-// c-subset document rather than by inventing a language.
+// c document rather than by inventing a language.
 [[nodiscard]] std::shared_ptr<GrammarSchema const> cSubsetWithPreprocessorOff() {
     fs::path const path =
-        dss::test::configRoot() / "sources" / "c-subset.lang.json";
+        dss::test::configRoot() / "sources" / "c.lang.json";
     std::ifstream in(path, std::ios::binary);
     if (!in) {
-        ADD_FAILURE() << "cannot read the shipped c-subset config: "
+        ADD_FAILURE() << "cannot read the shipped c config: "
                       << path.string();
         return nullptr;
     }
@@ -355,15 +355,15 @@ TEST(IncluderDirectory, EmbedResolvesAResourceBesideABareRelativeSource) {
     std::size_t const first = text.find(kOn);
     if (first == std::string::npos
         || text.find(kOn, first + kOn.size()) != std::string::npos) {
-        ADD_FAILURE() << "the shipped c-subset config no longer carries exactly "
+        ADD_FAILURE() << "the shipped c config no longer carries exactly "
                          "one `" << kOn << "` — rebind the preprocess `enabled` "
                          "key explicitly instead of by unique match";
         return nullptr;
     }
     text.replace(first, kOn.size(), "\"enabled\":             false");
-    auto loaded = GrammarSchema::loadFromText(text, "<c-subset, preprocess off>");
+    auto loaded = GrammarSchema::loadFromText(text, "<c, preprocess off>");
     if (!loaded.has_value()) {
-        ADD_FAILURE() << "loadFromText(c-subset with preprocess off) failed";
+        ADD_FAILURE() << "loadFromText(c with preprocess off) failed";
         return nullptr;
     }
     return *loaded;

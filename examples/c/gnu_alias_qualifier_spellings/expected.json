@@ -1,0 +1,33 @@
+{
+  "$comment": "D-CSUBSET-GNU-DUNDER-QUALIFIER-SPELLINGS: the GNU `__`-wrapped spellings of four qualifiers/specifiers plus `_Complex` — `__volatile__`/`__volatile` (== `volatile`), `__const__`/`__const` (== `const`), `__signed__`/`__signed` (== `signed`), `__restrict__`/`__restrict` (== `restrict`) and `__complex__`/`__complex` (== `_Complex`) — as keyword-table ALIASES onto five EXISTING token kinds. No new semantics, no new grammar, zero C++. ALL TEN spellings are load-bearing (see main.c's per-spelling map), so deleting any ONE keyword row makes this example fail to COMPILE. ★ IT IS ALSO RED ON A *WRONG* ALIAS FOR THREE OF THE FIVE KINDS, and which three is MEASURED (each row's `kind` swapped to a plausible neighbour in a scratch DSS_CONFIG_ROOT copy, then rebuilt and RE-RUN): `__signed__`→UnsignedKeyword compiles and exits 35 (arm 3's 8-bit signed wrap: -126/-55 become 130/201); `__complex__`→ImaginaryKeyword fails to compile; `__volatile__`→ConstKeyword fails to compile, via arm 1's `__asm__ __volatile__` slot which names VolatileKeyword specifically. ★ THE OTHER TWO ARE INVISIBLE HERE AND THAT IS WHY THE SEMANTIC PINS EXIST: `__const__`→VolatileKeyword and `__restrict__`→ConstKeyword both still compile and STILL EXIT 42 — const-ness and restrict-ness have no portable value observable, so a silently un-const object computes the same numbers. Those two are pinned in tests/analysis/semantic/test_semantic_analyzer_c.cpp (the `isConst` flag + S_ConstViolation on assignment; and for restrict, being REFUSED in declaration-head position exactly as ISO `restrict` is — which is what separates it from Const/Volatile/Atomic/Signed/Complex, all of which ARE accepted there), and those pins DID go red on these mis-keys when exercised. Neither surface alone is proof of the whole set. Arm 1 also exercises `__asm__ __volatile__ (\"\")`, the GNU qualifier in `asmStmt`'s optional slot, which is the `__volatile__` half of D-CSUBSET-INLINE-ASM-SPELLING; bare `asm` and the `:` operand list stay open. ANTI-FOLD: every value descends from `argc`, a runtime argument, so nothing is const-folded before the program runs, in the release pipeline either. Six independent arms worth 7 each → a failing arm drops the exit BELOW 42, so a wrong value is as red as a crash. Data-model-INDEPENDENT (only int / signed char / float / double — no `long`), so the one exit code holds on all four targets and on the shipped release pipeline. Its ISO-spelling siblings are examples/c/c99_complex (complex) and the volatile/restrict coverage in the semantic suite.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

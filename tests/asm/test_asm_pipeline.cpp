@@ -1,7 +1,7 @@
 // End-to-end LIR → bytes pipeline integration test (plan 13 AS6).
 //
-// Lowers a c-subset snippet through the full pipeline:
-//   c-subset source → HIR → MIR → LIR → legalize → assemble
+// Lowers a c snippet through the full pipeline:
+//   c source → HIR → MIR → LIR → legalize → assemble
 // and pins the substrate-level invariants the assembler ships:
 //   * AssembledModule.functions parallel-indexes with lir.funcAt(i)
 //   * AssembledFunction.symbol carries lir.funcSymbol(fn)
@@ -58,8 +58,8 @@ assembleEndToEnd(test_support::LoweredLir& lowered,
 
 } // namespace
 
-TEST(AsmPipeline, CSubsetTrivialFunctionAssemblesEndToEnd) {
-    auto lowered = test_support::lowerCSubsetToLir(
+TEST(AsmPipeline, CTrivialFunctionAssemblesEndToEnd) {
+    auto lowered = test_support::lowerCToLir(
         "int f(int x) { return x; }");
     ASSERT_TRUE(lowered.lir.ok);
 
@@ -72,7 +72,7 @@ TEST(AsmPipeline, CSubsetTrivialFunctionAssemblesEndToEnd) {
 }
 
 TEST(AsmPipeline, AssembledFunctionSymbolMatchesLirFunc) {
-    auto lowered = test_support::lowerCSubsetToLir(
+    auto lowered = test_support::lowerCToLir(
         "int f(int x) { return x; }");
     ASSERT_TRUE(lowered.lir.ok);
 
@@ -99,7 +99,7 @@ TEST(AsmPipeline, SourceMapByteOffsetsMonotonic) {
     // monotonically non-decreasing AND the final byteOffset must
     // be < bytes.size() (every entry points AT a real instruction,
     // never past the end).
-    auto lowered = test_support::lowerCSubsetToLir(
+    auto lowered = test_support::lowerCToLir(
         "int f(int x) { return x; }");
     ASSERT_TRUE(lowered.lir.ok);
 
@@ -151,7 +151,7 @@ TEST(AsmPipeline, LirToMirSizeMismatchEmitsDiagnostic) {
     // BEFORE the walker loop runs, returning an empty `functions[]`
     // so the parallel-index invariant is broken on purpose
     // (`ok() == false`).
-    auto lowered = test_support::lowerCSubsetToLir(
+    auto lowered = test_support::lowerCToLir(
         "int f(int x) { return x; }");
     ASSERT_TRUE(lowered.lir.ok);
     DiagnosticReporter prep;
@@ -179,7 +179,7 @@ TEST(AsmPipeline, AllRelocationsResolveToDeclaredKinds) {
     // This test guards against an assembler regression that
     // fabricates a kind tag not declared in the target's
     // relocations[] table.
-    auto lowered = test_support::lowerCSubsetToLir(
+    auto lowered = test_support::lowerCToLir(
         "int f(int x) { return x; }");
     ASSERT_TRUE(lowered.lir.ok);
 

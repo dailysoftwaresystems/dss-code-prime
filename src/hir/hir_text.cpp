@@ -3564,7 +3564,7 @@ private:
                 //
                 // ⓘ WHETHER THE NAMED KIND IS AN INTEGER IS NOT DECIDED HERE. The
                 // semantic tier already owns that rule (`S_InvalidEnumUnderlyingType`,
-                // c-subset.lang.json's `enumUnderlyingType`); re-deciding it in the
+                // c.lang.json's `enumUnderlyingType`); re-deciding it in the
                 // text reader would be a second owner of one fact, which is the
                 // defect this whole file has been closing.
                 std::string const n = takeIdent();

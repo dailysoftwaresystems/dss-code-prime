@@ -54,7 +54,7 @@ dss_add_test(NAME core/test_decl_prefix_strip   SOURCES test_decl_prefix_strip.c
 dss_add_test(NAME core/test_tree_visitor        SOURCES test_tree_visitor.cpp)
 dss_add_test(NAME core/test_tree_attrs          SOURCES test_tree_attrs.cpp)
 dss_add_test(NAME core/test_tree_end_to_end     SOURCES test_tree_end_to_end.cpp)
-dss_add_test(NAME core/test_c_subset            SOURCES test_c_subset.cpp)
+dss_add_test(NAME core/test_c            SOURCES test_c.cpp)
 dss_add_test(NAME core/test_operator_table      SOURCES test_operator_table.cpp)
 dss_add_test(NAME core/test_schema_cursor       SOURCES test_schema_cursor.cpp)
 dss_add_test(NAME core/test_schema_walker       SOURCES test_schema_walker.cpp)
@@ -70,7 +70,7 @@ dss_add_test(NAME core/test_sha256              SOURCES test_sha256.cpp)
 # host schema built inside the test and reaches the shipped
 # `sources/asm.lang.json` through it, so the "asm language is REUSED, zero new
 # grammar rules" property has a standing guard that does not depend on
-# c-subset — its only real consumer today. Links nlohmann_json because the test
+# c — its only real consumer today. Links nlohmann_json because the test
 # reads its OWN host document back to prove the host declares none of the rules
 # it inherits (a hand-copied list would rot into a tautology).
 dss_add_test(NAME core/test_language_references  SOURCES test_language_references.cpp)

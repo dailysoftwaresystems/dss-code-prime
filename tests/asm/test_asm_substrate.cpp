@@ -43,7 +43,7 @@
 #include <vector>
 
 using namespace dss;
-using dss::test_support::lowerCSubsetToLir;
+using dss::test_support::lowerCToLir;
 using dss::test_support::asm_::countDiagnostics;
 
 // ── Substrate surface: `assemble()` over an empty module ──────────────
@@ -441,14 +441,14 @@ TEST(AsmSubstrate, AssembledModuleOkIsParallelIndexShapeCheck) {
 // ── Substrate surface: cycle-1 fail-loud diagnostics ──────────────────
 
 TEST(AsmSubstrate, EveryUnencodedInstFiresNoEncodingDiagnostic) {
-    // Lower a trivial c-subset function all the way to LIR. The
+    // Lower a trivial c function all the way to LIR. The
     // shipped x86_64.target.json declares `encoding` for `mov` and
     // `ret` (AS2 cycle 2 scope); the remaining opcodes the LIR uses
     // (`add` / `jmp` / `call` / etc.) still have no encoding row,
     // so the assembler fires `A_NoEncodingDeclared` for them. The
     // parallel-index discipline must remain — every LIR function
     // produces a slot regardless of per-inst failure.
-    auto bundle = lowerCSubsetToLir("int f(int x) { return x; }");
+    auto bundle = lowerCToLir("int f(int x) { return x; }");
     ASSERT_TRUE(bundle.lir.ok);
     Lir const& lir = bundle.lir.lir;
 
@@ -498,7 +498,7 @@ TEST(AsmSubstrate, LirToMirSizeMismatchFailsLoud) {
     // a 1-entry span against an N-instruction module emits
     // A_LirToMirSizeMismatch and returns an empty module with
     // ok() == false.
-    auto bundle = lowerCSubsetToLir("int f(int x) { return x; }");
+    auto bundle = lowerCToLir("int f(int x) { return x; }");
     ASSERT_TRUE(bundle.lir.ok);
     Lir const& lir = bundle.lir.lir;
     ASSERT_GT(lir.instCount(), 1u) << "fixture must have multiple insts";
@@ -1069,12 +1069,12 @@ TEST(AsmDiagnostics, AnNibbleRendersAsLetterA) {
 // ── D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: encoder unit pins ──────────
 //
 // `lowerMirGlobalsToDataItems` encodes const-init aggregate globals to
-// `.rodata` bytes via the recursive `encodeAggregateValue`. The c-subset
+// `.rodata` bytes via the recursive `encodeAggregateValue`. The c
 // corpus `struct_body_top_level` is the end-to-end RUNTIME witness for the
 // encoder shapes a C source can REACH; these pins cover the shapes it cannot:
 // the short-init zero-fill (HIR pre-normalizes omitted slots into a FULL
 // positional field list, so the encoder never receives a short aggregate from
-// c-subset) and the fail-loud arms (over-long init, an exotic-float leaf, an
+// c) and the fail-loud arms (over-long init, an exotic-float leaf, an
 // absent aggregate-layout). They build the `MirAggregateValue` shape DIRECTLY
 // — §A.5(b): an unconsumed substrate path is latent unless the test constructs
 // the consuming shape itself, not waits for a real consumer. Each pin is
@@ -1640,7 +1640,7 @@ TEST(AsmAggregateGlobal, BitFieldUnionInitPacksFirstMemberByteExact) {
     EXPECT_EQ(r.items[0].bytes, expect);
 }
 
-// SHORT-init zero-fill — the path c-subset cannot reach (HIR delivers a full
+// SHORT-init zero-fill — the path c cannot reach (HIR delivers a full
 // field list). A {I32,I32,I32} with ONLY field 0 provided must encode field 0
 // then ZERO the trailing 8 bytes (the layout-sized, pre-zeroed buffer).
 // Red-on-disable: the trailing zeros come from the layout-sized pre-zero, so the
@@ -1741,7 +1741,7 @@ TEST(AsmAggregateGlobal, MissingAggregateLayoutFailsLoud) {
 // the always-on guards, independent of whether a pe/darwin corpus arm runs on the
 // host executing this suite. The runtime twins are
 // `tests/mir/test_overlap_struct_zero_init.cpp` (MIR tier) and
-// `examples/c-subset/overlap_struct_zero_init/` (end-to-end).
+// `examples/c/overlap_struct_zero_init/` (end-to-end).
 //
 // Two further pins guard the machinery the three outcomes rest on, each covering
 // code this cycle introduced and nothing else reaches: the `-0.0` arm of the new

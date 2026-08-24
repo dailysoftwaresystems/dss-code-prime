@@ -360,7 +360,7 @@ TEST(OperatorTable, DuplicateOperatorEntryIsError) {
 }
 
 // Same lexeme in two groups with DIFFERENT arities is fine — the
-// (id, arity) key is unique. This is the `-` case in c-subset.
+// (id, arity) key is unique. This is the `-` case in c.
 TEST(OperatorTable, SameLexemeDifferentArityIsNotADuplicate) {
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 2,
@@ -795,11 +795,11 @@ TEST(OperatorTableEndsAtBodyRule, BodyRuleReferencesUndefinedShape) {
 // 08.55 reads from each `expr.wrapperRules` block (no hardcoded names
 // anywhere in the engine).
 TEST(OperatorTableEndsAtBodyRule, WalkerWrapperNamesDoNotTripValidation) {
-    // Loading c-subset exercises the wrappers (the c-subset operator
+    // Loading c exercises the wrappers (the c operator
     // table declares prefix/infix/postfix groups, and its `expression`
     // shape declares `wrapperRules: { binary, unary, postfix }`).
     // Clean load = walker wrappers correctly skipped.
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value())
         << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
 }
@@ -809,8 +809,8 @@ TEST(OperatorTableEndsAtBodyRule, WalkerWrapperNamesDoNotTripValidation) {
 // operator is a simple (non-delimited) postfix or infix/prefix.
 // Pinned at the type level via `std::optional` — this test pins
 // the runtime invariant on a real loaded config.
-TEST(OperatorTableEndsAtBodyRule, GroupedPostfixInvariantHoldsOnCSubset) {
-    auto loaded = GrammarSchema::loadShipped("c-subset");
+TEST(OperatorTableEndsAtBodyRule, GroupedPostfixInvariantHoldsOnC) {
+    auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
 

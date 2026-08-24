@@ -1,0 +1,40 @@
+{
+  "$comment": "D-CODEGEN-FTS3-UNICODE61-TOKENIZER-END-OFFSET-OFF-BY-ONE — the runtime witness for a `do { CAPTURE; ADVANCE; } while (COND)` loop whose capture must LAG the cursor by one step and is read AFTER the loop. This is sqlite's fts3 unicode61 tokenizer reduced (ext/fts3/fts3_unicode.c unicodeNext). ✔MEASURED 2026-08-07: DSS release returned the CURSOR's value instead of the CAPTURE's, so the first token of \"abc\\x01xyz\" came back with end offset 4 instead of 3 — fts3 and fts5 then disagreed and upstream's fts5tok2.test failed at its first input. gcc -O0/-O2 correct, DSS --config=debug correct, DSS --config=release WRONG. ★ ROOT CAUSE was in SSA DESTRUCTION, not in any optimizer pass: `mir_to_lir.cpp` emitted a phi's edge copies in the PREDECESSOR for EVERY successor, so a two-successor block wrote the phi register even on the arm it did not take — the lost-copy problem on a critical edge [[D-LIR-PHI-COPY-ON-CRITICAL-EDGE]]. ⚠ A pass-drop bisect pointed at Mem2Reg and that was a MISREADING of a correct experiment: dropping Mem2Reg removes SSA promotion, hence the phi, hence the phi-copy — 'removing pass X fixes it' means X CREATES THE CONDITION, not that X is wrong. ★ THE `release` ARM IS THE POINT OF THIS EXAMPLE, not decoration: the BASELINE (debug) arm was already correct while the bug shipped, so an example without a release arm would have passed over it in silence — which is exactly what the rest of the corpus did. ⚠ Of 565 examples exactly ONE used do/while before this (nonmain_dowhile_inf_return: `do { return 7; } while(1)`), which has no loop-carried variable and a CONSTANT-TRUE condition — a shape measured CORRECT. The defect needs a real bottom test AND a lagging capture. exitCode 42 = every shape agreed; any other exit code is a BITMASK naming which one broke (1 = lag_int, 2 = lag_two's return, 4 = lag_two's out-param, 8 = the pointer/tokenizer shape), so a failure identifies the shape instead of reporting an anonymous wrong number.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

@@ -28,7 +28,7 @@
 // are NOT per-language source files; they are a NEUTRAL JSON descriptor read
 // by this UNIVERSAL reader. The user-facing UX is unchanged and C-faithful —
 // `#include <stdio.h>` still works — but the on-disk shipped artifact is a
-// language-agnostic schema, not a c-subset `.h`.
+// language-agnostic schema, not a c `.h`.
 //
 // Shape (`stdio.json`):
 //   { "header": "stdio.h", "standard": "c89",
@@ -439,7 +439,7 @@ struct DSS_EXPORT ShippedField {
 // One decoded STRUCT — the neutral form of a header's `struct tag { … };` with
 // NAMED fields (e.g. `struct timeval { i64 tv_sec; i64 tv_usec; }`). The semantic
 // phase interns the struct type and injects the tag into the TAG namespace plus a
-// field scope, so c-subset `struct tag v; v.field` resolves AND lays out at the
+// field scope, so c `struct tag v; v.field` resolves AND lays out at the
 // ABI offsets the layout engine DERIVES from the field sizes (the descriptor
 // declares names + types only — never explicit offsets). `typeId` is the interned
 // struct type (its identity is the name + positional field types).
@@ -569,7 +569,7 @@ struct DSS_EXPORT ShippedLibDescriptor {
 // distinction is worth keeping because it decides the next case. `pe/` organizes:
 // the realization KEY owns which format uses a body, the PATH owns which file,
 // and nothing is derived from the segment — a disagreement would be confusing,
-// not wrong. A LANGUAGE segment (`c-subset/`) would be semantic: it would compete
+// not wrong. A LANGUAGE segment (`c/`) would be semantic: it would compete
 // with the extension for HOW the file is compiled, and the moment it won, a
 // `foo.c` under `toy/` would compile as toy. It is therefore absent.
 // ⚠ The one case that would genuinely need a language axis is real and is NOT

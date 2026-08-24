@@ -4,7 +4,7 @@
 // SynchronousExecutor, so the parse+analyze worker runs inline before the
 // next message is read (deterministic, no sleeps).
 //
-// Documents use the shipped c-subset grammar (functions + locals + calls),
+// Documents use the shipped c grammar (functions + locals + calls),
 // resolved by the `.c` URI extension via the SchemaCache.
 //
 // Tests use STRICT asserts — exact counts and ranges where the source
@@ -38,7 +38,7 @@ using json = nlohmann::json;
 
 namespace {
 
-// A c-subset document with: a global function `add`, a `main` with a local
+// A c document with: a global function `add`, a `main` with a local
 // `x` declared and used, and a call to `add`. Positions are chosen so the
 // tests can point at exact tokens.
 //
@@ -332,8 +332,8 @@ TEST(LspSemantic, SignatureHelpReturnsExactCalleeSignature) {
 TEST(LspSemantic, StaleSetSemanticModelIsDropped) {
     using dss::sem_test::buildShippedUnit;
 
-    auto cuOld = buildShippedUnit("c-subset", {"int x;\n"});
-    auto cuNew = buildShippedUnit("c-subset", {"int x;\n"});
+    auto cuOld = buildShippedUnit("c", {"int x;\n"});
+    auto cuNew = buildShippedUnit("c", {"int x;\n"});
     auto modelOld = std::make_shared<dss::SemanticModel const>(
         dss::analyze(cuOld, dss::DiagnosticBudget::libraryDefault()));
     auto modelNew = std::make_shared<dss::SemanticModel const>(
@@ -357,7 +357,7 @@ TEST(LspSemantic, StaleSetSemanticModelIsDropped) {
         << "stale setSemanticModel must NOT overwrite the stored model";
 }
 
-// SE7 diagnostic union: didOpen of a c-subset doc containing a
+// SE7 diagnostic union: didOpen of a c doc containing a
 // const-violation triggers the analyzer + publishes the resulting
 // S_ConstViolation in textDocument/publishDiagnostics with the correct
 // code string. Confirms the analyzer-side semantic diagnostics survive

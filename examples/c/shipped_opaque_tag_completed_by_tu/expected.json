@@ -1,0 +1,36 @@
+{
+  "$comment": "[[D-FFI-OPAQUE-TAG-HAS-NO-SPELLING]] closed 2026-08-18 — the runnable witness that a translation unit may COMPLETE a struct tag a shipped descriptor declares OPAQUE, which is ordinary C and the entire point of an opaque handle. ★★★ THE DEFECT: DSS REFUSED IT, with `F_ShippedTypeIdentityConflict`, because the descriptor vocabulary had NO SPELLING for an opaque tag and an EMPTY NAMED STRUCT `struct \"DIR\" {}` was standing in for one. `type_interner.hpp` is explicit that this is not the same thing — `isIncompleteComposite` is documented as \"An EXPLICIT flag, NOT 'operands empty': `struct E {}` is a LEGAL COMPLETE zero-field struct (size 0)\" — so the engine compared a COMPLETE 0-byte layout against the TU's and called the difference a conflict, while `dirent.json` and `stdio.json` prose called the very same types OPAQUE and INCOMPLETE. The comment recorded the full fact; the code used half of it. ✔MEASURED before the fix, one TU per case, DSS pe64 against `x86_64-w64-mingw32-gcc -std=c2x -pedantic`: completing `DIR` and completing `FILE` were both `rc=1 F_ShippedTypeIdentityConflict` on DSS and `rc=0 clean` on the reference, while forward-declare-only, both reverse-direction orders (TU forward-declares a tag the descriptor ships COMPLETE), and an unrelated-tag control were already clean on both. Only COMPLETION tripped it. ★★ WHY BOTH TAGS ARE IN ONE FILE: `DIR` is completed — the shape a private windirent-style shim uses — and `FILE` is left opaque and used only through a pointer, the shape every ordinary program uses. A fix that accepted the completion but broke the pointer, or the reverse, passes neither half. ⛔ ONE ASSERTION WAS WRITTEN, MEASURED, AND DELETED, and the omission is recorded at the omission site rather than silently dropped: `DIR *p = &myDir; assert(p == viaTag)` would claim the descriptor's `DIR` typedef names THIS completed tag. ✔The reference says otherwise — mingw emits `warning: initialization of 'DIR *' from incompatible pointer type 'struct DIR *'`, because mingw's `DIR` typedefs its OWN struct and glibc's is `typedef struct __dirstream DIR`; in both, a user's `struct DIR` is an UNRELATED type. Pinning that equality would have made this example assert a DSS-only behaviour and call it conformance. The underlying divergence — DSS names the opaque tag `DIR` where every reference uses a reserved-namespace tag a user is not expected to define — is carried by [[D-FFI-OPAQUE-TAG-USES-A-USER-REACHABLE-NAME]], not papered over here. ⚠ WHAT THIS FILE DOES NOT CLAIM: nothing here calls `opendir`, so it asserts no runtime relationship between the shipped handle and this struct. The property under test is a TYPE-SYSTEM one — the completion is accepted and its members are addressable at the offsets THIS TU declared — so every read goes through the completed type. ⚠ `seed` is `volatile` so the release arm cannot fold the arithmetic to a constant and stop exercising the member offsets it exists to check. ✔THE REFERENCE AGREES END TO END: `-std=c2x -Wall` gives ZERO diagnostics, stdout `opaque-tag-completed`, exit 42. ★ RED-ON-DISABLE: neutralise the semantic arm (`if (false && in.isIncompleteComposite(ad.shipped))`) and rebuild — the completion returns to `rc=1 error[F_ShippedTypeIdentityConflict] ... declares tag 'DIR' (0 bytes / align 1) but this translation unit declares the SAME tag as a DIFFERENT layout (12 bytes / align 4)`, with the subject binary's mtime verified changed so the mutant is known to have compiled in. Equally, reverting the `hir_text.cpp` renderer to emit `{}` for an incomplete composite makes an opaque tag reintern as a COMPLETE zero-byte type — the same silent-drop class the neighbouring ` packed` marker exists to prevent.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "opaque-tag-completed\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "expectedStdout": "opaque-tag-completed\n",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "expectedStdout": "opaque-tag-completed\n",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "expectedStdout": "opaque-tag-completed\n",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

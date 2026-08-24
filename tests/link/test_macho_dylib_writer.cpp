@@ -913,7 +913,7 @@ TEST(MachoExecSourceExternSlot,
     Program            prog;
     DiagnosticReporter rep;
     prog.setOutputDir(outDir);
-    int const rc = prog.compileFiles({src.generic_string()}, "c-subset",
+    int const rc = prog.compileFiles({src.generic_string()}, "c",
                                      {"arm64:macho64-arm64-darwin-exec"}, rep);
     std::ostringstream diag;
     for (auto const& d : rep.all()) diag << "\n  " << d.actual;

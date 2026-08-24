@@ -209,7 +209,7 @@ function(dss_smoke_compile out_rc out_text)
     execute_process(
         COMMAND ${_env} "${_installed_exe}"
                 --compile hello.c
-                --language c-subset
+                --language c
                 --target "${DSS_SMOKE_TARGET_SPEC}"
                 --output "${_out}"
         WORKING_DIRECTORY "${A_CWD}"
@@ -311,7 +311,7 @@ file(MAKE_DIRECTORY "${_decoy}/src" "${_decoy_work}")
 file(COPY "${_installed_config}" DESTINATION "${_decoy}/src")
 file(WRITE "${_decoy}/VERSION" "${_decoy_version}\n")
 file(COPY "${_work}/hello.c" DESTINATION "${_decoy_work}")
-if(NOT EXISTS "${_decoy}/src/dss-config/sources/c-subset.lang.json")
+if(NOT EXISTS "${_decoy}/src/dss-config/sources/c.lang.json")
     message(FATAL_ERROR
         "install smoke: the decoy tree was not planted, so the precedence "
         "control below would pass vacuously.")

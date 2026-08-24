@@ -19,7 +19,7 @@
 // constant-fold, which has no CST) can still carry literal values. This is the
 // store HR7's reserved inline-`.dsshir`-value syntax and MIR/codegen read from.
 //
-// The variant covers the c-subset literal surface (bool / signed / unsigned /
+// The variant covers the c literal surface (bool / signed / unsigned /
 // floating / string). A char literal is stored as its decoded codepoint in the
 // `uint64_t` arm; a string literal's decoded bytes (escapes resolved, NOT
 // NUL-terminated — the NUL is implied by the Array<Char,N+1> type) live in the

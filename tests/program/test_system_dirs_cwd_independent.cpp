@@ -114,7 +114,7 @@ CompileOutcome compileOne(fs::path const& src, fs::path const& outDir) {
     p.setOutputDir(outDir);
     DiagnosticReporter rep;
     CompileOutcome out;
-    out.rc = p.compileFiles(std::vector<std::string>{src.string()}, "c-subset",
+    out.rc = p.compileFiles(std::vector<std::string>{src.string()}, "c",
                             std::vector<std::string>{kTarget}, rep);
     out.shippedHeaderMisses =
         countCode(rep, DiagnosticCode::F_ShippedHeaderNotFound);

@@ -7,7 +7,7 @@
 // command line, and nothing else is a substitute: a test that hands the program a
 // re-typed `argv` vector, or that only checks the emitted bytes, is testing
 // something the OS is not involved in. The examples runner has NO argv-passing
-// knob — every example is spawned with no arguments — so `examples/c-subset/
+// knob — every example is spawned with no arguments — so `examples/c/
 // main_argc_argv` can only ever witness `argc == 1`. Passing REAL arguments needs
 // a test that owns the spawn, which is this one.
 //
@@ -77,7 +77,7 @@ constexpr char const* kEchoArgvSource =
     }
     scratch.useAsCwd();
     Program prog;
-    int const rc = prog.compileFiles({src.generic_string()}, "c-subset",
+    int const rc = prog.compileFiles({src.generic_string()}, "c",
                                      {"x86_64:pe64-x86_64-windows-exec"});
     if (rc != 0) return {};
     return scratch.path() / "target" / "pe64-x86_64-windows-exec"

@@ -379,7 +379,7 @@ TEST(LirVerifierSideStructures, ARebuildThatAddsReferencesVerifiesClean) {
 // because its only subjects were modules the rule's own author had
 // hand-assembled out of arenas. A hand-built module can only ever
 // re-state its author's belief about what the compiler emits. So the
-// accept arm below lowers c-subset SOURCE through `lowerToLir` and
+// accept arm below lowers c SOURCE through `lowerToLir` and
 // asserts the verifier accepts what the compiler actually produced.
 // ⚠ If someone narrows the rule back, THIS is the test that reds.
 //
@@ -419,7 +419,7 @@ TEST(LirVerifierMemAddressing, RealLoweringOfAGlobalReadIsACCEPTED) {
     // reading a global lowers to `lea r, [@sym]` — a symbol-addressed
     // operand list with NO MemBase/MemOffset pair. Under the pre-fix rule
     // this module was rejected and `verifyLir` could not be wired at all.
-    auto lowered = test_support::lowerCSubsetToLir(
+    auto lowered = test_support::lowerCToLir(
         "int g = 7;\n"
         "int addr_of_g_is_read(void) { return g; }\n");
     ASSERT_TRUE(lowered.lir.ok) << "fixture failed to lower the source";
@@ -444,7 +444,7 @@ TEST(LirVerifierMemAddressing, RealLoweringOfComputedGotoIsACCEPTED) {
     // Membership, not position, is the property that holds. This test is
     // what stops a future "simplification" from re-introducing the bug in a
     // narrower form.
-    auto lowered = test_support::lowerCSubsetToLir(
+    auto lowered = test_support::lowerCToLir(
         "int dispatch(void) {\n"
         "  void *t = &&done;\n"
         "  goto *t;\n"
@@ -603,7 +603,7 @@ TEST(LirTwoAddrLegalizeUnwind, TheUnwoundResultCarriesNoHalfBuiltModule) {
 
 TEST(LirTwoAddrLegalizeUnwind, AWellFormedModuleStillLegalizesCleanly) {
     // The other half: the unwind must not have made the pass pessimistic.
-    auto lowered = test_support::lowerCSubsetToLir(
+    auto lowered = test_support::lowerCToLir(
         "int add(int a, int b) { return a + b; }\n");
     ASSERT_TRUE(lowered.lir.ok);
 

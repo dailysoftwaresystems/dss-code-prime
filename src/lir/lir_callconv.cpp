@@ -2180,7 +2180,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
     // agnosticism for a target schema that genuinely doesn't NEED
     // the opcode (e.g. ARM64's GOT/PLT macro-op encoding lands in a
     // future cycle; the schema may not declare
-    // `call_indirect_via_extern` until then — and a c-subset module
+    // `call_indirect_via_extern` until then — and a c module
     // with no extern calls under ARM64 should still lower cleanly).
     // Required opcodes still fail loud on missing.
     //
@@ -3846,7 +3846,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // DIFFERENT mechanism: a spill-reload that lands BETWEEN the
                     // not-yet-emitted arg moves) would here falsely fail-loud on a valid
                     // register-exhaustion call that legitimately fills every argGpr as a
-                    // DEST (see examples/c-subset/varargs_struct_split: 1 fixed + 5 longs
+                    // DEST (see examples/c/varargs_struct_split: 1 fixed + 5 longs
                     // exhaust rdi..r9, all dests) — so we exclude only argGprs that are
                     // ALSO a live source, which `liveArgSrc` already captures.
                     std::unordered_set<std::uint16_t> liveArgSrc;

@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: `__builtin_va_list` is the COMPILER-PROVIDED spelling of the va_list type (the Darwin SDK reaches va_list ONLY through `typedef __builtin_va_list __darwin_va_list;` — sqlite os_unix.c/mem1.c/test1.c S0006). The analyzer injects the name beside `va_list` in the builtin scope at all THREE VaListStrategy branches with the IDENTICAL per-CC TypeId. PROPERTY: vsum receives the list as `my_va_list` (typedef of __builtin_va_list) while sumv builds a plain `va_list` — the cross-name forward compiles/runs only because the c63 forwarding fix (D-CSUBSET-VA-LIST-PARAM-SLOT) is type-EXACT (TypeId identity, never spelling). VALUE-CORRECT + SENSITIVE: 10+11+12+9 = 42 across all four va_list ABIs (SysV + AAPCS64 + Win64/Apple-arm64). RED-ON-DISABLE: revert the three injections -> S0006/S_UnknownType on the typedef line. Pure c -> all 4 targets; pe RUNS on Windows, elf/arm64 RUN on linux/qemu.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "$comment": "FC17.9(c) (D-CSUBSET-SETJMP + D-OPT-SETJMP-RETURNS-TWICE-INLINE) - C11 <setjmp.h> setjmp/longjmp on 4 legs / 3 realizations, RUN on BOTH the baseline (debug) AND the `release` pipeline (Mem2Reg + Inlining active). elf x86_64 + arm64 (qemu) resolve setjmp/longjmp as DIRECT libc.so.6 FFI; pe64 expands `setjmp(env)` via the pe-only descriptor macro to `_setjmp(env, 0)`, bound to the ucrtbase export `__intrinsic_setjmp` through the descriptor's `linkName` (UCRT-P5; frame=0 non-SEH restore) + DIRECT `longjmp` — so THIS EXAMPLE IS THE RUN WITNESS FOR THE UCRT BIND: a wrong image or a wrong external name is not a compile error, it is a 0xC0000139 LOAD failure under the eager-import law, which this arm catches by failing to start; macho arm64 is DIRECT libSystem FFI (RUNS natively on a macOS-arm64 CI host). `run` (a callee of main) does the classic round-trip; `longjmp` is noreturn so the post-longjmp path is Unreachable. The release arm is the load-bearing proof of the optimizer hardening: mem2reg must NOT promote `modified` (a local stored before longjmp and read after the resume — a promoted read would observe the stale entry value 0 -> exit 40; kept in memory -> exit 42), and the inliner must NOT inline the returns-twice callee `run`. `determinate` (computed before setjmp, unmodified) is the M1 Call-barrier + longjmp-restore witness. exit 40 (determinate) + 2 (modified) = 42. ANTI-FOLD: g_base/g_bump are mutable globals so no pass folds the round-trip to `return 42`. RED-on-disable (mem2reg): revert the returns-twice whole-function bail in src/opt/passes/mem2reg.cpp -> the release arm exits 40 not 42. RED-on-disable (header): delete shippedLibs/setjmp.json -> `#include <setjmp.h>` fires F_ShippedHeaderNotFound and the compile fails.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "$commentByteIdentical": "MEASURED 2026-08-15 — optimized image BYTE-IDENTICAL to the baseline on: arm64:elf64-aarch64-linux-exec, x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec. Legs actually run: windows/pe64-x86_64 and linux/elf64 (x86_64 + aarch64 under qemu); the darwin/macho64 leg was NOT run. Where the image is identical the arm's exit-code/stdout comparison is x==x and cannot fail. HONEST: the work this example pins happens behind an EXTERN call the pipeline cannot see through, so no pass has a body to transform on this side of the call. The control flow runs through `setjmp`/`longjmp`, which the pipeline must treat conservatively. Deliberately NOT given \"mustDifferFromBaseline\" — an honest no-op, not a missed opt-in." }
+  ]
+}

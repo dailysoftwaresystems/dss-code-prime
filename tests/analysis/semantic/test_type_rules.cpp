@@ -132,7 +132,7 @@ TEST(TypeRules, IsAssignableRejectsCrossSignedness) {
 }
 
 // D-CSUBSET-INT-CROSS-SIGNEDNESS-CONVERT: with the `intCrossSignednessConverts` gate ON
-// (c-subset), signed↔unsigned IS assignable in BOTH directions and at ANY width (incl.
+// (c), signed↔unsigned IS assignable in BOTH directions and at ANY width (incl.
 // cross-signedness narrowing U64→I32) — C 6.3.1.3 / 6.5.16.1. coerce() materializes the
 // width-exact Cast. RED-ON-DISABLE: revert the isAssignable cross-signedness arm → the
 // four EXPECT_TRUE flip to false. SCOPE GUARD: the gate is signed↔unsigned ONLY — a
@@ -158,7 +158,7 @@ TEST(TypeRules, IsAssignableAdmitsCrossSignednessWhenGated) {
            "(needs the separate intSameSignednessNarrows gate, off here)";
 }
 
-// D-CSUBSET-INT-SAME-SIGN-NARROW: with `intSameSignednessNarrows` ON (c-subset), a
+// D-CSUBSET-INT-SAME-SIGN-NARROW: with `intSameSignednessNarrows` ON (c), a
 // SAME-signedness integer NARROWING (`short s = anInt;`, `signed char c = anInt;`,
 // `int i = aLong;`) IS assignable — C 6.3.1.3 / 6.5.16.1, value-preserving in range,
 // truncating (modular) out of range. coerce()'s arithmetic-core arm materializes the
@@ -216,7 +216,7 @@ TEST(TypeRules, IsAssignableRejectsIntFloatCross) {
 }
 
 // D-CSUBSET-INT-FLOAT-CONVERSION: with `intConvertsToFloat` / `floatConvertsToInt`
-// ON (c-subset), the int↔float implicit ASSIGNMENT conversion is admitted in the
+// ON (c), the int↔float implicit ASSIGNMENT conversion is admitted in the
 // gated direction — `double d = 5;` (int→float), `int n = aDouble;` (float→int) —
 // C 6.3.1.4 / 6.3.1.5 / 6.5.16.1. The two gates are INDEPENDENT: each admits only
 // its own direction. coerce()'s arithmetic-core arm materializes the MIR
@@ -280,7 +280,7 @@ TEST(TypeRules, IsAssignableRejectsFloatNarrowingByDefault) {
     EXPECT_TRUE (isAssignable(in, f64, f32)) << "F32 -> F64 widening IS admitted (gate-independent)";
 }
 
-// D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING: with `floatSameKindNarrows` ON (c-subset), a
+// D-CSUBSET-FLOAT-FROM-DOUBLE-NARROWING: with `floatSameKindNarrows` ON (c), a
 // WIDER floating rhs NARROWS into a NARROWER floating lhs — `float f = aDouble;` (F64→F32,
 // the GEOPOLY `typedef float GeoCoord` assigned from a `double`), F80/F128→F64/F32 — C
 // 6.3.1.4 / 6.5.16.1, precision-lossy (value the nearest representable). WIDENING stays

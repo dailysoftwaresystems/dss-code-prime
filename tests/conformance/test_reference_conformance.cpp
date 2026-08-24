@@ -931,7 +931,7 @@ struct DssVerdict {
         fs::path const log    = work / ("dss_" + probeId + "_" + safe + ".log");
         std::string const cmd =
             quoted(std::string{DSS_CLI_PATH}) + " --compile " + quoted(src.string())
-            + " --language c-subset --target " + target + " --output " + quoted(outDir.string());
+            + " --language c --target " + target + " --output " + quoted(outDir.string());
         // ✔ rc captured DIRECTLY from std::system, never after a pipe.
         int const status = std::system(native_probe::captureCmd(cmd, log).c_str());
         if (status == -1) {

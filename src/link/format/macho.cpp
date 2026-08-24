@@ -1757,9 +1757,9 @@ encode(AssembledModule const&    module,
     // split to keep in sync — see the symtab-order note above), so the emission
     // order is unchanged; only the N_EXT bit flips. A WEAK def keeps
     // `N_SECT|N_EXT` and adds N_WEAK_DEF in n_desc
-    // (D-LK-OBJECT-WEAK-DEF-RELOCATABLE): the c-subset DOES produce weak
+    // (D-LK-OBJECT-WEAK-DEF-RELOCATABLE): the c DOES produce weak
     // defined symbols (`__attribute__((weak))` → SymbolBinding::Weak, per
-    // `c-subset.lang.json` + examples/c-subset/attributes_syntax's
+    // `c.lang.json` + examples/c/attributes_syntax's
     // `weak_helper` and weak_inline_crosscu). Nothing about the section, the
     // symtab ordering or the mach_header changes — the whole of the weak fact
     // rides that one n_desc bit, which is why the Mach-O half of this anchor is

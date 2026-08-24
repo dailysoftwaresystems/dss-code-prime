@@ -12,8 +12,8 @@ dss_add_test(NAME analysis/semantic/test_type_rules
 dss_add_test(NAME analysis/semantic/test_semantic_analyzer_toy
              SOURCES test_semantic_analyzer_toy.cpp)
 
-dss_add_test(NAME analysis/semantic/test_semantic_analyzer_c_subset
-             SOURCES test_semantic_analyzer_c_subset.cpp)
+dss_add_test(NAME analysis/semantic/test_semantic_analyzer_c
+             SOURCES test_semantic_analyzer_c.cpp)
 
 dss_add_test(NAME analysis/semantic/test_semantic_analyzer_tsql
              SOURCES test_semantic_analyzer_tsql.cpp)
@@ -43,7 +43,7 @@ dss_add_test(NAME analysis/semantic/test_type_identity_vocabulary
              SOURCES test_type_identity_vocabulary.cpp)
 target_include_directories(dss_analysis_semantic_test_type_identity_vocabulary
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
-# Perturbs the SHIPPED c-subset JSON (the loader accept/reject matrix).
+# Perturbs the SHIPPED c JSON (the loader accept/reject matrix).
 target_link_libraries(dss_analysis_semantic_test_type_identity_vocabulary
                       PRIVATE nlohmann_json::nlohmann_json)
 
@@ -60,7 +60,7 @@ dss_add_test(NAME analysis/semantic/test_declarator_engine
 # libstdc++/gtest; same trap the compilation_unit suite hit).
 target_include_directories(dss_analysis_semantic_test_semantic_analyzer_toy
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
-target_include_directories(dss_analysis_semantic_test_semantic_analyzer_c_subset
+target_include_directories(dss_analysis_semantic_test_semantic_analyzer_c
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_include_directories(dss_analysis_semantic_test_semantic_analyzer_tsql
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
@@ -68,7 +68,7 @@ target_include_directories(dss_analysis_semantic_test_semantic_analyzer_generici
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_include_directories(dss_analysis_semantic_test_fc3_width_semantics
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
-# The FC3 suite perturbs the SHIPPED c-subset JSON — it needs nlohmann.
+# The FC3 suite perturbs the SHIPPED c JSON — it needs nlohmann.
 target_link_libraries(dss_analysis_semantic_test_fc3_width_semantics
                       PRIVATE nlohmann_json::nlohmann_json)
 # The FC4 declarator suite perturbs its SYNTHETIC schema doc the same way

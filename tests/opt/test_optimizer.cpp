@@ -421,7 +421,7 @@ TEST(Optimizer, EffectivenessConstFoldRerunPostMem2Reg) {
 
 // ── D-OPT-ALIAS-ARC-CORPUS-CAPSTONE-STRICT effectiveness pin ────────
 //
-// Hand-built mirror of `examples/c-subset/strict_alias_cse_capstone/
+// Hand-built mirror of `examples/c/strict_alias_cse_capstone/
 // main.c`'s `compute(int* pI, long* pL){int a=*pI; *pL=7; return
 // a+*pI;}` shape — but the alloca on `a` is elided because the
 // effectiveness arc closes at MIR level on the Args directly (the
@@ -433,7 +433,7 @@ TEST(Optimizer, EffectivenessConstFoldRerunPostMem2Reg) {
 // alias substrate (mirMayAlias Rule 6 distinct non-char primitives;
 // strict-TBAA opt-in via `MirAliasingMode::StrictTBAA`); cycle 10h
 // added the `long`→I64 primitive so `Ptr<I32>` vs `Ptr<I64>` is
-// expressible in c-subset source. This pin proves the FULL release
+// expressible in c source. This pin proves the FULL release
 // pipeline observes the effectiveness — the second Load(pI) is
 // eliminated AND `passMutationCount[Cse] >= 1`. Without it, the
 // corpus row's runtime exit code agreement between baseline + Cse
@@ -450,11 +450,11 @@ Mir buildAliasArcStrictCapstoneMir(TypeInterner& interner) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder b;
-    // Match the c-subset config: strictAliasingOnDistinctTypes=true
+    // Match the c config: strictAliasingOnDistinctTypes=true
     // + charTypesAliasAll=true. The capstone exercises Rule 6 (not
     // Rule 5), so charTypesAliasAll's value doesn't gate the
     // outcome — but setting both flags here keeps the fixture
-    // faithful to what the c-subset HIR→MIR lowering would stamp.
+    // faithful to what the c HIR→MIR lowering would stamp.
     b.setAliasingMode(MirAliasingMode::StrictTBAA);
     b.setCharTypesAliasAll(true);
     b.addFunction(fnSig, SymbolId{100},
@@ -907,7 +907,7 @@ TEST(Optimizer, FlatZeroIterationsClampsToOneTraversal) {
 }
 
 // D-CSUBSET-DIVISION-OP-CODEGEN closure-gate item (b) (cycle 10r,
-// 2026-06-04). The corpus example (`examples/c-subset/division/`)
+// 2026-06-04). The corpus example (`examples/c/division/`)
 // exercises the full source→optimized→binary pipeline, but a
 // hypothetical regression that silently CONST-FOLDS the divide away
 // (e.g. a future inlining pass that propagates the literal 100, 7
@@ -993,7 +993,7 @@ TEST(Optimizer, EffectivenessSDivSurvivesShippedReleasePipeline) {
 // D-CSUBSET-DIVISION-OP-CODEGEN closure-gate item (b) — UDiv analog
 // (cycle 10r 7-agent review fold pr-test #3 7/10, 2026-06-04). The
 // SDiv test above pins that the signed divide survives the shipped
-// release pipeline. UDiv has NO source-language entry in c-subset
+// release pipeline. UDiv has NO source-language entry in c
 // today (no unsigned types yet — anchored D-CSUBSET-UDIV-RUNTIME-HIGH-BIT-PIN),
 // so the only way UDiv reaches codegen is via hand-
 // built MIR — exactly the path this test pins. Without this analog,
@@ -1035,7 +1035,7 @@ TEST(Optimizer, EffectivenessUDivSurvivesShippedReleasePipeline) {
     ASSERT_EQ(countOpInModule(mir, MirOpcode::UDiv), 1u)
         << "MIR UDiv with runtime-opaque operands MUST survive the "
            "shipped release pipeline exactly once — same invariant as "
-           "SDiv's analog. No c-subset corpus row exercises UDiv today "
+           "SDiv's analog. No c corpus row exercises UDiv today "
            "(anchored D-CSUBSET-UDIV-RUNTIME-HIGH-BIT-PIN); this MIR-"
            "level pin is the sole codegen-tier-survives guard for the "
            "`xor_rdx_zero + div_op` shape until unsigned types land.";

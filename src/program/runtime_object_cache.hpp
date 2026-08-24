@@ -152,7 +152,7 @@
 //                costs the hash alone.
 //                ★★ AND THE SET MUST BE ASKED OF THE LOADERS, NEVER HAND-LISTED.
 //                ✔MEASURED: the first hand-written list was already WRONG — it
-//                named `c-subset.lang.json` and stopped, but that document's
+//                named `c.lang.json` and stopped, but that document's
 //                `languageReferences` block (line 18) pulls in `asm.lang.json`
 //                and its dialects, which are therefore real inputs to compiling
 //                a `.c`. A hand-enumerated set is a second owner of the loaders'
