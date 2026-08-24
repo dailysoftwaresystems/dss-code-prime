@@ -2849,10 +2849,165 @@ INSTANTIATE_TEST_SUITE_P(
         CastCase{::dss::MirOpcode::FPTrunc,  "fpcvt",    ::dss::TypeKind::F64, ::dss::TypeKind::F32, LirRegClass::FPR},
         CastCase{::dss::MirOpcode::FPExt,    "fpcvt",    ::dss::TypeKind::F32, ::dss::TypeKind::F64, LirRegClass::FPR},
         CastCase{::dss::MirOpcode::FPToSI,   "fp_to_si", ::dss::TypeKind::F64, ::dss::TypeKind::I64, LirRegClass::GPR},
-        CastCase{::dss::MirOpcode::FPToUI,   "fp_to_ui", ::dss::TypeKind::F64, ::dss::TypeKind::I64, LirRegClass::GPR},
-        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR},
-        CastCase{::dss::MirOpcode::UIToFP,   "ui_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR}
+        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR}
+        // ⚠ FPToUI and UIToFP USED TO SIT HERE, asserting that each emits ONE
+        // LIR instruction of the same-named opcode. On x86_64 that assertion
+        // was TRUE AND THE BUG: the same-named opcode carried the SIGNED
+        // converter's bytes, so the row pinned the miscompile in place. They
+        // move to `UnsignedFloatConversionsEmitTheDeclaredSequence` below,
+        // which states MORE than these rows did — see its docblock
+        // (D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE).
     ));
+
+// ─── D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE ────
+//
+// The two unsigned int↔float conversions no longer map 1:1 to a single LIR
+// opcode on every target, because on x86-64 there IS no single instruction:
+// SSE2 has only the SIGNED converters. What replaced the two `AllCastVariants`
+// rows is deliberately NOT "whatever the config says", which would be a guard
+// reading the file it guards and would pass under every mutation of it. These
+// expectations are an INDEPENDENT restatement of the intended lowering:
+//
+//   * arm64 must emit the UNSIGNED converter and exactly one of it. Pointing
+//     the declared step at `si_to_fp`/`fp_to_si` — the precise shape of the
+//     x86 defect — turns this red.
+//   * x86_64 must emit NEITHER `ui_to_fp` NOR `fp_to_ui` (they have no
+//     encoding any more, and emitting one would be the old lie), must produce
+//     its result from the final combining instruction, and must contain the
+//     specific working parts of the branchless expansion. Restoring either
+//     single-instruction encoding block turns this red.
+//
+// The VALUE-level proof lives in
+// examples/c-subset/unsigned_float_conversion_full_range, which runs on both
+// targets and compares against gcc-13/clang-19-agreed constants; this test's
+// job is to make a lowering regression surface at unit level too.
+namespace {
+
+// Every LIR opcode emitted into the function's entry block, in order.
+[[nodiscard]] std::vector<std::uint16_t>
+entryBlockOpcodes(::dss::Lir const& lir) {
+    std::vector<std::uint16_t> out;
+    LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
+    for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
+        out.push_back(lir.instOpcode(lir.blockInstAt(entry, i)));
+    }
+    return out;
+}
+
+[[nodiscard]] std::size_t
+countOf(std::vector<std::uint16_t> const& ops, std::uint16_t op) {
+    std::size_t n = 0;
+    for (auto const o : ops) if (o == op) ++n;
+    return n;
+}
+
+// Lower `argKind -> mirOp -> resultKind` on the named shipped target.
+struct LoweredCast {
+    ::dss::Lir                 lir;
+    std::vector<std::uint16_t> ops;
+};
+[[nodiscard]] LoweredCast
+lowerOneCast(::dss::TargetSchema const& sch, ::dss::MirOpcode mirOp,
+             ::dss::TypeKind srcKind, ::dss::TypeKind dstKind) {
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const srcT = ::dss::test_support::probeTypeOfKind(interner, srcKind);
+    auto const dstT = ::dss::test_support::probeTypeOfKind(interner, dstKind);
+    std::array<::dss::TypeId, 1> params{srcT};
+    auto const fnSig = interner.fnSig(params, dstT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const argInst = mb.addArg(0, srcT);
+    std::array<::dss::MirInstId, 1> castOps{argInst};
+    mb.addReturn(mb.addInst(mirOp, castOps, dstT));
+    ::dss::Mir m = std::move(mb).finish();
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, sch, interner, rep);
+    EXPECT_TRUE(result.ok);
+    LoweredCast out{std::move(result.lir), {}};
+    out.ops = entryBlockOpcodes(out.lir);
+    return out;
+}
+
+} // namespace
+
+TEST(MirToLir, UnsignedFloatConversionsEmitTheDeclaredSequence) {
+    // ── arm64: the ONE-STEP declaration, and it must name the UNSIGNED form.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("arm64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        auto const uiToFp = *sch.opcodeByMnemonic("ui_to_fp");
+        auto const siToFp = *sch.opcodeByMnemonic("si_to_fp");
+        auto const fpToUi = *sch.opcodeByMnemonic("fp_to_ui");
+        auto const fpToSi = *sch.opcodeByMnemonic("fp_to_si");
+
+        auto const u2f = lowerOneCast(sch, ::dss::MirOpcode::UIToFP,
+                                      ::dss::TypeKind::U64, ::dss::TypeKind::F64);
+        EXPECT_EQ(countOf(u2f.ops, uiToFp), 1u)
+            << "arm64 UIToFP must emit exactly one UCVTF (`ui_to_fp`)";
+        EXPECT_EQ(countOf(u2f.ops, siToFp), 0u)
+            << "arm64 UIToFP must NOT reach for the SIGNED SCVTF — that "
+               "substitution is precisely the x86 defect this cycle removed";
+
+        auto const f2u = lowerOneCast(sch, ::dss::MirOpcode::FPToUI,
+                                      ::dss::TypeKind::F64, ::dss::TypeKind::U64);
+        EXPECT_EQ(countOf(f2u.ops, fpToUi), 1u)
+            << "arm64 FPToUI must emit exactly one FCVTZU (`fp_to_ui`)";
+        EXPECT_EQ(countOf(f2u.ops, fpToSi), 0u)
+            << "arm64 FPToUI must NOT reach for the SIGNED FCVTZS";
+    }
+
+    // ── x86_64: the branchless expansion, and NO unsigned-converter lie.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        auto const uiToFp = *sch.opcodeByMnemonic("ui_to_fp");
+        auto const fpToUi = *sch.opcodeByMnemonic("fp_to_ui");
+
+        // Neither pseudo-opcode may carry an encoding any more: an encoding on
+        // either one IS the claim that x86-64 has an unsigned converter.
+        EXPECT_TRUE(sch.opcodeInfo(uiToFp)->encoding.variants.empty())
+            << "x86_64 `ui_to_fp` must declare NO encoding — SSE2 has no "
+               "unsigned int->float instruction to encode";
+        EXPECT_TRUE(sch.opcodeInfo(fpToUi)->encoding.variants.empty())
+            << "x86_64 `fp_to_ui` must declare NO encoding — SSE2 has no "
+               "float->unsigned instruction to encode";
+
+        auto const u2f = lowerOneCast(sch, ::dss::MirOpcode::UIToFP,
+                                      ::dss::TypeKind::U64, ::dss::TypeKind::F64);
+        EXPECT_EQ(countOf(u2f.ops, uiToFp), 0u)
+            << "x86_64 UIToFP must not emit the encodingless `ui_to_fp`";
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("si_to_fp")), 2u)
+            << "the u64->double expansion converts the low and high halves "
+               "SEPARATELY — each fits the signed window exactly";
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("zext")), 1u);
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("shr_l")), 1u);
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("movq_gpr_to_xmm")), 1u);
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("fmul")), 1u);
+        ASSERT_GE(u2f.ops.size(), 2u);
+        EXPECT_EQ(u2f.ops[u2f.ops.size() - 2],
+                  *sch.opcodeByMnemonic("fadd"))
+            << "the value is produced by the single correctly-rounded add of "
+               "two exactly-representable halves";
+
+        auto const f2u = lowerOneCast(sch, ::dss::MirOpcode::FPToUI,
+                                      ::dss::TypeKind::F64, ::dss::TypeKind::U64);
+        EXPECT_EQ(countOf(f2u.ops, fpToUi), 0u)
+            << "x86_64 FPToUI must not emit the encodingless `fp_to_ui`";
+        EXPECT_EQ(countOf(f2u.ops, *sch.opcodeByMnemonic("fp_to_si")), 2u)
+            << "the double->u64 expansion truncates x AND x-2^63, then selects";
+        EXPECT_EQ(countOf(f2u.ops, *sch.opcodeByMnemonic("fsub")), 1u);
+        EXPECT_EQ(countOf(f2u.ops, *sch.opcodeByMnemonic("shr_a")), 1u)
+            << "the selection mask is an ARITHMETIC shift of the signed "
+               "truncation — no compare and no condition code";
+        EXPECT_EQ(countOf(f2u.ops, *sch.opcodeByMnemonic("and")), 1u);
+        ASSERT_GE(f2u.ops.size(), 2u);
+        EXPECT_EQ(f2u.ops[f2u.ops.size() - 2], *sch.opcodeByMnemonic("or"));
+    }
+}
 
 TEST(MirToLir, GepDynamicIndexEmitsFourOperandLea) {
     // Cycle 3d added a 2-operand Gep case emitting

@@ -419,7 +419,25 @@ def run(root, subject_list, inventory, floor=PY_FLOOR, out=None):
 
 
 def write_inventory(root, subject_list, inventory):
-    """Regenerate the inventory DOWNWARD only. Growing it is a refusal."""
+    """Regenerate the inventory DOWNWARD only. Growing it is a refusal.
+
+    ★★★ THE ON-DISK DOCUMENT IS READ AND ONLY THE `unprotected` LIST IS
+    REPLACED, WHICH IS WHY THIS GUARD HAS NO `_INVENTORY_COMMENT` LITERAL AND
+    MUST NOT GROW ONE. Its siblings `check-plan-citations`,
+    `check-stale-refusal-citations` and `check-wrapped-anchor-ids` all SERIALIZE
+    a fresh body from an in-code literal, so for them the file and the code are
+    two copies of one text that can silently disagree -- and all three now refuse
+    on that disagreement. Here there is exactly ONE copy: the `_comment` in the
+    JSON round-trips through this function untouched, so there is nothing to
+    diverge FROM. ✔MEASURED 2026-08-24 (cycle P30, lane F): the module defines no
+    name containing COMMENT, and a `--write` over the live inventory leaves the
+    `_comment` block byte-identical while rewriting `unprotected`.
+    ⚠⚠ THE HAZARD THAT REMAINS IS THE OPPOSITE ONE, AND IT IS WHY THIS IS
+    SPELLED OUT RATHER THAN LEFT TO BE REDISCOVERED: "simplifying" this to
+    `json.dump({"unprotected": now}, ...)` would DELETE the sole copy of the
+    ratchet's rules and of its measured record, silently, with rc=0 and nothing
+    left to read. The self-test arm `17 WRITE-PRESERVES-THE-COMMENT` pins it.
+    """
     now = sorted(r for r in subject_list if probe(root, r)[0] == UNPROTECTED)
     added = sorted(set(now) - set(inventory))
     if added:
@@ -519,6 +537,17 @@ def _arm(results, label, got, expect_code, says=None, not_says=None):
     return ok
 
 
+# ★★★ THE ARM COUNT IS PINNED, AND UNTIL 2026-08-24 IT WAS NOT. Every sibling in
+# this battery pins one; this guard reported `len(results)` and compared it to
+# nothing, so an arm silently dropped by an early `return`, an exception swallowed
+# in a refactor, or a block moved inside a branch that stopped being taken would
+# have left the suite GREEN while asserting less -- the vacuity
+# D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS names, reached by subtraction
+# instead of by short-circuit. ⚠ Raising this number is not a formality: it is the
+# claim that the arms you added actually RUN.
+EXPECTED_ARMS = 21
+
+
 def self_test():
     """Every refusal, and both halves of the property-not-text rule."""
     box = _fixture_tree()
@@ -592,6 +621,60 @@ def self_test():
         _arm(results, "16 SELF-APPLICATION: this guard protects ITSELF, not transitively",
              (probe(os.path.dirname(os.path.abspath(__file__)),
                     os.path.abspath(__file__))[0], ""), SELF)
+
+        # -- the inventory's own prose survives the write verb -------------------
+        # ★★★ THIS IS THE PROPERTY THE SIBLING RATCHETS EXPRESS AS A DIVERGENCE
+        # REFUSAL, WRITTEN THE ONLY WAY IT CAN BE WRITTEN HERE. They serialize a
+        # fresh body from an in-code literal, so their file and their code are
+        # two copies that can disagree, and each now refuses on the disagreement.
+        # This guard keeps ONE copy -- `write_inventory` reads the document and
+        # replaces `unprotected` alone -- so there is nothing to compare against
+        # and minting a second copy to compare with would CREATE the hazard in
+        # order to guard it. What is real here is the DELETION direction: a
+        # `write_inventory` rewritten to serialize a fresh dict would drop the
+        # `_comment` silently, with rc=0, and take the ratchet's rules and its
+        # measured record with it. So the arm asserts the block SURVIVES a write,
+        # byte for byte, on a fixture inventory that carries prose no code knows.
+        inv_box = os.path.join(box, os.path.dirname(INVENTORY_REL))
+        os.makedirs(inv_box, exist_ok=True)
+        inv_path = os.path.join(box, INVENTORY_REL)
+        # ★ Prose invented HERE, not copied from the shipped inventory: a fixture
+        # quoting the real file would pass the day `write_inventory` started
+        # regenerating that exact text from a literal, which is the defect.
+        _FIXTURE_COMMENT = ["prose that exists only in this JSON",
+                            "and in no literal anywhere in the module."]
+        # ⚠ THE FIXTURE INVENTORY LISTS A SCRIPT THAT NOW PASSES, so the write is
+        # a REAL lowering rather than a no-op. An arm whose write changed nothing
+        # would prove the `_comment` survives doing nothing -- vacuously true of
+        # a `write_inventory` that never ran at all.
+        with io.open(inv_path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump({"_comment": _FIXTURE_COMMENT,
+                       "unprotected": ["bare.py", "protected.py", "quoted.py"]},
+                      fh, indent=2)
+            fh.write("\n")
+        write_inventory(box, ["protected.py", "bare.py", "quoted.py"],
+                        ["bare.py", "protected.py", "quoted.py"])
+        _written = json.load(io.open(inv_path, encoding="utf-8"))
+        _arm(results, "17 WRITE-PRESERVES-THE-COMMENT: the sole copy of the "
+             "ratchet's prose survives a `--write` byte for byte",
+             (_written.get("_comment"), ""), _FIXTURE_COMMENT)
+        _arm(results, "18 WRITE-STILL-LOWERED: and the write it survived was a "
+             "real one -- the repaired entry is gone",
+             (_written.get("unprotected"), ""), ["bare.py", "quoted.py"])
+
+        # ★★ THE RATCHET DIRECTION OF THE WRITE VERB, WHICH HAD NO ARM AT ALL.
+        # `write_inventory` refusing to ADD is the whole reason the inventory can
+        # be trusted as DEBT rather than as a permission list, and it was the one
+        # refusal in this file that nothing exercised -- so "refused" and
+        # "refused but wrote anyway" were indistinguishable here. The arm asserts
+        # BOTH the exit code and the FILE, because only the file separates them.
+        _before = io.open(inv_path, "rb").read()
+        _rc = write_inventory(box, ["protected.py", "bare.py", "quoted.py"], [])
+        _arm(results, "19 WRITE-REFUSES-A-RAISE: adding a script to the inventory "
+             "is refused, not baselined", (_rc, ""), EXIT_UNPROTECTED)
+        _arm(results, "19b WRITE-WROTE-NOTHING: and the refusal left the file "
+             "byte-identical",
+             (io.open(inv_path, "rb").read() == _before, ""), True)
     finally:
         shutil.rmtree(box, ignore_errors=True)
 
@@ -602,6 +685,11 @@ def self_test():
         else:
             print("  FAIL %s -- %s" % (label, detail))
             print("       report was: %s" % text.strip()[:400])
+    if len(results) != EXPECTED_ARMS:
+        print("  FAIL arm count -- expected %d arm(s), ran %d. An arm was dropped "
+              "or added without updating EXPECTED_ARMS."
+              % (EXPECTED_ARMS, len(results)))
+        bad = bad + [(False, "arm count", "", "")]
     print("guard-output-encoding: self-test %s - %d arm(s) exercised, every red arm "
           "asserting the MESSAGE of the refusal it names rather than merely a "
           "non-zero exit; this guard is PROVEN able to fail."

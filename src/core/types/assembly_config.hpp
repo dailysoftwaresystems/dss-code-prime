@@ -739,10 +739,11 @@ struct DSS_EXPORT AssemblyConfig {
     // ⚠ OPTIONAL AS A SET, REQUIRED OF EACH OTHER — the loader refuses any
     // proper subset. A mode with no rule mints tokens no shape accepts; a
     // rule with no mode declares a shape whose FIRST token nothing ever
-    // produces; and see `templateLabelRule` below for the third. Every one of
-    // them is a silent no-op, which is the one outcome this config surface is
-    // shaped to make impossible. A dialect that hosts no embedded templates
-    // declares none of them, and all stay invalid.
+    // produces; and see `templateLabelRule` and `templateModifiers` below for
+    // the other three members. Every one of them is a silent no-op, which is
+    // the one outcome this config surface is shaped to make impossible. A
+    // dialect that hosts no embedded templates declares none of them, and all
+    // stay invalid.
     LexerModeId templateLexerMode{};
     RuleId      templateOperandRule{};
 
@@ -768,10 +769,75 @@ struct DSS_EXPORT AssemblyConfig {
     // capability was therefore never really optional for such a document. That
     // is not a new policy: it is the consequence recorded in the closed row
     // `D-CONFIG-ASM-TEMPLATE-CAPABILITY-NO-LONGER-OPTIONAL-FOR-A-SHARED-SURFACE-IMPORTER`,
-    // now extended to a third key by the same argument. A dialect importing a
-    // NARROWER entry — one whose closure does not reach the template shapes —
-    // may still declare none of the three.
+    // now extended to a third key by the same argument — and to a FOURTH and
+    // FIFTH in P30, when the placeholder alternation grew its width-view arm
+    // (`templateModifierRule` + `templateModifiers`), for that same argument a
+    // third time. A dialect importing a NARROWER entry — one whose closure does
+    // not reach the template shapes — may still declare none of the five.
     RuleId      templateLabelRule{};
+
+    // ★★★ WHICH PLACEHOLDER RULE IS THE **WIDTH-VIEW** REFERENCE —
+    // `asm.lang.json`'s `asmTemplateModifiedRef`, naming `%w0` / `%x0` /
+    // `%k[out]`. The fourth member of the one capability, routed by RULE
+    // IDENTITY for exactly the reason `templateLabelRule` is: an operand
+    // placeholder and a MODIFIED operand placeholder both denote a register,
+    // but only the second states a width of its own, and the only
+    // dialect-neutral way to know which a matched node is asking is the rule
+    // it was produced by.
+    RuleId      templateModifierRule{};
+
+    // ★★★ ONE DECLARED WIDTH-VIEW LETTER, AND THE COMPOSED LEXEME THE LOADER
+    // BUILT FROM IT.
+    //
+    // ★★ THE LETTER IS PER DIALECT AND THAT IS MEASURED, NOT STYLISTIC: `%w`
+    // renders `w0` (32 bits) under `aarch64-linux-gnu-gcc` and `%ax` (16 bits)
+    // under x86-64 gcc, so a single shared table would be wrong for one of its
+    // readers by construction. What is NOT per dialect is the SIGIL: GNU spells
+    // it `%` in every dialect and it has one owner already
+    // (`semantics.inlineAsmTemplateLexemes.templatePlaceholder`). ⇒ the loader
+    // JOINS the two — language byte plus dialect letter — and stores the result
+    // here, so no tier below composes a sigil and no config file spells one
+    // twice (D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER
+    // stays closed).
+    //
+    // ⚠ `widthBits` IS THE PIPELINE'S OWN UNIT — `AsmResolvedRegister::
+    // widthBits`, `AsmOperandBinding::widthBits` and `lirInstWidthBits` are the
+    // same number — so a modified placeholder states a width every encoder
+    // already reads. A width no encoding variant of the elected instruction
+    // supports fails LOUD at variant election; it never widens in silence,
+    // which is the failure `S_InlineAsmOperandModifierUnsupported` was refusing
+    // the whole form to prevent.
+    struct AsmTemplateModifier {
+        std::string   letter;      // as declared ("w")
+        std::string   lexeme;      // sigil + letter, composed by the loader ("%w")
+        std::uint32_t widthBits = 0;
+    };
+    std::vector<AsmTemplateModifier> templateModifiers;
+
+    // The LANGUAGE's operand-placeholder sigil, carried from the join above.
+    // ★ IT IS HERE SO THE LOWERING CAN REBUILD THE **UNMODIFIED** SPELLING OF A
+    // MODIFIED REFERENCE (`%w0` → `%0`) AND ASK THE HOST'S ORDINARY BINDING
+    // TABLE FOR IT. `%w0` and `%0` name the SAME operand — a modifier selects a
+    // view, never a different operand — so the two must not become two keys:
+    // minting a second binding row per letter would put a spelling in the
+    // lowering's table that the front end never minted, and the tier that
+    // VALIDATES a reference and the tier that BINDS it would then disagree
+    // about which forms exist. One key, one binding, one width stated on top.
+    // ⚠ EMPTY when this dialect hosts no templates; every reader is gated on
+    // `templateModifierRule.valid()`, which cannot be true without it.
+    std::string templatePlaceholderLexeme;
+
+    // The declared modifier whose composed lexeme is exactly `lexeme`, or
+    // nullptr. ⚠ EXACT — never folded by `spellingCase`. A template placeholder
+    // is the EMBEDDING language's vocabulary rather than gas vocabulary, which
+    // is the split `decodePlaceholder` already states for the spelling itself.
+    [[nodiscard]] AsmTemplateModifier const*
+    templateModifierByLexeme(std::string_view lexeme) const noexcept {
+        for (auto const& m : templateModifiers) {
+            if (m.lexeme == lexeme) return &m;
+        }
+        return nullptr;
+    }
 
     // Indexed by `static_cast<std::size_t>(AsmOperandRole)`. Every role is
     // REQUIRED when the block is present — a partial `operandForms` is a load

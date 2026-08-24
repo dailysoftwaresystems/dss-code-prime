@@ -317,11 +317,15 @@ struct Lowerer {
     std::uint32_t currentFnFixedGpr_ = 0;
     std::uint32_t currentFnFixedFpr_ = 0;
     // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): the enclosing function's count of FIXED
-    // named-arg SLOTS under a slot-aligned CC (Win64). The HomogeneousPointer
-    // va_start sets ap = &home[currentFnFixedFlat_] — the slot count positions past
-    // ALL named args (int OR float, each one slot). Equal to currentFnFixedGpr_ for
-    // an int-only-named-param fn; differs only when a named param is FP (each still
-    // one slot). Set alongside the per-class counts before the body is lowered.
+    // named-arg SLOTS under a slot-aligned CC (Win64). The HOME-BASE branch of the
+    // HomogeneousPointer va_start (variadicUsesOverflowBase=false, i.e. Win64 only)
+    // sets ap = &home[currentFnFixedFlat_] — the slot count positions past
+    // ALL named args (int OR float, each one slot). The OTHER HomogeneousPointer
+    // branch (Apple arm64, variadicUsesOverflowBase=true) has no home area and reads
+    // currentFnFixedStackBytes_ instead, so this counter is inert there. Equal to
+    // currentFnFixedGpr_ for an int-only-named-param fn; differs only when a named
+    // param is FP (each still one slot). Set alongside the per-class counts before
+    // the body is lowered.
     std::uint32_t currentFnFixedFlat_ = 0;
     // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the EXACT byte count of
     // FIXED params placed on the INCOMING stack, accumulated in param order as the
@@ -8277,14 +8281,28 @@ struct Lowerer {
             //   * Apple arm64 (variadicUsesOverflowBase=true): start = the OVERFLOW base
             //     (VaOverflowArgAreaAddr) — Apple has NO home area; every vararg is
             //     stacked (the CALLER forces it, variadicArgsAlwaysStack), so the first
-            //     vararg sits at the overflow base. NO payload (the named args are NOT
-            //     in a home block — they stay in their registers, read via SSA).
+            //     vararg sits at the overflow base, DISPLACED past any named params that
+            //     did not fit the arg registers. The named args that DID fit stay in
+            //     their registers and are read via SSA (no home block to skip), but the
+            //     ones that OVERFLOWED sit on the incoming stack AHEAD of the first
+            //     vararg — so the payload is `currentFnFixedStackBytes_`, the SAME byte
+            //     cursor the SysV and Aapcs64DualCursor arms bake in, and the same one
+            //     `RecvByValueStackParam` uses to site a stacked fixed aggregate.
+            //     ⚠ D-MIR-VA-OVERFLOW-ARM-DROPS-FIXED-STACK-DISPLACEMENT: this arm used
+            //     to emit the leaf with NO payload, on the (half-true) reasoning above —
+            //     `ap` then aliased the FIRST named param that had overflowed onto the
+            //     incoming stack, and every va_arg was off by the WHOLE named-stack span
+            //     (✔MEASURED 2026-08-24 on real Apple Silicon: with nine named ints the
+            //     first va_arg returned the ninth NAMED param; with ten it returned the
+            //     ninth again, so the entire span was discarded, not one slot of it).
+            //     Silent in the strict sense: no diagnostic, in BOTH shipped pipelines.
             MirInstId const apPtr = lowerLvalueAddress(kids[0]);
             if (!apPtr.valid()) return InvalidMirInst;
             TypeId const voidPtr = interner.pointer(interner.primitive(TypeKind::Void));
             MirInstId const first =
                 vl.variadicUsesOverflowBase
-                    ? mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr)
+                    ? mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr,
+                                  /*payload=*/currentFnFixedStackBytes_)
                     : mir.addInst(MirOpcode::VaHomeArgAreaAddr, {}, voidPtr,
                                   /*payload=*/currentFnFixedFlat_);
             std::array<MirInstId, 2> st{first, apPtr};
@@ -11916,8 +11934,13 @@ struct Lowerer {
             // per-class ordinal has reached the pool rides the INCOMING stack
             // (independent CC); account it in the byte cursor so a body va_start's
             // overflow base skips it, and fail loud on the post-stacked-aggregate
-            // desync residual. (Win64/slot-aligned uses currentFnFixedFlat_ + the
-            // home-base path, not the byte cursor — untouched.)
+            // desync residual. The byte cursor feeds EVERY va_start arm whose base is
+            // the incoming-overflow area: SysVRegisterSave, Aapcs64DualCursor, AND the
+            // HomogeneousPointer/variadicUsesOverflowBase (Apple arm64) branch. Only
+            // the OTHER HomogeneousPointer branch — Win64, slot-aligned, the home-base
+            // path keyed on currentFnFixedFlat_ — is independent of it, and that branch
+            // never reaches here (the `!argSlotAligned` gate above excludes it), which
+            // is why this cursor stays 0 on Win64.
             if (!config.argSlotAligned) {
                 std::uint32_t const ord =
                     (sCls == AbiPieceClass::Fpr) ? argCtr.fpr : argCtr.gpr;

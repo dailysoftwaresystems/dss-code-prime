@@ -483,7 +483,11 @@ def is_mismarked_closure(status, closing_work):
     return not any(w in hay for w in WALK_BACK)
 
 
-# ── ARM 3: A GATED ROW MUST NAME THE ROW THAT OPENS IT ─────────────────────────
+# ── ARM 3: A GATED ROW MUST NAME WHAT OPENS IT ─────────────────────────────────
+# ⓘ This header read "MUST NAME THE ROW" until the 2026-08-24 ruling widened the
+# opener to a typed reference into EITHER namespace -- an anchor row or a plan phase.
+# The declaration half below is unchanged; the resolution half now lives beside
+# PLAN_PHASE_REF, where the widening and its one asymmetry are argued.
 # Operator ruling 2026-08-23: *"A ⛔ MUST-NOT-BUILD ROW MUST NAME THE ROW THAT
 # OPENS IT. A gate whose opener is an unowned event is unfalsifiable and will sit
 # forever; a gate whose opener is another ROW is a dependency, which is
@@ -693,6 +697,124 @@ OPENER_REF = re.compile(r"OPEN(?:ED|S)?[\s-]*BY[\s:]*\[\[([^\]|]+)\]\]",
                         re.IGNORECASE)
 
 
+# ── THE OPENER IS A **TYPED REFERENCE TO EITHER NAMESPACE** ───────────────────
+# Operator ruling 2026-08-24, widening the 2026-08-23 one recorded above ARM 3:
+# *"I wrote 'name the ROW.' I meant 'name something OWNED AND SCHEDULABLE.' A plan
+# phase is both -- it has an owner and a position in a sequence, which is MORE
+# schedulable than an anchor row, not less. Placeholder rows would be pure registry
+# pollution: rows that are not defects, existing only to satisfy a reference."*
+# ⇒ AN OPENER RESOLVES IN THE NAMESPACE ITS OWN SYNTAX NAMES: `D-...` in the
+# registry, `plan NN <phase>` under `.plans/`. A reference that names neither
+# namespace, or names one and does not resolve there, is refused exactly as before,
+# so this is a WIDENING and can never hide a row the old rule accused (pinned).
+#
+# ★★★ WHAT THE PLANS ACTUALLY WRITE IS NOT WHAT THE RULING SPELLS, AND THE PLANS WIN.
+# The ruling's `plan-NN §X` is INTENT; the plans' own heading and table syntax is the
+# FACT, and ✔MEASURED 2026-08-24 over the three plans the openerless gated rows wait on
+# they disagree:
+#   * plan 16 schedules `CS1`..`CS9` in the FIRST COLUMN of its section-3 PR table
+#     (`| CS1 | Crypto substrate: vendor + wrap BearSSL ... |`) and puts the phase in
+#     a heading only parenthetically (`### 2.10 Cryptographic substrate (CS1)`);
+#   * plan 22 schedules `OPT1`..`OPT10` (plus `OPT5+`) in the first column of TWO
+#     tables -- its section-0.1 stepper overview and its section-3 PR breakdown;
+#   * plan 27 declares NO alphanumeric phase ids at all -- its sequencing table
+#     numbers phases `1`..`6`, and every other thing it owns is a SECTION.
+# ⇒ a phase reference resolves against BOTH surfaces -- a numbered HEADING and a
+# leading TABLE-CELL id -- because admitting only one of them would force a reword on
+# rows whose trigger already names the other in words (`Trigger = Plan 16 CS1 lands`),
+# and rewording a row to satisfy an instrument is the outcome ARM 3's own FAIL text
+# tells authors not to take.
+#
+# ⚠⚠ AND THE ASYMMETRY IS REAL AND IS NOT PAPERED OVER: in the registry namespace this
+# gate refuses an opener that has ALREADY CLOSED, and in the plan namespace it CANNOT,
+# because there is no mechanical closure vocabulary to read. ✔MEASURED: plan 22's
+# stepper writes phase status as `🟩 **c1+c2 DONE**` / `⏳ **planned (v1.x)**` -- no
+# closure mark, so `is_closed` correctly says nothing about it -- and plan 16's PR
+# table has no status column at all. Guessing which column is the status would be
+# schema invention of exactly the kind the ruling refuses. So the plan half checks
+# RESOLUTION ONLY, that limit is stated here rather than discovered later, and the
+# consequence is recorded in the report: an opener naming a FINISHED plan phase passes.
+# ⚠⚠ THE SEPARATOR BETWEEN THE NUMBER AND THE PHASE IS MANDATORY, AND MAKING IT
+# OPTIONAL WAS A LIVE DEFECT IN THIS REGEX'S FIRST DRAFT -- caught by a CONTROL, not
+# by a test written for it. With `[\s–—:]?` the reference `plan-16`, which
+# names a whole plan and NO phase, backtracked into plan `1` phase `6` -- and plan 01
+# really does have a section 6, so a reference that schedules nothing RESOLVED. That
+# is the exact failure this arm exists to prevent, arrived at from the other side.
+# ⇒ a phase reference must SEPARATE its two parts; `plan-16` alone is refused.
+PLAN_PHASE_REF = re.compile(
+    r"^\s*plan[\s.\-]*([0-9]+(?:\.[0-9]+)*)"
+    r"(?:\s+|\s*[–—:]\s*|(?=§))"
+    r"(?:§\s*)?([A-Za-z0-9][A-Za-z0-9.+_]*)\s*$", re.IGNORECASE)
+_PLAN_FILE_NUMBER = re.compile(r"^([0-9]+(?:\.[0-9]+)*)-")
+_PLAN_HEADING_NUMBER = re.compile(r"^#{1,6}\s+([0-9]+(?:\.[0-9]+)*)(?=[.\s])")
+_PHASE_ID_CELL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,15}$")
+_HAS_DIGIT = re.compile(r"[0-9]")
+
+
+def canonical_plan_number(text):
+    """`06` -> `6`, `08.5` -> `8.5`, `22` -> `22`; "" when `text` is not a number.
+
+    Filenames PAD (`06-artifact-profile-plan`) and prose does not always
+    (`plan 6 §2.3`), so both sides fold to one key instead of one being trusted to
+    match the other's spelling. ⚠ The fold is on the plan NUMBER only -- a phase
+    token is compared verbatim, because `2.10` and `2.1` are different sections and
+    normalising them would merge two real phases into one.
+    """
+    parts = text.split(".")
+    if not parts[0] or not all(p.isdigit() for p in parts):
+        return ""
+    return ".".join(str(int(p)) for p in parts)
+
+
+def plan_number_of(relpath):
+    """The plan number a `.plans/` filename declares, or "" for an unnumbered file.
+
+    ⓘ Unnumbered files -- the registry itself, the handoff, `ZZ-final-goal` -- declare
+    no phases and are simply absent from the index, which is why a reference to them
+    cannot resolve. Two files may share a number (`.plans/` really does carry two
+    `24-` plans); the index UNIONS them rather than letting the later one win.
+    """
+    m = _PLAN_FILE_NUMBER.match(os.path.basename(relpath))
+    return canonical_plan_number(m.group(1)) if m else ""
+
+
+def phase_tokens(text):
+    """Every phase one plan document DECLARES: numbered headings + phase-table ids.
+
+    ★ THE TABLE HALF NEEDS THE DIGIT TEST, AND THE PLANS THEMSELVES SUPPLY THE REASON.
+    A leading table cell is a phase id only when it marks A POSITION IN A SEQUENCE --
+    the operator's own criterion -- and ✔MEASURED, every phase id in the three plans
+    above carries a digit (`CS1`, `OPT5`, `OPT5+`, `1`..`6`) while the header words
+    sharing that column do not (`PR`, `Tier`, `#`, `Anchor`). Without the test those
+    header words would resolve and `plan-22 PR` would satisfy this gate.
+    ⚠ ONE REAL PHASE IS THEREFORE UNRESOLVABLE, AND IT IS RECORDED HERE RATHER THAN
+    QUIETLY ADMITTED: plan 22's section-3 table lists `SimplifyCFG` as a PR. That plan
+    states in its own footnote that the row is NOT a numbered step -- it is a recurring
+    cleanup rather than a position in the OPT-N sequence, which is why it carries no
+    integer -- so refusing it as an opener is the plan's verdict, not this file's.
+    Widen only if a gated row ever genuinely needs to name it.
+    ⓘ A plan whose TITLE leads with its own number (`# 27 — GUI Plan`) therefore also
+    declares that number as a section. Harmless -- it is a real heading in the file --
+    and left alone rather than special-cased, because a title-shape exception is the
+    kind of enumeration this file's docstring says never to write.
+    """
+    tokens = set()
+    for line in text.split("\n"):
+        m = _PLAN_HEADING_NUMBER.match(line)
+        if m:
+            tokens.add(m.group(1).upper())
+            continue
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = split_row(line)
+        if len(cells) < 3:
+            continue
+        cell = strip_decoration(cells[1])
+        if _PHASE_ID_CELL.match(cell) and _HAS_DIGIT.search(cell):
+            tokens.add(cell.upper())
+    return tokens
+
+
 # ★★★ THE DECLARATION LIVES IN EITHER CELL, AND KEYING ON THE STATUS CELL ALONE
 # WAS A MEASURED BLIND SPOT -- D-GATE-ANCHOR-BALANCE-IS-GATED-BLIND-TO-THE-REMEDY-CELL.
 # The operator's rule is about the SEMANTICS ("a ⛔ MUST-NOT-BUILD row must name the
@@ -837,12 +959,18 @@ def is_gated(status, closing_work=""):
 
 
 def opener_of(whole_row):
-    """The anchor id this row names as its opener, or "" when it names none."""
+    """The REFERENCE this row names as its opener, or "" when it names none.
+
+    ⚠ Deliberately untyped here: the syntax inside the brackets is what names the
+    namespace, and deciding that is `opener_state`'s job. Returning the raw text
+    keeps the two halves separable -- and keeps a MISTYPED reference visible as a
+    dangling opener instead of vanishing at the parse.
+    """
     m = OPENER_REF.search(strip_decoration(whole_row))
     return m.group(1).strip() if m else ""
 
 
-def opener_state(opener, names, open_names):
+def opener_state(opener, names, open_names, phases=None):
     """-> "none" / "dangling" / "closed" / "open" for a gated row's named opener.
 
     ★ THREE OUTCOMES WHERE THERE USED TO BE TWO, and the new one is the point:
@@ -850,12 +978,32 @@ def opener_state(opener, names, open_names):
     holds every data row open or closed; `open_names` holds the open ones. A name
     in the first and not the second is a row all of whose homes are closed --
     and a closed row cannot open anything.
+
+    ★★★ AND THE REFERENCE IS TYPED: IT RESOLVES IN THE NAMESPACE IT NAMES (operator
+    2026-08-24; see PLAN_PHASE_REF for the ruling and the measurement behind the
+    spelling). `plan NN <phase>` resolves against `phases`, the phase index built
+    from `.plans/`; anything else resolves against the registry population, exactly
+    as before. Neither namespace forgives a dangling reference.
+
+    ⚠ `phases` DEFAULTS TO EMPTY, AND THE DEFAULT ERRS IN THE SAFE DIRECTION ON
+    PURPOSE: a caller that forgets to pass the index refuses every plan-phase opener
+    loudly rather than accepting it silently. Do not "fix" that by defaulting to a
+    permissive value -- the whole point of this arm is that an unresolvable opener
+    is a load error, and a silent pass is the one outcome it must never produce.
+    ⚠ The plan half returns "open" or "dangling" ONLY -- never "closed" -- because
+    the plan namespace has no mechanical closure vocabulary to read. That limit is
+    argued at PLAN_PHASE_REF; it is a known asymmetry, not an oversight.
     """
     if not opener:
         return "none"
-    if opener not in names:
+    ref = opener.strip()
+    m = PLAN_PHASE_REF.match(ref)
+    if m:
+        declared = (phases or {}).get(canonical_plan_number(m.group(1)), ())
+        return "open" if m.group(2).upper() in declared else "dangling"
+    if ref not in names:
         return "dangling"
-    return "open" if opener in open_names else "closed"
+    return "open" if ref in open_names else "closed"
 
 
 def row_name(cell1):
@@ -898,6 +1046,10 @@ class Scan(object):
                  silent; see ARM 5.
     unblocked  : {"relpath#name": reason} -- the row still PRESENTS as blocked but
                  the blocker it names has been discharged. See ARM 4.
+    plan_phases: {plan_number: {PHASE_TOKEN}} -- the SECOND namespace an opener may
+                 resolve in. Populated per document from its numbered headings and
+                 its phase-table ids; unnumbered files contribute nothing. Merged by
+                 UNION, never by overwrite, because two files can share a number.
     """
 
     def __init__(self):
@@ -909,6 +1061,7 @@ class Scan(object):
         self.gated_rows = {}
         self.unclassified = {}
         self.unblocked = {}
+        self.plan_phases = {}
 
     def merge(self, other):
         self.rows.update(other.rows)
@@ -919,6 +1072,11 @@ class Scan(object):
         self.gated_rows.update(other.gated_rows)
         self.unclassified.update(other.unclassified)
         self.unblocked.update(other.unblocked)
+        # ⚠ UNION, not `update`: `.plans/` really does carry two `24-` plans, and an
+        # overwrite would silently delete one of them from the namespace an opener
+        # resolves against -- a dangling verdict on a phase that exists.
+        for number, tokens in other.plan_phases.items():
+            self.plan_phases.setdefault(number, set()).update(tokens)
         return self
 
 
@@ -953,6 +1111,13 @@ def scan_document(text, relpath):
     scan = Scan()
     rows = scan.rows
     findings = scan.findings
+    # The phase namespace is a property of the WHOLE document, not of its recognized
+    # anchor tables, so it is read here rather than inside the shape-matching loop --
+    # plan 27's sequencing table and plan 16's PR table are not anchor tables and
+    # never will be, and a phase they schedule is still a phase.
+    plan_number = plan_number_of(relpath)
+    if plan_number:
+        scan.plan_phases[plan_number] = phase_tokens(text)
     lines = text.split("\n")
     consumed = set()
     i = 0
@@ -1217,7 +1382,9 @@ def self_test():
           population, and NET-NEUTRAL for the cycle (the arithmetic is run, not
           asserted, in `_case_net_neutral`);
       (g) a status cell whose opening VERDICT is a closure while its marker is not;
-      (h) a gated row that must NAME the row which opens it.
+      (h) a gated row that must NAME the row which opens it;
+      (i) an opener that resolves in EITHER namespace -- an anchor row or a plan
+          phase -- and is refused in both when it resolves in neither.
 
     star EVERY CASE ASSERTS ALL FOUR OUTPUTS -- the open set AND the three new
     per-row sets -- rather than only the one it was written for. A case that
@@ -1789,6 +1956,82 @@ def self_test():
         "got=%s" % opener_state("", names4, open4))
     extra_total += 2
 
+    # ── (i) AN OPENER RESOLVES IN **EITHER** NAMESPACE ────────────────────────
+    # Operator ruling 2026-08-24 (argued at PLAN_PHASE_REF). Four properties, and
+    # three of the four are NEGATIVE, which is where this arm's value is: the
+    # positive half of a widening is trivially green, and a widening that forgot to
+    # keep refusing would be indistinguishable from deleting the arm.
+    #   * a plan document declares its numbered HEADINGS and its phase-table IDS,
+    #     and declares neither a header word nor a separator row;
+    #   * a resolvable phase reference is an opener, in both spellings;
+    #   * an UNDECLARED phase, and a phase in an UNSCANNED plan, are both refused
+    #     exactly like a dangling anchor id;
+    #   * the anchor namespace is BYTE-FOR-BYTE unaffected -- the same three
+    #     fixtures from (h4), re-resolved with a populated phase index, must give
+    #     the same three verdicts.
+    # ⚠ The fixture plan's own table is deliberately UNRECOGNIZED as an anchor shape
+    # and carries no anchor-shaped ids, so it raises no finding -- a phase table is
+    # not an anchor table and must not have to become one to be readable.
+    d5 = scan_document(_doc("# A fixture plan with no number in its title",
+                            "",
+                            "## 2.9 A section that really exists",
+                            "",
+                            "| PR | Scope |",
+                            "|----|-------|",
+                            "| XY1 | a scheduled phase |",
+                            "| SomeWord | a word, not a position in a sequence |"),
+                       ".plans/99-fixture-plan.md")
+    # ⚠ THE SECOND FIXTURE IS NOT DECORATION -- IT IS WHAT MAKES THE SEPARATOR PIN
+    # BELOW LOAD-BEARING. Without a plan `9` that really declares a section `9`, the
+    # bad split of `plan-99` would land on an empty index and read as dangling for the
+    # WRONG reason, and the fixture would pass while asserting nothing. It must be
+    # possible for the defect to produce a WRONG PASS, or the pin is theatre.
+    d5.merge(scan_document(_doc("## 9 A section of a DIFFERENT plan"),
+                           ".plans/9-other-fixture-plan.md"))
+    pin(d5.plan_phases == {"99": {"2.9", "XY1"}, "9": {"9"}},
+        "a plan declares its numbered headings and its phase-table ids, and nothing else",
+        "got=%r" % (d5.plan_phases,))
+
+    d5b = scan_document(_doc(*REG_HDR,
+                             "| `D-XX-GATEDPHASE` | \U0001f7e0 **OPEN -- TRIGGER-GATED**, "
+                             "opened by [[plan-99 XY1]] | w | r |",
+                             "| `D-XX-GATEDSECTION` | \U0001f7e0 **OPEN -- TRIGGER-GATED**, "
+                             "opened by [[plan-99 §2.9]] | w | r |",
+                             "| `D-XX-GATEDNOPHASE` | \U0001f7e0 **OPEN -- TRIGGER-GATED**, "
+                             "opened by [[plan-99 XY7]] | w | r |",
+                             "| `D-XX-GATEDNOPLAN` | \U0001f7e0 **OPEN -- TRIGGER-GATED**, "
+                             "opened by [[plan-98 XY1]] | w | r |",
+                             # A WHOLE PLAN IS NOT A PHASE. This fixture pins the
+                             # separator defect recorded at PLAN_PHASE_REF: `plan-99`
+                             # names no position in any sequence, and the digits must
+                             # never be split to invent one.
+                             "| `D-XX-GATEDWHOLEPLAN` | \U0001f7e0 **OPEN -- TRIGGER-GATED**, "
+                             "opened by [[plan-99]] | w | r |"),
+                        REG_REL)
+    names5 = set(k.split("#", 1)[1] for k in d5b.names)
+    open5 = set(k.split("#", 1)[1] for k in d5b.rows)
+    states5 = dict((k.split("#", 1)[1], opener_state(v[0], names5, open5, d5.plan_phases))
+                   for k, v in d5b.gated_rows.items())
+    want5 = {"D-XX-GATEDPHASE": "open", "D-XX-GATEDSECTION": "open",
+             "D-XX-GATEDNOPHASE": "dangling", "D-XX-GATEDNOPLAN": "dangling",
+             "D-XX-GATEDWHOLEPLAN": "dangling"}
+    pin(states5 == want5,
+        "a plan-phase opener resolves, and a DANGLING one is refused like a dangling row",
+        "expected=%s got=%s" % (sorted(want5.items()), sorted(states5.items())))
+
+    bare5 = dict((k.split("#", 1)[1], opener_state(v[0], names5, open5))
+                 for k, v in d5b.gated_rows.items())
+    pin(set(bare5.values()) == {"dangling"},
+        "with NO phase index every plan-phase opener is refused -- the widening only ADDS",
+        "got=%s" % sorted(bare5.items()))
+
+    anchors5 = dict((k.split("#", 1)[1], opener_state(v[0], names4, open4, d5.plan_phases))
+                    for k, v in d4.gated_rows.items())
+    pin(anchors5 == want4,
+        "and a populated phase index does not perturb ANCHOR resolution",
+        "expected=%s got=%s" % (sorted(want4.items()), sorted(anchors5.items())))
+    extra_total += 4
+
     failed += extra_failed[0]
     print("self-test: %d case(s), %d failed" % (len(cases) + extra_total, failed))
     return 1 if failed else 0
@@ -1912,12 +2155,16 @@ def main():
     unopened, dangling, closed_opener = [], [], []
     known = set(n.split("#", 1)[1] for n in after.names)
     known_open = set(n.split("#", 1)[1] for n in after.rows)
+    # ⓘ BOTH namespaces resolve against `after`, never against the base ref, and for
+    # the same reason: an opener is a claim about what will open the row NEXT, so it
+    # has to resolve in the tree as it stands now. `before.plan_phases` is built and
+    # deliberately unused -- deleting a phase from a plan must red the rows citing it.
     unblocked = dict(after.unblocked)
     for k in sorted(after.gated_rows):
         opener, excerpt = after.gated_rows[k]
         # `after.rows` holds OPEN rows only, so a name in `known` but not in
         # `known_open` is a row every one of whose homes is CLOSED.
-        state = opener_state(opener, known, known_open)
+        state = opener_state(opener, known, known_open, after.plan_phases)
         if k in before.gated_rows:
             # Pre-existing: DEBT either way. A verdict that went stale under its
             # author is not a contradiction the author wrote.
@@ -2045,13 +2292,18 @@ def main():
                   "when the work predates this cycle - that closure is net-neutral), or "
                   "reword the opening so it stops claiming a closure it did not make.")
         if unopened or dangling or closed_opener:
-            print("  A GATED ROW NAMES ITS OPENER as `opened by [[D-XX-OPENER]]`, "
-                  "reusing the registry's own link form. The opener must RESOLVE to an "
-                  "OPEN row: a gate whose opener is an unowned event is unfalsifiable "
-                  "and will sit forever, and one whose opener has ALREADY CLOSED is not "
-                  "gated at all -- it is unblocked, and saying otherwise hides "
-                  "schedulable work. A gate whose opener is an OPEN ROW is a dependency "
-                  "-- schedulable, sizable, and visible in the queue.")
+            print("  A GATED ROW NAMES ITS OPENER as `opened by [[...]]`, reusing the "
+                  "registry's own link form. The opener is a TYPED reference and must "
+                  "RESOLVE IN THE NAMESPACE IT NAMES -- either an ANCHOR ROW (`D-XX-OPENER`, "
+                  "which must resolve to an OPEN row) or a PLAN PHASE (`plan-22 OPT8`, "
+                  "`plan-16 CS1`, `plan-27 §11`, which must resolve to a real numbered "
+                  "heading or phase-table id in that plan). A gate whose opener is an "
+                  "unowned event is unfalsifiable and will sit forever, and one whose "
+                  "opener has ALREADY CLOSED is not gated at all -- it is unblocked, and "
+                  "saying otherwise hides schedulable work. A gate whose opener is an open "
+                  "ROW or a scheduled PHASE is a dependency -- owned, sizable, and visible "
+                  "in the queue. DO NOT mint a placeholder row to satisfy this: a row that "
+                  "is not a defect, existing only to be pointed at, is registry pollution.")
             print("  IF THIS ROW IS *ABOUT* GATED ROWS RATHER THAN BEING ONE -- a census, "
                   "a rule, a report that has to quote the vocabulary -- do NOT reword it "
                   "to dodge this check. A row must be able to name the thing it is about. "

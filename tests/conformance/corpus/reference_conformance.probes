@@ -55,12 +55,42 @@
 #                      accepts it" is a union over ALL of them, and the harness
 #                      rejects a narrowed B probe.
 #   @expect-ref accept|reject|varies
-#                      accept → at least one judging oracle must accept, else RED.
-#                      reject → NO judging oracle may accept, else RED.
-#                      varies → host/toolchain-dependent; NO assertion, and it must
-#                               carry `@varies-note`. Every `varies` probe is PRINTED
-#                               in the summary so this escape hatch cannot grow
-#                               quietly.
+#                      THE PIN. It declares what REFERENCE COMPILERS do with this
+#                      construct — not what the compilers on this machine managed
+#                      to say about it. `pin()` reads it and takes no roster
+#                      argument; the roster's opinion goes to `corroborate()`.
+#                      accept → the corpus asserts a reference compiler accepts it.
+#                               DSS rejecting it everywhere is direction A. ⚠ IT IS
+#                               *NOT* A RED FOR NO LOCAL ORACLE TO ACCEPT IT: that
+#                               is the un-refutable negative, reported as
+#                               `not-witnessed` with the full roster and never a
+#                               failure, because no finite roster can refute an
+#                               existential claim. (This line USED to say "at least
+#                               one judging oracle must accept, else RED"; it was
+#                               true until the roster-dependence row
+#                               `D-TEST-GATE-VERDICT-DEPENDS-ON-HOST-TOOLCHAIN`
+#                               split the decision in two, then went stale rather
+#                               than false-loud, and then justified a waiver that
+#                               hid a real gap — see `a_nested_function_gnu`.)
+#                      reject → NO judging oracle may accept, else RED. This one IS
+#                               a measurement red and soundly so: a universal claim
+#                               met by a WITNESS, which is positive evidence and
+#                               reads the same on every host.
+#                      varies → NO assertion in either direction, and it must carry
+#                               `@varies-note`. Every `varies` probe is PRINTED in
+#                               the summary so this escape hatch cannot grow quietly.
+#                      ★ WHEN `varies` IS THE RIGHT ANSWER, AND WHEN IT IS A HOLE.
+#                        Legitimate only when the DIRECTION ITSELF turns on which
+#                        reference you believe — `b_empty_enumerator_list`: DSS
+#                        accepts, MSVC accepts, the gnu family does not, so `reject`
+#                        would pin it as an INVENTION and `accept` as agreement, and
+#                        the corpus genuinely cannot state one reference behaviour.
+#                        WRONG whenever DSS is on the SAME side of every reference:
+#                        if DSS rejects and any reference accepts, the direction is
+#                        A no matter how the references split among themselves, and
+#                        a waiver there is a gap in neither census. Operator's
+#                        disjunction rule (bar A.3b): ONE WORKING REFERENCE MAKES IT
+#                        REQUIRED. ✔It has cost this corpus a row once already.
 #   @varies-note <text>   required iff `@expect-ref varies`; must be non-empty.
 #   @acknowledged-gap <text>
 #                      OPTIONAL. Presence means: a divergence on this probe is a
@@ -211,7 +241,7 @@ int dss_comma_block_array_probe(int n) { int a[1, 2]; a[0] = n; return a[0]; }
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@acknowledged-gap MEASURED: DSS ACCEPTS `case 1, 2:` while all five oracles refuse it with a pure SYNTAX error (gcc `expected ':' or '...' before ','`, clang `expected ':' after 'case'`, cl `C2051 case expression not constant`). /shapes/caseLabel takes the full `expression`, so the comma operator is admitted where C 6.8.4.2 requires a constant-expression -- and the shape it most resembles is the multi-value case label that no C compiler has, so a reader could reasonably believe `case 1, 2:` matches both values.
+@acknowledged-gap MEASURED: DSS ACCEPTS `case 1, 2:` while all five oracles refuse it with a pure SYNTAX error (gcc `expected ':' or '...' before ','`, clang `expected ':' after 'case'`, cl `C2051 case expression not constant`). /shapes/caseLabel takes the full `expression`, so the comma operator is admitted where C 6.8.4.2 requires a constant-expression -- and the shape it most resembles is the multi-value case label that no C compiler has, so a reader could reasonably believe `case 1, 2:` matches both values. ✔MEASURED 2026-08-24 that the reader is WRONG AT RUNTIME, which makes this a SILENT MISCOMPILE and not merely a permissive accept: for elf64-x86_64-linux the arm lowers to `cmp $0x2,%r15d` / `je` (the left operand becomes a dead `mov $0x1` overwritten by `mov $0x2` on the next instruction), and linking the DSS object against a gcc driver and RUNNING it prints `sel(0)=0 sel(1)=0 sel(2)=7 sel(3)=0` -- the label matches ONLY 2, so the value the author wrote FIRST is the one silently discarded.
 @why /shapes/caseLabel takes the full `expression`; C 6.8.4.2 requires a constant-expression. `case 1, 2:` reads to a reference compiler as an attempt at the (non-existent) multi-value case label.
 @code
 int dss_comma_case_probe(int x) { switch (x) { case 1, 2: return 7; } return 0; }
@@ -258,7 +288,7 @@ enum DssElidedEnum { DSS_EE_A, , DSS_EE_B };
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@acknowledged-gap MEASURED: DSS ACCEPTS `{ 1, , 3 }`. Same `{optional}`-after-Comma shape as the enumerator list, in /shapes/braceInitList. This is the most dangerous of the elision family: the hole is SILENT, so the reader's third element lands at index 2 in DSS and the file does not compile anywhere else.
+@acknowledged-gap MEASURED: DSS ACCEPTS `{ 1, , 3 }`. Same `{optional}`-after-Comma shape as the enumerator list, in /shapes/braceInitList. This is the most dangerous of the elision family, and the acceptance is not merely permissive -- it SILENTLY MISCOMPILES. ✔MEASURED 2026-08-24: compiling this exact probe emits a 12-byte `.data` reading `01 00 00 00 03 00 00 00 00 00 00 00` for BOTH fixed targets (elf64-x86_64-linux read with WSL `objdump -s`, pe64-x86_64-windows identical), and adding a reader to the same TU, linking it against a gcc driver and RUNNING it prints `probe[0]=1 probe[1]=3 probe[2]=0`. So the hole is DROPPED, not zero-filled: every element after it shifts DOWN one index and the tail is zero -- `{ 1, , 3 }` means `{1,3,0}`, never `{1,0,3}`. ⚠ THIS SENTENCE PREVIOUSLY SAID THE `3` "lands at index 2", which was never measured and is the BENIGN reading (the one a hole-means-zero semantics would produce); it understated the row, so size the fix from the bytes above and not from that. The file does not compile anywhere else, so nothing outside DSS can witness the difference.
 @why /shapes/braceInitList has the same `{optional}`-after-Comma shape as enumBody, so an interior hole in an initializer list is admitted.
 @code
 static int dss_elided_init_probe[3] = { 1, , 3 };
@@ -876,9 +906,9 @@ int dss_label_value_probe(int n) { void *p = &&target; if (n) goto *p; return 0;
 @mode extended
 @min-stdc 0
 @families gnu
-@expect-ref varies
-@varies-note A gcc-only extension: gcc accepts a nested function definition, clang has never implemented it and rejects. Both are the `gnu` family, so the family-level verdict genuinely differs BY COMPILER and any single declared expectation would be false on some host.
-@why GNU nested functions.
+@expect-ref accept
+@acknowledged-gap MEASURED direction-A gap: DSS rejects a nested function definition for BOTH fixed targets with `error[P0001]: expected 'EndStatement' -- got '{'`, while win-gcc@Strawberry 13.2.0 and wsl-gcc-13 13.3.0 both compile it clean under `-std=gnu2x -c` (rc=0). ⚠ THIS ROW WAS A `varies` WAIVER UNTIL 2026-08-24 AND THE WAIVER WAS WRONG, so read why before restoring it. Its note argued that because clang 19.1.1 and 18.1.3 reject it (`function definition is not allowed here`) while gcc accepts, "any single declared expectation would be false on some host" -- but `@expect-ref` is a claim about REFERENCE BEHAVIOUR, not about a roster, and the harness is built so that the two cannot be confused: `pin()` takes NO roster argument, and an `accept` row that nothing local accepts routes to `not-witnessed`, which is printed with the full roster and NEVER reds. So `accept` is safe on a clang-only host and pins the row direction-A on every host, which is what the operator's disjunction rule (bar A.3b, "one WORKING reference makes it REQUIRED") says it is. Contrast b_empty_enumerator_list, where the waiver is still correct and for a different reason: there DSS ACCEPTS, so the row would pin as a direction-B INVENTION if the corpus declared `reject` and as agreement if it declared `accept` -- the direction itself, not just the strength of the evidence, turns on which reference you believe. Here it does not: DSS rejects, some reference accepts, and that is a gap in exactly one direction.
+@why GNU nested functions. A reference compiler ACCEPTS them (gcc, both hosts), so under the disjunction rule DSS must too; that clang never implemented them narrows the evidence, not the requirement.
 @code
 int dss_nested_fn_probe(int n) { int inner(int x) { return x + 1; } return inner(n); }
 @end

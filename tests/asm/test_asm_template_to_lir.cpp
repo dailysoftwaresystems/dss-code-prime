@@ -1085,6 +1085,96 @@ TEST(AsmTemplateToLir, PercentThreeWithTwoOperandsFailsLoudNamingTheBoundSet) {
     }
 }
 
+// ★★★ THE WIDTH VIEW (`%w0` / `%x0`) STATES THE **DECLARED** WIDTH, NOT THE
+// BINDING'S OWN — AND THE PROOF IS THAT THE TEMPLATE'S BYTES EQUAL THE
+// STANDALONE `.s`'s.
+//
+// ★★ THE HARNESS MINTS EVERY BINDING AT 64 BITS, WHICH IS WHAT MAKES THIS
+// DISCRIMINATE RATHER THAN AGREE BY LUCK. A build that ignored the letter and
+// used the binding's own width would encode the 64-bit `mov` for BOTH rows, and
+// the narrow row would match the wide `.s` control instead of the narrow one.
+// ⚠ AND THE THIRD ASSERTION IS THE ONE A "both compiled fine" TEST WOULD MISS:
+// the two views must NOT produce the same bytes. Two rows that both encoded
+// 64-bit would satisfy every "equals its own control" check written in the
+// obvious order.
+TEST(AsmTemplateToLir, AWidthViewStatesTheDeclaredWidthAndNotTheBindingsOwn) {
+    auto const narrow =
+        runTemplate(kArm, "mov %w0, %w1\n", {"%0", "%1"}, {"x0", "x1"});
+    ASSERT_TRUE(narrow->parsed)
+        << "`%w0` did not PARSE — the template lexer mode is not minting the "
+           "composed width-view lexeme:\n" << messages(*narrow);
+    ASSERT_TRUE(narrow->ok) << messages(*narrow);
+
+    auto const wide =
+        runTemplate(kArm, "mov %x0, %x1\n", {"%0", "%1"}, {"x0", "x1"});
+    ASSERT_TRUE(wide->parsed) << messages(*wide);
+    ASSERT_TRUE(wide->ok) << messages(*wide);
+
+    // The SAME two instructions written as a standalone `.s`, which is the one
+    // control that cannot be satisfied by a coincidence: the `.s` register
+    // spelling is where this pipeline's width has always come from.
+    auto const sNarrow = runTemplate(kArm, "mov w0, w1\n", {});
+    ASSERT_TRUE(sNarrow->ok) << messages(*sNarrow);
+    auto const sWide = runTemplate(kArm, "mov x0, x1\n", {});
+    ASSERT_TRUE(sWide->ok) << messages(*sWide);
+
+    EXPECT_EQ(narrow->bytes, sNarrow->bytes)
+        << "`mov %w0, %w1` must encode exactly `mov w0, w1`";
+    EXPECT_EQ(wide->bytes, sWide->bytes)
+        << "`mov %x0, %x1` must encode exactly `mov x0, x1`";
+    EXPECT_NE(narrow->bytes, sWide->bytes)
+        << "the two views encoded the same instruction — the declared width is "
+           "not being read";
+}
+
+// ★★★ ONE LETTER, TWO DIALECTS, TWO WIDTHS — THE MEASUREMENT THAT PUTS THE
+// TABLE ON THE DIALECT AND NOT IN SHARED SUBSTRATE.
+//
+// ✔MEASURED 2026-08-24 by execution on gcc 13.3.0, both ports, `-O0` and `-O2`:
+// `%w0` renders `w0` (32 bits) under `aarch64-linux-gnu-gcc` and `%ax` (16
+// bits) under x86-64 gcc. A single shared letter table would therefore be wrong
+// for one of its two readers BY CONSTRUCTION, which is why the letters live in
+// each dialect's `assembly.templateModifiers`. This test is that sentence made
+// executable: the same three bytes of template text, two dialects, two widths.
+TEST(AsmTemplateToLir, TheSameWidthViewLetterMeansADifferentWidthInEachDialect) {
+    auto const arm =
+        runTemplate(kArm, "mov %w0, %w1\n", {"%0", "%1"}, {"x0", "x1"});
+    ASSERT_TRUE(arm->ok) << messages(*arm);
+    auto const arm32 = runTemplate(kArm, "mov w0, w1\n", {});
+    ASSERT_TRUE(arm32->ok) << messages(*arm32);
+    EXPECT_EQ(arm->bytes, arm32->bytes) << "`%w` must be 32 bits on aarch64";
+
+    // The AT&T document declares `w` as the SIXTEEN-bit view, so the same
+    // letter must reach `%ax`/`%cx` and the 16-bit mnemonic.
+    auto const att =
+        runTemplate(kX86, "movw %w1, %w0\n", {"%0", "%1"}, {"rax", "rcx"});
+    ASSERT_TRUE(att->parsed) << messages(*att);
+    ASSERT_TRUE(att->ok) << messages(*att);
+    // ⚠ THE CONTROL IS WRITTEN WITH THE **ESCAPE**, NOT WITH A BARE `%`. Every
+    // run in this harness is read in the dialect's TEMPLATE lexer mode, where
+    // `%` is the placeholder sigil and not the register sigil — so `%ax` there
+    // is a malformed placeholder, and `%%ax` is how a template names a machine
+    // register at all (GNU 6.47.2.3). ✔MEASURED: the first draft of this test
+    // wrote the bare form and the CONTROL failed with "'cx'", i.e. the control
+    // was not the instruction it claimed to be. The aarch64 half needs no
+    // escape because that dialect writes no register sigil.
+    auto const att16 = runTemplate(kX86, "movw %%cx, %%ax\n", {});
+    ASSERT_TRUE(att16->ok) << messages(*att16);
+    EXPECT_EQ(att->bytes, att16->bytes) << "`%w` must be 16 bits on x86-64";
+
+    // ⚠ AND THE NEGATIVE HALF, because "equals the 16-bit control" would also
+    // hold if the bytes were empty. The 32-bit mnemonic against a 16-bit view is
+    // a width disagreement and must be REFUSED by name — which is only true if
+    // `%w` really is 16 here.
+    auto const mismatched =
+        runTemplate(kX86, "movl %w1, %w0\n", {"%0", "%1"}, {"rax", "rcx"});
+    ASSERT_TRUE(mismatched->parsed) << messages(*mismatched);
+    EXPECT_FALSE(mismatched->ok)
+        << "`movl` over a 16-bit view was accepted: " << messages(*mismatched);
+    EXPECT_NE(messages(*mismatched).find("16 bits"), std::string::npos)
+        << messages(*mismatched);
+}
+
 // `%[name]` — GNU 6.47.2.3's SYMBOLIC operand name. The engine holds no `%N`
 // convention, so a caller that binds the symbolic spelling gets it resolved by
 // exactly the same comparison the numeric one uses. ★ THAT IS THE POINT OF THE
@@ -1689,8 +1779,15 @@ TEST(AsmTemplateToLir, ADialectMintingThePlaceholderKindUnderItsOwnBytesIsRefuse
 // have left the new one's half of the rule unexercised — which is exactly how a
 // REQUIRE-ALL block quietly becomes a REQUIRE-MOST one.
 TEST(AsmTemplateToLir, HalfATemplateSurfaceIsRefusedAtLoadNamingEveryKey) {
-    constexpr std::array<char const*, 3> kCapability{
-        "templateLexerMode", "templateOperandRule", "templateLabelRule"};
+    // ⚠ THE SET GREW TO FIVE IN P30 AND THIS LIST HAD TO GROW WITH IT. A test
+    // that kept enumerating three would still pass — dropping any of the three
+    // is still refused — while asserting NOTHING about the two new members, and
+    // the whole point of this pin is that a PROPER SUBSET is refused. The
+    // per-arm `ASSERT_TRUE(contains)` below is what keeps a stale name from
+    // making an arm vacuous.
+    constexpr std::array<char const*, 5> kCapability{
+        "templateLexerMode", "templateOperandRule", "templateLabelRule",
+        "templateModifierRule", "templateModifiers"};
     for (auto const& p : {kX86, kArm}) {
         for (auto const* dropped : kCapability) {
             auto const half = loadDialectMutated(
@@ -1710,6 +1807,83 @@ TEST(AsmTemplateToLir, HalfATemplateSurfaceIsRefusedAtLoadNamingEveryKey) {
                     << "'): the refusal must name EVERY key of the set, so the "
                        "author learns what the capability actually is: " << why;
             }
+        }
+    }
+}
+
+// ★★★ EVERY WAY A WIDTH-VIEW DECLARATION CAN BE INCOHERENT IS REFUSED AT LOAD,
+// AND EACH ARM IS **EXERCISED** RATHER THAN READ.
+//
+// ⚠ THE FIRST ARM IS THE ONE THAT IS NOT OBVIOUS AND IS THE REASON THIS TEST
+// EXISTS. The letters are composed with the LANGUAGE's placeholder sigil, so a
+// dialect declaring `l` mints the exact bytes `%l` that `asm goto`'s label sigil
+// already owns. The tokenizer resolves competing lexemes by LENGTH and the two
+// are the same length, so which meaning survives is decided by table iteration
+// order — and BOTH outcomes are silent miscompiles (`%l2` decoded as a width
+// view of operand 2, or `%l0` refused as an out-of-range label). A refusal
+// naming both owners is the only honest answer.
+//
+// ⚠ THE WIDTH ARM IS NOT PEDANTRY EITHER: `lirInstWidthBits` states 8/16/32/64
+// and nothing else, so a declared 24 would be carried onto the instruction and
+// read back as 64 — a wrong-width operation with a clean build log, which is
+// precisely what the retired `S0067` refusal existed to prevent.
+TEST(AsmTemplateToLir, AnIncoherentWidthViewDeclarationIsRefusedAtLoad) {
+    struct Arm {
+        char const* what;
+        char const* modifiers;   // JSON for `assembly.templateModifiers`
+        char const* mustSay;
+    };
+    constexpr Arm kArms[] = {
+        {"a letter colliding with the label sigil",
+         R"([{"letter":"l","widthBits":32}])", "'l'"},
+        {"a width LIR cannot state",
+         R"([{"letter":"z","widthBits":24}])", "24"},
+        {"no letters at all",
+         R"([])", "NON-EMPTY"},
+        {"one letter, two widths",
+         R"([{"letter":"z","widthBits":32},{"letter":"z","widthBits":64}])",
+         "declared twice"},
+        {"a letter with no width",
+         R"([{"letter":"z"}])", "widthBits"},
+        {"an unknown key in a row",
+         R"([{"letter":"z","widthBits":32,"widthBytes":4}])", "widthBytes"},
+    };
+    for (auto const& p : {kX86, kArm}) {
+        for (auto const& a : kArms) {
+            auto const broken = loadDialectMutated(
+                p.dialect, [&a](nlohmann::json& doc) {
+                    doc["assembly"]["templateModifiers"] =
+                        nlohmann::json::parse(a.modifiers);
+                });
+            EXPECT_EQ(broken.grammar, nullptr)
+                << p.dialect << " (" << a.what << "): the document loaded";
+            auto const why = joined(broken.loadErrors);
+            EXPECT_NE(why.find(a.mustSay), std::string::npos)
+                << p.dialect << " (" << a.what
+                << "): the refusal must name what is wrong: " << why;
+        }
+    }
+}
+
+// ★★★ A `templateModifierRule` NAMING A RULE THE PLACEHOLDER FAMILY ALREADY
+// USES IS REFUSED — the plausible typo, and a totally silent one. Naming the
+// OPERAND rule makes the width-view arm match nothing, so every `%w0` would
+// decode at the operand's own type width; naming the LABEL rule routes a width
+// view to `resolveBranchTarget`, a different host virtual entirely.
+TEST(AsmTemplateToLir, ATemplateModifierRuleNamingAnExistingMemberIsRefused) {
+    for (auto const& p : {kX86, kArm}) {
+        for (char const* clash : {"asmTemplateOperand", "asmTemplateLabelRef"}) {
+            auto const strayed = loadDialectMutated(
+                p.dialect, [clash](nlohmann::json& doc) {
+                    doc["assembly"]["templateModifierRule"] = clash;
+                });
+            EXPECT_EQ(strayed.grammar, nullptr)
+                << p.dialect << ": 'templateModifierRule' = '" << clash
+                << "' loaded clean — the width-view arm is then dead or "
+                   "mis-routed and nothing says so";
+            EXPECT_NE(joined(strayed.loadErrors).find("templateModifierRule"),
+                      std::string::npos)
+                << p.dialect << ": " << joined(strayed.loadErrors);
         }
     }
 }

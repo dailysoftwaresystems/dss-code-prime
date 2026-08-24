@@ -79,8 +79,29 @@ matcher over the *older* tree reproduces all 17 raised ceilings exactly, so ZERO
 of that movement was an un-widened regression. Nothing was ever laundered — but
 nothing in the tool could have told the difference, and that was the defect.
 
-Exit codes: 0 OK · 1 a ceiling was exceeded or is stale · 2 the scan collapsed
-· 3 usage error.
+★★★ AND THE READ-ONLY VERB CHECKS THE INVENTORY'S `_comment` AGAINST
+`_INVENTORY_COMMENT`, BECAUSE IT IS THE ONLY VERB THAT **CAN**. `--write` and
+`--baseline` both STAMP the literal onto the JSON, so each resolves a
+disagreement — always in the CODE's favour — before anyone could observe that
+there was one. Until 2026-08-24 the literal had no NAME: it was an anonymous list
+inside `write_inventory`, so there was nothing to compare the file against and the
+read-only path asserted NOTHING about the one file this guard owns outright.
+⇒ a mismatch, or a `_comment` key deleted outright, is now a REFUSAL that quotes
+BOTH sides whole and names which side `--write` stamps. Graded with the ratchet
+failures rather than the collapses: the census ran and every ceiling still binds,
+so the COUNT is trustworthy — it is the inventory's PROSE that is not, and prose
+is what exit 1 governs here. Species record:
+D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED.
+ⓘ `--write` additionally ANNOUNCES an overwrite when the text it replaced
+disagreed, because the read-only arm structurally cannot see that direction:
+after the stamp the two AGREE again, so a correction made only in the JSON would
+be gone with rc=0 and nothing left to read. `--baseline` deliberately does NOT
+announce — it never reads the old inventory at all, being the bootstrap verb that
+must work when there IS no inventory, and its own ⚠ already sends the reader to
+review the written file as a diff, where a changed `_comment` is plainly visible.
+
+Exit codes: 0 OK · 1 a ceiling was exceeded or is stale, or the inventory's
+`_comment` diverged from the literal · 2 the scan collapsed · 3 usage error.
 
 Usage:
     python scripts/check-plan-citations/check-plan-citations.py             # verify
@@ -396,26 +417,57 @@ def census(root):
     return out
 
 
+# ★★★ THIS LITERAL IS THE INVENTORY'S SOURCE OF TRUTH, AND THAT IS WHY IT IS NOW
+# A NAMED CONSTANT RATHER THAN AN ANONYMOUS LIST INSIDE `write_inventory`.
+# Whatever these strings say, `--write` STAMPS ONTO `inventory.json`; a correction
+# made in the JSON alone is undone by the next burn-down, silently, with rc=0. A
+# literal with no name cannot be compared against the file it governs, so the
+# read-only path had nothing to compare and asserted nothing about it -- and the
+# species is one this battery has already suffered once, in a sibling guard whose
+# on-disk text was corrected while its literal was not
+# (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+# ★ THE TEXT IS UNCHANGED BY THE EXTRACTION, deliberately: ✔MEASURED 2026-08-24,
+# the on-disk `_comment` and this literal were byte-identical in UTF-8 before the
+# refusal was wired in, and rewording either one in the same edit that adds the
+# comparison would have made the first green run prove nothing.
+_INVENTORY_COMMENT = [
+    "Per-document ceilings for POSITIONAL citations (`path:line`).",
+    "A ceiling may only come DOWN. Convert citations to a stable reference -- a",
+    "symbol name, a comment id, or a [[D-ANCHOR]] -- and lower the ceiling in the",
+    "same commit. A raised ceiling is a new unreliable citation and reds the gate.",
+    "This file is DEBT, not a pass: green means no NEW positional citation landed.",
+]
+
+# ★ A DISTINCT VALUE FOR "THE KEY IS NOT THERE", and it is not defensive padding:
+# a `_comment` key that has been DELETED is a real divergence, and
+# `doc.get("_comment", _INVENTORY_COMMENT)` -- the obvious spelling -- would have
+# answered "they match" for the one input most likely to be wrong.
+_MISSING = object()
+
+
 def load_inventory(root):
+    """-> `(ceilings, comment)`; `comment` is `_MISSING` when the key is absent.
+
+    ★★ THE COMMENT COMES BACK RAW AND THE **CALLER** DECIDES WHAT A DIVERGENCE
+    MEANS FOR ITS VERB, rather than this function refusing on the spot. `--write`
+    calls it too, and `--write` is the verb that REPAIRS a divergence by
+    re-stamping the literal; a check buried here would make the divergence
+    unfixable by the only tool able to fix it.
+    """
     path = os.path.join(root, INVENTORY_REL)
     if not os.path.isfile(path):
         raise Collapse(
             "the inventory %s does not exist. Without it every count is "
             "unconstrained and this guard asserts nothing." % INVENTORY_REL)
     with io.open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)["ceilings"]
+        doc = json.load(fh)
+    return doc["ceilings"], doc.get("_comment", _MISSING)
 
 
 def write_inventory(root, ceilings):
     path = os.path.join(root, INVENTORY_REL)
     body = {
-        "_comment": [
-            "Per-document ceilings for POSITIONAL citations (`path:line`).",
-            "A ceiling may only come DOWN. Convert citations to a stable reference -- a",
-            "symbol name, a comment id, or a [[D-ANCHOR]] -- and lower the ceiling in the",
-            "same commit. A raised ceiling is a new unreliable citation and reds the gate.",
-            "This file is DEBT, not a pass: green means no NEW positional citation landed.",
-        ],
+        "_comment": _INVENTORY_COMMENT,
         "ceilings": dict(sorted(ceilings.items())),
     }
     tmp = path + ".tmp"
@@ -423,6 +475,55 @@ def write_inventory(root, ceilings):
         json.dump(body, fh, indent=2, ensure_ascii=False)
         fh.write("\n")
     os.replace(tmp, path)
+
+
+def _comment_text(label, value):
+    """One side of a `_comment` disagreement, quoted WHOLE and never trimmed.
+
+    ★ Untrimmed on purpose: the reader has to decide WHICH SIDE IS TRUE, and a
+    truncated quotation of the text under judgement is exactly the evidence that
+    decision needs.
+    """
+    if value is _MISSING:
+        return "    %s: there is no `_comment` key at all." % label
+    if not isinstance(value, list):
+        return "    %s: not a list of strings -- %r" % (label, value)
+    out = ["    %s -- %d line(s):" % (label, len(value))]
+    out.extend("      | %s" % line for line in value)
+    return "\n".join(out)
+
+
+def report_comment_divergence(comment):
+    """Print the refusal for a diverged inventory `_comment`. -> EXIT_RATCHET.
+
+    ★ GRADED WITH THE RATCHET FAILURES RATHER THAN THE COLLAPSES, following THIS
+    guard's exit vocabulary and not a sibling's: the census ran, the floors held,
+    and every ceiling still binds, so the COUNT is trustworthy. It is the
+    inventory's PROSE that is not -- and unreliable prose is what exit 1 already
+    governs here.
+    ⚠ PRINTED ON STDOUT, like every other finding this guard emits. `_arm`
+    redirects stdout alone, so a refusal written to stderr would be invisible to
+    its own self-test: the arm would see the exit code and none of the message,
+    which is the exact vacuity every red arm here exists to refuse.
+    """
+    print("check-plan-citations: FAIL -- the inventory's `_comment` has DIVERGED "
+          "from `_INVENTORY_COMMENT`, the in-code literal that is its source of "
+          "truth:")
+    print(_comment_text("in code, `_INVENTORY_COMMENT`", _INVENTORY_COMMENT))
+    print(_comment_text("on disk, %s" % INVENTORY_REL.replace("\\", "/"), comment))
+    print("")
+    print("  WHY THIS IS A REFUSAL AND NOT A COSMETIC DIFF: `--write` STAMPS the")
+    print("  in-code literal onto the JSON. For as long as the two disagree, the")
+    print("  on-disk text is one burn-down away from being replaced by whatever the")
+    print("  literal says -- silently, with rc=0 -- INCLUDING by text that has since")
+    print("  become false.")
+    print("  FIX: DECIDE WHICH SIDE IS TRUE FIRST; the repair is not symmetric. If")
+    print("  the CODE is right, re-stamp the JSON:")
+    print("      python scripts/check-plan-citations/check-plan-citations.py --write")
+    print("  If the JSON is right, edit `_INVENTORY_COMMENT` to match it -- running")
+    print("  `--write` would DESTROY the corrected text. Species record:")
+    print("      D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED")
+    return EXIT_RATCHET
 
 
 def run(root, write, baseline=False):
@@ -440,7 +541,7 @@ def run(root, write, baseline=False):
         print("    Use `--write` for burn-down; it can only lower.")
         return EXIT_OK
 
-    ceilings = load_inventory(root)
+    ceilings, comment = load_inventory(root)
 
     # ★★ `--write` MAY ONLY LOWER, AND IT WRITES NOTHING WHEN IT REFUSES.
     # An absent entry is a ceiling of ZERO, so a NEW document carrying citations
@@ -466,7 +567,30 @@ def run(root, write, baseline=False):
         write_inventory(root, now)
         print("check-plan-citations: re-baselined %d document(s), %d citation(s)"
               % (len(now), sum(now.values())))
+        # ★★★ ANNOUNCE A COMMENT OVERWRITE. THE READ-ONLY REFUSAL STRUCTURALLY
+        # CANNOT CATCH THIS DIRECTION, which is exactly why the print belongs
+        # here and not to the other verb: once `--write` has stamped the literal
+        # the two AGREE again, so the next read-only run is GREEN and a
+        # correction that existed only in the JSON is gone with rc=0 and nothing
+        # left to read. Loud here, or lost forever.
+        if comment != _INVENTORY_COMMENT:
+            print("  ⚠ REWROTE the `_comment` block: the on-disk text disagreed with")
+            print("    `_INVENTORY_COMMENT` and has been REPLACED by it. If the on-disk")
+            print("    wording was the CORRECT one, that correction is now gone --")
+            print("    restore it by editing the LITERAL, the side `--write` stamps.")
         return EXIT_OK
+
+    # ★★★ CHECKED BEFORE ANY TREE-DERIVED VERDICT, AND THE ORDER IS DELIBERATE:
+    # a divergence is a defect in the INSTRUMENT, not in the subject, and a
+    # finding reported by an instrument whose own source of truth is in
+    # disagreement cannot be acted on until you know which text is true.
+    # ⚠ DO NOT "IMPROVE" THIS BY MOVING IT BELOW THE CITATION VERDICTS. Nothing
+    # is hidden by putting it first -- the guard stays RED, and the gate stays
+    # shut, until every arm is clean; a second run is the whole cost. The inverse
+    # order costs the same second run and buries the instrument defect under the
+    # subject one.
+    if comment != _INVENTORY_COMMENT:
+        return report_comment_divergence(comment)
 
     raised, stale = [], []
     for doc, n in sorted(now.items()):
@@ -518,7 +642,7 @@ def run(root, write, baseline=False):
 # an arm that checks only the code cannot tell which one it proved. That mistake
 # was measured in a sibling guard in this same cycle.
 
-EXPECTED_ARMS = 34
+EXPECTED_ARMS = 39
 _RAN = None
 
 # ⚠ THE MUTATION FIXTURE IS ASSEMBLED, NOT SPELLED OUT. A literal `path:line` in
@@ -619,8 +743,15 @@ def _pipe_arms(fact):
                     "See %s for the walk.\n" % (_FIXTURE % 2020))
         io.open(os.path.join(box, "src", "x.cpp"), "w",
                 encoding="utf-8", newline="").write("int x;\n")
+        # ⚠ THE `_comment` IS WRITTEN FROM THE LITERAL, NOT OMITTED. This fixture
+        # drives the READ-ONLY path, which now refuses a `_comment` that is
+        # absent or divergent -- so a bare `{"ceilings": {}}` here would red on
+        # the WRONG refusal and this arm would stop witnessing the encoding
+        # property it exists for while still reporting a non-zero exit.
         io.open(os.path.join(box, INVENTORY_REL), "w",
-                encoding="utf-8", newline="").write('{"ceilings": {}}\n')
+                encoding="utf-8", newline="").write(
+                    json.dumps({"_comment": _INVENTORY_COMMENT, "ceilings": {}},
+                               indent=2, ensure_ascii=False) + "\n")
 
         driver = ("import importlib.util, sys\n"
                   "spec = importlib.util.spec_from_file_location('g', %r)\n"
@@ -933,6 +1064,55 @@ def selftest(root):
                                       now.get(rel_subject)))
         io.open(inv_path, "w", encoding="utf-8", newline="").write(pristine_inv)
         io.open(subject, "w", encoding="utf-8", newline="").write(pristine)
+
+        # ═══ THE INVENTORY'S OWN PROSE ══════════════════════════════════════
+        # ★★★ THE READ-ONLY PATH IS THE ONLY PATH THAT CAN SEE A DIVERGENCE,
+        # which is exactly why it went unasserted for so long: `--write` and
+        # `--baseline` both STAMP `_INVENTORY_COMMENT`, so each resolves the
+        # disagreement -- always in the CODE's favour -- before anyone could
+        # observe there was one.
+        # ⓘ THERE IS DELIBERATELY NO "AN IDENTICAL COMMENT IS GREEN" ARM. Arm 0
+        # and every `b RESTORED` arm already depend on it, because the replica
+        # carries the REAL inventory; a comparison that always fired would red
+        # all of them. A separate arm would assert what a dozen arms prove.
+        def _stamp_comment(value):
+            body = json.load(io.open(inv_path, encoding="utf-8"))
+            if value is _MISSING:
+                body.pop("_comment", None)
+            else:
+                body["_comment"] = value
+            io.open(inv_path, "w", encoding="utf-8", newline="").write(
+                json.dumps(body, indent=2, ensure_ascii=False) + "\n")
+
+        _STALE_COMMENT = ["a sentence this guard's literal no longer says."]
+        _stamp_comment(_STALE_COMMENT)
+        # ★ ASSERTED BY REFERENCE, never by a copied string: a hard-coded
+        # quotation of `_INVENTORY_COMMENT` inside its own self-test would be one
+        # more copy of the very text whose divergence is the subject, and it
+        # would rot the first time the literal is reworded.
+        ok &= _arm("21 COMMENT-DIVERGED", tmp, EXIT_RATCHET,
+                   says=("has DIVERGED", _STALE_COMMENT[0],
+                         _INVENTORY_COMMENT[0]),
+                   not_says="new positional citation")
+        _stamp_comment(_MISSING)
+        ok &= _arm("22 COMMENT-ABSENT", tmp, EXIT_RATCHET,
+                   says="no `_comment` key",
+                   not_says="new positional citation")
+
+        # ★ `--write` must still REPAIR: it is the verb the refusal above sends
+        # the reader to, so an arm proving only the refusal would leave the
+        # remedy unproven -- and the ANNOUNCEMENT is the half no read-only run
+        # can ever witness, because after the stamp the two agree again and the
+        # next run is green with nothing left to read.
+        _stamp_comment(_STALE_COMMENT)
+        ok &= _arm("23 WRITE-REPAIRS-AND-ANNOUNCES", tmp, EXIT_OK, write=True,
+                   says=("re-baselined", "REWROTE the `_comment` block"))
+        ok &= _fact("23b COMMENT-NOW-MATCHES-THE-LITERAL",
+                    json.load(io.open(inv_path, encoding="utf-8"))["_comment"]
+                    == _INVENTORY_COMMENT,
+                    "the on-disk block is the literal, element for element")
+        io.open(inv_path, "w", encoding="utf-8", newline="").write(pristine_inv)
+        ok &= _arm("23c GREEN-AFTER-REPAIR", tmp, EXIT_OK)
 
         ok &= _pipe_arms(_fact)
 

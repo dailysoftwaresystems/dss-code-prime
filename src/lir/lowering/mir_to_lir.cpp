@@ -2435,18 +2435,20 @@ struct Lowerer {
                                  fpsiSrcWidth);
             }
             case MirOpcode::FPToUI: {
-                // c78 (D-CSUBSET-FP-TO-UI-CODEGEN): fp_to_ui carries the
-                // SAME CVTTSD2SI/CVTTSS2SI encodings as fp_to_si, keyed on
-                // the SOURCE float width. A double→U32 conversion (sqlite's
-                // occurrence) truncates via CVTTSD2SI r64 and the U32 result
-                // reads its low 32 bits — VALUE-CORRECT because any double in
-                // the U32 range [0, 2^32) fits the signed-64 CVTTSD2SI result
-                // exactly (gcc emits the identical `cvttsd2si rax, xmm0`). The
-                // full-range unsigned-i64 case (a double ≥ 2^63) needs the
-                // conditional-subtract sequence — deferred
-                // (D-CSUBSET-UI-FROM-FP-UNSIGNED-I64; sqlite stays in range).
-                // Threads the source width like FPToSI (the result-width
-                // default would mis-key the SOURCE axis).
+                // D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE
+                // (closes D-CSUBSET-UI-FROM-FP-UNSIGNED-I64, 2026-08-24).
+                // `fp_to_ui` is realized by the TARGET-DECLARED instruction
+                // SEQUENCE — one step on arm64 (FCVTZU, natively full-range
+                // from both a D and an S source), seven on x86-64, which has
+                // no float→unsigned instruction at all and expands to clang's
+                // branchless truncate-both-and-select form. From c78 until
+                // this cycle the x86 row instead declared the SIGNED
+                // CVTTSD2SI/CVTTSS2SI, which was exact below 2^63 and
+                // silently returned 0x8000000000000000 above it, at BOTH
+                // source float widths. Nothing arch-specific happens here:
+                // this arm threads the SOURCE float width (the result-width
+                // default would mis-key the axis, exactly as for FPToSI) and
+                // `lowerNAryOp` emits whatever the target declared.
                 auto const fuOps = mir.instOperands(id);
                 if (fuOps.size() == 1
                     && !requireEncodedFloatWidth(id, mir.instType(fuOps[0]),
@@ -2462,7 +2464,17 @@ struct Lowerer {
             case MirOpcode::SIToFP:
             case MirOpcode::UIToFP: {
                 // D-CSUBSET-INT-FLOAT-CONVERSION (int→float codegen): cvtsi2sd /
-                // SCVTF. Like FPToSI's MIRROR, the encoded form keys on the SOURCE
+                // SCVTF for the SIGNED arm. ⚠ THE UNSIGNED ARM IS NO LONGER THE
+                // SAME INSTRUCTION — see
+                // D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE
+                // (closes D-CSUBSET-UI-TO-FP-UNSIGNED-I64,
+                // 2026-08-24): `ui_to_fp` is realized by the target-declared
+                // SEQUENCE (arm64: one UCVTF; x86-64: split the source into two
+                // sub-2^32 halves, convert each exactly, and recombine with ONE
+                // correctly-rounded add). Sharing cvtsi2sd between the two arms
+                // was wrong not only above 2^63 but above 2^31, because the
+                // width-32 variant is a SIGNED THIRTY-TWO-BIT read.
+                // Like FPToSI's MIRROR, the encoded form keys on the SOURCE
                 // INTEGER width, NOT the (float) result width — a 64-bit source
                 // selects the REX.W cvtsi2sd xmm,r64 / SCVTF Dd,Xn form, a 32-bit
                 // source the no-REX.W cvtsi2sd xmm,r32 / SCVTF Dd,Wn form. The
@@ -4435,6 +4447,39 @@ struct Lowerer {
         // magnitudes.
         LirReg const result = lir.newVReg(LirRegClass::GPR);
         if (!needsChain || !targetHasMovkLadder()) {
+            // ⚠ D-LIR-BARE-CONST-TRUNCATES-BEYOND-IMM32. The inline
+            // `mov reg, imm32` operand is a THIRTY-TWO-BIT slot, so a value
+            // outside int32 must NOT ride it — `static_cast<int32_t>` would
+            // silently drop the high half (0x41F0000000000000 → 0). Every
+            // pre-existing caller passed a bounded value, which is why this
+            // never fired; the lowering-sequence `const` operand kind is the
+            // first caller that can pass a full 64-bit bit pattern. Route it
+            // through the SAME `mov r64, imm64` LiteralPool carrier
+            // `lowerConst`'s wide-integer arm uses, capability-probed exactly
+            // as there — never an arch identity.
+            if (value < std::numeric_limits<std::int32_t>::min()
+                || value > std::numeric_limits<std::int32_t>::max()) {
+                if (!targetHasMovImm64()) {
+                    dss::report(reporter,
+                        DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                        DiagnosticSeverity::Error,
+                        std::format(
+                            "a synthetic 64-bit constant (0x{:016X}) is wider "
+                            "than imm32, but target '{}' declares neither a "
+                            "`mov r64, imm64` variant nor the MOVZ/MOVK wide-"
+                            "immediate ladder — it has no way to materialize "
+                            "one (D-CSUBSET-BITFIELD-WIDE-UNIT)",
+                            static_cast<std::uint64_t>(value), target.name()));
+                    return std::nullopt;
+                }
+                LirLiteralValue lirLit;
+                lirLit.core  = TypeKind::U64;
+                lirLit.value = static_cast<std::uint64_t>(value);
+                std::array<LirOperand, 1> ops{LirOperand::makeLiteralIndex(
+                    lir.literalPoolAdd(std::move(lirLit)))};
+                emitInst(*movOp, result, ops);   // 64-bit (default width)
+                return result;
+            }
             std::array<LirOperand, 1> ops{
                 LirOperand::makeImmInt32(static_cast<std::int32_t>(value))};
             emitInst(*movOp, result, ops);   // 64-bit (default width)
@@ -7403,11 +7448,28 @@ struct Lowerer {
             reportUnsupported(mir.instOpcode(id), id);
             return;
         }
+        std::array<LirReg, Arity>     srcRegs{};
         std::array<LirOperand, Arity> ops;
         for (std::size_t k = 0; k < Arity; ++k) {
             std::optional<LirReg> const r = regForValue(operands[k]);
             if (!r.has_value()) return;
-            ops[k] = LirOperand::makeReg(*r);
+            srcRegs[k] = *r;
+            ops[k]     = LirOperand::makeReg(*r);
+        }
+        // D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE:
+        // if the target declares an instruction SEQUENCE for this opcode,
+        // emit that instead of one instruction of the opcode. The check is
+        // here (rather than at the two conversion arms that needed it first)
+        // because the fact "this operation is realized by these machine
+        // instructions" is not special to those two: any opcode on any
+        // target may state it, and the 1:1 rows below are the same statement
+        // with one entry.
+        std::uint8_t const opWidthFlags =
+            widthOverride.has_value() ? *widthOverride
+                                      : widthFlagsForType(mir.instType(id));
+        if (lowerViaDeclaredSequence(id, *op, std::span<LirReg const>{srcRegs},
+                                     opWidthFlags)) {
+            return;
         }
         // Result reg class follows the MIR result type — FPR for float
         // ops, VR for vector ops, GPR otherwise.
@@ -7421,15 +7483,171 @@ struct Lowerer {
         // whose encoded form keys on a NON-result width — ZExt's
         // source (D-CSUBSET-ZEXT-32-TO-64). Every other caller leaves
         // it unset and keeps the result-type rule byte-identically.
-        emitInst(*op, result, ops, /*payload=*/0,
-                 widthOverride.has_value()
-                     ? *widthOverride
-                     : widthFlagsForType(mir.instType(id)));
+        emitInst(*op, result, ops, /*payload=*/0, opWidthFlags);
         defineValue(id, result);
     }
 
     void lowerBinaryOp(MirInstId id, MnemonicSlot slot) { lowerNAryOp<2>(id, slot); }
     void lowerUnaryOp (MirInstId id, MnemonicSlot slot) { lowerNAryOp<1>(id, slot); }
+
+    // ── D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE ──
+    //
+    // Emit the SEQUENCE of machine instructions the target declares for this
+    // opcode, instead of one instruction of the opcode itself. The shared
+    // substrate understands exactly one thing here — EMIT WHAT YOU WERE TOLD —
+    // and every ISA-shaped decision (which instructions, in what order, with
+    // which constants) lives in `<target>.target.json`. There is no strategy
+    // enum, no capability fork and no arch identity: a target whose hardware
+    // does the job in ONE instruction declares a ONE-STEP sequence, and this
+    // function cannot tell that case from the seven-step one.
+    //
+    // Temporaries are FRESH VIRTUAL REGISTERS, which is the whole reason the
+    // expansion belongs at MIR→LIR and not in the byte encoder: regalloc
+    // assigns them like any other value, so a sequence needing four scratch
+    // registers costs nothing architecturally and nothing is reserved.
+    //
+    // Returns FALSE when the opcode declares no sequence (the caller then
+    // emits its single instruction exactly as before — every pre-existing
+    // opcode keeps its behaviour). Returns TRUE when it owned the lowering,
+    // INCLUDING the failure paths, all of which poison the value and report.
+    [[nodiscard]] bool
+    lowerViaDeclaredSequence(MirInstId id, std::uint16_t opIdx,
+                             std::span<LirReg const> sourceRegs,
+                             std::uint8_t widthFlags) {
+        auto const* info = target.opcodeInfo(opIdx);
+        if (info == nullptr || info->lowering.sequences.empty()) return false;
+        // Sequence election mirrors the encoding-variant matcher's rule
+        // exactly: an exact width match first, then a width-ABSENT sequence
+        // (which the loader guarantees is the only one if present).
+        std::uint8_t const wantBits = lirInstWidthBits(widthFlags);
+        TargetLoweringSequence const* seq = nullptr;
+        for (auto const& cand : info->lowering.sequences) {
+            if (cand.guardWidthBits == wantBits) { seq = &cand; break; }
+        }
+        if (seq == nullptr) {
+            for (auto const& cand : info->lowering.sequences) {
+                if (cand.guardWidthBits == 0) { seq = &cand; break; }
+            }
+        }
+        if (seq == nullptr) {
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "MIR {}: target '{}' declares an instruction sequence for "
+                    "'{}' but none at operation width {} — the operation has no "
+                    "realization at this width, and emitting a different "
+                    "width's sequence would be a silent miscompile",
+                    mirOpcodeName(mir.instOpcode(id)), target.name(),
+                    info->mnemonic, wantBits));
+            poisonValue(id);
+            return true;
+        }
+        std::vector<LirReg> temps(seq->tempNames.size());
+        LirReg              produced{};
+        for (auto const& step : seq->steps) {
+            std::vector<LirOperand> ops;
+            ops.reserve(step.operands.size());
+            for (auto const& sop : step.operands) {
+                switch (sop.kind) {
+                    case TargetLoweringOperandKind::Source: {
+                        if (sop.sourceIndex >= sourceRegs.size()) {
+                            // The loader bounds `source` against maxOperands;
+                            // this catches an instruction that reached here
+                            // with FEWER operands than the row allows.
+                            dss::report(reporter,
+                                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                                DiagnosticSeverity::Error,
+                                std::format(
+                                    "MIR {}: the '{}' lowering sequence reads "
+                                    "source operand {}, but the instruction has "
+                                    "{}", mirOpcodeName(mir.instOpcode(id)),
+                                    info->mnemonic, sop.sourceIndex,
+                                    sourceRegs.size()));
+                            poisonValue(id);
+                            return true;
+                        }
+                        ops.push_back(
+                            LirOperand::makeReg(sourceRegs[sop.sourceIndex]));
+                        break;
+                    }
+                    case TargetLoweringOperandKind::Temp:
+                        ops.push_back(LirOperand::makeReg(temps[sop.tempSlot]));
+                        break;
+                    case TargetLoweringOperandKind::Immediate:
+                        ops.push_back(LirOperand::makeImmInt32(sop.immediate));
+                        break;
+                    case TargetLoweringOperandKind::Constant: {
+                        // Materialized by the TARGET's own declared wide-
+                        // constant capability (mov r64,imm64 / MOVZ+MOVK) —
+                        // the encoding table cannot name a constant-pool
+                        // entry, so a float constant travels as a GPR bit
+                        // pattern plus a declared cross-class move step.
+                        auto const k = emitBareConstToFresh(
+                            static_cast<std::int64_t>(sop.constant));
+                        if (!k.has_value()) { poisonValue(id); return true; }
+                        ops.push_back(LirOperand::makeReg(*k));
+                        break;
+                    }
+                }
+            }
+            std::uint8_t stepFlags = 0;
+            switch (step.widthBits) {
+                case 8:  stepFlags = kLirInstFlagWidth8;  break;
+                case 16: stepFlags = kLirInstFlagWidth16; break;
+                case 32: stepFlags = kLirInstFlagWidth32; break;
+                default: stepFlags = 0;                   break;  // 0/64
+            }
+            if (!step.hasResult) {
+                emitInst(step.opcodeIndex, LirReg{}, ops, /*payload=*/0,
+                         stepFlags);
+                continue;
+            }
+            auto const cls = static_cast<LirRegClass>(step.resultClass);
+            if (step.definesResult && cls != regClassFor(id)) {
+                // The declared class of the sequence's own result must agree
+                // with the class the MIR result type demands. A disagreement
+                // is a config bug that would hand the assembler an XMM
+                // ordinal in a GPR slot (or the reverse) — bytes that look
+                // valid and mean something else.
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format(
+                        "MIR {}: the '{}' lowering sequence declares its result "
+                        "in register class '{}', but this instruction's result "
+                        "type is class '{}' on target '{}'",
+                        mirOpcodeName(mir.instOpcode(id)), info->mnemonic,
+                        lirRegClassName(cls), lirRegClassName(regClassFor(id)),
+                        target.name()));
+                poisonValue(id);
+                return true;
+            }
+            LirReg const dst = lir.newVReg(cls);
+            emitInst(step.opcodeIndex, dst, ops, /*payload=*/0, stepFlags);
+            if (step.definesResult) produced = dst;
+            else                    temps[step.resultTempSlot] = dst;
+        }
+        // The loader enforces "exactly one step names the reserved result, and
+        // it is the last" — so this cannot fire from a loadable config. It
+        // exists because the alternative on a violated invariant is binding the
+        // MIR value to a DEFAULT-CONSTRUCTED register, which is a silent wrong
+        // def rather than a diagnostic.
+        if (!produced.valid()) {
+            dss::report(reporter,
+                DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "MIR {}: the '{}' lowering sequence on target '{}' ran to "
+                    "completion without any step yielding the operation's "
+                    "value", mirOpcodeName(mir.instOpcode(id)), info->mnemonic,
+                    target.name()));
+            poisonValue(id);
+            return true;
+        }
+        defineValue(id, produced);
+        return true;
+    }
 
     // ── c78 (D-CSUBSET-FLOAT-NEG-ENCODING): capability-driven MIR FNeg ──
     //

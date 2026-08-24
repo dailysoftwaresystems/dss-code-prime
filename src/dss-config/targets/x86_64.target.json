@@ -3861,26 +3861,37 @@
       }
     },
     {
-      "$comment": "Float-to-unsigned-integer conversion (FPToUI). c78 (D-CSUBSET-FP-TO-UI-CODEGEN): for the c-subset's in-range needs (a double/float whose value fits the U32 result — sqlite's usage), the truncating signed CVTTSD2SI/CVTTSS2SI r64 form serves: any value in [0, 2^32) fits the signed-64 result exactly, and the U32 result reads the low 32 bits (gcc emits the identical `cvttsd2si rax, xmm0` for `(unsigned)d`). SAME encoding + operand roles + SOURCE-width axis as fp_to_si: ModR/M.reg = the GPR destination (resultSlot), ModR/M.rm = the xmm source; REX.W keeps the 64-bit destination. Full correct unsigned-i64 (a double ≥ 2^63 → the conditional-subtract sequence) is deferred as D-CSUBSET-UI-FROM-FP-UNSIGNED-I64; sqlite does not hit it.",
+      "$comment": "Float-to-unsigned-integer conversion (FPToUI). ★ THIS ROW HAS NO `encoding`, AND THAT IS THE FACT: x86-64 SSE2 HAS NO float-to-UNSIGNED instruction. It carried CVTTSD2SI/CVTTSS2SI — the SIGNED truncating converts — from c78 until 2026-08-24, which was value-correct only below 2^63 and SILENTLY returned 0x8000000000000000 for everything above it: ✔MEASURED `(unsigned long long)1.0e19` = 9223372036854775808 on all three x86_64 formats, debug AND release, with ZERO diagnostics, where gcc-13 and clang-19 both give 10000000000000000000. The F32-source arm was wrong identically and no registry row said so (D-CSUBSET-UI-FROM-FP-UNSIGNED-I64 named only the F64 arm). The realization is clang-19's BRANCHLESS expansion (clang emits ZERO jumps for all of `unsigned long f(double)`, `unsigned long h(float)` and `double g(unsigned long)` at -O2; gcc emits 3, and under the one-working-reference rule DSS may take clang's): truncate as SIGNED, truncate (x − 2^63) as SIGNED, and select between them with the ARITHMETIC-SHIFT sign mask of the first — no compare, no condition code, no control flow. The 2^63 bias travels as a GPR bit pattern through `movq_gpr_to_xmm` rather than a rip-relative constant-pool item, because the encoding table CANNOT name a constant it wants emitted (`imm64` names an integer VALUE; `symbol` needs a SymbolId minted at HIR→MIR) — see D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE.",
       "mnemonic": "fp_to_ui", "result": "value",
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0,
-      "encoding": {
-        "format": "x86-variable",
-        "variants": [
+      "lowering": {
+        "sequences": [
           {
-            "$comment": "F64 source → CVTTSD2SI r64, xmm — F2 REX.W 0F 2C /r (truncating scalar-double → signed 64-bit; the low 32 bits are the in-range U32 result).",
-            "guard":      { "operandKinds": ["reg"], "width": 64 },
-            "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 44] },
-            "resultSlot": "modrm.reg",
-            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+            "$comment": "F64 source. lo = cvttsd2si(x) — exact below 2^63, 0x8000000000000000 (the integer-indefinite value) at or above it. adj = x − 2^63 (SUBSD against 0x43E0000000000000 = (double)2^63). hi = cvttsd2si(adj) — exact for x in [2^63, 2^64). mask = lo >> 63 arithmetic — all-ones EXACTLY when lo went indefinite. result = (hi & mask) | lo: below 2^63 the mask is 0 and lo passes through; at or above, lo IS the 2^63 bit and OR-ing it onto hi (which is < 2^63) adds it back. Byte-for-byte the same algebra as clang's `cvttsd2si/movq/subsd/cvttsd2si/sarq/andq/orq`.",
+            "guard": { "width": 64 },
+            "steps": [
+              { "op": "fp_to_si",         "result": "lo",     "resultClass": "gpr", "width": 64, "operands": [{ "source": 0 }] },
+              { "op": "movq_gpr_to_xmm",  "result": "bias",   "resultClass": "fpr", "width": 64, "operands": [{ "const": "0x43E0000000000000" }] },
+              { "op": "fsub",             "result": "adj",    "resultClass": "fpr", "width": 64, "operands": [{ "source": 0 }, { "temp": "bias" }] },
+              { "op": "fp_to_si",         "result": "hi",     "resultClass": "gpr", "width": 64, "operands": [{ "temp": "adj" }] },
+              { "op": "shr_a",            "result": "mask",   "resultClass": "gpr", "width": 64, "operands": [{ "temp": "lo" }, { "imm": 63 }] },
+              { "op": "and",              "result": "hiSel",  "resultClass": "gpr", "width": 64, "operands": [{ "temp": "hi" }, { "temp": "mask" }] },
+              { "op": "or",               "result": "result", "resultClass": "gpr", "width": 64, "operands": [{ "temp": "hiSel" }, { "temp": "lo" }] }
+            ]
           },
           {
-            "$comment": "F32 source → CVTTSS2SI r64, xmm — F3 REX.W 0F 2C /r.",
-            "guard":      { "operandKinds": ["reg"], "width": 32 },
-            "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 44] },
-            "resultSlot": "modrm.reg",
-            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+            "$comment": "F32 source — the identical algebra with CVTTSS2SI (width 32 selects the F3 prefix) and SUBSS against (float)2^63 = 0x5F000000, carried in the LOW DWORD of the 64-bit pattern the cross-class move writes (SUBSS reads only that dword). The MASK/AND/OR tail stays width 64: it operates on the 64-bit INTEGER result, not on the float.",
+            "guard": { "width": 32 },
+            "steps": [
+              { "op": "fp_to_si",         "result": "lo",     "resultClass": "gpr", "width": 32, "operands": [{ "source": 0 }] },
+              { "op": "movq_gpr_to_xmm",  "result": "bias",   "resultClass": "fpr", "width": 64, "operands": [{ "const": "0x5F000000" }] },
+              { "op": "fsub",             "result": "adj",    "resultClass": "fpr", "width": 32, "operands": [{ "source": 0 }, { "temp": "bias" }] },
+              { "op": "fp_to_si",         "result": "hi",     "resultClass": "gpr", "width": 32, "operands": [{ "temp": "adj" }] },
+              { "op": "shr_a",            "result": "mask",   "resultClass": "gpr", "width": 64, "operands": [{ "temp": "lo" }, { "imm": 63 }] },
+              { "op": "and",              "result": "hiSel",  "resultClass": "gpr", "width": 64, "operands": [{ "temp": "hi" }, { "temp": "mask" }] },
+              { "op": "or",               "result": "result", "resultClass": "gpr", "width": 64, "operands": [{ "temp": "hiSel" }, { "temp": "lo" }] }
+            ]
           }
         ]
       }
@@ -3911,26 +3922,32 @@
       }
     },
     {
-      "$comment": "Unsigned-integer-to-float (UIToFP). x86 SSE2 has NO direct unsigned-int->float opcode; for the c-subset's needs (where the unsigned value fits the SIGNED range of the next-wider int — true for U32 promoted into a 64-bit cvtsi2sd, and the common case) the same CVTSI2SD path serves. The SOURCE-int-width axis matches si_to_fp: width=64 -> REX.W (a U64 whose top bit is set would mis-convert as negative — a documented x86 SSE2 limitation, not exercised by sqlite's u32/size_t-in-range usage), width=32 -> no-REX.W (a U32 source; cvtsi2sd of a 32-bit reg reads it as signed-32, but a U32 always fits the signed-64 result exactly, so the result is value-correct). Dest fixed F64/sd as in si_to_fp; U->F32 deferred (D-CSUBSET-INT-TO-F32-CODEGEN). Full correct-unsigned-i64 handling (the zero-extend + conditional-fixup sequence) is deferred as D-CSUBSET-UI-TO-FP-UNSIGNED-I64; sqlite does not hit it.",
+      "$comment": "Unsigned-integer-to-float (UIToFP). ★ NO `encoding`, for the same reason as fp_to_ui: x86-64 SSE2 has NO unsigned-int→float instruction. This row carried CVTSI2SD — the SIGNED converter — until 2026-08-24, and the comment it carried (\"a U32 always fits the signed-64 result exactly, so the result is value-correct\") stated the FULL fact while the declaration used HALF of it: the width-32 variant emitted `cvtsi2sd xmm, r32`, a SIGNED THIRTY-TWO-BIT read, so the u32 arm was wrong from 2^31 up and NOT ONLY the u64 arm from 2^63 up. ✔MEASURED on pe64-x86_64: `(double)(unsigned)0xFFFFFFFF` = -1.0 and `(double)(1ULL<<63)` = -9223372036854775808.0, against 4294967295.0 / 9223372036854775808.0 from BOTH gcc-13 and clang-19. Neither registry row (D-CSUBSET-UI-TO-FP-UNSIGNED-I64) mentioned the u32 arm at all. The realization is the exact-split identity clang's SSE2 expansion computes with packed ops, in scalar form: x = hi·2^32 + lo with hi and lo each below 2^32, so BOTH convert exactly (well inside the 53-bit significand), hi·2^32 is exact (a pure exponent shift), and ONE addition of two exactly-representable values whose real sum IS x returns x correctly rounded in the prevailing mode — for EVERY u64, with no branch, no compare and no round-to-odd pre-step.",
       "mnemonic": "ui_to_fp", "result": "value",
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0,
-      "encoding": {
-        "format": "x86-variable",
-        "variants": [
+      "lowering": {
+        "sequences": [
           {
-            "$comment": "CVTSI2SD xmm, r64 — F2 REX.W 0F 2A /r (64-bit source; see the unsigned-i64 caveat above).",
-            "guard":      { "operandKinds": ["reg"], "width": 64 },
-            "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 42] },
-            "resultSlot": "modrm.reg",
-            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+            "$comment": "U64 source → double. lo = x & 0xFFFFFFFF via `zext` at width 32, which on x86 IS `mov r32, r32` (a 32-bit write zeroes bits 63:32). hi = x >> 32 logical. Both then take the SIGNED cvtsi2sd at width 64 — legitimately, because each is below 2^32 and therefore positive in the 64-bit signed window. scale = (double)2^32 = 0x41F0000000000000.",
+            "guard": { "width": 64 },
+            "steps": [
+              { "op": "zext",             "result": "lo",     "resultClass": "gpr", "width": 32, "operands": [{ "source": 0 }] },
+              { "op": "shr_l",            "result": "hi",     "resultClass": "gpr", "width": 64, "operands": [{ "source": 0 }, { "imm": 32 }] },
+              { "op": "si_to_fp",         "result": "dLo",    "resultClass": "fpr", "width": 64, "operands": [{ "temp": "lo" }] },
+              { "op": "si_to_fp",         "result": "dHi",    "resultClass": "fpr", "width": 64, "operands": [{ "temp": "hi" }] },
+              { "op": "movq_gpr_to_xmm",  "result": "scale",  "resultClass": "fpr", "width": 64, "operands": [{ "const": "0x41F0000000000000" }] },
+              { "op": "fmul",             "result": "dHiSc",  "resultClass": "fpr", "width": 64, "operands": [{ "temp": "dHi" }, { "temp": "scale" }] },
+              { "op": "fadd",             "result": "result", "resultClass": "fpr", "width": 64, "operands": [{ "temp": "dHiSc" }, { "temp": "dLo" }] }
+            ]
           },
           {
-            "$comment": "CVTSI2SD xmm, r32 — F2 0F 2A /r (32-bit source; a U32 fits the signed-64 result exactly -> value-correct).",
-            "guard":      { "operandKinds": ["reg"], "width": 32 },
-            "template":   { "mandatoryPrefix": [242], "opcode": [15, 42] },
-            "resultSlot": "modrm.reg",
-            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+            "$comment": "U32 source → double. Zero-extend to the full 64-bit register FIRST (`zext` width 32 = `mov r32, r32`), THEN take the width-64 cvtsi2sd, which reads all 64 bits and so sees the value unsigned. This two-step form is the whole fix for the u32 arm: the one-step `cvtsi2sd xmm, r32` it replaces read the SAME register as a signed 32-bit quantity.",
+            "guard": { "width": 32 },
+            "steps": [
+              { "op": "zext",             "result": "lo",     "resultClass": "gpr", "width": 32, "operands": [{ "source": 0 }] },
+              { "op": "si_to_fp",         "result": "result", "resultClass": "fpr", "width": 64, "operands": [{ "temp": "lo" }] }
+            ]
           }
         ]
       }
@@ -3955,6 +3972,24 @@
             "template":   { "mandatoryPrefix": [102], "rexW": true, "opcode": [15, 126] },
             "resultSlot": "modrm.rm",
             "wires":      [{ "index": 0, "slotKind": "modrm.reg" }]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE: r64→xmm bit-copy — MOVQ xmm, r/m64 = 66 REX.W 0F 6E /r (Intel SDM MOVQ, the load-from-GPR direction). The EXACT MIRROR of `movq_xmm_to_gpr` above and a SEPARATE opcode for the SAME reason that one is: the variant guard keys only on (operandKinds, width) and both directions are `reg`/width-64, so one opcode carrying both would silently pick a direction. Why it exists now: an FP constant in a lowering sequence travels as a GPR bit pattern (the encoding table cannot name a constant-pool entry), so the sequence needs a DECLARED way to put that pattern in an XMM. ⚠ NOT declared on `movq_xclass` — that opcode is consumed BIDIRECTIONALLY by Bitcast, and giving it these bytes would silently mis-encode the FPR→GPR direction (the trap `movq_xmm_to_gpr` was minted to avoid). ModR/M.reg = the xmm DESTINATION (resultSlot), ModR/M.rm = the r64 SOURCE. Byte-pin: `movq xmm1, rdx` = 66 48 0F 6E CA (66 prefix; REX.W=0x48; 0F 6E; ModR/M mod=11 reg=xmm1=001 rm=rdx=010 → 0xCA).",
+      "mnemonic": "movq_gpr_to_xmm", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [102], "rexW": true, "opcode": [15, 110] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
         ]
       }

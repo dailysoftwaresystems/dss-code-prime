@@ -856,6 +856,54 @@ struct AsmInstructionLowering::Impl {
         return false;
     }
 
+    // ★★★ WHICH DECLARED WIDTH VIEW THIS PLACEHOLDER STATES, OR NULLPTR — the
+    // third alternative of the placeholder family (`%w0`, `%k[out]`), asked of
+    // the CST by RuleId exactly as the label arm is.
+    //
+    // ★★ THE ROUTING IS BY RULE AND THE **WIDTH** IS BY DECLARED LEXEME, AND THE
+    // SPLIT IS DELIBERATE. Which alternative matched is a grammar fact only the
+    // dialect can name (`assembly.templateModifierRule`); WHICH view a matched
+    // letter selects is a vocabulary fact the dialect declares in
+    // `assembly.templateModifiers`, and matching the arm's own first token
+    // against that declared table is the same shape `instructions[]` already
+    // has — a written spelling compared against DECLARED bytes, never against a
+    // byte spelled in C++. So nothing here knows that `w` means 32; it knows
+    // only that this dialect said so.
+    //
+    // ⚠ THE FIRST TOKEN IS THE SIGIL BY THE SHAPE'S OWN DEFINITION
+    // (`sequence: [templateModifierPlaceholder, asmTemplateSelector]`), and an
+    // arm whose first token is NOT a declared modifier returns nullptr, which
+    // the caller turns into a loud refusal rather than into a silent full-width
+    // decode.
+    [[nodiscard]] AssemblyConfig::AsmTemplateModifier const*
+    placeholderWidthView(NodeId placeholder) const {
+        if (!cfg_.templateModifierRule.valid()) return nullptr;
+        for (NodeId const k : visibleChildren(tree_, placeholder)) {
+            if (tree_.kind(k) != NodeKind::Internal) continue;
+            if (tree_.rule(k).v != cfg_.templateModifierRule.v) continue;
+            for (NodeId const t : visibleChildren(tree_, k)) {
+                if (tree_.kind(t) != NodeKind::Token) continue;
+                return cfg_.templateModifierByLexeme(tree_.text(t));
+            }
+            return nullptr;
+        }
+        return nullptr;
+    }
+
+    // Is this placeholder the width-view alternative at all? Separated from the
+    // lookup above so "the arm matched" and "the arm's letter is declared" stay
+    // two questions: the second failing is a CONFIG defect that must be loud,
+    // and folding it into "no view" would decode `%w0` at the operand's own
+    // type width with a clean build log.
+    [[nodiscard]] bool placeholderIsAWidthView(NodeId placeholder) const {
+        if (!cfg_.templateModifierRule.valid()) return false;
+        for (NodeId const k : visibleChildren(tree_, placeholder)) {
+            if (tree_.kind(k) != NodeKind::Internal) continue;
+            if (tree_.rule(k).v == cfg_.templateModifierRule.v) return true;
+        }
+        return false;
+    }
+
     // ★★★ A TEMPLATE PLACEHOLDER — EVERY FORM THE DIALECT'S
     // `templateOperandRule` COVERS — RESOLVED THROUGH THE HOST BY ITS WRITTEN
     // SPELLING, EXACTLY AS A REGISTER SPELLING IS.
@@ -1002,8 +1050,46 @@ struct AsmInstructionLowering::Impl {
 
         out.role = AsmOperandRole::Register;
 
+        // ★★★ A WIDTH VIEW NAMES THE **SAME OPERAND** AS THE PLAIN FORM, SO IT
+        // IS ASKED FOR UNDER THE PLAIN FORM AND STATES A WIDTH ON TOP.
+        // `%w0` and `%0` are one operand written two ways — a modifier selects a
+        // VIEW of the register, never a different register — so minting a second
+        // binding row per letter would put spellings in the host's table that
+        // the front end never minted, and the tier that VALIDATES a reference
+        // would stop agreeing with the tier that BINDS it about which forms
+        // exist. Rebuilding the plain spelling instead keeps ONE key per
+        // operand: the host's table, the semantic scan's minted inventory and
+        // every refusal that quotes it all continue to describe the same set.
+        //
+        // ⚠ THE REBUILD USES THE **DECLARED** SIGIL, NEVER A BYTE SPELLED HERE.
+        // `cfg_.templatePlaceholderLexeme` is what the loader joined from the
+        // language's `semantics.inlineAsmTemplateLexemes.templatePlaceholder`,
+        // which is the same string the letters were composed with — so the
+        // prefix stripped and the prefix restored cannot disagree.
+        AssemblyConfig::AsmTemplateModifier const* view = nullptr;
+        std::string asked = written;
+        if (placeholderIsAWidthView(node)) {
+            view = placeholderWidthView(node);
+            if (view == nullptr || cfg_.templatePlaceholderLexeme.empty()
+                || written.size() < view->lexeme.size()) {
+                sink_.fail(node,
+                     std::format("'{}' matched this dialect's width-view "
+                                 "placeholder rule "
+                                 "('assembly.templateModifierRule'), but its "
+                                 "sigil is not one of the letters declared in "
+                                 "'assembly.templateModifiers' — so there is no "
+                                 "width for it to state, and decoding it at the "
+                                 "operand's own type width would run the "
+                                 "operation at a width the template did not "
+                                 "ask for{}", written, sink_.pairSuffix()));
+                return std::nullopt;
+            }
+            asked = cfg_.templatePlaceholderLexeme
+                  + written.substr(view->lexeme.size());
+        }
+
         AsmResolvedRegister resolved;
-        switch (host_.resolveRegister(written, node, resolved)) {
+        switch (host_.resolveRegister(asked, node, resolved)) {
         case AsmRegisterLookup::Reported:
             return std::nullopt;
         case AsmRegisterLookup::NotARegister:
@@ -1054,6 +1140,20 @@ struct AsmInstructionLowering::Impl {
         // asked for the literal — same mnemonic, different instruction, no
         // diagnostic. The immediate arm below now shapes that case; the arms
         // after it still refuse.
+        // ⚠⚠ A WIDTH VIEW ON A NON-REGISTER BINDING IS **CARRIED NOWHERE**, AND
+        // THAT IS THE MEASURED ANSWER RATHER THAN A SHRUG. ✔MEASURED 2026-08-24,
+        // gcc 13.3.0 both ports, `-O0` and `-O2`, each shape compiled with and
+        // without the letter and the two outputs compared: `"m"`-bound
+        // `__asm__("str %w1, %w0" : "=m"(*p) : "r"(v))` emits `str w1, [x0]` —
+        // byte-identical to the unmodified `%0` — and x86 `"i"`-bound `%k1`
+        // emits `movl $7, %eax`, likewise identical. The reference ACCEPTS the
+        // form and the letter changes nothing, because a memory operand carries
+        // an ADDRESS and an immediate IS its value: neither states an operation
+        // width. Refusing here would refuse what both references accept, and
+        // "applying" the width would invent a fact neither has. ⇒ the two arms
+        // below are reached unchanged, and the width dies with the view — which
+        // is also SAFE by construction, since `dataRegisterWidth` excludes
+        // memory and immediate operands from the width reconciliation anyway.
         switch (resolved.operandKind) {
             case OperandKindFilter::Reg:
                 break;
@@ -1120,7 +1220,19 @@ struct AsmInstructionLowering::Impl {
                 return std::nullopt;
         }
         out.regSpelling  = std::move(written);
-        out.regWidthBits = resolved.widthBits;
+        // ★★★ THE VIEW'S WIDTH REPLACES THE OPERAND'S OWN, AND THAT ONE LINE IS
+        // THE WHOLE FEATURE. `regWidthBits` is already what `dataRegisterWidth`
+        // reconciles into the instruction's operation width and what the
+        // encoders read, so a 32-bit view reaches exactly the path a
+        // `.s`-written `mov w0, w1` proves — no new concept, no `%w` anywhere
+        // below this line. ⚠ AND THE WIDTH-HONESTY GATE STILL APPLIES: a
+        // template mixing views (`add %w0, %w1, %2`) is refused by name, which
+        // is STRICTER than gcc — ✔MEASURED 2026-08-24, gcc 13.3.0 substitutes
+        // textually and happily emits `movl %ax, %ax`, which its own assembler
+        // then rejects. Refusing at the compiler is the same answer one stage
+        // earlier.
+        out.regWidthBits = view != nullptr ? view->widthBits
+                                           : resolved.widthBits;
         out.reg          = resolved.reg;
         out.regClass     = resolved.regClass;
         return out;

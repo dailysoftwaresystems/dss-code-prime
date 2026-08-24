@@ -621,17 +621,77 @@ TEST(InlineAsmRefusals, AnUnsupportedConstraintFormIsRefusedNamingWhichShapeFire
     EXPECT_FALSE(good.model->hasErrors()) << errorInventory(*good.model);
 }
 
-// S0067 — the width-view modifier, with the plain placeholder as its control.
-TEST(InlineAsmRefusals, AnOperandWidthModifierIsRefusedRatherThanWidened) {
-    auto bad = analyzeFor("arm64", wrap("__asm__ (\"mov %w0, %w1\" : \"=r\"(lo) : \"r\"(hi));"));
-    ASSERT_TRUE(bad.model.has_value());
-    EXPECT_TRUE(has(*bad.model, DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
-        << errorInventory(*bad.model);
-
-    // POSITIVE CONTROL — the same template WITHOUT the modifier letters.
-    auto good = analyzeFor("arm64", wrap("__asm__ (\"mov %0, %1\" : \"=r\"(lo) : \"r\"(hi));"));
+// ★★★ THE WIDTH-VIEW MODIFIER IS A CAPABILITY, AND THIS TEST IS THE INVERSION
+// OF THE PIN THAT USED TO ASSERT THE OPPOSITE.
+//
+// It read `AnOperandWidthModifierIsRefusedRatherThanWidened` and demanded
+// `S_InlineAsmOperandModifierUnsupported` on `%w0`. That was the CORRECT
+// assertion while no document declared a width-view vocabulary — falling back
+// to the full register runs a 32-bit operation 64-bit with a clean build log.
+// The dialects now declare `assembly.templateModifiers`, so the refusal became
+// the divergence: ✔MEASURED 2026-08-24 by execution on gcc 13.3.0, both ports,
+// `-O0` and `-O2`, `%w0` renders `w0` on aarch64 and `%ax` on x86-64, and under
+// §A.3b of the bar one working reference makes the behaviour REQUIRED.
+//
+// ★★ WHAT THE TEST ASSERTS NOW IS THE PROPERTY THE REFUSAL WAS PROTECTING,
+// STATED POSITIVELY: a width view is ACCEPTED, and the thing that made
+// accepting it dangerous — a reference to an operand that does not exist, which
+// under the old code would have been swallowed by the same blanket refusal —
+// is still refused, by the code that owns index questions.
+TEST(InlineAsmRefusals, AWidthViewModifierIsAcceptedAndItsSelectorIsStillChecked) {
+    // The exact template the old pin required to be REFUSED.
+    auto good = analyzeFor(
+        "arm64", wrap("__asm__ (\"mov %w0, %w1\" : \"=r\"(lo) : \"r\"(hi));"));
     ASSERT_TRUE(good.model.has_value());
     EXPECT_FALSE(good.model->hasErrors()) << errorInventory(*good.model);
+
+    // ★ THE OTHER DIALECT'S OWN LETTERS, on the target that declares them —
+    // which is the half that proves the letters are CONFIG rather than a shared
+    // table: `k` is spelled by x86-64 and not by aarch64.
+    auto att = analyzeFor(
+        "x86_64", wrap("__asm__ (\"movl %k1, %k0\" : \"=r\"(lo) : \"r\"(hi));"));
+    ASSERT_TRUE(att.model.has_value());
+    EXPECT_FALSE(att.model->hasErrors()) << errorInventory(*att.model);
+
+    // The SYMBOLIC selector through a view — one shape, both selectors, because
+    // the width-view rule takes the SAME `asmTemplateSelector` the plain and
+    // label forms take.
+    auto named = analyzeFor(
+        "arm64",
+        wrap("__asm__ (\"mov %w[o], %w[i]\" : [o] \"=r\"(lo) : [i] \"r\"(hi));"));
+    ASSERT_TRUE(named.model.has_value());
+    EXPECT_FALSE(named.model->hasErrors()) << errorInventory(*named.model);
+
+    // ⚠ THE SELECTOR IS STILL CHECKED, and this is the assertion that keeps the
+    // acceptance from being a blanket one: `%w2` on a two-operand statement
+    // names nothing, and the code that says so is the one that owns index
+    // questions — never the modifier code, which no longer refuses anything.
+    auto outOfRange = analyzeFor(
+        "arm64", wrap("__asm__ (\"mov %w0, %w2\" : \"=r\"(lo) : \"r\"(hi));"));
+    ASSERT_TRUE(outOfRange.model.has_value());
+    EXPECT_TRUE(has(*outOfRange.model,
+                    DiagnosticCode::S_InlineAsmPlaceholderOutOfRange))
+        << errorInventory(*outOfRange.model);
+    // The message must name BOTH forms — the one written and the one that has
+    // to be bound. An author told only about `%2` cannot see which half of
+    // `%w2` was wrong.
+    bool namesBoth = false;
+    for (auto const& d : outOfRange.model->diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_InlineAsmPlaceholderOutOfRange) continue;
+        namesBoth = namesBoth || (d.actual.find("%w2") != std::string::npos
+                                  && d.actual.find("`%2`") != std::string::npos);
+    }
+    EXPECT_TRUE(namesBoth) << errorInventory(*outOfRange.model);
+
+    // ⚠ AND THE FORM WITH NO SELECTOR AT ALL IS STILL REFUSED BY S0067 — the
+    // un-escaped register (`%eax` where `%%eax` was meant) is the live case, and
+    // it is what stops "accept any letter run" from accepting everything.
+    auto bare = analyzeFor(
+        "x86_64", wrap("__asm__ (\"xorl %eax, %eax\" ::: \"eax\");"));
+    ASSERT_TRUE(bare.model.has_value());
+    EXPECT_TRUE(has(*bare.model,
+                    DiagnosticCode::S_InlineAsmOperandModifierUnsupported))
+        << errorInventory(*bare.model);
 }
 
 // S0068 — with THREE controls, because "resolves" has three sources here.

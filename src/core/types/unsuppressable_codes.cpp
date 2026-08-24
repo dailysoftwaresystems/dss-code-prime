@@ -415,9 +415,15 @@ constexpr std::string_view kWhyAsmConstraintLetter =
 constexpr std::string_view kWhyAsmConstraintForm =
     "silenced, a multi-alternative or multi-letter constraint makes the "
     "binder pick one alternative on its own, unannounced";
+// ⚠ THE WIDTH-VIEW MODIFIER ITSELF IS NO LONGER WHAT THIS CODE REFUSES (P30 —
+// the dialects declare `assembly.templateModifiers` and `%w0` lowers), so the
+// reason names the PROPERTY rather than the retired spelling: what is left is
+// every other `%`-form this build cannot expand, and silencing any of them
+// emits the operand at the full register width.
 constexpr std::string_view kWhyAsmOperandModifier =
-    "silenced, a width-view modifier falls back to the full register, so a "
-    "32-bit operation executes 64-bit";
+    "silenced, a % form this build cannot expand is emitted with its operand "
+    "at the full register width, so an operation the template asked to be "
+    "narrow executes wide";
 constexpr std::string_view kWhyAsmClobberUnknown =
     "silenced, the clobber is dropped, a live value stays parked in a "
     "register the asm overwrites, and the wrong value is read after it";

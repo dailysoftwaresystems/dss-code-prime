@@ -1252,6 +1252,26 @@ constexpr std::size_t kMinDirectionBProbes = 15;
         // Two rows, two variables, neither able to hide the other.
         "a_thread_local_gnu_spelling", "a_extension_prefix_gnu",
         "a_thread_local_definition_c11",
+        // ★ THE GAP A WAIVER WAS HIDING (2026-08-24). `a_nested_function_gnu`
+        // shipped as `@expect-ref varies` and therefore pinned as NOT-PINNED,
+        // landing in NEITHER census — while gcc 13.2 (Windows) and gcc 13.3
+        // (WSL) both compile it and DSS refuses it on both fixed targets. The
+        // waiver's stated reason was that clang has never implemented nested
+        // functions, so "any single declared expectation would be false on some
+        // host". That confuses the two questions this file exists to keep
+        // apart: `@expect-ref` declares REFERENCE BEHAVIOUR and feeds `pin()`,
+        // which takes no roster argument, while the roster's opinion goes to
+        // `corroborate()` — and an `accept` row that no local oracle accepts is
+        // the un-refutable negative, printed as `not-witnessed` and never a red.
+        // A waiver is therefore only right when the DIRECTION itself turns on
+        // which reference you believe (`b_empty_enumerator_list`: DSS accepts,
+        // MSVC accepts, the gnu family does not — declare `reject` and it is an
+        // INVENTION, declare `accept` and it is agreement). It is wrong when
+        // only the STRENGTH of the evidence splits, which is this row. Listed
+        // here the day it was censused, for the same reason as
+        // `a_alignof_expression_operand_gnu` above: an OPEN gap must not be
+        // trimmable before it is fixed, and this one was already invisible once.
+        "a_nested_function_gnu",
     };
 }
 

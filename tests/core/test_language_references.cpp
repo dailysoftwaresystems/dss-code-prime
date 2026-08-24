@@ -1517,6 +1517,7 @@ constexpr std::string_view kLineHostDoc = R"JSON({
         "symbolName":               "Identifier",
         "templatePlaceholder":      "SlotMark",
         "templateLabelPlaceholder": "SlotLabelMark",
+        "templateModifierPlaceholder": "SlotWidthMark",
         "templateOperandIndex":     "IntLiteral",
         "symbolicNameOpen":         "HugOpen",
         "symbolicNameClose":        "HugClose"
@@ -1530,6 +1531,7 @@ constexpr std::string_view kLineHostDoc = R"JSON({
     "~":  [{ "kind": "LeadMark" }],
     "&":  [{ "kind": "SplitMark" }],
     "?^": [{ "kind": "SlotLabelMark" }],
+    "?#": [{ "kind": "SlotWidthMark" }],
     "?":  [{ "kind": "SlotMark" }],
     "(":  [{ "kind": "HugOpen" }],
     ")":  [{ "kind": "HugClose" }],
@@ -1545,15 +1547,23 @@ constexpr std::string_view kLineHostDoc = R"JSON({
   }
 })JSON";
 
-// The FIVE rules the placeholder surface adds, spelled out rather than counted
+// The SIX rules the placeholder surface adds, spelled out rather than counted
 // — the discipline `kAsmRules` states: a count stays green if the mechanism
-// imports five of the WRONG shapes.
-constexpr std::array<std::string_view, 5> kAsmTemplateRules{
+// imports six of the WRONG shapes.
+// ⚠ THE SIXTH ARRIVED WITH THE WIDTH-VIEW SURFACE (P30) AND IT BROUGHT A SIXTH
+// HOLE WITH IT (`templateModifierPlaceholder`), which is why this alien host
+// grew a `?#` lexeme and a binding for it. That is the documented consequence
+// of the shared standalone closure spelling the placeholder shapes: a host
+// naming `asmLine` owes every hole that closure spells, and a new arm in the
+// alternation is a LOAD-BREAKING change for out-of-tree hosts rather than a
+// silent no-op. This fixture is where that gets felt first, deliberately.
+constexpr std::array<std::string_view, 6> kAsmTemplateRules{
     "asmTemplateOperand",
     "asmTemplateOperandRef",
     "asmTemplateSelector",
     "asmTemplateSymbolicName",
     "asmTemplateLabelRef",
+    "asmTemplateModifiedRef",
 };
 
 // The line-structure rules the STANDALONE entry pulls in, including the alt
@@ -1617,11 +1627,12 @@ TEST(LanguageReferences, ThePlaceholderRulesArriveCompiledOnTheHostsOwnKinds) {
 
     const auto slot      = kind("SlotMark");
     const auto slotLabel = kind("SlotLabelMark");
+    const auto slotWidth = kind("SlotWidthMark");
     const auto hugOpen   = kind("HugOpen");
     const auto coin      = kind("CoinMark");
     const auto intLit    = kind("IntLiteral");
 
-    // Every one of the five has a NON-EMPTY FIRST set — the interned-but-dead
+    // Every one of the six has a NON-EMPTY FIRST set — the interned-but-dead
     // failure mode's exact signature is an empty one.
     for (auto const& r : kAsmTemplateRules) {
         EXPECT_FALSE(schema->firstSetOf(rule(r)).empty())
@@ -1633,16 +1644,23 @@ TEST(LanguageReferences, ThePlaceholderRulesArriveCompiledOnTheHostsOwnKinds) {
     // proved rather than assumed.
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateOperandRef"), slot));
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateLabelRef"), slotLabel));
+    EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateModifiedRef"), slotWidth));
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateSymbolicName"), hugOpen));
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateSelector"), intLit));
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateSelector"), hugOpen));
 
+    // ★★ THREE, NOT TWO, SINCE THE WIDTH-VIEW ARM LANDED — and the EXACT count
+    // is what keeps this from being a containment check that a fourth silent
+    // arm could pass. It is also the assertion that proves the three arms stay
+    // FIRST-DISJOINT BY KIND: three alternatives whose union has three members
+    // cannot share an opening token.
     auto const anyFirst = schema->firstSetOf(rule("asmTemplateOperand"));
-    ASSERT_EQ(anyFirst.size(), 2u)
-        << "`asmTemplateOperand` must predict on exactly the two placeholder "
+    ASSERT_EQ(anyFirst.size(), 3u)
+        << "`asmTemplateOperand` must predict on exactly the three placeholder "
            "sigils";
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateOperand"), slot));
     EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateOperand"), slotLabel));
+    EXPECT_TRUE(schema->firstSetContains(rule("asmTemplateOperand"), slotWidth));
 
     // ★★ THE REACHABILITY CLAIM, WHICH IS SEPARATE FROM THE COMPILATION ONE. A
     // placeholder rule that compiled perfectly and hung off nothing would be
@@ -1784,12 +1802,41 @@ TEST(LanguageReferences, HostSpelledPlaceholdersWalkTheMergedRulesToCompletion) 
             << "`?^ <selector>` walked the rule but did not COMPLETE it";
     }
 
-    // ⚠ AND THE SIGILS ARE NOT INTERCHANGEABLE. If the merge had bound both
+    // `?# 0` — an operand through a WIDTH VIEW, the third family. ★ IT REACHES
+    // THE **SAME** SELECTOR, which is the whole reason P30 added one rule and
+    // nothing below it: a width view by index and by name are the two forms the
+    // selector already had, so neither can drift from the other two families'.
+    {
+        auto cur = schema->advance(schema->enterRule(rule("asmTemplateModifiedRef")),
+                                   kind("SlotWidthMark"));
+        ASSERT_TRUE(cur.valid())
+            << "asmTemplateModifiedRef rejected the host's WIDTH-VIEW sigil";
+        EXPECT_FALSE(schema->isAtEndOfRule(cur))
+            << "a bare width-view sigil COMPLETED the rule — it would name no "
+               "operand at all";
+        ASSERT_EQ(schema->slotKind(cur), SlotKind::RuleLeaf);
+        EXPECT_EQ(schema->slotRuleRef(cur).v, selector.v)
+            << "a width view does not descend into the SELECTOR — the three "
+               "placeholder families are no longer sharing one selector rule";
+        cur = schema->leaveRule(cur);
+        ASSERT_TRUE(cur.valid());
+        EXPECT_TRUE(schema->isAtEndOfRule(cur))
+            << "`?# <selector>` walked the rule but did not COMPLETE it";
+    }
+
+    // ⚠ AND THE SIGILS ARE NOT INTERCHANGEABLE. If the merge had bound two
     // roles to one kind — the easy way to get this wrong — every assertion
-    // above would still pass and `%0` would parse as a label.
+    // above would still pass and `%0` would parse as a label, or `%w0` as a
+    // plain reference at the operand's own width.
     EXPECT_FALSE(schema->advance(schema->enterRule(indexRef),
                                  kind("SlotLabelMark")).valid())
         << "the OPERAND rule accepted the LABEL sigil";
+    EXPECT_FALSE(schema->advance(schema->enterRule(indexRef),
+                                 kind("SlotWidthMark")).valid())
+        << "the OPERAND rule accepted the WIDTH-VIEW sigil";
+    EXPECT_FALSE(schema->advance(schema->enterRule(labelRef),
+                                 kind("SlotWidthMark")).valid())
+        << "the LABEL rule accepted the WIDTH-VIEW sigil";
     EXPECT_FALSE(schema->advance(schema->enterRule(labelRef),
                                  kind("SlotMark")).valid())
         << "the LABEL rule accepted the OPERAND sigil";
@@ -1808,6 +1855,7 @@ TEST(LanguageReferences, HostSpelledPlaceholdersWalkTheMergedRulesToCompletion) 
 // exactly the failure this arm is shaped to catch.
 TEST(LanguageReferenceRefusals, AnUnboundPlaceholderHoleFailsLoud) {
     for (auto const* hole : {"templatePlaceholder", "templateLabelPlaceholder",
+                             "templateModifierPlaceholder",
                              "templateOperandIndex", "symbolicNameOpen",
                              "symbolicNameClose"}) {
         auto doc = lineHostJson();

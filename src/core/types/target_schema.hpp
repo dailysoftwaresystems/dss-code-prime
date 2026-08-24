@@ -3023,6 +3023,124 @@ struct DSS_EXPORT ImplicitRegisterConstraint {
     }
 };
 
+// ── D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE ────────
+//
+// ★★★ THE FACT AN OPCODE ROW STATES IS *"on this target, this operation is
+// realized by these machine instructions"* — PLURAL. Everything above this
+// point (`TargetEncodingInfo` and its variants) can only say it for ONE
+// instruction, and 1:1 is the DEGENERATE CASE of the real relationship, not
+// the relationship. The first consumer that needed more than one found the
+// hole: x86-64 SSE2 has NO unsigned integer↔double instruction at all, so
+// `ui_to_fp` / `fp_to_ui` were declared with the SIGNED cvt's bytes and
+// SILENTLY MISCOMPILED every value at or above 2^63 (and, on the u32 source
+// arm, every value at or above 2^31) — measured against gcc-13 and clang-19,
+// which agree on all of them.
+//
+// A two-valued "strategy" enum (native / fixup) was REJECTED as an arch
+// branch with a different spelling: no `if (arch == x86)` appears, but the
+// switch arm is x86-shaped and lives in shared substrate, and x86 has more of
+// these coming (popcount without POPCNT, 128-bit multiply-high, float min/max
+// NaN semantics). ⇒ **each target STATES A FACT in ONE uniform form and the
+// shared substrate understands ONE thing: emit what you were told.** A target
+// whose hardware does the job in one instruction declares a ONE-STEP sequence
+// (arm64's UCVTF / FCVTZU) — not a special case and not a `native` flag, the
+// same kind of row, one entry long.
+//
+// ★ WHY THIS IS A SIBLING OF `encoding`, NOT AN EXTENSION OF IT. The two
+// blocks answer questions at DIFFERENT TIERS and folding them would break the
+// assembler. `encoding` is LIR-instruction → BYTES (one instruction in, one
+// byte string out — the assembler's whole contract). `lowering` is MIR
+// operation → LIR INSTRUCTIONS, consumed at MIR→LIR while virtual registers
+// still exist, which is the only tier where a sequence's TEMPORARIES can be
+// register-allocated instead of stealing fixed scratch registers.
+//
+// ★ ONE LEVEL, NEVER RECURSIVE. A step names a REAL MACHINE INSTRUCTION: the
+// loader rejects a step whose opcode declares no `encoding`, and the expander
+// emits each step directly without re-consulting the step opcode's own
+// `lowering`. That is what makes arm64's SELF-NAMING one-step sequence
+// (`ui_to_fp` → [`ui_to_fp`]) well-founded rather than an infinite regress.
+
+// One operand of one lowering step. The four kinds are the complete
+// vocabulary a straight-line expansion needs:
+//   Source    — the k-th operand of the MIR instruction being lowered.
+//   Temp      — a register defined by an EARLIER step of this sequence.
+//   Immediate — an inline 32-bit immediate (a shift count, a mask).
+//   Constant  — a 64-bit BIT PATTERN materialized into a fresh GPR by the
+//               target's own declared wide-constant capability (x86's
+//               `mov r64, imm64`; arm64's MOVZ/MOVK ladder) before the step
+//               runs. This is the ONLY kind that costs an extra instruction,
+//               and it exists because the encoding table CANNOT name a
+//               constant-pool entry: `imm64` names a VALUE (integer only) and
+//               `symbol` needs a SymbolId minted upstream at HIR→MIR. A
+//               float constant therefore rides a GPR bit pattern and a
+//               declared cross-class move, not a rodata item.
+enum class TargetLoweringOperandKind : std::uint8_t {
+    Source = 0, Temp = 1, Immediate = 2, Constant = 3,
+};
+inline constexpr EnumNameTable<TargetLoweringOperandKind, 4>
+kTargetLoweringOperandKindTable{{{
+    { TargetLoweringOperandKind::Source,    "source"   },
+    { TargetLoweringOperandKind::Temp,      "temp"     },
+    { TargetLoweringOperandKind::Immediate, "imm"      },
+    { TargetLoweringOperandKind::Constant,  "const"    },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kTargetLoweringOperandKindTable);
+[[nodiscard]] constexpr std::string_view
+targetLoweringOperandKindName(TargetLoweringOperandKind k) noexcept {
+    return kTargetLoweringOperandKindTable.name(k);
+}
+[[nodiscard]] constexpr std::optional<TargetLoweringOperandKind>
+targetLoweringOperandKindFromName(std::string_view s) noexcept {
+    return kTargetLoweringOperandKindTable.fromName(s);
+}
+
+struct DSS_EXPORT TargetLoweringOperand {
+    TargetLoweringOperandKind kind = TargetLoweringOperandKind::Source;
+    std::uint8_t  sourceIndex = 0;   // Source: MIR operand index
+    std::uint16_t tempSlot    = 0;   // Temp: index into the sequence's temp table
+    std::int32_t  immediate   = 0;   // Immediate: the inline imm32 value
+    std::uint64_t constant    = 0;   // Constant: the 64-bit bit pattern
+    std::string   tempName;          // Temp: the declared spelling (diagnostics)
+};
+
+// One step = one machine instruction the operation expands into.
+//
+// `widthBits` is the LIR instruction's operation width, i.e. the axis the
+// encoding-variant guards key on. 0 means "the LIR default", which
+// `lirInstWidthBits` reads as 64 — the same absent-flag state every
+// pre-existing single-instruction lowering emits. It is per-STEP and not
+// inherited from the sequence guard because a real sequence mixes them: the
+// x86 F32→u64 expansion truncates at width 32 (CVTTSS2SI) and masks at
+// width 64 (SAR/AND/OR) in the same seven steps.
+struct DSS_EXPORT TargetLoweringStep {
+    std::string    opcodeMnemonic;               // the machine opcode to emit
+    std::uint16_t  opcodeIndex   = 0;            // loader-resolved (post-pass)
+    bool           hasResult     = false;        // the step defines a register
+    bool           definesResult = false;        // ...and it is the SEQUENCE's result
+    std::uint16_t  resultTempSlot = 0;           // when hasResult && !definesResult
+    std::string    resultName;                   // declared spelling (diagnostics)
+    TargetRegClass resultClass   = TargetRegClass::None;
+    std::uint8_t   widthBits     = 0;            // 0 / 8 / 16 / 32 / 64
+    std::vector<TargetLoweringOperand> operands;
+};
+
+// One sequence + the width it applies to. `guardWidthBits` mirrors
+// `TargetEncodingVariant::guardWidthBits` EXACTLY, including which width it
+// names: whatever axis the opcode's encoding variants key on (for the
+// int↔float conversions that is the SOURCE width, threaded as the
+// `widthOverride` at MIR→LIR). 0 = matches any width. The loader rejects two
+// sequences with the same width and the ambiguous keyed/absent mix, for the
+// same first-match-shadowing reason the encoding variants do.
+struct DSS_EXPORT TargetLoweringSequence {
+    std::uint8_t                    guardWidthBits = 0;
+    std::vector<std::string>        tempNames;   // slot → declared spelling
+    std::vector<TargetLoweringStep> steps;
+};
+
+struct DSS_EXPORT TargetLoweringInfo {
+    std::vector<TargetLoweringSequence> sequences;
+};
+
 // One row per opcode; index in the vector IS the opcode's numeric
 // value (stored as `std::uint16_t` in the LIR instruction PODs).
 //
@@ -3061,6 +3179,17 @@ struct DSS_EXPORT TargetOpcodeInfo {
     // requires a non-empty `encoding.variants[]` (validate()-enforced);
     // each variant carries its guard + template + slot wiring.
     TargetEncodingInfo   encoding;
+
+    // Instruction-SEQUENCE facet
+    // (D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE).
+    // EMPTY `sequences` (the default) means this opcode declares no expansion
+    // and MIR→LIR emits ONE instruction of it, exactly as before — every
+    // pre-existing opcode row keeps its behaviour byte-identically. A NON-empty
+    // block means MIR→LIR emits the matching sequence's steps INSTEAD, and the
+    // opcode itself may then legitimately carry NO `encoding` at all (x86-64's
+    // `ui_to_fp`/`fp_to_ui`: the machine has no such instruction, so declaring
+    // one was the miscompile). See the docblock above `TargetLoweringOperandKind`.
+    TargetLoweringInfo   lowering;
 
     // 2-address legalization constraint (plan 13 AS3 — `lir_2addr_
     // legalize.cpp`). ENGAGED means the LIR pre-assembly legalize pass

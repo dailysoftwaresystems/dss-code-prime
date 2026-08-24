@@ -1,0 +1,35 @@
+{
+  "$comment": "THE WIDTH-VIEW OPERAND MODIFIER, RUNNABLE ON BOTH CPUs (D-CSUBSET-INLINE-ASM-OPERANDS; tranche 2 of D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE). ★★★ THE FORM WAS A REFUSAL UNTIL 2026-08-24 — `error[S0067] the inline-asm template uses the operand modifier '%w'` — so this example could not have been written at all before the dialects declared `assembly.templateModifiers`. ★★★ WHAT MAKES IT A TEST RATHER THAN A SMOKE RUN: every assertion reads ABOVE BIT 31. ✔MEASURED that the same program written through `(int)` exits 42 whether the move was 32-bit or 64-bit — the truncation destroys exactly the evidence — so the seed's two halves differ (`0x11223344` / `0x55667788`) and shape 6 asserts that the `(int)` observation IS blind, rather than leaving a reader to assume the wide checks were merely thorough. ★★ BOTH DECLARED LETTERS ARE ASSERTED on each dialect (`%w`/`%x` on aarch64, `%k`/`%q` on x86-64) because the two failure modes are opposite: a build ignoring the letter passes every wide shape and fails every narrow one, and a build hard-coding 'a modifier means 32' does the reverse. ⚠ THE `release` ARM IS NOT DECORATION — a `volatile` seed plus the optimizer is what witnesses that the template survives the shipped pipeline; a release-only miscompile has shipped in this project before.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

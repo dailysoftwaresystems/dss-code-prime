@@ -73,6 +73,10 @@ Each FC phase is one or more `/dss-cycle` cycles ending at a green push with a r
 | **FC17.9** ✅ COMPLETE (2026-07-16) **(FULL-C23 COMPLETENESS — the §3.2 named exclusions PROMOTED into scope; user 2026-07-14: 100% C23 BEFORE FC18, the DSS Axis substrate mandate)** | The last named-exclusion tier — DSS becomes a COMPLETE C23 implementation before the FC18 conformance sweep, because C (and C++) are the substrate DSS Axis stands on, so the exotic corners must be REAL, not fail-loud. Each sub-feature is a normal /dss-cycle (best-long-term, agnostic, fail-loud, strict red-on-disable + a runnable release-arm corpus where runtime-observable) and is ALREADY tracked as a loud-RED `c23_advanced` probe in the dss-state battery (`.claude/skills/dss-state/probes.mjs`, committed `a50a334`) that flips GREEN the cycle it lands. **Order (leverage/dependency):** **(a) `<threads.h>` ✅ COMPLETE 2026-07-14 (Cycle 1+2)** — Cycle 2 landed the OS-callback trampolines: `thrd_create` (DIRECT-pass, no closure — x64 C11 `int(*)(void*)` ≡ Win32 `DWORD(*)(void*)`), `call_once` (`__dss_once_tramp` via InitOnceExecuteOnce), `thrd_join` (the FIRST multi-block synth recipe, canonical markers via `rederiveStructCfMarkers`); `__STDC_NO_THREADS__` now macho-ONLY (threads work on elf/pe64); a REAL-thread create/join witness → 42 on 3 legs; design-audit deleted the malloc-closure (direct-pass) + code-audit SHIP; closes `-TRAMPOLINES` + the pre-FC18 threads config gate. Original Cycle-1: (mutex/cnd/tss + thrd_join/yield/exit/detach/current on elf+pe64+arm64; pe64 = a synthesized Win32 shim via the NEW `synthesize`-recipe descriptor mechanism [the tagged symbol skips its kernel32 import but seeds `functionSymbols`, and `synth_threads_shim` supplies the MIR body]; single- AND multi-CU; battery `c11_threads_mutex` GREEN; ★ trampolines `thrd_create`/`call_once` + `__STDC_NO_THREADS__` removal = Cycle 2)** — — C11 `thrd_*`/`mtx_*`/`cnd_*`/`tss_*`, ALREADY PROMOTED + lands FIRST (registry `D-CSUBSET-C11-THREADS-HEADER`; a `shippedLibs/threads.json` over the landed TLS substrate + the pe64 posture §B) → **(b) `<stdbit.h>` ✅ COMPLETE 2026-07-15** — the WHOLE C23 header (all 14 type-generic ops × 5 widths + 4-way `_Generic` + endian/version macros). ⚠ STALE-PREMISE CORRECTED: NOT "pure library over existing popcount codegen" (there was NONE) — built 3 NEW hardware MIR primitives (Popcount/Clz/Ctz, native x86 POPCNT/LZCNT/TZCNT + arm64 CLZ/RBIT, SWAR fallback via config mnemonic slots) + 56 per-width builtins → 14 single-eval branchless composition arms + `stdbit.json` (`D-FULLC-STDBIT` + `D-CSUBSET-BITCOUNT-INTRINSICS` ✅; 3 deferrals: arm64-CNT-popcount/big-endian-native/addressable-fn). Differential exit 168 ×3 legs + sqlite ×3 → **(c) `setjmp`/`longjmp` ✅ COMPLETE 2026-07-15** — `<setjmp.h>` non-local control flow via libc FFI (the synthesized intrinsic REFUTED: DSS's IndirectBr needs a closed same-function target list; setjmp/longjmp are real glibc/libSystem/msvcrt exports). `setjmp.json` (per-arch `jmp_buf`: elf-x64 200B / elf-arm64 312B / pe64 256B-16align-via-`arr<u128,16>` / macho 224B; pe-only `_setjmp(env,0)` macro; longjmp noreturn) + a `returnsTwice` flag → a per-Call `MirInstFlags::ReturnsTwice` carrier read by 2 SUPERVISED optimizer changes (user Full-scope §B 2026-07-15): mem2reg WHOLE-FUNCTION pessimize + the inliner `inlineLegalityGate` refusal. `D-CSUBSET-SETJMP` + `D-OPT-SETJMP-RETURNS-TWICE-INLINE` ✅ (D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC left OPEN; deferrals sigsetjmp/Win64-SEH-scope); a RUNTIME-DIFFERENTIAL example (exit 42 iff mem2reg keeps the local memory-resident) ×3 legs + 2 red-on-disable pins → **(d) `_Atomic` / `<stdatomic.h>`** — the atomics-with-memory-ordering arc, SPLIT (user §B + design-audit I3, 2026-07-15): **1a = the qualifier-representation refactor ✅ LANDED 2026-07-15** — generalize the single-skin `VolatileQual` → a `{volatile,atomic}` `QualBit` bitset (`D-CSUBSET-QUAL-BITSET`) so `_Atomic volatile` is ONE skin; BEHAVIOR-PRESERVING for volatile; adds `qualified`/`atomicQualified`/`isAtomicQualified`/`qualifierBits` + the C1 strip-merge-reintern discipline + interner-API unit tests incl. red-on-disable Trap-1/Trap-2 pins; NO grammar/MIR change → **1b = SPLIT (user §B 2026-07-15, the VLA-C1a fail-loud-boundary precedent): 1b-i ✅ LANDED 2026-07-15** (`D-CSUBSET-ATOMIC`; front-end + IR + fail-loud LIR boundary — `_Atomic` grammar/access via the LIVE `cfg.atomicMarker` path [the per-decl `volatileMarker` is DEAD] + new `AtomicLoad`/`AtomicStore` MIR ops [distinct-opcode barrier, the `AtomicCas` precedent — NO flag; `hasSideEffects`+`opcodeClobbersMemory` auto-excludes the 4 gates] + ONE emit chokepoint [6 scalar sites] + the C1 fail-loud BELT `I_AtomicAccessNotLowered`=0xA018 so a plain access to an `_Atomic` type is LOUD not silently-non-atomic; `_Atomic` fails loud at mir_to_lir until 1b-ii) **→ 1b-ii ✅ LANDED 2026-07-16** = the codegen: REAL per-order `memory_order` fences (the PURE SLOT-PRESENCE matrix — arm64 `ldar`/`stlr` + x86 `mov`/`xchg`-seqcst, capability-probe, FAIL-LOUD on a missing slot per target) + `stdatomic.json` (+ the `atomic_*_explicit` builtins) + the M1 `appendType`/`parseType` type-text codec + a runtime `c11_atomic` example — both dss-state probes (c23_atomic_qualifier + c11_stdatomic_order) GREEN ×3 legs, `D-CSUBSET-ATOMIC` ✅ CLOSED (atomic cycle-1 complete: lock-free scalar `_Atomic` load/store with real fences; RMW/fence-op/non-lock-free/sub-word-width/specifier-form each a named fail-loud deferral) → **(e) `long double` ✅ COMPLETE 2026-07-16** — the width/format-divergence primitive LANDED as the per-format `longDoubleFormat` axis (`D-CSUBSET-LONG-DOUBLE` ✅): NEW `TypeKind::F80` (distinct from F128 so the future x87/binary128 arithmetic arcs can never cross-fire) + ONE typeSpecifiers row `[Long,Double]` core F64 + `coreByLongDoubleFormat {x87-80:F80, ieee128:F128}` (the coreByDataModel twin) + `l`/`L` float suffixes (with the tokenizer per-shape suffix fix — design-audit CRITICAL-1: `20L` stays an integer) + axis values pe64/macho-arm64=`f64` (long double ≡ F64 ≡ double, the LLP64 `long`≡`int` collapse precedent — WORKS end-to-end, battery probe `c_long_double` GREEN, 20.0L+22.0L→42 RUNS on pe64), elf-x86_64/macho-x86_64=`x87-80`, elf-arm64=`ieee128` (both LAYOUT-HONORED sizeof/align 16 + VALUE-WALLED: the F32/F64-only encode wall + 4 NEW call-boundary gates [design-audit CRITICAL-2] + the hostBacked const-fold gate + classifyAggregate leaf reject), wasm/spirv undeclared → `S_LongDoubleFormatUndeclared` 0xE056 at the decl. 5 trigger-gated deferrals: `-X87-ARITH`/`-IEEE128-ARITH`/`-CONSTFOLD-PRECISION`/`-AGGREGATE-ABI`/`-GENERIC-DISTINCT` (the last is a NAMED BLOCKER for (g) tgmath — on f64 formats `_Generic(x, double:, long double:)` is S_GenericSelectionAmbiguous) → **(f) `_Complex` / `<complex.h>` ✅ COMPLETE 2026-07-16** — the C99 complex type-system LANDED (`D-CSUBSET-COMPLEX` ✅): a first-class `TypeKind::Complex` (operands=[elementFloat], MEMORY-RESIDENT by-value aggregate {re@0, im@elemSize} reached BY ADDRESS — the wide-BitInt precedent; the SSA-aggregate path was deliberately removed so by-address is FORCED) + the 3-part by-address arithmetic contract (the request value→address flip · materializeComplexBinaryOp/UnaryOp/Cast from lowerLvalueAddressNode with the ×/÷ cross-terms · isByValueClass caller consumption + a combineBinaryOp misroute guard) + `__builtin_complex` (the FIRST aggregate-returning builtin) + the coerce real→complex(im=0) promotion + `<complex.h>` (complex.json MACROS `complex`/`I`/`_Complex_I` — the stdbit macros precedent — + creal/cimag/conj builtins, F64 this cycle) + `complex:true` typeSpecifiers rows reusing the LD axis (`long double _Complex` = complex(F80/F128/F64) by format — decl/layout work, arithmetic walls) + the collectLeaves 2-float-leaves ABI arm (SysV 2-SSE / AAPCS64 2-double-HFA — a silent-ABI class only unit pins catch) + complex fn-return (the Call arm widened to isByValueClass). Probe `c99_complex_arith` (40.0+2.0*I → 42) RUNS ×3 legs; design-audit GO-WITH-FIXES (3 probe-load-bearing mechanism gaps caught pre-build) + code-audit GO-WITH-FIXES (code VERIFIED-CLEAN; 6 MINOR test-hardening folds). Deferrals: `-TRANSCENDENTAL` (cabs/cexp/… libcalls) / `-ANNEX-G` (∞/NaN recovery) / `-MONOMORPH-F64` (crealf/creall…) / `D-CSUBSET-IMAGINARY-TYPE` → **(g) `<tgmath.h>` ✅ COMPLETE 2026-07-16** — C99/C23 type-generic math LANDED (`D-CSUBSET-TGMATH` ✅; a CONFIG-ONLY cycle, zero src/ changes — every mechanism was landed + empirically proven pre-build): NEW `tgmath.json` = 17 function-like `_Generic` macros (the proven shape `_Generic((x), float: sqrtf((float)(x)), default: sqrt((x)))` — ★ the CAST DISCIPLINE is load-bearing both ways: explicit `(float)` on float arms [unselected arms are FULLY type-checked] + BARE default arms [a `(double)` cast LAUNDERS complex/F80 args into silent miscompiles — demonstrated: the cast variant silently ran exit 2 on a complex arg]; pow/atan2/fmod nested `_Generic`; fabs/ldexp per-format `variants` bridging the pe float arm through the f64 fn since msvcrt exports no fabsf/ldexpf) + 34 symbol rows (17 f64 + 15 msvcrt-proven f32 + 2 gated elf/macho) + math.json +17 f-variants. ★ `D-CSUBSET-LONG-DOUBLE-GENERIC-DISTINCT` STRUCTURALLY ROUTED AROUND (no double:/long-double: arm pair spelled — on f64 formats a long-double arg rides `default:` correctly-BY-IDENTITY; walled formats fail loud): the (g) blocker DISSOLVED, stays deferred. Probe `c99_tgmath_generic` → 42 (battery 8/10); example `c99_tgmath` (sizeof-witnessed dispatch) → 42 ×3 legs; the 17×3 matrix pins + the complex-arg hazard pin red-on-disable vs the SHIPPED file. Deferrals: `-COMPLEX` (rides `D-CSUBSET-COMPLEX-TRANSCENDENTAL`) / `-SURFACE` (the C23 functions beyond math.json's 17) / `D-CSUBSET-MATH-FLOAT-VARIANTS-PE` → **(h) `#embed` ✅ COMPLETE 2026-07-16** — C23 binary-resource inclusion LANDED (`D-PP-EMBED` ✅): `#embed "resource"` + `__has_embed` — the resource's bytes spliced as a comma-separated integer-literal token list (the C23 phase-4 model) via `materializeSignificant` (design-audit P2 CONFIRMED: product tokens accepted in brace-init), a `handleEmbed` arm in the authoritative MacroExpander (config-driven `embedDirective`/`hasEmbedOperator` words — NO hardcoded "embed" in the engine; pre-scan copies verbatim → zero parity change), resolution relative to the includer (the `__FILE__` line-map precedent), a BINARY read, `__has_embed` trichotomy (NOT_FOUND/FOUND/EMPTY 0/1/2) + `__STDC_EMBED_*`, and ★ the design-audit FIX-1 LOUD 16 MiB size cap (`P_PreprocessorEmbed`, fail-loud-never-OOM) + the .gitattributes `*.bin binary` override (the CRLF-corruption trap). Probe `c23_embed` → 42; 15 unit pins (2 red-on-disable); params/angle/macro-arg/missing all loud (C23 SUBSET, honest). Deferrals: `-PARAMS`/`-ANGLE`/`-MACRO-ARG`/`-STREAMING` → **(i) inline assembly ✅ COMPLETE 2026-07-16 — FC17.9 = 100%** — the empty-template `__asm__ volatile ("")` optimizer barrier LANDED (`D-CSUBSET-INLINE-ASM` ✅; a SMALL cycle REUSING the existing `MirOpcode::CompilerBarrier`, no new op): config `__asm__`/`asmStmt` grammar (cloned from `staticAssertDecl`) + a strictly-empty-template pass2Post semantic gate (`S_InlineAsmNonEmptyTemplate` 0xE057, UNSUPPRESSABLE — so `asm("hlt")` can't be silently no-op'd, a miscompile) + a `HirKind::InlineAsm` leaf → CompilerBarrier. ⚠ **THAT LOCATION IS SUPERSEDED — note added 2026-08-12 so this line does not send a reader to the wrong file.** The sentence above records what FC17.9(i) SHIPPED and stays as written, but the asm grammar no longer lives in `c-subset.lang.json`: the inline-asm P1+P2 arc moved it to `src/dss-config/sources/asm.lang.json` (assembly is its own SOURCE LANGUAGE, referenced through the new `languageReferences` mechanism), and ✔MEASURED 2026-08-12 `c-subset.lang.json` now defines **no `asmStmt` shape at all** — only the reference that binds asm's 2 rule holes and 13 token holes to C's vocabulary. `asmLabel` DOES remain a C shape, deliberately (it renames a C symbol; see plan 29 §5). The semantic gate, `S_InlineAsmNonEmptyTemplate` and the CompilerBarrier lowering are unchanged. Owner: [`29-inline-asm-plan`](./29-inline-asm-plan%20-%20tbd.md). The T2 MIR-shape pin (`InlineAsmEmptyTemplateLowersToCompilerBarrier`, asserts EXACTLY one CompilerBarrier — the guard against the silent-barrier-deletion risk since an empty barrier is result-neutral, red-on-disable) is the strict test. Probe `c_inline_asm` → 42; non-empty/operands/goto/bare-spelling deferred loud (`-TEXT`/`-OPERANDS`/`-GOTO`/`-SPELLING`). Each sub-feature registered its own `D-CSUBSET-*` anchor. **★★ FC17.9 = 100% (all 9 items ✅ threads/stdbit/setjmp/atomics/long-double/complex/tgmath/embed/inline-asm); the PRE-FC18 CONFIG GATE is ALREADY CLOSED (both `__STDC_NO_VLA__` [VLA C1b] + `__STDC_NO_THREADS__` [FC17.9(a)] removed) → FC18 (the broad C23 corpus + positioned-diag sweep) is NEXT.** | promotes §3.2; `D-CSUBSET-C11-THREADS-HEADER` + a `D-FULLC-*` per sub-feature (registered as each lands); pre-FC18 config gate |
 | **FC18** ⏳ | A broad runnable C23 corpus (real-ish programs across all targets, §A.5) + positioned-diagnostic assertions for the new error classes (REUSES the V2-4 Part C `expectDiagnostics` harness); grows the golden diagnostic corpus | `D-DIAG-CORPUS-EVERY-CODE` (grows toward closure) |
 
+| **FC19** ⏳ **PLANNED 2026-08-24 (operator-approved; toolchain installed the same day) — CONFORMANCE ON A BIG-ENDIAN TARGET** | ★★★ **EVERY CONFORMANCE CLAIM THIS PLAN MAKES HAS ONLY EVER BEEN TESTED ON LITTLE-ENDIAN MACHINES.** Struct and union layout, bit-field allocation, integer representation, `unsigned char` aliasing, and the `__BYTE_ORDER__` / `__LITTLE_ENDIAN__` / `__BIG_ENDIAN__` predefines are all C-VISIBLE and all endianness-dependent — so a whole class of C semantics is unexercised, not merely untested on one CPU. **The target is `s390x` (IBM Z) and the reason it is s390x rather than anything cheaper is that it is the ONLY commercially live big-endian platform** — real distro ports, real glibc, and therefore the ONLY one that can run the sqlite corpus, which is what “real support” has to mean here. ✔**THE WHOLE CHAIN WAS VERIFIED BY EXECUTION 2026-08-24 BEFORE THIS ROW WAS WRITTEN, on WSL:** `s390x-linux-gnu-gcc 13.3.0` links a HOSTED binary (`ELF64`, `Data: 2's complement, big endian`, `Machine: IBM S/390`); `qemu-s390x 8.2.2` RUNS it, and a program returning the first byte of `0x12345678` exits **18 (0x12)** — big-endianness observed by RUNNING, not read from a manual; a hosted `printf`+`malloc`+`strcpy` program prints `0102030405060708` for a `long long` and exits 42; and `sizeof(long)==8`, so s390x is **LP64 like our existing elf64 legs** and brings NO data-model confound with it. ★★ **s390x is big-endian in its INSTRUCTION STREAM TOO** (✔measured: `eb bf f0 58 00 24  stmg %r11,%r15,88(%r15)` reads MSB-first), which is strictly more than `aarch64_be` can ever test — A64 instructions are little-endian in memory at both endiannesses. | ⏳ fires [[D-ASM-TARGET-DECLARES-NO-BYTE-ORDER]] (trigger-gated until today BECAUSE no shipped target declared a byte order — that gate is now dischargeable, not by argument but by a target existing) · the `endianness` target key the target descriptors deliberately withheld (*“the day a consumer exists, it gets declared and THEN gets its coherence example”*) · [[D-PP-ENDIANNESS-PREDEFINES]]'s untested half |
+
+| **FC20** ⏳ **PLANNED 2026-08-24 (operator-decided across four exchanges) — C STANDARDS BECOME LANGUAGE DOCUMENTS, AND THE FRONT END IS RENAMED `c`** | ★★★ **A `-std` ENUM WOULD BE `if (std >= C23)` SCATTERED THROUGH THE FRONT END — a source-identity branch in shared substrate, i.e. the hard veto.** A standard is a LANGUAGE DOCUMENT; the CLI flag is a document SELECTOR. `--source=c23` resolves to *load `c23.lang.json`*, and the engine learns nothing about standards at all. ✔**THE SELECTOR ALREADY EXISTS AND ALREADY RESOLVES THAT EXACT FILENAME** (measured by running the shipped binary: `--language c23` fails with `error[C_InvalidLanguageName] c23: no shipped language config found`, having tried `src/dss-config/sources/c23.lang.json`) — so the mechanism is built and merely has no document to find. ★ The same measurement showed the `.s` dialect split is NOT resolved by `fileExtensions` but by a `defaultAssemblyLanguage` NAME carried in the target document, with `--language` overriding it — the same *name resolved to a document, caller beats document* shape, so nothing about selection needs inventing. | ⏳ fires [[D-CSUBSET-BARE-ASM-ACCEPTANCE-IS-UNCONDITIONAL]] (trigger-gated on exactly a strict-conformance mode existing) · [[D-CONFIG-GRAMMAR-ISA-AND-IDENTIFIERCLASS-BELONG-IN-THE-LANGUAGE-BLOCK]] (opener is a `.lang.json` schema-version bump, which this does) · worsens [[D-CONFIG-STRAY-FILE-NAMED-AFTER-A-LANGUAGE-LOADS-AS-A-SECOND-DOCUMENT]] |
+
 ### Cluster F — SQLite-readiness (FC16-pre) *(USER-PRIORITIZED 2026-06-24)*
 > **Goal:** clear the cheap, pervasive gaps blocking the first REAL-WORLD program (SQLite / `sqlite3.c`). Each is a single narrow gap from the live `dss-state` 104-probe battery failing-list; NOT phase-gated. **User priority order (2026-06-24, set during the autonomous /loop):** (1) **FC15 fully delivered — NO deferrals** (close the FC15a paste residuals: object-like `##`, placemarker, GNU comma-elision), THEN (2) **this Cluster F**, THEN (3) the rest of C23 (FC16→FC18). Each item is a normal /dss-cycle (best-long-term, agnostic, fail-loud, strict red-on-disable + runnable corpus where observable).
 
@@ -133,6 +137,207 @@ A NEW token-stream pass between tokenization and parsing, building on the existi
 FC16 gives MEANING to the standard-C features the front-end parses but doesn't yet implement (`_Generic`, real `static_assert`/`alignas`/`alignof`, anonymous members, attribute *semantics* incl. layout-affecting `packed`, wide/UTF literals, `volatile`-honoring codegen) — closing the parse-without-semantics stub class. FC17 adds the C23-specific surface. **FC17.9 (NEW, user 2026-07-14) closes the §3.2 named exclusions — `<threads.h>` · `<stdbit.h>` · `setjmp`/`longjmp` · `_Atomic`/`<stdatomic.h>` · `long double` · `_Complex`/`<complex.h>` · `<tgmath.h>` · `#embed` · inline asm — so DSS is a COMPLETE C23 implementation before the sweep (C is the DSS Axis substrate).** FC18 is the broad C23 corpus + the positioned-diagnostic conformance sweep that grows `D-DIAG-CORPUS-EVERY-CODE`.
 
 ---
+
+### 2.F — FC19: big-endian conformance (s390x), and why it is four phases rather than one
+
+★★★ **THE WORK SPLITS INTO A DIFFUSE HALF AND A LARGE HALF, AND THEY MUST NOT BE
+DEBUGGED TOGETHER.** The *mechanism* (making serialization consult a declared byte order) is
+scattered across many small sites and is easy to miss one of; the *backend* (a new ISA) is large
+but mechanical. Debugging wrong BYTES and wrong INSTRUCTION ENCODINGS simultaneously, on an
+unfamiliar architecture, is the worst available order — so the plan removes the first from
+the equation before starting the second.
+
+**Phase 0 — close the fail-loud gap (small, and NOT speculative).** ⚠ SUSPECT, to be
+verified first: `elf_backend.cpp`'s `kElfDataEncodingRows` already maps `msb` → 2, so a
+format descriptor can declare a big-endian container TODAY, while `asm.hpp`'s
+`appendLittleEndianBytes` serializes payload little-endian unconditionally. If nothing downstream
+refuses that combination, then a big-endian ELF header over little-endian payload is reachable
+right now — a silent miscompile needing no new target at all. Closing it (REFUSE loudly,
+naming what is unimplemented) is honest work under the existing bar, independent of s390x.
+
+**Phase 1 — the mechanism.** Declare `endianness` on the target schema. The target
+descriptors argued AGAINST such a key and stated the exact precondition for adding one —
+*“nothing in the engine consumes an endianness value today … the day a consumer exists,
+it gets declared and THEN gets its coherence example”* — and FC19 is what finally
+satisfies it. Then make every serialization site consult it: `appendLittleEndianBytes`, ELF
+header / section / symbol-table / relocation encoding, constant emission, `_BitInt` limbs, and
+bit-field allocation (whose own justification reads *“LSB-first … == gnu_packed **for
+little-endian**”*). ⚠ Per the `charIsUnsigned` precedent this owes a COHERENCE EXAMPLE:
+there will now be THREE notations of one fact — the predefined macro, the target key, and the
+format's `data` — and two notations of one fact already proved a drift source once.
+
+**Phase 2 — validate the mechanism cheaply, on a backend we already trust.** `aarch64_be` is
+a **TEST FIXTURE, NOT A SHIPPED TARGET**, and this is the only reason it appears in this plan.
+✔MEASURED 2026-08-24: `aarch64-linux-gnu-gcc -mbig-endian` compiles and links FREESTANDING and
+`qemu-aarch64_be` runs it (a program returning the top byte of `0x12345678` exits 18 BE / 120 LE);
+a HOSTED link FAILS — `libgcc_s.so.1: file in wrong format` — because no big-endian glibc
+is packaged and no distro ships an aarch64_be port. That freestanding limit is FINE here, because
+this phase checks BYTES rather than running programs: same C compiled both ways on the arm64
+backend, data sections diffed against `gcc -mlittle-endian` / `-mbig-endian`. It proves Phase 1
+without a new ISA in the picture. ⚠ It can NEVER be the destination: it cannot run the corpus,
+and it cannot test a big-endian instruction stream.
+
+**Phase 3 — the s390x backend.** The real destination and a multi-cycle arc comparable to the
+original arm64 work: 16 GPRs, a 2-bit condition code rather than a flags register,
+base-displacement addressing, 2/4/6-byte instructions, its own psABI (r2–r6 arguments, r2
+return) and its own relocation set. Validated against `s390x-linux-gnu-gcc`, then the sqlite
+corpus under `qemu-s390x`.
+
+★★★ **THE BAR, RESTATED HERE BECAUSE A NEW BACKEND IS THE MOST TEMPTING PLACE IN THIS
+REPOSITORY TO BREAK IT** (operator, 2026-08-24: *“we always want best long term solution, no
+workarounds, 100% config driven”*):
+
+* **NO IDENTITY BRANCH, ANYWHERE.** Not one `if (arch == s390x)`, `if (format == ...)` or
+  `if (endianness == big)` in shared substrate (`src/{opt,mir,hir,lir,core,analysis,asm,tokenizer,link,preprocess}`).
+  Byte order is a DECLARED VALUE the serializers read, exactly as `charIsUnsigned` and
+  `bitFieldStrategy` already are. A serializer asks the target what order to write in; it never
+  asks which target it is.
+* **NO `S390*` VERB SET.** The backend binds to the vocabulary the pipeline already has —
+  `LirOperandKind`, `SymbolBinding`, `TargetCondCode`, `opcodeInfo`, the register/`subOf`/
+  `widthBytes`/`hwEncoding` rows, the relocation and calling-convention tables. **If a
+  z/Architecture fact does not fit, the fix is to the CORE vocabulary, never a private verb** —
+  and a private verb set is the SLOW form of the same agnosticism break, which no grep catches.
+  s390x's 2-bit condition code and base-displacement addressing are the two most likely pressure
+  points; both are candidates to widen the shared vocabulary, not to fork it.
+* **CONFIG-DRIVEN END TO END.** The target descriptor declares the CPU (registers, encodings,
+  condition codes, calling convention, byte order); the object-format descriptor declares the
+  container (`data: msb`, machine id, relocations). Adding s390x should mean adding
+  `s390x.target.json` and `elf64-s390x-linux-*.format.json` — not adding engine code that
+  knows the name.
+* **NO WORKAROUND IS ACCEPTABLE FOR PHASE 0.** If Phase 0 finds the `msb`/little-endian-payload
+  mismatch is reachable, it is FIXED or REFUSED LOUD — never papered over by removing `msb`
+  from the format vocabulary to make the hole unreachable. Narrowing a vocabulary to hide a defect
+  is the workaround shape this project has rejected by name.
+
+★ **WHY THIS ROW EXISTS AT ALL, RECORDED BECAUSE THE REASONING WAS NEARLY LOST:** an earlier
+pass proposed building `aarch64_be` simply because it was CHEAP. That was wrong and was withdrawn
+— cheapness is not a driver, and `appendLittleEndianBytes` being unconditional is **not a
+defect today**: it is CORRECT for every target currently shipped. Building a big-endian target
+purely to make our own code wrong would have been exactly the speculative build the bar forbids,
+which is precisely what [[D-ASM-TARGET-DECLARES-NO-BYTE-ORDER]] had been saying by staying
+trigger-gated. The row is legitimate ONLY because a real, live, hosted platform now backs it and
+the operator approved the destination. ⇒ **a cheap way to build something is never a reason to
+build it; a real target on the other end is.**
+
+### 2.G — FC20: the dialect chain, and the `c-subset` → `c` rename
+
+★★★ **OPERATOR DECISIONS, 2026-08-24. Recorded here so they are not re-litigated.**
+
+**① THE VERSIONING RELATION IS NEW AND SEPARATE — it is NOT `languageReferences`.** Operator,
+verbatim: *"aren't we talking about languageExtensions? that should be the new rule, not
+languageReferences, which is the embedding rule."* ✔MEASURED why this matters:
+`mergeLanguageReferences` refuses collisions **by deliberate design**, and its own comment states the
+argument — *"'the host wins' would let a host silently weaken a refusal it did not write; 'the
+fragment wins' would let a fragment silently retune the host's language. Neither may happen
+quietly."* A versioning chain REQUIRES override and removal, so loading that policy would have traded
+away a correct safety property. ⇒ **Embedding keeps collision-refusal at full strength; the new
+relation gets override/removal as its entire purpose.** Two relations, two policies, both principled.
+
+**② ONE PROPERTY CARRIES THE EDGE: `baseLanguage` NAMES THE PARENT, NOT THE FAMILY.**
+`c11.baseLanguage = "c"`, `c17.baseLanguage = "c11"`, `c23.baseLanguage = "c17"`. Family membership is
+then *walk to the root*, and `--source=c` means **the newest document whose root is `c`** while
+`--source=c11` names one exactly. ★ A flat family tag would need a SECOND property for the edge and
+would leave the chain order implicit in the version numbers, which is strictly worse.
+
+**③ THE DELTA NEEDS THREE VERBS, AND THE MISSING ONE IS THE CONFORMANCE-CRITICAL ONE.** ADD
+(`typeof`, `_BitInt`, `nullptr`, `constexpr`, binary literals, `#embed`); **REMOVE** (C23 deleted K&R
+function definitions; C99 deleted implicit int and implicit function declarations); **REDEFINE**
+(`bool`/`true`/`false` are `<stdbool.h>` macros in C11 and KEYWORDS in C23 — same name, different
+kind, which neither add nor remove expresses). ★ **A dialect that can only ADD cannot express a
+deletion, so it keeps accepting what the standard removed — the over-acceptance defect rebuilt
+inside the fix.** ⚠ A remove of something the parent never declared, or an add of something it
+already has, is a LOAD ERROR: a no-op delta entry is a stale belief about the parent, and that is how
+a chain rots silently.
+
+**④ WHERE TWO PARENTS COLLIDE, THE CHILD NAMES THE SOURCE PER RULE — and a mixin declares no
+parent.** An ordered parent list whose ORDER is load-bearing is a silent-behaviour-change vector:
+reorder the JSON, change the language, no diagnostic. Per-rule attribution removes ordering from the
+semantics entirely. The loader computes the overlap set and **every name two parents both touch must
+carry an explicit source; a missing one is a load error** — fail-loud with a resolution you are
+required to write down, rather than a hard error that would make a `gnu*` document unconstructible the
+moment its parents ever touched one rule. Required ONLY where the materialization is genuinely
+ambiguous; on every rule it would be noise that trains readers to skip it. ★ **And a mixin
+declares no parent of its own**, which makes a transitive diamond structurally impossible rather than
+merely detectable — without that, "which ancestor" stops being well-defined exactly when the
+attribution needs it.
+
+**⑤ EVERY SHIPPED DIALECT MUST BE ONE A MODERN COMPILER ACCEPTS.** Operator, verbatim: *"each C
+dialect must be an modern compiler accepted dialect, not strict if no modern compilers accept it. We
+need to WORK."* This is bar §A.3b as a config invariant rather than a habit: a dialect naming no
+reference implementation is DSS inventing a language. ⇒ the default dialect is **gnu-flavoured**,
+matching what gcc and clang actually default to — and ✔measured, DSS already behaves as one
+(it defines `__GNUC__`/`__clang__` and does **not** define `__STRICT_ANSI__`). ★ It also closes
+the obvious escape hatch: minting a `dss-c.lang.json` to host a DSS-only extension fails this
+invariant whichever file it lives in.
+
+**⑥ THE FIRST SHIPPED LINK IS `c23` ALONE, AS A PARENTLESS ROOT.** ✔MEASURED: DSS accepts
+**none** of the three constructs C23 removed — K&R definitions have no production and no
+`identifierList` shape exists among the 154; implicit int cannot parse because `topLevelHead` is a
+required element; implicit function declarations hit an unconditional `S_UndeclaredIdentifier` with no
+config gate. ⇒ **a truthful `c11.lang.json` must CONTAIN those three, so declaring the chain
+c11-first forces building three constructs DSS has never had before anything at all can ship**, and a
+`c11` that merely behaved like C23 would be a document naming a standard it does not implement —
+the overstatement that then propagates to every child. ★★ **The edge direction and the ship
+order are independent, because the MATERIALIZED SET is the contract and the chain is only how it is
+factored.** Ship `c23.lang.json` now (it is the current document, renamed); when `c11` and `c17` are
+real, re-parent `c23` onto `c17` and prove the materialized set BYTE-IDENTICAL to what shipped.
+Nothing about the language changes; only its factoring does. ⇒ this is why the materialization
+emitter (author as a delta, verify as a materialization) is built EARLY rather than last: it is what
+makes the re-parenting safe, and it is separately the only thing that catches an accidental edit in a
+PARENT silently changing a child.
+
+**⑦ SHIPPED STANDARD DOCUMENTS ARE FROZEN.** C11 is C11 forever. Evolution happens by ADDING
+documents, never by editing a shipped one; an edit is either a defect fix (which owes a row saying
+what was wrong) or drift. Payoff: a conformance regression becomes **a diff against a frozen file**,
+which is reviewable in a way *"the front end behaves differently"* never is.
+
+#### The rename: `c-subset` → `c`
+
+The front end is renamed because **`c-subset` is a name that cannot exist in the chain's vocabulary**
+— the documents are `c11`/`c17`/`c23`, and *a subset of what?* has no answer among them. So this
+is a prerequisite of the chain rather than tidying, and doing it after would mean renaming twice.
+✔MEASURED scope: **1,429 path renames and 7,583 content substitutions across 1,002 files**
+(`c-subset`→`c` 4,680 · `c_subset`→`c` 175 · `CSubset`→`C` 2,724 ·
+`csubset`→`c` 4), both targets free of collisions.
+
+★★★ **THE ANCHOR IDS ARE FROZEN — OPERATOR RULING, and this is the rule a future
+reader needs:** **BOTH `D-C-*` AND `D-CSUBSET-*` DENOTE THE C LANGUAGE.** Renaming 426 distinct ids
+across 6,547 citations would break archaeology from every commit message that cites one, for a
+prefix that is opaque anyway. ★ The exclusion is FREE rather than delicate, because the frozen
+spelling `CSUBSET` and the renamed spelling `CSubset` differ in case and every substitution is
+case-SENSITIVE — but the rename asserts it per-file regardless, because *"it cannot happen"* is
+exactly the class of claim this project requires an instrument for.
+
+⚠ **`c.lang.json` KEEPS its `fileExtensions` through the rename.** An earlier pass proposed
+stripping them so it could be the unselectable spine, on the `asm.lang.json` precedent (which
+deliberately claims no extension, *permanently*, because *"this document claims `.s`"* and *"this
+document can read `.s`"* must become true together). That was WITHDRAWN: ✔measured, nothing else
+claims `.c` today, so stripping them would refuse every extension-resolved compile. Spine-ness belongs
+to the chain's cycle. **The rename is a rename.**
+
+#### Two measured constraints the chain must satisfy
+
+* **Transitive references are currently REFUSED** — a referenced document that itself declares
+  `languageReferences` is a load error (`C_ConflictingField`), because *"composing holes across more
+  than one hop needs bottom-up substitution and a cycle guard that nothing in the tree can exercise
+  yet."* A `c11 → c17 → c23` chain needs that restriction lifted **deliberately**, with the
+  cycle guard that comment names.
+* **Exactly ONE document may claim `.c`/`.h`.** ✔MEASURED: the extension-resolution path fails
+  loud on both ZERO claimants and TWO claimants (it already refuses rather than guessing for `.s`,
+  which both asm dialects claim). If `c11`/`c17`/`c23` each claimed `.c`, every extension-resolved
+  compile would refuse.
+
+#### The key name for ⑤'s reference invariant
+
+✔MEASURED: `languageReferences` is TAKEN (it holds the asm EMBEDDING contract — `entry`,
+`bindRules`, `bindTokens`), `imports` is TAKEN (`#include` strategy), and `semantics.references` is
+TAKEN (name-reference rules). ⇒ use **`referenceCompilers`**: unused at every level in every
+shipped document and in all three loader key vocabularies, and it is already the project's own word
+in the differential-oracle test. ⚠ If it names real compilers it is a claim about the outside
+world, and this repository's precedent is to back such a claim AT THE MOMENT IT IS MADE —
+`impliedSurface` is mandatory, `null` is the declared absence, and an omitted field is a load error,
+*"because a defaulted absence is indistinguishable from an author who never asked the question."* A
+decorative `referenceCompilers` would be the `_MSC_VER` defect in a new place.
 
 ## 3. Deferrals
 

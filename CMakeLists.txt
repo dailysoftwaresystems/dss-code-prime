@@ -756,9 +756,16 @@ if(DSS_BUILD_TESTS)
     # a finished burn-down was still in flight. Re-derive the population with the
     # guard itself rather than trusting any number written here.
     # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
-    # the tree and then drives 35 arms, every red arm asserting the MESSAGE of the
-    # refusal it names, so this entry cannot pass without also proving the guard
-    # can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS). Its fixtures are
+    # the tree and then drives EVERY arm its own `EXPECTED_ARMS` pin declares, each
+    # red arm asserting the MESSAGE of the refusal it names, so this entry cannot
+    # pass without also proving the guard can fail
+    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    # ⚠ THE ARM COUNT USED TO BE WRITTEN HERE AS A NUMBER AND WENT STALE (it said
+    # 35; the guard drives 40 as of 2026-08-24). A count in a comment is a
+    # measurement with no instrument attached, so it decays silently in the
+    # direction of looking authoritative. The authority is the script's own
+    # `EXPECTED_ARMS`, which the guard checks against itself on every run. Its
+    # fixtures are
     # SYNTHESIZED into a temp tree at run time and deleted: an on-disk wrapped
     # fixture would be a deliberate wrap that the burn-down step would un-wrap,
     # silently breaking the self-test.
@@ -817,9 +824,15 @@ if(DSS_BUILD_TESTS)
     # DEBT that may only get shorter — the guard names them on every run. A NEW
     # primary without the block is refused.
     # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
-    # the tree and then drives 17 arms, every red arm asserting the MESSAGE of the
-    # refusal it names, so this entry cannot pass without also proving the guard
-    # can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    # the tree and then drives EVERY arm its own `EXPECTED_ARMS` pin declares, each
+    # red arm asserting the MESSAGE of the refusal it names, so this entry cannot
+    # pass without also proving the guard can fail
+    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    # ⚠ THE ARM COUNT USED TO BE WRITTEN HERE AS A NUMBER AND WENT STALE (it said
+    # 17; the guard drives 21 as of 2026-08-24), and this guard had NO
+    # `EXPECTED_ARMS` pin at all until P30 -- it reported its own arm count and
+    # compared it to nothing, so arms lost by subtraction left the suite green.
+    # The pin is the authority now; do not write the number here again.
     add_test(
         NAME guard_output_encoding_guard
         COMMAND ${Python3_EXECUTABLE}

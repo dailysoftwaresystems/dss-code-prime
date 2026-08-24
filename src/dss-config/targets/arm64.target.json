@@ -2238,6 +2238,23 @@
       "result":        "value",
       "minOperands":   1,
       "maxOperands":   1,
+      "lowering": {
+        "$comment": "D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE. ★ THIS IS NOT A SPECIAL CASE AND NOT A `native` FLAG — it is the same kind of row x86-64's seven-step fp_to_ui carries, ONE ENTRY LONG, because on this machine the operation genuinely IS one instruction. Declaring it makes the statement uniform: every target STATES how the operation is realized, and the shared substrate reads one thing and emits what it was told. ✔MEASURED under qemu-aarch64 on all ten conversion probes (both directions, both source float widths, u32 and u64, at and above 2^31/2^63): 10/10 agree with gcc-13 and clang-19 — FCVTZU Xd is genuinely full-range from BOTH a Dn and an Sn source, so the one-step declaration is TRUE and not a half-truth. The step names this very opcode; that is well-founded, not circular, because a step is emitted as a MACHINE instruction and never re-expanded (the loader enforces it by requiring every step's opcode to declare an encoding).",
+        "sequences": [
+          {
+            "guard": { "width": 64 },
+            "steps": [
+              { "op": "fp_to_ui", "result": "result", "resultClass": "gpr", "width": 64, "operands": [{ "source": 0 }] }
+            ]
+          },
+          {
+            "guard": { "width": 32 },
+            "steps": [
+              { "op": "fp_to_ui", "result": "result", "resultClass": "gpr", "width": 32, "operands": [{ "source": 0 }] }
+            ]
+          }
+        ]
+      },
       "encoding": {
         "format":   "fixed32",
         "variants": [
@@ -2298,6 +2315,23 @@
       "result":        "value",
       "minOperands":   1,
       "maxOperands":   1,
+      "lowering": {
+        "$comment": "D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE — the one-entry form of the same row x86-64 needs seven steps for. UCVTF Dd,Xn is full-range over the whole u64 and UCVTF Dd,Wn over the whole u32, so BOTH declarations are true at their declared width; the destination stays fixed at F64/Dd on this target, and an F32 destination still has no realization at all and fails loud upstream (D-CSUBSET-INT-TO-F32-CODEGEN) rather than being half-declared here.",
+        "sequences": [
+          {
+            "guard": { "width": 64 },
+            "steps": [
+              { "op": "ui_to_fp", "result": "result", "resultClass": "fpr", "width": 64, "operands": [{ "source": 0 }] }
+            ]
+          },
+          {
+            "guard": { "width": 32 },
+            "steps": [
+              { "op": "ui_to_fp", "result": "result", "resultClass": "fpr", "width": 32, "operands": [{ "source": 0 }] }
+            ]
+          }
+        ]
+      },
       "encoding": {
         "format":   "fixed32",
         "variants": [

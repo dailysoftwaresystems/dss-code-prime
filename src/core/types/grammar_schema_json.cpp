@@ -3963,7 +3963,11 @@ void synthesizeInlineAsmTemplateLexemeRows(
 
     struct Row { std::string lexeme; std::string kind; json meaning; };
     std::vector<Row> rows;
-    std::unordered_map<std::string, std::string> lexemeOwner;  // lexeme → role
+    // lexeme → a PHRASE naming what declares it. A phrase rather than the role
+    // key because two DIFFERENT kinds of declaration now mint rows into this
+    // mode — the language's template ROLES and this dialect's width-view
+    // LETTERS — and a collision between the two has to name both honestly.
+    std::unordered_map<std::string, std::string> lexemeOwner;
     for (auto const& role : kInlineAsmTemplateRoles) {
         std::string const key{role.key};
         // ★★★ AN EXPLICIT `null` ROLE THAT THIS DOCUMENT NEVERTHELESS BINDS A
@@ -4061,13 +4065,14 @@ void synthesizeInlineAsmTemplateLexemeRows(
                           key, origin));
             continue;
         }
-        auto const [owner, fresh] = lexemeOwner.emplace(lexeme, key);
+        auto const [owner, fresh] = lexemeOwner.emplace(
+            lexeme, std::format("the template role '{}'", key));
         if (!fresh) {
             coll.emit(DiagnosticCode::C_ConflictingField,
                       std::format("/semantics/{}/{}",
                                   kInlineAsmTemplateLexemesKey, key),
                       std::format(
-                          "template roles '{}' and '{}' are BOTH declared with "
+                          "{} and the template role '{}' are BOTH declared with "
                           "the lexeme '{}' — the tokenizer resolves competing "
                           "lexemes by LENGTH, so two roles on one spelling means "
                           "one of them can never be produced and which one is "
@@ -4087,6 +4092,88 @@ void synthesizeInlineAsmTemplateLexemeRows(
         if (entry.contains("opensScope")) meaning["opensScope"] = entry.at("opensScope");
         if (entry.contains("closesScope")) meaning["closesScope"] = entry.at("closesScope");
         rows.push_back(Row{lexeme, it->second, std::move(meaning)});
+    }
+
+    // ── THE WIDTH-VIEW MODIFIER LETTERS: THE SAME JOIN, ONE AXIS WIDER ──
+    //
+    // ★★★ THE SIGIL IS THE LANGUAGE'S AND THE LETTER IS THE DIALECT'S, SO THE
+    // LEXEME IS COMPOSED HERE AND NOWHERE ELSE. `%w0` asks for a width VIEW of
+    // the register an operand was bound to, and the view a letter names is
+    // per-CPU: ✔MEASURED 2026-08-24 by execution on gcc 13.3.0 and clang 19.1.1,
+    // `%w0` renders `w0` (32 bits) on aarch64 and `%ax` (16 bits) on x86-64. ⇒ a
+    // letter table in the LANGUAGE document would be wrong for one of its two
+    // readers by construction, while the SIGIL is the same byte in every GNU
+    // dialect and already has exactly one owner above. Joining them here is the
+    // only placement where neither fact gets a second owner — and it is the same
+    // join this function already performs for (language byte, dialect kind),
+    // extended by one axis rather than duplicated beside it.
+    //
+    // ⚠ EVERY LETTER TAKES THE **SAME** KIND, which is what keeps
+    // `asmTemplateOperand`'s alternation FIRST-disjoint however many letters a
+    // dialect declares: three kinds, three arms, and adding a letter is a config
+    // row rather than a grammar edit.
+    //
+    // ⚠ THE SHAPE OF A ROW IS NOT VALIDATED HERE — the `assembly` block reader
+    // owns that (it has the key vocabulary, the width table and the rule
+    // resolution) and reports precisely. A row this pass cannot read is SKIPPED,
+    // never guessed at, so the two readers cannot disagree about what was
+    // declared: one of them reports, and neither invents.
+    std::string placeholderLexeme;
+    if (roles->contains("templatePlaceholder")
+        && roles->at("templatePlaceholder").is_object()
+        && roles->at("templatePlaceholder").contains("lexeme")
+        && roles->at("templatePlaceholder").at("lexeme").is_string()) {
+        placeholderLexeme =
+            roles->at("templatePlaceholder").at("lexeme").get<std::string>();
+    }
+    auto const modifierKind = boundKind.find("templateModifierPlaceholder");
+    json const* modifierRows = nullptr;
+    if (doc.contains("assembly") && doc.at("assembly").is_object()
+        && doc.at("assembly").contains("templateModifiers")
+        && doc.at("assembly").at("templateModifiers").is_array()) {
+        modifierRows = &doc.at("assembly").at("templateModifiers");
+    }
+    if (modifierRows != nullptr && !placeholderLexeme.empty()
+        && modifierKind != boundKind.end()) {
+        for (auto const& m : *modifierRows) {
+            if (!m.is_object() || !m.contains("letter")
+                || !m.at("letter").is_string()) continue;
+            auto const letter = m.at("letter").get<std::string>();
+            if (letter.empty()) continue;
+            std::string const lexeme = placeholderLexeme + letter;
+            auto const owner =
+                lexemeOwner.emplace(lexeme,
+                                    std::format("the width-view letter '{}'",
+                                                letter));
+            if (!owner.second) {
+                // ★★★ A LETTER WHOSE COMPOSED LEXEME IS ALREADY SPOKEN FOR IS
+                // REFUSED BY NAME RATHER THAN LEFT TO MAXIMAL MUNCH. The live
+                // example is `l`: the LANGUAGE spells the `asm goto` label sigil
+                // `%l`, so a dialect declaring the letter `l` would mint a
+                // second row for those exact bytes and one of the two meanings
+                // would simply never be produced — decided by table iteration
+                // order, and silent in both directions (`%l2` would decode as an
+                // operand width view, or a width view as a branch target).
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          std::format("/assembly/templateModifiers/{}", letter),
+                          std::format(
+                              "'{}' declares the inline-asm width-view letter "
+                              "'{}', which composes with '{}'s operand "
+                              "placeholder sigil '{}' into the template lexeme "
+                              "'{}' — and that lexeme is already declared by {}. "
+                              "The tokenizer resolves competing lexemes by "
+                              "LENGTH, so two meanings on one spelling means one "
+                              "of them can never be produced and which one is "
+                              "decided by table iteration order. Choose a letter "
+                              "this language's sigils do not already spell",
+                              hostLabel, letter, origin, placeholderLexeme,
+                              lexeme, owner.first->second));
+                continue;
+            }
+            json meaning = json::object();
+            meaning["kind"] = modifierKind->second;
+            rows.push_back(Row{lexeme, modifierKind->second, std::move(meaning)});
+        }
     }
 
     // ── R1: the dialect may not own any of this ──
@@ -4135,7 +4222,7 @@ void synthesizeInlineAsmTemplateLexemeRows(
             if (owner != lexemeOwner.end()) {
                 clash = owner->second;
                 why   = std::format("its row for '{}' is the very LEXEME that "
-                                    "role is declared with", lexeme);
+                                    "declaration is made with", lexeme);
             } else if (meanings.is_array()) {
                 for (auto const& m : meanings) {
                     if (!m.is_object() || !m.contains("kind")
@@ -4147,7 +4234,7 @@ void synthesizeInlineAsmTemplateLexemeRows(
                         clash = lexemeOwner.at(r.lexeme);
                         why   = std::format(
                             "its row for '{}' carries the KIND '{}', which is "
-                            "already the token this document binds to that role "
+                            "already the token this document binds for it "
                             "— spelling it '{}' instead of '{}' does not make it "
                             "a different fact",
                             lexeme, k, lexeme, r.lexeme);
@@ -4162,20 +4249,21 @@ void synthesizeInlineAsmTemplateLexemeRows(
                       std::format(
                           "'{}' declares an inline-asm TEMPLATE lexeme of its "
                           "own. Mode '{}' is this document's template lexer mode "
-                          "and {} for the template role '{}', which '{}' already "
-                          "owns in 'semantics.{}'. The template sigils have "
-                          "exactly ONE owner — the LANGUAGE — and this dialect's "
-                          "rows for them are SYNTHESIZED from it, so a second "
-                          "declaration here could only ever disagree, and "
-                          "nothing downstream could notice: the semantic tier "
+                          "and {} for {}. Every row of this mode is SYNTHESIZED "
+                          "— the SIGILS from the language's 'semantics.{}' "
+                          "(where '{}' declares them) and the width-view LETTERS "
+                          "from this document's own 'assembly.templateModifiers' "
+                          "— so each spelling has exactly one owner and a second "
+                          "declaration here could only ever disagree, with "
+                          "nothing downstream able to notice: the semantic tier "
                           "scans templates with no dialect in scope. Delete the "
                           "row; declare only the capability ('templateLexerMode' "
                           "+ 'templateOperandRule') and the kind binding in "
                           "'bindTokens' "
                           "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-"
                           "CONFIG-OWNER)",
-                          hostLabel, modeName, why, clash, origin,
-                          kInlineAsmTemplateLexemesKey));
+                          hostLabel, modeName, why, clash,
+                          kInlineAsmTemplateLexemesKey, origin));
         }
     }
 
@@ -15304,14 +15392,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // two keys the loader reads two hundred lines further down. One
             // owner per fact: the OPTIONALITY is a comment, the MEMBERSHIP is
             // the table.
-            static constexpr std::array<std::string_view, 16> kAssemblyKeys{
+            static constexpr std::array<std::string_view, 18> kAssemblyKeys{
                 // required whenever the block is present
                 "unitRule",      "lineRule",      "elementRule",
                 "directiveRule", "statementRule", "labelTailRule",
                 "operandSeqRule", "operandOrder", "operandForms",
                 "instructions",  "spellingCase",
                 "templateLexerMode", "templateOperandRule",
-                "templateLabelRule",
+                "templateLabelRule", "templateModifierRule",
+                "templateModifiers",
                 // OPTIONAL, and validated separately below: a dialect with no
                 // directive vocabulary refuses every directive by name, which
                 // is a coherent state.
@@ -15394,13 +15483,28 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // six orderings by hand, which is how one of them ends up
                 // saying the wrong thing.
                 struct CapabilityKey { char const* name; bool present; };
-                std::array<CapabilityKey, 3> const capability{{
+                std::array<CapabilityKey, 5> const capability{{
                     {"templateLexerMode",
                      as.contains("templateLexerMode")},
                     {"templateOperandRule",
                      as.contains("templateOperandRule")},
                     {"templateLabelRule",
                      as.contains("templateLabelRule")},
+                    // ⚠ THE SET GREW FROM THREE TO FIVE FOR THE SAME REASON IT
+                    // GREW FROM TWO TO THREE: `asm.lang.json`'s placeholder alt
+                    // now has a WIDTH-VIEW arm, so a dialect that imports the
+                    // shared surface imports a shape whose FIRST token only its
+                    // own declared letters can mint. Declaring the rule without
+                    // the letters is a shape nothing ever produces; declaring
+                    // the letters without the rule mints tokens no shape
+                    // accepts; and either way `%w0` fails at the parser with a
+                    // message about the sigil rather than about the missing
+                    // declaration. Both are silent no-ops, which is the outcome
+                    // this whole block is shaped to make impossible.
+                    {"templateModifierRule",
+                     as.contains("templateModifierRule")},
+                    {"templateModifiers",
+                     as.contains("templateModifiers")},
                 }};
                 std::size_t declaredCount = 0;
                 for (auto const& k : capability) {
@@ -15425,7 +15529,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               std::format("/assembly/{}", firstMissing),
                               std::format(
                                   "'assembly' declares {} but not {} — these "
-                                  "are the THREE PARTS of one capability (an "
+                                  "are the FIVE PARTS of one capability (an "
                                   "embedded assembly template's placeholders) "
                                   "and none does anything alone. "
                                   "'templateLexerMode' is what gives this "
@@ -15438,7 +15542,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                   "OPERAND reference — a label denotes a BLOCK "
                                   "and an operand a REGISTER, and the rule is "
                                   "the only dialect-neutral thing that "
-                                  "distinguishes them. Declare all three, or "
+                                  "distinguishes them; 'templateModifierRule' "
+                                  "and 'templateModifiers' are the same pair "
+                                  "for a WIDTH-VIEW reference (`%w0`) — the "
+                                  "rule says which shape states a width of its "
+                                  "own, and the letters say which widths this "
+                                  "dialect spells, because `%w` is 32 bits on "
+                                  "aarch64 and 16 on x86-64 and no shared "
+                                  "document can hold both. Declare all five, or "
                                   "none and host no templates",
                                   present, missing));
                     assemblyClean = false;
@@ -15452,6 +15563,166 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // that question unanswerable and the check enforced a proxy.
                     readRule("templateOperandRule", cfg.templateOperandRule);
                     readRule("templateLabelRule",   cfg.templateLabelRule);
+                    readRule("templateModifierRule",
+                             cfg.templateModifierRule);
+
+                    // ── the WIDTH-VIEW LETTERS ────────────────────────────
+                    //
+                    // ★★★ THE LETTER IS THIS DIALECT'S AND THE SIGIL IS THE
+                    // LANGUAGE'S, so the composed lexeme is built ONCE, at the
+                    // join, and stored on the config. ✔MEASURED 2026-08-24 by
+                    // execution on gcc 13.3.0 and clang 19.1.1 that the letter
+                    // must be per dialect: `%w0` renders `w0` (32 bits) on
+                    // aarch64 and `%ax` (16 bits) on x86-64. The sigil is NOT
+                    // per dialect — GNU spells it the same everywhere and it
+                    // already has an owner — so it is READ from there rather
+                    // than re-declared here.
+                    // ⚠ AN EMPTY SIGIL WITH THE CAPABILITY DECLARED IS A
+                    // REFUSAL, not a composed lexeme that is just the letter:
+                    // `w0` as a template lexeme would shadow the register
+                    // spelling in every `.s` this dialect reads.
+                    cfg.templatePlaceholderLexeme =
+                        data.semantics.inlineAsmTemplateLexemes.placeholder;
+                    if (cfg.templatePlaceholderLexeme.empty()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/assembly/templateModifiers",
+                                  std::format(
+                                      "'assembly.templateModifiers' declares "
+                                      "width-view letters, but no language "
+                                      "document in scope declares "
+                                      "'semantics.{}.templatePlaceholder' — a "
+                                      "letter is only half a lexeme, and "
+                                      "composing it with nothing would declare "
+                                      "the bare letter as a template lexeme, "
+                                      "shadowing every register spelling that "
+                                      "begins with it",
+                                      kInlineAsmTemplateLexemesKey));
+                        assemblyClean = false;
+                    }
+
+                    json const& mods = as.at("templateModifiers");
+                    if (!mods.is_array() || mods.empty()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                  "/assembly/templateModifiers",
+                                  "'templateModifiers' must be a NON-EMPTY "
+                                  "array of { letter, widthBits } — the shared "
+                                  "placeholder grammar carries a width-view "
+                                  "arm, so a dialect declaring the capability "
+                                  "and no letters declares a shape whose FIRST "
+                                  "token nothing can ever mint");
+                        assemblyClean = false;
+                    } else {
+                        static constexpr std::array<std::string_view, 2>
+                            kModifierKeys{"letter", "widthBits"};
+                        DSS_CHECK_KEY_VOCABULARY(kModifierKeys);
+                        // ⚠ THE WIDTHS ARE THE ONES `lirInstWidthBits` CAN
+                        // STATE, and the check is not pedantry: a width outside
+                        // the set has no LIR flag, so it would be carried to
+                        // the instruction and silently read back as 64 — a
+                        // wrong-width operation with a clean build log, the
+                        // exact outcome the refusal this surface replaces
+                        // existed to prevent.
+                        static constexpr std::array<std::uint32_t, 4>
+                            kModifierWidths{8, 16, 32, 64};
+                        std::size_t index = 0;
+                        for (auto const& m : mods) {
+                            auto const path =
+                                std::format("/assembly/templateModifiers/{}",
+                                            index);
+                            ++index;
+                            if (!m.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path,
+                                          "each 'templateModifiers' entry must "
+                                          "be an object { letter, widthBits }");
+                                assemblyClean = false;
+                                continue;
+                            }
+                            if (!checkKeysAgainst(
+                                    m, kModifierKeys, path,
+                                    "a 'templateModifiers' entry",
+                                    DiagnosticCode::C_InvalidHirLowering, coll,
+                                    "A misspelled key would leave the letter "
+                                    "or its width undeclared and the view "
+                                    "would resolve to the wrong register")) {
+                                assemblyClean = false;
+                            }
+                            if (!m.contains("letter")
+                                || !m.at("letter").is_string()
+                                || m.at("letter").get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/letter",
+                                          "'letter' is required and must be a "
+                                          "non-empty string — it is composed "
+                                          "with the language's placeholder "
+                                          "sigil to form this mode's lexeme");
+                                assemblyClean = false;
+                                continue;
+                            }
+                            if (!m.contains("widthBits")
+                                || !m.at("widthBits").is_number_unsigned()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/widthBits",
+                                          "'widthBits' is required and must be "
+                                          "a positive integer — the whole "
+                                          "point of a width-view letter is the "
+                                          "width it states, and a view with no "
+                                          "width would fall back to the full "
+                                          "register");
+                                assemblyClean = false;
+                                continue;
+                            }
+                            auto const letter =
+                                m.at("letter").get<std::string>();
+                            auto const width =
+                                m.at("widthBits").get<std::uint32_t>();
+                            if (std::find(kModifierWidths.begin(),
+                                          kModifierWidths.end(), width)
+                                == kModifierWidths.end()) {
+                                std::string allowed;
+                                for (std::uint32_t const w : kModifierWidths) {
+                                    if (!allowed.empty()) allowed += " | ";
+                                    allowed += std::to_string(w);
+                                }
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/widthBits",
+                                          std::format(
+                                              "width-view letter '{}' declares "
+                                              "'widthBits' {}, which is not one "
+                                              "of the operation widths LIR can "
+                                              "state ({}). A width outside the "
+                                              "set carries no instruction flag "
+                                              "and would be read back as the "
+                                              "full register width",
+                                              letter, width, allowed));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            std::string lexeme =
+                                cfg.templatePlaceholderLexeme + letter;
+                            bool duplicate = false;
+                            for (auto const& prev : cfg.templateModifiers) {
+                                if (prev.letter != letter) continue;
+                                duplicate = true;
+                                coll.emit(DiagnosticCode::C_ConflictingField,
+                                          path + "/letter",
+                                          std::format(
+                                              "width-view letter '{}' is "
+                                              "declared twice ({} bits and {} "
+                                              "bits) — one spelling cannot name "
+                                              "two widths, and which one "
+                                              "answered would be decided by "
+                                              "table order",
+                                              letter, prev.widthBits, width));
+                                assemblyClean = false;
+                                break;
+                            }
+                            if (duplicate) continue;
+                            cfg.templateModifiers.push_back(
+                                AssemblyConfig::AsmTemplateModifier{
+                                    letter, std::move(lexeme), width});
+                        }
+                    }
 
                     // ★★★ THE LABEL RULE MUST BE A PLACEHOLDER FORM THE OPERAND
                     // RULE CAN ACTUALLY REACH, AND BOTH ARMS BELOW ARE SILENT
@@ -15516,6 +15787,71 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                           "goto` label form would be silently "
                                           "dead. Name the LABEL alternative of "
                                           "the placeholder rule itself",
+                                          kinds));
+                            assemblyClean = false;
+                        }
+                    }
+
+                    // ★ THE SAME TWO ARMS FOR THE WIDTH-VIEW RULE, AND FOR THE
+                    // SAME REASON: `decodePlaceholder` matches the CHILD of the
+                    // operand rule's node against this rule, so a rule equal to
+                    // the operand rule matches nothing and every `%w0` silently
+                    // stops stating a width — the wrong-width miscompile with a
+                    // clean build log. Naming the LABEL rule is the other
+                    // plausible typo and is refused by name, because a width
+                    // view and a branch target are answered by different host
+                    // virtuals.
+                    if (cfg.templateOperandRule.valid()
+                        && cfg.templateModifierRule.valid()) {
+                        char const* same = nullptr;
+                        if (cfg.templateModifierRule.v
+                            == cfg.templateOperandRule.v) {
+                            same = "templateOperandRule";
+                        } else if (cfg.templateLabelRule.valid()
+                                   && cfg.templateModifierRule.v
+                                          == cfg.templateLabelRule.v) {
+                            same = "templateLabelRule";
+                        }
+                        if (same != nullptr) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      "/assembly/templateModifierRule",
+                                      std::format(
+                                          "'templateModifierRule' names the "
+                                          "same rule as '{}' — a width view is "
+                                          "a THIRD alternative of the "
+                                          "placeholder rule, decoded through "
+                                          "the operand path while stating a "
+                                          "width of its own. Naming an existing "
+                                          "member makes the width-view arm "
+                                          "match nothing, so `%w0` would decode "
+                                          "at the operand's own type width with "
+                                          "a clean build log",
+                                          same));
+                            assemblyClean = false;
+                        } else if (auto const unreachable =
+                                       ruleFirstKindsOutside(
+                                           data, cfg.templateModifierRule,
+                                           cfg.templateOperandRule);
+                                   !unreachable.empty()) {
+                            std::string kinds;
+                            for (SchemaTokenId const k : unreachable) {
+                                if (!kinds.empty()) kinds += ", ";
+                                kinds += '\'';
+                                kinds += data.schemaTokens->name(k);
+                                kinds += '\'';
+                            }
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      "/assembly/templateModifierRule",
+                                      std::format(
+                                          "'templateModifierRule' begins with "
+                                          "{}, which 'templateOperandRule' "
+                                          "cannot begin with — so no "
+                                          "placeholder this dialect can parse "
+                                          "would ever match the width-view "
+                                          "rule, and the whole modifier form "
+                                          "would be silently dead. Name the "
+                                          "WIDTH-VIEW alternative of the "
+                                          "placeholder rule itself",
                                           kinds));
                             assemblyClean = false;
                         }

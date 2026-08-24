@@ -1536,14 +1536,38 @@ enum class DiagnosticCode : std::uint16_t {
     // ★★ THE DE-FACTO CONTRACT IS BROADER THAN THE NAME, AND THE NAME IS THE
     // NARROW ONE: this code means **a `%`-form in an EXTENDED inline-asm template
     // that this build cannot expand.** ✔MEASURED 2026-08-17 that
-    // `scanInlineAsmTemplate` already emits it for THREE distinct constructs, of
-    // which the modifier is only the first
-    // (D-DIAG-S0067-DOCBLOCK-NAMES-ONE-OF-THE-THREE-FORMS-IT-REPORTS):
+    // `scanInlineAsmTemplate` emitted it for THREE distinct constructs, of which
+    // the modifier was only the first
+    // (D-DIAG-S0067-DOCBLOCK-NAMES-ONE-OF-THE-THREE-FORMS-IT-REPORTS).
+    // ⚠ TWO OF THE THREE HAVE SINCE BECOME LOWERED FEATURES AND **ONE IS LEFT
+    // LIVE** — entry (2). The retired entries are kept numbered rather than
+    // deleted, because the broadening argument below turns on how many forms
+    // this code reported and a silent renumbering would leave the next reader
+    // unable to check that claim against the history:
     //
-    //   (1) an operand MODIFIER placeholder — `%w0`, `%k0`, `%b0` — which asks
-    //       for a narrower VIEW of the register the operand was bound to
-    //       (arm64's `w0` half of `x0`; x86's `%k`/`%b`/`%h` width letters)
-    //       rather than for the operand itself;
+    //   (1) ⛔ RETIRED 2026-08-24 (cycle P30) — the WIDTH-VIEW modifier
+    //       placeholder `%w0` / `%k0` / `%q0`, which asks for a narrower VIEW of
+    //       the register the operand was bound to, was refused here from
+    //       2026-08-14 to 2026-08-24 because no document declared a width-view
+    //       vocabulary. It is now a LOWERED FEATURE: `asm.lang.json` carries an
+    //       `asmTemplateModifiedRef` arm taking the shared `asmTemplateSelector`
+    //       (so `%w0` and `%w[out]` both parse), each DIALECT declares its own
+    //       letters and their `widthBits` in `assembly.templateModifiers`, and
+    //       the lowering states that width on the operand it already resolved.
+    //       ✔The letter table was MEASURED to be per-dialect by execution on gcc
+    //       13.3.0, both ports, `-O0` and `-O2`: `%w0` renders `w0` (32 bits) on
+    //       aarch64 and `%ax` (16 bits) on x86-64, so no shared table could have
+    //       been right for both — which is why the refusal's own reasoning ("the
+    //       FACET is owed") named a target facet and the facet that landed is a
+    //       DIALECT one. A selector that names no operand is now refused by
+    //       `S_InlineAsmPlaceholderOutOfRange` — the code that owns index
+    //       questions — not here, and an UNDECLARED letter mints no template
+    //       lexeme and is refused by the dialect at MIR→LIR inside
+    //       `S_InlineAsmTemplateUnparsable`, exactly as an undeclared mnemonic
+    //       is. ★ Kept as a numbered entry rather than deleted, for the same
+    //       reason entry (3) is: the census reason below turns on how many forms
+    //       this code reports, and silently renumbering would leave the next
+    //       reader unable to check that claim against the history.
     //   (2) any other unrecognised `%`-form, including GNU's `%=` (the unique
     //       per-instantiation number) and a template ending in a bare `%`;
     //   (3) ⛔ RETIRED 2026-08-19 (cycle P20) — the positional `asm goto`
@@ -1568,23 +1592,35 @@ enum class DiagnosticCode : std::uint16_t {
     // one refusal reason, one severity, and one remedy (write the form this build
     // declares), and three codes would make the census enumerate spellings
     // instead of the property.
+    // ★ AND THE TWO RETIREMENTS ARE THE ARGUMENT PAYING OFF RATHER THAN
+    // WEAKENING IT. Under three codes, realizing `%lN` and then `%w0` would have
+    // left two codes that no input can reach — dead diagnostics that still have
+    // to be maintained, censused and tested. Under one code the same two changes
+    // are two paragraphs of history and the live contract is unchanged: a
+    // `%`-form this build cannot expand. ⚠ A reader adding a form should expect
+    // that number to keep shrinking, and should NOT read a shrinking census as a
+    // reason to narrow the code's NAME back to the modifier it was named for.
     //
-    // ★ WHY A REFUSAL AND NOT A LOWERING: the view a modifier letter selects
-    // is per-TARGET vocabulary of exactly the kind `asmConstraints` already
-    // is, and NO shipped `.target.json` declares it. Implementing it in C++
-    // would put `if (letter == 'w')` — an arm64 fact — into shared substrate,
-    // the agnosticism break the bar vetoes outright. ⇒ the FACET is owed, and
-    // until it is declared this refuses by name and quotes the modifier.
-    // ⚠ NO REGISTRY ROW EXISTS FOR THAT FACET YET (measured 2026-08-14): it
-    // belongs to D-CSUBSET-INLINE-ASM-OPERANDS' deferral tail. Do not read
-    // this comment as a pointer to a row that can be looked up.
+    // ★ WHAT THE RETIRED FIRST ENTRY LEFT BEHIND, BECAUSE THE REASONING WAS
+    // RIGHT AND ITS CONCLUSION ABOUT **WHERE** WAS NOT. The old text said the
+    // view a letter selects is per-TARGET vocabulary "of exactly the kind
+    // `asmConstraints` already is", so the FACET was owed on `.target.json`.
+    // The half that survives is that it is CONFIG and never C++: an
+    // `if (letter == 'w')` in shared substrate is the agnosticism break the bar
+    // vetoes outright. The half that was wrong is the OWNER — a template
+    // placeholder is a fact of (target, DIALECT), the same per-(X,Y) shape that
+    // put `operandOrder` and `spellingCase` on the dialect rather than the CPU,
+    // and the letters are needed at GRAMMAR LOAD (to mint the mode's lexemes)
+    // where no `TargetSchema` exists at all. ⇒ the facet landed as
+    // `assembly.templateModifiers`.
     //
-    // UNSUPPRESSABLE: silenced, `%w0` falls back to the FULL register — `x0`
-    // where the source wrote `w0` — so a 32-bit operation executes 64-bit.
-    // That is not a hypothetical failure mode for this arc: the standalone
-    // arm64 dialect shipped exactly it once (a `mov w0, w1` that encoded
-    // 64-bit) and it was found by execution, not by review.
-    // Renders error[S0067].
+    // UNSUPPRESSABLE, and the reason is unchanged by the retirement: silenced,
+    // a form this code still reports would be emitted with the operand at the
+    // FULL register width — `x0` where the source wrote `w0` — so a 32-bit
+    // operation executes 64-bit. That is not a hypothetical failure mode for
+    // this arc: the standalone arm64 dialect shipped exactly it once (a
+    // `mov w0, w1` that encoded 64-bit) and it was found by execution, not by
+    // review. Renders error[S0067].
     S_InlineAsmOperandModifierUnsupported = 0xE067,
 
     // D-CSUBSET-INLINE-ASM-OPERANDS (inline-asm P5): a clobber-list entry that

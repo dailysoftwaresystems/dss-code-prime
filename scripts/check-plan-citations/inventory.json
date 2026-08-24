@@ -24,7 +24,7 @@
     ".plans/25-posix-per-target-structs - tbd.md": 6,
     ".plans/28-driver-builder-plan.md": 6,
     ".plans/29-inline-asm-plan - tbd.md": 42,
-    ".plans/_deferred-anchor-registry.md": 2064,
+    ".plans/_deferred-anchor-registry.md": 2060,
     ".plans/_handoff.md": 60,
     ".plans/_next-session-brief.md": 2,
     "examples/c-subset/abstract_fnptr_cast/main.c": 1,

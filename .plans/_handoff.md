@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-24 — cycles **P14 … P29**. ★★★ **P29: THE ROWS P28 OPENED — AND MEASURING THEM KEPT EXPOSING THE INSTRUMENTS DOING THE MEASURING.** Nine lanes, five waves; balance **1022 → 1022, net +0** (closed 6, opened 6 — **2 created**, 4 disclosed, 2 bookkeeping-only, **1 BORN CLOSED**) — ⚠ the authority is `python scripts/check-anchor-balance/check-anchor-balance.py`, which prints every one of those numbers on every run; re-measure rather than re-quote this line. Gate **1580/1580** in 431.59 s, up from 1562. ★★★ **A TENTH FINDING ARRIVED AFTER THE AUDIT, FROM A REPAIR LANE'S OWN PROBE: AN INLINE-ASM TEMPLATE THAT PARSES BUT EMITS NO INSTRUCTION *ABORTED* THE COMPILER** — `__asm__ ("   ")` → rc=127, `dss::Lir fatal: LirBuilder::lastInst: no instruction has been appended`, no code and no source position, on five shapes gcc 13.3.0 compiles and RUNS (a `/* */` comment among them, so not an exotic input). ★ **THE CAUSE WAS SHADOW STATE AND THE AUTHOR'S OWN COMMENT NAMED IT BEFORE IT BIT** — *"`LirBuilder` exposes no count, so the empty case is TRACKED rather than probed"*: the tracking `bool` MIRRORED the arena, the assembly engine bypasses the site that maintained it, so the asm path re-derived it FROM THE SHAPE OF THE INPUT on an argument that ENUMERATED its exceptions — and a comment, whitespace and a bare newline were not in the enumeration. Fixed by ADDING the missing count (`LirBuilder::hasAnyInst()`) and DELETING both the mirror and the proxy; ✔it is a crash and NOT a miscompile, measured (barrier intact, two loads no CSE, release image byte-IDENTICAL before/after). ★★ **AND THE SAME SPECIES REACHING THE OPERATOR: 71 shipped diagnostics cite a row that has CLOSED** — sized, not swept, and P30's item 1. ★★ **FOUR of the five addressable P28 openings are CLOSED — not five:** `D-PLANS-GATED-ROWS-NAME-NO-OPENER` is still 🔵 OPEN, it is the one row whose debt this cycle GREW, and it is P30's item 1. ★★★ **FIVE OF THE NINE LANES ENDED UP FIXING THE TOOLS THAT JUDGE THIS PROJECT:** `check-anchor-balance`'s `split_row` read an ESCAPED PIPE as a column separator (**161 of 2,252 rows mis-split**) — found by TWO INDEPENDENT LANES from opposite directions, and neither could have concluded it alone; `is_gated` read a PHRASE rather than the operator's rule and was blind to **98** rows the rule condemns, then after its first widening enumerated 2 glyphs where 11 lead a cell and recognised **one spelling of six** for *trigger fired*; `run-gate.ps1` silently swallowed `-V`/`-v`/`-D` — **the exact flag this repo uses to prove a guard runs its arms** — with rc 0 and the success witness still matching; `check-ninja-deps` exited 0 on a directory that does not exist while the gate reference told every cycle to invoke it there; and `check-plan-citations --write` could RAISE the ratchet ceiling it exists to lower. ★★ **AND A GUARD REGISTERED BY AN ENTRY THAT PASSES NO FLAG CAN EXECUTE ZERO ARMS** — ✔`no_abort_in_tests_guard` ran **0** self-test arms at HEAD and now runs **16** (printed by the registered no-argument form itself), with no `CMakeLists.txt` change: P28 registered four unregistered guards, P29 found that registration alone does not mean the guard checks anything. ★★★ **TWO LIVE SILENT MISCOMPILES, BOTH FOUND BY BYTE-DIFFING AGAINST THE REFERENCE:** an x86 encoding variant with no `resultSlot` emitted register field 0, so `movw $42` into `%cx`/`%dx`/`%bx`/`%si`/`%r15w` all produced the identical bytes writing **`%ax`** — rc=0, no diagnostic, **and the corpus example was GREEN through it**; and a `"=m"` lowering its operand's VALUE where its ADDRESS belongs compiles clean and dies at run time. ★★ **CONFORMANCE:** `"=m"`/`"+m"`/`"=&m"` RUN on both targets with **zero functional lines** changed in `mir_to_lir.cpp`, and x86_64 went from **0 of 86** probed memory/sub-native spellings compiling to **83**, 58 byte-identical to GNU as. ⚠⚠ **ONE DIVERGENCE IS NOW A §B IN FRONT OF THE OPERATOR:** bare `%N` means a different register width in DSS than in gcc/clang — **on aarch64 only**, x86_64 agrees — so *"the reference rule"* is a PER-TARGET property and neither fix arm may be an architecture branch. ★★ **The wrapped-anchor arc CLOSED: 290 sites / 145 files → 0**, and the defect is worse than the row said — **a wrap does not only make an id disappear, it MINTS one** (`D-TO-PINNED-ARCHIVE` is the trailing `D` of the word `GENERALISED` joined to the next line), and **six anchor ids had ZERO greppable citation anywhere in the repository** before this pass.
+**Last updated:** 2026-08-24 — cycles **P14 … P30**. ★★★ **P30: THREE SILENT MISCOMPILES CLOSED, AND THE ENCODING TABLE LEARNS TO STATE A SEQUENCE INSTEAD OF ONE INSTRUCTION** — gate **1584/1584** in 461.72 s, balance **1022 → 1023** (closed 6, opened 7, one disclosed-pre-existing and exempt). See §0.000000000000000000000000000000000. ★★★ **P29: THE ROWS P28 OPENED — AND MEASURING THEM KEPT EXPOSING THE INSTRUMENTS DOING THE MEASURING.** Nine lanes, five waves; balance **1022 → 1022, net +0** (closed 6, opened 6 — **2 created**, 4 disclosed, 2 bookkeeping-only, **1 BORN CLOSED**) — ⚠ the authority is `python scripts/check-anchor-balance/check-anchor-balance.py`, which prints every one of those numbers on every run; re-measure rather than re-quote this line. Gate **1580/1580** in 431.59 s, up from 1562. ★★★ **A TENTH FINDING ARRIVED AFTER THE AUDIT, FROM A REPAIR LANE'S OWN PROBE: AN INLINE-ASM TEMPLATE THAT PARSES BUT EMITS NO INSTRUCTION *ABORTED* THE COMPILER** — `__asm__ ("   ")` → rc=127, `dss::Lir fatal: LirBuilder::lastInst: no instruction has been appended`, no code and no source position, on five shapes gcc 13.3.0 compiles and RUNS (a `/* */` comment among them, so not an exotic input). ★ **THE CAUSE WAS SHADOW STATE AND THE AUTHOR'S OWN COMMENT NAMED IT BEFORE IT BIT** — *"`LirBuilder` exposes no count, so the empty case is TRACKED rather than probed"*: the tracking `bool` MIRRORED the arena, the assembly engine bypasses the site that maintained it, so the asm path re-derived it FROM THE SHAPE OF THE INPUT on an argument that ENUMERATED its exceptions — and a comment, whitespace and a bare newline were not in the enumeration. Fixed by ADDING the missing count (`LirBuilder::hasAnyInst()`) and DELETING both the mirror and the proxy; ✔it is a crash and NOT a miscompile, measured (barrier intact, two loads no CSE, release image byte-IDENTICAL before/after). ★★ **AND THE SAME SPECIES REACHING THE OPERATOR: 71 shipped diagnostics cite a row that has CLOSED** — sized, not swept, and P30's item 1. ★★ **FOUR of the five addressable P28 openings are CLOSED — not five:** `D-PLANS-GATED-ROWS-NAME-NO-OPENER` is still 🔵 OPEN, it is the one row whose debt this cycle GREW, and it is P30's item 1. ★★★ **FIVE OF THE NINE LANES ENDED UP FIXING THE TOOLS THAT JUDGE THIS PROJECT:** `check-anchor-balance`'s `split_row` read an ESCAPED PIPE as a column separator (**161 of 2,252 rows mis-split**) — found by TWO INDEPENDENT LANES from opposite directions, and neither could have concluded it alone; `is_gated` read a PHRASE rather than the operator's rule and was blind to **98** rows the rule condemns, then after its first widening enumerated 2 glyphs where 11 lead a cell and recognised **one spelling of six** for *trigger fired*; `run-gate.ps1` silently swallowed `-V`/`-v`/`-D` — **the exact flag this repo uses to prove a guard runs its arms** — with rc 0 and the success witness still matching; `check-ninja-deps` exited 0 on a directory that does not exist while the gate reference told every cycle to invoke it there; and `check-plan-citations --write` could RAISE the ratchet ceiling it exists to lower. ★★ **AND A GUARD REGISTERED BY AN ENTRY THAT PASSES NO FLAG CAN EXECUTE ZERO ARMS** — ✔`no_abort_in_tests_guard` ran **0** self-test arms at HEAD and now runs **16** (printed by the registered no-argument form itself), with no `CMakeLists.txt` change: P28 registered four unregistered guards, P29 found that registration alone does not mean the guard checks anything. ★★★ **TWO LIVE SILENT MISCOMPILES, BOTH FOUND BY BYTE-DIFFING AGAINST THE REFERENCE:** an x86 encoding variant with no `resultSlot` emitted register field 0, so `movw $42` into `%cx`/`%dx`/`%bx`/`%si`/`%r15w` all produced the identical bytes writing **`%ax`** — rc=0, no diagnostic, **and the corpus example was GREEN through it**; and a `"=m"` lowering its operand's VALUE where its ADDRESS belongs compiles clean and dies at run time. ★★ **CONFORMANCE:** `"=m"`/`"+m"`/`"=&m"` RUN on both targets with **zero functional lines** changed in `mir_to_lir.cpp`, and x86_64 went from **0 of 86** probed memory/sub-native spellings compiling to **83**, 58 byte-identical to GNU as. ⚠⚠ **ONE DIVERGENCE IS NOW A §B IN FRONT OF THE OPERATOR:** bare `%N` means a different register width in DSS than in gcc/clang — **on aarch64 only**, x86_64 agrees — so *"the reference rule"* is a PER-TARGET property and neither fix arm may be an architecture branch. ★★ **The wrapped-anchor arc CLOSED: 290 sites / 145 files → 0**, and the defect is worse than the row said — **a wrap does not only make an id disappear, it MINTS one** (`D-TO-PINNED-ARCHIVE` is the trailing `D` of the word `GENERALISED` joined to the next line), and **six anchor ids had ZERO greppable citation anywhere in the repository** before this pass.
 **Branch:** `feature/c23-conformance-burndown-4` · **HEAD:** this commit (Cycle P29). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`.
 
 ---
@@ -467,6 +467,114 @@ second pattern beside the one P23 built and pinned.**
 
 ---
 
+## 0.000000000000000000000000000000000 ★★★ CYCLE P30 — THREE SILENT MISCOMPILES, AND THE ENCODING TABLE LEARNS TO STATE A SEQUENCE INSTEAD OF ONE INSTRUCTION
+
+**Gate ✔MEASURED at this commit: 1584/1584 in 461.72 s** (`scripts/run-gate/run-gate.sh` with the
+tool-emitted witness `100% tests passed`; a caller-authored success string is refused). **Balance
+✔MEASURED: closed 6, opened 7, OPEN 1022 → 1023** — net +1, of which one is a disclosed
+pre-existing row and exempt. ⚠ Re-measure both with the scripts; do not re-quote this line.
+
+★★★ **THE UNIFYING FINDING: THREE OF THE FOUR DEFECTS WERE DECLARATIONS THAT COULD
+ONLY EXPRESS HALF THE FACT, AND EACH STAYED GREEN FOR MONTHS BECAUSE THE TEST WRITTEN TO CATCH IT
+COULD NOT TELL THE TWO HALVES APART.**
+
+### The silent miscompiles — all witnessed by EXECUTION, none by code-reading
+
+**1. Apple ARM64 `va_arg` returned the WRONG ARGUMENT.** `lowerVaStart`'s `HomogeneousPointer` /
+`variadicUsesOverflowBase` branch emitted `VaOverflowArgAreaAddr` with **no payload**, so the entire
+fixed-stack displacement was discarded and the first `va_arg` read the last NAMED parameter. Scoped
+to `apple_arm64` alone — AAPCS64 ELF and every x86_64 leg were correct. One omitted operand; the
+LIR consumer already threaded it. ✔Apple Silicon: exit **210** fixed / **54** mutant, debug AND
+release, **with the emitted artifact's md5 changing between arms** rather than only an mtime. Apple
+clang 21 returns 210.
+★★ **THE EXAMPLE WRITTEN TO CATCH THIS ALREADY DECLARED THE darwin-arm64 LEG AND PASSED.**
+`varargs_overflow_fixed_stack`'s own `main.c` says *“RED-ON-ZERO-DISPLACEMENT”*, but its
+seven named ints were calibrated for SysV's **six**-GPR pool; on Apple's **eight** nothing overflows,
+the displacement is 0 by construction, and the assertion was true of the broken and the correct
+implementation alike. **That leg is REMOVED rather than recalibrated** — a red-on-disable claim
+is a UNIVERSAL about the source and must hold on every target it declares.
+★ **And the row's proposed fix was RIGHT FOR A REASON THE ROW DOES NOT GIVE**: ✔Apple packs
+named stack args at NATURAL size (a second stacked `int` at incoming+4) while the cursor counts 8 per
+scalar. The payload is correct only because DSS's own `lir_callconv` pads to `outgoingSlotSize` on
+BOTH sides. Anyone re-deriving from Apple's ABI alone would have concluded the row was wrong —
+and that fact is itself a divergence, now
+[[D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED]].
+
+**2. x86 unsigned↔float was wrong in FOUR arms, not the two the rows named.**
+`x86_64.target.json` declared the SIGNED converters for the unsigned opcodes, because SSE2 has no
+unsigned scalar convert. ✔Measured against gcc-13, clang-19 and Apple clang 21 (which agree
+10/10): `(unsigned long long)1.0e19` gave 2^63 from BOTH a `double` and a `float` source, and
+`(double)(1ULL<<63)` gave a negative double. ★ **THE FOURTH ARM WAS NAMED BY NO ROW AT ALL** —
+`(double)(unsigned)0xFFFFFFFF` returned **−1.0**, because the width-32 variant emitted
+`cvtsi2sd xmm, r32`, a signed **32-bit** read. The old row's own comment carried the full fact
+(*“a U32 always fits the signed-64 result exactly”*) while the declaration used half of it.
+
+### The architecture — OPERATOR-RULED, and the premise that sized it was measured FALSE first
+
+An opcode row could declare only ONE instruction, and **1:1 is the DEGENERATE CASE** of *“this
+operation is realized by these machine instructions”*. A two-valued strategy enum was rejected as
+**“an arch branch with a different spelling”**: no `if (arch == x86)` appears, but the switch
+arm is x86-shaped and lives in shared substrate, and x86 has more of these coming (`popcount` without
+POPCNT, 128-bit multiply-high, float min/max NaN semantics). `TargetOpcodeInfo` now carries a
+`lowering` block — a DIFFERENT TIER from `encoding` (LIR-instruction→bytes vs
+MIR-operation→LIR-instructions), consumed while virtual registers still exist so a sequence's
+temporaries are REGISTER-ALLOCATED rather than stealing scratch. **arm64 declares a ONE-STEP
+sequence, not a `native` flag** — the same kind of row, one entry long, and
+`lowerViaDeclaredSequence` cannot tell a one-step sequence from a seven-step one.
+★★ **THE BLOCKING PREMISE WAS KILLED BY MEASUREMENT BEFORE ANY OF IT WAS BUILT.** Both the
+row and my own brief assumed the fix needed a compare and a branch, because that is what gcc emits.
+✔clang-19 emits **ZERO jumps** across all three conversion functions and does not even use
+`cmov`. Under the disjunction rule DSS may take clang's algebra, so `TargetCondCode` never entered
+into it. ⇒ **the question that decides a design is often not the one the row asks.**
+
+### The conformance oracle, repaired
+
+direction-A **17 → 18**, divergences **30 → 31**, over a full 5-oracle roster.
+`a_nested_function_gnu` was hidden behind an `@expect-ref varies` waiver while MinGW gcc 13.2 and WSL
+gcc 13.3 both ACCEPT it — and ★ **the waiver's author reasoned CORRECTLY from a corpus header
+sentence that had stopped being true**: it documented `accept` as *“at least one judging oracle
+must accept, else RED”*, which ceased to hold on 2026-08-11 when `pin()`/`corroborate()` were
+split, and went stale instead of failing loud. `b_elided_initializer_element`'s note said the element
+lands at index 2; ✔measured by `objdump` AND by execution, `{ 1, , 3 }` emits `{1,3,0}` with the
+`3` at index **1**.
+⚠ **A GREEN RUN DOES NOT IMPLY A FULL ROSTER** — an unwitnessed accept routes to
+`NotWitnessed`, which never reds. WSL cold-started with `HCS_E_CONNECTION_TIMEOUT` on one run this
+cycle; inside that window the census would have dropped to 2 oracles and still exited 0. **Always
+read the `ORACLES USED (n)` line.** ✔With the full roster, **8** rows (not the 2 previously
+believed) would have become FALSE direction-B without clang.
+
+### Inline-asm width-view modifiers
+
+`%w`/`%x` on arm64, `%b`/`%w`/`%k`/`%q` on x86-64. ✔**`%w` means 32 bits on aarch64 and 16 on
+x86-64**, so a SHARED letter table is wrong by construction and the vocabulary belongs to the DIALECT
+document — landed with **zero** changes to `mir_to_lir.cpp`. ✔Also measured: a width view on
+an `"m"` or `"i"` binding is accepted and IGNORED by gcc, so refusing it would refuse what both
+references accept.
+
+### ⚠ WHAT THIS CYCLE OWES THE NEXT ONE
+
+1. **THE RENAME `c-subset` → `c`, AS ITS OWN COMMIT, ON A CLEAN TREE** — see §0's item 8.
+   It is the bottleneck for the whole conformance queue: 17 of the 18 direction-A divergences are GNU
+   extensions requiring edits to the very language document the rename moves.
+2. **The seven rows this cycle opened**, per the standing order's own refinement. The two largest are
+   [[D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED]] (needs a MIXED-COMPILER witness — no
+   single-compiler test can distinguish the two conventions) and
+   [[D-CONF-CORPUS-NO-DIRECTION-FOR-A-C23-REMOVED-CONSTRUCT]] (fires the moment a `c11`/`c17` document
+   exists, which FC20 plans).
+3. **Tranche 1 of the asm work**: 27 operand refs to respell, and 8 shipped examples whose comments
+   still claim the width modifier is `S0067`-refused.
+4. **The hand-coded C++ expansions** `lowerPopcount`/`lowerClz`/`lowerCtz`/`lowerBswap`/`lowerFNeg`
+   and the three shift rules — now migratable onto the declared-sequence table.
+
+ⓘ **Two guards caught the orchestrator's OWN errors at the gate, and both were the guard working
+as designed:** the citation ratchet demanded its ceilings come DOWN after positional citations were
+removed (unclaimed headroom is where the next one hides), and the registry guard caught three
+UNESCAPED PIPES in `{source\|temp\|imm\|const}` — content read as column boundaries, 7 cells
+against a 4-cell header — inside a row being written ABOUT a different trap. ★ That failure
+mode is invisible from both sides: nothing in the raw text shows it and nothing in the diff shows it.
+
+---
+
 ## 0.00000000000000000000000000000000 CYCLE P29 — THE ROWS P28 OPENED, AND WHAT MEASURING THEM FOUND UNDERNEATH
 
 **Nine lanes across five waves, then a step-10 audit, then a repair lane whose own probe found a live
@@ -645,13 +753,33 @@ copies and re-run three times under four new rules.
    widening it re-opens the false-positive surface its six measured narrowings (147 → 9) exist to
    close. The natural close is the census productionised as its own ratcheted guard, ratchet starting
    at the measured 71 so no NEW instance can land during the burn-down.
-2. **`D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE`** — §B, in front of the operator, with both
-   arms sized. Nothing proceeds on it without a word.
-3. **16 rows that need an operator decision and 16 that are INCONCLUSIVE**, both enumerated by the
-   gated-row census. The class-4 list is mostly SHIP decisions (an ILP32 target, a big-endian target,
-   static Mach-O, a second language) — ⚠ including
-   `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS`, **a MUST-NOT-BUILD ruling standing over a
-   trigger the row itself records as ALREADY TRUE.**
+2. **`D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE` — ✅ RULED 2026-08-24, and the ruling
+   dissolved the fork rather than picking an arm.** The operator's instruction was to VERIFY the
+   premise before designing, and verifying it killed it: ✔MEASURED across 16 data points on both
+   oracles, the references agree on the SPELLING and differ only on the DERIVATION — aarch64 bare
+   `%0` renders `x0` for char/short/int/long, x86_64 renders `%al`/`%ax`/`%eax`/`%rax`. ★★
+   **`%w` MEANS 32 BITS ON aarch64 AND 16 ON x86-64**, so any SHARED letter table is wrong by
+   construction and the width-view vocabulary belongs to the DIALECT document — which is where
+   P30 put it, with zero changes to `mir_to_lir.cpp`. ⚠ RESIDUAL: tranche 1 (respelling 27 operand
+   refs in two corpus files, and 8 shipped examples whose comments still claim the modifier is
+   `S0067`-refused) is unblocked and NOT yet done.
+3. **✅ SUPERSEDED 2026-08-24 BY A BATCH RULING — and the figures this entry carried were both
+   wrong.** ⚠ It said *“16 rows that need an operator decision and 16 that are INCONCLUSIVE”*.
+   ✔RE-MEASURED from the registry: CLASS 4 is **11**, and there is **no INCONCLUSIVE census at
+   all** — three rows use the word, about a test oracle's verdict, never as a census class. The
+   16+16 came from re-quoting this file instead of re-deriving from the registry, which is the exact
+   failure this file warns about in its own header.
+   ★★★ **THE RULING THAT REPLACED ALL OF THEM (operator, verbatim):** *“SHIP
+   EVERYTHING that is C conformance that gcc, msvc or clang accepts/rejects that we do wrong!
+   EVERYTHING MUST BE DONE. JUST RESPECT THE 4 PARALLEL LANES AT A TIME”*, extended the same day
+   to **“production backend pending stuff = MUST DO EVERYTHING, along with C + ASM full
+   conformance”**. ⚠ I first narrowed this to exclude new TARGET/FORMAT decisions (ILP32,
+   big-endian, static Mach-O) and was corrected on that exact sentence — **“-> this is also a
+   MUST BE DONE!!!!!!!!”**. ⇒ **THERE IS NO OUT-OF-SCOPE-BECAUSE-IT-IS-A-TARGET BUCKET.** The
+   only deferral is C++, gated on C + ASM being done. ★ Order the queue by the DEPENDENCY GRAPH:
+   shipping a target FIRES triggers on rows gated for months.
+   ⚠ `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS` stands unchanged as the one row whose
+   MUST-NOT-BUILD ruling sits over a trigger the row itself records as ALREADY TRUE.
 4. **`D-PLANS-GATED-ROWS-NAME-NO-OPENER` IS STILL OPEN — the one addressable P28 row this cycle did
    not close, and the one whose debt it GREW.** ✔MEASURED, both predicates over the SAME tree so the
    predicate change is isolated from the registry change: the base-ref `is_gated` finds **30**
@@ -666,6 +794,60 @@ copies and re-run three times under four new rules.
    Plan-16 CS1, the `gui` profile. Plans 16/22/27 schedule these as phases and declare no anchor rows,
    so *"name the ROW"* cannot be satisfied without minting placeholders. Classified (4) and the
    DECISION named instead of a row invented.
+
+6. **✅ DECIDED 2026-08-24 — BIG-ENDIAN IS `s390x`, AND THE CHAIN WAS VERIFIED BY EXECUTION BEFORE
+   THE DECISION WAS WRITTEN.** Plan 23 **FC19** carries it in full. The short form: every conformance
+   claim this project has ever made was measured on little-endian machines only, while struct/union
+   layout, bit-field allocation, integer representation, `unsigned char` aliasing and the
+   `__BYTE_ORDER__` predefines are all C-visible and all endianness-dependent. s390x is chosen because
+   it is the ONLY commercially live big-endian platform — real distro port, real glibc, therefore the
+   only one that can run the sqlite corpus, which is what *“real support”* has to mean.
+   ✔MEASURED on WSL 2026-08-24: `s390x-linux-gnu-gcc 13.3.0` links a HOSTED binary (`ELF64`, big
+   endian, `Machine: IBM S/390`); `qemu-s390x 8.2.2` RUNS it and a program returning the first byte of
+   `0x12345678` exits **18 (0x12)**; a hosted `printf`+`malloc`+`strcpy` program prints
+   `0102030405060708` and exits 42; `sizeof(long)==8`, so LP64 like our existing elf64 legs and NO
+   data-model confound. ★★ s390x is big-endian in its INSTRUCTION STREAM too
+   (`eb bf f0 58 00 24 stmg` reads MSB-first), which is strictly more than `aarch64_be` can ever test.
+   ★ **This is what makes `D-ASM-TARGET-DECLARES-NO-BYTE-ORDER` dischargeable** — not by
+   argument, but by a target existing. ⚠ The row was RIGHT to stay trigger-gated: an earlier pass
+   proposed `aarch64_be` because it was CHEAP, and that was withdrawn — `appendLittleEndianBytes`
+   being unconditional is **not a defect today**, and building a big-endian target purely to make our
+   own code wrong is the speculative build the bar forbids. **A cheap way to build something is never a
+   reason to build it; a real target on the other end is.**
+
+7. **✅ DECIDED 2026-08-24 — C STANDARDS BECOME LANGUAGE DOCUMENTS, AND THE FRONT END IS RENAMED
+   `c`.** Plan 23 **FC20 / §2.G** carries all seven decisions. The three a next cycle most needs:
+   (a) the versioning relation is **NEW and SEPARATE** from `languageReferences` — embedding keeps
+   its collision-refusal at full strength, the new relation gets override/removal as its whole purpose;
+   (b) `baseLanguage` names the **PARENT**, so family is *walk to the root* and `--source=c` means the
+   newest document whose root is `c`; (c) **the first shipped link is `c23` ALONE, parentless**,
+   because ✔measured, DSS accepts none of the three constructs C23 removed — so a truthful
+   `c11.lang.json` must CONTAIN K&R definitions, implicit int and implicit function declarations, none
+   of which DSS has ever had. The edge direction and the ship order are independent because the
+   MATERIALIZED SET is the contract; `c23` is re-parented onto `c17` later and proved byte-identical.
+   ★ **The selector already exists** — ✔`--language c23` today resolves
+   `src/dss-config/sources/c23.lang.json` and fails only because no such file exists.
+   ⚠ TWO MEASURED CONSTRAINTS: transitive references are currently REFUSED (one hop only, by design),
+   and **exactly one document may claim `.c`/`.h`** or every extension-resolved compile refuses.
+
+8. **THE RENAME IS THE BOTTLENECK FOR THE WHOLE CONFORMANCE QUEUE, and it needs an EMPTY TREE.**
+   ✔MEASURED: **1,429 path renames and 7,583 content substitutions across 1,002 files**
+   (`c-subset`→`c` · `c_subset`→`c` · `CSubset`→`C` · `csubset`→`c`), with
+   `CSUBSET` — the 6,547 citations of the 426 frozen `D-CSUBSET-*` ids — structurally out of reach
+   because every substitution is case-sensitive. ★★★ **OPERATOR RULING: the anchor ids are
+   FROZEN and BOTH `D-C-*` AND `D-CSUBSET-*` DENOTE THE C LANGUAGE**; renaming them would break
+   archaeology from every commit message that cites one, for a prefix that is opaque anyway.
+   ⚠ It must land as its OWN COMMIT — a 7,583-substitution mechanical diff mixed with any logic
+   change is unreviewable, and the whole value of a pure substitution is that reviewing it is a
+   verification rather than a reading. ⚠ And it cannot run while any lane holds `src/**` or
+   `examples/**`: renaming the language document underneath a lane does not merely conflict, it changes
+   what that lane's binaries MEAN between two runs.
+   ★ **Why it blocks the queue:** 17 of the 18 direction-A divergences are GNU extensions the front
+   end must learn (`__extension__`, `__COUNTER__`, statement expressions, `__builtin_expect`, case
+   ranges, `__label__`, `__builtin_types_compatible_p`, `__builtin_choose_expr`, `__builtin_offsetof`,
+   `__real__`/`__imag__`, `__alignof__(expr)`, `__attribute__((constructor))`,
+   `__attribute__((alias))`, `__thread`, `_Thread_local` definitions, `[[maybe_unused]]` on a
+   parameter, `__try`/`__except`) — all of them edits to the very document the rename moves.
 
 ⓘ **An incident recorded rather than buried:** one lane ran `git stash push` inside a compound command
 by mistake and stashed the whole shared tree, recovering it immediately with byte-for-byte
