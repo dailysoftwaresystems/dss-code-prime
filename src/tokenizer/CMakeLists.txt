@@ -6,7 +6,7 @@ add_library(tokenizer OBJECT
 
 target_include_directories(tokenizer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
-# Aggregated into dss-code-prime-lib via $<TARGET_OBJECTS:tokenizer> at
+# Aggregated into dsscp-lib via $<TARGET_OBJECTS:tokenizer> at
 # src/CMakeLists.txt — same pattern as core/. DSS_BUILDING_DLL must live
 # here (not on the SHARED target) so DSS_EXPORT decorations resolve to
 # dllexport when these .obj files are produced on MSVC.

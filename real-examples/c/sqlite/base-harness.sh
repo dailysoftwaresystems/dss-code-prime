@@ -584,7 +584,7 @@ dss_bh_emit_recipe() {
 # table, keyed on the CLOSED object-format enum, and src/program/program.cpp:216
 # now reports every artifact it commits:
 #
-#     dss-code-prime: artifact <targetSpec> <absolute path>
+#     dsscp: artifact <targetSpec> <absolute path>
 #
 # A target spec cannot contain whitespace (DSS refuses one that does), so the
 # path is the whole REMAINDER of the line and an output dir containing a space
@@ -596,9 +596,9 @@ dss_bh_reported_artifacts() {
   local log="$1" spec="$2" hits
   # rc DIRECTLY off grep, never after a pipe. `-F`: a target spec is a LITERAL
   # and carries `+`/`.` characters a regex would reinterpret.
-  hits="$(grep -F "dss-code-prime: artifact $spec " "$log" 2>/dev/null)" || return 1
+  hits="$(grep -F "dsscp: artifact $spec " "$log" 2>/dev/null)" || return 1
   [ -n "$hits" ] || return 1
-  printf '%s\n' "$hits" | sed "s|^dss-code-prime: artifact $spec ||" | awk '!seen[$0]++'
+  printf '%s\n' "$hits" | sed "s|^dsscp: artifact $spec ||" | awk '!seen[$0]++'
 }
 
 # dss_bh_reported_artifact <log> <spec> -> THE path this build produced for <spec>
@@ -680,7 +680,7 @@ dss_bh_generate_manifest() {
 #      rc 0 built · 1 no artifact reported · 2 ambiguous · 3 diagnostics
 #         4 an artifact was REPORTED and is not on disk
 #
-# dss-code-prime RETURNS EXIT 0 EVEN ON FATAL ERRORS, so the verdict is taken
+# dsscp RETURNS EXIT 0 EVEN ON FATAL ERRORS, so the verdict is taken
 # from `error[` in the log PLUS the artifact the build itself reported — never
 # from the process exit status. The caller renders the verdict; this returns the
 # facts. The four failure codes are kept apart because they have four different
@@ -858,26 +858,26 @@ dss_bh_self_test() {
 
   # ── 5. the artifact reader ──────────────────────────────────────────────────
   local spec='x86_64:elf64-x86_64-linux-exec'
-  printf 'noise\ndss-code-prime: artifact %s /out/a\nmore noise\n' "$spec" > "$T/log1"
+  printf 'noise\ndsscp: artifact %s /out/a\nmore noise\n' "$spec" > "$T/log1"
   _bh_eq "reported_artifact reads the path"  "/out/a" "$(dss_bh_reported_artifact "$T/log1" "$spec")"
   # A path with a SPACE: the spec is one token by construction, so the path is
   # the whole remainder of the line and must survive intact.
-  printf 'dss-code-prime: artifact %s /out dir/a\n' "$spec" > "$T/log1s"
+  printf 'dsscp: artifact %s /out dir/a\n' "$spec" > "$T/log1s"
   _bh_eq "reported_artifact keeps a path containing a space" \
          "/out dir/a" "$(dss_bh_reported_artifact "$T/log1s" "$spec")"
   # The LEGITIMATE re-run case: the same path reported twice is still one answer.
-  printf 'dss-code-prime: artifact %s /out/a\ndss-code-prime: artifact %s /out/a\n' "$spec" "$spec" > "$T/log2"
+  printf 'dsscp: artifact %s /out/a\ndsscp: artifact %s /out/a\n' "$spec" "$spec" > "$T/log2"
   _bh_eq "a REPEATED identical report is still one artefact" "/out/a" "$(dss_bh_reported_artifact "$T/log2" "$spec")"
   # ★ THE SEAM. Two DIFFERENT artefacts for one spec used to silently return the
   # last; it must now REFUSE. This is the assertion that the CLI work made necessary.
-  printf 'dss-code-prime: artifact %s /out/a\ndss-code-prime: artifact %s /out/b\n' "$spec" "$spec" > "$T/log3"
+  printf 'dsscp: artifact %s /out/a\ndsscp: artifact %s /out/b\n' "$spec" "$spec" > "$T/log3"
   dss_bh_reported_artifact "$T/log3" "$spec" >/dev/null 2>&1
   _bh_rc "TWO DIFFERENT artefacts for one spec is REFUSED" 2 "$?"
   local amb; amb="$(dss_bh_reported_artifact "$T/log3" "$spec" 2>&1 >/dev/null)"
   _bh_eq "  … and the refusal NAMES both paths" "1" \
          "$(printf '%s\n' "$amb" | grep -c '/out/b')"
   # A sibling spec's line must never be handed back for ours.
-  printf 'dss-code-prime: artifact arm64:elf64-aarch64-linux-exec /out/other\n' > "$T/log4"
+  printf 'dsscp: artifact arm64:elf64-aarch64-linux-exec /out/other\n' > "$T/log4"
   dss_bh_reported_artifact "$T/log4" "$spec" >/dev/null 2>&1
   _bh_rc "a DIFFERENT spec's artefact is not returned" 1 "$?"
   dss_bh_reported_artifact "$T/nosuchlog" "$spec" >/dev/null 2>&1

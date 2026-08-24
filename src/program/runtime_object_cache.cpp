@@ -259,9 +259,9 @@ struct RootCandidate {
 
 constexpr char const* kOverrideVariable = "DSS_RUNTIME_CACHE_DIR";
 
-// The vendor tail. `dss-code-prime` (never a bare `dss`) so the directory is
+// The vendor tail. `dsscp` (never a bare `dss`) so the directory is
 // attributable in a cache root shared with every other tool on the machine.
-constexpr char const* kVendorTail = "dss-code-prime/runtime-cache";
+constexpr char const* kVendorTail = "dsscp/runtime-cache";
 
 constexpr RootCandidate kRootCandidates[] = {
     // The override takes the directory VERBATIM — no vendor tail. The caller
@@ -274,7 +274,7 @@ constexpr RootCandidate kRootCandidates[] = {
     // The XDG spec's OWN documented default when `XDG_CACHE_HOME` is unset —
     // not an invention of this file, which is why it is `.cache` and not, say,
     // `.dss-cache`.
-    {"HOME", ".cache/dss-code-prime/runtime-cache", "$HOME"},
+    {"HOME", ".cache/dsscp/runtime-cache", "$HOME"},
 };
 
 // Join a candidate-name list for a diagnostic. Names are quoted so a message

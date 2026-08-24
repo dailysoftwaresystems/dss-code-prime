@@ -3,7 +3,7 @@
 # `nix run github:@NIX_FLAKE_SLUG@` / `nix profile install github:@NIX_FLAKE_SLUG@`
 # fetch the matching release binary. The tarball is a PREFIX TREE produced by
 # `cmake --install` (bin/, lib/, share/) — see cmake/DssInstall.cmake, the single
-# owner of what ships. Still depends on the queued dss-code-prime -> dsscp rename.
+# owner of what ships. Still depends on the queued dsscp -> dsscp rename.
 {
   description = "@DESCRIPTION@";
 
@@ -31,15 +31,15 @@
           installPhase = ''
             runHook preInstall
             # Copied WHOLE: `dsscp` resolves its config tree by a path relative to
-            # its own executable (../share/dss-code-prime/<version>/dss-config) and
+            # its own executable (../share/dsscp/<version>/dss-config) and
             # its shared library by $ORIGIN/../lib. Installing selected files would
             # break both hops and leave a compiler that cannot resolve a single
             # `#include <stdio.h>`. autoPatchelfHook still fixes the interpreter.
             mkdir -p "$out"
             cp -a bin lib share "$out/"
             chmod 755 "$out/bin/dsscp"
-            test -d "$out/share/dss-code-prime" || {
-              echo "dsscp: release tarball carries no share/dss-code-prime config tree" >&2
+            test -d "$out/share/dsscp" || {
+              echo "dsscp: release tarball carries no share/dsscp config tree" >&2
               exit 1
             }
             runHook postInstall

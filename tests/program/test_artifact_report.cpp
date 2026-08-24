@@ -70,7 +70,7 @@ namespace {
 // protocol and stay green. `harness/test_sqlite_harness_legs` §10 holds the
 // other end — it requires this exact spelling to appear in BOTH drivers AND in
 // `src/program/program.cpp`, so changing it in one place reds there.
-constexpr std::string_view kMarker = "dss-code-prime: artifact ";
+constexpr std::string_view kMarker = "dsscp: artifact ";
 
 struct ReportedArtifact {
     std::string spec;

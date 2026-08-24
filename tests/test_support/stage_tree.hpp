@@ -25,7 +25,7 @@
 // `std::error_code` / `std::optional` / `<fstream>`, so it lifted verbatim; the
 // only edit was moving the `namespace fs` alias inside this header's namespace.
 // That matters beyond convenience: the two runners are different binaries with
-// different link sets (`dss_examples_runner` links dss-code-prime-lib + GTest;
+// different link sets (`dss_examples_runner` links dsscp-lib + GTest;
 // `integrated_tests` links nlohmann_json alone and drives the compiler as a
 // SUBPROCESS), so a shared home that needed either of those would not be shared.
 //

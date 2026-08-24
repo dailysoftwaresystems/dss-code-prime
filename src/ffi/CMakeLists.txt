@@ -39,7 +39,7 @@ target_compile_definitions(ffi_shipped PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL
 # the descriptor reader parses JSON, mirroring `opt`'s optimizer_json.cpp.
 target_link_libraries(ffi_shipped PRIVATE core hir nlohmann_json::nlohmann_json)
 
-# Aggregated into dss-code-prime-lib via $<TARGET_OBJECTS:ffi>.
+# Aggregated into dsscp-lib via $<TARGET_OBJECTS:ffi>.
 target_compile_definitions(ffi PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 
 # Declared deps reflect actual include surface: c_header_parser.cpp

@@ -68,7 +68,7 @@ struct DSS_EXPORT ShippedConfigLocator {
 };
 
 // The installed config root's path RELATIVE to the directory holding the
-// installed executable (e.g. `../share/dss-code-prime/0.0.2/dss-config`).
+// installed executable (e.g. `../share/dsscp/0.0.2/dss-config`).
 //
 // COMPUTED BY `cmake/DssInstall.cmake` from the same `GNUInstallDirs` variables
 // its `install()` rules use, and forwarded here as a compile definition — so the

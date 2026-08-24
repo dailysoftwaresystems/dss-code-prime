@@ -43,7 +43,7 @@ body:
       label: Command line
       description: The exact invocation — language, target, and any flags.
       render: shell
-      placeholder: dss-code-prime --compile main.c --language c --target x86_64:pe64-x86_64-windows-exec --output out
+      placeholder: dsscp --compile main.c --language c --target x86_64:pe64-x86_64-windows-exec --output out
     validations:
       required: true
   - type: dropdown
@@ -80,7 +80,7 @@ body:
     id: version
     attributes:
       label: Version / commit
-      description: Output of `dss-code-prime --version`, or the git commit SHA you built from.
+      description: Output of `dsscp --version`, or the git commit SHA you built from.
       placeholder: "e.g. 8956b79"
     validations:
       required: true

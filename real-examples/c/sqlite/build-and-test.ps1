@@ -43,7 +43,7 @@
 #
 #   1. identify the host (os/arch), locate this HOST's POSIX toolchain + python3,
 #      confirm online, then RESOLVE THE LEG PLAN from the catalogue
-#   2. use the dss-code-prime checkout AS-IS on its CURRENT branch (never
+#   2. use the dsscp checkout AS-IS on its CURRENT branch (never
 #      switched/pulled — a probe tests the working tree exactly as it is)
 #   3+4. VIA THIS HOST'S POSIX TOOLCHAIN (WSL on a Windows host, the native
 #      shell elsewhere): clone-or-update sqlite/sqlite, configure, and derive the
@@ -58,7 +58,7 @@
 #      PRESERVED, as a ONE-SIDED attribution oracle: it is a Linux ELF, so it can
 #      EXONERATE a corpus failure (it fails too => upstream) but never convict
 #      (it passes => inconclusive on a Windows/CRT difference). Step 9 prints it.
-#   5. locate (or build) a dss-code-prime binary (Release preferred)
+#   5. locate (or build) a dsscp binary (Release preferred)
 #   6. PER LEG, resolve the tcl + zlib LIBRARIES that leg's fixture links against
 #      from the leg's OWN declared `libraries.provider`. For the pe64 leg
 #      (`search-paths`) `--resolve-library` reads a DLL's EXPORT table (`.edata`)
@@ -83,9 +83,9 @@
 #      leg's two libraries as resolveLibraries — each carrying the leg's DECLARED
 #      runtime identity when its library is an acquired STAND-IN, so the artefact
 #      does not record the packager's own install name) and build it:
-#        dss-code-prime --project <manifest> --config=release --output <out>/<leg>
+#        dsscp --project <manifest> --config=release --output <out>/<leg>
 #      → <out>/<leg>/<format>/, where the COMPILER names the file and SAYS SO
-#      (`dss-code-prime: artifact <spec> <path>`). The suffix belongs to the
+#      (`dsscp: artifact <spec> <path>`). The suffix belongs to the
 #      object format, and this driver no longer holds a copy of that table —
 #      see Get-DssReportedArtifact (base-harness.ps1). An ACQUIRED library is then copied BESIDE the
 #      artefact, because a `@loader_path/<name>` identity is a claim about that
@@ -110,7 +110,7 @@
 #      ENVIRONMENTAL skips warn by default and are FATAL under
 #      DSS_STRICT_ARM_VERDICTS=1.
 #
-# DESIGN: every step is idempotent and FAIL-LOUD. dss-code-prime exits 0 even on
+# DESIGN: every step is idempotent and FAIL-LOUD. dsscp exits 0 even on
 # fatal compile errors, so step 7 reads success from the DIAGNOSTICS (no `error[`
 # line) + the emitted binary, never $LASTEXITCODE.
 #
@@ -220,7 +220,7 @@
 #               typo costs a second rather than a multi-hour corpus run).
 #
 # ── THE COMPILER THIS RUN USES, AND THE ONE CONTRACT ALL THREE SHARE ────────
-# ★★ Step 5 uses a RELEASE dss-code-prime, and the build type is READ from the
+# ★★ Step 5 uses a RELEASE dsscp, and the build type is READ from the
 # CMakeCache.txt of the tree that produced the binary and PRINTED next to its
 # path — by every one of these three paths, because the twin (build-and-test.sh)
 # builds -DCMAKE_BUILD_TYPE=Release unconditionally and a number from one driver
@@ -1336,7 +1336,7 @@ DSS_STRICT_ARM_VERDICTS='$($env:DSS_STRICT_ARM_VERDICTS)' is neither on nor off.
 # AFTER the sqlite clone + configure + stage, so a misspelling discovered there
 # costs the whole staging run rather than a second. Same three-state parse.
 # ★ WHAT IT OPTS OUT OF IS THE REFUSAL, NEVER THE STATEMENT: it permits a
-# non-Release dss-code-prime, and the run then says which build type it actually
+# non-Release dsscp, and the run then says which build type it actually
 # used on every report line. The variable is CONTROLLED either way — the flag only
 # decides whether an uncontrolled-looking run stops or announces itself.
 $AllowNonReleaseDss = $false
@@ -1483,7 +1483,7 @@ if ($FilteredOut.Count) {
 }
 Pass "leg plan resolved — $($Legs.Count) leg(s) selected of $($AllLegs.Count) declared"
 
-# ── Step 2 — dss-code-prime (current checkout, untouched) ────────────────────
+# ── Step 2 — dsscp (current checkout, untouched) ────────────────────
 # >>> dss:src-provenance >>>
 # ★ THIS REGION IS EXTRACTED AND EXECUTED by test-confound-scope.ps1 (the Step-0
 # self-test) against throwaway git repos — the same discipline the .sh's self-test
@@ -1491,7 +1491,7 @@ Pass "leg plan resolved — $($Legs.Count) leg(s) selected of $($AllLegs.Count) 
 # would stay green while this rotted. The sentinel comments are a CONTRACT with
 # that file; rename or move one and the self-test fails with "could not locate",
 # which this driver treats as refuse-to-start.
-Step "2/9  Use dss-code-prime at $RepoRoot (current checkout, untouched)"
+Step "2/9  Use dsscp at $RepoRoot (current checkout, untouched)"
 $DssBranchWant = if ($env:DSS_BRANCH) { $env:DSS_BRANCH } else { '' }
 $DssCommitWant = if ($env:DSS_COMMIT) { $env:DSS_COMMIT } else { '' }
 # One line of git output, or '' — never $null, never an array, never a throw.
@@ -1537,7 +1537,7 @@ if ($dssIsRepo) {
 # NOT PORTED — the CLONE GATE. Its shapes (a) and (c) are about $SRC_DIR being
 # absent, or populated-but-not-a-checkout, and about the harness then CLONING our
 # repo onto the default branch. $RepoRoot is derived from $PSScriptRoot, so this
-# driver always runs on the checkout it lives in and never clones dss-code-prime at
+# driver always runs on the checkout it lives in and never clones dsscp at
 # all -- neither shape can occur, and inventing a gate for them would be ceremony.
 # Nor does the .sh's stale-.git hybrid exist here: the measured instance of that was
 # the rsync'd WSL tree, and this driver reads the real Windows checkout (verified in
@@ -1622,7 +1622,7 @@ DSS_COMMIT='$DssCommitWant' ($dssCommitFull) but $RepoRoot is at $dssHeadLong.
 # WARNED about (not merely noted) so a commit-pinned run cannot read as byte-pinned:
 # DSS_COMMIT proves which COMMIT is checked out, never that the sources match it.
 if ($dssDivergeNote) { Warn "  $RepoRoot$dssDivergeNote" }
-Pass "dss-code-prime checkout ready"
+Pass "dsscp checkout ready"
 # <<< dss:src-provenance <<<
 
 # ── Step 2b — take the RUN LOCK on the work tree ─────────────────────────────
@@ -2723,7 +2723,7 @@ foreach ($lg in $AllLegs) {
 Assert-StagedSourceCoherence 'staged sqlite (Step 4)'
 Pass "recipe: $nTus TUs, $nDefs defines, $nIncs include dirs (sqlite @ $sqliteHead) staged under $Stage"
 
-# ── Step 5 — locate (or build) the dss-code-prime compiler ───────────────────
+# ── Step 5 — locate (or build) the dsscp compiler ───────────────────
 # Picks the newest existing RELEASE binary across every known build root.
 # NEWEST-wins deliberately avoids a STALE binary that predates a project-config
 # field (the exact trap that fails loud below); RELEASE-only is the contract this
@@ -2738,7 +2738,7 @@ Pass "recipe: $nTus TUs, $nDefs defines, $nIncs include dirs (sqlite @ $sqliteHe
 # decides, never a version flag — the list follows the tree instead of having to
 # be kept in sync with it.
 # ★ THE COMPILER IS A HOST BINARY AND HAS NOTHING TO DO WITH THE LEG SET: ONE
-# dss-code-prime emits every one of the five targets, selected from config. That
+# dsscp emits every one of the five targets, selected from config. That
 # is why there is one Step 5 and not one per leg.
 #
 # ★★★ THE COMPILER'S OWN BUILD TYPE IS A VARIABLE OF EVERY RUN THIS DRIVER MAKES,
@@ -2763,13 +2763,13 @@ Pass "recipe: $nTus TUs, $nDefs defines, $nIncs include dirs (sqlite @ $sqliteHe
 # ✔MEASURED 2026-08-18, and the cost was not a slow run — it was a FALSE
 # COMPARISON written into the anchor registry as a HOST defect. The previous
 # cycle's `build/real-examples/win-probe.log` records
-# `compiler: …\build\dbg\bin\dss\dss-code-prime.exe`, and that tree's
+# `compiler: …\build\dbg\bin\dss\dsscp.exe`, and that tree's
 # CMakeCache.txt says `CMAKE_BUILD_TYPE:STRING=Debug` (-g, no -O, no NDEBUG). The
 # figure that run produced opened
 # D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX and survived a whole cycle.
 # Re-measured with this variable controlled, the ratio is ~2.1x: the row was
 # never about Windows, it was about -O0 against -O3.
-Step '5/9  Locate / build dss-code-prime (RELEASE — build type READ from CMakeCache.txt)'
+Step '5/9  Locate / build dsscp (RELEASE — build type READ from CMakeCache.txt)'
 # ★★ DISCOVER THE LAYOUT UNDER A BUILD ROOT; DO NOT ENUMERATE IT.
 # [D-HARNESS-PS1-COMPILER-LOOKUP-BLIND-TO-A-MULTI-CONFIG-GENERATOR]
 #
@@ -2782,14 +2782,14 @@ Step '5/9  Locate / build dss-code-prime (RELEASE — build type READ from CMake
 # and restating it in a list here is how one cell came to be missing.
 #
 # ✔MEASURED 2026-08-11 in a fresh worktree, and the two lines were one second apart:
-#     dss-code-prime.vcxproj -> ...\build-rel\bin\dss\Release\dss-code-prime.exe
-#     [X] ERROR: dss-code-prime.exe not found.
+#     dsscp.vcxproj -> ...\build-rel\bin\dss\Release\dsscp.exe
+#     [X] ERROR: dsscp.exe not found.
 # The build SUCCEEDED and the driver died claiming its own output did not exist, so
 # no Windows corpus run could ever start in a checkout that had no pre-existing
 # Ninja build dir.
 #
 # ⓘ The `.sh` twin never had this defect because it already searched rather than
-# declared (`find "$SRC_DIR/build" -type f -name dss-code-prime`), which is exactly
+# declared (`find "$SRC_DIR/build" -type f -name dsscp`), which is exactly
 # why this was invisible on every POSIX leg. The ROOTS below remain a declared
 # POLICY list — which build directories are eligible, and their precedence is by
 # mtime, newest wins — while the layout BENEATH each root is discovered.
@@ -2879,7 +2879,7 @@ function Find-DssCandidates {
   # Both spellings on every host: the executable suffix is a fact about the
   # machine this compiler RUNS on, and probing for a name that cannot exist here
   # costs nothing.
-  $names = @('dss-code-prime.exe', 'dss-code-prime')
+  $names = @('dsscp.exe', 'dsscp')
   $roots = @('build/rel', 'build/dbg', 'build-rel', 'build', 'build-dbg')
   $script:DssSearchedDirs = @()
   $cands = @()
@@ -2935,7 +2935,7 @@ function Format-DssCandidateList($cands) {
 # is what turned this into a log dive instead of a one-line diagnosis.
 function Get-DssSearchNote {
   $dirs = if ($script:DssSearchedDirs) { $script:DssSearchedDirs -join '; ' } else { '<Find-DssCandidates not yet called>' }
-  return ("searched at any depth under: $dirs (for dss-code-prime.exe or dss-code-prime). " +
+  return ("searched at any depth under: $dirs (for dsscp.exe or dsscp). " +
           "A multi-config generator lands it in a per-config subdirectory (bin/dss/Release); " +
           "a single-config one in bin/dss. Only a RELEASE binary is eligible, and each candidate's " +
           "build type is read from its own tree's CMakeCache.txt. Set `$env:DSS_BIN to name a binary " +
@@ -2970,8 +2970,8 @@ if ($env:DSS_BIN) {
     # conditional for the same reason: an escape hatch that is already ON, or that
     # would have nothing to select, must not be offered as the fix.
     Die @"
-SKIP_DSS_BUILD=1 but no eligible dss-code-prime exists, and SKIP_DSS_BUILD forbids building one.
-      $(if (@($DssCands).Count -eq 0) { 'NO dss-code-prime binary exists under any eligible root at all.' } else { 'Every candidate below was rejected on BUILD TYPE — only a Release compiler is eligible.' })
+SKIP_DSS_BUILD=1 but no eligible dsscp exists, and SKIP_DSS_BUILD forbids building one.
+      $(if (@($DssCands).Count -eq 0) { 'NO dsscp binary exists under any eligible root at all.' } else { 'Every candidate below was rejected on BUILD TYPE — only a Release compiler is eligible.' })
       This driver times a RELEASE compiler because its .sh twin builds one unconditionally
       (build-and-test.sh Step 5). Proceeding with a Debug binary compares -O0 against -O3 and
       publishes the difference as a property of this HOST — which is how
@@ -2979,7 +2979,7 @@ SKIP_DSS_BUILD=1 but no eligible dss-code-prime exists, and SKIP_DSS_BUILD forbi
       candidates found (build type read from each tree's CMakeCache.txt):
 $(Format-DssCandidateList $DssCands)
       $(Get-DssSearchNote)
-      Build one (cmake -B build/rel -DCMAKE_BUILD_TYPE=Release && cmake --build build/rel --target dss-code-prime),
+      Build one (cmake -B build/rel -DCMAKE_BUILD_TYPE=Release && cmake --build build/rel --target dsscp),
       or unset SKIP_DSS_BUILD and let this step do it$(if (@($DssCands).Count -gt 0 -and -not $AllowNonReleaseDss) { ', or set DSS_ALLOW_NONRELEASE_COMPILER=1 to reuse the newest candidate above ANYWAY — with every report line of the run saying so' }).
 "@
   }
@@ -2993,9 +2993,9 @@ $(Format-DssCandidateList $DssCands)
     # of them eligible" are different facts about this machine, and a reader must
     # not have to infer which one from the absence of a line.
     if (@($DssCands).Count -gt 0) {
-      Warn ("no RELEASE dss-code-prime under any eligible root — the following exist and were REJECTED on build type:`n" + (Format-DssCandidateList $DssCands))
+      Warn ("no RELEASE dsscp under any eligible root — the following exist and were REJECTED on build type:`n" + (Format-DssCandidateList $DssCands))
     } else {
-      Info "no dss-code-prime binary under any eligible root"
+      Info "no dsscp binary under any eligible root"
     }
     # A FRESH build always goes to the NEW layout — there is no reason to create
     # another legacy root. `Find-DssCandidates` above still finds a legacy tree if
@@ -3010,8 +3010,8 @@ $(Format-DssCandidateList $DssCands)
     # than trusting that this line worked.
     & cmake -S $RepoRoot -B $bdir -DCMAKE_BUILD_TYPE=Release
     if ($LASTEXITCODE -ne 0) { Die "cmake configure failed" }
-    & cmake --build $bdir --config Release --target dss-code-prime -j $Jobs
-    if ($LASTEXITCODE -ne 0) { Die "dss-code-prime build failed" }
+    & cmake --build $bdir --config Release --target dsscp -j $Jobs
+    if ($LASTEXITCODE -ne 0) { Die "dsscp build failed" }
     $DssCands = Find-DssCandidates
     $DssInfo  = Select-DssCompiler $DssCands
     if ($DssInfo) { $DssBin = $DssInfo.Path }
@@ -3025,7 +3025,7 @@ if (-not $DssBin -or -not (Test-Path -LiteralPath $DssBin)) {
   # say Release — say WHICH in the report below rather than adding another cell to
   # a list. [D-HARNESS-PS1-COMPILER-LOOKUP-BLIND-TO-A-MULTI-CONFIG-GENERATOR]
   Die (@"
-no RELEASE dss-code-prime binary after the build step.
+no RELEASE dsscp binary after the build step.
       $(Get-DssSearchNote)
       candidates found (build type read from each tree's CMakeCache.txt):
 $(Format-DssCandidateList $DssCands)
@@ -3058,11 +3058,11 @@ this run would be timed against a NON-RELEASE compiler. It REFUSES rather than p
       read from  : $($DssInfo.Source)
       note       : $(if ($DssInfo.Detail) { $DssInfo.Detail } else { '(none)' })
       The .sh twin builds -DCMAKE_BUILD_TYPE=Release unconditionally, so a number from this driver and a
-      number from that one are only comparable if this one is Release too. A Debug dss-code-prime is -g,
+      number from that one are only comparable if this one is Release too. A Debug dsscp is -g,
       no -O and no NDEBUG: it compiles the same program correctly and takes several times as long, and
       the difference lands in whatever the run is being read for.
       Either build a Release compiler (cmake -B build/rel -DCMAKE_BUILD_TYPE=Release && cmake --build
-      build/rel --target dss-code-prime), or set DSS_ALLOW_NONRELEASE_COMPILER=1 to proceed with THIS
+      build/rel --target dsscp), or set DSS_ALLOW_NONRELEASE_COMPILER=1 to proceed with THIS
       binary — the run then says so on every report line, so no measurement taken from it can be quoted
       as a controlled one.
 "@
@@ -3073,7 +3073,7 @@ this run would be timed against a NON-RELEASE compiler. It REFUSES rather than p
   Warn "DSS_ALLOW_NONRELEASE_COMPILER=1 — proceeding with a $($DssInfo.Type) compiler. TIMINGS FROM THIS RUN ARE NOT COMPARABLE with build-and-test.sh or with any other run: that driver always times a Release compiler."
 }
 Warn "if the build below fails with a stale-manifest-field error (e.g. unknown 'artifactName'), this binary predates the project-config extensions — rebuild it (delete build-rel or set SKIP_DSS_BUILD off)."
-Pass "dss-code-prime located — $($DssInfo.Type) build"
+Pass "dsscp located — $($DssInfo.Type) build"
 
 # ── Step 6 — PER-LEG build inputs (each leg's OWN tcl + z resolve-libraries) ──
 # ★ WHAT CHANGED AND WHY. This used to be two globals — $TclDll/$ZlibDll — that
@@ -4358,7 +4358,7 @@ function Stop-OurFixturesUnder($dir, $why) {
 # object-format enum) and now REPORTS the artefact it commits, one line per
 # artefact, on stderr:
 #
-#     dss-code-prime: artifact <targetSpec> <absolute path>
+#     dsscp: artifact <targetSpec> <absolute path>
 #
 # A target spec cannot contain whitespace (DSS refuses one that does), so the path
 # is the whole REMAINDER of the line and an output directory with a space in it
@@ -4476,7 +4476,7 @@ function Invoke-Fixture($exe, $argv, $workdir, $logPath, $errPath, $stall, $cap,
 # one broken target delete four legs' worth of evidence — the same "one bad unit
 # must never cost the other thousand" rule the resume engine exists for. The
 # poisoned verdict is loud, it is in the Step-9 ledger, and it exits non-zero.
-Step "7/9  Build each leg's full-source testfixture (dss-code-prime --project, $Config)"
+Step "7/9  Build each leg's full-source testfixture (dsscp --project, $Config)"
 # LAST GATE BEFORE HOURS OF COMPILING — re-assert the shared stage's coherence.
 # See the call site at the end of Step 3+4 for why this exists; it is repeated
 # here because everything between the two is the last chance to notice that the
@@ -4630,7 +4630,7 @@ foreach ($leg in $BuildableLegs) {
   }
   $clog = Join-Path $legOut 'compile.log'
   # A project build routes each target to <output>/<formatName>/, and NAMES the file
-  # there itself. dss-code-prime returns exit 0 even on FATAL errors → judge from
+  # there itself. dsscp returns exit 0 even on FATAL errors → judge from
   # `error[` plus the artefact the build REPORTED. Invoke-DssBuild (the shared
   # core) is the ONE place that decision is made, for this artefact and the CLI
   # and both of build-and-test.sh's; the three failure statements it keeps
@@ -4749,7 +4749,7 @@ Info "built $($BuiltLegs.Count) of $($BuildableLegs.Count) buildable leg(s); $($
 # ★ EVERY SELECTED LEG IS BUILT, ON EVERY HOST. No host test here, and there
 # must never be one — whether this machine can EXECUTE the result is Step 7c's
 # question, answered from the leg's resolved `run.mode`.
-Step "7b/9  Build the sqlite3 CLI (dss-code-prime --project, $Config)"
+Step "7b/9  Build the sqlite3 CLI (dsscp --project, $Config)"
 $CliBuilt = @{}
 $CliFails = 0
 foreach ($leg in $Legs) {

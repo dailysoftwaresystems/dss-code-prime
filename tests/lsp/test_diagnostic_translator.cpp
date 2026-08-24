@@ -96,7 +96,7 @@ TEST(DiagnosticTranslator, SerializePublishDiagnosticsIncludesUriVersionAndArray
     d.range.end   = {0u, 2u};
     d.severity    = LspSeverity::Warning;
     d.code        = "P_UnexpectedToken";
-    d.source      = "dss-code-prime";
+    d.source      = "dsscp";
     d.message     = "hello";
     params.diagnostics.push_back(d);
     const auto wire = dss::lsp::serializePublishDiagnostics(params);
@@ -104,7 +104,7 @@ TEST(DiagnosticTranslator, SerializePublishDiagnosticsIncludesUriVersionAndArray
     EXPECT_NE(wire.find(R"("version":7)"), std::string::npos);
     EXPECT_NE(wire.find(R"("severity":2)"), std::string::npos);
     EXPECT_NE(wire.find(R"("code":"P_UnexpectedToken")"), std::string::npos);
-    EXPECT_NE(wire.find(R"("source":"dss-code-prime")"), std::string::npos);
+    EXPECT_NE(wire.find(R"("source":"dsscp")"), std::string::npos);
     EXPECT_NE(wire.find(R"("message":"hello")"), std::string::npos);
 }
 

@@ -4416,11 +4416,11 @@ TEST_F(HarnessLegs, NoDeclaredWslArgvOmitsExec) {
 // marker from a driver or from program.cpp and rule 3 fails naming the file.
 TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
     // The report line the compiler emits per artefact it commits:
-    //   dss-code-prime: artifact <targetSpec> <absolute path>
-    constexpr char const* kMarker = "dss-code-prime: artifact ";
+    //   dsscp: artifact <targetSpec> <absolute path>
+    constexpr char const* kMarker = "dsscp: artifact ";
 
     // DSS's artifact-extension table, as a driver would be tempted to spell one
-    // entry of it: a bare, quoted extension. `wsl.exe` / `dss-code-prime.exe` are
+    // entry of it: a bare, quoted extension. `wsl.exe` / `dsscp.exe` are
     // whole file names and never match; a `$sfx`-style row always does.
     constexpr std::string_view kSuffixes[] = {".exe", ".dll", ".so", ".dylib",
                                               ".lib"};

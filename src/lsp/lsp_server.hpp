@@ -33,7 +33,7 @@ namespace dss::lsp {
 
 struct DSS_EXPORT LspServerOptions {
     // Default name reported in `Diagnostic.source`.
-    std::string diagnosticSource = "dss-code-prime";
+    std::string diagnosticSource = "dsscp";
 };
 
 class DSS_EXPORT LspServer {

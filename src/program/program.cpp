@@ -192,11 +192,11 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 // Info-severity member is itself a KNOWN open question
 // (D-FF2-UNSUPP-INFO-WAE-ASYMMETRY). This is a driver REPORT, not an opinion
 // about the program, so it goes out the way `--time`'s report does: same
-// stream, same `dss-code-prime: ` prefix, no policy in the way.
+// stream, same `dsscp: ` prefix, no policy in the way.
 //
 // ★ THE SHAPE, and each part of it is load-bearing for a machine reader:
 //
-//     dss-code-prime: artifact <targetSpec> <absolute path>
+//     dsscp: artifact <targetSpec> <absolute path>
 //
 //   · a FIXED leading marker, so a consumer matches a prefix and never a
 //     regex over prose;
@@ -239,7 +239,7 @@ void reportArtifactWritten(std::string const& targetSpec,
     // the line stays TRUE either way. Only the ABSOLUTE guarantee is lost, and
     // only when the process has no usable cwd to resolve against.
     if (ec) abs = outPath;
-    std::cerr << "dss-code-prime: artifact " << targetSpec << ' '
+    std::cerr << "dsscp: artifact " << targetSpec << ' '
               << artifactPathForReport(abs.lexically_normal()) << '\n';
 }
 
@@ -2498,9 +2498,9 @@ int runCusToTargets(
     auto const ms = [](std::uint64_t ns) {
         return formatWallTime(static_cast<long long>(ns / 1'000'000u));
     };
-    constexpr char const* kPfx = "dss-code-prime:   ";
+    constexpr char const* kPfx = "dsscp:   ";
 
-    os << "dss-code-prime: compile time " << ms(totalNs) << "  (process wall)\n";
+    os << "dsscp: compile time " << ms(totalNs) << "  (process wall)\n";
     os << kPfx << std::format("{:<21}{:>12}{:>12}{:>7}{:>8}", "phase", "cpu",
                               "wall", "peak", "runs")
        << "\n";
@@ -2581,11 +2581,11 @@ int runCusToTargets(
         // ★ NEVER CLAMPED. The remainder is not printed at all when it cannot
         // be computed honestly — a `0ms` in its place is precisely the defect
         // being removed.
-        os << "dss-code-prime: *** --time INVARIANT VIOLATION — the phase "
+        os << "dsscp: *** --time INVARIANT VIOLATION — the phase "
               "accounting is inconsistent with itself, so the unattributed "
               "remainder is NOT reported ***\n";
         for (auto const& v : violations) {
-            os << "dss-code-prime:   ! " << v << "\n";
+            os << "dsscp:   ! " << v << "\n";
         }
     }
 
@@ -2720,12 +2720,12 @@ int Program::run(int argc, char* argv[]) {
     }
 
     // No mode flags set — print the ready message + usage hint. The
-    // back-compat path for `dss-code-prime` with zero arguments. The
+    // back-compat path for `dsscp` with zero arguments. The
     // parseCliArgs `NoModeSelected` guard already rejects the case
     // where the user supplied options without a mode flag, so we
     // know all CliArgs are at their defaults here.
     std::cout << "DSS Code Prime compiler ready.\n"
-              << "Run `dss-code-prime --help` for usage.\n";
+              << "Run `dsscp --help` for usage.\n";
     return 0;
     }();
     if (!args.time) return dispatchRc;

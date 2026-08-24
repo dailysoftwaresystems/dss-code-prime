@@ -1516,7 +1516,7 @@ def self_test():
          set(), "a NAMED non-deferral table is excluded, and raises no false alarm",
          path=".plans/13-x.md")
     case(_doc("| Tier | Example | External tools? |", "|---|---|---|",
-              "| **Production pipeline** | dss-code-prime compiling sqlite | Zero. |"),
+              "| **Production pipeline** | dsscp compiling sqlite | Zero. |"),
          set(), "an ordinary prose table with no anchors is simply ignored",
          path=".plans/17-x.md")
     # star The line-based predecessor would have counted these; a table-based reader

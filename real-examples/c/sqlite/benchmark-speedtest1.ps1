@@ -189,7 +189,7 @@ if (-not $Python) { $Python = Get-Command python3 -ErrorAction SilentlyContinue 
 if (-not $Python) { Die 'no native python on PATH; the measurement core runs here, not in WSL.' }
 
 if (-not $DssSrc) { $DssSrc = (Resolve-Path (Join-Path $ScriptDir '..\..\..')).Path }
-# ★ THE BINARY IS `dss-code-prime.exe`, NOT `dss.exe`, AND SEARCHING FOR THE
+# ★ THE BINARY IS `dsscp.exe`, NOT `dss.exe`, AND SEARCHING FOR THE
 # WRONG NAME LOOKS EXACTLY LIKE "NOT BUILT YET" (a rename to `dsscp` is queued
 # but has not landed). Same resolution the .sh does, same rel-before-dbg
 # preference: a debug compiler's build time is not a number worth publishing.
@@ -197,7 +197,7 @@ if (-not $Dss) {
   foreach ($tree in @('rel', 'dbg')) {
     $root = Join-Path $DssSrc "build\$tree"
     if (-not (Test-Path $root)) { continue }
-    $hit = Get-ChildItem -Path $root -Filter 'dss-code-prime.exe' -Recurse -File `
+    $hit = Get-ChildItem -Path $root -Filter 'dsscp.exe' -Recurse -File `
              -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($hit) { $Dss = $hit.FullName; break }
   }
@@ -207,13 +207,13 @@ if (-not $Dss) {
 # searched" have different remedies, and one message for both sends the reader to
 # build a compiler they already have.
 if ($Dss -and -not (Test-Path $Dss)) {
-  Die "the dss-code-prime path given does not exist: $Dss`n      (the compiler is named 'dss-code-prime.exe', not 'dss.exe')"
+  Die "the dsscp path given does not exist: $Dss`n      (the compiler is named 'dsscp.exe', not 'dss.exe')"
 }
 if (-not $Dss) {
   Die @"
-no dss-code-prime binary found.
+no dsscp binary found.
       Pass -Dss <path>, or build one: scripts\local-build\local-build.ps1 -Tree rel
-      Searched for dss-code-prime.exe under $DssSrc\build\{rel,dbg}\.
+      Searched for dsscp.exe under $DssSrc\build\{rel,dbg}\.
 "@
 }
 $Dss = (Resolve-Path $Dss).Path
@@ -225,7 +225,7 @@ Info "dss       : $Dss"
 # the measured binary with whichever config tree sits above wherever it was
 # launched — and a measurement of "this binary" has to say which config it read.
 # ⚠ THIS CHECK RUNS HERE, NOT IN THE .sh, and that is not duplication: the .sh
-# derives inside WSL where a Windows `dss-code-prime.exe` is not native, so it
+# derives inside WSL where a Windows `dsscp.exe` is not native, so it
 # skips the probe BY NAME and this host runs it. Same implementation
 # (speedtest1_bench.py --preflight-dss), different host.
 # ✔MEASURED 2026-08-21: a two-day-stale build against the current config refuses

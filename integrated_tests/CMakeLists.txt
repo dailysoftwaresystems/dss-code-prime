@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 
 # ── Integration Tests ──────────────────────────────────────────
 #
-# Invokes the compiled `dss-code-prime` executable as a subprocess
+# Invokes the compiled `dsscp` executable as a subprocess
 # and validates the user-facing CLI surface end-to-end. Cross-
 # platform (Windows / Linux / macOS) — the runner's per-host
 # spec selection lives at runtime, not in cmake. Always against
@@ -95,7 +95,7 @@ foreach(MANIFEST ${DSS_EXAMPLE_MANIFESTS})
     add_test(
         NAME ${TEST_NAME}
         COMMAND integrated_tests
-                $<TARGET_FILE:dss-code-prime>
+                $<TARGET_FILE:dsscp>
                 ${CMAKE_SOURCE_DIR}/examples
                 "--only=${LANG_NAME}/${EXAMPLE_NAME}"
                 "--cells=${DSS_INTEGRATED_CELLS}"
@@ -110,7 +110,7 @@ endforeach()
 # The host-independent CLI surface and the self-test pins: one entry, no walk.
 add_test(NAME integrated_tests/cli-surface
          COMMAND integrated_tests
-                 $<TARGET_FILE:dss-code-prime>
+                 $<TARGET_FILE:dsscp>
                  ${CMAKE_SOURCE_DIR}/examples
                  --only=cli)
 set_tests_properties(integrated_tests/cli-surface PROPERTIES
@@ -128,7 +128,7 @@ dss_strict_arm_verdicts(integrated_tests/cli-surface)
 # is not evidence, and the one thing it must never do is read as green.
 add_test(NAME integrated_tests/adjudicate
          COMMAND integrated_tests
-                 $<TARGET_FILE:dss-code-prime>
+                 $<TARGET_FILE:dsscp>
                  ${CMAKE_SOURCE_DIR}/examples
                  --only=adjudicate
                  "--cells=${DSS_INTEGRATED_CELLS}")
@@ -155,7 +155,7 @@ set_tests_properties(integrated_tests/adjudicate PROPERTIES
     DEPENDS "${DSS_INTEGRATED_EXAMPLE_ENTRIES};integrated_tests/cells-reset")
 
 # ── The SPAWNED CLI needs this in its ENVIRONMENT, not just baked ──────────
-# This runner's whole job is to invoke `dss-code-prime` as a SUBPROCESS, and
+# This runner's whole job is to invoke `dsscp` as a SUBPROCESS, and
 # that subprocess resolves shipped config through its own
 # `core/types/config_path_walk.cpp`, which reads $DSS_CONFIG_ROOT and otherwise
 # walks up from ITS cwd. An out-of-tree build gives it a cwd with no
@@ -220,7 +220,7 @@ set_tests_properties(integrated_tests/adjudicate PROPERTIES
 # when the directory is unset, which is what keeps the two instruments apart.
 add_test(NAME integrated_tests/coverage-boundary
          COMMAND integrated_tests
-                 $<TARGET_FILE:dss-code-prime>
+                 $<TARGET_FILE:dsscp>
                  ${CMAKE_SOURCE_DIR}/examples
                  --only=coverage-boundary
                  "--sibling-runner=$<TARGET_FILE:dss_examples_runner>")

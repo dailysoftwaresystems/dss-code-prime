@@ -7032,7 +7032,7 @@ struct Lowerer {
     // POINT — an earlier draft of this comment claimed it WAS the guard and a
     // mutant refuted that. ✔MEASURED 2026-08-24 (P31 red-on-disable M2): swapping
     // the direct read back to `resolveStampedTypeBelow` and rebuilding
-    // (`libdss-code-prime.dll` md5 57bae630… → 6fddde1f…, so the mutant really was
+    // (`libdsscp.dll` md5 57bae630… → 6fddde1f…, so the mutant really was
     // compiled in) left the WHOLE scoped suite GREEN, `examples/c/gnu_alignof_value_operand`
     // included. The reason is that Pass 2's `alignofValueRule` arm STAMPS the
     // operand node, so the descent finds that stamp immediately and never gets

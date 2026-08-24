@@ -15,7 +15,7 @@
 #include <vector>
 
 // CLI argument parsing — LK10 cycle 3 (plan 14 §3 LK10 cycle 3
-// landed 2026-06-01). The dss-code-prime CLI's argv → structured
+// landed 2026-06-01). The dsscp CLI's argv → structured
 // `CliArgs` pivot.
 //
 // Standing rule check: source / target / linker-format agnostic.

@@ -711,7 +711,7 @@ TEST(DumpPredefinedMacros, EveryShippedObjectFormatDefinesNoStdcNoMacro) {
 //     in THREE places (usage block, Modes entry, Examples block), so deleting the
 //     Modes ENTRY left the other two and the pin stayed GREEN over a help text
 //     that no longer explained the flag. FAIL-OPEN.
-//   · v2 used `"dss-code-prime --dump-predefined-macros --language"` for the
+//   · v2 used `"dsscp --dump-predefined-macros --language"` for the
 //     usage block — which the EXAMPLES line also contains, so deleting the usage
 //     line stayed GREEN too. FAIL-OPEN again, one layer down.
 // v3 keys the usage witness on the `<name> --target <spec>` PLACEHOLDERS (usage
@@ -760,7 +760,7 @@ struct Argv {
 
 TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
     {   // the happy shape
-        Argv a{"dss-code-prime", "--dump-predefined-macros",
+        Argv a{"dsscp", "--dump-predefined-macros",
                "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux-exec"};
         auto r = parseCliArgs(a.argc(), a.argv());
@@ -770,7 +770,7 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
         EXPECT_FALSE(r->lspMode);
     }
     {   // no --language: the triple is incomplete, so REFUSE at the parser
-        Argv a{"dss-code-prime", "--dump-predefined-macros",
+        Argv a{"dsscp", "--dump-predefined-macros",
                "--target", "x86_64:elf64-x86_64-linux-exec"};
         auto r = parseCliArgs(a.argc(), a.argv());
         ASSERT_FALSE(r.has_value());
@@ -781,7 +781,7 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
                   std::string::npos);
     }
     {   // no --target
-        Argv a{"dss-code-prime", "--dump-predefined-macros",
+        Argv a{"dsscp", "--dump-predefined-macros",
                "--language", "c"};
         auto r = parseCliArgs(a.argc(), a.argv());
         ASSERT_FALSE(r.has_value());
@@ -791,7 +791,7 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
     }
     {   // MUTUALLY EXCLUSIVE with a compile: "does the compile still happen?"
         // must never be an open question.
-        Argv a{"dss-code-prime", "--dump-predefined-macros",
+        Argv a{"dsscp", "--dump-predefined-macros",
                "--compile", "x.c",
                "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux-exec"};
@@ -801,7 +801,7 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
     }
     {   // `-dM` is NOT an alias and must stay an unknown flag, so adding one
         // later is a deliberate act rather than a silent accretion.
-        Argv a{"dss-code-prime", "-dM", "--language", "c",
+        Argv a{"dsscp", "-dM", "--language", "c",
                "--target", "x86_64:elf64-x86_64-linux-exec"};
         auto r = parseCliArgs(a.argc(), a.argv());
         ASSERT_FALSE(r.has_value());
@@ -809,7 +809,7 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
     }
     {   // --stack-reserve asks for a field in an EMITTED IMAGE; this mode emits
         // none, so the request must be REFUSED rather than silently dropped.
-        Argv a{"dss-code-prime", "--dump-predefined-macros",
+        Argv a{"dsscp", "--dump-predefined-macros",
                "--language", "c",
                "--target", "x86_64:pe64-x86_64-windows-exec",
                "--stack-reserve", "4194304"};

@@ -2,7 +2,7 @@
 
 > The **project config** points the driver (`Program::compileProject`) at *what to build*:
 > which language, which artifact profile, which targets, which sources. It is the
-> file-driven counterpart to the `dss-code-prime` CLI flags. Owned by plan 06
+> file-driven counterpart to the `dsscp` CLI flags. Owned by plan 06
 > (`artifactProfile`, AP2/AP3/AP5/AP6) + the `program/` driver layer.
 >
 > Companion spec: the per-**language** declaration of which profiles a language *supports*

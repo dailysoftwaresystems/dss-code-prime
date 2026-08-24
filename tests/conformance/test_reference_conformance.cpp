@@ -38,7 +38,7 @@
 //      and prints `@@PROBE <id> RC=<n>` after each compile, with `%ERRORLEVEL%` /
 //      `$?` read DIRECTLY on the following line and never after a pipe.
 //   3. It drives the REAL DSS CLI as a subprocess (`DSS_CLI_PATH`, baked from
-//      `$<TARGET_FILE:dss-code-prime>`), not the library in-process. A pin on
+//      `$<TARGET_FILE:dsscp>`), not the library in-process. A pin on
 //      "what DSS accepts" that bypasses argv, the config resolver and the
 //      pipeline is not a pin on the thing users run.
 //
@@ -131,7 +131,7 @@ namespace fs = std::filesystem;
 namespace native_probe = dss::test_support::native_probe;
 
 #if !defined(DSS_CLI_PATH)
-#  error "DSS_CLI_PATH must be baked from $<TARGET_FILE:dss-code-prime> — see tests/conformance/CMakeLists.txt"
+#  error "DSS_CLI_PATH must be baked from $<TARGET_FILE:dsscp> — see tests/conformance/CMakeLists.txt"
 #endif
 
 namespace {

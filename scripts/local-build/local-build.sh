@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# PURPOSE: build dss-code-prime incrementally on this host, and optionally run ctest.
-# Local incremental build + test harness for dss-code-prime.
+# PURPOSE: build dsscp incrementally on this host, and optionally run ctest.
+# Local incremental build + test harness for dsscp.
 #
 # Usage:
 #   scripts/local-build/local-build.sh                    # build build/dbg

@@ -846,7 +846,7 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     // With NO redirection, NO STARTF_USESTDHANDLES: the child inherits the
     // parent's stdio exactly as-is. `bInheritHandles=TRUE` is required for that
     // to hold when the parent's own stdout is a pipe or a file (which it is
-    // under ctest and under any `dss-code-prime ... > log` invocation) — with
+    // under ctest and under any `dsscp ... > log` invocation) — with
     // FALSE, only a console-attached parent would pass its output on, so the
     // child's diagnostics would vanish precisely when they are being captured.
     STARTUPINFOW si{};
@@ -1245,7 +1245,7 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     // access to `environ` (it is the linker's, when a whole program is being
     // linked) and names `_NSGetEnviron()` from `<crt_externs.h>` as the way to
     // reach it at runtime. This translation unit IS compiled into a shared
-    // library (`libdss-code-prime.dylib`). ⚠ MEASURED 2026-08-12 on Darwin 25.5
+    // library (`libdsscp.dylib`). ⚠ MEASURED 2026-08-12 on Darwin 25.5
     // / Apple clang 21: a trivial `-dynamiclib` referencing `extern char**
     // environ` LINKS today, so the restriction is not enforced by this linker
     // and a future reader who tests the direct spelling will find it "works".

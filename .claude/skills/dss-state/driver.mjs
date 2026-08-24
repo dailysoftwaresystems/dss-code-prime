@@ -3,7 +3,7 @@
 // compiler by driving the real CLI, and derives every % axis live:
 //
 //   1. C-feature battery (probes.mjs) compiled + RUN through the actual
-//      `dss-code-prime` binary on the host target → empirical coverage %,
+//      `dsscp` binary on the host target → empirical coverage %,
 //      a parse→semantic→codegen→runtime funnel, and a miscompile alarm.
 //   2. Cross-target emit/run matrix (5 exec specs) with a canonical program.
 //   3. Plan axis: `.plans/23-full-c-plan - tbd.md` FC-phase ✅/⏳ markers,
@@ -135,7 +135,7 @@ function findCli() {
     if (!existsSync(explicit)) { console.error(`fatal: --cli path not found: ${explicit}`); process.exit(2); }
     return explicit;
   }
-  const exe = process.platform === 'win32' ? 'dss-code-prime.exe' : 'dss-code-prime';
+  const exe = process.platform === 'win32' ? 'dsscp.exe' : 'dsscp';
   const candidates = [
     join(repoRoot, 'build', 'bin', 'dss', 'Debug', exe),
     join(repoRoot, 'build', 'bin', 'dss', 'Release', exe),
@@ -144,7 +144,7 @@ function findCli() {
     join(repoRoot, 'build-dbg', 'bin', 'dss', exe),
   ].filter(existsSync);
   if (!candidates.length) {
-    console.error('fatal: no dss-code-prime binary found. Build one, e.g.:\n  cmake --build build --config Debug --target dss-code-prime');
+    console.error('fatal: no dsscp binary found. Build one, e.g.:\n  cmake --build build --config Debug --target dsscp');
     process.exit(2);
   }
   candidates.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
@@ -291,7 +291,7 @@ function parseRegistry() {
 // `build/` is often a STALE/broken config that can't compile current src,
 // while the live work happens in a Ninja `build-dbg/`). Deriving the build
 // root from `cli` keeps the test count honest: the CLI lives at
-// `<buildRoot>/bin/dss/[Debug|Release/]dss-code-prime[.exe]`, so the build
+// `<buildRoot>/bin/dss/[Debug|Release/]dsscp[.exe]`, so the build
 // root is the path component just above `bin/dss`, and a `Debug`/`Release`
 // segment after it (if present) means a multi-config generator needing `-C`.
 function buildInfoOf(cliPath) {
@@ -352,7 +352,7 @@ const cliMtime = statSync(cli).mtime;
 // Stale = the built ENGINE is older than the newest C++ source ON DISK
 // (worktree truth, not commit timestamps — those skew by minutes when the
 // binary is built during the cycle and committed right after). Two quirks:
-//  * the exe is a thin main over dss-code-prime.dll/.so — compare the
+//  * the exe is a thin main over dsscp.dll/.so — compare the
 //    newest of the exe + its engine sibling, not the exe alone;
 //  * .json configs are loaded at RUNTIME, so they never stale the binary.
 function newestCodeMtimeUnder(dir) {
@@ -364,7 +364,7 @@ function newestCodeMtimeUnder(dir) {
   }
   return newest;
 }
-const engineSiblings = ['dss-code-prime.dll', 'libdss-code-prime.so', 'libdss-code-prime.dylib']
+const engineSiblings = ['dsscp.dll', 'libdsscp.so', 'libdsscp.dylib']
   .map((n) => join(dirname(cli), n)).filter(existsSync);
 const binMtime = Math.max(cliMtime.getTime(), ...engineSiblings.map((p) => statSync(p).mtimeMs));
 const cliStale = binMtime < newestCodeMtimeUnder(join(repoRoot, 'src'));

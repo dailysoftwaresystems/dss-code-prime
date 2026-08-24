@@ -287,9 +287,9 @@ def build_msvc(arm: dict, subject: dict, jobs: int, objdir: str,
 
 def build_dss(arm: dict, subject: dict, jobs: int, objdir: str,
               binpath: str) -> tuple[bool, str]:
-    """dss-code-prime: ONE `--project` invocation, in-process CU pool.
+    """dsscp: ONE `--project` invocation, in-process CU pool.
 
-    ⚠ dss-code-prime RETURNS EXIT 0 EVEN ON FATAL ERRORS, so the verdict is
+    ⚠ dsscp RETURNS EXIT 0 EVEN ON FATAL ERRORS, so the verdict is
     taken from `error[` in the log plus the artifact's existence — never from
     the process exit status. Same rule `base-harness.sh`'s
     `dss_bh_build_artifact` states; restated rather than imported because this
@@ -329,7 +329,7 @@ def build_dss(arm: dict, subject: dict, jobs: int, objdir: str,
     # sibling's binary silently is the worst outcome available here, because
     # every number downstream would then describe a file nobody meant to measure.
     spec = arm.get("target", "")
-    marker = f"dss-code-prime: artifact {spec} "
+    marker = f"dsscp: artifact {spec} "
     reported, seen = [], set()
     for line in log.splitlines():
         i = line.find(marker)
@@ -375,7 +375,7 @@ def preflight_dss(binary: str, config_root: str) -> tuple[bool, str]:
         src = os.path.join(td, "probe.c")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("int main(void){return 0;}\n")
-        # ⚠ rc is NOT the verdict — dss-code-prime returns 0 on fatal errors, so
+        # ⚠ rc is NOT the verdict — dsscp returns 0 on fatal errors, so
         # the log is what decides, exactly as build_dss does.
         r = run_capture([binary, "--compile", src, "--output", td], env=env)
         log = (r.stdout or "") + (r.stderr or "")
@@ -776,7 +776,7 @@ def main() -> int:
                     help="print the resolved cl.exe environment as JSON, or the "
                          "reason there is none, and exit")
     ap.add_argument("--preflight-dss", metavar="BIN",
-                    help="prove this dss-code-prime can compile three lines "
+                    help="prove this dsscp can compile three lines "
                          "against --config-root, and exit; run it BEFORE paying "
                          "for a configure and a reference build")
     ap.add_argument("--config-root", metavar="DIR",

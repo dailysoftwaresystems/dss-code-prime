@@ -36,7 +36,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
-# OBJECT libraries under src/ (core, program, ...) feed dss-code-prime-lib,
+# OBJECT libraries under src/ (core, program, ...) feed dsscp-lib,
 # which is SHARED. CMake doesn't auto-enable -fPIC on OBJECT libs, so without
 # this the Linux link step rejects their .o files with "relocation ... cannot
 # be used when making a shared object; recompile with -fPIC". Setting it
@@ -377,7 +377,7 @@ endfunction()
 add_subdirectory(src)
 
 if(DSS_BUILD_TESTS)
-    # `integrated_tests` is a test harness (drives the dss-code-prime
+    # `integrated_tests` is a test harness (drives the dsscp
     # CLI as a subprocess + asserts OS exit codes from spawned
     # binaries). It uses `enable_testing()` + `add_test()`, so it
     # must live inside the DSS_BUILD_TESTS gate alongside the unit

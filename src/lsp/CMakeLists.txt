@@ -14,7 +14,7 @@ add_library(lsp OBJECT
 
 target_include_directories(lsp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
-# Aggregated into dss-code-prime-lib via $<TARGET_OBJECTS:lsp> at
+# Aggregated into dsscp-lib via $<TARGET_OBJECTS:lsp> at
 # src/CMakeLists.txt — same pattern as core/ and tokenizer/.
 # DSS_BUILDING_DLL must live here (not on the SHARED target) so
 # DSS_EXPORT decorations resolve to dllexport when these .obj files
@@ -74,7 +74,7 @@ target_link_libraries(lsp
 #     which is what `#include "program/..."` resolves against.
 #   * No edge is needed for LINKING: `$<TARGET_OBJECTS:lsp>` and
 #     `$<TARGET_OBJECTS:program>` are both aggregated into the single
-#     `dss-code-prime-lib` (src/CMakeLists.txt), so the symbols are already in
+#     `dsscp-lib` (src/CMakeLists.txt), so the symbols are already in
 #     one image. Test binaries link that lib, not the object libs.
 #
 # Duplicating either reader here to avoid the smell would be strictly worse: an

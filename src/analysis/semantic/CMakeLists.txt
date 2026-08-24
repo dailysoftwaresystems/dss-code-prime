@@ -7,7 +7,7 @@ add_library(analysis_semantic OBJECT
 
 target_include_directories(analysis_semantic PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
-# Aggregated into dss-code-prime-lib via $<TARGET_OBJECTS:analysis_semantic>
+# Aggregated into dsscp-lib via $<TARGET_OBJECTS:analysis_semantic>
 # at src/CMakeLists.txt — same pattern as core/, tokenizer/,
 # analysis_compilation_unit/. DSS_BUILDING_DLL must live here (not on the
 # SHARED target) so DSS_EXPORT decorations resolve to dllexport when

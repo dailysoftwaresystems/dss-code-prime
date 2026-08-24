@@ -133,20 +133,20 @@ The compiler exposes a **program API** with three input modes.
 ```
 
 ```bash
-dss-code-prime --project myapp.dss-project.json
+dsscp --project myapp.dss-project.json
 ```
 
 **File list:**
 
 ```bash
-dss-code-prime --compile src/main.c src/utils.c --language c \
+dsscp --compile src/main.c src/utils.c --language c \
   --target x86_64:elf64-x86_64-linux-exec --target x86_64:pe64-x86_64-windows-exec
 ```
 
 **Directory scan** (recurses for the language's configured extensions):
 
 ```bash
-dss-code-prime --dir ./src/ --language c --target x86_64:elf64-x86_64-linux-exec
+dsscp --dir ./src/ --language c --target x86_64:elf64-x86_64-linux-exec
 ```
 
 ## Defining a language or target

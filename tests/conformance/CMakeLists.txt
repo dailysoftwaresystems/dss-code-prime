@@ -26,7 +26,7 @@ target_include_directories(dss_conformance_test_reference_conformance
 #
 # A pin on "what DSS accepts" that drives the library in-process is not a pin on
 # what users run: it skips argv parsing, the shipped-config resolver, and the
-# per-target pipeline selection. `$<TARGET_FILE:dss-code-prime>` resolves to the
+# per-target pipeline selection. `$<TARGET_FILE:dsscp>` resolves to the
 # real executable (with `.exe` on Windows) at generate time, so the test needs no
 # search heuristic and cannot pick up a stale binary from another build tree.
 #
@@ -35,8 +35,8 @@ target_include_directories(dss_conformance_test_reference_conformance
 # never built — which fails as "the DSS CLI produced no verdict", i.e. it looks
 # like a harness bug rather than a missing build step.
 target_compile_definitions(dss_conformance_test_reference_conformance
-    PRIVATE DSS_CLI_PATH="$<TARGET_FILE:dss-code-prime>")
-add_dependencies(dss_conformance_test_reference_conformance dss-code-prime)
+    PRIVATE DSS_CLI_PATH="$<TARGET_FILE:dsscp>")
+add_dependencies(dss_conformance_test_reference_conformance dsscp)
 
 # Cost, MEASURED on this host (Windows, Debug, 5 oracles, 76 probes): the DSS
 # half is ~130 ms per invocation x 76 probes x 2 fixed targets, and each oracle

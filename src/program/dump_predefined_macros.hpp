@@ -64,7 +64,7 @@ namespace dss {
 //   predefined-macro origin=<o> kind=<k> form=<f> name=<NAME> value=<...>
 //
 // A fixed leading marker (never a regex over prose) so a machine reader selects
-// these lines by prefix — the same discipline as the `dss-code-prime: artifact`
+// these lines by prefix — the same discipline as the `dsscp: artifact`
 // report line. Every field is a single token except `value`.
 inline constexpr std::string_view kPredefinedMacroLineMarker = "predefined-macro";
 
@@ -73,7 +73,7 @@ inline constexpr std::string_view kPredefinedMacroLineMarker = "predefined-macro
 // answered for nothing) is visible in the output itself rather than inferred
 // from a short list.
 inline constexpr std::string_view kPredefinedMacroHeaderMarker =
-    "dss-code-prime: predefined-macros";
+    "dsscp: predefined-macros";
 
 // A NOTE line, emitted after a section's macro lines. Its own marker (never the
 // macro marker) so a machine reader selecting macro lines by prefix never picks
@@ -89,7 +89,7 @@ inline constexpr std::string_view kPredefinedMacroHeaderMarker =
 // the handler. So the dump STATES the condition, names both governing clauses,
 // and leaves the verdict where it belongs.
 inline constexpr std::string_view kPredefinedMacroNoteMarker =
-    "dss-code-prime: predefined-macros-note";
+    "dsscp: predefined-macros-note";
 
 // The `origin=` field's closed vocabulary — WHICH CONFIG FAMILY (or the command
 // line) declared the entry. This is what makes the output an AUDIT instrument

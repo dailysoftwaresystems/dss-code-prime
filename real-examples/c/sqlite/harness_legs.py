@@ -4981,7 +4981,7 @@ def verify_shared_lib(path, want_container):
 # all three containers and two architectures, every one reporting 887/894/883
 # exported names, `Tcl_CreateInterp` present, ZERO of the 9.0 markers:
 #   /usr/lib/x86_64-linux-gnu/libtcl8.6.so            ELF64 x86_64  DT_SONAME    libtcl8.6.so
-#   ~/.cache/dss-code-prime/arm64libs/libtcl8.6.so    ELF64 aarch64 DT_SONAME    libtcl8.6.so
+#   ~/.cache/dsscp/arm64libs/libtcl8.6.so    ELF64 aarch64 DT_SONAME    libtcl8.6.so
 #   harness-libs/macho64-arm64/libtcl8.6.dylib        Mach-O arm64  LC_ID_DYLIB  /opt/local/lib/libtcl8.6.dylib
 #   harness-libs/macho64-x86_64/libtcl8.6.dylib       Mach-O x86_64 LC_ID_DYLIB  /opt/local/lib/libtcl8.6.dylib
 #   C:/Program Files/Git/mingw64/bin/tcl86.dll        PE64          export Name  tcl86.dll
@@ -5439,7 +5439,7 @@ def _fwd(path):
     spelling differed between the tool that produced it and the tool that
     consumed it. Windows accepts `/` in every API and in PowerShell; POSIX is
     unaffected because there is nothing to replace. It is also the spelling
-    dss-code-prime itself prints (base-harness.ps1: "the compiler prints forward
+    dsscp itself prints (base-harness.ps1: "the compiler prints forward
     slashes on every host"), so the report and the compiler's own log agree."""
     return (path or "").replace("\\", "/")
 
@@ -5474,16 +5474,16 @@ def _run_capture(argv, cwd=None):
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
-# The line dss-code-prime prints for each artefact it emitted. ✔MEASURED
-# 2026-08-05: `dss-code-prime: artifact x86_64:pe64-x86_64-windows-dll <path>`.
+# The line dsscp prints for each artefact it emitted. ✔MEASURED
+# 2026-08-05: `dsscp: artifact x86_64:pe64-x86_64-windows-dll <path>`.
 # Matched here the SAME way base-harness.sh's `dss_bh_reported_artifacts` and
 # base-harness.ps1's `Get-DssReportedArtifacts` match it — by the literal
-# `dss-code-prime: artifact <spec> ` prefix, taking DISTINCT paths, and REFUSING
+# `dsscp: artifact <spec> ` prefix, taking DISTINCT paths, and REFUSING
 # to guess when there is more than one. Duplicated here rather than reached for
 # because those two live in base-harness.{sh,ps1}, which this cycle does not own;
 # the shapes must not diverge, and the self-test pins this one against the exact
 # prefix both of them grep for.
-DSS_ARTIFACT_LINE_PREFIX = "dss-code-prime: artifact "
+DSS_ARTIFACT_LINE_PREFIX = "dsscp: artifact "
 
 
 def dss_reported_artifacts(log_text, spec):
@@ -5500,7 +5500,7 @@ def dss_reported_artifacts(log_text, spec):
 
 
 def dss_log_errors(log_text, limit=8):
-    """The diagnostic lines a caller should quote. BOTH spellings: dss-code-prime
+    """The diagnostic lines a caller should quote. BOTH spellings: dsscp
     prints `error[CODE]` for its own diagnostics, and a front-end message can
     read `error:` — grepping only one of them has cost this project a diagnosis
     before."""
@@ -5600,7 +5600,7 @@ def build_loadext_helper(leg, dss, sqlite_src, sqlite_bld, dest_dir, work_dir,
         arm = {"builder": "dss", "available": True, "ok": False, "rc": rc,
                "argv": argv, "log": log_path, "artifact": "", "bytes": 0,
                "errors": dss_log_errors(out), "why": ""}
-        # ★ dss-code-prime EXITS 0 EVEN ON FATAL ERRORS — the verdict comes from
+        # ★ dsscp EXITS 0 EVEN ON FATAL ERRORS — the verdict comes from
         # `error[`/`error:` in the output PLUS the artefact the build itself
         # REPORTED, never from the process exit status. Same rule, same order, as
         # base-harness.{sh,ps1}.
@@ -6159,7 +6159,7 @@ def cache_root(explicit=None):
     """Where THIS MACHINE keeps caches. A host fact, in the same category as
     `searchPaths` — it decides nothing about which legs exist. Precedence:
     an explicit --cache-root, then DSS_HARNESS_CACHE_ROOT, then the
-    `~/.cache/dss-code-prime` the pe64 leg's declared search paths already
+    `~/.cache/dsscp` the pe64 leg's declared search paths already
     name, spelled through the variable that exists on this host."""
     if explicit:
         return os.path.abspath(explicit)
@@ -6173,7 +6173,7 @@ def cache_root(explicit=None):
             "HOME nor USERPROFILE is set. The acquisition cache lives OUTSIDE "
             "the repository on purpose (a downloaded third-party binary is not "
             "a source artefact), so there is no in-tree fallback to take.")
-    return os.path.join(os.path.abspath(home), ".cache", "dss-code-prime")
+    return os.path.join(os.path.abspath(home), ".cache", "dsscp")
 
 
 def leg_cache_dir(leg, root):
@@ -14611,10 +14611,10 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         shutil.rmtree(_hd, ignore_errors=True)
 
     # ── the artefact line, matched the way BOTH base harnesses match it ───────
-    _log = ("dss-code-prime: artifact x86_64:pe64-x86_64-windows-dll /out/a.dll\n"
+    _log = ("dsscp: artifact x86_64:pe64-x86_64-windows-dll /out/a.dll\n"
             "info[R_Something] noise\n"
-            "dss-code-prime: artifact x86_64:pe64-x86_64-windows-dll /out/a.dll\n"
-            "dss-code-prime: artifact x86_64:elf64-x86_64-linux-dyn /out/a.so\n")
+            "dsscp: artifact x86_64:pe64-x86_64-windows-dll /out/a.dll\n"
+            "dsscp: artifact x86_64:elf64-x86_64-linux-dyn /out/a.so\n")
     check("the reported artefact is selected by SPEC and de-duplicated",
           dss_reported_artifacts(_log, "x86_64:pe64-x86_64-windows-dll")
           == ["/out/a.dll"],
@@ -14625,10 +14625,10 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("TWO DIFFERENT paths for one spec are BOTH returned, so the caller can "
           "refuse to guess",
           len(dss_reported_artifacts(
-              _log + "dss-code-prime: artifact x86_64:pe64-x86_64-windows-dll "
+              _log + "dsscp: artifact x86_64:pe64-x86_64-windows-dll "
                      "/out/b.dll\n", "x86_64:pe64-x86_64-windows-dll")) == 2)
     check("the prefix is the one base-harness.{sh,ps1} grep for",
-          DSS_ARTIFACT_LINE_PREFIX == "dss-code-prime: artifact ")
+          DSS_ARTIFACT_LINE_PREFIX == "dsscp: artifact ")
     # BOTH spellings. Grepping only `error[` has cost this project a diagnosis.
     check("diagnostics are found as `error[` AND as `error:`",
           dss_log_errors("error[P0016]: got quote include not found: sqlite3.h")
@@ -14707,7 +14707,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         check("a silent build that reports NO artefact is poisoned",
               _r["verdictClass"] == "poisoned"
               and "reported NO artefact" in _r["detail"], _r["detail"])
-        # dss-code-prime EXITS 0 ON FATAL ERRORS — the diagnostics decide.
+        # dsscp EXITS 0 ON FATAL ERRORS — the diagnostics decide.
         _r = _call(runner=lambda argv: (0, "error[P0016]: got quote include not "
                                            "found: sqlite3.h\n"))
         check("rc=0 with `error[` diagnostics is a FAILURE, never a success",
@@ -15226,7 +15226,7 @@ def main(argv=None):
                         "network nor the filesystem")
     p.add_argument("--cache-root", default=None, metavar="DIR",
                    help="where acquired libraries are cached (default: "
-                        "$DSS_HARNESS_CACHE_ROOT, else ~/.cache/dss-code-prime). "
+                        "$DSS_HARNESS_CACHE_ROOT, else ~/.cache/dsscp). "
                         "OUTSIDE the repository, always.")
     p.add_argument("--offline", action="store_true",
                    help="refuse to reach the network: --acquire completes from "

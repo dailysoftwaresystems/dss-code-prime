@@ -107,10 +107,10 @@ tmp_probe/
 # scratchpad; this catches anything that lands here anyway.)
 scratchpad/
 # DSS CLI default output dir (target-spec-named subdirs of compiled binaries
-# from ad-hoc `dss-code-prime <src>` runs; not a build-system dir).
+# from ad-hoc `dsscp <src>` runs; not a build-system dir).
 target/
 # `.dss-project.json` `dependsOn` checkout cache. ★ THIS DIRECTORY BELONGS TO
-# THE PROJECT BEING COMPILED, NOT TO THIS COMPILER: dss-code-prime creates
+# THE PROJECT BEING COMPILED, NOT TO THIS COMPILER: dsscp creates
 # `.dss-deps/<name>/` beside the CONSUMING project's own manifest — in the
 # user's repo, wherever their `.dss-project.json` lives — never in the
 # compiler's tree or in a shared/global location. A build of someone else's

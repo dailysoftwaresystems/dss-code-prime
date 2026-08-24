@@ -1,7 +1,7 @@
 # cmake-import
 
 Convert a CMake project into a DSS **`.dss-project.json`** manifest — the file
-the compiler consumes via `dss-code-prime --project <file>`.
+the compiler consumes via `dsscp --project <file>`.
 
 ## Layout
 
@@ -36,7 +36,7 @@ to drift.
    Relative source/include paths keep the manifest **portable** (no
    machine-specific absolute paths). DSS resolves a manifest's relative
    `sources` against the **process working directory**, so **run
-   `dss-code-prime --project <manifest>` from the project root** (see the
+   `dsscp --project <manifest>` from the project root** (see the
    example below).
 4. Writes the `.dss-project.json` with a stable key order:
    `language`, `artifactProfile`, `targets`, `artifactName`, `sources`,
@@ -122,7 +122,7 @@ scripts/cmake-import/cmake-import.sh scripts/cmake-import/example \
 
 # build with DSS — run FROM the project root so the relative sources resolve
 cd scripts/cmake-import/example
-dss-code-prime --project demo.dss-project.json --output /tmp/demo-out
+dsscp --project demo.dss-project.json --output /tmp/demo-out
 ```
 
 The generated `demo.dss-project.json` (paths relative to the project root):
@@ -153,7 +153,7 @@ The generated `demo.dss-project.json` (paths relative to the project root):
 `macho64-…` on macOS.) The produced binary returns `scaled_square(7) = 7*7*2 =
 98`, proving the imported `-DSCALE=2` flowed through the whole
 CMake → import → `--project` → codegen chain. Because the `sources` are
-relative, `dss-code-prime --project` must run from the project root (the
+relative, `dsscp --project` must run from the project root (the
 working directory DSS resolves them against); running it from a different
 directory fails with `D_FileNotFound` for `src/main.c`.
 

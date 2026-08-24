@@ -543,7 +543,7 @@ stage_run() {   # stage_run <leg> <rundir> <resolver> ; env: STUB_RC/STUB_CLASS/
     printf 'LEG_RESOLVER=%q\n'  "$3"
     printf 'LEG_CATALOGUE=%q\n' "$LOADTMP/legs.json"
     printf 'LOADEXT_BUILDER=%q\n' "${STUB_BUILDER:-dss}"
-    printf 'DSS_BIN=%q\n'       "/nonexistent/dss-code-prime"
+    printf 'DSS_BIN=%q\n'       "/nonexistent/dsscp"
     printf 'DSS_CONFIG=%q\n'    "release"
     printf 'SQLITE_DIR=%q\n'    "$LOAD_SQ"
     printf 'BLD=%q\n'           "$LOAD_BLD"

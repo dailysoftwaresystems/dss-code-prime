@@ -169,7 +169,7 @@ DEFAULT_TARGETS = [
 ISOLATION_PROFILE = "staticlib"
 PER_CODE_CAP = 50   # DiagnosticReporter::Config::maxPerCode
 
-# Windows spells the compiler `dss-code-prime.exe`. Used ONLY when auto-
+# Windows spells the compiler `dsscp.exe`. Used ONLY when auto-
 # discovering the binary; an explicit `--dss-bin` / `DSS_BIN` is taken verbatim.
 EXE_SUFFIX = ".exe" if os.name == "nt" else ""
 
@@ -995,16 +995,16 @@ def main(argv: list[str]) -> int:
         else:
             # The executable SUFFIX is part of the name on Windows, and leaving
             # it out made auto-discovery unable to succeed on that platform at
-            # all: the built binary is `dss-code-prime.exe`, so neither the
+            # all: the built binary is `dsscp.exe`, so neither the
             # fixed default path nor the glob could ever match and `--dss-bin`
             # was mandatory on the one platform the `.ps1` launcher exists for.
             # Only the NAME is widened here — the directories searched are
             # unchanged on purpose, because quietly picking up whichever
             # compiler some other build tree happens to hold is a run-identity
             # problem, not a convenience.
-            names = ["dss-code-prime"]
+            names = ["dsscp"]
             if EXE_SUFFIX:
-                names.insert(0, "dss-code-prime" + EXE_SUFFIX)
+                names.insert(0, "dsscp" + EXE_SUFFIX)
             for name in names:
                 default = REPO_ROOT / "build" / "bin" / "dss" / name
                 if default.is_file():
@@ -1015,7 +1015,7 @@ def main(argv: list[str]) -> int:
                     dss_bin = found[0]
                     break
     if dss_bin is None or not dss_bin.is_file() or not os.access(dss_bin, os.X_OK):
-        die("dss-code-prime not found; build the project or pass --dss-bin.")
+        die("dsscp not found; build the project or pass --dss-bin.")
 
     # ── the corpus manifest ──
     manifest_path = Path(args.manifest or os.environ.get("SQLITE_MANIFEST")

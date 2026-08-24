@@ -1,6 +1,6 @@
 // DSS Code Prime — integration tests.
 //
-// Drives the compiled `dss-code-prime` executable as a SUBPROCESS
+// Drives the compiled `dsscp` executable as a SUBPROCESS
 // (vs the in-process `Program::compileFiles` path exercised by
 // `tests/examples/examples_runner`). The two paths share the
 // curated `examples/` corpus but exercise different surfaces:
@@ -82,7 +82,7 @@
 //
 // PROJECT MODE (D-EXAMPLES-RUNNER-PROJECT-MANIFEST): a manifest may name a
 // `.dss-project.json` via the top-level `"project"` key INSTEAD of
-// `source`/`sources`, and this runner then drives `dss-code-prime --project`
+// `source`/`sources`, and this runner then drives `dsscp --project`
 // instead of `--compile`. That is the only CLI mode which expands the
 // manifest's source GLOBS and runs its `preBuildScripts`/`postBuildScripts`
 // hooks, so it is the only way the corpus can witness a build script that
@@ -562,7 +562,7 @@ struct ExpectedDiagnostic {
 struct ExampleManifest {
     std::string                language;
     // D-EXAMPLES-RUNNER-PROJECT-MANIFEST: PROJECT MODE. Present ⇒ this example is
-    // built by `dss-code-prime --project <file>` from the named
+    // built by `dsscp --project <file>` from the named
     // `.dss-project.json` (relative to the example dir) instead of by
     // `--compile <sources>`. MUTUALLY EXCLUSIVE with `source`/`sources`; see the
     // in-process examples_runner's copy of this field for the full rationale,
@@ -1338,7 +1338,7 @@ struct CwdGuard {
 
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT + nested extension (CLI-subprocess mirror of
 // the in-process examples_runner's buildDependencyArtifact): build ONE
-// prerequisite LIBRARY via a `dss-code-prime` SUBPROCESS, RECURSIVELY building
+// prerequisite LIBRARY via a `dsscp` SUBPROCESS, RECURSIVELY building
 // its own nested `dependsOn` FIRST (into the same out dir) and threading their
 // paths into THIS dep's `--resolve-library`. So a fat `-staticlib` dep that
 // nests an input `-staticlib` MERGES it (D-FF1-STATICLIB-FAT-ARCHIVE): the
@@ -1570,7 +1570,7 @@ std::size_t dependencyImagesDiffered  = 0;
 }
 
 // Drive ONE ARM of one example's SELECTED target through the CLI subprocess path:
-//   1. spawn `dss-code-prime --compile <src> --language <l> --target <spec> --output <outdir> [--config=<name>]`
+//   1. spawn `dsscp --compile <src> --language <l> --target <spec> --output <outdir> [--config=<name>]`
 //   2. check rc == 0
 //   3. check artifact file exists at outdir/<artifact>
 //   4. spawn artifact, capture exit code (and, when pinned, stdout) via run_binary.hpp
@@ -4851,7 +4851,7 @@ void reportLegacyDebris(fs::path const& base) {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: integrated_tests <path-to-dss-code-prime> "
+        std::cerr << "Usage: integrated_tests <path-to-dsscp> "
                   << "<path-to-examples-root> [--only=<selector>]\n"
                   << "  --only=cli           the host-independent CLI surface "
                      "and the self-test pins; no corpus walk\n"

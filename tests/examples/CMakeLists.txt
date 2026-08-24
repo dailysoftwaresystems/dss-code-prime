@@ -18,7 +18,7 @@
 add_executable(dss_examples_runner examples_runner.cpp)
 target_link_libraries(dss_examples_runner
     PRIVATE
-        dss-code-prime-lib
+        dsscp-lib
         GTest::gtest
         GTest::gtest_main
         nlohmann_json::nlohmann_json

@@ -9,7 +9,7 @@ Curated source programs the DSS compiler must compile + run end-to-end. Each exa
 **Two runners drive the same corpus, and a capability must land in BOTH:**
 
 - `tests/examples/examples_runner.cpp` — **in-process**, via `Program::compileFiles` (the API + library link path).
-- `integrated_tests/runner.cpp` — **CLI subprocess**, driving the built `dss-code-prime` binary (argv parsing, exit codes, filesystem layout, output routing).
+- `integrated_tests/runner.cpp` — **CLI subprocess**, driving the built `dsscp` binary (argv parsing, exit codes, filesystem layout, output routing).
 
 One runner enforcing something its sibling shrugs at is a silent harness bug, not a shortcut — that is how `D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT` survived in both for as long as it did. They already share their skip vocabulary, strict parse and emulator lint through `tests/test_support/arm_verdict_ledger.hpp`, and their recursive neighbour staging — plus its self-test — through `tests/test_support/stage_tree.hpp`.
 
@@ -52,7 +52,7 @@ Counts below are MEASURED over the **613** manifests in the tree, ✔re-derived 
 - `language` — language name passed to `Program::compileFiles` (must match a `.lang.json` in `src/dss-config/sources/`). In PROJECT MODE the `.dss-project.json` is the authority and this is a MIRROR — both runners fail loud if the two disagree. *Declared by every manifest in the corpus.*
 - `source` — the single source file name, relative to the example dir. *577.*
 - `sources` — a non-empty ARRAY of source file names, for a multi-CU example. An `expectDiagnostics` example must be single-source (one buffer, so a diagnostic's offset maps unambiguously). *15.*
-- `project` — PROJECT MODE: the path (relative to the example dir) of a `.dss-project.json` that owns the build. The runners drive `Program::compileProject` / `dss-code-prime --project` instead of `compileFiles` / `--compile`, which is the ONLY entry point that expands the manifest's source globs, runs its `preBuildScripts` / `postBuildScripts` hooks, and RESOLVES its `dependsOn` graph. *4.* See **Project mode** below for the three things it changes.
+- `project` — PROJECT MODE: the path (relative to the example dir) of a `.dss-project.json` that owns the build. The runners drive `Program::compileProject` / `dsscp --project` instead of `compileFiles` / `--compile`, which is the ONLY entry point that expands the manifest's source globs, runs its `preBuildScripts` / `postBuildScripts` hooks, and RESOLVES its `dependsOn` graph. *4.* See **Project mode** below for the three things it changes.
 - `exitCode` — exact OS exit code the spawned binary must produce. REQUIRED unless `expectDiagnostics` is present. *573.*
 - `expectedStdout` — exact stdout the binary must print; declaring it is what routes the capture pipe. A per-target entry of the same name overrides it. *164 top-level + 78 per-target.*
 - `expectDiagnostics` — a non-empty array of `{code, line, col}` (+ optional `positioned`) inverting the contract: the compile MUST fail, producing exactly this diagnostic set, and nothing is spawned. *23.*

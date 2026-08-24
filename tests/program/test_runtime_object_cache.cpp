@@ -87,7 +87,13 @@
 // INSTALLED compiler on Windows, and that is the number that matters. With the
 // default `%LOCALAPPDATA%` root, a 5-character username, a 4-character unit
 // stem, `release` and the arm64 elf slug, the longest composed path was 223
-// (37 characters of headroom) and is now 177 — **83 characters of headroom**.
+// (37 characters of headroom) and is now 168 — **92 characters of headroom**.
+// ★ THE LAST 9 OF THOSE 92 WERE BOUGHT BY A RENAME THAT WAS NOT ABOUT PATH
+// LENGTH AT ALL: the vendor directory went from `dss-code-prime/runtime-cache`
+// to `dsscp/runtime-cache` (2026-08-24, cycle P32), and this case is what
+// MEASURED it — it red on the SHORTENING, which is the direction nobody
+// thinks to check, and is the argument for asserting an exact figure rather
+// than an upper bound.
 // It still fails LOUD when it bites, and the refusal now names the composed
 // path, its length, and a MEASURED verdict on whether the length was the cause
 // (see `composedPathNote`), plus the remedy: point `DSS_RUNTIME_CACHE_DIR` at a
@@ -1127,7 +1133,7 @@ TEST(RuntimeObjectCacheRoots, PlatformDefaultsFollowTheDocumentedChain) {
     std::string const segment = runtimeCacheBuildStampSegment();
     ASSERT_FALSE(segment.empty());
 
-    fs::path const vendorTail = fs::path{"dss-code-prime"} / "runtime-cache";
+    fs::path const vendorTail = fs::path{"dsscp"} / "runtime-cache";
 
     // ── PHASE 1: LOCALAPPDATA present ⇒ it wins over XDG and HOME ───────────
     {
@@ -1207,7 +1213,7 @@ TEST(RuntimeObjectCacheRoots, AnEmptyOverrideFallsThroughRatherThanRootingAtCwd)
     auto const roots = resolveRuntimeCacheRoots(configRoot);
     ASSERT_FALSE(roots.perUser.empty()) << roots.trail;
     EXPECT_EQ(roots.perUser.generic_string(),
-              (localAppData / "dss-code-prime" / "runtime-cache"
+              (localAppData / "dsscp" / "runtime-cache"
                / runtimeCacheBuildStampSegment())
                   .generic_string());
     EXPECT_TRUE(roots.perUser.is_absolute())
@@ -1769,13 +1775,13 @@ TEST(RuntimeObjectCachePathBudget, TheLongestComposedNameFitsWindowsMaxPath) {
     std::size_t const installed =
         std::string_view{"C:/Users/"}.size() + 5u
         + std::string_view{"/AppData/Local"}.size()
-        + std::string_view{"/dss-code-prime/runtime-cache"}.size()
+        + std::string_view{"/dsscp/runtime-cache"}.size()
         + 1u + 41u          // the build-stamp segment
         + 1u + std::string_view{"release"}.size()
         + 1u + std::string_view{"arm64_elf64-aarch64-linux-exec"}.size()
         + 1u + longestName;
-    EXPECT_EQ(installed, 177u);
-    EXPECT_EQ(260u - installed, 83u)
+    EXPECT_EQ(installed, 168u);
+    EXPECT_EQ(260u - installed, 92u)
         << "the Windows MAX_PATH headroom for an installed compiler changed; "
            "re-measure and update this file's docblock.";
 

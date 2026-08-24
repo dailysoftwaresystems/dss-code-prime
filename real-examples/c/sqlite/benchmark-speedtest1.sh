@@ -253,19 +253,19 @@ command -v tclsh >/dev/null 2>&1 || die "'tclsh' is not on PATH.
       recipe cannot be derived without it. apt: tcl. brew: tcl-tk.
       (speedtest1 itself links no Tcl — this is a build-host tool.)"
 
-# ★ THE BINARY IS `dss-code-prime`, NOT `dss`, AND SEARCHING FOR THE WRONG NAME
-# LOOKS EXACTLY LIKE "NOT BUILT YET". The compiler is `dss-code-prime[.exe]`
+# ★ THE BINARY IS `dsscp`, NOT `dss`, AND SEARCHING FOR THE WRONG NAME
+# LOOKS EXACTLY LIKE "NOT BUILT YET". The compiler is `dsscp[.exe]`
 # (a rename to `dsscp` is queued but has not landed); build-and-test.sh resolves
-# it by `find … -name dss-code-prime -perm -u+x`, and this does the same rather
+# it by `find … -name dsscp -perm -u+x`, and this does the same rather
 # than carrying a second list of guessed paths. Preference is rel over dbg,
 # because a debug compiler's build time is not a number worth publishing.
 if [[ -z "$DSS_BIN" ]]; then
   for _tree in rel dbg; do
-    DSS_BIN="$(find "$SRC_DIR/build/$_tree" -type f -name 'dss-code-prime*' \
+    DSS_BIN="$(find "$SRC_DIR/build/$_tree" -type f -name 'dsscp*' \
                  -perm -u+x -print -quit 2>/dev/null || true)"
     [[ -n "$DSS_BIN" ]] && break
   done
-  [[ -n "$DSS_BIN" ]] || DSS_BIN="$(find "$SRC_DIR/build" -type f -name 'dss-code-prime*' \
+  [[ -n "$DSS_BIN" ]] || DSS_BIN="$(find "$SRC_DIR/build" -type f -name 'dsscp*' \
                                       -perm -u+x -print -quit 2>/dev/null || true)"
 fi
 # ⚠ TWO DIFFERENT FACTS, TWO DIFFERENT MESSAGES. "You passed a path that is not
@@ -274,12 +274,12 @@ fi
 # they already have. An instrument that misattributes is the failure this project
 # cares most about.
 if [[ -n "${DSS_BIN:-}" && ! -x "$DSS_BIN" ]]; then
-  die "the dss-code-prime path given is not an executable file: $DSS_BIN
-      (the compiler is named 'dss-code-prime[.exe]', not 'dss')"
+  die "the dsscp path given is not an executable file: $DSS_BIN
+      (the compiler is named 'dsscp[.exe]', not 'dss')"
 fi
-[[ -n "${DSS_BIN:-}" ]] || die "no dss-code-prime binary found.
+[[ -n "${DSS_BIN:-}" ]] || die "no dsscp binary found.
       Pass --dss <path>, or build one: scripts/local-build/local-build.sh --tree rel
-      Searched for an executable named dss-code-prime* under $SRC_DIR/build/."
+      Searched for an executable named dsscp* under $SRC_DIR/build/."
 info "dss       : $DSS_BIN"
 
 # The reference C compiler. A benchmark that silently picked whichever `cc`
@@ -600,7 +600,7 @@ plan = {
      "bin": conv(dss), "manifest": conv(manifest_p), "config": "release",
      "configRoot": conv(os.environ["CFG_ROOT"]),
      # The TARGET SPEC is on the arm because the artifact path is read back out
-     # of the build's own `dss-code-prime: artifact <spec> <path>` line, and that
+     # of the build's own `dsscp: artifact <spec> <path>` line, and that
      # line is keyed on the spec.
      "target": target,
      "artifactName": "speedtest1", "optimizationLabel": "--config=release"},

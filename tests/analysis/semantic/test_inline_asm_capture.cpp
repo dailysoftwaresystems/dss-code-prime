@@ -1176,7 +1176,7 @@ TEST(InlineAsmRefusals, APositionalAsmGotoLabelReferenceIsAcceptedAndItsIndexIsC
 // KIND: a WRONG ANSWER out of the shipped CLI, not a reasoned hazard.
 // ✔MEASURED 2026-08-19, `__asm__("movl %[v], %[out]" : [out] "=r"(r),
 // [v] "=r"(d) : [v] "r"(a))` with `a == 20`, compiled by the shipped
-// `dss-code-prime` for `x86_64:pe64-x86_64-windows-exec` at `--config=debug`
+// `dsscp` for `x86_64:pe64-x86_64-windows-exec` at `--config=debug`
 // AND `--config=release`: rc=0 both times, and the program exited **0** where
 // 20 was written. `%[v]` bound the OUTPUT, because `mintTemplateSpellings` gives
 // both occurrences the same form and every spelling lookup below this tier is a

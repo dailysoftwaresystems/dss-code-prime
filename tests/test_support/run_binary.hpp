@@ -65,7 +65,7 @@
 // own directory first, so this one spelling works everywhere with no build-graph
 // change. The target it protects is why the quoter is header-only and
 // dependency-free in the first place (see that header's opening note); linking
-// `dss-code-prime-lib` into `integrated_tests` to borrow a string helper would
+// `dsscp-lib` into `integrated_tests` to borrow a string helper would
 // break the very boundary that target exists to hold. Included UNCONDITIONALLY,
 // not under `#if defined(_WIN32)`, so the pure transform is compile-checked on
 // every leg of the matrix rather than only where its output is used.

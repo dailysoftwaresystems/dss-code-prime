@@ -19,19 +19,26 @@ config tree**, from a release tarball that is a **prefix tree** (`bin/`, `lib/`,
 1. ✅ **CMake `install()` rules + rpath** — **LANDED.** `cmake/DssInstall.cmake`
    is the single owner of what ships: the exe to `bin/`, the shared lib to
    `lib/` with `$ORIGIN/../lib` (Linux) / `@loader_path/../lib` (macOS), and
-   `src/dss-config/` to `share/dss-code-prime/<version>/dss-config/`.
+   `src/dss-config/` to `share/dsscp/<version>/dss-config/`.
    (`D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE`.)
-2. **The `dss-code-prime` → `dsscp` binary rename** — still queued, so the
-   installed command is still `dss-code-prime` while every manifest here names
-   `dsscp`.
+2. ✅ **The `dss-code-prime` → `dsscp` binary rename** — **LANDED** (P32,
+   2026-08-24, operator ruling “command identity”). The installed command, the
+   shared library and the config tree under `share/dsscp/` now all carry the
+   command's name, so the manifests here and the tarball they consume agree.
+   ⚠ The PROJECT is still `dss-code-prime` — `project()`, the repository and the
+   funding identity are deliberately unchanged, exactly as Ziglang ships `zig`.
 
-Until (2) lands, **leave `ENABLE_PKG_PUBLISH` unset.**
+**Both prerequisites are now discharged, and `ENABLE_PKG_PUBLISH` still stays unset**
+— for a DIFFERENT reason, stated so the change of reason is not read as an
+oversight: what remains is per-manager PROVISIONING (each publisher's repo,
+tap/bucket and token, listed below), not anything about the compiler. Turn the
+managers on one at a time as you provision each one.
 
 ### ⛔ The one rule every manifest here obeys
 
 **Take the tarball WHOLE; never cherry-pick files out of it.** `dsscp` locates
 its config tree by a path *relative to its own executable*
-(`../share/dss-code-prime/<version>/dss-config`) and its shared library the same
+(`../share/dsscp/<version>/dss-config`) and its shared library the same
 way. Rearranging `bin/` and `share/` produces a package that installs cleanly and
 then cannot resolve a single `#include <stdio.h>` — which is exactly what these
 manifests did before the install set existed, and nothing noticed, because every

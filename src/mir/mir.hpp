@@ -699,7 +699,7 @@ public:
         // fall-through edge, which only a hand-built result can manage.
         //
         // ⓘ DEFINED INLINE ON PURPOSE, not for speed. ✔DOCUMENTED from the build
-        // files: `dss-code-prime-lib` is SHARED and `CMAKE_CXX_VISIBILITY_PRESET`
+        // files: `dsscp-lib` is SHARED and `CMAKE_CXX_VISIBILITY_PRESET`
         // is `hidden`, so only `DSS_EXPORT` symbols cross the boundary — and a
         // NESTED type's members are not covered by the enclosing class's export
         // attribute. An out-of-line definition here would therefore have to be

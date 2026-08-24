@@ -114,7 +114,7 @@ struct DSS_EXPORT Diagnostic {
     Range              range;
     DiagnosticSeverity severity = DiagnosticSeverity::Error;
     std::string        code;     // e.g. "P_UnexpectedToken"
-    std::string        source = "dss-code-prime";
+    std::string        source = "dsscp";
     std::string        message;
 };
 

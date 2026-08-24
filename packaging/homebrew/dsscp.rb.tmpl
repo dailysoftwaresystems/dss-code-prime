@@ -4,7 +4,7 @@
 # This is a BINARY formula: it downloads the per-OS/arch release tarball, which
 # is a PREFIX TREE produced by `cmake --install` (bin/, lib/, share/) — see
 # cmake/DssInstall.cmake, the single owner of what ships. Still depends on the
-# queued dss-code-prime -> dsscp binary rename.
+# queued dsscp -> dsscp binary rename.
 class @CLASSNAME@ < Formula
   desc "@DESCRIPTION@"
   homepage "@HOMEPAGE@"
@@ -33,7 +33,7 @@ class @CLASSNAME@ < Formula
     # The tarball has SEVERAL top-level entries (bin/, lib/, share/), so Homebrew
     # does NOT strip a leading directory — paths here are the prefix tree itself.
     # Installed WHOLE into the keg, deliberately: `dsscp` locates its config tree
-    # by a path RELATIVE TO ITS OWN EXECUTABLE (`../share/dss-code-prime/<version>/
+    # by a path RELATIVE TO ITS OWN EXECUTABLE (`../share/dsscp/<version>/
     # dss-config`), and its rpath finds the shared library the same way
     # (@loader_path/../lib on macOS, $ORIGIN/../lib on Linux). Cherry-picking the
     # exe and the lib would break both hops, and the compiler would then be unable

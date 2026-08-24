@@ -11,7 +11,7 @@ function(dss_add_test)
 
     string(REPLACE "/" "_" target "dss_${DSS_NAME}")
     add_executable(${target} ${DSS_SOURCES})
-    target_link_libraries(${target} PRIVATE dss-code-prime-lib GTest::gtest GTest::gtest_main)
+    target_link_libraries(${target} PRIVATE dsscp-lib GTest::gtest GTest::gtest_main)
     target_include_directories(${target}
         PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -82,12 +82,12 @@ endfunction()
 # top-level CMakeLists). The ~166 test TUs are the larger half of the cold
 # compile and every one of them includes <gtest/gtest.h> + the heavy STL set;
 # precompiling them ONCE here and reusing across all test targets removes that
-# reparse. It links dss-code-prime-lib + GTest::gtest purely to inherit their
+# reparse. It links dsscp-lib + GTest::gtest purely to inherit their
 # usage-requirement flags (the PUBLIC DSS_SHARED_BUILD define, the gtest include
 # dir) so the precompiled header matches every consumer's compile line exactly.
 # `dss_test_pch` is never linked anywhere; REUSE_FROM wires the build dependency.
 add_library(dss_test_pch STATIC ${CMAKE_CURRENT_SOURCE_DIR}/test_support/pch_stub.cpp)
-target_link_libraries(dss_test_pch PRIVATE dss-code-prime-lib GTest::gtest)
+target_link_libraries(dss_test_pch PRIVATE dsscp-lib GTest::gtest)
 target_include_directories(dss_test_pch
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src

@@ -5,7 +5,7 @@
 # hands the resulting compile_commands.json to the shared transform
 # `cmake-import.py` (the single source of truth), which aggregates the per-TU
 # sources / includes / defines and writes the `.dss-project.json` the compiler
-# consumes via `dss-code-prime --project`.
+# consumes via `dsscp --project`.
 #
 # Usage:
 #   scripts/cmake-import/cmake-import.ps1 <root-cmake-dir> <output-project-file> [options]

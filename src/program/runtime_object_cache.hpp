@@ -171,7 +171,7 @@
 // ═══ TWO ROOTS, READ THROUGH ═════════════════════════════════════════════════
 // The artifact was originally rooted ONLY at the shipped config root
 // (`<configRoot>/runtime/platform/dist/`). For an INSTALLED compiler that root
-// is READ-ONLY — it is `<prefix>/share/dss-code-prime/<ver>/dss-config/`, owned
+// is READ-ONLY — it is `<prefix>/share/dsscp/<ver>/dss-config/`, owned
 // by the package manager — so the first cache MISS after install could not be
 // written and the build could not proceed at all. The cache therefore resolves
 // through TWO roots:
@@ -306,11 +306,11 @@ struct DSS_EXPORT RuntimeCacheRoots {
 //      platform default. This is the explicit override for CI and hermetic
 //      builds, and it takes the directory VERBATIM: the caller already named
 //      the location, so no vendor tail is appended under it.
-//   2. `%LOCALAPPDATA%` + `dss-code-prime/runtime-cache` — the Windows per-user
+//   2. `%LOCALAPPDATA%` + `dsscp/runtime-cache` — the Windows per-user
 //      non-roaming cache location.
-//   3. `$XDG_CACHE_HOME` + `dss-code-prime/runtime-cache` — the XDG base
+//   3. `$XDG_CACHE_HOME` + `dsscp/runtime-cache` — the XDG base
 //      directory spec's cache root, when the user has set one.
-//   4. `$HOME` + `.cache/dss-code-prime/runtime-cache` — the XDG spec's own
+//   4. `$HOME` + `.cache/dsscp/runtime-cache` — the XDG spec's own
 //      documented default when `XDG_CACHE_HOME` is unset.
 //   ⇒ NONE resolves: `perUser` is EMPTY, lookup still consults the shipped
 //      root (so an installed compiler with a packaged `dist/` keeps working),
