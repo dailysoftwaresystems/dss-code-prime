@@ -62,6 +62,54 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   (there were two unrelated `ctest.exe` processes running from `C:\Program Files\CMake\bin`). (2) Do
   NOT edit a poisoned log to annotate it; drop a `*.POISONED.README.txt` marker beside it. Editing the
   evidence is how a suspect log later gets read as a clean one.
+- ★★★ **AND IT IS NOT ABOUT BUILDS — IT IS ABOUT ANY SHARED INPUT MOVING UNDER A
+  RUN. ✔MEASURED 2026-08-24 (cycle P31, lane G): a gate reported 1102 passed / 501 FAILED
+  WITH NOTHING BUILDING AT ANY POINT.** `src/dss-config/sources/c.lang.json` was rewritten in
+  place while that lane's own gate was reading it, and every example after that instant died
+  with `[arm-ledger] … 4 poisoned (of 4 declared arms)`, `compiled=- spawned=- ran=-` —
+  not compiled, not attempted; 4857 `C_MalformedJson` / `D_SchemaLoadFailed`. The re-run on a
+  quiesced tree: **1602 of 1603**, the one failure an unrelated anchor-registry debt.
+  ★★ **AND THE WRITER WAS A PAIR OF HANDS, NOT A SCRIPT — WHICH IS THE WHOLE
+  DIFFERENCE BETWEEN "FIX THE PROBES" AND "FIX EVERY WRITER".** The orchestrator inferred a
+  cut-probe from the probes sitting in that lane's scratchpad; the lane MEASURED it and
+  refuted the attribution: every cut probe's last write was 15:48:45, the gate started at
+  15:59, and the 16:06:02 mtime was a DIRECT, hand-run config restructure done with a plain
+  `open(path,"wb")` mid-gate. ⇒ the repair is a single atomic-write helper that EVERY
+  writer goes through, hand-run edits included. ⚠ And atomicity removes the torn READ; it
+  does not license writing a shipped document during a gate at all.
+  ⇒ the build output is only ONE of the shared inputs a run depends on. The shipped
+  config tree is another, and `.plans/**` is a third for every guard that takes it as a
+  subject.
+  ★★ **THE TELL IS A CLIFF, AND IT IS WORTH KNOWING BEFORE YOU SPEND AN HOUR.** A
+  mid-run tear produces a CONTIGUOUS run of failures that starts at one point in the sequence
+  and NEVER RECOVERS — here `examples/c/concat_wchar_widen_width` passed at sequence 1101
+  and `examples/c/cond_init_release` failed at 1102, with every entry after it red. A genuine
+  regression scatters across the entries that exercise it, wherever they happen to fall in the
+  order. Extract the sequence before reading any single failure:
+      grep -oE "^ *[0-9]+/[0-9]+ Test +#[0-9]+: [^ ]+ .*" <log> \
+        | awk '{n=$1; sub(/\/[0-9]+/,"",n); print n, (/Failed/?"F":"P"), $3, $4}'
+  ★ **THEN TAKE THE CONTROL, WHICH IS CHEAPER THAN DIAGNOSING ONE RED.** Run the
+  suspect's own binary against the live tree NOW: if a trivial input compiles to exit 0, there
+  is no standing regression and the log is void — ✔that is exactly what settled the case
+  above, in one command, against 501 failures.
+- ★★★ **A WRAPPER CANNOT REPORT ITS VERDICT IF YOU APPEND A COMMAND AFTER IT — AND THE
+  FAILURE IS SILENT AND FLATTERING.** ✔MEASURED 2026-08-24 (cycle P31,
+  `D-CYCLE-A-TRAILING-ECHO-REPLACED-A-FAILED-GATE-S-EXIT-CODE-WITH-ZERO`): the fold gate
+  exited **8** with `stale_refusal_citations_guard` RED, and the background-task notification
+  said **`completed (exit code 0)`**. The invocation ended `…; echo "RUNGATE_EXIT=$?"`. The
+  echo read the code CORRECTLY and printed `RUNGATE_EXIT=8` — and then, being the last
+  command in the compound, **became the terminal state**, which is the one thing the
+  notification channel carries. ★ **The instinct was right and the placement destroyed the
+  signal it existed to make visible.**
+  ⇒ **Never append a command after `run-gate.sh`.** Its last line is already the verdict.
+  Where a witness line is genuinely wanted, PRESERVE the code across it:
+  `…; rc=$?; echo "RUNGATE_EXIT=$rc"; exit "$rc"`.
+  ⚠ **This is the standing watcher rule one hop further out.** *"A watcher must observe every
+  terminal state on the channel it polls"* is usually read as "watch the right channel"; this
+  case is the other half — **do not move the terminal state OFF that channel at the last
+  hop.** ⓘ It was caught only because the log was read before the notification was believed.
+  Nothing enforced that, which is exactly why it is written down here.
+
 - **no NEW `abort()` in test code:**
 
   ```bash

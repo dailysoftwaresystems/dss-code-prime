@@ -8,7 +8,7 @@
   ],
   "ceilings": {
     ".claude/skills/dss-code-prime/references/repo-map.md": 2,
-    ".plans/00-compiler-implementation-plan - tbd.md": 57,
+    ".plans/00-compiler-implementation-plan - tbd.md": 56,
     ".plans/05-parser-plan - ok.md": 6,
     ".plans/06-artifact-profile-plan - tbd.md": 12,
     ".plans/07-production-readiness-plan - tbd.md": 1,
@@ -24,7 +24,7 @@
     ".plans/25-posix-per-target-structs - tbd.md": 6,
     ".plans/28-driver-builder-plan.md": 6,
     ".plans/29-inline-asm-plan - tbd.md": 42,
-    ".plans/_deferred-anchor-registry.md": 2060,
+    ".plans/_deferred-anchor-registry.md": 2054,
     ".plans/_handoff.md": 60,
     ".plans/_next-session-brief.md": 2,
     "examples/c/abstract_fnptr_cast/main.c": 1,

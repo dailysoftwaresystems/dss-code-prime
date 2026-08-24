@@ -87,9 +87,46 @@ enum class SectionKind : std::uint8_t {
     // (base-relocated before the page is sealed RO). Distinct from `Data`
     // (stays writable) — reloc-bearing MUTABLE data still routes to `Data`.
     RelRoConst = 15, // const data needing load-time relocations (relro)
+    // D-LK-MACHO-COMPACT-UNWIND-SECTION-REFUSED-BLOCKS-EVERY-STOCK-MACOS-ARCHIVE:
+    // PER-FUNCTION UNWIND METADATA, and the taxonomy's THIRD species -- neither
+    // code nor data. Every one of the fifteen kinds above answers "what do
+    // these bytes BECOME in the image": text becomes instructions, the data
+    // family becomes storage, the table kinds are structure the walker
+    // synthesizes. An unwind section answers a different question entirely: it
+    // DESCRIBES OTHER SECTIONS' CODE. Its bytes are consumed by the LINKER (and
+    // then by the runtime unwinder through whatever table the linker chose to
+    // synthesize), never merged into text or data, and its own extent is not
+    // addressable program state.
+    //
+    // ★ WHY IT IS NOT `Debug`, WHICH IS THE TEMPTING BUCKET AND IS WRONG.
+    //   ✔MEASURED 2026-08-24 (Apple clang 21.0.0, macOS 26.5.2, `otool -l` on a
+    //   stock `clang -c` object): `__LD,__compact_unwind` carries section flags
+    //   0x02000000 = S_ATTR_DEBUG, so the wire really does tag it with the
+    //   debug attribute. That attribute is a LINKER instruction ("do not load
+    //   this into the image"), not a statement about what the bytes mean --
+    //   compact unwind is consumed at RUNTIME by the unwinder, and stripping
+    //   debug info from a binary must not remove it. Filing it under `Debug`
+    //   would make "strip the debug sections" and "keep the unwind tables" the
+    //   same predicate, which is exactly the silent-wrongness this taxonomy
+    //   exists to prevent.
+    //
+    // ★ UNIVERSAL, NOT A MACH-O SPELLING. Mach-O `__LD,__compact_unwind`,
+    //   ELF `.eh_frame`/`.eh_frame_hdr` and PE `.pdata`/`.xdata` are the same
+    //   species; each format document names its own. Only the two Mach-O
+    //   RELOCATABLE documents declare a row today, because the Mach-O reader
+    //   is the only one that has been taught to consume one -- a format that
+    //   declares no row keeps the old, correct refusal for a section it cannot
+    //   classify.
+    //
+    // NOT a `DataSectionKind`: no producer in this codebase emits an unwind
+    // section as `AssembledData`. DSS states a function's unwind rules in the
+    // NEUTRAL `CfiFunction` vocabulary (`AssembledFunction::cfi`) and each
+    // format writer encodes its own table from that, so a producer reaching for
+    // this kind would be spelling a format's table by hand.
+    Unwind     = 16, // per-function unwind metadata (linker-consumed)
 };
 
-inline constexpr EnumNameTable<SectionKind, 16> kSectionKindTable{{{
+inline constexpr EnumNameTable<SectionKind, 17> kSectionKindTable{{{
     { SectionKind::Text,       "text"       },
     { SectionKind::Rodata,     "rodata"     },
     { SectionKind::Data,       "data"       },
@@ -106,6 +143,7 @@ inline constexpr EnumNameTable<SectionKind, 16> kSectionKindTable{{{
     { SectionKind::ThreadBss,  "tbss"       },
     { SectionKind::ThreadVars, "tvars"      },
     { SectionKind::RelRoConst, "relro"      },
+    { SectionKind::Unwind,     "unwind"     },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -125,12 +163,15 @@ sectionKindFromName(std::string_view s) noexcept {
 // Narrow subset of `SectionKind` that a producer can legitimately
 // emit via `AssembledData`. Closes D-LK4-RODATA-SECTION-NARROW.
 //
-// Of the 16 `SectionKind` values, 10 are walker-synthesized
+// Of the 17 `SectionKind` values, 11 are NOT producer-emittable
 // (`Text` = executable code; `Symtab`/`Strtab`/`ShStrtab` = symbol
 // + name tables; `RelocTable` = relocation entries; `Dynamic` =
 // dynamic linking metadata; `Note` = vendor notes; `Debug` =
 // DWARF/CodeView; `ThreadVars` = the Mach-O tlv descriptors, minted
-// by the WRITER and never by a producer; `Custom` = format-specific
+// by the WRITER and never by a producer; `Unwind` = per-function
+// unwind metadata, which arrives on the READ side from a foreign
+// object and which DSS's own producers state as `CfiFunction`
+// instead; `Custom` = format-specific
 // anything). A producer constructing
 // `AssembledData{symbol, SectionKind::Symtab, ...}` is semantically
 // nonsense — the assembler doesn't emit symbol tables; the linker
@@ -143,7 +184,10 @@ sectionKindFromName(std::string_view s) noexcept {
 // species of defect as the projection count below, arriving through a
 // comment instead of through a template argument. Both are now pinned
 // by the `static_assert` beside `kDataSectionKindNames`, which fails
-// the build if the 6/10 split ever moves.
+// the build if the 6/11 split ever moves — and it EARNED that keep on
+// 2026-08-24, when `Unwind` landed: the assert went red on the same
+// compile that added the enumerator, which is what dragged this prose
+// forward with it instead of letting it rot a third time.
 //
 // The SIX valid producer-emittable kinds:
 //   * `Rodata` — read-only initialised data (string literals,
@@ -249,6 +293,48 @@ dataSectionKindName(DataSectionKind d) noexcept {
     return dataSectionKindOf(k).has_value();
 }
 
+// Can a DEFINED SYMBOL inside a section of this kind START AN ATOM — i.e. does
+// the section contribute LINKABLE BODY BYTES that the symbol names?
+//
+// D-LK-MACHO-COMPACT-UNWIND-SECTION-REFUSED-BLOCKS-EVERY-STOCK-MACOS-ARCHIVE.
+// Every relocatable-object reader in `src/link/format/` asks this question, and
+// each used to answer it by testing `Text` and then `dataSectionKindOf(...)`
+// separately — two conditions with no name, which is how a THIRD answer becomes
+// invisible. It is stated once here, DERIVED from the two facts that already
+// exist (`Text` is the code kind, `isDataSectionKind` is the storage subrange),
+// so a future kind is classified by construction rather than by whichever
+// reader happened to be edited.
+//
+// ★ FALSE FOR `Unwind` IS THE WHOLE POINT, and it is not the same statement as
+//   "drop the section". A clang-emitted `__LD,__compact_unwind` carries a local
+//   section label (`ltmp1`) at offset 0, and under MH_SUBSECTIONS_VIA_SYMBOLS
+//   that label looks exactly like an atom boundary. It is not one: the bytes it
+//   labels are metadata ABOUT other sections' atoms, so slicing them into an
+//   atom would mint a body the image must then place somewhere. The reader
+//   handles such a section explicitly instead — never by guessing, and never by
+//   silence.
+//
+// ⚠ ONLY MEANINGFUL FOR A KIND THAT RESOLVED. A section whose (name/segment)
+// matched no format-document row has NO kind, and that case must keep reaching
+// its reader's loud refusal — `false` here means "classified, and classified as
+// something that holds no body", which is a completely different claim from
+// "unclassified".
+[[nodiscard]] constexpr bool sectionKindCarriesLinkableBody(SectionKind k) noexcept {
+    return k == SectionKind::Text || isDataSectionKind(k);
+}
+
+static_assert( sectionKindCarriesLinkableBody(SectionKind::Text));
+static_assert( sectionKindCarriesLinkableBody(SectionKind::Rodata));
+static_assert( sectionKindCarriesLinkableBody(SectionKind::Data));
+static_assert( sectionKindCarriesLinkableBody(SectionKind::Bss));
+static_assert( sectionKindCarriesLinkableBody(SectionKind::ThreadData));
+static_assert( sectionKindCarriesLinkableBody(SectionKind::ThreadBss));
+static_assert( sectionKindCarriesLinkableBody(SectionKind::RelRoConst));
+static_assert(!sectionKindCarriesLinkableBody(SectionKind::Unwind));
+static_assert(!sectionKindCarriesLinkableBody(SectionKind::Debug));
+static_assert(!sectionKindCarriesLinkableBody(SectionKind::Symtab));
+static_assert(!sectionKindCarriesLinkableBody(SectionKind::ThreadVars));
+
 // The spellings a data-section declaration may use — `kSectionKindTable`
 // narrowed to the data subrange. What a loader's "the closed set is …" half
 // must render.
@@ -274,16 +360,17 @@ dataSectionKindName(DataSectionKind d) noexcept {
 //
 // ⓘ THE SENTINEL SHAPE ONE VOCABULARY OVER: `kSelectableObjectFormatKindNames`
 // in `core/types/object_format_kind.hpp` is the same pair where the rejected
-// set is a single sentinel row. Here it is a SUBRANGE of ten, which is why the
-// constant is `10` and not the `1` every sibling site carries — it is derived
-// from THIS table, never copied from a neighbour.
+// set is a single sentinel row. Here it is a SUBRANGE of eleven, which is why
+// the constant is `11` and not the `1` every sibling site carries — it is
+// derived from THIS table, never copied from a neighbour.
 inline constexpr auto kDataSectionKindNames =
     namesWhere<6>(kSectionKindTable, isDataSectionKind);
 static_assert(kSectionKindTable.rows.size()
-                  == kDataSectionKindNames.size() + 10,
-              "kSectionKindTable must have exactly TEN rows that are NOT "
-              "producer-emittable (the walker-synthesized kinds, for which "
-              "`dataSectionKindOf` returns nullopt) — an eleventh leaves "
+                  == kDataSectionKindNames.size() + 11,
+              "kSectionKindTable must have exactly ELEVEN rows that are NOT "
+              "producer-emittable (the walker-synthesized kinds plus the "
+              "linker-consumed `Unwind` metadata kind, for all of which "
+              "`dataSectionKindOf` returns nullopt) — a twelfth leaves "
               "`namesWhere`'s literal count matching while every 'the closed "
               "set is …' message silently stops describing the split "
               "`isDataSectionKind` actually enforces. If the new kind IS "

@@ -315,7 +315,7 @@ Two reasons, and the second is the important one: without a sibling there is no 
 
 ### 3.2 The probe corpus
 
-Probes are small programs — C through each vendor's C dialect first, DSS Axis once plan 20/24 provides it — and they follow the `examples/c-subset/` discipline exactly: **each probe isolates ONE fact**, so that a disassembly diff attributes cleanly to it, and each carries a `$comment` recording what is red when the fact changes. A probe that exercises five things at once produces a listing nobody can attribute.
+Probes are small programs — C through each vendor's C dialect first, DSS Axis once plan 20/24 provides it — and they follow the `examples/c/` discipline exactly: **each probe isolates ONE fact**, so that a disassembly diff attributes cleanly to it, and each carries a `$comment` recording what is red when the fact changes. A probe that exercises five things at once produces a listing nobody can attribute.
 
 | Family | Isolates | Yields |
 |---|---|---|

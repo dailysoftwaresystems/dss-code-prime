@@ -244,7 +244,29 @@ struct LirOperand {
     // class-correct load op. Repurposes one of the two padding bytes — no
     // struct-size change (still 8). Unused (0) for any other operand kind.
     std::uint8_t   spillSlotClass = 0;           // 1
-    std::uint8_t   _pad[1] = {};                 // 1
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: for a `Reg` (or
+    // `SpillSlotRef`) operand sitting in a CALL's argument region, the argument's
+    // NATURAL BYTE SIZE (1/2/4/8). 0 = "not stated", which every producer other
+    // than `MirToLir::lowerCall` leaves it at and which every `Slot`-packing CC
+    // ignores. Consumed by `lir_wide_call_args`, whose overflow cursor needs the
+    // datum's own size + alignment once a CC declares NATURAL packing.
+    //
+    // ★★ WHY THE OPERAND AND NOT THE INSTRUCTION. The width bits ride
+    // `LirInst::flags`, which is exactly right for a one-datum instruction (the
+    // callee's `arg` uses them); a CALL carries N arguments of N different sizes
+    // in ONE instruction, so its width axis is necessarily per-OPERAND. This
+    // repurposes the last padding byte — `LirOperand` stays 8 bytes (asserted
+    // below), the same trick `byValueAggExhaust` and `spillSlotClass` already use.
+    //
+    // ⚠ IT IS NOT ROUND-TRIPPED THROUGH `.dsslir` TEXT — deliberately, and it
+    // shares that property with the two side bytes above (see `lir_text.cpp`).
+    // Its whole lifetime is isel → `lowerWideCallArgs`, which run back-to-back in
+    // `compile_pipeline` with only verbatim operand copies in between. A CC that
+    // declares NATURAL packing and reaches the overflow cursor with 0 here is a
+    // DROPPED CARRIER, and `lowerWideCallArgs` REFUSES it loudly rather than
+    // silently reverting that one argument to slot packing while the callee reads
+    // it packed — which is the shape of a silent miscompile.
+    std::uint8_t   argNaturalBytes = 0;          // 1
     union {
         LirReg        reg;        // 4 — kind == Reg
         std::int32_t  immInt32;   // 4 — kind == ImmInt (truncated; full int64 lives in scalar pool)
@@ -270,6 +292,18 @@ struct LirOperand {
         LirOperand o{};
         o.kind = LirOperandKind::Reg;
         o.reg  = r;
+        return o;
+    }
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: a `Reg` operand in a
+    // CALL's argument region, carrying the argument's natural byte size so the
+    // overflow cursor can pack it. Every OTHER Reg operand keeps `makeReg`, whose
+    // `argNaturalBytes` is 0 = "not stated" — so this is additive by construction.
+    [[nodiscard]] static constexpr LirOperand
+    makeArgReg(LirReg r, std::uint8_t naturalBytes) noexcept {
+        LirOperand o{};
+        o.kind            = LirOperandKind::Reg;
+        o.argNaturalBytes = naturalBytes;
+        o.reg             = r;
         return o;
     }
     [[nodiscard]] static constexpr LirOperand makeImmInt32(std::int32_t v) noexcept {

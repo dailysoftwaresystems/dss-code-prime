@@ -366,6 +366,28 @@ struct DSS_EXPORT HirLoweringConfig {
     // language has no generic-selection surface (unset; the dispatch skips it).
     RuleId      genericRule{};          std::string genericRuleName;
 
+    // P31: the rules whose ENTIRE meaning is a compile-time number the SEMANTIC
+    // tier already computed — `__builtin_offsetof(T, m)` and
+    // `__builtin_types_compatible_p(T1, T2)`. CST→HIR emits the recorded value
+    // (`SemanticModel::foldedConstantAt`) as a Literal and NEVER lowers the
+    // subtree: there is nothing there to lower, because the operands are
+    // type-names and member designators rather than expressions.
+    // ★ A LIST, NOT ONE FIELD PER CONSTRUCT. "Read the folded constant" is ONE
+    // lowering verb; giving each construct its own field would have made a third
+    // one need a third dispatch arm to say the same sentence a third time.
+    // ⚠ A rule named here whose node carries NO recorded value is a HARD REFUSAL
+    // in the lowering, never a zero — a zero offset is a plausible wrong address.
+    std::vector<RuleId>      foldedConstantRules;
+    std::vector<std::string> foldedConstantRuleNames;
+
+    // P31: `__builtin_choose_expr` — the compile-time `?:`. Routed to the SAME
+    // lowering body `genericRule` is (`lowerRecordedSelection`), because the two
+    // differ ONLY in how the semantic tier picked the winner and not at all in
+    // what the lowering does with it: read the recorded NodeId out of
+    // `nodeToSelectedExpr`, lower that sub-expression, discard the rest.
+    // Invalid ⇒ the language has no `__builtin_choose_expr` surface.
+    RuleId      chooseExprRule{};       std::string chooseExprRuleName;
+
     // D-CSUBSET-COMPUTED-GOTO: the GNU `&&label` label-address operand rule
     // (`labelAddressExpr`). A dedicated operand alt (the SizeOf precedent) — its
     // `Identifier` child is a RAW label name, recovered by the CST→HIR lowering
@@ -373,6 +395,19 @@ struct DSS_EXPORT HirLoweringConfig {
     // per-function ordinal, NEVER lowered as an expression. Invalid ⇒ the language
     // has no computed-goto surface (unset; the dispatch skips it).
     RuleId      labelAddressRule{};    std::string labelAddressRuleName;
+
+    // P31 (D-C-GNU-STATEMENT-EXPRESSION): the GNU `({ … })` operand rule
+    // (`stmtExpr`). A dedicated operand alt (the `sizeof` / `_Generic`
+    // precedent) whose children are STATEMENTS, not expressions — so it must
+    // never reach the generic operand descent, which would try to lower a
+    // declaration as a value. The lowering (`lowerStatementExpr`) runs the
+    // statements through the ordinary statement machinery and yields the last
+    // one's expression, building the ALREADY-EXISTING `HirKind::SeqExpr`
+    // ([stmts…, result]) — no new HIR kind, and no MIR change, because MIR's
+    // SeqExpr arm already runs each statement child through `lowerStmt`.
+    // Invalid ⇒ the language has no statement-expression surface (unset; the
+    // operand dispatch skips it).
+    RuleId      stmtExprRule{};        std::string stmtExprRuleName;
 
     // Per-language MIR-globals const-evaluation policy. The shared
     // const-eval engine (plan 12.5) supports a float-folding gate via

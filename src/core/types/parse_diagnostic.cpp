@@ -94,6 +94,14 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_InlineAsmPlaceholderInBasicTemplate";
         case DiagnosticCode::S_InlineAsmDuplicateSymbolicName:
             return "S_InlineAsmDuplicateSymbolicName";
+        case DiagnosticCode::S_OffsetofInvalidMember:
+            return "S_OffsetofInvalidMember";
+        case DiagnosticCode::S_BuiltinChooseExprNonConstant:
+            return "S_BuiltinChooseExprNonConstant";
+        case DiagnosticCode::S_StatementExprHasNoValue:
+            return "S_StatementExprHasNoValue";
+        case DiagnosticCode::S_StatementExprAtFileScope:
+            return "S_StatementExprAtFileScope";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

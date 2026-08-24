@@ -182,6 +182,23 @@ struct CstFieldResolution { std::uint64_t offset = 0; TypeId fieldType{}; };
 using CstFieldOffsetResolver =
     std::function<std::optional<CstFieldResolution>(TypeId, NodeId)>;
 
+// P31: compile-time-answer resolver — given a node of one of the config's
+// `foldedConstantRules` (`__builtin_offsetof`, `__builtin_types_compatible_p`),
+// return its value, or nullopt when the fold fails. Owns the type resolver and
+// the layout engine, which this const-eval engine must not depend on — the
+// SAME separation `resolveSizeof` / `resolveAlignof` / `resolveFieldOffset` use.
+// Absent ⇒ those rules stay non-foldable and every const-expr use fails loud.
+using CstFoldedConstantResolver =
+    std::function<std::optional<std::uint64_t>(NodeId)>;
+
+// P31: compile-time-SELECTION resolver — given a node of the config's
+// `chooseExprRule` (`__builtin_choose_expr`), return the NodeId of the arm its
+// constant condition selects, or nullopt (non-constant condition / malformed).
+// The engine then evaluates THAT node, so the discarded arm is never even
+// visited — which is what makes `__builtin_choose_expr(1, 4, 1/0)` fold rather
+// than trip the divide-by-zero wall, exactly as gcc does.
+using CstChosenExprResolver = std::function<std::optional<NodeId>(NodeId)>;
+
 struct CstEvalEnvironment {
     CstSymbolInitResolver  resolveSymbolInit{};
     CstSymbolValueResolver resolveSymbolValue{};  // Item 1 — direct inline constant value
@@ -189,6 +206,8 @@ struct CstEvalEnvironment {
     CstAlignofResolver     resolveAlignof{};  // 6.5.3.4 — _Alignof in a const-expr context
     CstCastTargetResolver  resolveCastTarget{};   // c43 — (T*)0 / (char*)x / (size_t)int
     CstFieldOffsetResolver resolveFieldOffset{};  // c43 — &((T*)0)->M offsets
+    CstFoldedConstantResolver resolveFoldedConstant{};  // P31 — offsetof / types_compatible_p
+    CstChosenExprResolver     resolveChosenExpr{};      // P31 — __builtin_choose_expr
 };
 
 // Static recognition context. All fields are non-owning references

@@ -50,7 +50,7 @@ trail and **must not be built**.
   `module` ⇒ becomes required. A hardcoded `if (profile=="module")` or `if (verb==SourceMerge)`
   passes every other test and **fails this one**.
 - Also pin: `cli`/`lib` without `targets[]` ⇒ still a load error (proves CONDITIONAL, not deleted).
-- **Migration:** `examples/c-subset/project_dependson_module_source_merge/scalemod/.dss-project.json`
+- **Migration:** `examples/c/project_dependson_module_source_merge/scalemod/.dss-project.json`
   DROPS its `targets[]` **and its explanatory comment**. ⚠ ✔It still has `targets[]` today
   (1 occurrence) — if the comment survives, the fix did not land.
 - **Separate row to open** (disclosed, not created): the six case-(B) profiles

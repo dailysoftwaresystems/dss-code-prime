@@ -33,10 +33,13 @@ using dss::report;
 // still places. (A production version folds ALL overflow placement — scalars
 // here + carriers — into this single pre-regalloc site; see the design.)
 
-// The outgoing-arg slot quantum. Every current ABI (SysV/Win64/AAPCS64/
-// Apple) uses a pointer-width (= GPR width = 8) stack slot per stack-passed
-// arg; lir_callconv derives it from widthForClass(GPR). The prototype only
-// needs it for the by-value-agg carrier span; scalar args are one slot each.
+// The outgoing-arg slot QUANTUM — the unit the overflow area is reserved and
+// aligned in. Every current ABI (SysV/Win64/AAPCS64/Apple) uses a pointer-width
+// (= GPR width = 8) quantum; lir_callconv derives it from widthForClass(GPR).
+// ⚠ It is no longer the same thing as "the space one stacked argument takes":
+// D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED made that a per-CC,
+// per-axis rule that `StackArgCursor` owns. This value is what the cursor rounds
+// TO, not what it advances BY.
 constexpr std::uint32_t kOutgoingSlotBytes = 8u;
 
 // Rewrite ONE function into builder `b`. Splits each Call's scalar overflow
@@ -112,7 +115,16 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
 
             std::vector<LirOperand> keepOps;
             keepOps.reserve(ops.size());
-            struct OutStore { LirReg value; std::uint32_t slot; };
+            // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the carrier
+            // now states a BYTE OFFSET (was a slot INDEX) plus the store's access
+            // WIDTH. Under every `Slot`-packing CC the offset is `idx*slot` and
+            // the width is 0 (= 64-bit), so the emitted carriers — and the frame
+            // stores callconv materializes from them — are byte-identical.
+            struct OutStore {
+                LirReg        value;
+                std::uint32_t byteOffset;
+                std::uint8_t  widthFlags;
+            };
             std::vector<OutStore> stores;
 
             // Preserve ops[0] (callee: SymbolRef direct / Reg indirect) and,
@@ -122,7 +134,14 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 keepOps.push_back(ops[k]);
 
             ArgCursors argCursors{schema, cc};
-            std::uint32_t overflowIdx = 0;   // monotonic outgoing-slot cursor
+            // ★ THE SAME OBJECT the three other stacked-arg walks use, so the
+            // placement rule is stated ONCE (D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED).
+            StackArgCursor stackCursor{cc, kOutgoingSlotBytes};
+            // The cursor lir_callconv will independently run over the SHRUNKEN call
+            // — carriers only, because the scalars are removed here. Kept beside the
+            // real one so "the two passes agree" is CHECKED rather than assumed; see
+            // the refusal below.
+            StackArgCursor carrierOnlyCursor{cc, kOutgoingSlotBytes};
             std::uint32_t argRegionIdx = 0;  // 0-based arg position
             for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
                 LirOperand const& argOp = ops[k];
@@ -140,8 +159,51 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                     // Advance the shared cursors exactly as callconv does.
                     keepOps.push_back(argOp);
                     std::uint32_t const aggBytes = ops[k + 1].byValueAggBytes;
-                    overflowIdx +=
-                        (aggBytes + kOutgoingSlotBytes - 1u) / kOutgoingSlotBytes;
+                    // ⚠⚠ D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES
+                    // — A LIVE SILENT MISCOMPILE, PRE-EXISTING, AND THIS IS THE
+                    // MISSING HALF OF A REFUSAL THAT ALREADY EXISTS ON THE OTHER
+                    // SIDE. This pass removes scalar overflow args from the Call and
+                    // places them from ITS cursor; the CARRIERS stay on the Call and
+                    // lir_callconv places them from a cursor of its own, which
+                    // necessarily restarts at 0 because the scalars are no longer
+                    // there to advance it. So the moment a stacked SCALAR precedes a
+                    // stacked AGGREGATE in one call, the two passes hand out the SAME
+                    // bytes twice.
+                    // ✔MEASURED 2026-08-24 at cycle P31 on
+                    // `arm64:elf64-aarch64-linux-exec`, calling a function POINTER of
+                    // type `void(*)(int×8, int, struct{int,int,int})` (a direct call
+                    // cannot reach it — HIR→MIR already refuses the CALLEE of this
+                    // shape with D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS,
+                    // which is exactly the refusal this one mirrors):
+                    //     stur x20, [sp]        <- the scalar `9` at outgoing +0
+                    //     ldur x0,  [x19]
+                    //     stur x0,  [sp]        <- the aggregate's first eightbyte,
+                    //                              SAME BYTES, scalar destroyed
+                    //     stur x0,  [sp, #8]
+                    // No diagnostic, both shipped pipelines. Refuse rather than emit
+                    // it: the real repair is ONE pass owning ALL overflow placement
+                    // (scalars AND carriers), which is a design change with its own
+                    // row, not something to smuggle in behind a stacked-arg cycle.
+                    if (stackCursor.bytes() != carrierOnlyCursor.bytes()) {
+                        report(reporter,
+                               DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                               DiagnosticSeverity::Error,
+                               std::format(
+                                   "lowerWideCallArgs: call inst {} passes a "
+                                   "by-value aggregate on the stack AFTER a scalar "
+                                   "argument that also overflowed onto the stack. "
+                                   "The scalar's placement is decided here and the "
+                                   "aggregate's in lir_callconv, from cursors that "
+                                   "cannot see each other ({} vs {} bytes consumed) "
+                                   "— the two would be written to overlapping "
+                                   "outgoing-argument bytes. Refusing rather than "
+                                   "emitting the overlap",
+                                   inst.v, stackCursor.bytes(),
+                                   carrierOnlyCursor.bytes()));
+                        return false;
+                    }
+                    (void)carrierOnlyCursor.placeNamedAggregate(aggBytes);
+                    (void)stackCursor.placeNamedAggregate(aggBytes);
                     std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
                     if (ex == kByValueStackArgExhaustGpr)
                         argCursors.exhaust(LirRegClass::GPR);
@@ -173,8 +235,43 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 if (argIndex < poolSize && !forceStack) {
                     keepOps.push_back(argOp);      // register-resident
                 } else {
-                    stores.push_back({argOp.reg, overflowIdx});  // overflow
-                    ++overflowIdx;
+                    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: a
+                    // VARARG and a NAMED scalar are DIFFERENT axes — ✔MEASURED,
+                    // Apple packs named scalars naturally and keeps 8-byte slots
+                    // for varargs — so the region decides which rule applies. The
+                    // vararg predicate is the SAME `argRegionIdx >= fixedOps` the
+                    // placement + pre-scan use, so all three agree on the boundary.
+                    bool const isVariadicRegion =
+                        ::dss::call_payload::isVariadic(payload)
+                        && argRegionIdx >= fixedOps;
+                    std::uint32_t const nat = argOp.argNaturalBytes;
+                    // ⚠ FAIL LOUD ON A DROPPED CARRIER. Under NATURAL packing an
+                    // unstated natural size would silently revert THIS argument to
+                    // slot padding while the callee reads it packed — a boundary
+                    // miscompile with no diagnostic. Refuse instead.
+                    if (nat == 0
+                        && (isVariadicRegion
+                                ? cc.stackArgPacking.variadic
+                                : cc.stackArgPacking.namedScalars)
+                               == StackArgPacking::Natural) {
+                        report(reporter,
+                               DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                               DiagnosticSeverity::Error,
+                               std::format(
+                                   "lowerWideCallArgs: call inst {} arg {} "
+                                   "overflows onto the stack under a calling "
+                                   "convention that packs stacked arguments "
+                                   "naturally, but its operand states no natural "
+                                   "byte size — the MIR->LIR arg-size carrier was "
+                                   "dropped, and padding it to a whole slot here "
+                                   "would place it where the callee does not read "
+                                   "it", inst.v, argRegionIdx));
+                        return false;
+                    }
+                    auto const p = isVariadicRegion
+                                       ? stackCursor.placeVariadic(nat)
+                                       : stackCursor.placeNamedScalar(nat);
+                    stores.push_back({argOp.reg, p.byteOffset, p.widthFlags});
                 }
                 ++argRegionIdx;
             }
@@ -184,7 +281,8 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
             // no later pass reorders it off its call.
             for (auto const& s : stores) {
                 std::array<LirOperand, 1> so{LirOperand::makeReg(s.value)};
-                b.addInst(storeOutgoingOp, InvalidLirReg, so, s.slot, /*flags=*/0);
+                b.addInst(storeOutgoingOp, InvalidLirReg, so, s.byteOffset,
+                          s.widthFlags);
             }
             // D-LIR-PER-INST-REG-CONSTRAINTS: 1 → N `store_outgoing_arg`
             // carriers + 1 shrunken Call. The side data belongs to the CALL —

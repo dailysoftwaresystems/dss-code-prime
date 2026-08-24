@@ -111,3 +111,31 @@ dss_add_test(NAME analysis/semantic/test_inline_asm_operand_kind_binding
 # `VERSION` file shadows `<version>` on case-insensitive filesystems).
 target_include_directories(dss_analysis_semantic_test_inline_asm_operand_kind_binding
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P31 (2026-08-24): the four GNU COMPILE-TIME operand forms -- alignof on a VALUE
+# ([[D-CSUBSET-ALIGNOF-VALUE-OPERAND]]), __builtin_offsetof ([[D-FFI-OFFSETOF-MACRO]]),
+# __builtin_types_compatible_p and __builtin_choose_expr. Lives here rather than in
+# the runnable corpus because it pins what a corpus example structurally CANNOT: the
+# REFUSALS and the exact diagnostic CODE each one carries, plus the Pass-1.5
+# const-expr tier (a different consumer from the Pass-2 + HIR path an ordinary
+# expression takes). Shares `semantic_test_fixture.hpp`, so it needs the tests/
+# include root for the same reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_builtin_compile_time_operators
+             SOURCES test_builtin_compile_time_operators.cpp)
+target_include_directories(dss_analysis_semantic_test_builtin_compile_time_operators
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P31 (2026-08-24): the GNU `__extension__` prefix ([[D-C-GNU-EXTENSION-KEYWORD]])
+# and the GNU statement expression ([[D-C-GNU-STATEMENT-EXPRESSION]]). Lives here
+# rather than only in the runnable corpus because it pins what a corpus example
+# structurally CANNOT: the REFUSED positions -- which are the ONLY thing that
+# distinguishes `__extension__`-as-a-prefix from `__extension__`-as-a-specifier,
+# since every ACCEPTING shape passes under both readings -- plus the two
+# statement-expression refusals and their exact diagnostic codes, plus the
+# per-DATA-MODEL fold of a constant written through the prefix. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root for the same
+# reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_gnu_extension_and_statement_expr
+             SOURCES test_gnu_extension_and_statement_expr.cpp)
+target_include_directories(dss_analysis_semantic_test_gnu_extension_and_statement_expr
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

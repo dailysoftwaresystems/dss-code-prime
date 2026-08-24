@@ -173,6 +173,9 @@ struct Lowered {
                 static_cast<std::uint32_t>(cc->argGprs.size());
             mirCfg.argFprCount               =
                 static_cast<std::uint32_t>(cc->argFprs.size());
+            // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: threaded as
+            // part of adding the field (see the fixture note in tests/lir).
+            mirCfg.stackArgPacking           = cc->stackArgPacking;
             mirCfg.aggregateStackExhaustsRegisters =
                 cc->aggregateStackExhaustsRegisters;
             // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the CC's va_list layout so
@@ -577,6 +580,7 @@ namespace {
             mirCfg.argSlotAligned            = cc->slotAligned;
             mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
             mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.stackArgPacking = cc->stackArgPacking;
             mirCfg.aggregateStackExhaustsRegisters = cc->aggregateStackExhaustsRegisters;
             mirCfg.vaListLayout = cc->vaListLayout;
         }
@@ -655,6 +659,7 @@ namespace {
             mirCfg.argSlotAligned            = cc->slotAligned;
             mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
             mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.stackArgPacking = cc->stackArgPacking;
             mirCfg.aggregateStackExhaustsRegisters = cc->aggregateStackExhaustsRegisters;
             mirCfg.vaListLayout = cc->vaListLayout;
         }
@@ -13192,6 +13197,7 @@ constexpr char const* kSetjmpRoundTripSrc =
             mirCfg.argSlotAligned            = cc->slotAligned;
             mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
             mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.stackArgPacking = cc->stackArgPacking;
             mirCfg.aggregateStackExhaustsRegisters = cc->aggregateStackExhaustsRegisters;
             mirCfg.vaListLayout = cc->vaListLayout;
         }

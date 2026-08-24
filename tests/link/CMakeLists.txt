@@ -381,3 +381,18 @@ dss_add_test(NAME link/test_weak_definition_dialect
              SOURCES test_weak_definition_dialect.cpp)
 target_link_libraries(dss_link_test_weak_definition_dialect
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LK-MACHO-COMPACT-UNWIND-SECTION-REFUSED-BLOCKS-EVERY-STOCK-MACOS-ARCHIVE:
+# `__LD,__compact_unwind` -- the section Apple's clang emits BY DEFAULT, which
+# had no `SectionKind` and so made DSS refuse EVERY stock macOS relocatable
+# object. Reads two checked-in STOCK Apple-clang objects (arm64 + x86_64, built
+# by `/usr/bin/clang -c` with NO flags on real Apple Silicon), and mutates the
+# SHIPPED format document in memory (nlohmann consumer) rather than standing up
+# a hand-written format-like fixture that could rot against the real file.
+# MUST run through ctest, never a bare .exe: the config-level mutants read the
+# shipped document off disk, and the resolver walks the cwd unless
+# `DSS_CONFIG_ROOT` is set -- only `dss_add_test` sets it.
+dss_add_test(NAME link/test_macho_compact_unwind_section
+             SOURCES test_macho_compact_unwind_section.cpp)
+target_link_libraries(dss_link_test_macho_compact_unwind_section
+                      PRIVATE nlohmann_json::nlohmann_json)

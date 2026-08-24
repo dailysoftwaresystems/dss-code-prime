@@ -42,6 +42,55 @@ namespace {
 //                field is "/N" (N decimal) takes its real name from the
 //                "//" table starting at byte N, terminated by "/\n".
 //
+// -- The BSD variant (D-FF1-AR-BSD-VARIANT) ----------------------
+// The same "!<arch>\n" container, two structures replaced. Both are
+// parsed here; the variant is sniffed from the MEMBER TABLE (the bytes),
+// never from the host -- a Darwin archive read on Windows and a Linux
+// archive read on a Mac must decode identically, so there is deliberately
+// no platform test anywhere in this file.
+//
+//   (1) INLINE MEMBER NAMES. The 16-byte name field literally reads
+//       "#1/N"; the first N bytes of the member DATA are the real name,
+//       NUL-padded to N. ⚠ Those name bytes are PART OF THE PAYLOAD, so
+//       the member's logical content starts at dataOffset + N and its
+//       logical size is size - N. Getting that subtraction wrong yields a
+//       member whose head is N bytes of name text and whose tail is
+//       silently truncated -- a linker then reads a `.o` that begins with
+//       "s.o\0" instead of a magic. ✔MEASURED against both fixtures
+//       below, not reasoned through.
+//       Unlike GNU "/N", this needs no side table: the name travels with
+//       the member, so it is resolved during pass 1.
+//
+//   (2) THE "__.SYMDEF" SYMBOL TABLE, replacing the SysV "/" armap.
+//       Payload, every scalar LITTLE-endian (the SysV armap's big-endian
+//       quirk is NOT shared -- reaching for readU32BE here silently
+//       decodes a byte-swapped count):
+//         [0..3]                 ranlib array size IN BYTES (u32 LE)
+//         [4 .. 4+rbs-1]         struct ranlib { u32 strx; u32 offset; }
+//         [4+rbs .. 4+rbs+3]     string-table size IN BYTES (u32 LE)
+//         [8+rbs .. +sts-1]      NUL-terminated symbol names
+//       `strx` indexes the trailing string table; `offset` is the
+//       defining member's ar_hdr offset -- the SAME meaning as a SysV
+//       armap offset, so pass 3 shares one member-offset resolution.
+//
+// ★ The symbol-table member CARRIES ITS OWN NAME INLINE ("#1/20" whose
+//   data begins "__.SYMDEF SORTED"), so (1) MUST run before (2): a
+//   classifier that tests the raw 16-byte field for "__.SYMDEF" never
+//   fires on a real archive. ✔MEASURED on both fixtures.
+//
+// Sub-shapes ✔MEASURED from two independent REAL producers (never
+// hand-authored bytes -- a hand-built archive tests the reader against
+// the author's own understanding):
+//   * Apple `ar` (Xcode, macOS 26.5.2 arm64): "__.SYMDEF SORTED", inline
+//     names padded to 20 / 12, Mach-O members, symbols carry a leading
+//     '_'. Sorted BY NAME, so ranlib[0] is not member[0].
+//   * `llvm-ar-19 --format=bsd` (Ubuntu): plain "__.SYMDEF", padding to
+//     12 / 4, ELF members. `--format=darwin` is byte-identical to
+//     `--format=bsd` here (md5-compared), so ONE parse arm serves both.
+// The 64-bit forms ("/SYM64/", "__.SYMDEF_64", "__.SYMDEF SORTED_64")
+// need a >4 GiB archive to exercise honestly and so KEEP their loud
+// refusal -- an unexercised parse arm is a speculative build.
+//
 // Fail-loud discipline mirrors the c159 PE / c160 Mach-O readers: a
 // structural break (bad magic, header/data past EOF, non-numeric size,
 // armap count/offset out of range, a "/N" offset past the "//" table,
@@ -107,6 +156,56 @@ parseAsciiDecimalField(std::span<std::uint8_t const> bytes,
         if (c < '0' || c > '9') return false;
     }
     return true;
+}
+
+// Strip trailing NULs from a BSD "#1/N" inline member name.
+// NULs ONLY, never spaces: the BSD format NUL-pads the inline name to N,
+// and a member name is otherwise taken VERBATIM -- "__.SYMDEF SORTED"
+// (16 chars, the name Apple's `ar` writes) proves the interior space is
+// significant, so a space-stripping rstrip is the wrong tool here even
+// though the 16-byte SysV name field needs exactly that.
+[[nodiscard]] std::string stripTrailingNuls(std::span<std::uint8_t const> bytes,
+                                            std::size_t off, std::size_t len) {
+    std::size_t end = len;
+    while (end > 0 && bytes[off + end - 1] == 0u) --end;
+    return std::string{reinterpret_cast<char const*>(&bytes[off]), end};
+}
+
+// What a member's RESOLVED name says the member is. The archive variant
+// is a property of these BYTES and of nothing else -- there is no host,
+// target or format input to this decision.
+enum class MemberKind : std::uint8_t {
+    Object,        // a real linkable member
+    SysVArmap,     // "/"   -- big-endian SysV/GNU symbol index
+    GnuLongNames,  // "//"  -- the GNU long-name string table
+    BsdArmap,      // "__.SYMDEF" / "__.SYMDEF SORTED" -- LE ranlib table
+    Unsupported64, // "/SYM64/" / "__.SYMDEF*_64" -- refused, see below
+    UnknownSymdef, // "__.SYMDEF<something else>" -- refused
+};
+
+[[nodiscard]] MemberKind classifyMemberName(std::string_view name) noexcept {
+    if (name == "/")  return MemberKind::SysVArmap;
+    if (name == "//") return MemberKind::GnuLongNames;
+    if (name == "/SYM64/") return MemberKind::Unsupported64;
+    if (name.rfind("__.SYMDEF", 0) == 0) {
+        if (name == "__.SYMDEF" || name == "__.SYMDEF SORTED") {
+            return MemberKind::BsdArmap;
+        }
+        // The 64-bit ranlib forms widen every scalar to u64. They need a
+        // >4 GiB archive to exercise, so they are NAMED and refused
+        // rather than parsed blind.
+        if (name == "__.SYMDEF_64" || name == "__.SYMDEF SORTED_64") {
+            return MemberKind::Unsupported64;
+        }
+        // ★ Any OTHER "__.SYMDEF*" spelling is a dialect this reader has
+        // never been shown. Refusing it keeps the property that made the
+        // pre-parse state an asset: an unrecognised shape must REFUSE BY
+        // NAME, never fall through to a best-effort parse. Widening the
+        // accept path here would trade a loud refusal for a silent
+        // misparse -- the one trade this reader never makes.
+        return MemberKind::UnknownSymdef;
+    }
+    return MemberKind::Object;
 }
 
 // Tokenize the GNU "//" long-name string table ONCE into an
@@ -202,13 +301,15 @@ resolveMemberName(std::string trimmed,
     return trimmed;
 }
 
-// A member header located during the pass-1 walk (name resolved later,
-// once the "//" table is known).
+// A member header located during the pass-1 walk. A GNU name is resolved
+// later (pass 2, once the "//" table is known); a BSD "#1/N" inline name
+// is ALREADY final here, because it travelled with the member.
 struct RawMember {
-    std::string   nameTrimmed;
-    std::uint64_t headerOffset;
-    std::uint64_t dataOffset;
-    std::uint64_t size;
+    std::string   name;          // 16-byte field, OR the final BSD inline name
+    bool          nameIsFinal;   // true => skip the pass-2 GNU "/N" expansion
+    std::uint64_t headerOffset;  // the ar_hdr offset (what an armap references)
+    std::uint64_t dataOffset;    // LOGICAL payload start (past a BSD inline name)
+    std::uint64_t size;          // LOGICAL payload size (inline name excluded)
 };
 
 } // namespace
@@ -236,7 +337,8 @@ readArArchive(std::span<std::uint8_t const> bytes,
     // -- Pass 1: walk member headers --
     std::vector<RawMember> raw;
     std::optional<std::span<std::uint8_t const>> longnames;
-    std::optional<std::span<std::uint8_t const>> armap;
+    std::optional<std::span<std::uint8_t const>> armap;     // SysV "/", big-endian
+    std::optional<std::span<std::uint8_t const>> bsdArmap;  // "__.SYMDEF", little-endian
 
     std::uint64_t off = kArMagicSize;
     while (off < bytes.size()) {
@@ -273,31 +375,74 @@ readArArchive(std::span<std::uint8_t const> bytes,
 
         std::string const trimmed = rstripNameField(bytes, off + kArNameOff);
 
-        // BSD / SYM64 variants: detect + fail loud cleanly (never silently
-        // misparse). Anchor D-FF1-AR-BSD-VARIANT.
-        if (trimmed.rfind("__.SYMDEF", 0) == 0) {
-            return std::unexpected(emitAndReturn(
-                BinaryReadErrorKind::CorruptedBinary,
-                "ar reader: BSD-variant archive symbol table ('__.SYMDEF') "
-                "is not yet supported -- GNU/System V archives are "
-                "(anchor D-FF1-AR-BSD-VARIANT)", reporter));
-        }
-        if (trimmed.rfind("#1/", 0) == 0) {
-            return std::unexpected(emitAndReturn(
-                BinaryReadErrorKind::CorruptedBinary,
-                "ar reader: BSD-variant inline-length member name ('#1/N') "
-                "is not yet supported -- GNU/System V archives are "
-                "(anchor D-FF1-AR-BSD-VARIANT)", reporter));
-        }
-        if (trimmed == "/SYM64/") {
-            return std::unexpected(emitAndReturn(
-                BinaryReadErrorKind::CorruptedBinary,
-                "ar reader: 64-bit GNU archive symbol table ('/SYM64/', for "
-                ">4 GiB archives) is not yet supported -- 32-bit '/' armaps "
-                "are (anchor D-FF1-AR-BSD-VARIANT)", reporter));
+        // -- BSD "#1/N" inline names (D-FF1-AR-BSD-VARIANT) ----------
+        // Resolved HERE, before classification, because the BSD symbol
+        // table announces itself through this very mechanism: its 16-byte
+        // field reads "#1/20" and the name "__.SYMDEF SORTED" lives in its
+        // payload. Classify on the raw field and the armap is invisible.
+        std::string resolvedName  = trimmed;
+        bool        nameIsFinal   = false;
+        std::uint64_t logicalData = dataOffset;
+        std::uint64_t logicalSize = memberSize;
+        if (trimmed.size() > 3 && trimmed.rfind("#1/", 0) == 0
+            && allDigits(std::string_view{trimmed}.substr(3))) {
+            std::uint64_t n = 0;
+            for (std::size_t k = 3; k < trimmed.size(); ++k) {
+                std::uint64_t const d =
+                    static_cast<std::uint64_t>(trimmed[k] - '0');
+                if (n > (UINT64_MAX - d) / 10u) {
+                    return std::unexpected(emitAndReturn(
+                        BinaryReadErrorKind::CorruptedBinary,
+                        "ar reader: BSD inline-name length '" + trimmed
+                        + "' overflows", reporter));
+                }
+                n = n * 10u + d;
+            }
+            // The name is carved OUT OF the payload, so it cannot exceed
+            // it. An N past the member end would otherwise underflow the
+            // logical size below into a near-UINT64_MAX span.
+            if (n > memberSize) {
+                return std::unexpected(emitAndReturn(
+                    BinaryReadErrorKind::CorruptedBinary,
+                    "ar reader: BSD inline member name at offset "
+                    + std::to_string(off) + " declares " + std::to_string(n)
+                    + " name bytes, more than the member's "
+                    + std::to_string(memberSize) + "-byte payload", reporter));
+            }
+            resolvedName = stripTrailingNuls(
+                bytes, static_cast<std::size_t>(dataOffset),
+                static_cast<std::size_t>(n));
+            nameIsFinal = true;
+            logicalData = dataOffset + n;   // ⚠ the payload starts AFTER the name
+            logicalSize = memberSize - n;   // ⚠ and is that much shorter
         }
 
-        if (trimmed == "/") {
+        switch (classifyMemberName(resolvedName)) {
+        case MemberKind::Unsupported64:
+            // KEPT LOUD ON PURPOSE. The 64-bit ranlib forms need a >4 GiB
+            // archive to exercise, and this project does not ship a parse
+            // arm it has never run.
+            return std::unexpected(emitAndReturn(
+                BinaryReadErrorKind::CorruptedBinary,
+                "ar reader: 64-bit archive symbol table ('" + resolvedName
+                + "', for >4 GiB archives) is not supported -- the 32-bit "
+                  "System V '/' and BSD '__.SYMDEF' armaps are "
+                  "(anchor D-FF1-AR-BSD-VARIANT)", reporter));
+        case MemberKind::UnknownSymdef:
+            return std::unexpected(emitAndReturn(
+                BinaryReadErrorKind::CorruptedBinary,
+                "ar reader: unrecognised BSD archive symbol-table dialect '"
+                + resolvedName + "' -- only '__.SYMDEF' and "
+                  "'__.SYMDEF SORTED' are supported "
+                  "(anchor D-FF1-AR-BSD-VARIANT)", reporter));
+        case MemberKind::BsdArmap:
+            // First-wins, mirroring the SysV arm. Never a linkable member.
+            if (!bsdArmap) {
+                bsdArmap = bytes.subspan(static_cast<std::size_t>(logicalData),
+                                         static_cast<std::size_t>(logicalSize));
+            }
+            break;
+        case MemberKind::SysVArmap:
             // The FIRST "/" is the System V / COFF-1st-linker-member armap
             // (big-endian), which this reader parses. A Windows COFF `.lib`
             // carries a SECOND "/" member -- Microsoft's little-endian sorted
@@ -306,14 +451,18 @@ readArArchive(std::span<std::uint8_t const> bytes,
             // BE). FIRST-"/"-WINS: keep the big-endian armap, treat the 2nd "/"
             // as an ignored index member (not a linkable object).
             if (!armap) {
-                armap = bytes.subspan(static_cast<std::size_t>(dataOffset),
-                                      static_cast<std::size_t>(memberSize));
+                armap = bytes.subspan(static_cast<std::size_t>(logicalData),
+                                      static_cast<std::size_t>(logicalSize));
             }
-        } else if (trimmed == "//") {
-            longnames = bytes.subspan(static_cast<std::size_t>(dataOffset),
-                                      static_cast<std::size_t>(memberSize));
-        } else {
-            raw.push_back(RawMember{trimmed, off, dataOffset, memberSize});
+            break;
+        case MemberKind::GnuLongNames:
+            longnames = bytes.subspan(static_cast<std::size_t>(logicalData),
+                                      static_cast<std::size_t>(logicalSize));
+            break;
+        case MemberKind::Object:
+            raw.push_back(RawMember{std::move(resolvedName), nameIsFinal,
+                                    off, logicalData, logicalSize});
+            break;
         }
 
         // Advance to the next header, 2-byte aligned (a '\n' pad byte
@@ -339,18 +488,154 @@ readArArchive(std::span<std::uint8_t const> bytes,
     std::unordered_map<std::uint64_t, std::size_t> hdrOffToIndex;
     hdrOffToIndex.reserve(raw.size());
     for (RawMember const& r : raw) {
-        auto nameE = resolveMemberName(r.nameTrimmed, longNameMap, reporter);
-        if (!nameE) return std::unexpected(nameE.error());
+        // A BSD "#1/N" name was carved out of the member's own payload in
+        // pass 1 and is final; only a GNU name needs the "//" table.
+        std::string resolved;
+        if (r.nameIsFinal) {
+            resolved = r.name;
+        } else {
+            auto nameE = resolveMemberName(r.name, longNameMap, reporter);
+            if (!nameE) return std::unexpected(nameE.error());
+            resolved = std::move(*nameE);
+        }
         hdrOffToIndex.emplace(r.headerOffset, out.members.size());
         ArMember m;
-        m.name         = std::move(*nameE);
+        m.name         = std::move(resolved);
         m.headerOffset = r.headerOffset;
         m.dataOffset   = r.dataOffset;
         m.size         = r.size;
         out.members.push_back(std::move(m));
     }
 
-    // -- Pass 3: parse the armap (System V / GNU symbol index) --
+    // -- Pass 3: parse the armap --
+    // Two mutually-exclusive shapes. A real archive carries exactly one:
+    // `ar` on Linux writes "/", `ar` on macOS writes "__.SYMDEF". An
+    // archive carrying BOTH is a shape no producer emits, and picking a
+    // winner would be a guess -- so it fails loud instead.
+    if (armap && bsdArmap) {
+        return std::unexpected(emitAndReturn(
+            BinaryReadErrorKind::CorruptedBinary,
+            "ar reader: archive carries BOTH a System V '/' armap and a BSD "
+            "'__.SYMDEF' armap; no producer emits both and this reader will "
+            "not guess which indexes the members "
+            "(anchor D-FF1-AR-BSD-VARIANT)", reporter));
+    }
+
+    // Shared by both arms: bind one armap entry to its defining member.
+    // An offset matching no member header is a structural inconsistency --
+    // fail loud (the index would mis-route a lazy pull). Checked BEFORE
+    // the empty-name skip so a corrupt offset is never masked by a
+    // degenerate name.
+    std::uint32_t emptyNameSkips = 0;
+    auto bindSymbol =
+        [&](std::string name, std::uint64_t memberOff)
+        -> std::expected<void, BinaryReadError> {
+        auto const it = hdrOffToIndex.find(memberOff);
+        if (it == hdrOffToIndex.end()) {
+            return std::unexpected(emitAndReturn(
+                BinaryReadErrorKind::CorruptedBinary,
+                "ar reader: armap symbol '" + name
+                + "' points at member-header offset "
+                + std::to_string(memberOff)
+                + ", which matches no archive member", reporter));
+        }
+        if (name.empty()) {
+            ++emptyNameSkips;
+            return {};
+        }
+        ArSymbol sym;
+        sym.name         = std::move(name);
+        sym.memberOffset = memberOff;
+        sym.memberIndex  = it->second;
+        out.symbols.push_back(std::move(sym));
+        return {};
+    };
+
+    // -- Pass 3a: the BSD "__.SYMDEF" ranlib table (little-endian) --
+    if (bsdArmap) {
+        std::span<std::uint8_t const> const d = *bsdArmap;
+        if (d.size() < 4u) {
+            return std::unexpected(emitAndReturn(
+                BinaryReadErrorKind::CorruptedBinary,
+                "ar reader: BSD '__.SYMDEF' table is smaller than its 4-byte "
+                "ranlib-size field", reporter));
+        }
+        std::uint32_t const ranlibBytes = readU32(d, 0);
+        // ★ THE ENDIAN / WIDTH GUARD. A ranlib entry is exactly 8 bytes
+        // (u32 strx + u32 offset), so a byte count that is not a multiple
+        // of 8 means these bytes are not what they claim: a big-endian
+        // table read little-endian, or a 64-bit (u64) ranlib. Both would
+        // otherwise decode into plausible-looking garbage. Refusing beats
+        // sniffing -- a guess here is a silent misparse.
+        if ((ranlibBytes % 8u) != 0u) {
+            return std::unexpected(emitAndReturn(
+                BinaryReadErrorKind::CorruptedBinary,
+                "ar reader: BSD '__.SYMDEF' ranlib array is "
+                + std::to_string(ranlibBytes)
+                + " bytes, not a multiple of the 8-byte (strx, offset) entry "
+                  "-- the table is byte-swapped or 64-bit "
+                  "(anchor D-FF1-AR-BSD-VARIANT)", reporter));
+        }
+        if (rangeExceedsBuffer(4u, ranlibBytes, d.size())) {
+            return std::unexpected(emitAndReturn(
+                BinaryReadErrorKind::CorruptedBinary,
+                "ar reader: BSD '__.SYMDEF' ranlib array ("
+                + std::to_string(ranlibBytes)
+                + " bytes) runs past the table end", reporter));
+        }
+        std::uint64_t const strSizeOff = 4u + static_cast<std::uint64_t>(ranlibBytes);
+        if (rangeExceedsBuffer(strSizeOff, 4u, d.size())) {
+            return std::unexpected(emitAndReturn(
+                BinaryReadErrorKind::CorruptedBinary,
+                "ar reader: BSD '__.SYMDEF' table ends before its 4-byte "
+                "string-table size field", reporter));
+        }
+        std::uint32_t const strBytes =
+            readU32(d, static_cast<std::size_t>(strSizeOff));
+        std::uint64_t const strStart = strSizeOff + 4u;
+        if (rangeExceedsBuffer(strStart, strBytes, d.size())) {
+            return std::unexpected(emitAndReturn(
+                BinaryReadErrorKind::CorruptedBinary,
+                "ar reader: BSD '__.SYMDEF' string table ("
+                + std::to_string(strBytes)
+                + " bytes) runs past the table end", reporter));
+        }
+
+        std::uint32_t const count = ranlibBytes / 8u;
+        out.symbols.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::size_t const e = static_cast<std::size_t>(
+                4u + static_cast<std::uint64_t>(i) * 8u);
+            std::uint32_t const strx      = readU32(d, e);
+            std::uint64_t const memberOff = readU32(d, e + 4u);
+            if (strx >= strBytes) {
+                return std::unexpected(emitAndReturn(
+                    BinaryReadErrorKind::CorruptedBinary,
+                    "ar reader: BSD '__.SYMDEF' entry " + std::to_string(i)
+                    + " has string-table index " + std::to_string(strx)
+                    + ", past the " + std::to_string(strBytes)
+                    + "-byte string table", reporter));
+            }
+            std::uint64_t s = strStart + strx;
+            std::uint64_t const strEnd = strStart + strBytes;
+            while (s < strEnd && d[static_cast<std::size_t>(s)] != 0u) ++s;
+            if (s >= strEnd) {
+                return std::unexpected(emitAndReturn(
+                    BinaryReadErrorKind::CorruptedBinary,
+                    "ar reader: BSD '__.SYMDEF' symbol name at string-table "
+                    "index " + std::to_string(strx)
+                    + " is not NUL-terminated within the table", reporter));
+            }
+            std::uint64_t const nameStart = strStart + strx;
+            std::string name{
+                reinterpret_cast<char const*>(&d[static_cast<std::size_t>(nameStart)]),
+                static_cast<std::size_t>(s - nameStart)};
+            auto bound = bindSymbol(std::move(name), memberOff);
+            if (!bound) return std::unexpected(bound.error());
+        }
+    }
+
+    // -- Pass 3b: the System V / GNU "/" armap (big-endian) --
     if (armap) {
         std::span<std::uint8_t const> const d = *armap;
         if (d.size() < 4u) {
@@ -369,7 +654,6 @@ readArArchive(std::span<std::uint8_t const> bytes,
         }
         std::uint64_t pos = 4u + offsetsBytes;   // name-blob start
         out.symbols.reserve(count);
-        std::uint32_t emptyNameSkips = 0;
         for (std::uint32_t i = 0; i < count; ++i) {
             std::uint64_t const memberOff =
                 readU32BE(d, static_cast<std::size_t>(4u + static_cast<std::uint64_t>(i) * 4u));
@@ -394,43 +678,24 @@ readArArchive(std::span<std::uint8_t const> bytes,
                 static_cast<std::size_t>(s - pos)};
             pos = s + 1u;
 
-            // An armap offset that matches no member header is a structural
-            // inconsistency -- fail loud (the index would mis-route a
-            // lazy pull). Checked BEFORE the empty-name skip so a corrupt
-            // offset is never masked by a degenerate name.
-            auto const it = hdrOffToIndex.find(memberOff);
-            if (it == hdrOffToIndex.end()) {
-                return std::unexpected(emitAndReturn(
-                    BinaryReadErrorKind::CorruptedBinary,
-                    "ar reader: armap symbol '" + name
-                    + "' points at member-header offset "
-                    + std::to_string(memberOff)
-                    + ", which matches no archive member", reporter));
-            }
-
-            if (name.empty()) {
-                // Degenerate (not structural): a lone NUL in the blob. Skip
-                // + count, mirroring the c159 PE reader's empty-name skip.
-                ++emptyNameSkips;
-                continue;
-            }
-
-            ArSymbol sym;
-            sym.name         = std::move(name);
-            sym.memberOffset = memberOff;
-            sym.memberIndex  = it->second;
-            out.symbols.push_back(std::move(sym));
+            // Offset-matches-no-member (structural, fail loud) and the
+            // degenerate empty-name skip both live in `bindSymbol`, which
+            // the BSD arm shares -- one policy, two table shapes.
+            auto bound = bindSymbol(std::move(name), memberOff);
+            if (!bound) return std::unexpected(bound.error());
         }
+    }
 
-        if (emptyNameSkips > 0) {
-            dss::report(reporter,
-                DiagnosticCode::F_BinaryReaderPartialCorruption,
-                DiagnosticSeverity::Warning,
-                "ar reader: '" + std::string{archivePathLabel}
-                + "': skipped " + std::to_string(emptyNameSkips)
-                + " armap entries with empty symbol names. Surfaced "
-                + std::to_string(out.symbols.size()) + " valid symbols.");
-        }
+    // Degenerate (not structural): a lone NUL in the name blob / string
+    // table. Skip + count, mirroring the c159 PE reader's empty-name skip.
+    if (emptyNameSkips > 0) {
+        dss::report(reporter,
+            DiagnosticCode::F_BinaryReaderPartialCorruption,
+            DiagnosticSeverity::Warning,
+            "ar reader: '" + std::string{archivePathLabel}
+            + "': skipped " + std::to_string(emptyNameSkips)
+            + " armap entries with empty symbol names. Surfaced "
+            + std::to_string(out.symbols.size()) + " valid symbols.");
     }
 
     return out;

@@ -607,6 +607,67 @@ struct VaListLayout {
     }
 };
 
+// D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: how ONE argument that
+// did not fit the argument registers occupies the overflow (stack) area.
+//
+// ★ THE RULE IS NOT ONE RULE — IT HAS THREE AXES AND THEY MEASURABLY DIFFER.
+// ✔MEASURED 2026-08-24 on Apple clang 21.0.0 / macOS 26.5.2 (`otool -tV` of a
+// `-target arm64-apple-macos` object) against `aarch64-linux-gnu-gcc 13.3.0`
+// (`objdump -d`) for the same sources:
+//   * NAMED SCALARS — Apple packs NATURALLY (`char,short,int,long,char` land at
+//     +0,+2,+4,+8,+16; `float,float,double,float` at +0,+4,+8,+16 — the FPR pool
+//     obeys the same rule), AAPCS64 uses an 8-byte slot each (+0,+8,+16,+24).
+//   * NAMED AGGREGATES — BOTH round to whole 8-byte slots (a 3-byte struct then
+//     an `int` puts the int at +8 on Apple, not +3; a 12-byte struct puts it at
+//     +16, not +12).
+//   * VARIADIC ARGS — BOTH use 8-byte slots (Apple's caller emits `str x` at
+//     +8,+16 for stacked varargs).
+// ⇒ A single boolean ("this CC packs naturally") would encode Apple's own ABI
+// WRONGLY on two of the three axes, which is why this is a three-field object
+// and not a flag. Do NOT add a fourth axis speculatively — three is what was
+// measured.
+//
+// `Slot` is the default on every axis, so a CC that declares nothing keeps the
+// classic one-pointer-width-slot-per-stacked-arg placement byte-for-byte.
+enum class StackArgPacking : std::uint8_t {
+    Slot    = 0,  // one whole pointer-width slot, whatever the datum's size
+    Natural = 1,  // aligned up to the datum's own alignment, advanced by its own size
+};
+
+inline constexpr EnumNameTable<StackArgPacking, 2> kStackArgPackingTable{{{
+    { StackArgPacking::Slot,    "slot"    },
+    { StackArgPacking::Natural, "natural" },
+}}};
+
+// Well-formedness of the table itself (no empty spelling, no duplicate spelling,
+// no duplicate enumerator) — an under-filled table is legal C++ and would make
+// "" resolve to `Slot`, i.e. silently disable a declared divergence.
+DSS_CHECK_ENUM_NAME_TABLE(kStackArgPackingTable);
+
+[[nodiscard]] constexpr std::string_view
+stackArgPackingName(StackArgPacking p) noexcept {
+    // The `-Werror=switch` backstop — it owns no spelling.
+    switch (p) {
+        case StackArgPacking::Slot:
+        case StackArgPacking::Natural:
+            break;
+    }
+    return kStackArgPackingTable.nameOrEmpty(p);
+}
+[[nodiscard]] constexpr std::optional<StackArgPacking>
+stackArgPackingFromName(std::string_view s) noexcept {
+    return kStackArgPackingTable.fromName(s);
+}
+
+// The three measured axes, declared per calling convention. An OMITTED
+// `stackArgPacking` object (and an omitted key inside it) means `Slot`, so every
+// pre-existing CC is byte-unchanged by construction rather than by testing.
+struct StackArgPackingRules {
+    StackArgPacking namedScalars    = StackArgPacking::Slot;
+    StackArgPacking namedAggregates = StackArgPacking::Slot;
+    StackArgPacking variadic        = StackArgPacking::Slot;
+};
+
 // One calling convention. A target may declare multiple (SysV AMD64,
 // Microsoft x64, fastcall, ...); the front-end picks one via attribute /
 // driver flag. The `argGprs` / `argFprs` ordering is significant — the
@@ -807,6 +868,13 @@ struct DSS_EXPORT TargetCallingConvention {
     // (Phase A) + callee (Phase B) cursor handling — kept in lockstep so the two
     // sides agree AND va_start's `__gr_offs`/`__vr_offs` clamp reflects it.
     bool aggregateStackExhaustsRegisters = false;
+
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the three measured
+    // stacked-argument packing axes (see `StackArgPackingRules` above). Omitted
+    // in JSON ⇒ all three `Slot` ⇒ every pre-existing CC keeps its exact
+    // placement AND its 8-byte access width. `apple_arm64` declares
+    // `namedScalars: "natural"`.
+    StackArgPackingRules stackArgPacking{};
 
     // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the
     // classification STRATEGY for a struct/union passed/returned by value.

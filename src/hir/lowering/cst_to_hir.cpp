@@ -459,6 +459,21 @@ struct Lowerer {
     // lowering of each switch.
     std::uint32_t                                    switchBodyDepth_{};
 
+    // P31 (D-C-GNU-STATEMENT-EXPRESSION): the depth of FUNCTION BODIES currently
+    // being lowered. Raised and lowered at the same three sites that save/restore
+    // the per-function label namespace above — those three ARE the function-body
+    // lowering sites, and keeping the two facts adjacent is what stops a fourth
+    // one from acquiring a label scope and not a body depth.
+    // Read by `lowerStatementExpr`: a GNU statement expression needs an enclosing
+    // function (both references say so — see S_StatementExprAtFileScope), and a
+    // global initializer is lowered through the SAME `lowerExpr` a body is, so the
+    // expression tier cannot tell the two apart without this.
+    // ⚠ NOT `currentReturnType_.valid()`: a `void` function's return type is a
+    // VALID void TypeId, and an unresolved signature leaves it Invalid INSIDE a
+    // body — so that field answers a different question and would answer this one
+    // wrongly in both directions.
+    std::uint32_t                                    functionBodyDepth_{};
+
     // The result of lowering an expression: the HIR node + its resolved type.
     struct E { HirNodeId id; TypeId type; };
 
@@ -3175,7 +3190,32 @@ struct Lowerer {
             // `_Generic` surface leaves this invalid and skips it.
             if (cfg.genericRule.valid()
              && tree().rule(c).v == cfg.genericRule.v) {
-                return lowerGeneric(c);
+                return lowerRecordedSelection(c, "_Generic");
+            }
+            // P31: `__builtin_choose_expr` takes the SAME recorded-selection
+            // lowering, because the two constructs differ ONLY in how the
+            // semantic tier picked the winner. A second, near-identical body
+            // here would have been the slow way to grow two owners of "which
+            // sub-expression survives".
+            if (cfg.chooseExprRule.valid()
+             && tree().rule(c).v == cfg.chooseExprRule.v) {
+                return lowerRecordedSelection(c, "__builtin_choose_expr");
+            }
+            // P31 (D-C-GNU-STATEMENT-EXPRESSION): `({ … })` — its children are
+            // STATEMENTS, so it routes to a dedicated lowering for the same
+            // reason sizeof's and `_Generic`'s type children do: the generic
+            // operand descent would try to lower a declaration as a value.
+            if (cfg.stmtExprRule.valid()
+             && tree().rule(c).v == cfg.stmtExprRule.v) {
+                return lowerStatementExpr(c);
+            }
+            // P31: the compile-time-answer operators. Their ENTIRE meaning is a
+            // number the semantic tier computed, so there is no subtree to lower
+            // at all — the operands are type-names and member designators, which
+            // must NEVER be lowered as expressions (the sizeof/`_Generic`
+            // precedent, for the same reason).
+            if (isFoldedConstantRule(tree().rule(c))) {
+                return lowerFoldedConstant(c);
             }
         }
         for (NodeId c : visible(node)) {
@@ -6967,18 +7007,64 @@ struct Lowerer {
         return {so, u64};
     }
 
-    // C11/C23 6.5.3.4: `_Alignof ( type-name )` | `alignof ( type-name )` → core
-    // `HirKind::AlignOf`, result type size_t (U64). An ADDITIVE mirror of
-    // `lowerSizeof` reading ALIGNMENT instead of size. TYPE-NAME FORM ONLY (no
-    // value form): the operand is ALWAYS the castTypeRef, whose semantic-stamped
-    // type this recovers via the SAME `resolveStampedTypeBelow` descent sizeof
-    // uses (past any wrapper), then emits the leaf. The operand is UNEVALUATED —
-    // only its type reaches the node; the AlignOf folds to that type's alignment
-    // via the `type_layout` engine at MIR lowering.
+    // C11/C23 6.5.3.4: `_Alignof ( type-name )` | `_Alignof unary-expression` →
+    // core `HirKind::AlignOf`, result type size_t (U64). An ADDITIVE mirror of
+    // `lowerSizeof` reading ALIGNMENT instead of size — including WHICH READ each
+    // form gets, which is the half that is easy to get wrong. The operand is
+    // UNEVALUATED (C 6.5.3.4p1) — only its type reaches the node; the AlignOf
+    // folds to that type's alignment via the `type_layout` engine at MIR lowering.
+    //
+    // ★ [[D-CSUBSET-ALIGNOF-VALUE-OPERAND]] (2026-08-24): the node handed here is
+    // the `alignofExpr` WRAPPER (the config's `alignofRule`), so the form has to
+    // be identified before its operand can be read — and the two forms need
+    // DIFFERENT reads:
+    //   * TYPE form → `resolveStampedTypeBelow` DESCENDS, because the stamp
+    //     legitimately lives on a leaf token under the (unstamped) type-ref.
+    //   * VALUE form → the DIRECT stamp on the operand node, and NEVER a descent.
+    //     This is [[D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK]] inherited, not
+    //     re-derived: a descent past an unstamped operator node lands on a CHILD's
+    //     stamp, so `__alignof__(*p)` would read `p`'s POINTER alignment and
+    //     `__alignof__(a[0])` the ARRAY's — a plausible wrong number, never a
+    //     refusal. An untyped value operand is a semantic-tier failure and FAILS
+    //     LOUD here rather than being guessed at one level down.
+    //
+    // ⚠★ THIS READ IS DEFENCE-IN-DEPTH, NOT THE GUARD, AND SAYING SO IS THE
+    // POINT — an earlier draft of this comment claimed it WAS the guard and a
+    // mutant refuted that. ✔MEASURED 2026-08-24 (P31 red-on-disable M2): swapping
+    // the direct read back to `resolveStampedTypeBelow` and rebuilding
+    // (`libdss-code-prime.dll` md5 57bae630… → 6fddde1f…, so the mutant really was
+    // compiled in) left the WHOLE scoped suite GREEN, `examples/c/gnu_alignof_value_operand`
+    // included. The reason is that Pass 2's `alignofValueRule` arm STAMPS the
+    // operand node, so the descent finds that stamp immediately and never gets
+    // the chance to go looking at a child. ✔MEASURED in the same pass (M2b) that
+    // deleting THAT STAMP reddens the example — with this refusal, `H0009`, not
+    // with a wrong number. So: the STAMP is the guard, this read is what turns
+    // its absence into a build failure instead of a guess, and the two together
+    // are what make a missing type impossible to mistake for a small one.
     [[nodiscard]] E lowerAlignof(NodeId node) {
-        TypeId sized = InvalidType;
+        NodeId form{};
         for (NodeId c : visible(node)) {
-            if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
+            if (tree().kind(c) == NodeKind::Internal) { form = c; break; }
+        }
+        NodeId const scan = form.valid() ? form : node;
+        TypeId sized = InvalidType;
+        bool const valueForm =
+            form.valid() && sem.alignofValueRule.valid()
+            && tree().rule(form).v == sem.alignofValueRule.v;
+        if (valueForm) {
+            for (NodeId c : visible(form)) {
+                if (TypeId t = model.typeAt(c); t.valid()) { sized = t; break; }
+            }
+            if (!sized.valid()) {
+                return exprError(node,
+                    "_Alignof value-operand was not typed by the semantic analyzer "
+                    "(refusing to descend into a sub-expression and silently "
+                    "report the wrong operand's alignment)");
+            }
+        } else {
+            for (NodeId c : visible(scan)) {
+                if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
+            }
         }
         if (!sized.valid()) {
             return exprError(node, "_Alignof operand did not resolve to a type");
@@ -7094,18 +7180,25 @@ struct Lowerer {
     // analyzer already errored — fail loud here (never a silent mis-lower). The
     // NON-selected associations' expressions are discarded WITHOUT being lowered,
     // so a non-selected branch imposes no lowering-tier constraint (6.5.1.1p3).
-    [[nodiscard]] E lowerGeneric(NodeId node) {
+    // ★ P31: RENAMED FROM `lowerGeneric` AND SHARED, rather than copied. The body
+    // never knew anything about `_Generic` — it reads a NodeId the semantic tier
+    // recorded and lowers that sub-expression — so `__builtin_choose_expr`, whose
+    // only difference is that the winner was picked by an integer constant instead
+    // of a type match, routes here unchanged. `what` names the construct so the
+    // refusal message stays specific; that string is the ONLY thing that differs
+    // between the two callers, which is the measure of how much of this is shared.
+    [[nodiscard]] E lowerRecordedSelection(NodeId node, char const* what) {
         NodeId const selected = model.selectedGenericExpr(node);
         if (!selected.valid()) {
-            // The analyzer left this `_Generic` unselected (a constraint violation
-            // it already reported — S_GenericSelectionNoMatch / Ambiguous — or a
-            // cascade from an un-typeable controlling expression). Emit a loud HIR
-            // error so the failure is never silent even if the semantic diagnostic
-            // were suppressed; both selection-failure codes are unsuppressable.
-            return exprError(node,
-                "_Generic did not select an association (no matching type and no "
-                "default, an ambiguous match, or an un-typeable controlling "
-                "expression)");
+            // The analyzer recorded no winner — a constraint violation it already
+            // reported (S_GenericSelectionNoMatch / Ambiguous /
+            // S_BuiltinChooseExprNonConstant) or a cascade from an un-typeable
+            // operand. Emit a loud HIR error so the failure is never silent even
+            // if the semantic diagnostic were suppressed.
+            return exprError(node, std::format(
+                "{} did not select a sub-expression (no matching type and no "
+                "default, an ambiguous match, a non-constant condition, or an "
+                "un-typeable operand)", what));
         }
         // Lower ONLY the selected association's assignment-expression; its result
         // (id + type) IS the generic selection's result. `track` re-anchors the
@@ -7113,6 +7206,48 @@ struct Lowerer {
         E const chosen = lowerExpr(selected);
         if (!chosen.type.valid()) return chosen;   // diagnostic already emitted
         return {track(chosen.id, node), chosen.type};
+    }
+
+    // P31: does this rule lower to the semantic tier's recorded compile-time
+    // value? A linear scan of a list that holds 2 entries in the shipped C
+    // document and none in any other language.
+    [[nodiscard]] bool isFoldedConstantRule(RuleId rule) const {
+        for (RuleId r : cfg.foldedConstantRules) {
+            if (r.valid() && r.v == rule.v) return true;
+        }
+        return false;
+    }
+
+    // ── P31: `__builtin_offsetof(T, m)` / `__builtin_types_compatible_p(A, B)` ──
+    // The whole node IS a number, computed once by the semantic tier (which owns
+    // the type resolver and the target's layout engine) and read back here. The
+    // children are NEVER lowered: a type-name and a member designator are not
+    // expressions, and lowering them would resolve a member name in the wrong
+    // namespace — the `sizeof` / `va_arg` / `_Generic` precedent exactly.
+    //
+    // ⚠ A MISSING RECORDED VALUE IS A HARD REFUSAL, NOT A ZERO. `offsetof` feeds
+    // pointer arithmetic, so a fabricated 0 is a wrong ADDRESS: a program that
+    // builds, runs, and reads the wrong field. The semantic tier already reported
+    // WHY (S_OffsetofInvalidMember / S_UnknownType); this refusal exists so the
+    // build still fails even if that diagnostic were suppressed.
+    [[nodiscard]] E lowerFoldedConstant(NodeId node) {
+        TypeId const type = typeAtOr(node, InvalidType);
+        if (!type.valid()) {
+            return exprError(node,
+                "a compile-time builtin was not typed by the semantic analyzer");
+        }
+        auto const v = model.foldedConstantAt(node);
+        if (!v.has_value()) {
+            return exprError(node,
+                "a compile-time builtin did not fold to a value (refusing to "
+                "substitute a zero, which for an offset would be a wrong address "
+                "rather than a failed build)");
+        }
+        HirLiteralValue lit;
+        lit.core  = interner.kind(type);
+        lit.value = *v;
+        return {track(builder.makeLiteral(type, literals.add(std::move(lit))), node),
+                type};
     }
 
     // FC2: explicit cast `(T)expr` (`hirLowering.castRule`). The grammar
@@ -8204,6 +8339,22 @@ struct Lowerer {
     // is the bare lowered expression (wrapped in ExprStmt when `wrapBare`).
     HirNodeId lowerStmtExprCore(NodeId core, bool wrapBare) {
         if (tree().kind(core) == NodeKind::Internal) {
+            // P31 (D-C-GNU-STATEMENT-EXPRESSION): a statement expression whose
+            // VALUE IS DISCARDED **is** a block, and lowering it as one is what
+            // makes `({ int a = 1; });` and `({ });` legal here — ✔MEASURED
+            // accepted by gcc 13.3.0 AND clang 19.1.7, while the same construct
+            // used as a VALUE is refused by both (S_StatementExprHasNoValue).
+            // Routing the discard position through `Block` rather than through a
+            // SeqExpr that needs a result is what removes the need to INVENT a
+            // void-typed yield expression — the honest answer is that there is
+            // no value here and no node has to pretend otherwise.
+            // Covers BOTH callers: an `exprStmt` (wrapBare = true) and a bare
+            // for-init/for-update clause (wrapBare = false) — MIR's for-clause
+            // router already sends a `Block` clause through `lowerStmt`, so the
+            // same node is correct in both, and no `ExprStmt` wrap is wanted in
+            // either (a Block IS a statement).
+            if (NodeId const se = stmtExprChildOf(core); se.valid())
+                return lowerStatementExprAsBlock(se);
             std::uint32_t const rv = tree().rule(core).v;
             if (rv == cfg.binaryExprRule.v) {
                 for (NodeId c : visible(core)) {
@@ -8289,6 +8440,118 @@ struct Lowerer {
     HirNodeId lowerBlock(NodeId node) {
         std::vector<HirNodeId> stmts;
         for (NodeId c : blockChildNodes(node)) stmts.push_back(lowerStmt(c));
+        return track(builder.makeBlock(stmts), node);
+    }
+
+    // ── P31 (D-C-GNU-STATEMENT-EXPRESSION): the GNU `({ … })` construct ────────
+    //
+    // The DIRECT `stmtExpr` child of an operand node, or an invalid NodeId when
+    // there is none. A direct-child scan and not a peel, exactly as
+    // `lowerOperandTerminal` scans for `sizeof`/`_Generic`/the cast rule: the
+    // construct is a BRANCH of the operand alt, never a wrapper layer, and
+    // `peelToCore` stops at the operand node anyway (`isExprNode` covers it).
+    [[nodiscard]] NodeId stmtExprChildOf(NodeId operandNode) const {
+        if (!cfg.stmtExprRule.valid()) return {};
+        if (tree().kind(operandNode) != NodeKind::Internal) return {};
+        if (tree().rule(operandNode).v != cfg.operandRule.v) return {};
+        for (NodeId c : visible(operandNode)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (tree().rule(c).v == cfg.stmtExprRule.v) return c;
+        }
+        return {};
+    }
+
+    // The statement items of a `({ … })` body, plus — when the LAST item is an
+    // expression statement — the expression that item wraps, which is the
+    // construct's VALUE (GNU C 6.1: "the last thing in the compound statement
+    // should be an expression followed by a semicolon"). `valueNode` is left
+    // invalid when the last item is anything else (a declaration, a loop, an
+    // empty statement, or nothing at all) — that is the `void` statement
+    // expression, and the two callers differ ONLY in what they do about it.
+    //
+    // ★ The last item's expression is recovered and handed to `lowerExpr` rather
+    // than lowered through `lowerStmt`: `({ a = 1; })` and `({ a++; })` yield the
+    // assigned / pre-increment VALUE in gcc and clang (✔MEASURED, both), whereas
+    // statement position turns those two into an `AssignStmt` that yields
+    // nothing. Value position is the whole point of the construct, so the value
+    // path is the one the last item takes.
+    // ★ The recognition is by HIR KIND ("ExprStmt"), not by a grammar rule name —
+    // the `lowerStmt` driver's own idiom (`k == "Block"`, `k == "IfStmt"`), so no
+    // second config key has to name which rule an expression statement is.
+    void stmtExprItems(NodeId node, std::vector<NodeId>& items, NodeId& valueNode) {
+        for (NodeId c : visible(node)) {
+            if (isToken(c)) continue;          // ( { } )
+            items.push_back(c);
+        }
+        valueNode = NodeId{};
+        if (items.empty()) return;
+        NodeId const lastCore = peelToCore(items.back());
+        HirRuleMapping const* m = mappingFor(lastCore);
+        if (m == nullptr || m->hirKind != "ExprStmt") return;
+        for (NodeId c : visible(lastCore)) {
+            if (isToken(c)) continue;
+            valueNode = c;
+            return;
+        }
+    }
+
+    // `({ stmt… expr; })` in VALUE position → `HirKind::SeqExpr` ([stmts…,
+    // result]) — the node whose own header comment names GCC statement
+    // expressions as what it models, and which MIR already lowers by running
+    // each statement child through `lowerStmt` and yielding the last child's
+    // value. No new HIR kind, and no MIR/LIR change: `collectLocalDecls` already
+    // walks the whole body subtree, so a declaration nested inside an expression
+    // already gets its entry-block `Alloca`.
+    [[nodiscard]] E lowerStatementExpr(NodeId node) {
+        // C's block scope has no meaning without a frame, and both references
+        // refuse the construct at file scope (see S_StatementExprAtFileScope).
+        // Refuse BEFORE lowering anything: a global initializer that folded to
+        // the last literal would silently DISCARD every statement before it.
+        if (functionBodyDepth_ == 0) {
+            emitH(DiagnosticCode::S_StatementExprAtFileScope, node,
+                  "a statement expression '({ ... })' is only valid inside a "
+                  "function (GNU C 6.1) — at file scope there is no frame to "
+                  "run its statements in");
+            return E{errorNode(node), InvalidType};
+        }
+        std::vector<NodeId> items;
+        NodeId valueNode{};
+        stmtExprItems(node, items, valueNode);
+        if (!valueNode.valid()) {
+            emitH(DiagnosticCode::S_StatementExprHasNoValue, node,
+                  "this statement expression has no value: its last statement "
+                  "is not an expression statement, so its type is 'void' "
+                  "(GNU C 6.1) — it may be written as a statement, but not "
+                  "where a value is required");
+            return E{errorNode(node), InvalidType};
+        }
+        std::vector<HirNodeId> stmts;
+        stmts.reserve(items.size() - 1);
+        for (std::size_t i = 0; i + 1 < items.size(); ++i)
+            stmts.push_back(lowerStmt(items[i]));
+        E const yield = lowerExpr(valueNode);
+        return E{track(builder.makeSeqExpr(stmts, yield.id, yield.type), node),
+                 yield.type};
+    }
+
+    // `({ … })` in a DISCARD position → a plain `Block`. See the call site in
+    // `lowerStmtExprCore` for why the discard position is a block and not a
+    // value-less SeqExpr. The LAST item lowers as an ordinary statement here
+    // (its value, if it has one, is discarded exactly as `f();` discards one),
+    // so this arm needs no `valueNode` at all and the `void` case is not a case.
+    [[nodiscard]] HirNodeId lowerStatementExprAsBlock(NodeId node) {
+        if (functionBodyDepth_ == 0) {
+            emitH(DiagnosticCode::S_StatementExprAtFileScope, node,
+                  "a statement expression '({ ... })' is only valid inside a "
+                  "function (GNU C 6.1) — at file scope there is no frame to "
+                  "run its statements in");
+            return errorNode(node);
+        }
+        std::vector<HirNodeId> stmts;
+        for (NodeId c : visible(node)) {
+            if (isToken(c)) continue;
+            stmts.push_back(lowerStmt(c));
+        }
         return track(builder.makeBlock(stmts), node);
     }
 
@@ -9684,10 +9947,12 @@ struct Lowerer {
         labelOrdinals_.clear();
         caseLabelOrdinals_.clear();
         nextLabelOrdinal_ = 0;
+        ++functionBodyDepth_;              // P31: see the field's comment
         if (bodyNode.valid()) prescanLabels(bodyNode);
         HirNodeId body = bodyNode.valid()
             ? lowerStmt(bodyNode)
             : track(builder.makeBlock({}), node);
+        --functionBodyDepth_;              // P31: see the field's comment
         labelOrdinals_ = std::move(savedLabels);
         caseLabelOrdinals_ = std::move(savedCaseLabels);
         nextLabelOrdinal_ = savedNextOrd;
@@ -10015,10 +10280,12 @@ struct Lowerer {
         labelOrdinals_.clear();
         caseLabelOrdinals_.clear();
         nextLabelOrdinal_ = 0;
+        ++functionBodyDepth_;              // P31: see the field's comment
         if (bodyNode.valid()) prescanLabels(bodyNode);
         HirNodeId body = bodyNode.valid()
                        ? lowerStmt(bodyNode)
                        : track(builder.makeBlock({}), node);
+        --functionBodyDepth_;              // P31: see the field's comment
         labelOrdinals_ = std::move(savedLabels);
         caseLabelOrdinals_ = std::move(savedCaseLabels);
         nextLabelOrdinal_ = savedNextOrd;
@@ -10400,8 +10667,10 @@ struct Lowerer {
         labelOrdinals_.clear();
         caseLabelOrdinals_.clear();
         nextLabelOrdinal_ = 0;
+        ++functionBodyDepth_;              // P31: see the field's comment
         if (bodyNode.valid()) prescanLabels(bodyNode);
         HirNodeId body = bodyNode.valid() ? lowerStmt(bodyNode) : track(builder.makeBlock({}), node);
+        --functionBodyDepth_;              // P31: see the field's comment
         labelOrdinals_ = std::move(savedLabels);
         caseLabelOrdinals_ = std::move(savedCaseLabels);
         nextLabelOrdinal_ = savedNextOrd;

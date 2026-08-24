@@ -12,6 +12,25 @@
 //     example but catches CLI-level regressions the in-process
 //     path misses.
 //
+// ★★★ THE COVERAGE BOUNDARY, AND ITS COMPLEMENT — the half that was missing.
+// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+//
+//   BOTH runners compile the target this host can execute, and both run it.
+//   Only the IN-PROCESS runner compiles a target whose `runOn` excludes this
+//   host. NEITHER spawns a binary the host cannot execute.
+//
+// The FIRST sentence of that rule — this runner's own half — has been stated
+// here and in `integrated_tests/CMakeLists.txt` since 2026-06-02. The SECOND
+// was stated for corpus authors in `examples/README.md` and NOWHERE ELSE, and
+// nothing checked it: a change that stopped the sibling compiling cross-host
+// targets would leave every cross-target capability without a witness, with
+// both corpus suites still green. ⚠ The shared arm-verdict vocabulary cannot
+// carry the distinction either — `SkippedByRunOn` means *compiled, not spawned*
+// in the sibling and *never compiled* here. The `integrated_tests/coverage-
+// boundary` entry (`runCoverageBoundaryJudge` below) now RUNS both harnesses on
+// one corpus example and judges the two coverage reports; the vocabulary and
+// the five clauses live in `tests/test_support/coverage_boundary.hpp`.
+//
 // **Always against current host platform** (user invariant
 // 2026-06-02): each example's manifest declares a per-target
 // `runOn` list naming the host OSes that may spawn the produced
@@ -75,6 +94,11 @@
 // implemented identically in the in-process sibling.
 
 #include "arm_verdict_ledger.hpp"
+// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+// The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
+// parsed by the boundary guard. Its header states the boundary as a sentence;
+// this runner's own statement of its half is in the block above `runExampleViaCli`.
+#include "coverage_boundary.hpp"
 #include "host_native_target.hpp"  // hostNativeTarget / hostExeArtifact — the
                                    // source-argument-shape pin BUILDS AND SPAWNS
                                    // its own output, so it must build for this
@@ -130,6 +154,12 @@ namespace {
 using ::dss::test_support::ArmVerdict;
 using ::dss::test_support::ArmVerdictLedger;
 using ::dss::test_support::armVerdictName;
+using ::dss::test_support::CoverageReport;
+using ::dss::test_support::findCoverageReport;
+using ::dss::test_support::judgeCoverageBoundary;
+using ::dss::test_support::kCoverageRunnerCli;
+using ::dss::test_support::kCoverageRunnerInProcess;
+using ::dss::test_support::renderCoverageLine;
 using ::dss::test_support::currentHostArch;
 using ::dss::test_support::currentHostOs;
 using ::dss::test_support::DeclaredArm;
@@ -186,6 +216,12 @@ enum class OnlyKind {
     // exactly one check — two entries for one scope, so a reader triaging "a
     // corpus-wide thing is red" had to know which to open.
     Adjudicate,
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ★ SELECTS its own subject from the corpus, then DEGRADES ITSELF INTO
+    // `OneExample` so the CLI half of the measurement goes through the very code
+    // path a per-example entry uses — a boundary guard that measured a private
+    // code path would be measuring something no ctest entry runs.
+    CoverageBoundary,
 };
 
 struct Selector {
@@ -224,6 +260,31 @@ std::vector<DeclaredArm> declaredArms;
 // Either state makes the lint vacuous; they have different causes and
 // different fixes, so collapsing them would cost the reader the fix.
 std::size_t manifestsWalked = 0;
+
+// ── D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY ──
+//
+// The SIBLING runner's executable, supplied by the ctest registration of the
+// coverage-boundary entry. EMPTY on every other invocation: no other entry
+// spawns the in-process harness, and a default path that quietly went looking
+// for one would be a second way to fail.
+fs::path g_siblingRunner;
+
+// This runner's OWN coverage observation for the example it just walked. Global
+// for exactly the reason `passes` / `failures` / `armLedger` are: one process,
+// one corpus walk, one summary. ★ `std::optional` and not a default-constructed
+// report, because "the walk executed no example" and "the walk executed an
+// example that compiled nothing" are different facts and the boundary guard
+// must be able to refuse the first rather than judge it as the second.
+std::optional<CoverageReport> g_cliCoverage;
+
+// Print a coverage line AND publish it. ONE function, so no exit path can do
+// half of it — a printed-but-unpublished report would leave the guard reading a
+// stale observation, and a published-but-unprinted one would vanish from the
+// log a human triages with.
+void emitCoverage(CoverageReport const& r) {
+    std::cout << renderCoverageLine(r) << "\n";
+    g_cliCoverage = r;
+}
 
 void check(std::string const& description, bool condition,
            std::string const& detail = "") {
@@ -1410,6 +1471,12 @@ struct CliArmOutcome {
     // arm's image with the baseline's, and that comparison is host-independent.
     fs::path    artifactPath;
     bool        compiled = false;
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // The ATTEMPT to exec, not its outcome. `verdict == Ran` cannot stand in for
+    // it: a spawn that FAILED is `Poisoned`, and the coverage-boundary clause
+    // that forbids exec'ing a foreign-host artifact must catch the attempt
+    // whether or not this machine let it succeed.
+    bool        spawnAttempted = false;
     // Every PREREQUISITE image this arm produced, keyed by
     // `dependencyImageKey`. PATHS rather than bytes — unlike the in-process
     // sibling, whose arms build inside an RAII scratch dir that is gone before
@@ -1835,12 +1902,19 @@ std::size_t dependencyImagesDiffered  = 0;
     // exit carries it, because the arm-vs-baseline artifact comparison is
     // host-independent and must survive a run this MACHINE cannot perform: a box
     // with no emulator still proves the two pipelines produced different code.
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // Set at the exec site below and read by EVERY outcome built after it, so
+    // no exit path can report a spawn attempt as not having happened — the
+    // failing paths (`spawn failed`, `spawn timed out`) are precisely the ones a
+    // clause about foreign-host execs must still see.
+    bool spawnAttempted = false;
     auto const compiledOutcome = [&](ArmVerdict v, std::string why) {
         CliArmOutcome o;
         o.verdict      = v;
         o.detail       = std::move(why);
         o.artifactPath = artifactPath;
         o.compiled     = true;
+        o.spawnAttempted = spawnAttempted;
         // Carried on the SAME reasoning as `artifactPath` directly above: the
         // prerequisite images are a fact about the COMPILE, so a box that
         // cannot spawn the binary can still answer whether the arm's pipeline
@@ -1931,6 +2005,7 @@ std::size_t dependencyImagesDiffered  = 0;
         // ⚠ It is `runBinary`'s own DEFAULT for this parameter, and it is passed
         // explicitly anyway: `captureStdout` and `launcherPrefix` follow it
         // positionally, so the default cannot be reached by omission here.
+        spawnAttempted = true;  // the ATTEMPT, recorded BEFORE the outcome
         result = dss::test_support::runBinary(
             absArtifact, dss::test_support::kRunBudget, captureStdout,
             launcherPrefix);
@@ -2008,7 +2083,8 @@ void runSelectedTargetViaCli(std::string const& compiler,
                       ExampleManifest const& m,
                       ExampleTarget const*   target,
                       std::string const&     exampleName,
-                      std::string const&     exampleId) {
+                      std::string const&     exampleId,
+                      CoverageReport&        coverage) {
     // Target spec format is `<cpu>:<format>`; the `:` is illegal in Windows path
     // components. Substitute `_` to derive a filesystem-safe sub-directory name.
     // The substitution is local to disk layout and never leaks back into the
@@ -2043,6 +2119,15 @@ void runSelectedTargetViaCli(std::string const& compiler,
     // every pre-existing skip line greps exactly as it did.
     armLedger.record(exampleId, target->spec, "cli", baseline.verdict,
                      baseline.detail);
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ★ THE FACT THE ARM VERDICT CANNOT CARRY. `SkippedByRunOn` means *compiled,
+    // not spawned* in the in-process sibling and *never compiled* here, so the
+    // shared ledger cannot tell a witnessed spec from an unwitnessed one. These
+    // two lines are the missing observation, taken from the BUILD's own outcome
+    // rather than re-derived from the verdict.
+    if (baseline.compiled) coverage.compiled.push_back(target->spec);
+    if (baseline.spawnAttempted) coverage.spawned.push_back(target->spec);
+    if (baseline.verdict == ArmVerdict::Ran) coverage.ran.push_back(target->spec);
     if (baseline.verdict == ArmVerdict::Ran) {
         bool const exitMatches =
             static_cast<std::int64_t>(baseline.exitCode) == expectedExit;
@@ -2399,16 +2484,29 @@ void runExampleViaCli(std::string const& compiler,
         }
     }
 
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ★★★ THIS RUNNER'S HALF OF THE COVERAGE BOUNDARY, EMITTED RATHER THAN
+    // IMPLIED. `declared` is filled BEFORE either exit path below, so the
+    // no-bound-target case reports its (empty) coverage against the full
+    // declared set instead of vanishing from the accounting — the same reason
+    // the arm ledger records an arm this runner never reaches.
+    CoverageReport coverage;
+    coverage.runner    = std::string{kCoverageRunnerCli};
+    coverage.exampleId = exampleId;
+    for (auto const& t : m.targets) coverage.declared.push_back(t.spec);
+
     if (target == nullptr) {
         std::cout << "  [SKIP] " << exampleName
                   << " — no target's runOn includes host=" << host
                   << " (cross-host compile-only is exercised by"
                   << " tests/examples/ in-process runner)\n";
+        emitCoverage(coverage);
         return;
     }
 
     runSelectedTargetViaCli(compiler, exampleDir, outputBase, m, target,
-                            exampleName, exampleId);
+                            exampleName, exampleId, coverage);
+    emitCoverage(coverage);
 }
 
 // V2-4 Part C: drive an EXPECT-ERROR example through the CLI SUBPROCESS.
@@ -2429,6 +2527,22 @@ void runErrorExampleViaCli(std::string const& compiler,
         return;
     }
     auto const& spec = m.targets.front().spec;
+
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ⚠ AN EXPECT-ERROR EXAMPLE REPORTS AN EMPTY `compiled` SET, AND THAT IS THE
+    // TRUTH, NOT A HOLE: its whole assertion is that the compile FAILS, so no
+    // runner can produce an artifact for it and the union-completeness clause
+    // would red for a reason that is not a defect. The boundary guard therefore
+    // selects its subject from the manifests that expect a build; the line is
+    // emitted here anyway so a reader diffing the two runners' coverage over the
+    // corpus never meets an example that simply said nothing.
+    {
+        CoverageReport coverage;
+        coverage.runner    = std::string{kCoverageRunnerCli};
+        coverage.exampleId = exampleId;
+        for (auto const& t : m.targets) coverage.declared.push_back(t.spec);
+        emitCoverage(coverage);
+    }
 
     // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: an expect-error arm is VERIFIED
     // without being spawned — the assertion is the rejected compile plus the
@@ -4046,6 +4160,303 @@ void runRunnerVocabularyPin() {
     std::cout << "\n";
 }
 
+// ═══ THE COVERAGE BOUNDARY GUARD ════════════════════════════════════════════
+//
+// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+//
+// ★★★ WHAT THIS ENTRY IS FOR, IN ONE SENTENCE: it RUNS both corpus harnesses
+// over the same example and compares what each of them actually built, so the
+// division of labour between them is a CHECKED FACT rather than a habit.
+//
+// ✔THE MEASUREMENT THAT MADE IT NECESSARY (windows/x86_64, this tree): over the
+// corpus the in-process runner compiles EVERY declared target of every manifest
+// — all four of a typical example's specs, arm64 included — while this runner
+// binds ONE and compiles only that one. Both harnesses record the difference as
+// the SAME `ArmVerdict::SkippedByRunOn` token, which in the sibling means
+// *compiled, not spawned* and here means *never compiled*. So the one instrument
+// that spans both harnesses could not distinguish a spec that has a witness from
+// a spec that has none, and a red-on-disable mutant confined to a cross-host
+// spec is caught by exactly one of the two suites with nothing saying which.
+//
+// ⚠ THE ASYMMETRY IS NOT THE DEFECT AND THIS GUARD DOES NOT TRY TO REMOVE IT.
+// This runner's contract is stated in its own header block and in
+// `integrated_tests/CMakeLists.txt` — *always against the current host platform*,
+// a user invariant of 2026-06-02 — and a CLI-subprocess harness that pretended
+// to spawn a foreign-arch binary would be worse than one that declines. What was
+// missing is the COMPLEMENT of that contract: nothing said who covers the rest,
+// and nothing checked that anybody does.
+//
+// ⇒ the five clauses in `judgeCoverageBoundary` (tests/test_support/
+// coverage_boundary.hpp) forbid a LOSS of coverage, never a gain. Teaching this
+// runner to compile every declared spec would leave every clause green.
+[[nodiscard]] bool selectCoverageBoundarySubject(fs::path const& examplesRoot,
+                                                 fs::path&    subjectDir,
+                                                 std::string& subjectId,
+                                                 ExampleManifest& subject) {
+    // The subject is DERIVED FROM THE CORPUS, never named in CMake or here. An
+    // example renamed or retired moves the selection automatically, which is the
+    // one property a hand-picked id cannot have — and the property that stops
+    // this entry from silently becoming a pin on a file that no longer exists.
+    std::vector<fs::path> manifests;
+    std::error_code       ec;
+    for (fs::recursive_directory_iterator it(examplesRoot, ec), end;
+         it != end && !ec; it.increment(ec)) {
+        if (it->path().filename() == "expected.json") manifests.push_back(it->path());
+    }
+    if (ec) {
+        check("walk the corpus for a coverage-boundary subject", false,
+              "scan of " + examplesRoot.generic_string() + " failed: "
+                  + ec.message());
+        return false;
+    }
+    std::sort(manifests.begin(), manifests.end());  // deterministic subject
+
+    auto const host = currentHostOs();
+    std::size_t consideredParsed = 0;
+    for (auto const& mp : manifests) {
+        ExampleManifest m;
+        // A manifest this walk cannot parse is ALREADY a [FAIL] on its own
+        // per-example entry. Skipping it here rather than reporting it twice
+        // keeps a corpus-wide parse break from arriving as a boundary finding,
+        // which would send the reader to the wrong instrument.
+        std::ostringstream sink;
+        auto* const        saved = std::cerr.rdbuf(sink.rdbuf());
+        bool const         ok    = readManifest(mp, m);
+        std::cerr.rdbuf(saved);
+        if (!ok) continue;
+        ++consideredParsed;
+        // ── the four properties a usable subject must have, each with its
+        //    reason, because every one of them silently weakens the judgement:
+        // (1) it must expect a BUILD. An `expectDiagnostics` example asserts a
+        //     FAILED compile, so no runner can produce an artifact for it and
+        //     union-completeness would red for a reason that is not a defect.
+        if (!m.expectDiagnostics.empty()) continue;
+        // (2) NOT project mode and NO `dependsOn`: both multiply the builds this
+        //     entry performs without touching the property under test, and this
+        //     entry pays for its subject twice (once per harness).
+        if (m.project.has_value()) continue;
+        bool hasDeps = false;
+        for (auto const& t : m.targets) hasDeps = hasDeps || !t.dependsOn.empty();
+        if (hasDeps) continue;
+        // (3) at least one target this runner BINDS here — otherwise the two
+        //     harnesses share no executed spec and clause C5 is judging nothing.
+        // (4) at least one target `runOn` EXCLUDES from this host, AND OF A
+        //     FOREIGN ARCH. The cross-OS half alone would qualify a subject
+        //     whose every spec targets this machine's own processor — and the
+        //     defect that opened this row was a CODEGEN mutant confined to the
+        //     other arch, caught by one runner and not the other. A subject
+        //     without a foreign-arch spec would leave that exact class outside
+        //     what this entry measures while still reporting a boundary.
+        bool bindable = false, excludedForeignArch = false;
+        for (auto const& t : m.targets) {
+            bool const admits =
+                std::find(t.runOn.begin(), t.runOn.end(), host) != t.runOn.end();
+            bindable = bindable || admits;
+            if (!admits && specTargetArch(t.spec) != currentHostArch()) {
+                excludedForeignArch = true;
+            }
+        }
+        if (!bindable || !excludedForeignArch) continue;
+
+        subjectDir = mp.parent_path();
+        subjectId  = subjectDir.parent_path().filename().generic_string() + "/"
+                   + subjectDir.filename().generic_string();
+        subject    = std::move(m);
+        return true;
+    }
+
+    // ★★★ NO SUBJECT IS A RED, NOT A SKIP, AND THAT IS THE WHOLE POINT OF
+    // SAYING SO HERE. A guard whose subject vanished asserts nothing, and a
+    // guard that asserts nothing while exiting 0 is worse than no guard: it
+    // reads as coverage. The two ways to arrive here have DIFFERENT fixes, so
+    // the message names both rather than guessing.
+    check("the corpus offers an example with BOTH a host-bindable target and a"
+          " runOn-excluded FOREIGN-ARCH one (the coverage boundary's two halves)",
+          false,
+          "walked " + std::to_string(manifests.size()) + " manifest(s), parsed "
+              + std::to_string(consideredParsed) + ", and none qualified on host="
+              + currentHostOs() + "/" + currentHostArch()
+              + ". Either the corpus stopped declaring cross-host foreign-arch"
+                " targets — in which case this boundary no longer exists and"
+                " this entry must be retired deliberately — or the selection's"
+                " own predicates stopped matching the manifest vocabulary."
+                " Refusing to report a pass over an empty subject.");
+    return false;
+}
+
+void runCoverageBoundaryJudge(fs::path const& subjectDir,
+                              std::string const& subjectId,
+                              ExampleManifest const& subject,
+                              fs::path const& outputBase) {
+    std::cout << "[Coverage boundary] the two corpus runners' division of"
+                 " labour, MEASURED on " << subjectId << "\n";
+
+    // ── THE INSTRUMENT'S OWN PRECONDITIONS, ASSERTED BEFORE ANY CLAUSE ──────
+    // Each of these, unchecked, converts the judgement below into a comparison
+    // between an observation and a default-constructed struct.
+    if (g_siblingRunner.empty()) {
+        check("--sibling-runner=<path> was supplied", false,
+              "the coverage boundary is a claim about TWO harnesses; with only"
+              " one of them reachable this entry could compare nothing and must"
+              " not exit 0");
+        return;
+    }
+    if (!fileExists(g_siblingRunner).ok) {
+        check("the sibling runner exists at "
+                  + g_siblingRunner.generic_string(), false,
+              "the in-process corpus harness (dss_examples_runner) is not there."
+              " Build it before running this entry — an unreachable sibling"
+              " produces an empty coverage report, and an empty report compares"
+              " EQUAL to another empty one");
+        return;
+    }
+    if (!g_cliCoverage.has_value()) {
+        check("this runner produced a coverage report for " + subjectId, false,
+              "the corpus walk executed no example, so there is nothing of this"
+              " harness's to compare. An instrument that observed nothing must"
+              " never be read as one that observed a small coverage");
+        return;
+    }
+    CoverageReport const& cli = *g_cliCoverage;
+    check("this runner's coverage report names the selected example"
+          " (got '" + cli.exampleId + "')",
+          cli.exampleId == subjectId,
+          "the walk executed a different example than the one selected — the"
+          " comparison below would pit two different manifests against each"
+          " other");
+    if (cli.exampleId != subjectId) return;
+    check("this runner's coverage report is authored by '"
+              + std::string{kCoverageRunnerCli} + "' (got '" + cli.runner + "')",
+          cli.runner == kCoverageRunnerCli,
+          "a report whose author is not this harness cannot be this harness's"
+          " half of the boundary");
+
+    // ── RUN THE SIBLING, on the SAME example directory its own ctest entry
+    //    hands it, so what this entry measures is what that entry measures ────
+    //
+    // ⚠ `--gtest_filter` NAMES THE ONE TEST, not a negated suite. A filter that
+    // matches nothing makes gtest print `[  PASSED  ] 0 tests.` and exit 0 — the
+    // silence this repository has already paid for once (see
+    // `dss_refuse_a_vacuous_gtest_selection`). Naming the test positively means
+    // a rename produces NO coverage line, and no coverage line is a hard refusal
+    // below rather than a small one.
+    auto const siblingLog = outputBase / "coverage-boundary-sibling.log";
+    std::string const cmd = quote(g_siblingRunner.string()) + " "
+        + quote(subjectDir.string())
+        + " --gtest_filter=Examples.RunFromManifest > "
+        + quote(siblingLog.string()) + " 2>&1";
+    // The sibling resolves its scratch + config relative to the repo root, which
+    // is what its own ctest registration gives it (`WORKING_DIRECTORY
+    // ${CMAKE_SOURCE_DIR}`). Restored by the guard, because this runner resolves
+    // relative paths of its own afterwards.
+    int siblingRc = -1;
+    bool cwdOk = false;
+    {
+        fs::path repo;
+        try {
+            repo = ::dss::test::repoRoot();
+        } catch (std::exception const& e) {
+            check("resolve the repo root to run the sibling from", false,
+                  std::string{e.what()});
+            return;
+        }
+        CwdGuard cwd{repo};
+        cwdOk = cwd.ok;
+        if (cwd.ok) siblingRc = std::system(shellWrap(cmd).c_str());
+    }
+    if (!cwdOk) {
+        check("chdir to the repo root to run the sibling", false,
+              "the sibling resolves its scratch tree and shipped config against"
+              " the repo root; running it elsewhere measures a different thing");
+        return;
+    }
+
+    std::string body;
+    {
+        std::ifstream in(siblingLog.string(), std::ios::binary);
+        body.assign(std::istreambuf_iterator<char>(in),
+                    std::istreambuf_iterator<char>());
+    }
+    // ⚠ THE SIBLING'S EXIT CODE IS REPORTED, NOT ASSERTED, and that is a
+    // deliberate trade. Its correctness is its own ctest entry's business; what
+    // this entry needs is its COVERAGE, and a change that makes it spawn a
+    // foreign-arch binary reds it — so asserting rc==0 here would swallow clause
+    // C4 behind a generic "the sibling failed" and lose the finding.
+    std::cout << "  sibling rc=" << siblingRc << " ("
+              << body.size() << " bytes of output at "
+              << siblingLog.generic_string() << ")\n";
+
+    CoverageReport inproc;
+    std::string    why;
+    if (!findCoverageReport(body, subjectId, inproc, why)) {
+        check("the sibling emitted exactly one parseable coverage line for "
+                  + subjectId, false,
+              why + ". Sibling rc=" + std::to_string(siblingRc)
+                  + "; its output is kept at " + siblingLog.generic_string());
+        return;
+    }
+    check("the sibling emitted exactly one parseable coverage line for "
+              + subjectId, true);
+    check("the sibling's coverage report is authored by '"
+              + std::string{kCoverageRunnerInProcess} + "' (got '"
+              + inproc.runner + "')",
+          inproc.runner == kCoverageRunnerInProcess,
+          "this entry compares TWO harnesses; two reports from the same author"
+          " would compare a run with itself");
+    if (inproc.runner != kCoverageRunnerInProcess) return;
+
+    // The manifest fact clause C4 needs, computed from the manifest's own
+    // `runOn` lists and never inferred from either runner's behaviour — a guard
+    // that derived its expectation from the thing it is guarding would agree
+    // with any change at all.
+    auto const host = currentHostOs();
+    std::vector<std::string> hostExcluded;
+    for (auto const& t : subject.targets) {
+        if (std::find(t.runOn.begin(), t.runOn.end(), host) == t.runOn.end()) {
+            hostExcluded.push_back(t.spec);
+        }
+    }
+
+    std::cout << "  in-process: " << renderCoverageLine(inproc) << "\n"
+              << "  cli:        " << renderCoverageLine(cli) << "\n";
+
+    // ⚠ THE DETAIL IS IN THE DESCRIPTION, NOT IN `check`'s detail slot. Each
+    // clause's message is the whole finding, and `check` prints
+    // `<description> — <detail>` on a failure: passing it twice printed the
+    // finding twice, which is how a reader learns to skim the thing they most
+    // need to read. A PASS keeps the same text, so a green clause still SAYS
+    // what it saw.
+    for (auto const& v : judgeCoverageBoundary(inproc, cli, hostExcluded)) {
+        check("[boundary] " + v.clause + " — " + v.detail, v.ok);
+    }
+
+    // ── THE BOUNDARY'S OWN SIZE, STATED RATHER THAN LEFT TO BE INFERRED ─────
+    //
+    // ★ A ZERO HERE IS NOT A FAILURE — it would mean this runner had grown to
+    // compile every declared spec, which is an improvement — but it IS a state
+    // in which the clause that names the in-process runner as the sole witness
+    // has nothing to witness. `D-TEST-STRICT-ARM-VERDICTS-INERT-ON-WINDOWS` is
+    // the row that made this rule: a leg whose input cannot reach a guard must
+    // SAY SO, or the first green run is quoted as evidence of something it never
+    // measured.
+    std::size_t inprocOnly = 0;
+    for (auto const& s : inproc.compiled) {
+        if (std::find(cli.compiled.begin(), cli.compiled.end(), s)
+            == cli.compiled.end()) {
+            ++inprocOnly;
+        }
+    }
+    std::cout << "  BOUNDARY WIDTH on host=" << host << "/" << currentHostArch()
+              << ": " << inprocOnly << " of " << inproc.declared.size()
+              << " declared spec(s) are compiled by the IN-PROCESS runner ALONE"
+              << (inprocOnly == 0
+                      ? " — the boundary is EMPTY on this host, so the"
+                        " sole-witness clause above asserted nothing about it"
+                      : " — a capability's behaviour on those specs has exactly"
+                        " ONE witness in this suite")
+              << "\n\n";
+}
+
 // ── D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the ledger summary ───────────
 //
 // Printed beside the pass/fail counts so `N passed` can never again be read as
@@ -4448,8 +4859,14 @@ int main(int argc, char* argv[]) {
                   << "  --only=<lang>/<name> execute exactly one example\n"
                   << "  --only=adjudicate    parse every manifest, execute"
                      " none; the corpus-wide lints AND floors\n"
+                  << "  --only=coverage-boundary  run ONE corpus example through"
+                     " BOTH harnesses and judge the division of labour between"
+                     " them (needs --sibling-runner)\n"
                   << "  --cells=<dir>        where a per-example entry writes"
                      " its cell, and where the adjudicator reads them\n"
+                  << "  --sibling-runner=<exe>  the in-process corpus harness"
+                     " (dss_examples_runner), spawned by the coverage-boundary"
+                     " entry and by nothing else\n"
                   << "  (omitted)            everything, exactly as before\n";
         return 1;
     }
@@ -4467,10 +4884,16 @@ int main(int argc, char* argv[]) {
             g_cellDir = fs::path{a.substr(kCells.size())};
             continue;
         }
+        constexpr std::string_view kSibling = "--sibling-runner=";
+        if (a.rfind(kSibling, 0) == 0) {
+            g_siblingRunner = fs::path{a.substr(kSibling.size())};
+            continue;
+        }
         constexpr std::string_view kOnly = "--only=";
         if (a.rfind(kOnly, 0) != 0) {
             std::cerr << "[ERROR] unknown argument '" << a
-                      << "' (expected --only=<cli|corpus-lints|<lang>/<name>>)\n";
+                      << "' (expected --only=<cli|adjudicate|coverage-boundary"
+                         "|<lang>/<name>>, --cells= or --sibling-runner=)\n";
             return 1;
         }
         std::string const sel = a.substr(kOnly.size());
@@ -4478,13 +4901,15 @@ int main(int argc, char* argv[]) {
             g_only.kind = OnlyKind::CliSurface;
         } else if (sel == "adjudicate") {
             g_only.kind = OnlyKind::Adjudicate;
+        } else if (sel == "coverage-boundary") {
+            g_only.kind = OnlyKind::CoverageBoundary;
         } else if (sel.find('/') != std::string::npos) {
             g_only.kind      = OnlyKind::OneExample;
             g_only.exampleId = sel;
         } else {
             std::cerr << "[ERROR] --only='" << sel << "' is not a selector."
-                      << " Expected `cli`, `adjudicate`, or an example id of"
-                         " the form `<lang>/<name>`.\n";
+                      << " Expected `cli`, `adjudicate`, `coverage-boundary`,"
+                         " or an example id of the form `<lang>/<name>`.\n";
             return 1;
         }
     }
@@ -4541,6 +4966,34 @@ int main(int argc, char* argv[]) {
               << "Output:        " << outputBase.string()
               << "  (per-run, unique to THIS process)\n"
               << "Host OS:       " << currentHostOs() << "\n\n";
+
+    // ── the coverage-boundary entry picks its subject, then becomes an
+    //    ordinary per-example run ──────────────────────────────────────────
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ★ THE DEGRADE IS THE DESIGN, not a shortcut. Rewriting the selector into
+    // `OneExample` means this entry's CLI-side measurement goes through the
+    // SAME `runAllExamples` -> `runExampleViaCli` path every per-example entry
+    // uses. A boundary guard that drove a private path would be comparing the
+    // sibling against code no ctest entry executes, and could report a boundary
+    // the suite does not actually have.
+    bool const wantCoverageBoundary = g_only.kind == OnlyKind::CoverageBoundary;
+    fs::path        boundarySubjectDir;
+    std::string     boundarySubjectId;
+    ExampleManifest boundarySubject;
+    if (wantCoverageBoundary) {
+        if (!selectCoverageBoundarySubject(examplesRoot, boundarySubjectDir,
+                                           boundarySubjectId, boundarySubject)) {
+            // The refusal already fired a [FAIL] naming both causes.
+            std::cout << "===========================================\n"
+                      << "Results: " << passes << " passed, " << failures
+                      << " failed (coverage boundary: no subject)\n";
+            return 1;
+        }
+        std::cout << "[Coverage boundary] subject selected from the corpus: "
+                  << boundarySubjectId << "\n\n";
+        g_only.kind      = OnlyKind::OneExample;
+        g_only.exampleId = boundarySubjectId;
+    }
 
     // ── which phases this invocation owns ───────────────────────────────────
     // D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD. Spelled as two
@@ -4664,6 +5117,13 @@ int main(int argc, char* argv[]) {
     if (wantWalk) {
         runOptimizedArmInstrument(
             /*executed=*/g_only.kind != OnlyKind::Adjudicate);
+    }
+
+    // ── the coverage boundary, judged over what the walk above ACTUALLY did ──
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    if (wantCoverageBoundary) {
+        runCoverageBoundaryJudge(boundarySubjectDir, boundarySubjectId,
+                                 boundarySubject, outputBase);
     }
 
     // ★ The cell is written whatever this entry's verdict, so a RED example still

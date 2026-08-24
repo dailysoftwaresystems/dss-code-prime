@@ -219,6 +219,14 @@ struct Section {
     std::uint32_t flags    = 0;
     bool          zeroFill = false;
     std::optional<SectionKind> kind;  // resolved from (segment, name) via the schema
+    // The schema ROW the (segment, name) pair resolved to, or null when it
+    // resolved to none. `kind` is a projection of it and stays for the dozen
+    // read sites that only ever ask that question -- this pointer exists for
+    // the sites that need a field the row owns and the enum cannot carry
+    // (`entrySize`, today). Points into `ObjectFormatSchema::sections()`, which
+    // outlives this reader's call by construction (the schema is a caller
+    // parameter). D-LK-MACHO-COMPACT-UNWIND-SECTION-REFUSED-BLOCKS-EVERY-STOCK-MACOS-ARCHIVE.
+    ObjectFormatSectionInfo const* schemaRow = nullptr;
 };
 
 // One decoded nlist_64.
@@ -518,15 +526,83 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         k.append(name);
         return k;
     };
-    std::unordered_map<std::string, SectionKind> pairToKind;
+    std::unordered_map<std::string, ObjectFormatSectionInfo const*> pairToRow;
     for (auto const& row : objectFormatSchema.sections()) {
-        pairToKind.emplace(pairKey(row.segment, row.name), row.kind);
+        pairToRow.emplace(pairKey(row.segment, row.name), &row);
     }
     for (auto& sec : sections) {
-        if (auto it = pairToKind.find(pairKey(sec.segName, sec.sectName));
-            it != pairToKind.end()) {
-            sec.kind = it->second;
+        if (auto it = pairToRow.find(pairKey(sec.segName, sec.sectName));
+            it != pairToRow.end()) {
+            sec.schemaRow = it->second;
+            sec.kind      = it->second->kind;
         }
+    }
+
+    // -- (3b) UNWIND METADATA: say what is being left behind ----------
+    //
+    // D-LK-MACHO-COMPACT-UNWIND-SECTION-REFUSED-BLOCKS-EVERY-STOCK-MACOS-ARCHIVE.
+    // A `SectionKind::Unwind` section is READ (its shape is now classified, so
+    // the object links) but NOT CARRIED: DSS's image-side unwind table is built
+    // from the neutral `CfiFunction` vocabulary that its own producers attach to
+    // each `AssembledFunction`, and a foreign object states the same facts in
+    // its format's own encoding, which nothing in this pipeline converts. So the
+    // merged functions arrive in the image with no unwind description.
+    //
+    // ★★ THE ONE THING THIS MUST NOT BE IS QUIET. A dropped unwind table
+    //    produces a binary that links, runs, and cannot be unwound -- no
+    //    backtrace, no profiler stack, an exception thrown through the frame
+    //    terminates -- and that is invisible until a core dump. It is exactly
+    //    the failure `K_UnwindRuleUnrepresentable`'s own docblock was minted to
+    //    name, so this borrows that code rather than inventing a synonym.
+    //    ⓘ WARNING, not Error, and the split is the whole point of the row: the
+    //    OBJECT is well-formed and every byte DSS does carry is correct, so
+    //    refusing it would reject the ordinary output of the platform's own
+    //    compiler over a capability gap. `--warnings-as-errors` is the knob for
+    //    a build that will not accept the gap.
+    //
+    // ⚠ THE GAP IS FORMAT-WIDE AND PRE-EXISTING, NOT SOMETHING MACH-O DOES
+    // WORSE. ✔MEASURED 2026-08-24: a `gcc -c` ELF member merged through
+    // `--resolve-library` links and RUNS (exit 42), and `readelf
+    // --debug-dump=frames` on the image shows ONE FDE -- for DSS's own `main`
+    // -- while all three merged foreign functions have none. The ELF path drops
+    // the same information in SILENCE today. ⇒
+    // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE.
+    //
+    // Counted from the SCHEMA's `entrySize`, never from a record layout typed
+    // into this file: the row declares how wide one function's unwind record is,
+    // so the count in the message is the format document's own arithmetic. A
+    // body that is not a whole number of records is a corrupt object and fails
+    // LOUD -- a fractional record means this reader and the producer disagree
+    // about the section, and a warning that names a wrong count is worse than
+    // no count.
+    for (auto const& sec : sections) {
+        if (!sec.kind.has_value() || *sec.kind != SectionKind::Unwind) continue;
+        if (sec.size == 0u) continue;   // nothing described, nothing to say
+        std::string const where = sec.segName + "," + sec.sectName;
+        std::uint64_t const entry =
+            sec.schemaRow != nullptr ? sec.schemaRow->entrySize : 0u;
+        if (entry == 0u || (sec.size % entry) != 0u) {
+            return fail(DiagnosticCode::F_CorruptedBinary,
+                "macho::readRelocatableObject: unwind section '" + where
+                + "' is " + std::to_string(sec.size) + " bytes, which is not a "
+                "whole number of " + std::to_string(entry) + "-byte records as "
+                "object format '" + std::string{objectFormatSchema.name()}
+                + "' declares in that section's `entrySize` -- refusing to "
+                "report a record count this reader and the producer do not "
+                "agree on.");
+        }
+        report(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
+               DiagnosticSeverity::Warning,
+               "macho::readRelocatableObject: section '" + where + "' carries "
+               + std::to_string(sec.size / entry) + " function unwind "
+               "record(s) in this object's own encoding. DSS reads the section "
+               "-- so the object links -- but builds its image unwind table "
+               "only from the neutral call-frame information its own producers "
+               "attach, and converts no foreign encoding into it. The "
+               "function(s) this object contributes will therefore appear in "
+               "the image with NO unwind description: a backtrace stops at "
+               "them and an exception thrown through them terminates. Anchored: "
+               "D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE.");
     }
 
     // -- (4) Reverse reloc map (nativeId -> RelocationKind), from the
@@ -657,6 +733,49 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
         std::uint64_t const secRelOff = s.value - sec.addr;
 
+        // ── IS THAT EVEN A QUESTION FOR THIS SECTION? ─────────────
+        //
+        // D-LK-MACHO-COMPACT-UNWIND-SECTION-REFUSED-BLOCKS-EVERY-STOCK-MACOS-ARCHIVE.
+        // Everything below -- the atom-boundary rule, the bodiless-label
+        // fallback, the coverage staging -- presumes the section HOLDS BYTES
+        // THE IMAGE WILL CARRY. A classified section that carries no linkable
+        // body does not: its content describes OTHER sections' code and is
+        // consumed by the linker. Apple's clang puts a local label (`ltmp1`) at
+        // offset 0 of `__LD,__compact_unwind` and sets MH_SUBSECTIONS_VIA_SYMBOLS
+        // on the header, so that label is indistinguishable from an atom
+        // boundary by the rule alone -- and treating it as one is what drove the
+        // slicing loop into its "no known code/data section kind" refusal on
+        // EVERY stock macOS object.
+        //
+        // ★ ONE GATE, THREE CONSEQUENCES, AND THE THIRD IS THE ONE MEASUREMENT
+        //   CAUGHT. It mints no atom (the refusal above); it stages nothing for
+        //   the coverage guard (a body no atom covers is the guard's whole
+        //   subject, and this is not a body); and it publishes NO `ModuleSymbol`
+        //   -- ✔MEASURED 2026-08-24, because the first version of this fix
+        //   recorded the label and `nm -n` on the linked arm64 exec then showed
+        //   `T ltmp1` AT THE ADDRESS OF DSS'S OWN ENTRY TRAMPOLINE -- where the
+        //   same link with this gate in place shows the trampoline's own
+        //   `_sym_*` name, and a no-archive control shows it too. The program
+        //   still ran (nothing references the label), so that was a green build
+        //   shipping a symbol table which states something false about the
+        //   artifact.
+        //
+        // ★ THE PREDICATE IS THE TAXONOMY'S, NOT THIS READER'S
+        //   (`sectionKindCarriesLinkableBody`), so a future kind is classified
+        //   where the kinds live. This file must never test a section NAME.
+        // ⚠ `kind.has_value()` IS LOAD-BEARING AND IS NOT THE SAME TEST. An
+        //   UNRESOLVED section keeps the old path deliberately, so a symbol in a
+        //   section no format row describes still reaches the slicing loop's
+        //   loud refusal. "Classified as holding no body" and "unclassified" are
+        //   different claims, and only the first one licenses skipping.
+        // ⓘ A REFERENCE TO SUCH A LABEL NOW FAILS LOUD RATHER THAN BINDING
+        //   WRONG: an r_extern=1 relocation naming it resolves to nothing and
+        //   the link reports `K_SymbolUndefined` -- correct, because DSS
+        //   genuinely did not carry the bytes that reference points into.
+        if (sec.kind.has_value() && !sectionKindCarriesLinkableBody(*sec.kind)) {
+            continue;
+        }
+
         // ── Does this defined symbol START AN ATOM? ────────────────
         //
         // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM. The
@@ -749,6 +868,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // not hold, and that must be loud too. Only a KIND-RESOLVED section
             // is staged -- a symbol in an unmodeled metadata section
             // reconstructs no body BY DESIGN and is not a dropped body.
+            // ⓘ Its CLASSIFIED sibling -- a section that resolved to a kind
+            // carrying no linkable body -- never reaches this line at all; it
+            // left the loop at the gate above.
             if (sec.kind.has_value()) {
                 bodilessDefined.push_back(link::format::BodilessDefinedSymbol{
                     /*sectionKey=*/s.sect, /*sectionOffset=*/secRelOff,
@@ -1125,15 +1247,37 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         auto const dIt = dataIntervalsBySec.find(ordinal);
         bool const patchesText = (fIt != funcIntervalsBySec.end() && !fIt->second.empty());
         bool const patchesData = (dIt != dataIntervalsBySec.end() && !dIt->second.empty());
+        // ── A CLASSIFIED BODYLESS SECTION'S RELOCS GO WITH ITS BYTES ──
+        //
+        // D-LK-MACHO-COMPACT-UNWIND-SECTION-REFUSED-BLOCKS-EVERY-STOCK-MACOS-ARCHIVE.
+        // A `SectionKind::Unwind` section's relocations exist to bind ITS OWN
+        // record fields (each record's `functionStart`, and a personality or
+        // LSDA pointer) to the code the records describe. Those bytes are not
+        // reconstructed into any atom and never reach the image, so there is
+        // nothing for the relocations to patch -- routing them anywhere would be
+        // patching bytes that do not exist. They are consumed WITH the section,
+        // and the loss is already stated once, at full volume and with a record
+        // count, by the (3b) pass above; repeating it per relocation would bury
+        // it. ⚠ THE TEST IS THE KIND, NEVER THE NAME, and never `nreloc == 0`:
+        // an UNCLASSIFIED reloc-bearing section still falls through to the
+        // refusal below, which is what keeps an unknown foreign section loud.
+        if (sec.kind.has_value()
+            && !sectionKindCarriesLinkableBody(*sec.kind)) {
+            continue;
+        }
         if (!patchesText && !patchesData) {
             // A reloc-bearing section that reconstructed NO atom. DSS output has
             // none -- every reloc it emits patches a __text function or a data
             // item, each an N_EXT atom. Fail loud rather than `continue`
             // (silent-failure-review fold): skipping would also bypass the
             // r_extern=0 guard below, so a foreign object's atom-less
-            // section-relative relocs would vanish undiagnosed. A foreign
-            // metadata section with relocs (e.g. `__compact_unwind`) rides the
-            // named follow-up D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC.
+            // section-relative relocs would vanish undiagnosed. ⓘ THE SECTION
+            // THIS SENTENCE USED TO NAME IS NO LONGER ONE OF THEM: a
+            // `__LD,__compact_unwind` now resolves to `SectionKind::Unwind` and
+            // exits at the arm above, so what still reaches here is a section
+            // whose kind NO format row describes -- anonymous `__cstring` /
+            // jump-table content reached through a section symbol, which is the
+            // gap-atom half of D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC.
             return fail(DiagnosticCode::F_CorruptedBinary,
                 "macho::readRelocatableObject: section '" + sec.segName + ","
                 + sec.sectName + "' carries " + std::to_string(sec.nreloc)

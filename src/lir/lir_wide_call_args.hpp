@@ -18,13 +18,20 @@
 // the linear-scan allocator + rewriter never exhaust the register file on
 // a wide call (the func-2088 blocker).
 //
-// The overflow-slot indexing MIRRORS lir_callconv's post-regalloc placement
-// loop EXACTLY (same monotonic source-order NSAA cursor, same per-class /
+// The overflow placement MIRRORS lir_callconv's post-regalloc placement loop
+// EXACTLY (same monotonic source-order NSAA cursor, same per-class /
 // slot-aligned pool logic, same ByValueStackAgg-carrier skip, same
 // hasIndirectResult / firstArgIdx handling), so the store offset callconv
 // computes for a `store_outgoing_arg` payload is byte-identical to what the
 // old placement loop stored — the caller-store ↔ callee-load contract is
 // unchanged.
+//
+// D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: "mirrors exactly" is
+// now a STRUCTURAL fact rather than a promise — the byte placement lives in
+// `StackArgCursor` (lir_callconv.hpp) and all four walks call it. The carrier's
+// payload is consequently a BYTE OFFSET, not a slot index, and its `flags` carry
+// the store's access width; under every `Slot`-packing CC those are `idx*slot`
+// and 0 (= 64-bit), i.e. exactly the previous encoding.
 //
 // Runs after MIR→LIR (which has NO active-cc knowledge) and before
 // liveness/regalloc (both of which receive callingConventionIndex), so this

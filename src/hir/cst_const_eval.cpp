@@ -289,6 +289,19 @@ unaryPlan(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
     return CstUnaryPlan{operandN, e};
 }
 
+// P31: is this rule one the config declares as folding to a compile-time value
+// the SEMANTIC tier computed? A linear scan of a list that is 2 entries long in
+// the shipped C document and empty in every other language — the same shape and
+// the same cost as the rule-id comparisons around it, and a set would buy
+// nothing but a second representation of a two-element list.
+[[nodiscard]] bool
+isFoldedConstantRule(HirLoweringConfig const& cfg, RuleId rule) {
+    for (RuleId r : cfg.foldedConstantRules) {
+        if (r.valid() && r.v == rule.v) return true;
+    }
+    return false;
+}
+
 // Resolve a transparent WRAPPER node to its single child to descend into (the
 // deep-parens axis `((((expr))))`), IFF it is NOT one of the rule-dispatched
 // arms (sizeof / binary / unary / ternary) — those are matched first in
@@ -314,7 +327,16 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
         // a type-ref or follower child the peel would mishandle — keep them for
         // evalNode's address arms (mirror sizeof).
         (cfg.castRule.valid()        && rule.v == cfg.castRule.v)        ||
-        (cfg.postfixExprRule.valid() && rule.v == cfg.postfixExprRule.v);
+        (cfg.postfixExprRule.valid() && rule.v == cfg.postfixExprRule.v)  ||
+        // P31: `__builtin_choose_expr` has THREE meaningful Internal children, so
+        // the peel declines it anyway — but naming it here states the reason
+        // (evalNode owns it) instead of relying on a child count that a future
+        // grammar edit could change underneath.
+        (cfg.chooseExprRule.valid()  && rule.v == cfg.chooseExprRule.v)
+        // P31: `__builtin_offsetof` / `__builtin_types_compatible_p` — each has a
+        // castTypeRef child the peel would descend into and then reject as
+        // non-constant, exactly the sizeof hazard one row up.
+        || isFoldedConstantRule(cfg, rule);
     if (isDispatched) return NodeId{};
     NodeId onlyInternal{};
     int    internalCount = 0;
@@ -580,6 +602,46 @@ evalNode(NodeId                              expr,
         v.core  = TypeKind::U64;   // size_t
         v.value = static_cast<std::uint64_t>(*al);
         return ok(std::move(v));
+    }
+
+    // P31 ([[D-FFI-OFFSETOF-MACRO]] + `__builtin_types_compatible_p`): the
+    // compile-time-answer operators in a const-expr context — the canonical use,
+    // since `_Static_assert(offsetof(struct S, b) == 4, "")` is what a real
+    // header writes. Dispatched by rule-id ahead of the wrapper-peel for the SAME
+    // reason sizeof is: their one meaningful Internal child is a castTypeRef the
+    // peel would descend into and reject. The VALUE comes from the caller's
+    // `resolveFoldedConstant` closure, which owns the type resolver and the
+    // target's layout params this engine must not depend on. Absent closure or a
+    // failed fold ⇒ NotAConstantExpression (fail loud) — never a zero.
+    if (isFoldedConstantRule(cfg, rule)) {
+        if (!env.resolveFoldedConstant) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto const v = env.resolveFoldedConstant(expr);
+        if (!v.has_value()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        HirLiteralValue lit;
+        lit.core  = TypeKind::U64;
+        lit.value = *v;
+        return ok(std::move(lit));
+    }
+
+    // P31: `__builtin_choose_expr` in a const-expr context. The closure hands
+    // back the SELECTED arm and this engine then evaluates ONLY that node, so the
+    // discarded arm is never visited at all — which is why
+    // `__builtin_choose_expr(1, 4, 1/0)` folds to 4 here instead of tripping the
+    // divide-by-zero wall, matching gcc.
+    if (cfg.chooseExprRule.valid() && rule.v == cfg.chooseExprRule.v) {
+        if (!env.resolveChosenExpr) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto const arm = env.resolveChosenExpr(expr);
+        if (!arm.has_value() || !arm->valid()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        return evalImpl(*arm, ctx, env, options, currentScopeOpaque,
+                        visitedInitNodes);
     }
 
     // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): a CAST in a const-expr.

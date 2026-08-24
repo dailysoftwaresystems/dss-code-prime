@@ -244,6 +244,7 @@ struct EngineState {
           nodeToSymbol{cu},
           nodeToType{cu},
           nodeToSelectedExpr{cu},
+          nodeToFoldedConstant{cu},
           nullPointerConstantNodes{cu},
           intPointeeCompatNodes{cu} {}
 
@@ -262,6 +263,41 @@ struct EngineState {
     // LOCAL, so a multi-source CU restarts numbering per tree — a flat map would
     // alias node K across files. Routes per-tree exactly like nodeToType/nodeToSymbol.
     UnitAttribute<NodeId>      nodeToSelectedExpr;
+    // ★ THE COMPILE-TIME-ANSWER SIDE TABLE (P31): for a node whose whole meaning
+    // IS a number the SEMANTIC tier computed — `__builtin_offsetof(T, m)`,
+    // `__builtin_types_compatible_p(T1, T2)` — the computed value. Written by
+    // Pass 2; read by CST→HIR, which emits a Literal instead of lowering the
+    // subtree (there is no subtree to lower: the operands are type-names, not
+    // expressions).
+    //
+    // ★★ WHY THE VALUE AND NOT A SYMBOLIC NODE, WHICH IS WHAT `SizeOf`/`AlignOf`
+    // DO ONE ROW UP. Those stay symbolic to MIR for a REASON THAT DOES NOT APPLY
+    // HERE: a `sizeof` operand can be a VLA, whose size is a RUNTIME value
+    // (C 6.7.6.2p2) — so the fold cannot be made at a tier that has no runtime.
+    // A member offset and a type-compatibility answer have no runtime case at
+    // all; they are constants in every program that can be written. And the fold
+    // is TARGET-EXACT rather than target-guessing, because the whole front end
+    // RUNS PER TARGET: ✔MEASURED 2026-08-24 through the shipped CLI, ONE
+    // invocation of ONE source with `--target x86_64:pe64-…` AND
+    // `--target x86_64:elf64-…` produced two artifacts exiting 4 and 8 for
+    // `sizeof(long)` — LLP64 and LP64 answers out of one compile — and
+    // `buildCuMir(cu, grammar, target, format, …)` in `compile_pipeline.cpp`
+    // shows why: `analyze` → `lowerToHir` → `lowerToMir` all run inside it, once
+    // per target. A value stamped here is therefore stamped for exactly the
+    // target that will consume it.
+    //
+    // ⚠ THE PAYLOAD IS UNSIGNED AND THAT IS A DECLARED LIMIT, NOT AN OVERSIGHT:
+    // both current writers yield a `size_t` / 0-or-1, and the node's TypeId comes
+    // from `nodeToType` — the ONE existing owner of width and signedness — so
+    // nothing here re-declares a type. A future construct needing a NEGATIVE or
+    // non-integer fold must WIDEN this payload; encoding a negative as a
+    // wrapped u64 would make the side table a second, contradictable owner of
+    // the very fact `nodeToType` already states.
+    //
+    // MUST be a TREE-KEYED UnitAttribute for the same reason `nodeToSelectedExpr`
+    // is: NodeId is tree-LOCAL, so a flat map would alias node K across the files
+    // of a multi-source CU.
+    UnitAttribute<std::uint64_t> nodeToFoldedConstant;
     // R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING): source nodes admitted as a null-
     // pointer constant via the FOLDED path — a non-literal integer constant
     // expression that folds to 0 (`1-1`, `-0`). The HIR lowerer materializes a
@@ -1371,6 +1407,41 @@ floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
 constIntExpr(EngineState& s, Tree const& tree, NodeId node, ScopeId fromScope,
              SemanticConfig const* cfg);
 
+// ── P31: the two COMPILE-TIME-ANSWER operators, and the ONE place either is
+//    computed. `__builtin_offsetof(T, m)` and `__builtin_types_compatible_p(A, B)`
+//    are folded here and NOWHERE else, by THREE callers that must agree by
+//    construction rather than by review:
+//      (a) `buildConstEvalEnv`'s `resolveFoldedConstant` closure, so a const-expr
+//          context (array dimension, `_Static_assert`, static initializer) folds
+//          at Pass 1.5;
+//      (b) Pass 2, which stamps the value into `nodeToFoldedConstant` for the
+//          CST→HIR lowering to emit as a Literal;
+//      (c) `subtreeType`, indirectly, via the type it stamps.
+//    A second implementation for any one of them is the shape this signature
+//    exists to prevent: two folds of one offset can differ, and the difference
+//    would be a wrong ADDRESS at run time rather than a failed build.
+//
+//    `loud` selects whether a FAILED fold reports `S_OffsetofInvalidMember`.
+//    Pass 2 is loud (it owns the user-facing message); the const-eval closure is
+//    SILENT, because its caller already fails loud in its own words
+//    (`S_NonConstantArrayLength`, `S_StaticAssertFailed`) and Pass 2 will reach
+//    the same node afterwards and name the real reason.
+//    Defined after `constIntExpr` (an array-index designator step folds through
+//    it); declared here so `buildConstEvalEnv`, ABOVE it, can capture it.
+[[nodiscard]] std::optional<std::uint64_t>
+foldCompileTimeAnswer(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                      NodeId node, ScopeId here, bool loud);
+
+// P31: `__builtin_choose_expr` — the NodeId of the arm its constant condition
+// selects, or InvalidNode when the condition is not an integer constant
+// expression. The SAME single-owner discipline as `foldCompileTimeAnswer`: Pass 2
+// records this NodeId in `nodeToSelectedExpr` (the side table `_Generic` already
+// writes) and `subtreeType` + the const-eval closure re-derive it here, never
+// separately. `loud` reports `S_BuiltinChooseExprNonConstant`.
+[[nodiscard]] NodeId
+chooseExprSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                      NodeId node, ScopeId here, bool loud);
+
 // VLA C1a (D-CSUBSET-VLA): the two array-suffix arms (`applyArraySuffix`,
 // `applyDeclaratorSuffix` — both DEFINED above the definition below) gate the VLA
 // accept on BLOCK scope via `fileScopeOf` (the agnostic scope-chain walk the
@@ -2352,29 +2423,52 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
             if (!layout) return std::nullopt;
             return layout->size;
         };
-        // C11/C23 6.5.3.4: fold `_Alignof(T)` in a const-expr position (an array
-        // dimension `int a[_Alignof(T)]`, `_Static_assert(_Alignof(T)==N,...)`).
-        // An ADDITIVE mirror of `resolveSizeof` reading ALIGNMENT instead of size.
-        // The engine dispatches the `alignofRule` node here (ahead of its wrapper-
-        // peel); this closure resolves the queried type (the castTypeRef child)
-        // and reads its alignment through the same `computeLayout` engine MIR
-        // uses. Type-name form ONLY (no value form). `nullopt` when un-alignable
-        // or the target declared no layout params → the caller fails loud, never a
-        // guessed alignment.
+        // C11/C23 6.5.3.4: fold `_Alignof(T)` / `_Alignof e` in a const-expr
+        // position (an array dimension `int a[_Alignof(T)]`,
+        // `_Static_assert(_Alignof(T)==N,...)`). An ADDITIVE mirror of
+        // `resolveSizeof` reading ALIGNMENT instead of size — INCLUDING its shape:
+        // the engine dispatches the `alignofRule` node here, and since
+        // [[D-CSUBSET-ALIGNOF-VALUE-OPERAND]] (2026-08-24) that rule is the
+        // `alignofExpr` WRAPPER, not the form. ★ THE DESCENT IS LOAD-BEARING AND
+        // ITS ABSENCE WOULD HAVE BEEN SILENT-ADJACENT: keeping the old
+        // `tree.rule(alignofNode) == alignofTypeRule` test would match NOTHING
+        // once the wrapper exists, so every ALREADY-SHIPPED const-expr `_Alignof`
+        // (`int a[_Alignof(double)]`, `_Static_assert(_Alignof(T)==8)`) would stop
+        // folding and start failing S_NonConstantArrayLength — a regression the
+        // value form did not cause and could not have been blamed for. Pinned by
+        // AlignofTypeStillFoldsInAnArrayDimension.
+        // `nullopt` when un-alignable or the target declared no layout params →
+        // the caller fails loud, never a guessed alignment.
         env.resolveAlignof = [&s, &tree, cfg, fromScope](NodeId alignofNode)
             -> std::optional<std::uint64_t> {
             if (!s.aggregateLayout.has_value()) return std::nullopt;
             TypeId queried{};
-            if (cfg->alignofTypeRule.valid()
-                && tree.rule(alignofNode).v == cfg->alignofTypeRule.v) {
-                auto ak = visibleChildren(tree, alignofNode);
-                if (cfg->alignofTypeChild < ak.size())
-                    // emitOnMiss=false: an unknown queried type yields nullopt →
-                    // the caller fails loud with ONE positioned diagnostic (it
-                    // owns it), not a redundant S_UnknownType pair.
-                    queried = resolveTypeNode(s, *cfg, tree,
-                                              ak[cfg->alignofTypeChild], fromScope,
-                                              /*emitOnMiss=*/false);
+            for (NodeId form : visibleChildren(tree, alignofNode)) {
+                if (tree.kind(form) != NodeKind::Internal) continue;
+                RuleId const fr = tree.rule(form);
+                if (cfg->alignofTypeRule.valid() && fr.v == cfg->alignofTypeRule.v) {
+                    auto ak = visibleChildren(tree, form);
+                    if (cfg->alignofTypeChild < ak.size())
+                        // emitOnMiss=false: an unknown queried type yields nullopt
+                        // → the caller fails loud with ONE positioned diagnostic
+                        // (it owns it), not a redundant S_UnknownType pair.
+                        queried = resolveTypeNode(s, *cfg, tree,
+                                                  ak[cfg->alignofTypeChild], fromScope,
+                                                  /*emitOnMiss=*/false);
+                } else if (cfg->alignofValueRule.valid()
+                           && fr.v == cfg->alignofValueRule.v) {
+                    // The VALUE form's operand type, derived by the SAME
+                    // `subtreeType` the sizeof value arm uses at this same
+                    // Pass-1.5 stage (leaves are not Pass-2-stamped yet, so the
+                    // const-context scope is threaded in for identifier operands).
+                    for (NodeId opnd : visibleChildren(tree, form)) {
+                        if (tree.kind(opnd) == NodeKind::Internal) {
+                            queried = subtreeType(s, tree, opnd, fromScope);
+                            break;
+                        }
+                    }
+                }
+                break;  // the single alignof form
             }
             if (!queried.valid()) return std::nullopt;
             auto const layout = computeLayout(queried, s.lattice.interner(),
@@ -2493,6 +2587,27 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
             if (!layout || idx >= layout->fieldOffsets.size()) return std::nullopt;
             return CstFieldResolution{layout->fieldOffsets[idx], frec.type};
         };
+        // P31: the compile-time-answer operators in a const-expr context —
+        // `int a[__builtin_offsetof(struct S, b)]`,
+        // `_Static_assert(__builtin_offsetof(struct S, b) == 4, "")`,
+        // `static size_t k = __builtin_offsetof(struct S, b);`. SILENT on failure
+        // (see foldCompileTimeAnswer's `loud` note): the caller owns the message.
+        env.resolveFoldedConstant = [&s, &tree, cfg, fromScope](NodeId node)
+            -> std::optional<std::uint64_t> {
+            return foldCompileTimeAnswer(s, *cfg, tree, node, fromScope,
+                                         /*loud=*/false);
+        };
+        // P31: `__builtin_choose_expr` in a const-expr context. Returns the
+        // SELECTED arm so the engine evaluates only that one — which is why
+        // `__builtin_choose_expr(1, 4, 1/0)` folds to 4 instead of tripping the
+        // divide-by-zero wall, exactly as gcc does.
+        env.resolveChosenExpr = [&s, &tree, cfg, fromScope](NodeId node)
+            -> std::optional<NodeId> {
+            NodeId const arm = chooseExprSelectedArm(s, *cfg, tree, node,
+                                                     fromScope, /*loud=*/false);
+            if (!arm.valid()) return std::nullopt;
+            return arm;
+        };
     }
     return env;
 }
@@ -2520,6 +2635,247 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
     ConstEvalResult const r = evaluateConstantCst(node, ctx, env, {}, fromScope.v);
     if (!r.value.has_value()) return std::nullopt;
     return asInt64Bridge(*r.value);
+}
+
+// ── P31: `__builtin_offsetof` + `__builtin_types_compatible_p` (see the
+//    forward declaration above for WHY there is exactly one of these). ────────
+[[nodiscard]] std::optional<std::uint64_t>
+foldCompileTimeAnswer(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                      NodeId node, ScopeId here, bool loud) {
+    if (!node.valid() || tree.kind(node) != NodeKind::Internal) return std::nullopt;
+    RuleId const rule = tree.rule(node);
+    TypeInterner& in = s.lattice.interner();
+
+    auto refuse = [&](NodeId at, std::string why) -> std::optional<std::uint64_t> {
+        if (loud) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_OffsetofInvalidMember;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(at.valid() ? at : node);
+            d.actual   = std::move(why);
+            s.reporter.report(std::move(d));
+        }
+        return std::nullopt;
+    };
+
+    // ── `__builtin_types_compatible_p ( T1 , T2 )` ──────────────────────────
+    // The predicate is `_Generic`'s, verbatim: interned TypeId equality after a
+    // top-level-volatile strip. Because [[D-LANG-TYPE-IDENTITY-VOCABULARY]] made
+    // that identity NAME-keyed rather than representation-keyed, this answers 0
+    // for `(long, int)` on LLP64 — where the two share a representation — which
+    // is what gcc answers. An unresolvable operand folds NOTHING (the resolve
+    // emitted its own S_UnknownType): never a default 0, which would be a
+    // plausible wrong answer for exactly the type-dispatch this feeds.
+    if (cfg.builtinTypesCompatibleRule.valid()
+        && rule.v == cfg.builtinTypesCompatibleRule.v) {
+        auto kids = visibleChildren(tree, node);
+        if (cfg.builtinTypesCompatibleLeftChild >= kids.size()
+            || cfg.builtinTypesCompatibleRightChild >= kids.size()) {
+            return std::nullopt;
+        }
+        TypeId const lhs = resolveTypeNode(
+            s, cfg, tree, kids[cfg.builtinTypesCompatibleLeftChild], here, loud);
+        TypeId const rhs = resolveTypeNode(
+            s, cfg, tree, kids[cfg.builtinTypesCompatibleRightChild], here, loud);
+        if (!lhs.valid() || !rhs.valid()) return std::nullopt;
+        return sameType(in.stripVolatile(lhs), in.stripVolatile(rhs))
+                   ? std::uint64_t{1} : std::uint64_t{0};
+    }
+
+    // ── `__builtin_offsetof ( T , member-designator )` ──────────────────────
+    if (!cfg.builtinOffsetofRule.valid() || rule.v != cfg.builtinOffsetofRule.v) {
+        return std::nullopt;
+    }
+    if (!s.aggregateLayout.has_value()) return std::nullopt;  // no layout params
+    auto kids = visibleChildren(tree, node);
+    if (cfg.builtinOffsetofTypeChild >= kids.size()
+        || cfg.builtinOffsetofDesignatorChild >= kids.size()) {
+        return std::nullopt;
+    }
+    TypeId container = resolveTypeNode(s, cfg, tree,
+                                       kids[cfg.builtinOffsetofTypeChild], here, loud);
+    if (!container.valid()) return std::nullopt;  // resolve already spoke
+
+    // ONE member step, shared by the leading name and every `.field` follower —
+    // and it is the SAME lookup `env.resolveFieldOffset` performs for the
+    // `&((T*)0)->m` spine: the composite's own member scope for the field index,
+    // then `computeLayout` for the byte offset. Two lookups would be two answers
+    // to "where does this member live".
+    std::uint64_t offset = 0;
+    auto stepField = [&](NodeId nameTok) -> bool {
+        TypeKind const ck = in.kind(container);
+        if (ck != TypeKind::Struct && ck != TypeKind::Union) {
+            (void)refuse(nameTok,
+                std::format("'{}' cannot be reached: the type it is looked up in "
+                            "is not a struct or union", tree.text(nameTok)));
+            return false;
+        }
+        auto const scopeIt = s.compositeScopeByType.find(container.v);
+        if (scopeIt == s.compositeScopeByType.end()) {
+            (void)refuse(nameTok,
+                std::format("'{}' cannot be reached: its containing struct/union "
+                            "is INCOMPLETE here, so it has no layout yet",
+                            tree.text(nameTok)));
+            return false;
+        }
+        SymbolId const fsym = s.scopes.lookup(scopeIt->second, tree.text(nameTok));
+        if (!fsym.valid()) {
+            (void)refuse(nameTok,
+                std::format("'{}' is not a member of that struct/union",
+                            tree.text(nameTok)));
+            return false;
+        }
+        SymbolRecord const& frec = s.symbols.at(fsym);
+        std::uint32_t const idx = frec.fieldIndex;
+        if (in.fieldBitWidth(container, idx).has_value()) {
+            (void)refuse(nameTok,
+                std::format("'{}' is a BIT-FIELD, which has no byte offset (C "
+                            "6.5.3.2 also forbids taking its address)",
+                            tree.text(nameTok)));
+            return false;
+        }
+        auto const layout = computeLayout(container, in, *s.aggregateLayout,
+                                          s.dataModel);
+        if (!layout || idx >= layout->fieldOffsets.size()) {
+            (void)refuse(nameTok,
+                std::format("'{}' has no computable layout offset in its "
+                            "containing type", tree.text(nameTok)));
+            return false;
+        }
+        offset += layout->fieldOffsets[idx];
+        container = frec.type;
+        return true;
+    };
+
+    // `[i]` — a CONSTANT index times the element stride. A non-constant index is
+    // REFUSED, never assumed zero: `offsetof(T, arr[i])` with a variable `i` is
+    // not a constant expression in any reference compiler either.
+    auto stepIndex = [&](NodeId idxExpr, NodeId at) -> bool {
+        if (in.kind(container) != TypeKind::Array) {
+            (void)refuse(at, "an '[index]' designator step was applied to a "
+                             "member that is not an array");
+            return false;
+        }
+        auto const ops = in.operands(container);
+        if (ops.empty()) {
+            (void)refuse(at, "the indexed member's element type is unknown");
+            return false;
+        }
+        auto const idxVal = constIntExpr(s, tree, idxExpr, here, &cfg);
+        if (!idxVal.has_value()) {
+            (void)refuse(at, "an '[index]' designator step is not an integer "
+                             "constant expression");
+            return false;
+        }
+        if (*idxVal < 0) {
+            (void)refuse(at, "an '[index]' designator step is negative");
+            return false;
+        }
+        auto const elemLayout = computeLayout(ops[0], in, *s.aggregateLayout,
+                                              s.dataModel);
+        if (!elemLayout) {
+            (void)refuse(at, "the indexed member's element type has no "
+                             "computable layout");
+            return false;
+        }
+        offset += static_cast<std::uint64_t>(*idxVal) * elemLayout->size;
+        container = ops[0];
+        return true;
+    };
+
+    NodeId const desig = kids[cfg.builtinOffsetofDesignatorChild];
+    auto dkids = visibleChildren(tree, desig);
+    NodeId lead{};
+    for (NodeId c : dkids) {
+        if (tree.kind(c) == NodeKind::Token) { lead = c; break; }
+    }
+    if (!lead.valid()) return std::nullopt;
+    if (!stepField(lead)) return std::nullopt;
+
+    // The follower steps. Each is a `designator` UMBRELLA node wrapping either
+    // the field or the index alternative — descend through the wrapper exactly as
+    // `selectGenericAssociation`'s `innerAssoc` does, so this works whether the
+    // grammar routes through the alt rule or names the alternatives directly.
+    for (NodeId c : dkids) {
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        NodeId step = c;
+        RuleId r = tree.rule(step);
+        bool const isInner =
+            (cfg.offsetofFieldDesignatorRule.valid()
+             && r.v == cfg.offsetofFieldDesignatorRule.v)
+            || (cfg.offsetofIndexDesignatorRule.valid()
+                && r.v == cfg.offsetofIndexDesignatorRule.v);
+        if (!isInner) {
+            NodeId inner{};
+            for (NodeId g : visibleChildren(tree, step)) {
+                if (tree.kind(g) == NodeKind::Internal) { inner = g; break; }
+            }
+            if (!inner.valid()) {
+                (void)refuse(step, "a member-designator step is malformed");
+                return std::nullopt;
+            }
+            step = inner;
+            r = tree.rule(step);
+        }
+        if (cfg.offsetofFieldDesignatorRule.valid()
+            && r.v == cfg.offsetofFieldDesignatorRule.v) {
+            // `. Identifier` — the name is the LAST token (the first is the dot).
+            NodeId nameTok{};
+            for (NodeId g : visibleChildren(tree, step)) {
+                if (tree.kind(g) == NodeKind::Token) nameTok = g;
+            }
+            if (!nameTok.valid() || !stepField(nameTok)) return std::nullopt;
+        } else if (cfg.offsetofIndexDesignatorRule.valid()
+                   && r.v == cfg.offsetofIndexDesignatorRule.v) {
+            NodeId idxExpr{};
+            for (NodeId g : visibleChildren(tree, step)) {
+                if (tree.kind(g) == NodeKind::Internal) { idxExpr = g; break; }
+            }
+            if (!idxExpr.valid() || !stepIndex(idxExpr, step)) return std::nullopt;
+        } else {
+            (void)refuse(step, "unrecognized member-designator step");
+            return std::nullopt;
+        }
+    }
+    return offset;
+}
+
+// ── P31: `__builtin_choose_expr` — which arm survives. ──────────────────────
+[[nodiscard]] NodeId
+chooseExprSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                      NodeId node, ScopeId here, bool loud) {
+    if (!node.valid() || tree.kind(node) != NodeKind::Internal) return InvalidNode;
+    if (!cfg.builtinChooseExprRule.valid()
+        || tree.rule(node).v != cfg.builtinChooseExprRule.v) {
+        return InvalidNode;
+    }
+    auto kids = visibleChildren(tree, node);
+    if (cfg.builtinChooseConditionChild >= kids.size()
+        || cfg.builtinChooseThenChild >= kids.size()
+        || cfg.builtinChooseElseChild >= kids.size()) {
+        return InvalidNode;
+    }
+    // The SAME `constIntExpr` `_Static_assert`, array dimensions, case labels and
+    // enum values fold through — so "is this an integer constant expression"
+    // has ONE answer in this language, not a per-construct one.
+    auto const cond = constIntExpr(s, tree, kids[cfg.builtinChooseConditionChild],
+                                   here, &cfg);
+    if (!cond.has_value()) {
+        if (loud) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_BuiltinChooseExprNonConstant;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(kids[cfg.builtinChooseConditionChild]);
+            d.actual   = "the controlling expression of __builtin_choose_expr is "
+                         "not an integer constant expression";
+            s.reporter.report(std::move(d));
+        }
+        return InvalidNode;
+    }
+    return *cond != 0 ? kids[cfg.builtinChooseThenChild]
+                      : kids[cfg.builtinChooseElseChild];
 }
 
 // FC17 (D-CSUBSET-CONSTEXPR): the FLOAT-CAPABLE full-value sibling of
@@ -9929,9 +10285,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // TYPE arm. Resolves + stamps its castTypeRef child through the SAME type
         // resolver (so the HIR lowering's `resolveStampedTypeBelow` recovers the
         // queried type) and stamps the node `size_t` (the SAME declared vocabulary
-        // entry the sizeof arm mints — C 6.5.3.4p5). Type-name form ONLY (no value
-        // arm — `_Alignof(expr)` is a constraint violation the binder rejects at
-        // type-resolve).
+        // entry the sizeof arm mints — C 6.5.3.4p5). The VALUE arm is a SEPARATE
+        // `if` below, beside sizeof's, so the two forms never share a branch.
         if (cfg.alignofTypeRule.valid() && rule.v == cfg.alignofTypeRule.v) {
             auto kids = visibleChildren(tree, node);
             if (cfg.alignofTypeChild < kids.size()) {
@@ -9970,6 +10325,82 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                              synthesizedType(s.lattice.interner(),
                                              cfg.sizeofResultType, s.dataModel,
                                              TypeKind::U64));
+        }
+        // [[D-CSUBSET-ALIGNOF-VALUE-OPERAND]] (2026-08-24): `_Alignof e` typing —
+        // the sizeof VALUE arm directly above, one operator across, and it is a
+        // COPY OF THAT ARM ON PURPOSE rather than a shared helper: the two differ
+        // only in which `SynthesizedTypeRule` they mint, and folding them would
+        // put a `which operator am I` parameter into a function whose whole body
+        // is two statements. Post-order means the operand subtree is already
+        // typed, and `subtreeType` is the exact deriver the Pass-1.5 array-
+        // dimension alignof closure uses for the SAME recovery — one deriver, two
+        // call sites, so a Pass-1.5 `_Alignof e` and a Pass-2 one cannot disagree.
+        // ★ WITHOUT THIS STAMP THE LOWERING MIS-READS THE OPERAND, SILENTLY: the
+        // HIR probe would descend past the (unstamped) operator node to the FIRST
+        // STAMPED LEAF, so `__alignof__(*p)` would report the alignment of the
+        // POINTER and `__alignof__(a[0])` the alignment of the ARRAY — the exact
+        // shape of D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK, which reached a
+        // shipped SQLite as a heap corruption. Pinned by the corpus example's
+        // `*p` / `a[0]` shapes, where the two readings DISAGREE.
+        if (cfg.alignofValueRule.valid() && rule.v == cfg.alignofValueRule.v) {
+            for (NodeId opnd : visibleChildren(tree, node)) {
+                if (tree.kind(opnd) != NodeKind::Internal) continue;
+                if (TypeId t = subtreeType(s, tree, opnd, here); t.valid()) {
+                    s.nodeToType.set(opnd, t);
+                }
+                break;  // the single operand child
+            }
+            s.nodeToType.set(node,
+                             synthesizedType(s.lattice.interner(),
+                                             cfg.alignofResultType, s.dataModel,
+                                             TypeKind::U64));
+        }
+
+        // ── P31: the three GNU compile-time OPERATORS. ─────────────────────
+        // [[D-FFI-OFFSETOF-MACRO]] `__builtin_offsetof` and its sibling
+        // `__builtin_types_compatible_p` both fold to a NUMBER, recorded in
+        // `nodeToFoldedConstant` for CST→HIR to emit as a Literal. This is the
+        // LOUD call of the one-and-only fold (`foldCompileTimeAnswer`); the
+        // const-expr path called the same function silently at Pass 1.5, so a
+        // program using the value in BOTH an array dimension and an expression
+        // cannot get two different answers.
+        // ⚠ The TYPE is stamped even when the FOLD FAILED, deliberately: the node
+        // still HAS a type (size_t / int) and leaving it untyped would cascade a
+        // second, less accurate diagnostic on top of the accurate one already
+        // reported. The missing VALUE is what makes the lowering refuse.
+        if ((cfg.builtinOffsetofRule.valid() && rule.v == cfg.builtinOffsetofRule.v)
+            || (cfg.builtinTypesCompatibleRule.valid()
+                && rule.v == cfg.builtinTypesCompatibleRule.v)) {
+            bool const isOffsetof = cfg.builtinOffsetofRule.valid()
+                                 && rule.v == cfg.builtinOffsetofRule.v;
+            if (auto const v = foldCompileTimeAnswer(s, cfg, tree, node, here,
+                                                     /*loud=*/true)) {
+                s.nodeToFoldedConstant.set(node, *v);
+            }
+            s.nodeToType.set(
+                node,
+                synthesizedType(s.lattice.interner(),
+                                isOffsetof ? cfg.offsetofResultType
+                                           : cfg.typesCompatibleResultType,
+                                s.dataModel,
+                                isOffsetof ? TypeKind::U64 : TypeKind::I32));
+        }
+        // `__builtin_choose_expr` — the SAME recorded-selection protocol
+        // `_Generic` uses one arm up: record the winner in `nodeToSelectedExpr`,
+        // stamp the node with the winner's type, and let the lowering do the rest.
+        // The arm NOT chosen is never typed and never lowered (gcc: it "may be of
+        // any type"), which is precisely what makes
+        // `__builtin_choose_expr(1, 42, "not an int")` legal.
+        if (cfg.builtinChooseExprRule.valid()
+            && rule.v == cfg.builtinChooseExprRule.v) {
+            NodeId const arm = chooseExprSelectedArm(s, cfg, tree, node, here,
+                                                     /*loud=*/true);
+            if (arm.valid()) {
+                if (TypeId const t = subtreeType(s, tree, arm, here); t.valid()) {
+                    s.nodeToType.set(node, t);
+                }
+                s.nodeToSelectedExpr.set(node, arm);
+            }
         }
 
         // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE):
@@ -12399,6 +12830,44 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // whose Identifier child is a LABEL name, never typed as an expression).
         if (hirCfg.labelAddressRule.valid() && r.v == hirCfg.labelAddressRule.v) {
             result = interner.pointer(interner.primitive(TypeKind::Void)); return;
+        }
+        // P31: the compile-time-answer operators are RE-TYPING wrappers, exactly
+        // like the sizeof / alignof arms above and for the same reason — their one
+        // meaningful child is a TYPE-NAME, and the wrapper fallthrough below would
+        // hand back THAT type (so `int a[__builtin_offsetof(struct S, b)]` would be
+        // typed `struct S`). Pass 2 stamps these nodes, so `typeAt` wins there;
+        // this arm is what makes Pass 1.5 agree with it.
+        if (sem.builtinOffsetofRule.valid() && r.v == sem.builtinOffsetofRule.v) {
+            result = synthesizedType(interner, sem.offsetofResultType, s.dataModel,
+                                     TypeKind::U64);
+            return;
+        }
+        if (sem.builtinTypesCompatibleRule.valid()
+            && r.v == sem.builtinTypesCompatibleRule.v) {
+            result = synthesizedType(interner, sem.typesCompatibleResultType,
+                                     s.dataModel, TypeKind::I32);
+            return;
+        }
+        // P31: `__builtin_choose_expr` types as the arm its constant condition
+        // SELECTS — never as its first child. Without this arm the wrapper
+        // fallthrough would take the CONTROLLING expression's type, which is the
+        // same silent wrong-width bug the `_Generic` frame below exists to avoid.
+        // The winner is re-derived through the ONE selector, so Pass 1.5 and
+        // Pass 2 cannot disagree about which arm survives.
+        if (sem.builtinChooseExprRule.valid()
+            && r.v == sem.builtinChooseExprRule.v) {
+            // The const_cast is `selectGenericAssociation`'s exact discipline,
+            // for the same reason and with the same guarantee: the selector
+            // memoizes in the interner and (silently) folds a constant, and no
+            // caller of `subtreeType` holds a genuinely const EngineState.
+            EngineState& mutS = const_cast<EngineState&>(s);   // NOLINT
+            NodeId const arm = chooseExprSelectedArm(mutS, sem, tree, node, scope,
+                                                     /*loud=*/false);
+            if (!arm.valid()) { result = InvalidType; return; }
+            std::vector<NodeId> only{arm};
+            work.push_back(Frame{node, Frame::Kind::Wrapper, 0, {}, {}, nullptr,
+                                 std::move(only), 0, {}});
+            return;
         }
         if (auto const it = s.idx().castByRule.find(r.v);
             it != s.idx().castByRule.end()) {
@@ -15034,6 +15503,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(s.nodeToSymbol),
         std::move(s.nodeToType),
         std::move(s.nodeToSelectedExpr),
+        std::move(s.nodeToFoldedConstant),
         std::move(s.reporter),
         std::move(s.usesBySymbol),
         std::move(s.compositeScopeByType),

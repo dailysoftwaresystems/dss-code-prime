@@ -104,6 +104,14 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
             static_cast<std::uint32_t>(cc->argFprs.size());
         mirCfg.aggregateStackExhaustsRegisters =
             cc->aggregateStackExhaustsRegisters;
+        // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the stacked-arg
+        // packing rules decide `va_start`'s overflow base for a callee whose named
+        // params overflow the arg registers. ⚠ THREADED HERE AS PART OF ADDING THE
+        // FIELD, not as a follow-up — the docblock below records this fixture
+        // silently reading a default THREE times (TF-C78 / TF-C81 / TF-C92) and
+        // every test concluding the feature was absent. A default here would make
+        // the Apple `va_start` pin PASS against slot packing.
+        mirCfg.stackArgPacking           = cc->stackArgPacking;
         mirCfg.vaListLayout              = cc->vaListLayout;
     }
     // D-CSUBSET-VLA (C1b): thread the captured VLA size-expr map so a `int a[n]`

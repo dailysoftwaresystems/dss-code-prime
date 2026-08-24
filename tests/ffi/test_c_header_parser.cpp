@@ -9,6 +9,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/c_header_parser.hpp"
 #include "diagnostic_count.hpp"
+#include "private_config_root.hpp"
 
 #include <gtest/gtest.h>
 
@@ -18,6 +19,36 @@ using namespace dss;
 using namespace dss::ffi;
 using dss::test_support::countCode;
 namespace fs = std::filesystem;
+
+// ── D-TEST-SHIPPED-CONFIG-READ-FROM-A-TREE-ANOTHER-PROCESS-IS-WRITING ─────────
+//
+// ★★★ EVERY `readCHeaderFromText` CALL BELOW RE-OPENS THE SHIPPED `c` GRAMMAR
+// FROM DISK. `readCHeaderFromText` starts with `GrammarSchema::loadShipped("c")`,
+// so this file's ~25 cases are ~25 independent reads of a 478 KB document in the
+// LIVE working tree — ✔MEASURED with a writer-denial probe, the handle on
+// `src/dss-config/sources/c.lang.json` is open for ~67% of this suite's wall
+// time. That made this the single most exposed reader of that file in the tree,
+// and it is why a neighbouring lane's in-place rewrite of it (truncate, then
+// write) turned this suite — and only this suite — red once at 8-way parallelism
+// and green on the immediate re-run.
+//
+// The contended resource is therefore made PER-TEST rather than tolerated: the
+// line below copies the shipped tree once, before any case runs, and repoints
+// `$DSS_CONFIG_ROOT` at the copy. No retry, no `RUN_SERIAL`, no widened
+// assertion. See `tests/test_support/private_config_root.hpp` for the mechanism,
+// what it does NOT claim, and why the copy is taken at RUN time (a build-time
+// copy would silently green every config-level red-on-disable).
+//
+// RED-ON-DISABLE: delete this registration, then empty
+// `$DSS_CONFIG_ROOT`'s `sources/c.lang.json` 400 ms into a run — the cases still
+// to execute red with `GrammarLoadFailed`. ⚠ EMPTY it, never DELETE it: a
+// deleted file makes the override a set-but-MISS, `findShippedConfig` falls
+// THROUGH to its cwd ancestor walk, lands on the real repo tree and rescues the
+// run — ✔MEASURED, both arms passed under a delete and the probe proved nothing.
+namespace {
+[[maybe_unused]] auto const* kPrivateConfigRoot =
+    dss::test_support::installPrivateConfigRoot("ffi-c-header-parser");
+}  // namespace
 
 // ── Happy-path row emission ───────────────────────────────────
 

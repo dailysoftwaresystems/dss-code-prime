@@ -564,12 +564,43 @@ TEST(ParserSpeculation, COperandAltBranchesAreInDeclaredOrder) {
         "charLiteralExpr",
         "compoundLiteralExpr",
         "sizeofExpr",            // FC6
-        "alignofType",           // C11/C23 6.5.3.4 (`_Alignof`/`alignof`)
+        // P31 [[D-CSUBSET-ALIGNOF-VALUE-OPERAND]]: was `alignofType` (the FORM).
+        // The value arm made alignof a two-arm choice, and — exactly as for
+        // sizeof — the choice has to be INTERNAL to a wrapper: two `operand`
+        // branches leading with the same keyword is the `C_AmbiguousAlternatives`
+        // the loader refuses. This entry moving is the visible half of that.
+        "alignofExpr",           // C11/C23 6.5.3.4 (`_Alignof`/`alignof`)
         "labelAddressExpr",      // D-CSUBSET-COMPUTED-GOTO (`&&label`)
         "vaStartExpr",           // FC12a-core (D-FC12A-VARIADIC-CALLEE)
         "vaArgExpr",             // FC12a-core
         "vaEndExpr",             // FC12a-core
         "genericExpr",           // FC16 (D-CSUBSET-GENERIC-SELECTION, `_Generic`)
+        // P31: the three GNU compile-time OPERATORS. Keyword-led, so the LL(k)
+        // predictive prune discards each in ONE token for every operand that is
+        // not one of them — but their POSITION in this list is still pinned,
+        // because the declared order is what the probe loop walks and a silent
+        // re-ordering is exactly what this test exists to catch.
+        "builtinOffsetofExpr",         // [[D-FFI-OFFSETOF-MACRO]]
+        "builtinTypesCompatibleExpr",
+        "builtinChooseExpr",
+        // P31: the GNU statement expression `({ … })` ([[D-C-GNU-STATEMENT-EXPRESSION]])
+        // and the GNU `__extension__` expression prefix ([[D-C-GNU-EXTENSION-KEYWORD]]).
+        // ★ THIS PIN CAUGHT THE CHANGE, WHICH IS THE POINT OF IT, AND IT ALSO
+        // ANSWERS A QUESTION THE LANE THAT ADDED THEM ASKED SEPARATELY. The
+        // config comment on this alt originally claimed `stmtExpr` MUST precede
+        // the three paren-led branches; a red-on-disable mutant that moved it to
+        // the END left the whole scoped gate GREEN, because `operand` is
+        // SPECULATIVE — `parenExpr`/`castExpr`/`compoundLiteralExpr` each fail
+        // one token in (no C expression and no type-name begins with `{`) and
+        // roll back. So the ORDER here is a latency choice, not a correctness
+        // one, and it is pinned for the reason the entries above it are: a
+        // SILENT re-ordering is what this test exists to catch, whether or not
+        // any given re-ordering happens to change an answer.
+        // ⓘ `extensionExpr`'s FIRST = {ExtensionKeyword} is disjoint from every
+        // sibling, so it is a unique-production direct descent and never opens a
+        // probe at all; its position is free in both senses.
+        "stmtExpr",
+        "extensionExpr",
         "castExpr",
         "parenExpr",
     };

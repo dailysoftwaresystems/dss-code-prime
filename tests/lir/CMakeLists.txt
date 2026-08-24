@@ -99,3 +99,13 @@ dss_add_test(NAME lir/test_lir_asm_operand_move_class
 # between the source's output SECTION and the descriptor's result-piece list.
 dss_add_test(NAME lir/test_lir_asm_memory_output
              SOURCES test_lir_asm_memory_output.cpp)
+
+# D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: Apple's arm64 ABI packs
+# NAMED stacked scalars at their own alignment and size, while keeping 8-byte
+# slots for named aggregates and for varargs — three axes that were MEASURED to
+# differ, which is why the CC declares an object rather than a boolean. The pins
+# type the measured offsets out as literals and fetch the CC by name from the
+# shipped target, so deleting the declaration reddens the Apple arms and leaves
+# the AAPCS64 control green.
+dss_add_test(NAME lir/test_lir_apple_stack_arg_packing
+             SOURCES test_lir_apple_stack_arg_packing.cpp)

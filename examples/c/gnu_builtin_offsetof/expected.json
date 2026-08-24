@@ -1,0 +1,32 @@
+{
+  "$comment": "[[D-FFI-OFFSETOF-MACRO]] (P31, 2026-08-24) — the first runnable witness for GNU `__builtin_offsetof`, and the reason it outranked every other row in the direction-A census is not that programs write this token. ✔MEASURED by reading `-E` output on this host, gcc 13.3.0 AND clang 19.1.1: `<stddef.h>`'s `offsetof(struct S, b)` expands LITERALLY to `__builtin_offsetof(struct S, b)`, so a TU that reaches ANY real SDK header trips it without the program ever writing it. ✔MEASURED through the shipped CLI at HEAD `60198126`: `error[P0002] expected 'ParenClose' — got 'struct'` — DSS was reading it as an ordinary CALL, which it cannot be, because `struct S` is not an expression and `b` names a MEMBER that no expression scope contains. ★★ THE DISCRIMINATING SHAPES: SHAPE 6 is the only one that USES the offset as an offset — `*(int *)((char *)&obj + off)` — so a wrong offset there is a wrong VALUE out of a program that built and ran, which is the failure class this construct actually threatens; every other shape compares an integer, where a wrong answer merely fails. SHAPE 7 puts `struct Packed` and `struct Plain` side by side with IDENTICAL member lists and different offsets (1 vs 4, 5 vs 8), so an implementation that summed member sizes itself — the obvious wrong way — answers the plain layout for both and passes everything else in the file; only the real `computeLayout` engine gets it right, which is the claim the shape exists to test. SHAPE 3 indexes `r[2]` of an `int[4]` at offset 12, so a step that ignored the element STRIDE answers 12 or 14 rather than 20. SHAPE 8 routes through a DIFFERENT consumer than the runtime shapes — the CST const-eval engine at Pass 1.5, via a `_Static_assert` and an array dimension — and that is the canonical use, since a header asserts an offset far more often than it computes one. ★ THE `release` ARM: every check is an explicit early return so the optimizer cannot convert a wrong answer into a right exit code, and `dss_seed` is `volatile` so the closing arithmetic keeps a real load. ⚠ THE NEGATIVE HALF IS DELIBERATELY ABSENT — a corpus example must BUILD. The three refusals (unknown member, a BIT-FIELD member, a non-constant `[index]`) are pinned in `analysis/semantic/test_builtin_compile_time_operators`, which can assert on a diagnostic CODE; ✔MEASURED that gcc 13.3.0, clang 18.1.3 and clang 19.1.1 reject the same shapes.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

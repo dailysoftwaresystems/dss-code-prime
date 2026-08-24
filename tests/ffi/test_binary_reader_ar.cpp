@@ -16,8 +16,13 @@
 //   * Failure modes each fail loud CorruptedBinary: bad magic,
 //     member-header-past-EOF, non-numeric size, member-data-past-EOF,
 //     armap-offset matches no member, "/N" long-name offset past the
-//     "//" table, truncated armap name blob, BSD/__SYMDEF + SYM64
-//     variant rejection.
+//     "//" table, truncated armap name blob, a garbage BSD ranlib size,
+//     and the still-refused 64-bit "/SYM64/" armap.
+//
+// SCOPE: this file is the GNU / System V reader. The BSD variant
+// ("__.SYMDEF" ranlib tables + "#1/N" inline member names) is PARSED as
+// of P31 and tested in `test_binary_reader_ar_bsd.cpp`, which reads real
+// committed archives instead of synthesising them.
 //
 // Strategy: synthesize minimal archives directly in C++ (byte-exact to
 // the GNU `ar` 2.42 layout audited for W1/W2) + read them back. No real
@@ -449,14 +454,23 @@ TEST(BinaryReaderAr, TruncatedArmapNameBlobRejected) {
     EXPECT_NE(r.error().detail.find("name blob ends"), std::string::npos);
 }
 
-TEST(BinaryReaderAr, BsdSymdefRejectedCleanly) {
+// The BSD armap is now PARSED, not refused (D-FF1-AR-BSD-VARIANT, P31) --
+// acceptance lives in `test_binary_reader_ar_bsd.cpp`, against real Apple-`ar`
+// and llvm-`ar` fixtures. What survives here is the shape this synthetic
+// archive actually is: a "__.SYMDEF" member whose payload is four 0x22 bytes,
+// i.e. a ranlib size of 0x22222222, which is not a multiple of the 8-byte
+// entry. That is the endian/width guard, and it is worth keeping precisely
+// because the bytes are garbage -- the reader must refuse them rather than
+// read 71 million entries out of a 4-byte member.
+TEST(BinaryReaderAr, BsdSymdefWithGarbageRanlibSizeRejected) {
     std::vector<std::uint8_t> data(4, 0x22);
     auto built = buildAr({{"__.SYMDEF", data}}, /*symbols=*/{});
     DiagnosticReporter rep;
     auto r = readArArchive(built.bytes, "bsd.a", rep);
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
-    EXPECT_NE(r.error().detail.find("BSD-variant"), std::string::npos);
+    EXPECT_NE(r.error().detail.find("not a multiple of the 8-byte"),
+              std::string::npos) << r.error().detail;
     EXPECT_NE(r.error().detail.find("D-FF1-AR-BSD-VARIANT"), std::string::npos);
 }
 

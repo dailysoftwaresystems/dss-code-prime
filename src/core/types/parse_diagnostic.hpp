@@ -1777,6 +1777,60 @@ enum class DiagnosticCode : std::uint16_t {
     // behaviour. Renders error[S006C].
     S_InlineAsmDuplicateSymbolicName = 0xE06C,
 
+    // P31 ([[D-FFI-OFFSETOF-MACRO]]): a `__builtin_offsetof` member designator
+    // does not name a member with a byte offset. ONE code for the whole family of
+    // reasons — the name is not a member of that composite, the composite is
+    // incomplete, the member is a BIT-FIELD (which has no byte offset at all, and
+    // whose address C 6.5.3.2 forbids taking), or an array-index step is not an
+    // integer constant expression — because each of them ends the SAME way: the
+    // offset is unknown. The message carries WHICH reason; the code carries the
+    // consequence. Renders error[S006D].
+    //
+    // ★ IT IS AN ERROR AND NOT A WARNING-WITH-A-ZERO, and that is the whole point
+    // of the row: `offsetof` feeds pointer arithmetic, so a fabricated offset is
+    // a wrong ADDRESS — a silent miscompile that reads or writes the wrong field
+    // and passes every test that does not happen to look at that byte.
+    S_OffsetofInvalidMember = 0xE06D,
+
+    // P31: the controlling expression of `__builtin_choose_expr` is not an
+    // integer constant expression (gcc requires one). NOT silently read as
+    // false — that would pick the OTHER arm, and both arms are valid programs, so
+    // the result would be a program that builds and does the wrong thing.
+    // Renders error[S006E].
+    S_BuiltinChooseExprNonConstant = 0xE06E,
+
+    // P31 ([[D-C-GNU-STATEMENT-EXPRESSION]]): a GNU statement expression
+    // `({ … })` whose last statement is not an expression statement — so it has
+    // NO value (gcc types it `void`) — was written where a value is required.
+    // Renders error[S006F].
+    //
+    // ★ IT MATCHES THE REFERENCES RATHER THAN NARROWING THEM, and that is a
+    // MEASUREMENT: gcc 13.3.0 says `void value not ignored as it ought to be`
+    // and clang 19.1.7 says `initializing 'int' with an expression of
+    // incompatible type 'void'` for `int x = ({ int a = 1; });`. The SAME
+    // construct in a DISCARD position (`({ int a = 1; });` as a statement) is
+    // accepted by both and is accepted here — the refusal is about the value,
+    // never about the construct.
+    // ★ IT IS AN ERROR AND NOT A ZERO-VALUED FALLBACK: there is no value to
+    // produce, and inventing one (a 0, or the last declaration's initializer)
+    // builds a program that runs and is wrong.
+    S_StatementExprHasNoValue = 0xE06F,
+
+    // P31 ([[D-C-GNU-STATEMENT-EXPRESSION]]): a GNU statement expression at FILE
+    // scope — in a global initializer, an array dimension outside a function, or
+    // any other position with no enclosing function. gcc: `braced-group within
+    // expression allowed only inside a function`; clang: `statement expression
+    // not allowed at file scope` (both ✔MEASURED 2026-08-24). The grammar admits
+    // the form wherever an operand is admitted, so the refusal lives at the
+    // semantic tier, which is the only tier that knows whether a function
+    // encloses the node. Renders error[S0070].
+    //
+    // ★ A statement expression at file scope has no frame to run its statements
+    // in; folding it to its last literal would silently DISCARD the statements
+    // before it (`int g = ({ f(); 1; });` would become `int g = 1;` with the
+    // call gone), which is the shape of silent miscompile this project refuses.
+    S_StatementExprAtFileScope = 0xE070,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

@@ -32,6 +32,21 @@
 // `expected.json` lists host OS names ("windows" / "linux" /
 // "darwin") on which the binary should spawn.
 //
+// ★★★ AND THAT POLICY MAKES THIS RUNNER THE SOLE WITNESS FOR EVERY CROSS-HOST
+// SPEC, WHICH IS NOW A CHECKED FACT RATHER THAN A HABIT.
+// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+// The CLI-subprocess sibling binds ONE target per manifest and compiles only
+// that one, by a user invariant of 2026-06-02 stated in its own header. So the
+// sentence above is not merely this runner's policy — it is the ONLY reason a
+// `runOn`-excluded spec is compiled by anything at all, and moving the `runOn`
+// gate above the compile here would silently strip every cross-target
+// capability of its only witness while both corpus suites stayed green. ⚠ The
+// shared arm-verdict vocabulary cannot express the difference: `SkippedByRunOn`
+// means *compiled, not spawned* here and *never compiled* there.
+// `tests/test_support/coverage_boundary.hpp` carries the fact the ledger
+// cannot, and the `integrated_tests/coverage-boundary` entry runs BOTH
+// harnesses on one example and judges them against it.
+//
 // A SKIP IS NOT A PASS (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT). Every
 // declared arm — every target x every optimizedPipelines arm — lands in an
 // `ArmVerdictLedger` with a named reason, and the entry prints the accounting
@@ -44,6 +59,12 @@
 // bug, which is how this defect survived in both for as long as it did.
 
 #include "arm_verdict_ledger.hpp"
+// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+// The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
+// parsed by the boundary guard. This runner is the SUPERSET half: it compiles
+// every declared target, including the ones this host can never spawn, and its
+// header states why that half is the only witness a cross-host spec has.
+#include "coverage_boundary.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
@@ -1278,6 +1299,12 @@ struct ArmResult {
     // SILENT MISS — exactly the class of defect this exists to end — and corpus
     // artifacts are single-digit KB, so the exact comparison costs nothing.
     std::string artifactBytes;
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // The ATTEMPT to exec, not its outcome. `verdict == Ran` cannot stand in for
+    // it — a spawn that FAILED is `Poisoned` — and the coverage-boundary clause
+    // that forbids exec'ing a foreign-host artifact must catch the attempt
+    // whether or not this machine let it succeed.
+    bool spawnAttempted = false;
     // Every PREREQUISITE image this arm produced, keyed by
     // `dependencyImageKey`. Captured for the SAME forced reason as
     // `artifactBytes` above — the deps are built into `scratch`'s out dir, and
@@ -2121,6 +2148,7 @@ compileAndRunArm(fs::path const& exampleDir,
     // this site was a bare `5000` literal that had to cover both, and the
     // OS half — a Gatekeeper notarization round trip that serializes across
     // concurrent execs — pushed 35/737 tests over it under `ctest -j8`.
+    armResult.spawnAttempted = true;  // the ATTEMPT, recorded BEFORE the outcome
     auto const result = runBinary(artifactPath,
                                   kRunBudget,
                                   captureStdout,
@@ -2153,7 +2181,8 @@ void runOneTarget(fs::path const&        exampleDir,
                   ExampleTarget const&   t,
                   std::string const&     exampleId,
                   ArmVerdictLedger&      ledger,
-                  ArtifactIdentityTally& identity) {
+                  ArtifactIdentityTally& identity,
+                  CoverageReport&        coverage) {
     ASSERT_FALSE(t.spec.empty())
         << "target spec missing in manifest";
     ASSERT_FALSE(t.artifact.empty())
@@ -2169,6 +2198,18 @@ void runOneTarget(fs::path const&        exampleDir,
                                            "baseline");
     ledger.record(exampleId, t.spec, "baseline", baseline.verdict,
                   baseline.detail);
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // ★★★ THE OBSERVATION THIS RUNNER IS THE ONLY ONE ABLE TO MAKE, AND WHICH
+    // THE ARM VERDICT ERASES. A `runOn`-excluded target lands in the ledger as
+    // `SkippedByRunOn` here AND in the CLI-subprocess sibling — but here it means
+    // *compiled, artifact produced, not spawned* and there it means *never
+    // compiled*. `artifactBytes` is non-empty exactly when a build succeeded (it
+    // is read off disk immediately after the size check, BEFORE the runOn gate),
+    // so it is the honest witness of the compile and is taken from the build's
+    // own result rather than re-derived from the verdict.
+    if (!baseline.artifactBytes.empty()) coverage.compiled.push_back(t.spec);
+    if (baseline.spawnAttempted) coverage.spawned.push_back(t.spec);
+    if (baseline.verdict == ArmVerdict::Ran) coverage.ran.push_back(t.spec);
     if (baseline.verdict != ArmVerdict::Ran) {
         // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the declared optimized arms
         // are NOT compiled when the baseline does not run (the early return is
@@ -2492,18 +2533,34 @@ TEST(Examples, RunFromManifest) {
 
     ArmVerdictLedger      ledger;
     ArtifactIdentityTally identity;
+    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // `declared` is filled from the manifest BEFORE the loop, so a target whose
+    // build dies mid-way still appears as declared-and-uncompiled rather than
+    // disappearing from the boundary judgement altogether.
+    CoverageReport coverage;
+    coverage.runner    = std::string{kCoverageRunnerInProcess};
+    coverage.exampleId = exampleId;
+    for (auto const& t : m.targets) coverage.declared.push_back(t.spec);
     for (auto const& t : m.targets) {
         SCOPED_TRACE("target spec=" + t.spec);
         // V2-4 Part C: an `expectDiagnostics` manifest asserts a failed
         // compile + positioned diagnostics; otherwise the source must
         // compile + run cleanly.
         if (m.expectDiagnostics.empty()) {
-            runOneTarget(exampleDir, m, t, exampleId, ledger, identity);
+            runOneTarget(exampleDir, m, t, exampleId, ledger, identity, coverage);
         } else {
             runErrorTarget(exampleDir, m, t, exampleId, ledger);
         }
     }
 
+    // ⚠ EMITTED IMMEDIATELY AFTER THE LOOP AND BEFORE THE FATAL ASSERTIONS
+    // BELOW, deliberately: the boundary guard's job includes catching a runner
+    // that started SPAWNING a spec this host cannot execute, and that change
+    // reds this entry. A coverage line printed after a fatal assert would be
+    // absent in exactly the run whose coverage the guard most needs to read,
+    // and the guard would report "the runner said nothing" instead of naming
+    // what it did.
+    std::cout << renderCoverageLine(coverage) << '\n';
 
     // ── D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the ledger ───────────────
     //

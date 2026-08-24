@@ -7475,7 +7475,7 @@ struct Lowerer {
             // — a stacked SCALAR; account it in the byte cursor + residual guard so
             // va_start's overflow base skips it (D-FC12-...).
             if (!config.argSlotAligned && ctr.gpr >= config.argGprCount
-                && !accountFixedStackScalar(anchor))
+                && !accountFixedStackScalar(anchor, interner.pointer(aggTy)))
                 return false;
             std::uint32_t const pos = ctr.nextPosition();  // one call operand
             MirInstId const ptr =
@@ -7601,13 +7601,42 @@ struct Lowerer {
         return slot == 0 ? bytes : ((bytes + slot - 1) / slot) * slot;
     }
 
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the byte displacement
+    // `va_start` must apply to the incoming-overflow base so `ap` lands past every
+    // NAMED parameter that overflowed onto the stack.
+    //
+    // ★ IT IS THE CURSOR ROUNDED UP TO A WHOLE SLOT, NOT THE CURSOR. The named
+    // region ends at a slot boundary because the first VARARG starts at one — Apple
+    // packs named scalars naturally but keeps 8-byte slots for varargs (✔MEASURED:
+    // its caller emits `str x` at +8/+16 for stacked varargs), so a named region of
+    // 4 bytes still pushes the first vararg to +8. Under `Slot` packing the cursor
+    // is already a multiple of the slot, so this is the identity and every existing
+    // target's `va_start` payload is byte-unchanged.
+    [[nodiscard]] std::uint32_t vaStartOverflowBase() const {
+        return roundUpToSlot(currentFnFixedStackBytes_, stackSlotBytes());
+    }
+
     // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: account ONE stacked fixed
     // SCALAR (or a ByReference aggregate's stacked hidden pointer) in the byte cursor
     // + residual guard. A stacked scalar AFTER a stacked aggregate desyncs the
     // per-class-ordinal siting from the byte cursor (the AAPCS64 clamp strands it) →
     // fail loud. Returns false (diagnostic emitted) on that residual. INDEPENDENT-
     // counter CCs only (the caller gates on !argSlotAligned).
-    [[nodiscard]] bool accountFixedStackScalar(HirNodeId anchor) {
+    //
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: `ty` is the parameter's
+    // TYPE, and it is a parameter rather than an assumption because under NATURAL
+    // packing the cursor advances by the datum's own size at its own alignment. This
+    // is the SAME rule `StackArgCursor` applies at the LIR tier — restated here, at
+    // the only tier that still has the types, because `va_start`'s overflow base is
+    // a byte span over the named parameter list and nothing downstream can recover
+    // it. ✔VALIDATED BY PREDICTION (2026-08-24, Apple clang 21.0.0 / macOS 26.5.2):
+    // the rule was derived from the ABI, the two numbers were PREDICTED, and the
+    // measurement then agreed — `f(int×8, char, short, ...)` bases va_start at +8
+    // (char@0, short@2, cursor 4, rounded to 8) and `f(int×8, int, char, int, ...)`
+    // at +16 (int@0, char@4, int@8, cursor 12, rounded to 16). Slot packing gives 16
+    // and 24 for those, which is what DSS emitted and what made every `va_arg` on a
+    // narrow-named-param Apple variadic read the wrong object.
+    [[nodiscard]] bool accountFixedStackScalar(HirNodeId anchor, TypeId ty) {
         if (currentFnSawStackedAggregate_) {
             unsupported(anchor,
                 "a fixed scalar parameter that overflows onto the incoming stack AFTER "
@@ -7615,9 +7644,32 @@ struct Lowerer {
                 "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
             return false;
         }
-        currentFnFixedStackBytes_    += stackSlotBytes();
+        std::uint32_t const slot = stackSlotBytes();
+        std::uint32_t const nat  = naturalStackArgBytes(ty, slot);
+        bool const natural =
+            config.stackArgPacking.namedScalars == StackArgPacking::Natural
+            && nat != 0 && nat <= slot;
+        std::uint32_t const size  = natural ? nat : slot;
+        std::uint32_t const align = natural ? nat : slot;
+        currentFnFixedStackBytes_ =
+            roundUpToSlot(currentFnFixedStackBytes_, align) + size;
         currentFnSawFixedStackParam_  = true;
         return true;
+    }
+
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the NATURAL byte size
+    // of a scalar parameter, i.e. how many bytes it owns in the incoming-stack area
+    // under natural packing. 0 (or anything larger than a slot) means "not a
+    // naturally-packable scalar", and the caller falls back to a whole slot — the
+    // pre-existing behaviour, and the right answer for a datum the LIR tier will
+    // also pad (an F80/F128 home, a 128-bit integer, an aggregate).
+    [[nodiscard]] std::uint32_t naturalStackArgBytes(TypeId ty,
+                                                     std::uint32_t slot) const {
+        if (!ty.valid()) return 0;
+        auto const bytes = scalarByteSize(interner.kind(ty), config.dataModel);
+        if (!bytes.has_value()) return 0;
+        auto const n = static_cast<std::uint32_t>(*bytes);
+        return (n == 1 || n == 2 || n == 4 || n == slot) ? n : 0;
     }
 
     // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): emit a by-value struct/union-
@@ -8225,7 +8277,7 @@ struct Lowerer {
             // silently UNDERCOUNTED a stacked aggregate (the all-or-nothing cursor
             // backfills or clamps — never EXCEEDS the pool — so the slot delta missed
             // the aggregate's bytes entirely → the deferral's fail-loud guard).
-            std::uint32_t const fixedStackBytes = currentFnFixedStackBytes_;
+            std::uint32_t const fixedStackBytes = vaStartOverflowBase();
             MirInstId const tagBase = vaTagBase(kids[0]);
             if (!tagBase.valid()) return InvalidMirInst;
 
@@ -8302,7 +8354,7 @@ struct Lowerer {
             MirInstId const first =
                 vl.variadicUsesOverflowBase
                     ? mir.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidPtr,
-                                  /*payload=*/currentFnFixedStackBytes_)
+                                  /*payload=*/vaStartOverflowBase())
                     : mir.addInst(MirOpcode::VaHomeArgAreaAddr, {}, voidPtr,
                                   /*payload=*/currentFnFixedFlat_);
             std::array<MirInstId, 2> st{first, apPtr};
@@ -8339,7 +8391,7 @@ struct Lowerer {
             // aggregate's bytes). The __gr_offs/__vr_offs clamp below reads
             // currentFnFixedGpr_/Fpr_ directly (the reception loop set them with the
             // exhaust/backfill policy), so the cursors are already correct.
-            std::uint32_t const fixedStackBytes = currentFnFixedStackBytes_;
+            std::uint32_t const fixedStackBytes = vaStartOverflowBase();
             MirInstId const base = vaTagBase(kids[0]);   // the `__va_list` struct base
             if (!base.valid()) return InvalidMirInst;
 
@@ -11947,7 +11999,7 @@ struct Lowerer {
                 std::uint32_t const pool =
                     (sCls == AbiPieceClass::Fpr) ? config.argFprCount
                                                  : config.argGprCount;
-                if (ord >= pool && !accountFixedStackScalar(p)) {
+                if (ord >= pool && !accountFixedStackScalar(p, ty)) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }

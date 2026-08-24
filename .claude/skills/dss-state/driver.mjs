@@ -193,7 +193,7 @@ async function runProbe(cli, host, tmpRoot, p) {
   for (const [name, content] of Object.entries(p.aux ?? {})) {
     writeFileSync(join(dir, name), content);
   }
-  const c = await run(cli, ['--compile', ...srcPaths, '--language', 'c-subset', '--target', host.spec, '--output', outDir], { timeoutMs: 60000 });
+  const c = await run(cli, ['--compile', ...srcPaths, '--language', 'c', '--target', host.spec, '--output', outDir], { timeoutMs: 60000 });
   if (c.timedOut) return { ...p, status: 'toolfail', detail: 'compiler timeout' };
   if (c.spawnError) return { ...p, status: 'toolfail', detail: 'compiler spawn failed' };
   if (c.rc !== 0) {
@@ -231,7 +231,7 @@ async function runMatrix(cli, tmpRoot, wsl) {
   return pool(rows, 3, async (row) => {
     const outDir = join(tmpRoot, 'matrix', row.spec.replace(/[:*]/g, '_'));
     mkdirSync(outDir, { recursive: true });
-    const c = await run(cli, ['--compile', src, '--language', 'c-subset', '--target', row.spec, '--output', outDir], { timeoutMs: 60000 });
+    const c = await run(cli, ['--compile', src, '--language', 'c', '--target', row.spec, '--output', outDir], { timeoutMs: 60000 });
     if (c.rc !== 0) return { ...row, emit: false, run: 'n/a' };
     const art = join(outDir, row.art);
     if (!existsSync(art)) return { ...row, emit: false, run: 'n/a' };

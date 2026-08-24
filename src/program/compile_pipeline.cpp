@@ -869,6 +869,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
             static_cast<std::uint32_t>(cc->argFprs.size());
         mirCfg.aggregateStackExhaustsRegisters =
             cc->aggregateStackExhaustsRegisters;
+        // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the stacked-arg
+        // packing rules — HIR→MIR needs them for `va_start`'s overflow base, which
+        // is the byte span of the named params that overflowed onto the incoming
+        // stack and therefore depends on how those params are packed.
+        mirCfg.stackArgPacking          = cc->stackArgPacking;
         // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the active CC's va_list layout
         // so HIR→MIR can lower va_start/va_arg (or fail loud when the CC omits it).
         mirCfg.vaListLayout             = cc->vaListLayout;

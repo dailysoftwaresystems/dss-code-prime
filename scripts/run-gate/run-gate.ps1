@@ -181,6 +181,31 @@ function Test-RunGateForeignPath([string]$p) {
     return ($p -match '^/')
 }
 
+# ── A LOG PATH THAT BEGINS WITH '-' IS REFUSED, BY NAME, BEFORE ANYTHING OPENS ──
+# Mirror of run-gate.sh's block; the measurement, the reason the rule is the LEADING
+# DASH rather than a PowerShell parameter SHAPE, and the './-name' escape all live
+# there. This twin is where the defect was OBSERVED: `-LogPath <path> …` bound the
+# NAME as $__argv[0] (the param block is empty on purpose, see above), and the script
+# then created a file literally called '-LogPath' in the repo root. Placed here, next
+# to Get-RunGateShellIdentity and ahead of the truncate, for the same reason and in
+# the same order as the twin.
+if ($LogPath.StartsWith('-')) {
+    Write-Host "run-gate.ps1: FAIL - the log path '$LogPath' begins with '-', so nothing was run."
+    Write-Host "  This refusal is about the LOG PATH, not about the gate command."
+    Write-Host "  shell   : $(Get-RunGateShellIdentity)"
+    Write-Host "  This wrapper's interface is POSITIONAL and it accepts NO named parameters:"
+    Write-Host "      run-gate.ps1 <log-path> <success-regex> <command> [args...]"
+    Write-Host "  If you meant '-LogPath'/'-SuccessPattern'/'-Command' as PowerShell named"
+    Write-Host "  parameters, drop the names and pass the three values in that order - this"
+    Write-Host "  script's param() block is EMPTY ON PURPOSE (declaring them breaks the"
+    Write-Host "  argument pass-through it exists to preserve), so a name binds as a VALUE."
+    Write-Host "  Refused rather than honoured because creating it would leave a stray file"
+    Write-Host "  named '$LogPath' behind, and every later tool that receives that path reads"
+    Write-Host "  a leading '-' as an OPTION - including the twin's own grep and tail."
+    Write-Host "  If you really do want that filename, spell it './$LogPath'."
+    exit 2
+}
+
 # Truncate up front (see LogPath above).
 try {
     Set-Content -LiteralPath $LogPath -Value $null -NoNewline -ErrorAction Stop
@@ -226,7 +251,62 @@ if (-not $env:CTEST_PARALLEL_LEVEL) {
     $env:CTEST_PARALLEL_LEVEL = '8'
     $__cplSet = $true
 }
+
+# ── DEFAULT: A FAILING TEST'S OWN OUTPUT GOES IN THE LOG ─────────────────────
+# Mirror of run-gate.sh's block; the reasoning, and the measurement that ctest
+# honours this variable, live there. Same env-channel argument as the level
+# above (never argv injection), same in-process scoping obligation as the level
+# above (a .ps1 assignment would otherwise outlive this script), and it prints
+# only for tests that FAIL, so a green run's log is unchanged.
+$__coofPrev = $env:CTEST_OUTPUT_ON_FAILURE
+$__coofSet  = $false
+if (-not $env:CTEST_OUTPUT_ON_FAILURE) {
+    $env:CTEST_OUTPUT_ON_FAILURE = '1'
+    $__coofSet = $true
+}
+# ── AND ACROSS THE WSL BOUNDARY, WHICH SETTING THEM DOES NOT CROSS ──────────
+#
+# ★★ THE TWIN HAD THIS AND THIS FILE DID NOT, so a `.ps1` gate that shells into
+# WSL (`run-gate.ps1 <log> <witness> wsl.exe -e ctest …`) ran with BOTH defaults
+# lost on the far side while this script believed it had set them. Windows->WSL
+# forwards only the variables `WSLENV` names.
+#
+# ✔MEASURED 2026-08-24 from THIS host's PowerShell, `wsl.exe -e printenv <NAME>`:
+#     no WSLENV ......................................... [] (empty)
+#     WSLENV='CTEST_PARALLEL_LEVEL' ..................... [8]
+#     WSLENV='CTEST_PARALLEL_LEVEL:CTEST_OUTPUT_ON_FAILURE' -> [8] and [1]
+# i.e. a plain colon-separated NAME (no `/p`, `/u`, `/w`, `/l` flag) is what these
+# two need, because neither is a path and neither needs translating.
+#
+# APPENDING, never overwriting — the twin's reason exactly: a caller may already
+# be forwarding something of their own, and clobbering it would silently drop it.
+# The membership test matches the twin's BARE-NAME test character for character so
+# the two cannot diverge about what counts as already-present. ⓘ Neither twin
+# recognises a flagged spelling (`CTEST_PARALLEL_LEVEL/p`) as the same entry; that
+# is a shared narrowing, stated so it is not rediscovered as a bug in one of them.
+#
+# ★ AND IT IS RESTORED, for the reason the level above is: a .ps1 runs IN-PROCESS,
+# so a bare assignment would outlive this script and silently re-route every later
+# `wsl.exe` the caller runs. The .sh twin's `export` dies with its own process and
+# owes nothing here.
+$__wslenvPrev = $env:WSLENV
+$__wslenvSet  = $false
+foreach ($__n in @('CTEST_PARALLEL_LEVEL', 'CTEST_OUTPUT_ON_FAILURE')) {
+    if ((':' + $env:WSLENV + ':') -notlike ('*:' + $__n + ':*')) {
+        $env:WSLENV = if ($env:WSLENV) { $env:WSLENV + ':' + $__n } else { $__n }
+        $__wslenvSet = $true
+    }
+}
+
 function Restore-CplDefault {
+    if ($script:__wslenvSet) {
+        if ($null -eq $script:__wslenvPrev) {
+            Remove-Item Env:\WSLENV -ErrorAction SilentlyContinue
+        } else {
+            $env:WSLENV = $script:__wslenvPrev
+        }
+        $script:__wslenvSet = $false
+    }
     if ($script:__cplSet) {
         if ($null -eq $script:__cplPrev) {
             Remove-Item Env:\CTEST_PARALLEL_LEVEL -ErrorAction SilentlyContinue
@@ -234,6 +314,14 @@ function Restore-CplDefault {
             $env:CTEST_PARALLEL_LEVEL = $script:__cplPrev
         }
         $script:__cplSet = $false
+    }
+    if ($script:__coofSet) {
+        if ($null -eq $script:__coofPrev) {
+            Remove-Item Env:\CTEST_OUTPUT_ON_FAILURE -ErrorAction SilentlyContinue
+        } else {
+            $env:CTEST_OUTPUT_ON_FAILURE = $script:__coofPrev
+        }
+        $script:__coofSet = $false
     }
 }
 trap { Restore-CplDefault; break }

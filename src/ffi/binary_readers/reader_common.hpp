@@ -72,9 +72,15 @@ emitAndReturn(BinaryReadErrorKind kind, std::string detail,
 // value itself (`0xFEEDFACF` LE vs `0xCFFAEDFE` BE).
 //
 // TWO structures escape that rule and MUST go through `readU32BE`
-// below: the `ar` armap, and the Mach-O `fat_header` — see the
-// kMachOFatMagic block near `guessFormat`. Reaching for `readU32` on
-// either reads a byte-swapped value that silently never matches.
+// below: the System V / GNU `ar` armap (the "/" member), and the Mach-O
+// `fat_header` — see the kMachOFatMagic block near `guessFormat`.
+// Reaching for `readU32` on either reads a byte-swapped value that
+// silently never matches.
+// ⚠ The BSD `ar` armap (the "__.SYMDEF" member) is the MIRROR trap: it
+// is LITTLE-endian and belongs on `readU32` above. The two archive
+// symbol tables therefore disagree about byte order inside one container
+// format, so "the ar armap" is not by itself enough to pick a reader —
+// the SPECIAL MEMBER'S NAME is what decides (see ar_reader.cpp).
 
 [[nodiscard]] inline std::uint16_t
 readU16(std::span<std::uint8_t const> b, std::size_t off) noexcept {

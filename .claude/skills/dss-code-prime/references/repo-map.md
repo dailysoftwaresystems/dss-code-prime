@@ -15,7 +15,7 @@
 | `src/ffi/` | FFI descriptors — how a target library's symbols are declared |
 | `src/program/`, `src/source-factory/`, `src/lsp/` | Driver / project manifest, source assembly, language server |
 | `src/dss-config/` | **The config vocabulary — this is where "target = data, not code" lives**: `sources/` (`.lang.json`), `targets/` (`.target.json`), `object-formats/` (`.format.json`), `pipelines/`, `shippedLibs/`, `schemas/` |
-| `examples/c-subset/` | The runnable corpus — each dir is `main.c` + `expected.json`, compiled → executed → exit/stdout asserted |
+| `examples/c/` | The runnable corpus — each dir is `main.c` + `expected.json`, compiled → executed → exit/stdout asserted |
 | `tests/` | GoogleTest unit + integration tests (one executable per file) |
 | **`real-examples/`** | **★ The real-world repository registry — see §2.1. Known upstream projects DSS compiles from unmodified source and whose own test suites it runs** |
 | `integrated_tests/` | The CLI-subprocess examples runner (live ctest entry `integrated_tests`) — sibling of the in-process `tests/examples/examples_runner.cpp`; **a capability added to one MUST be added to the other** |

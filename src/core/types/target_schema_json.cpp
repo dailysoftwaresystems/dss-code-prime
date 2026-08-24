@@ -27,6 +27,14 @@ namespace {
 
 using json = nlohmann::json;
 
+// The anchor id this loader's stacked-arg-packing refusal cites, spelled ONCE
+// and on ONE line. ⚠ A `std::format` message assembled from adjacent string
+// literals is exactly where an anchor id gets WRAPPED across two lines by a
+// re-indent — which does not fail anything, it makes the id invisible to the
+// registry scan and mints a false one. Naming it here makes that unwritable.
+inline constexpr std::string_view kApplePackingAnchor =
+    "D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED";
+
 using Collector = substrate::DiagnosticCollector;
 
 // Note: EVERY opcode-vocabulary `…FromName` lives in `target_schema.hpp`
@@ -3189,7 +3197,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // instances carry the most `$...Comment` prose keys - which is
                 // exactly why the carve-out lives in `rejectUnknownKeys` as a
                 // PREFIX test rather than a literal `"$comment"` entry.
-                static constexpr std::array<std::string_view, 26> kCallConvKeys{
+                static constexpr std::array<std::string_view, 27> kCallConvKeys{
                     "name",
                     "argGprs", "argFprs", "returnGprs", "returnFprs",
                     "argVrs", "returnVrs", "callerSaved", "calleeSaved",
@@ -3199,6 +3207,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     "aggregateClassification", "slotAligned",
                     "variadicArgsAlwaysStack",
                     "aggregateStackExhaustsRegisters",
+                    "stackArgPacking",
                     "linkRegister", "stackPointer", "framePointer",
                     "variadicVectorCountReg", "indirectResultRegister",
                     "vaListLayout"};
@@ -3331,6 +3340,98 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     } else {
                         cc.aggregateStackExhaustsRegisters =
                             c.at("aggregateStackExhaustsRegisters").get<bool>();
+                    }
+                }
+                // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the
+                // three-axis stacked-argument packing declaration. OPTIONAL, and
+                // an omitted object (or an omitted key inside it) means "slot" —
+                // the classic one-pointer-width-slot rule — so every CC that says
+                // nothing is byte-unchanged. Each value is a name from the closed
+                // `StackArgPacking` vocabulary; an unknown key OR an unknown value
+                // FAILS LOUD naming the accepted set, because the failure mode of
+                // silently accepting either is an ABI divergence that compiles
+                // clean and miscompiles at the boundary
+                // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+                if (c.contains("stackArgPacking")) {
+                    std::string const sapPath =
+                        std::format("{}/stackArgPacking", ccPath);
+                    if (!c.at("stackArgPacking").is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, sapPath,
+                                  "'stackArgPacking' must be an object with the "
+                                  "optional keys 'namedScalars' / "
+                                  "'namedAggregates' / 'variadic'");
+                    } else {
+                        auto const& sap = c.at("stackArgPacking");
+                        static constexpr std::array<std::string_view, 3>
+                            kStackArgPackingKeys{"namedScalars",
+                                                 "namedAggregates", "variadic"};
+                        DSS_CHECK_KEY_VOCABULARY(kStackArgPackingKeys);
+                        rejectUnknownKeys(sap, kStackArgPackingKeys, sapPath,
+                                          "a stack-arg-packing row", coll);
+                        auto readAxis =
+                            [&](std::string_view key, StackArgPacking& out) {
+                                if (!sap.contains(std::string{key})) return;
+                                auto const& v = sap.at(std::string{key});
+                                if (!v.is_string()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_MalformedJson,
+                                        std::format("{}/{}", sapPath, key),
+                                        std::format(
+                                            "'{}' must be a packing-rule name "
+                                            "string — accepted: {}", key,
+                                            detail::renderAllowedList(
+                                                allNames(kStackArgPackingTable),
+                                                " / ")));
+                                    return;
+                                }
+                                auto const s = v.get<std::string>();
+                                if (auto const p = stackArgPackingFromName(s);
+                                    p.has_value()) {
+                                    out = *p;
+                                } else {
+                                    coll.emit(
+                                        DiagnosticCode::C_MalformedJson,
+                                        std::format("{}/{}", sapPath, key),
+                                        std::format(
+                                            "unknown stack-arg packing rule '{}' "
+                                            "— accepted: {}", s,
+                                            detail::renderAllowedList(
+                                                allNames(kStackArgPackingTable),
+                                                " / ")));
+                                }
+                            };
+                        readAxis("namedScalars",    cc.stackArgPacking.namedScalars);
+                        readAxis("namedAggregates", cc.stackArgPacking.namedAggregates);
+                        readAxis("variadic",        cc.stackArgPacking.variadic);
+                        // ⚠ ONE BUILDABLE VALUE ON THE AGGREGATE AXIS, AND THE
+                        // OTHER IS REFUSED RATHER THAN APPROXIMATED. Natural
+                        // packing needs the datum's own ALIGNMENT; a stacked
+                        // aggregate reaches the placement tier through the
+                        // `ByValueStackAgg` carrier, which states a byte SIZE and
+                        // nothing else. Accepting "natural" here would make the
+                        // cursor align aggregates to the slot while advancing by
+                        // their exact size — a THIRD rule nobody measured, shipped
+                        // under the name of one that was. ✔MEASURED: both shipped
+                        // ABIs slot-round aggregates, so nothing is lost today.
+                        if (cc.stackArgPacking.namedAggregates
+                                != StackArgPacking::Slot) {
+                            coll.emit(
+                                DiagnosticCode::C_MalformedJson,
+                                std::format("{}/namedAggregates", sapPath),
+                                std::format(
+                                    "'namedAggregates' may only be '{}' today: "
+                                    "natural aggregate packing needs the "
+                                    "aggregate's own alignment, which the "
+                                    "by-value stack-aggregate carrier does not "
+                                    "state (it carries a byte size only), so the "
+                                    "placement tier cannot honour it — refusing "
+                                    "rather than approximating it as "
+                                    "slot-aligned-but-exactly-sized ({})",
+                                    stackArgPackingName(StackArgPacking::Slot),
+                                    kApplePackingAnchor));
+                            cc.stackArgPacking.namedAggregates =
+                                StackArgPacking::Slot;
+                        }
                     }
                 }
                 if (c.contains("linkRegister")) {

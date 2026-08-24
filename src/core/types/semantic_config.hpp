@@ -2301,12 +2301,22 @@ struct DSS_EXPORT SemanticConfig {
     std::uint32_t sizeofTypeChild = 0;
     RuleId        sizeofValueRule{};  std::string sizeofValueRuleName;
     // C11/C23 6.5.3.4: `_Alignof`/`alignof` typing. `alignofTypeRule` = the
-    // `_Alignof ( type-name )` form (TYPE-NAME ONLY — no value form, unlike
-    // sizeof); pass 2 resolves + stamps its `alignofTypeChild` castTypeRef child
-    // (so the HIR lowering recovers the type whose ALIGNMENT is read) and stamps
-    // the node size_t (U64). Invalid ⇒ the language has no `_Alignof` surface.
+    // `_Alignof ( type-name )` form; pass 2 resolves + stamps its
+    // `alignofTypeChild` castTypeRef child (so the HIR lowering recovers the type
+    // whose ALIGNMENT is read) and stamps the node size_t (U64). Invalid ⇒ the
+    // language has no `_Alignof` surface.
     RuleId        alignofTypeRule{};  std::string alignofTypeRuleName;
     std::uint32_t alignofTypeChild = 0;
+    // [[D-CSUBSET-ALIGNOF-VALUE-OPERAND]] (closed 2026-08-24): the
+    // `_Alignof unary-expression` form — the EXACT counterpart of
+    // `sizeofValueRule` above, and OPTIONAL for the same reason `sizeof`'s is
+    // not: ISO C has no value form, so a language may legitimately declare only
+    // the type-name arm and have the value form fail loud at parse. Present ⇒
+    // pass 2 stamps the operand with its full EXPRESSION type and the node
+    // size_t, and the CST→HIR lowering reads that DIRECT stamp (never a descent
+    // — see D-CSUBSET-SIZEOF-DEREF-ARRAY-SILENT-FALLBACK, whose silent
+    // mis-sizing is the same trap one operator across).
+    RuleId        alignofValueRule{}; std::string alignofValueRuleName;
     // D-LANG-TYPE-IDENTITY-VOCABULARY (`semantics.synthesizedTypes`): the
     // VOCABULARY ENTRY each engine-synthesized standard type resolves to, per
     // data model. `sizeof`/`_Alignof` yield C's `size_t`; a same-pointee
@@ -2315,6 +2325,55 @@ struct DSS_EXPORT SemanticConfig {
     SynthesizedTypeRule sizeofResultType;
     SynthesizedTypeRule alignofResultType;
     SynthesizedTypeRule pointerDifferenceType;
+    // P31: `__builtin_offsetof` yields C 7.19's `size_t`;
+    // `__builtin_types_compatible_p` yields `int` (gcc). Separate roles rather
+    // than a share of `sizeofResultType`, so the block reads as a list of
+    // answers to "what type does THIS operator have" with no cross-reference.
+    SynthesizedTypeRule offsetofResultType;
+    SynthesizedTypeRule typesCompatibleResultType;
+
+    // ── P31: the three GNU compile-time OPERATORS ────────────────────────────
+    // All three are OPERATORS, not builtin FUNCTIONS, and the distinction is
+    // structural rather than stylistic: a `builtinFunctions` row declares a CALL
+    // whose arguments are values with types, and none of these has an argument
+    // list at all — `__builtin_offsetof`'s first operand is a type-name and its
+    // second is a member designator that names nothing an expression scope
+    // contains; `__builtin_types_compatible_p` takes two type-names;
+    // `__builtin_choose_expr` DISCARDS one operand unevaluated. Invalid rule ⇒
+    // the language has no such surface.
+    //
+    // `__builtin_offsetof ( type-name , member-designator )` —
+    // [[D-FFI-OFFSETOF-MACRO]]. Pass 2 resolves the container type, walks the
+    // designator over the SAME `computeLayout` engine codegen reads, and records
+    // the byte offset in `nodeToFoldedConstant`. `offsetofFieldDesignatorRule` /
+    // `offsetofIndexDesignatorRule` NAME the two shipped `designator`
+    // alternatives so the walk tells `.f` from `[i]` by RULE — never by owning a
+    // second copy of the token spellings the grammar already declares.
+    RuleId        builtinOffsetofRule{};   std::string builtinOffsetofRuleName;
+    std::uint32_t builtinOffsetofTypeChild = 0;
+    std::uint32_t builtinOffsetofDesignatorChild = 0;
+    RuleId        offsetofFieldDesignatorRule{};
+    std::string   offsetofFieldDesignatorRuleName;
+    RuleId        offsetofIndexDesignatorRule{};
+    std::string   offsetofIndexDesignatorRuleName;
+    //
+    // `__builtin_types_compatible_p ( type-name , type-name )` — folds to 0/1 by
+    // the SAME interned type identity `_Generic` matches an association with, so
+    // the two can never disagree about what "compatible" means.
+    RuleId        builtinTypesCompatibleRule{};
+    std::string   builtinTypesCompatibleRuleName;
+    std::uint32_t builtinTypesCompatibleLeftChild = 0;
+    std::uint32_t builtinTypesCompatibleRightChild = 0;
+    //
+    // `__builtin_choose_expr ( const-expr , expr , expr )` — the compile-time
+    // `?:`. Pass 2 const-evaluates the condition through the SAME `constIntExpr`
+    // `_Static_assert` / array dimensions / case labels use, then records the
+    // winning arm in the SAME `nodeToSelectedExpr` side table `_Generic` writes.
+    RuleId        builtinChooseExprRule{};
+    std::string   builtinChooseExprRuleName;
+    std::uint32_t builtinChooseConditionChild = 0;
+    std::uint32_t builtinChooseThenChild = 0;
+    std::uint32_t builtinChooseElseChild = 0;
     // C23 6.7.2.5 (D-CSUBSET-TYPEOF): `typeof`/`typeof_unqual` typing. Both are
     // TYPE-SPECIFIERS resolving to the operand's type. `typeofTypeRule` = the
     // TYPE-NAME operand form (`typeof ( type-name )`, whose `typeofOperandChild`

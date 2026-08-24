@@ -1,0 +1,39 @@
+{
+  "$comment": "D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED. Apple's arm64 ABI packs a stacked NAMED SCALAR at its own alignment and advances by its own size; AAPCS64 gives each a whole 8-byte slot. DSS did the AAPCS64 thing on BOTH, which is invisible to a single-compiler corpus because a DSS caller and a DSS callee agreed with each other in every direction. The macho64-arm64 arm reads the named region THROUGH `va_list` -- an address the ABI defines rather than one DSS chooses -- and asserts Apple's offsets as literals, so it reds when the packing declaration is removed from the apple_arm64 calling convention. The other legs run the cross-tier congruence halves (the caller's placement lives in LIR, the callee's va_start base in HIR->MIR) which must hold under EITHER rule.",
+  "$commentRedOnDisable": "VERIFIED BY EXECUTION on real Apple Silicon (macOS 26.5.2), cycle P31: delete the `stackArgPacking` object from the apple_arm64 row of arm64.target.json, rebuild this example for macho64-arm64-darwin-exec, and it exits 6 instead of 0 -- bits 2 and 4, the char and short probes. Bits 1 and 8 (the two congruence halves) stay CLEAN under the mutant, which is what shows the red is the ABI fact and not the harness. Artifact md5 fixed=0bb7acc28a0a8caf18b28ee0db62167b rc=0, mutant=c5b506bb97aa6ce1ce9a1621db51ea55 rc=6.",
+  "$commentTargetGating": "The `#if defined(__arm64__)` half is macho-only by construction: arm64.target.json declares __arm64__ for the macho object formats only, so the elf64-aarch64 leg compiles the same source under AAPCS64 and runs the congruence halves. That is deliberate -- one source, two ABIs, and the leg that must NOT move is exercised alongside the one that must.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 0,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

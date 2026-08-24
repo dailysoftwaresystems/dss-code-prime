@@ -2573,8 +2573,19 @@ struct Lowerer {
         // reads the result class to pick the right arg-passing
         // register per the cycle-2b TargetCallingConvention.
         LirReg const result = lir.newVReg(regClassFor(id));
+        // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: state this
+        // parameter's NATURAL WIDTH on the `arg` instruction. It is inert for a
+        // register-resident param (callconv emits the class MOVE, which carries
+        // its own plumbing width) and inert for every `Slot`-packing CC (the
+        // stacked read stays the 8-byte slot load) — but a CC that declares
+        // NATURAL packing needs the callee's incoming-stack read to be
+        // width-EXACT, because the neighbouring argument starts inside what an
+        // 8-byte load would consume. `memAccessWidthFlags` is the SAME function
+        // the caller side uses to state the outgoing size, so the two sides agree
+        // by construction rather than by two hand-kept tables.
         emitInst(*opcode(MnemonicSlot::Arg), result, std::span<LirOperand const>{},
-                    /*payload=*/mir.argIndex(id));
+                    /*payload=*/mir.argIndex(id), /*flags=*/
+                    memAccessWidthFlags(mir.instType(id), regClassFor(id)));
         defineValue(id, result);
     }
 
@@ -7038,7 +7049,25 @@ struct Lowerer {
             }
             std::optional<LirReg> const r = regForValue(operandMir);
             if (!r.has_value()) return;
-            ops.push_back(LirOperand::makeReg(*r));
+            // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: state each
+            // argument's NATURAL BYTE SIZE on its operand. This is the ONE point
+            // in the pipeline where an argument's TYPE and its operand exist
+            // together — the LIR `Reg` below is 4 bytes of class + ordinal and
+            // carries no size, which is exactly why the overflow cursor has always
+            // padded every stacked scalar to a pointer-width slot. `lowerWideCall
+            // Args` reads it back; a `Slot`-packing CC ignores it entirely.
+            // The width comes from `memAccessWidthFlags`, the same function
+            // `lowerArg` uses for the CALLEE's read, so caller and callee cannot
+            // disagree about how many bytes the datum occupies. A by-value
+            // aggregate carrier (below) states its span on its own marker instead,
+            // so it stays 0 here.
+            std::uint8_t const argNaturalBytes =
+                mir.instOpcode(operandMir) == MirOpcode::ByValueStackArg
+                    ? std::uint8_t{0}   // the carrier's marker states the span
+                    : static_cast<std::uint8_t>(
+                          lirInstWidthBits(memAccessWidthFlags(
+                              mir.instType(operandMir), r->regClass())) / 8u);
+            ops.push_back(LirOperand::makeArgReg(*r, argNaturalBytes));
             if (mir.instOpcode(operandMir) == MirOpcode::ByValueStackArg) {
                 // The preceding Reg is the aggregate/F80 temp address; this marker
                 // carries the byte size + exhaust class (the MIR op's payload, per

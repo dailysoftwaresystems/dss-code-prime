@@ -47,6 +47,22 @@
 *.a
 *.lib
 
+# ★ BSD `ar` archive fixtures (D-FF1-AR-BSD-VARIANT), the exact mirror of the
+# `!examples/**/*.so` negation above and for the same reason. `tests/ffi/
+# test_binary_reader_ar_bsd.cpp` reads two REAL archives -- one from Apple's
+# `ar` on macOS, one from `llvm-ar --format=bsd` -- because a hand-authored BSD
+# archive would only test the reader against its author's reading of the format
+# and the two would agree by construction. Neither can be regenerated at test
+# time: the Apple one needs a Mac, and this repo's `ar` WRITER emits GNU only.
+# ★ WITHOUT THIS NEGATION both fixtures are silently un-committable and every
+# assertion in that file dies on a fresh clone -- loudly (the tests assert the
+# bytes are non-empty), but loud-on-every-clone is not shipped coverage.
+# Scoped to this one directory on purpose: `*.a` must keep ignoring real build
+# output everywhere else. `.gitattributes` already declares `tests/**/data/**`
+# `binary`, so no text rule can rewrite their bytes. Provenance + md5s for both
+# are recorded in `tests/ffi/data/README-bsd-archives.md`.
+!tests/ffi/data/*.a
+
 # Executables
 *.exe
 *.out

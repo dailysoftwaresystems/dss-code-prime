@@ -1,0 +1,32 @@
+{
+  "$comment": "P31 ([[D-C-GNU-EXTENSION-KEYWORD]]): the runnable witness for the GNU `__extension__` prefix. ★★ BORN AGAINST A REFUSAL, NOT A MISCOMPILE: ✔MEASURED through the shipped CLI at HEAD 60198126 immediately before this cycle, `__extension__ typedef long long T;` failed with `error[P0009]: expected 'Identifier', 'ParenOpen', 'StarOp', 'EndStatement', 'BracketOpen' or 'BlockOpen' — got 'typedef'` — the word was being read as a declarator NAME.\n★★ WHY THE SHAPE IS A PREFIX RULE AND NOT A DECLARATION SPECIFIER, WHICH IS THE ONE DECISION THIS FILE PINS: ✔MEASURED gcc 13.3.0 AND clang 19.1.7, each case its own translation unit so no failure masks the next — `__extension__ static int g;`, `__extension__ typedef …`, `__extension__ long long g;`, `__extension__ struct S {…};`, `__extension__ int f(void){…}` ALL compile and run, while `static __extension__ int g;` and `int __extension__ g;` are REFUSED BY BOTH. Adding the word to `singleDeclSpecifier`'s alt — the shape this repository reaches for first, and the one every other GNU dunder qualifier alias took — would have accepted two spellings NO reference accepts. SHAPE 3 (storage class AFTER the keyword) and SHAPE 4b (attribute AFTER the keyword) are the two positives that only the prefix reading admits; their negatives live in the ctest pins, which is where a REFUSAL belongs.\n★ WHY IT IS WORTH A ROW AT ALL: ✔MEASURED 2026-08-24 — a plain `#include <stdlib.h>` + 8 more ordinary headers expands (gcc 13.3.0 -E, glibc 2.39) to 23 `__extension__` occurrences, and 40 C headers under /usr/include carry 261 in total. It is the single highest-frequency remaining GNU divergence, and it is what `stdlib.h`, `strings.h`, `bits/mathcalls.h`, `bits/byteswap.h`, `bits/pthreadtypes.h` and `bits/atomic_wide_counter.h` all require before their first declaration parses.\n★ THE `release` ARM: `__extension__` is semantically transparent, so the optimizer must see EXACTLY the program the un-prefixed spelling produces. The release arm is the pin that the wrapper node is peeled before any pass can trip over it — a wrapper that survived into HIR would fail the arity/verifier gate rather than merely slow things down.\n⚠ SHAPE 10 IS NOT DECORATION. The expression prefix binds an `assignmentExpr`, not an `expression`: had it bound `expression`, `ext_double(__extension__ 4)` inside a two-argument call would parse the comma as the COMMA OPERATOR and silently pass one argument instead of two. That failure mode compiles, runs, and returns the wrong number, so it is exactly the kind this corpus exists to catch.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

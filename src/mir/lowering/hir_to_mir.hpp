@@ -148,6 +148,21 @@ struct DSS_EXPORT MirLoweringConfig {
     std::uint32_t      argFprCount                = 0;
     bool               aggregateStackExhaustsRegisters = false;
 
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the active CC's
+    // stacked-argument packing rules, threaded from the resolved
+    // `TargetCallingConvention` exactly as the fields above are.
+    //
+    // ★ WHY HIR→MIR NEEDS THEM AT ALL, given that PLACEMENT is a LIR-tier job:
+    // `va_start`'s overflow base is the byte span of the NAMED parameters that
+    // overflowed onto the incoming stack, and HIR→MIR is the only tier that walks
+    // the parameter list with its TYPES in hand. Under `Slot` packing that span is
+    // "one slot per stacked named scalar", which is what `currentFnFixedStackBytes_`
+    // has always accumulated; under `Natural` it is the naturally-packed cursor,
+    // rounded up to a whole slot. Getting it wrong is invisible to a non-variadic
+    // witness and makes every `va_arg` read the wrong object.
+    // Default (all `Slot`) reproduces the previous arithmetic byte-for-byte.
+    StackArgPackingRules stackArgPacking{};
+
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the active CC's `__va_list_tag` layout +
     // register-save-area geometry, threaded from the resolved `TargetCallingConvention`
     // (mirrors `aggregateClassification`). ENGAGED ⇒ HIR→MIR lowers va_start (4 field

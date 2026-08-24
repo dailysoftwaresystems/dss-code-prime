@@ -63,3 +63,13 @@ target_link_libraries(dss_test_support_test_mutate_target_schema
 # sibling above — it must stay a SEPARATE target.
 dss_add_test(NAME test_support/test_run_binary_deadline_clock
              SOURCES test_run_binary_deadline_clock.cpp)
+# D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+# `coverage_boundary.hpp` is the ONE grammar in which the two corpus harnesses
+# state what they actually BUILT, and the `integrated_tests/coverage-boundary`
+# entry judges the real thing with it. Most of its REFUSALS are unreachable from
+# there — a torn line, an unknown field, a spec claimed but never declared are
+# states a working pair of runners never produces — so a refusal nothing
+# exercises would be a refusal nobody knows fires. Every one of them is
+# exercised here, and every case asserts on message CONTENT.
+dss_add_test(NAME test_support/test_coverage_boundary
+             SOURCES test_coverage_boundary.cpp)

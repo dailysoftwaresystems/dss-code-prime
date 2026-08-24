@@ -131,6 +131,27 @@ hand-typing every edit or reading every subsystem.
    until the lanes that read it have reported, or hand it to a lane that owns it. Re-measure
    anything a lane reported across such an edit before acting on it — and when a lane's
    report and the tree disagree, suspect the SEQUENCING before suspecting the lane.
+   ★★ **AND THE TREE THAT RULE NAMES IS TOO NARROW: `.plans/**` IS AN INPUT TO A
+   GUARD, AND A GUARD IS A CTEST ENTRY, SO EVERY LANE'S GATE READS IT.**
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-THE-ORCHESTRATOR-EDITED-PLANS-UNDER-A-RUNNING-LANE-AND-FLIPPED-ITS-GATE`):
+   a lane's `plan_citations_guard` was RED in one gate and GREEN in the next **with no edit
+   of its own in between**, because the orchestrator applied registry rows and re-baselined
+   the citation ratchet while that gate was in flight. `anchor_registry_guard`,
+   `plan_citations_guard`, `check-anchor-balance`, `check-stale-refusal-citations` and
+   `check-retyped-closed-sets` all take `.plans/**` as their SUBJECT ⇒ a row written
+   mid-gate moves a lane's verdict exactly as a config edit moves a lane's binary.
+   ★ **THE DIRECTION THAT COSTS SOMETHING IS THE FLATTERING ONE.** That guard went
+   red→GREEN, so the lane could have concluded its earlier red was a flake and stopped
+   looking. It measured instead and named the mechanism, which is the only reason this is
+   written down rather than sitting in a wrong number.
+   ⇒ the orchestrator announces `src/dss-config/**` **and `.plans/**`** among its owned
+   paths, and holds a row application or a ratchet re-baseline until the lanes whose gates
+   read them have reported — the same hold it already owes a config edit.
+   ★★ **THE GENERAL FORM, WHICH IS THE PART WORTH CARRYING: ASK WHAT A FILE IS AN
+   INPUT TO, NOT WHICH DIRECTORY IT LIVES IN.** Both instances of this defect came from
+   reasoning about the directory — the first framed the hazard as *a config document is
+   an input to the compiler* and so stopped at `src/dss-config/**`. Any tree a GUARD takes
+   as its subject is a shared input, whatever it is called.
    ★★ **A LANE THAT BUILDS GETS ITS OWN BUILD TREE.** File ownership is not enough, because
    two lanes with disjoint FILE sets still collide in a shared `build/`: one relinks the DLL
    while the other is mid-`ctest`. ⚠ ✔MEASURED 2026-08-20 (cycle P22): `0xc0000043`
@@ -216,6 +237,90 @@ hand-typing every edit or reading every subsystem.
    ★ The reusable half: **an instruction that names the recipient's scope can be REFUTED by the
    recipient; one that only names the work cannot.** Redundancy in the addressing is what makes
    mis-delivery detectable at the destination, which is the only place it can still be caught.
+   ★★ **THE DELIVERABLE TRAVELS IN THE REPORT, NEVER AS A PATH — AND THE BRIEF SAYS SO.** A lane's
+   registry row text, its red-on-disable transcript, its md5s and any number the fold will quote come
+   back INLINE in the reply. `scratchpad/<cycle>/<lane>/` keeps its P23 job — a private place for
+   harnesses and intermediates — and stops being a place a RESULT is left.
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31,
+   `D-CYCLE-A-LANE-DELIVERABLE-LEFT-IN-THE-SCRATCHPAD-IS-INVISIBLE-TO-THE-FOLD`): TWO lanes in one
+   cycle reported by citing a path, and both paths were empty when the orchestrator read them — one
+   of them holding the lane's **registry row**, which IS that lane's deliverable, and the other a
+   483-row byte-identity baseline taken at a named commit.
+   ★ **The mechanism is an interaction between two rules that are each correct alone**, which is why
+   neither side looked wrong: `scratchpad/` is gitignored, and a `git worktree` gets **no copy of an
+   ignored directory** — so a lane working in a worktree writes into a scratchpad the main tree does
+   not have, while the orchestrator reads one the lane never wrote to. Do NOT "fix" this by
+   un-ignoring `scratchpad/`: it holds build spill and half-written harnesses, and it would not help
+   the worktree half at all, because the ignore rule is not what separates the two trees.
+   ⇒ **The one-line test to put in the brief:** *if the orchestrator would have to open a file to
+   fold your work, the work is not reported yet.*
+   ⇒ **A lane that uses a `git worktree` NAMES IT in its report**, because the orchestrator must
+   `git worktree remove` it at the fold and cannot remove one it does not know about.
+   ★★ **AND BEFORE EDITING A FILE YOU OWN, COPY IT INTO YOUR SCRATCH DIRECTORY — that
+   copy is your ONLY sanctioned undo.** The standing order forbids `git stash` / `checkout --` /
+   `clean` / `reset` because the tree is shared, and that prohibition is correct and stays
+   BLANKET. ⚠ But it was SILENT about a need it creates: a lane that corrupts its own
+   exclusively-owned file has no way back except the one thing it is forbidden to do.
+   ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-THE-NEVER-CHECKOUT-RULE-LEAVES-A-LANE-NO-WAY-TO-UNDO-ITS-OWN-EDIT`):
+   a lane ran `git checkout -- <its own config file>` to undo a malformed patch of its own, then
+   disclosed it unprompted. ★ **The disclosure is the only reason anyone knows** — a restored
+   file looks exactly like a file that was never edited, so this violation leaves nothing in any
+   diff, which makes it the one class of rule-break that cannot be caught after the fact.
+   ⇒ restore from your scratch copy: it restores exactly one file, cannot reach another lane's
+   work even by mistake, and needs no judgement about what `--` would have swept.
+   ★ The distinction to hold: **the ban is on the INSTRUMENT, not on the intent.** Undoing your
+   own bad edit is legitimate; doing it with a tree-wide tool is not. And the prohibition keeps NO
+   carve-out for "only my own files" — a tired lane applies that to a file it merely BELIEVES
+   it owns, which is the case the rule exists for.
+   ★★ **A BYTE-IDENTITY BASELINE IS TAKEN AS AN ISOLATING PAIR, NEVER INHERITED —
+   AND IN A SHARED TREE ITS SHELF LIFE IS MEASURED IN HOURS.**
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-A-BYTE-IDENTITY-BASELINE-EXPIRES-WHEN-THE-SHARED-TREE-MOVES`):
+   a lane diffed a predecessor's 483-row baseline, taken two hours earlier at the same commit, and
+   got **13 differing lines with 8 examples flipping to NO-ARTIFACT — none of them its own**. A
+   sibling lane's front-end work had landed in between, while the instrument's `cfgroot` snapshot
+   still pinned HEAD's language document.
+   ★ **The trap is that both failure modes produce the SAME diff:** *"my change moved these
+   bytes"* and *"the world moved underneath my baseline"* are indistinguishable by looking, and only
+   one is a defect. A lane that trusts an inherited baseline either hunts a regression it did not
+   cause, or — worse — accepts 13 moved rows as noise and misses a real one.
+   ⇒ **Take BOTH halves yourself:** revert only YOUR files to HEAD with
+   `git cat-file -p HEAD:<path>` (never `checkout --` or `stash`, which reach the whole shared
+   tree), leave every other lane's work in place, take the BEFORE; restore your files, take the
+   AFTER. Both runs then see the same sibling state, so your diff is the only variable left. ✔That
+   is what produced that lane's result: **zero differing lines in 486 pre-existing rows**, the final
+   manifest differing by exactly one ADDED row for its new example.
+   ★ Two corollaries, each paid for: **an inherited baseline is usable only with a CONTROL** that
+   re-derives a handful of its rows against the live tree — cheap, and it separates stale from
+   broken in one run; and **a baseline's identity is the CONFIG SNAPSHOT plus the commit**, not the
+   commit alone, so an instrument pinning a `cfgroot` must record which one and a reader must never
+   assume HEAD.
+   ⭐ **AND A PATH THAT SOMEBODY ELSE MUST RESOLVE IS ABSOLUTE, OR NAMES ITS ROOT.** TWO roots
+   answer to the name `scratchpad/`: the repository's (gitignored) and the SESSION's, under
+   `…/AppData/Local/Temp/claude/<project>/<session>/scratchpad/`, which is outside the repo
+   entirely. A lane writing to one and reporting a bare relative path sends the orchestrator to the
+   other, and both readings are plausible.
+   ★★★ **AND THE CLAUSE THE ORCHESTRATOR'S OWN ERROR HERE ADDS, WHICH BINDS EVERY
+   PARTY: A NEGATIVE RESULT CARRIES THE SCOPE IT WAS TAKEN OVER.** ⚠ ✔MEASURED 2026-08-24
+   (cycle P31): the orchestrator ran `find` over the REPO root, found none of a lane's seven
+   instruments, and told that live lane *"✔MEASURED just now: none of them exists"*. They were
+   intact in the session root the whole time — the search could not have seen them. The lane
+   began rebuilding a 483-row byte-identity baseline on that word, and the next hazard was a
+   reconstructed baseline reconciled against a real one: a claim with two provenances and no way to
+   separate them. ⇒ *"not found under `<root>`"* is a measurement; *"does not exist"* is a claim
+   the instrument did not make. Before telling a lane something of its own is missing, search every
+   root that could hold it — and prefer **asking the lane where it put the thing**, since it is
+   the one party that knows. ★ This is the same species as a lane's vacuous key-name scan and as
+   a guard clause that cannot fire on the gating leg: **a SCOPED instrument reporting an UNSCOPED
+   claim.** It is worse from the orchestrator, because a lane can refute its brief, while a lane
+   cannot easily refute a measurement handed down as fact.
+   ★★ **AND A BRIEF THAT RELAYS A PRIOR LANE'S ARTIFACT MUST OPEN ONE OF THEM FIRST**, or say
+   *"unverified, rebuild your own"*. Same measurement: the replacement brief for that second lane
+   asserted its scratchpad *"ALREADY CONTAINS the instruments and baselines"* and named seven files,
+   relayed from the prior lane's report with none of them opened — this section's own
+   run-it-before-you-write-it rule, violated one level up by the party that enforces it. ★ The
+   damage that was nearly done is the instructive part: not wasted effort, but a **RECONSTRUCTED
+   baseline presented as the prior lane's** — a byte-identity claim with no provenance, which is
+   evidence-shaped and worth nothing.
 6. **Review and fold** — `/pr-review-toolkit:review-pr`, plus the agnosticism pass and the CI-hazard
    screen. ★★ **If this cycle created or modified a `.sh`/`.ps1` pair, TWIN PARITY IS PART OF THIS
    STEP** — same inputs, same properties, same flags, same exit codes, both siblings changed in this

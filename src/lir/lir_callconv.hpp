@@ -470,6 +470,128 @@ private:
     [[nodiscard]] static std::optional<std::size_t> rowOf(LirRegClass cls);
 };
 
+// ── THE OVERFLOW-AREA CURSOR, AS ONE OBJECT FOR THE SAME REASON ─────────────
+//
+// D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED.
+//
+// `ArgCursors` answers "does this argument get a REGISTER"; this answers "and if
+// it does not, WHERE in the overflow area does it sit and HOW WIDE is the access".
+// The two questions were separated in the code but not in the hazard: the byte
+// placement of stacked arguments is walked in FOUR places that must agree
+// byte-for-byte or the caller writes where the callee does not read —
+//   * `lir_callconv::computeMaxOutgoingStackArgs` (sizes the outgoing area),
+//   * `lir_wide_call_args::lowerOneFunc` (assigns each overflow arg its offset),
+//   * `lir_callconv::materializeOneFunc`'s call arm (the residual placement),
+//   * `lir_callconv::materializeOneFunc`'s `arg` arm (the CALLEE's read),
+// and each of them used to spell the rule as its own `idx * outgoingSlotSize`.
+// That was survivable while the rule was one slot per argument. It is not
+// survivable now that a CC may declare NATURAL packing, because then the rule
+// depends on each datum's own size and alignment and a fifth spelling is a
+// silent miscompile. So the rule is spelled ONCE, here.
+//
+// ★ THE ACCESS WIDTH IS PART OF THE PLACEMENT, NOT A SEPARATE DECISION. Under
+// `Slot` the datum owns the whole pointer-width slot — the caller stored a whole
+// register into it — so the access stays the 8-byte one every existing target
+// emits (`widthFlags == 0`), byte-for-byte. Under `Natural` the datum owns
+// EXACTLY its own bytes, and an 8-byte store would clobber the next argument
+// (Apple puts a `short` at +2 with an `int` at +4), so the access must be
+// width-exact. Returning them together is what makes "packed narrow but accessed
+// wide" unwritable.
+class DSS_EXPORT StackArgCursor {
+public:
+    // `slotBytes` is the outgoing slot quantum (the GPR/pointer width) — the
+    // same value `FrameLayout::outgoingSlotSize` carries.
+    StackArgCursor(TargetCallingConvention const& cc,
+                   std::uint32_t slotBytes) noexcept
+        : rules_(cc.stackArgPacking), slot_(slotBytes == 0 ? 1u : slotBytes) {}
+
+    struct Placement {
+        std::uint32_t byteOffset;   // offset within the overflow area
+        std::uint8_t  widthFlags;   // kLirInstFlagWidth* for the access; 0 ⇒ 64-bit
+    };
+
+    // Place ONE stacked NAMED scalar whose natural size is `naturalBytes`
+    // (1/2/4/8; 0 or >slot ⇒ treated as a whole slot, which is what every
+    // pre-`Natural` producer effectively said).
+    [[nodiscard]] Placement placeNamedScalar(std::uint32_t naturalBytes) noexcept {
+        return place(rules_.namedScalars, naturalBytes);
+    }
+
+    // Place ONE stacked VARIADIC argument. Separate axis: Apple packs named
+    // scalars naturally but keeps 8-byte slots for varargs (✔MEASURED).
+    [[nodiscard]] Placement placeVariadic(std::uint32_t naturalBytes) noexcept {
+        return place(rules_.variadic, naturalBytes);
+    }
+
+    // Place ONE stacked by-value AGGREGATE of `aggBytes`: ceil(aggBytes/slot)
+    // whole slots at slot alignment.
+    //
+    // ⚠ THIS AXIS HAS ONE BUILDABLE VALUE AND THE OTHER IS REFUSED AT LOAD, not
+    // approximated here. ✔MEASURED: BOTH shipped ABIs slot-round aggregates
+    // (Apple puts an `int` after a 3-byte struct at +8, and after a 12-byte
+    // struct at +16 — not +3 / +12), so `slot` is what the vocabulary needs
+    // today. A CC declaring `namedAggregates: "natural"` would need the
+    // aggregate's own ALIGNMENT, which the `ByValueStackAgg` carrier does not
+    // state (it carries a byte SIZE only) — so the loader REFUSES that spelling
+    // rather than letting this method guess slot alignment and call it natural.
+    // (`target_schema_json.cpp`, the `stackArgPacking` reader.)
+    [[nodiscard]] std::uint32_t placeNamedAggregate(std::uint32_t aggBytes) noexcept {
+        std::uint32_t const span = ((aggBytes + slot_ - 1u) / slot_) * slot_;
+        std::uint32_t const off  = alignUp(cursor_, slot_);
+        cursor_ = off + span;
+        return off;
+    }
+
+    // The raw cursor (bytes consumed so far, NOT slot-rounded).
+    [[nodiscard]] std::uint32_t bytes() const noexcept { return cursor_; }
+
+    // The cursor rounded up to a whole slot — the size the outgoing area must
+    // reserve, and the byte displacement a callee's `va_start` must skip.
+    [[nodiscard]] std::uint32_t slotAlignedBytes() const noexcept {
+        return alignUp(cursor_, slot_);
+    }
+
+    [[nodiscard]] std::uint32_t slotBytes() const noexcept { return slot_; }
+
+private:
+    [[nodiscard]] static constexpr std::uint32_t
+    alignUp(std::uint32_t v, std::uint32_t a) noexcept {
+        return a == 0 ? v : ((v + a - 1u) / a) * a;
+    }
+
+    [[nodiscard]] Placement place(StackArgPacking rule,
+                                  std::uint32_t naturalBytes) noexcept {
+        // ⚠ A natural size the producer did not state (0), or one larger than a
+        // slot, falls back to the SLOT rule. That is the pre-existing behaviour
+        // and is correct for every `Slot` CC; a `Natural` CC that reaches here
+        // with 0 is a DROPPED CARRIER, and the caller-side walk refuses it loudly
+        // rather than letting the two sides disagree — see
+        // `lir_wide_call_args::lowerOneFunc`.
+        bool const natural = rule == StackArgPacking::Natural
+                             && naturalBytes != 0 && naturalBytes <= slot_;
+        std::uint32_t const size  = natural ? naturalBytes : slot_;
+        std::uint32_t const align = natural ? naturalBytes : slot_;
+        std::uint32_t const off   = alignUp(cursor_, align);
+        cursor_ = off + size;
+        return Placement{off, natural ? widthFlagsForBytes(naturalBytes)
+                                      : std::uint8_t{0}};
+    }
+
+    [[nodiscard]] static constexpr std::uint8_t
+    widthFlagsForBytes(std::uint32_t bytes) noexcept {
+        switch (bytes) {
+            case 1:  return kLirInstFlagWidth8;
+            case 2:  return kLirInstFlagWidth16;
+            case 4:  return kLirInstFlagWidth32;
+            default: return 0;   // 8 (and anything else) ⇒ the 64-bit access
+        }
+    }
+
+    StackArgPackingRules rules_{};
+    std::uint32_t        slot_   = 8;
+    std::uint32_t        cursor_ = 0;
+};
+
 // Per-function frame layout computed before emission. Stored so
 // downstream passes (AS1 unwind info, debug-info DWARF .debug_frame
 // generation) can read it without re-computing.

@@ -122,6 +122,39 @@ case ":${WSLENV:-}:" in
     *) export WSLENV="${WSLENV:+${WSLENV}:}CTEST_PARALLEL_LEVEL" ;;
 esac
 
+# ── DEFAULT: A FAILING TEST'S OWN OUTPUT GOES IN THE LOG ────────────────────
+#
+# ★★★ WHY THIS IS HERE. A gate that reds without saying WHY is a gate whose
+# verdict cannot be acted on, and for a PROBABILISTIC red it is worse than that:
+# the evidence is gone for good, because ctest's only other copy of a failing
+# test's output is `<build>/Testing/Temporary/LastTest.log`, which the NEXT ctest
+# run OVERWRITES. ✔MEASURED 2026-08-24 (P31): `ffi/test_c_header_parser` failed
+# once at 8-way parallelism in a scoped gate; the confirming re-run four minutes
+# later replaced `LastTest.log` with its own passing text, and the only surviving
+# artefact was a 30-byte `LastTestsFailed.log` naming the test and nothing else.
+# The flake had to be re-derived from scratch. The 30 bytes were the whole record
+# of it.
+#
+# ★★ THE MECHANISM IS CTEST'S OWN ENV CHANNEL, NOT ARGV INJECTION, and that
+# distinction is the same one the parallelism block above makes: this wrapper
+# runs an ARBITRARY command, so splicing `--output-on-failure` into someone
+# else's argv would be wrong for every gate that is not ctest.
+# `CTEST_OUTPUT_ON_FAILURE` is ignored by everything that is not ctest, and an
+# explicit flag on the command line still decides. ✔MEASURED (ctest 4.3.2,
+# Windows) on a one-entry project whose only test prints a witness and exits 1:
+#     no variable ................. the witness appears 0 times in ctest's stdout
+#     CTEST_OUTPUT_ON_FAILURE=1 ... 1 time
+#     --output-on-failure ......... 1 time
+#
+# ⓘ IT COSTS NOTHING ON A GREEN RUN — it prints only for tests that FAIL, so a
+# passing gate's log is byte-identical to what it was before this block.
+: "${CTEST_OUTPUT_ON_FAILURE:=1}"
+export CTEST_OUTPUT_ON_FAILURE
+case ":${WSLENV:-}:" in
+    *:CTEST_OUTPUT_ON_FAILURE:*) ;;
+    *) export WSLENV="${WSLENV:+${WSLENV}:}CTEST_OUTPUT_ON_FAILURE" ;;
+esac
+
 # ⓘ WHAT THIS STILL DOES NOT REACH, stated rather than left to be discovered:
 # an `ssh` child. ssh forwards no environment without `SendEnv`/`AcceptEnv`
 # on both ends, so a gate run through the ssh-arm64-vps or ssh-macos carriage
@@ -135,6 +168,52 @@ esac
 # `line NNN: C:/…: No such file or directory` printed AHEAD of the named refusal
 # below, which is the anonymous noise this whole block exists to replace. The
 # group form establishes the group's stderr first, so only our sentence survives.
+# ── A LOG PATH THAT BEGINS WITH '-' IS REFUSED, BY NAME, BEFORE ANYTHING OPENS ──
+#
+# ★★★ THE OBSERVED FAILURE WAS SILENT REPO POLLUTION, NOT A USAGE ERROR.
+# ✔MEASURED 2026-08-24 (P31): `run-gate.ps1 -LogPath <path> -SuccessRegex … -Command …`
+# — named-parameter syntax, which this wrapper deliberately does NOT accept (the
+# param block is empty ON PURPOSE; see the long comment above it in the .ps1, and
+# the interface is POSITIONAL) — bound `-LogPath` as argv[0], and the wrapper then
+# CREATED A FILE LITERALLY NAMED `-LogPath` IN THE REPO ROOT and wrote its refusal
+# into it. Nothing said "you invoked this with named-parameter syntax". The caller
+# reads a refusal about something else entirely and leaves a stray file behind.
+#
+# ★★ AND A LEADING '-' IS HOSTILE FAR BEYOND THIS SCRIPT. Every POSIX tool that
+# later receives that path reads it as an OPTION: this file's own `grep -qE "$witness" "$log"`
+# and `tail -20 "$log"` would parse it as flags, and so would every `rm`, `cat` or
+# `cp` a reader reaches for afterwards.
+#
+# ★ THE RULE IS "FIRST CHARACTER IS '-'", AND THE NARROWER ONE WAS REJECTED.
+# The obvious alternative is to match a PowerShell parameter SHAPE (`-[A-Za-z]…`).
+# Rejected for two reasons: (1) it waves through `--output.log` and `-1.log`, which
+# are exactly as hostile to the pipeline above — the defect is the leading dash, not
+# the spelling after it; and (2) it would make BOTH twins reason about PowerShell's
+# grammar, inside a file that also has to be right for POSIX. One rule, both shells,
+# is what keeps the twins from disagreeing about what they accept. The refusal still
+# NAMES the named-parameter case, because that is the one that actually happened.
+#
+# ⓘ THE ESCAPE IS THE STANDARD ONE and it works in both shells: spell it `./-name`.
+# So a caller who genuinely wants such a file is not blocked, only slowed down.
+case "$log" in
+    -*)
+        echo "run-gate.sh: FAIL — the log path '$log' begins with '-', so nothing was run." >&2
+        echo "  This refusal is about the LOG PATH, not about the gate command." >&2
+        echo "  shell   : $(run_gate_shell_identity)" >&2
+        echo "  This wrapper's interface is POSITIONAL and it accepts NO named parameters:" >&2
+        echo "      run-gate.sh <log-path> <success-regex> <command> [args...]" >&2
+        echo "  If you meant '-LogPath'/'-SuccessPattern'/'-Command' as PowerShell named" >&2
+        echo "  parameters, drop the names and pass the three values in that order — the" >&2
+        echo "  .ps1 twin's param block is empty ON PURPOSE (declaring them breaks the" >&2
+        echo "  argument pass-through it exists to preserve), so a name binds as a VALUE." >&2
+        echo "  Refused rather than honoured because creating it would leave a stray file" >&2
+        echo "  named '$log' behind, and every later tool that receives that path reads a" >&2
+        echo "  leading '-' as an OPTION — including this script's own grep and tail." >&2
+        echo "  If you really do want that filename, spell it './$log'." >&2
+        exit 2
+        ;;
+esac
+
 if ! { : > "$log"; } 2>/dev/null; then
     echo "run-gate.sh: FAIL — cannot create the log '$log', so nothing was run." >&2
     echo "  This refusal is about the LOG PATH, not about the gate command." >&2

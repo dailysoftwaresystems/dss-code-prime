@@ -8,6 +8,13 @@ cmake_minimum_required(VERSION 3.28)
 # spec selection lives at runtime, not in cmake. Always against
 # the CURRENT host platform (user invariant 2026-06-02).
 #
+# ★★★ AND THE COMPLEMENT OF THAT INVARIANT, WHICH USED TO BE UNSAID HERE:
+# because this harness compiles ONLY the host-runnable spec, a manifest's other
+# targets are compiled by the IN-PROCESS runner ALONE. That division of labour is
+# checked by the `integrated_tests/coverage-boundary` entry at the bottom of this
+# file — see
+# D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+#
 # The runner ALSO drives the curated `examples/` corpus through
 # the CLI path (parallel to the in-process exercise via
 # `tests/examples/examples_runner`). The two paths share the
@@ -170,8 +177,9 @@ set_tests_properties(integrated_tests/adjudicate PROPERTIES
 # together — one runner enforcing an arm's verdict while its sibling shrugs is a
 # silent harness bug, which is the class this whole change closes.
 #
-# ⚠ APPLIED ABOVE TO EXACTLY THE ENTRIES THAT CAN EXECUTE AN ARM: every
-# per-example entry in the `foreach`, and `cli-surface`. The two OMISSIONS are
+# ⚠ APPLIED TO EXACTLY THE ENTRIES THAT CAN EXECUTE AN ARM: every per-example
+# entry in the `foreach`, `cli-surface`, and `coverage-boundary` below (which
+# executes one corpus example through this harness). The two OMISSIONS are
 # deliberate and named here so a later reader does not "repair" them — a
 # `cmake -E rm -rf` (`cells-reset`) and an entry that executes no example
 # (`adjudicate`) have no arm whose verdict could be strict. The strictness the
@@ -182,3 +190,42 @@ set_tests_properties(integrated_tests/adjudicate PROPERTIES
 # `set_tests_properties(... ENVIRONMENT ...)` that carries `DSS_CONFIG_ROOT`.
 # Reversing the two would drop the config root and take every config-level
 # red-on-disable pin with it.
+
+# ── the coverage boundary between the TWO corpus harnesses ───────────────────
+#
+# D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+#
+# ★★★ THE ONE ENTRY THAT RUNS BOTH HARNESSES AND COMPARES THEM. Every other
+# entry in this file measures ONE runner; this one selects a corpus example that
+# has both halves of the boundary (a target this host binds, and a target whose
+# `runOn` excludes it), drives it through THIS harness, spawns
+# `dss_examples_runner` on the SAME example directory, and judges the two
+# coverage reports against the five clauses in
+# `tests/test_support/coverage_boundary.hpp`.
+#
+# ⚠ WHY IT EXISTS AT ALL: the project's rule is that a capability change must
+# reach BOTH runners, and that rule has a real exception — this harness compiles
+# only the target the host can execute, by the user invariant of 2026-06-02
+# named at the top of this file. The exception was written down; its COMPLEMENT
+# ("and the in-process runner compiles the rest") was not, and nothing checked
+# that anybody covered the other half. A cross-target capability could therefore
+# lose its only witness with both corpus suites still reporting green.
+#
+# ⚠ `$<TARGET_FILE:dss_examples_runner>` IS A FORWARD REFERENCE and that is
+# fine: `tests/` is added AFTER this directory in the root CMakeLists, and a
+# generator expression is resolved at GENERATE time, when both targets exist.
+# ⚠ NO `--cells=`, deliberately: this entry executes a corpus example, so it
+# WOULD write a cell — and that cell would join the adjudicator's population
+# from an entry the population count knows nothing about. `writeCell` no-ops
+# when the directory is unset, which is what keeps the two instruments apart.
+add_test(NAME integrated_tests/coverage-boundary
+         COMMAND integrated_tests
+                 $<TARGET_FILE:dss-code-prime>
+                 ${CMAKE_SOURCE_DIR}/examples
+                 --only=coverage-boundary
+                 "--sibling-runner=$<TARGET_FILE:dss_examples_runner>")
+set_tests_properties(integrated_tests/coverage-boundary PROPERTIES
+    ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}")
+# ORDER IS LOAD-BEARING, same as every call above: `dss_strict_arm_verdicts`
+# READS the entry's existing ENVIRONMENT and appends to it.
+dss_strict_arm_verdicts(integrated_tests/coverage-boundary)

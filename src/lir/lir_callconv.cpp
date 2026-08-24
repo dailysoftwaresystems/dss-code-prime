@@ -51,17 +51,13 @@ alignUp(std::uint32_t n, std::uint32_t align) {
     return (n + align - 1u) & ~(align - 1u);
 }
 
-// FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): the number of outgoing
-// overflow SLOTS a by-value-stack aggregate of `bytes` occupies = ceil(bytes /
-// slotSize). One source of the slot formula so the pre-scan reservation
-// (computeMaxOutgoingStackArgs) and the placement byte-copy (materializeOneFunc)
-// can NEVER disagree — a divergence would either under-reserve the frame (the
-// stack stores clobber the frame, a silent miscompile) or over-reserve it.
-[[nodiscard]] inline std::uint32_t
-byValueStackAggSlots(std::uint32_t bytes, std::uint32_t slotSize) noexcept {
-    if (slotSize == 0) return 0;
-    return (bytes + slotSize - 1u) / slotSize;
-}
+// FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): the ceil(bytes/slotSize)
+// span of a by-value-stack aggregate used to live here, as ONE source of the slot
+// formula so the pre-scan reservation (computeMaxOutgoingStackArgs) and the
+// placement byte-copy (materializeOneFunc) could never disagree. It is now
+// `StackArgCursor::placeNamedAggregate` (lir_callconv.hpp), which owns the SAME
+// invariant for one more walk and for the two SCALAR axes as well —
+// D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED.
 
 // Walk every inst of a function and collect the set of phys-reg
 // ordinals that appear as a result or as a Reg-kind operand AND that
@@ -623,10 +619,12 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
     // moved a wide call's scalar overflow args OUT of the Call operand list and
     // into `store_outgoing_arg` carriers, so the per-call arg walk below no
     // longer sees them. The reservation must still cover their slots, else the
-    // stores clobber the frame. Each store's payload is its 0-based overflow
-    // slot index (per-call, restarting at 0), so max(payload+1) across all
-    // store_outgoing_arg insts = the widest single call's overflow — exactly
-    // the shared outgoing-area size needed. Folded into maxOverflow below.
+    // stores clobber the frame.
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: each store's payload
+    // is now the BYTE OFFSET it writes at and its `flags` state the access width,
+    // so the slots it reaches into are `ceil((offset + width) / slot)` — for every
+    // `Slot`-packing CC that is `(8*i + 8)/8 = i + 1`, i.e. the previous
+    // `payload + 1` exactly. Folded into maxOverflow below.
     std::uint16_t const storeOutOp =
         schema.opcodeByMnemonic("store_outgoing_arg").value_or(0);
 
@@ -639,7 +637,12 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
             LirInstId const inst = src.blockInstAt(blk, i);
             std::uint16_t const op = src.instOpcode(inst);
             if (storeOutOp != 0 && op == storeOutOp) {
-                std::uint32_t const slots = src.instPayload(inst) + 1u;
+                std::uint32_t const endByte =
+                    src.instPayload(inst)
+                    + std::max<std::uint32_t>(
+                          1u, lirInstWidthBits(src.instFlags(inst)) / 8u);
+                std::uint32_t const slots =
+                    (endByte + outgoingSlotSize - 1u) / outgoingSlotSize;
                 if (slots > maxOverflow) maxOverflow = slots;
                 continue;
             }
@@ -683,9 +686,15 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
             // object, so "mirrors the materialize placement loop exactly" is a
             // structural fact rather than a comment two copies promise.
             ArgCursors argCursors{schema, cc};
-            std::uint32_t regOverflow = 0;              // register args past their pool
-            std::uint32_t byValSlots = 0;               // by-value-stack overflow slots
-            std::uint32_t forcedVarargs = 0;            // always-stacked variadic region
+            // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the three
+            // hand-summed counters (`byValSlots + forcedVarargs + regOverflow`)
+            // are now ONE monotonic byte cursor — the SAME object the placement
+            // loop and `lowerWideCallArgs` walk. Under a `Slot`-packing CC each
+            // item advances exactly one slot (a carrier its rounded span), so the
+            // total is byte-for-byte the old sum; under a `Natural` one the sum
+            // could not have been written at all, because the size of an item now
+            // depends on the item.
+            StackArgCursor stackCursor{cc, outgoingSlotSize};
             std::uint32_t argRegionIdx = 0;             // 0-based arg position
             for (std::size_t k = 1; k < ops.size(); ++k) {
                 LirOperand const& argOp = ops[k];
@@ -702,8 +711,8 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                     && (k + 1) < ops.size()
                     && ops[k + 1].kind == LirOperandKind::ByValueStackAgg;
                 if (isByValCarrier) {
-                    byValSlots += byValueStackAggSlots(ops[k + 1].byValueAggBytes,
-                                                       outgoingSlotSize);
+                    (void)stackCursor.placeNamedAggregate(
+                        ops[k + 1].byValueAggBytes);
                     // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64
                     // EXHAUSTS the carrier's class — a later same-class arg also stacks.
                     // PAD the class count up to its pool so the "count - pool" overflow
@@ -721,7 +730,7 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                 // overflow and do NOT add it to the class tallies (it never fills a
                 // register slot). Named args fall through to the class tallies.
                 if (variadicForcesStack && argRegionIdx >= fixedOps) {
-                    ++forcedVarargs;
+                    (void)stackCursor.placeVariadic(argOp.argNaturalBytes);
                     ++argRegionIdx;
                     continue;
                 }
@@ -744,12 +753,14 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                 // silent answer standing in for a missing one.
                 auto const slot = argCursors.next(argOp.reg.regClass());
                 if (!slot.has_value() || slot->index >= slot->poolSize)
-                    ++regOverflow;
+                    (void)stackCursor.placeNamedScalar(argOp.argNaturalBytes);
                 ++argRegionIdx;
             }
 
-            // forcedVarargs already excludes carriers (counted in byValSlots).
-            std::uint32_t const overflow = byValSlots + forcedVarargs + regOverflow;
+            // The cursor already accounts carriers, forced varargs and
+            // pool-overflowing register args, in placement order.
+            std::uint32_t const overflow =
+                stackCursor.slotAlignedBytes() / outgoingSlotSize;
             if (overflow > maxOverflow) maxOverflow = overflow;
         }
     }
@@ -831,23 +842,32 @@ LirInstId emitStackProbe(LirBuilder& b, std::uint16_t op, LirReg sp,
 // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-SCALED-IMM12 (register-offset /
 // address-materialization, future).
 //
-// accessSizeBytes: the chokepoint emits a default-width (flags=0 ⇒ width 64)
-// frame op, so the encoder's `instWidth` is 64 and its scaled field is
-// byteOffset/8. The threshold here uses the SAME access size (8) — derived
-// from `lirInstWidthBits(0)` so the two stay coupled to one width axis rather
-// than a bare literal. (Every frame load/store this chokepoint emits is the
-// 8-byte slot store; a narrower-width frame op would need its width threaded
-// in, which no caller does today.)
+// accessSizeBytes: the chokepoint emits a frame op of the caller's stated WIDTH
+// (`widthFlags`, 0 ⇒ width 64), so the encoder's `instWidth` matches and its
+// scaled field is byteOffset/accessSize. The threshold here derives the access
+// size from the SAME flags via `lirInstWidthBits`, so the two stay coupled to one
+// width axis rather than to a bare literal.
+//
+// ⚠⚠ THE DIVISOR IS THE SPECIFIC HAZARD OF THREADING A WIDTH THROUGH HERE, and it
+// is why the parameter is not optional-in-spirit. This used to be a `constexpr 8`.
+// The scaled AArch64 forms encode `imm12 = byteOffset / accessSize` with
+// accessSize taken from the instruction's own size field — so a width-32 STR at
+// [sp,#1024] is imm12 = 256, not 128. Leaving the constant at 8 while emitting a
+// narrow op would have PASSED this range test using the wrong divisor and then
+// encoded the wrong displacement: a silent frame clobber reachable only on a
+// large frame, i.e. only in the shapes a small test never builds.
+// D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED.
 [[nodiscard]] std::uint16_t
 selectFrameMemOp(std::uint16_t baseOp, std::uint16_t universalGprOp,
-                 std::uint16_t scaledOp, std::int32_t offset) {
+                 std::uint16_t scaledOp, std::int32_t offset,
+                 std::uint8_t widthFlags = 0) {
     // Only the universal GPR load/store has the scaled twin; an FPR/other
     // class op is never swapped (it would mis-encode as a GPR LDR/STR).
     if (scaledOp == 0 || baseOp != universalGprOp) return baseOp;
     bool const fitsImm9 = offset >= -256 && offset <= 255;
     if (fitsImm9) return baseOp;
-    constexpr std::uint32_t accessSizeBytes =
-        std::max<std::uint32_t>(1u, lirInstWidthBits(0) / 8u);  // = 8
+    std::uint32_t const accessSizeBytes =
+        std::max<std::uint32_t>(1u, lirInstWidthBits(widthFlags) / 8u);
     if (offset >= 0
         && static_cast<std::uint32_t>(offset) % accessSizeBytes == 0
         && static_cast<std::uint32_t>(offset) / accessSizeBytes <= 4095u) {
@@ -868,17 +888,27 @@ selectFrameMemOp(std::uint16_t baseOp, std::uint16_t universalGprOp,
 // selectFrameMemOp). Threading them through the ONE store chokepoint covers
 // every frame-store caller (saved-reg, spill, va-spill, by-value copy) by
 // construction.
+//
+// D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: `widthFlags` states the
+// ACCESS WIDTH (`kLirInstFlagWidth*`; 0 ⇒ 64-bit, which is what every frame slot,
+// spill, saved register and va-spill is). It DEFAULTS to 0 so all pre-existing
+// call sites keep emitting the exact byte sequence they always did BY
+// CONSTRUCTION rather than by re-measuring each of them — only the two stacked-
+// argument sites pass anything else, and only when the CC declares that a stacked
+// datum owns fewer bytes than a slot.
 LirInstId emitFrameStore(LirBuilder& b, std::uint16_t storeOp, LirReg value,
                          LirReg sp, std::int32_t offset,
-                         std::uint16_t universalStore = 0, std::uint16_t storeU = 0) {
+                         std::uint16_t universalStore = 0, std::uint16_t storeU = 0,
+                         std::uint8_t widthFlags = 0) {
     std::array<LirOperand, 4> ops{
         LirOperand::makeReg(value),
         LirOperand::makeReg(sp),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(offset)
     };
-    return b.addInst(selectFrameMemOp(storeOp, universalStore, storeU, offset),
-                     InvalidLirReg, ops);
+    return b.addInst(
+        selectFrameMemOp(storeOp, universalStore, storeU, offset, widthFlags),
+        InvalidLirReg, ops, /*payload=*/0, widthFlags);
 }
 
 // Emit `result = load [SP + offset]`. `load` operand layout:
@@ -886,16 +916,19 @@ LirInstId emitFrameStore(LirBuilder& b, std::uint16_t storeOp, LirReg value,
 // `universalLoad`/`loadU` are the universal GPR `load` opcode and its scaled-
 // imm12 twin `load_u` (both 0 if none); the chokepoint swaps to `loadU` for
 // an out-of-imm9 GPR-load offset (see selectFrameMemOp).
+// `widthFlags`: see `emitFrameStore` — same contract, same 0-default, same reason.
 LirInstId emitFrameLoad(LirBuilder& b, std::uint16_t loadOp, LirReg result,
                         LirReg sp, std::int32_t offset,
-                        std::uint16_t universalLoad = 0, std::uint16_t loadU = 0) {
+                        std::uint16_t universalLoad = 0, std::uint16_t loadU = 0,
+                        std::uint8_t widthFlags = 0) {
     std::array<LirOperand, 3> ops{
         LirOperand::makeReg(sp),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(offset)
     };
-    return b.addInst(selectFrameMemOp(loadOp, universalLoad, loadU, offset),
-                     result, ops);
+    return b.addInst(
+        selectFrameMemOp(loadOp, universalLoad, loadU, offset, widthFlags),
+        result, ops, /*payload=*/0, widthFlags);
 }
 
 // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): emit
@@ -2592,7 +2625,16 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // (Win64) never hits this path via a per-class miscount (its payload IS the
     // flat shared slot index — see below), but the cursor is class-agnostic so
     // it is correct there too.
-    std::uint32_t incomingStackArgByteOffset = 0;
+    //
+    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the cursor is now the
+    // shared `StackArgCursor`, so the CALLEE's read is placed by the same object
+    // that places the CALLER's write. A callee's `arg` ops are all NAMED (varargs
+    // are reached through `va_arg`, never an `arg`), so this walk uses the
+    // named-scalar axis only; a stacked by-value aggregate arrives through
+    // `RecvByValueStackParam` instead and HIR→MIR refuses the interleaving of the
+    // two (a stacked scalar after a stacked aggregate, or an aggregate straddle
+    // after a stacked scalar), so the two sitings cannot collide.
+    StackArgCursor incomingStackArgs{cc, widthForClass(schema, LirRegClass::GPR)};
 
     // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the per-alloca FRAME OFFSET
     // (sp-relative), indexed by the alloca's 0-based scan-order index — the SAME
@@ -2824,7 +2866,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // class and collides across classes); the shared cursor is
                     // the fix, so NO assertion there.
                     std::uint32_t const overflowIdx =
-                        incomingStackArgByteOffset / outLayout.outgoingSlotSize;
+                        incomingStackArgs.bytes() / outLayout.outgoingSlotSize;
                     if (cc.slotAligned && (payload - poolSize) != overflowIdx) {
                         report(reporter,
                                DiagnosticCode::L_VirtualRegInPostRegalloc,
@@ -2836,16 +2878,22 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                            overflowIdx));
                         return false;
                     }
+                    // Place this incoming arg through the SHARED cursor — under a
+                    // `Slot`-packing CC it advances one pointer-width slot per arg
+                    // (a stacked `double` is still 8 bytes) exactly as the old
+                    // `+= outgoingSlotSize` did; under `Natural` it advances by the
+                    // arg's own size, and hands back the width-EXACT access the
+                    // read needs. The arg's natural size rides the `arg`
+                    // instruction's own width flags, set by `MirToLir::lowerArg`
+                    // from the SAME `memAccessWidthFlags` the caller side used.
+                    auto const place = incomingStackArgs.placeNamedScalar(
+                        std::max<std::uint32_t>(
+                            1u, lirInstWidthBits(src.instFlags(inst)) / 8u));
                     std::int32_t const offset = static_cast<std::int32_t>(
                         outLayout.totalFrameSize
                         + static_cast<std::uint32_t>(cc.callPushBytes)
                         + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
-                        + incomingStackArgByteOffset);
-                    // Advance the shared cursor by ONE stack slot (the caller
-                    // stored this arg in exactly one pointer-width slot,
-                    // regardless of class — a stacked `double` is still 8
-                    // bytes). Mirrors the caller's `++overflowIdx`.
-                    incomingStackArgByteOffset += outLayout.outgoingSlotSize;
+                        + place.byteOffset);
                     auto const argLoad = classOpHandle(
                         schema, cls, RegClassOp::Load,
                         "materializeOneFunc: stack-resident arg load",
@@ -2863,7 +2911,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // VLA function, captured at FB where SP == the entry SP - F, so
                     // the offset is UNCHANGED). `frameBase == sp` for a non-VLA fn.
                     emitFrameLoad(b, *argLoad, result, frameBase, offset,
-                                  h.load, h.loadU);
+                                  h.load, h.loadU, place.widthFlags);
                 }
                 continue;
             }
@@ -3344,6 +3392,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 struct StackArgStore {
                     LirReg       src;
                     std::int32_t offset;  // from THIS fn's SP-post-prologue
+                    // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the
+                    // access width the shared cursor chose (0 ⇒ the 64-bit slot
+                    // store every `Slot`-packing CC emits).
+                    std::uint8_t widthFlags = 0;
                 };
                 // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a by-value-
                 // stack aggregate arg — byte-copy `bytes` from [addr] into the
@@ -3421,7 +3473,11 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // collapse, so nothing here re-spells either rule. Per-CALL
                 // state, so it is constructed per call site.
                 ArgCursors argCursors{schema, cc};
-                std::uint32_t overflowIdx = 0;  // count of stack-arg SLOTS so far
+                // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the
+                // outgoing BYTE cursor (was a slot COUNT). The SAME object
+                // `lowerWideCallArgs` and the pre-scan walk, so the three cannot
+                // drift; under a `Slot`-packing CC it yields `idx * slot` exactly.
+                StackArgCursor stackCursor{cc, outLayout.outgoingSlotSize};
                 // FC12a-struct: arg POSITION (advanced once per arg, incl. a by-value-
                 // stack aggregate carrier; NOT per raw operand — a carrier is a Reg +
                 // a ByValueStackAgg marker, two operands but ONE arg). The forced-
@@ -3498,10 +3554,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         std::int32_t const dstOffset =
                             static_cast<std::int32_t>(
                                 static_cast<std::uint32_t>(cc.shadowSpaceBytes)
-                                + overflowIdx * outLayout.outgoingSlotSize);
+                                + stackCursor.placeNamedAggregate(aggBytes));
                         byValStackCopies.push_back({srcReg, dstOffset, aggBytes});
-                        overflowIdx += byValueStackAggSlots(
-                            aggBytes, outLayout.outgoingSlotSize);
                         // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64
                         // EXHAUSTS the carrier's class (NGRN/NSRN←pool) — CLAMP the
                         // matching arg cursor so a SUBSEQUENT same-class arg/vararg gets
@@ -3627,16 +3681,26 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         }
                         // D-ML7-2.2 stack-arg overflow: spill srcReg
                         // into THIS fn's outgoing-args area at
-                        // [sp + shadowSpaceBytes + overflowIdx * slotSize].
+                        // [sp + shadowSpaceBytes + the cursor's byte offset].
                         // Stack stores are emitted BEFORE register
                         // moves below so the src reg is read before
                         // any later register move could clobber it.
+                        // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED:
+                        // the placement + its access width come from the shared
+                        // cursor, and the named/variadic axes are distinguished by
+                        // the SAME `argRegionIdx >= fixedOperandCnt` predicate the
+                        // register arm above uses.
+                        bool const isVariadicRegion =
+                            isVariadicCall && argRegionIdx >= fixedOperandCnt;
+                        auto const place =
+                            isVariadicRegion
+                                ? stackCursor.placeVariadic(argOp.argNaturalBytes)
+                                : stackCursor.placeNamedScalar(argOp.argNaturalBytes);
                         std::int32_t const offset =
                             static_cast<std::int32_t>(
                                 static_cast<std::uint32_t>(cc.shadowSpaceBytes)
-                                + overflowIdx * outLayout.outgoingSlotSize);
-                        stackStores.push_back({srcReg, offset});
-                        ++overflowIdx;
+                                + place.byteOffset);
+                        stackStores.push_back({srcReg, offset, place.widthFlags});
                     }
                     ++argRegionIdx;   // this arg position is done (one per arg)
                 }
@@ -3794,7 +3858,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // AreaSize) base; a call with many stack args can push them
                     // past imm9 — the chokepoint swaps a GPR store to store_u.
                     emitFrameStore(b, *stkStore, s.src, sp, s.offset,
-                                   h.store, h.storeU);
+                                   h.store, h.storeU, s.widthFlags);
                 }
                 // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): emit the by-
                 // value-stack aggregate byte-copies — ALSO in the stack-store phase
@@ -4181,12 +4245,17 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 continue;
             }
             // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): the pre-regalloc
-            // wide-call pass's outgoing-stack-arg store. Payload = overflow slot
-            // index; operand[0] = the (now physical) arg value. Offset =
-            // shadowSpaceBytes + payload*outgoingSlotSize — BYTE-IDENTICAL to the
-            // placement-loop stack store below, so the caller-store ↔ callee-load
-            // contract (the stack-resident `arg` read) is unchanged. Emitted in
-            // THIS fn's outgoing-args area at [sp + 0 .. outgoingArgAreaSize).
+            // wide-call pass's outgoing-stack-arg store. Operand[0] = the (now
+            // physical) arg value. Offset = shadowSpaceBytes + payload — the
+            // caller-store ↔ callee-load contract, both sides of which are placed
+            // by the ONE `StackArgCursor`.
+            // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the payload is
+            // the BYTE OFFSET (was a slot index — for every `Slot`-packing CC it
+            // is `idx * outgoingSlotSize`, so this is byte-identical), and the
+            // instruction's `flags` state the access WIDTH the cursor chose. A
+            // narrow stacked argument MUST be stored narrow: Apple puts a `short`
+            // at +2 with an `int` starting at +4, so an 8-byte store of the short
+            // would overwrite the int the callee is about to read.
             if (h.storeOutgoingArg != 0 && op == h.storeOutgoingArg) {
                 if (ops.empty() || ops[0].kind != LirOperandKind::Reg
                     || ops[0].reg.isPhysical == 0) {
@@ -4198,14 +4267,13 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     return false;
                 }
                 std::int32_t const offset = static_cast<std::int32_t>(
-                    static_cast<std::uint32_t>(cc.shadowSpaceBytes)
-                    + payload * outLayout.outgoingSlotSize);
+                    static_cast<std::uint32_t>(cc.shadowSpaceBytes) + payload);
                 auto const stkStore = classOpHandle(
                     schema, ops[0].reg.regClass(), RegClassOp::Store,
                     "materializeOneFunc: store_outgoing_arg", reporter);
                 if (!stkStore.has_value()) return false;
                 emitFrameStore(b, *stkStore, ops[0].reg, sp, offset,
-                               h.store, h.storeU);
+                               h.store, h.storeU, src.instFlags(inst));
                 continue;
             }
 

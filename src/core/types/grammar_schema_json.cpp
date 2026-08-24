@@ -7553,7 +7553,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // It is a SIBLING of `inlineAsm` rather than a member because it
             // must reach a DIALECT document too, and `inlineAsm` names twelve
             // rules of the embedded surface a dialect never imports.
-            static constexpr std::array<std::string_view, 57> kSemanticsKeys{
+            // ⓘ 57 → 60 (P31, 2026-08-24): the three GNU compile-time
+            // OPERATORS — `builtinOffsetof`, `builtinTypesCompatible`,
+            // `builtinChooseExpr`. Siblings of `sizeof`/`alignof`/`generic`
+            // rather than `builtinFunctions` rows, because their operands are
+            // TYPE-NAMES and unevaluated expressions, not call arguments.
+            static constexpr std::array<std::string_view, 60> kSemanticsKeys{
                 // declaration / reference / scope surface (plan 08.6)
                 "declarators", "declarations", "references", "memberAccesses",
                 "scopes",
@@ -7573,6 +7578,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 "variadic", "staticAssertRule", "inlineAsm",
                 "inlineAsmTemplateLexemes", "generic",
                 "compoundLiterals", "builtinFunctions",
+                // P31: the compile-time OPERATORS (not functions — see above)
+                "builtinOffsetof", "builtinTypesCompatible", "builtinChooseExpr",
                 // statement surface
                 "returnRules", "loopRules", "loopControls",
                 // single-token roles
@@ -11696,11 +11703,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // cannot be added without naming its slot, and the key set
                     // is PROJECTED from it by `keysOf` rather than retyped.
                     using RoleSlot = SynthesizedTypeRule SemanticConfig::*;
-                    static constexpr std::array<std::pair<std::string_view, RoleSlot>, 3>
+                    // 3 -> 5 (P31): `offsetof` (C 7.19 -- size_t, given its own
+                    // role rather than sharing sizeof's slot so this block answers
+                    // the question without a cross-reference) and
+                    // `typesCompatible` (gcc yields `int`).
+                    static constexpr std::array<std::pair<std::string_view, RoleSlot>, 5>
                         kSynthesizedTypeRoleRows{{
                             {"sizeof",            &SemanticConfig::sizeofResultType},
                             {"alignof",           &SemanticConfig::alignofResultType},
                             {"pointerDifference", &SemanticConfig::pointerDifferenceType},
+                            {"offsetof",          &SemanticConfig::offsetofResultType},
+                            {"typesCompatible",   &SemanticConfig::typesCompatibleResultType},
                         }};
                     static constexpr auto kSynthesizedTypeRoles =
                         keysOf(kSynthesizedTypeRoleRows,
@@ -11964,17 +11977,24 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             }
 
             // ── alignof (C11/C23 6.5.3.4) ──
-            // `{ typeRule, typeChild }` — alignof typing (TYPE-NAME FORM ONLY, so
-            // NO valueRule, unlike sizeof). Pass 2 resolves the type form's
-            // castTypeRef child + stamps the node size_t. Mirrors the sizeof
-            // block's readRule discipline (a present-but-bad field emits + fails
-            // the load; an ABSENT block leaves the rule invalid → no surface).
+            // `{ typeRule, typeChild, valueRule? }` — alignof typing. Pass 2
+            // resolves the type form's castTypeRef child + stamps the node size_t.
+            // Mirrors the sizeof block's readRule discipline (a present-but-bad
+            // field emits + fails the load; an ABSENT block leaves the rule
+            // invalid → no surface).
+            // [[D-CSUBSET-ALIGNOF-VALUE-OPERAND]] (2026-08-24): `valueRule` is
+            // OPTIONAL, and that asymmetry with sizeof's REQUIRED one is the
+            // point rather than an oversight — ISO C really has no
+            // `_Alignof(expr)`, so a language may declare the type-name arm
+            // alone and have the value form fail loud at parse. Absent field ⇒
+            // `alignofValueRule` stays invalid; PRESENT-but-unknown is still a
+            // load failure, so a typo cannot silently disable the form.
             if (sem.contains("alignof")) {
                 json const& al = sem.at("alignof");
                 if (!al.is_object()) {
                     coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/alignof",
                               "'semantics.alignof' must be an object "
-                              "{ typeRule, typeChild }");
+                              "{ typeRule, typeChild, valueRule? }");
                 } else {
                     if (!al.contains("typeRule") || !al.at("typeRule").is_string()) {
                         coll.emit(DiagnosticCode::C_MissingField,
@@ -11993,6 +12013,26 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 data.rules->find(cfg.alignofTypeRuleName);
                         }
                     }
+                    if (al.contains("valueRule")) {
+                        if (!al.at("valueRule").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/alignof/valueRule",
+                                      "'valueRule' must be a string");
+                        } else {
+                            cfg.alignofValueRuleName =
+                                al.at("valueRule").get<std::string>();
+                            if (!data.rules->contains(cfg.alignofValueRuleName)) {
+                                coll.emit(DiagnosticCode::C_UnknownShape,
+                                          "/semantics/alignof/valueRule",
+                                          std::format("'alignof.valueRule' references "
+                                                      "unknown shape '{}'",
+                                                      cfg.alignofValueRuleName));
+                            } else {
+                                cfg.alignofValueRule =
+                                    data.rules->find(cfg.alignofValueRuleName);
+                            }
+                        }
+                    }
                     // `typeChild` is required — readReqIndex emits its own
                     // C_MissingField / C_InvalidSemantics into `coll` on a bad
                     // value (failing the load); the flag just satisfies the
@@ -12004,6 +12044,110 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── P31: the three GNU compile-time OPERATORS ──
+            // Each is `{ rule, <child indices>, ... }`. They share one loader
+            // shape and one discipline: a MISSING required field emits and fails
+            // the load, and an ABSENT block leaves every rule invalid so the
+            // language simply has no such surface (toy / tsql are unaffected).
+            {
+                auto readOpRule = [&](json const& blk, char const* block,
+                                      char const* key, RuleId& outRule,
+                                      std::string& outName) {
+                    if (!blk.contains(key) || !blk.at(key).is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  std::string{"/semantics/"} + block + "/" + key,
+                                  std::format("'{}' is required and must be a "
+                                              "string", key));
+                        return;
+                    }
+                    outName = blk.at(key).get<std::string>();
+                    if (!data.rules->contains(outName)) {
+                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                  std::string{"/semantics/"} + block + "/" + key,
+                                  std::format("'{}.{}' references unknown shape "
+                                              "'{}'", block, key, outName));
+                        return;
+                    }
+                    outRule = data.rules->find(outName);
+                };
+
+                // `__builtin_offsetof ( type-name , member-designator )`
+                // [[D-FFI-OFFSETOF-MACRO]] - what <stddef.h>'s `offsetof` expands to.
+                if (sem.contains("builtinOffsetof")) {
+                    json const& b = sem.at("builtinOffsetof");
+                    if (!b.is_object()) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  "/semantics/builtinOffsetof",
+                                  "'semantics.builtinOffsetof' must be an object "
+                                  "{ rule, typeChild, designatorChild, "
+                                  "fieldDesignatorRule, indexDesignatorRule }");
+                    } else {
+                        readOpRule(b, "builtinOffsetof", "rule",
+                                   cfg.builtinOffsetofRule,
+                                   cfg.builtinOffsetofRuleName);
+                        readOpRule(b, "builtinOffsetof", "fieldDesignatorRule",
+                                   cfg.offsetofFieldDesignatorRule,
+                                   cfg.offsetofFieldDesignatorRuleName);
+                        readOpRule(b, "builtinOffsetof", "indexDesignatorRule",
+                                   cfg.offsetofIndexDesignatorRule,
+                                   cfg.offsetofIndexDesignatorRuleName);
+                        bool ok = true;
+                        readReqIndex(b, "typeChild", "/semantics/builtinOffsetof",
+                                     cfg.builtinOffsetofTypeChild, ok);
+                        readReqIndex(b, "designatorChild",
+                                     "/semantics/builtinOffsetof",
+                                     cfg.builtinOffsetofDesignatorChild, ok);
+                        (void)ok;
+                    }
+                }
+
+                // `__builtin_types_compatible_p ( type-name , type-name )`
+                if (sem.contains("builtinTypesCompatible")) {
+                    json const& b = sem.at("builtinTypesCompatible");
+                    if (!b.is_object()) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  "/semantics/builtinTypesCompatible",
+                                  "'semantics.builtinTypesCompatible' must be an "
+                                  "object { rule, leftTypeChild, rightTypeChild }");
+                    } else {
+                        readOpRule(b, "builtinTypesCompatible", "rule",
+                                   cfg.builtinTypesCompatibleRule,
+                                   cfg.builtinTypesCompatibleRuleName);
+                        bool ok = true;
+                        readReqIndex(b, "leftTypeChild",
+                                     "/semantics/builtinTypesCompatible",
+                                     cfg.builtinTypesCompatibleLeftChild, ok);
+                        readReqIndex(b, "rightTypeChild",
+                                     "/semantics/builtinTypesCompatible",
+                                     cfg.builtinTypesCompatibleRightChild, ok);
+                        (void)ok;
+                    }
+                }
+
+                // `__builtin_choose_expr ( const-expr , expr , expr )`
+                if (sem.contains("builtinChooseExpr")) {
+                    json const& b = sem.at("builtinChooseExpr");
+                    if (!b.is_object()) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  "/semantics/builtinChooseExpr",
+                                  "'semantics.builtinChooseExpr' must be an object "
+                                  "{ rule, conditionChild, thenChild, elseChild }");
+                    } else {
+                        readOpRule(b, "builtinChooseExpr", "rule",
+                                   cfg.builtinChooseExprRule,
+                                   cfg.builtinChooseExprRuleName);
+                        bool ok = true;
+                        readReqIndex(b, "conditionChild",
+                                     "/semantics/builtinChooseExpr",
+                                     cfg.builtinChooseConditionChild, ok);
+                        readReqIndex(b, "thenChild", "/semantics/builtinChooseExpr",
+                                     cfg.builtinChooseThenChild, ok);
+                        readReqIndex(b, "elseChild", "/semantics/builtinChooseExpr",
+                                     cfg.builtinChooseElseChild, ok);
+                        (void)ok;
+                    }
+                }
+            }
             // ── typeof / typeof_unqual (C23 6.7.2.5, D-CSUBSET-TYPEOF) ──
             // `{ typeRule, valueRule, operandChild, stripQualifiersToken? }` — the
             // two operand forms (type-name / expression) share the operand
@@ -14729,6 +14873,46 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("genericRule",         cfg.genericRule,         cfg.genericRuleName);
             // D-CSUBSET-COMPUTED-GOTO: `&&label` → core HirKind::LabelAddressOf.
             readExprRule("labelAddressRule",    cfg.labelAddressRule,    cfg.labelAddressRuleName);
+            // P31: `__builtin_choose_expr` → the SAME recorded-selection lowering
+            // `genericRule` takes (the winner's NodeId out of `nodeToSelectedExpr`).
+            readExprRule("chooseExprRule",      cfg.chooseExprRule,      cfg.chooseExprRuleName);
+            // P31: the GNU statement expression `({ … })` → core HirKind::SeqExpr.
+            // Its children are STATEMENTS; like sizeof/_Generic it must never take
+            // the generic operand descent.
+            readExprRule("stmtExprRule",        cfg.stmtExprRule,        cfg.stmtExprRuleName);
+
+            // ── P31: foldedConstantRules [ shapeName, ... ] ──
+            // The rules CST→HIR lowers by emitting the semantic tier's recorded
+            // compile-time value instead of walking a subtree. A LIST because the
+            // verb is one; a present-but-unknown shape FAILS THE LOAD, so a typo
+            // cannot silently turn a construct back into an ordinary expression.
+            if (hl.contains("foldedConstantRules")) {
+                json const& arr = hl.at("foldedConstantRules");
+                if (!arr.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/hirLowering/foldedConstantRules",
+                              "'foldedConstantRules' must be an array of shape names");
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        auto const path =
+                            std::format("/hirLowering/foldedConstantRules/{}", i);
+                        if (!arr[i].is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each entry must be a shape name string");
+                            continue;
+                        }
+                        auto name = arr[i].get<std::string>();
+                        if (!data.rules->contains(name)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'foldedConstantRules' references "
+                                                  "unknown shape '{}'", name));
+                            continue;
+                        }
+                        cfg.foldedConstantRules.push_back(data.rules->find(name));
+                        cfg.foldedConstantRuleNames.push_back(std::move(name));
+                    }
+                }
+            }
 
             // ── HR10: extensionKinds [{ name, lang }] ──
             if (hl.contains("extensionKinds")) {

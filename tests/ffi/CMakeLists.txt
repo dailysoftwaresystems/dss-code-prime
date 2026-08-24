@@ -52,3 +52,12 @@ dss_add_test(NAME ffi/test_environ_data_object_binding
              SOURCES test_environ_data_object_binding.cpp)
 target_link_libraries(dss_ffi_test_environ_data_object_binding
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-FF1-AR-BSD-VARIANT (P31): the BSD `ar` variant -- "__.SYMDEF" /
+# "__.SYMDEF SORTED" ranlib tables and "#1/N" inline member names. Split from
+# its GNU sibling because it reads REAL committed fixtures (tests/ffi/data/
+# libbsdapple.a from Apple ar, libbsdllvm.a from llvm-ar --format=bsd) rather
+# than synthesising bytes -- see that file's header for why. Needs no json
+# link: it reads binary bytes, not shipped descriptors.
+dss_add_test(NAME ffi/test_binary_reader_ar_bsd
+             SOURCES test_binary_reader_ar_bsd.cpp)
