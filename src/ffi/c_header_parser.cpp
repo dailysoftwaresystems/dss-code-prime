@@ -3,6 +3,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/types/config_path_walk.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -208,31 +209,30 @@ emitWithFirstReportedCause(HeaderReadErrorKind              kind,
 
 [[nodiscard]] std::expected<std::string, HeaderReadError>
 slurpFile(std::filesystem::path const& path, DiagnosticReporter& reporter) {
-    std::ifstream in{path, std::ios::binary};
-    if (!in.is_open()) {
+    // Silent-failure C2 (mid-read I/O truncation) + C3 (output-side OOM): a
+    // successful open followed by a drain that hits either leaves a PARTIAL
+    // PREFIX, and the parser then either accepts truncated input or emits a
+    // misleading parse error. (post-FF2-#2 silent-failure CRITICAL fold.)
+    //
+    // ★★ THE CHECK THIS SITE CARRIED WAS THE FIRST IN THE TREE AND IT WAS STILL
+    // NOT ENOUGH — which is exactly why the drain now lives in ONE place
+    // (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    // ✔MEASURED: `in.bad()` after `ss << in.rdbuf()` is unreachable (the
+    // insertion goes through the STREAMBUF and never touches the istream
+    // object), `ss.bad()` does not fire when the streambuf THROWS (that is
+    // failbit), and a short read reporting EOF — what a real OS read error
+    // produces — sets no bit at all. The shared helper compares BYTES.
+    auto text = core::readFileChecked(path);
+    if (!text) {
+        auto const err = std::move(text).error();
         return std::unexpected(emitAndReturn(
             HeaderReadErrorKind::FileOpenFailed,
-            "FFI header file could not be opened: " + path.generic_string(),
+            (err.kind == core::FileReadFailure::OpenFailed
+                 ? "FFI header file could not be opened: " + path.generic_string()
+                 : "FFI header file: " + err.message),
             reporter));
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    // Silent-failure C2 (mid-read I/O truncation) + C3 (output-side
-    // OOM): a successful `is_open()` followed by `rdbuf` drain that
-    // hits either an input badbit (disk/network I/O error) OR an
-    // output badbit (allocation failure mid-stream) leaves a partial
-    // prefix in `ss`. Without checking BOTH, the parser would either
-    // silently accept truncated input or emit a misleading parse
-    // error. (post-FF2-#2 silent-failure CRITICAL fold.)
-    if (in.bad() || ss.bad()) {
-        return std::unexpected(emitAndReturn(
-            HeaderReadErrorKind::FileOpenFailed,
-            std::string{"FFI header file I/O error after open: "}
-                + path.generic_string()
-                + (ss.bad() ? " (output buffer allocation failure)" : ""),
-            reporter));
-    }
-    return ss.str();
+    return *std::move(text);
 }
 
 } // namespace

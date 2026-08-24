@@ -139,3 +139,42 @@ dss_add_test(NAME analysis/semantic/test_gnu_extension_and_statement_expr
              SOURCES test_gnu_extension_and_statement_expr.cpp)
 target_include_directories(dss_analysis_semantic_test_gnu_extension_and_statement_expr
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P32 lane A: [[D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED]]
+# -- an attribute clause NAME spelled with a KEYWORD (`__attribute__((__const__))`,
+# 50 occurrences in ONE preprocessed glibc TU). Lives here rather than only in the
+# runnable corpus because a corpus example must BUILD, so it can only exercise the
+# ACCEPTING half -- and the accepting half is exactly what a GRAMMAR-ONLY widening
+# also passes, while silently dropping every keyword-named attribute. The pins
+# that separate the two are REFUSALS and their exact codes: an unmodelled
+# keyword-spelled name must reach the strict gate and fail loud, and its modelled
+# sibling must not. Shares `semantic_test_fixture.hpp`, so it needs the tests/
+# include root for the same reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_attribute_clause_name_token_class
+             SOURCES test_attribute_clause_name_token_class.cpp)
+target_include_directories(dss_analysis_semantic_test_attribute_clause_name_token_class
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P32 lane A: [[D-C-SUBTREE-TYPE-WALKS-INTO-A-STATEMENT-EXPRESSION-BODY]] -- the
+# semantic expression typer must take a statement expression's type from the LAST
+# ITEM'S EXPRESSION (the same place the lowering takes its value) and not from a
+# declaration inside the body. The runnable example owns the accepting half; this
+# owns the REFUSING half, which an example structurally cannot carry: a `void`
+# statement expression in value position must be REFUSED with its own code, not
+# silently typed from whatever the body declared.
+dss_add_test(NAME analysis/semantic/test_stmt_expr_value_type
+             SOURCES test_stmt_expr_value_type.cpp)
+target_include_directories(dss_analysis_semantic_test_stmt_expr_value_type
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P32 lane A: [[D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT]] plus the SEMANTIC
+# half of [[D-CSUBSET-ATTRIBUTE-PARAM-POSITION]]. Every discard shape is pinned as
+# a PAIR -- a must-warn context beside a must-not-warn sibling -- because a
+# discard test can fail in two opposite directions and only the pair can tell a
+# fix that landed from a fix that over-reached. The parameter-attribute pin
+# asserts the EFFECT (a `deprecated` parameter warns at its USE site) rather than
+# the parse, which is what a grammar-only change would also pass.
+dss_add_test(NAME analysis/semantic/test_nodiscard_discard_context
+             SOURCES test_nodiscard_discard_context.cpp)
+target_include_directories(dss_analysis_semantic_test_nodiscard_discard_context
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

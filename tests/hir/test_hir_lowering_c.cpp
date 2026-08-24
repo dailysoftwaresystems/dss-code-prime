@@ -24,6 +24,9 @@
 #include "tokenizer/token_stream.hpp"
 #include "tokenizer/tokenizer.hpp"
 
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+#include "shipped_schema_or_throw.hpp"   // the ONE load-or-fail-this-test helper
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -33,6 +36,7 @@
 #include <fstream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -52,9 +56,13 @@ namespace {
 // Drive: c source → CompilationUnit → SemanticModel. Asserts the front
 // end (parse + semantic) is clean so a lowering test never chases a phantom.
 [[nodiscard]] SemanticModel analyzeC(std::string src) {
-    auto loaded = GrammarSchema::loadShipped("c");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
-    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // ✔MEASURED against an emptied shipped config, the abort took the whole
+    // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
+    // no summary -- every sibling test in this executable lost its verdict.
+    auto const loaded = dss::test_support::shippedSchemaOrThrow("c");
+    UnitBuilder builder{loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     return analyze(cu, DiagnosticBudget::libraryDefault());
@@ -65,9 +73,13 @@ namespace {
 // witness the FORMAT-keyed wide-char constraint (an astral `L'😀'` is representable
 // under the default I32 but NOT under the pe U16).
 [[nodiscard]] SemanticModel analyzeCPe(std::string src) {
-    auto loaded = GrammarSchema::loadShipped("c");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
-    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // ✔MEASURED against an emptied shipped config, the abort took the whole
+    // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
+    // no summary -- every sibling test in this executable lost its verdict.
+    auto const loaded = dss::test_support::shippedSchemaOrThrow("c");
+    UnitBuilder builder{loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     return analyze(cu, DiagnosticBudget::libraryDefault(),
@@ -85,9 +97,13 @@ namespace {
 // program (no `#include`) parses via Tokenizer+Parser directly (skipping the PP)
 // and is ingested via `UnitBuilder::addTree` — exactly the construct these pins use.
 [[nodiscard]] SemanticModel analyzeCRaisedCap(std::string src, std::size_t cap) {
-    auto loaded = GrammarSchema::loadShipped("c");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
-    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // ✔MEASURED against an emptied shipped config, the abort took the whole
+    // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
+    // no summary -- every sibling test in this executable lost its verdict.
+    auto const loaded = dss::test_support::shippedSchemaOrThrow("c");
+    std::shared_ptr<GrammarSchema const> schema = loaded;
     auto srcBuf = SourceBuffer::fromString(std::move(src), "<deepmem>");
     Tokenizer tk{srcBuf, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
@@ -144,15 +160,19 @@ namespace {
 [[nodiscard]] std::string shippedCText() {
     fs::path const cand =
         dss::test::configRoot() / "sources" / "c.lang.json";
-    std::ifstream in{cand, std::ios::binary};
-    if (!in) {
-        ADD_FAILURE() << "cannot open shipped c.lang.json at "
-                      << cand.string();
-        return {};
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT: this
+    // returned an EMPTY string on an unreadable config, and the caller then
+    // aborted on the resulting missing needle -- so an I/O fault surfaced as
+    // "shiftResult key not found", one frame away from the truth, and killed
+    // the binary. THROW at the fault, and read through the ONE checked read
+    // (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT) so a
+    // TORN read is named as a read failure rather than as a bad document.
+    auto text = dss::core::readFileChecked(cand);
+    if (!text) {
+        throw std::runtime_error("shipped c.lang.json: "
+                                 + std::move(text).error().message);
     }
-    std::stringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
+    return *std::move(text);
 }
 
 // Lower `void f(int a, long b) { a << b; }` under a schema whose
@@ -169,36 +189,34 @@ namespace {
     std::string const needle = "\"shiftResult\": \"promotedLeft\"";
     auto const pos = text.find(needle);
     if (pos == std::string::npos) {
-        ADD_FAILURE() << "shiftResult key not found in shipped c config";
-        std::abort();
+        throw std::runtime_error(
+            "shiftResult key not found in shipped c config");
     }
     text.replace(pos, needle.size(), "\"shiftResult\": \"" + verb + "\"");
     auto schema = GrammarSchema::loadFromText(text,
                                               "<shiftResult-" + verb + ">");
     if (!schema) {
-        ADD_FAILURE() << "perturbed schema (shiftResult=" << verb << ") failed";
-        std::abort();
+        throw std::runtime_error("perturbed schema (shiftResult=" + verb
+                                 + ") failed to load");
     }
     UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory("void f(int a, long b) { a << b; }\n", "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
     if (model.hasErrors()) {
-        ADD_FAILURE() << "front-end errors under shiftResult=" << verb;
-        std::abort();
+        throw std::runtime_error("front-end errors under shiftResult=" + verb);
     }
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     if (!res->ok) {
-        ADD_FAILURE() << "lowering failed under shiftResult=" << verb;
-        std::abort();
+        throw std::runtime_error("lowering failed under shiftResult=" + verb);
     }
     HirNodeId const fn = firstFunction(res->hir);
     HirNodeId const shift =
         findFirstByKind(res->hir, res->hir.functionBody(fn), HirKind::BinaryOp);
     if (!shift.valid()) {
-        ADD_FAILURE() << "no BinaryOp in body under shiftResult=" << verb;
-        std::abort();
+        throw std::runtime_error("no BinaryOp in body under shiftResult="
+                                 + verb);
     }
     return model.lattice().interner().kind(res->hir.typeId(shift));
 }
@@ -5199,10 +5217,17 @@ namespace {
 }
 
 [[nodiscard]] std::string readFile(fs::path const& p) {
-    std::ifstream in{p, std::ios::binary};
-    if (!in) { ADD_FAILURE() << "cannot open " << p.string(); std::abort(); }
-    std::ostringstream buf; buf << in.rdbuf();
-    std::string s = std::move(buf).str();
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // `std::abort()` here killed the whole binary, so one unreadable golden
+    // cost every sibling test its verdict. THROW -- GoogleTest reports an
+    // escaping exception as a failure of the ONE running test. The read itself
+    // goes through the ONE checked read, so a golden that reads SHORT is named
+    // as a torn read instead of surfacing as a golden mismatch.
+    auto text = dss::core::readFileChecked(p);
+    if (!text) {
+        throw std::runtime_error("golden: " + std::move(text).error().message);
+    }
+    std::string s = *std::move(text);
     std::erase(s, '\r');   // CRLF→LF: golden compare is line-ending agnostic (Windows autocrlf)
     return s;
 }
@@ -6794,9 +6819,13 @@ TEST(HirLoweringC, DeepNestedSwitchAnalyzesFlatOnNormalStack) {
     // off the bounded reserve), then ANALYZE on the bounded reserve — the flatness
     // witness. A bare `int main(){…}` program parses via Tokenizer+Parser directly
     // (no PP) and is ingested via addTree — exactly as analyzeCRaisedCap does.
-    auto loaded = GrammarSchema::loadShipped("c");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
-    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // ✔MEASURED against an emptied shipped config, the abort took the whole
+    // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
+    // no summary -- every sibling test in this executable lost its verdict.
+    auto const loaded = dss::test_support::shippedSchemaOrThrow("c");
+    std::shared_ptr<GrammarSchema const> schema = loaded;
     auto cu = dss::substrate::callOnLargeStack(
         dss::substrate::kDeepRecursionStackBytes,
         [&]() -> std::shared_ptr<CompilationUnit const> {
@@ -8406,9 +8435,13 @@ namespace {
     // ended in `std::abort()`, which kills the whole test BINARY and costs
     // every sibling test its verdict. `configRoot()` throws instead.
     fs::path const shipped = dss::test::configRoot() / "shippedLibs";
-    auto loaded = GrammarSchema::loadShipped("c");
-    if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
-    UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // ✔MEASURED against an emptied shipped config, the abort took the whole
+    // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
+    // no summary -- every sibling test in this executable lost its verdict.
+    auto const loaded = dss::test_support::shippedSchemaOrThrow("c");
+    UnitBuilder builder{loaded, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(shipped);
     builder.setActiveFormat(format);
     builder.addInMemory(std::move(src), "main.c");

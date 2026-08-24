@@ -1,5 +1,6 @@
 #include "core/types/source_buffer.hpp"
 
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/mint_monotonic_id.hpp"
 
 #include <algorithm>
@@ -64,20 +65,19 @@ SourceBuffer::SourceBuffer(BufferId id, std::string text, std::string name)
     , lineStarts_(buildLineStarts(text_)) {}
 
 std::shared_ptr<SourceBuffer> SourceBuffer::fromFile(std::filesystem::path const& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("SourceBuffer::fromFile: cannot open " + path.string());
+    // A drain can silently truncate on a mid-stream IO error (disk failure,
+    // network share disconnect), and a truncated source file tokenizes to a
+    // quietly-incorrect program rather than to an error. THE ONE CHECKED READ
+    // (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT) — the
+    // `if (in.bad())` this replaces could not fire at all: `<< in.rdbuf()` goes
+    // through the streambuf and never touches the istream's own state
+    // (✔MEASURED). The helper compares BYTES against the size it measured.
+    auto text = core::readFileChecked(path);
+    if (!text) {
+        throw std::runtime_error("SourceBuffer::fromFile: "
+                                 + std::move(text).error().message);
     }
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    // `in.rdbuf()` can silently truncate on mid-stream IO errors (disk
-    // failure, network share disconnect). Check the stream state
-    // explicitly so a truncated read becomes a loud error rather than
-    // a quietly-incorrect tokenization of half the file.
-    if (in.bad()) {
-        throw std::runtime_error("SourceBuffer::fromFile: read error on " + path.string());
-    }
-    auto contents = std::move(buf).str();
+    auto contents = *std::move(text);
     enforceSizeLimit(contents.size());
     // Use new-delete-friendly construction since the constructor is private.
     return std::shared_ptr<SourceBuffer>(

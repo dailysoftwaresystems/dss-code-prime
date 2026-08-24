@@ -1,0 +1,46 @@
+{
+  "$comment": "D-CSUBSET-ATTRIBUTE-PARAM-POSITION (P32 lane A): an attribute on a FUNCTION PARAMETER, in BOTH positions and BOTH spellings. The whole surface was a parse error before this -- `declHeadForParam` had no attribute slot, so `void f([[maybe_unused]] int p)` died at P0009 and `int f(int p __attribute__((__unused__)))` at `P0001 expected 'ParenClose'`; the second is the idiom C code uses to silence an unused parameter in a DEFINITION, so the leading position alone would have been half a fix. The example covers the C23 leading form, the GNU leading form, the GNU after-declarator form, and a PROTOTYPE whose parameter has no name: 20+12+6+4 = 42. RED-ON-DISABLE: drop `{\"optional\": \"paramDeclSpecifiers\"}` from the `param` shape in src/dss-config/sources/c.lang.json -> the first function fails P0009 -> compile failure, not exit 42 (dropping `paramTrailingAttrRun` instead reddens the third with P0001). ** WHAT THIS FILE CANNOT WITNESS: a corpus example must build, so it shows only the ACCEPTING half, and a GRAMMAR-ONLY fix passes every line here while the attributes reach no reader and are dropped in silence. The pin that separates the two is in tests/analysis/semantic/test_attribute_clause_name_token_class.cpp -- a `deprecated` attribute on a PARAMETER must produce a real warn-on-use diagnostic at the parameter's use site, which is only possible if the run reached `scanAttributeSemantics`. * VERIFIED clean against BOTH references (-std=c2x -Wall -Wextra): gcc 13.3.0 and clang 19.1.7, zero errors and zero warnings each, both binaries exit 42 -- and -Wextra is the load-bearing half, since it makes -Wunused-parameter live. The release arm re-witnesses that the decorated parameters survive the shipped optimizer pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

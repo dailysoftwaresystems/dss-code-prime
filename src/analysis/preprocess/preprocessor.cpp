@@ -1,5 +1,6 @@
 #include "analysis/preprocess/preprocessor.hpp"
 
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/path_identity.hpp"
 
 #include "analysis/preprocess/pp_if_eval.hpp"
@@ -3873,15 +3874,19 @@ private:
         // reads as a silently-empty embed.
         std::error_code ec;
         if (!fs::is_regular_file(path, ec)) return std::nullopt;
-        std::ifstream in(path, std::ios::binary);
-        if (!in) return std::nullopt;
-        std::ostringstream buf;
-        buf << in.rdbuf();
         // A mid-stream IO error (disk/share failure) can silently truncate the
-        // read; check the stream state so a truncated resource is a LOUD error,
-        // never a quietly-shortened embed.
-        if (in.bad()) return std::nullopt;
-        return std::move(buf).str();
+        // read, and a truncated `#embed` is a SILENT MISCOMPILE — the program
+        // gets fewer bytes than the resource holds and nothing says so.
+        // THE ONE CHECKED READ
+        // (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+        // ⚠ The `if (in.bad())` this replaces could not fire: `<< in.rdbuf()`
+        // inserts through the STREAMBUF and never touches the istream object's
+        // state (✔MEASURED), so this resource read has been unguarded since it
+        // was written. The helper compares BYTES against the size it measured,
+        // which is the only detector a short read has.
+        auto text = core::readFileChecked(path);
+        if (!text) return std::nullopt;
+        return *std::move(text);
     }
 
     // FC17.9(h): the directory the `#embed` quote form resolves against -- the

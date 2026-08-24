@@ -114,6 +114,14 @@ ALLOWLIST: dict[str, str] = {}
 # a file, is a FAILURE — that is the ratchet.
 # ⇒ Burn-down tracked by D-TEST-ABORT-IN-A-FIXTURE-HAS-NO-GUARD, which stays OPEN
 #   until this dict is empty. A guard existing is not the debt being paid.
+# ⇣ BURN-DOWN, 2026-08-24 (P32 lane b, closing
+#   D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT):
+#   the whole of `tests/hir/**` came OFF this list -- 17 sites across 5 files,
+#   every one the same `ADD_FAILURE() << "loadShipped(...) failed";
+#   std::abort();` idiom or its golden-reader twin. They now THROW, through
+#   `tests/test_support/shipped_schema_or_throw.hpp`, and the load failure
+#   arrives as a named GoogleTest failure of the ONE running case instead of a
+#   0xC0000409 that unwinds nothing. 61 -> 44 sites, 29 -> 24 files.
 INVENTORY: dict[str, int] = {
     'tests/analysis/compilation_unit/test_compilation_unit.cpp': 2,
     'tests/analysis/compilation_unit/toy_cu_fixture.hpp': 1,
@@ -129,11 +137,6 @@ INVENTORY: dict[str, int] = {
     'tests/asm/test_asm_x86_variable.cpp': 1,
     'tests/core/e2e_harness.hpp': 1,
     'tests/core/test_diagnostic_budget_threading.cpp': 1,
-    'tests/hir/test_hir_lowering_c.cpp': 11,
-    'tests/hir/test_hir_lowering_multi_lang.cpp': 1,
-    'tests/hir/test_hir_lowering_toy.cpp': 2,
-    'tests/hir/test_hir_lowering_tsql.cpp': 2,
-    'tests/hir/test_hir_text.cpp': 1,
     'tests/lir/lowered_lir_fixture.hpp': 3,
     'tests/lir/test_lir.cpp': 2,
     'tests/lir/test_lir_pass_util.cpp': 2,

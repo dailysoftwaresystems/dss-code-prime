@@ -319,6 +319,24 @@ struct DSS_EXPORT GrammarSchemaData {
     // per-lexeme-string in `lexemeTable`; this is the parser-side query).
     std::unordered_set<std::uint32_t>                 contextualKinds;
 
+    // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
+    // the document's declared TOKEN CLASSES — `tokenClasses.<name>` maps a name
+    // to a SET of token kinds, and that ONE declaration is what both the GRAMMAR
+    // (`{"tokenClass": "<name>"}` as a shape element) and the SEMANTIC tier
+    // (`semantics.attributeSemantics.clauseNameTokenClass`) resolve against.
+    //
+    // ★ THE SHARED DECLARATION IS THE POINT, not a convenience. The row this
+    // closes exists because a grammar position and a semantic reader BOTH decided
+    // "is this token a name?" and decided it separately — widen one and the other
+    // silently drops what the first now admits. Two lists cannot drift when there
+    // is one list; a per-side spelling could, and did.
+    //
+    // Values are SORTED + deduplicated by the loader (the shape builder hands
+    // them straight to `Position::makeTokenClassLeaf`, whose `expectedSet`
+    // contract is a sorted set). A class that resolves to the EMPTY set is a load
+    // error, never a silently-never-matching slot.
+    std::unordered_map<std::string, std::vector<SchemaTokenId>> tokenClasses;
+
     // Per-scope forbidden-token sets — keyed by ScopeKind's underlying
     // value, value = set of SchemaTokenId values.
     std::unordered_map<std::uint16_t, std::unordered_set<std::uint32_t>> scopeForbid;

@@ -1,5 +1,6 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 
+#include "core/substrate/checked_file_read.hpp"    // the ONE checked whole-file read
 #include "core/types/config_key_vocabulary.hpp"   // the ONE closed-key check + the `$`-prose carve-out
 #include "core/types/config_path_walk.hpp"       // findShippedConfigDir — shared src/dss-config/<dir> resolver
 #include "core/types/data_model.hpp"             // dataModelFromName (signatureByDataModel keys)
@@ -78,18 +79,22 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
     auto const key = descriptorPathKey(path);
     if (auto const it = cache.find(key); it != cache.end()) return &it->second;
 
-    std::ifstream in{path, std::ios::binary};
-    if (!in) {
+    // THE ONE CHECKED READ (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    // ★ SHARPER HERE THAN ANYWHERE ELSE BECAUSE OF THE CACHE ABOVE: an unchecked
+    // drain could park a TRUNCATED document in the thread-local map and re-serve
+    // it to every later reader in this thread, so one transient I/O fault would
+    // outlive itself. A read failure returns before the `cache.emplace` below,
+    // and failures are not cached — so the fault stays a fault.
+    auto text = core::readFileChecked(path);
+    if (!text) {
         emitMalformed(reporter,
-            std::string{"shipped-lib descriptor: failed to open '"}
-                + path.generic_string() + "' for reading");
+            std::string{"shipped-lib descriptor: "}
+                + std::move(text).error().message);
         return nullptr;
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
     json doc;
     try {
-        doc = json::parse(ss.str());
+        doc = json::parse(*text);
     } catch (json::parse_error const& e) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + path.generic_string()

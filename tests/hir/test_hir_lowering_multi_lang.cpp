@@ -22,10 +22,13 @@
 #include "hir/lowering/cst_to_hir.hpp"
 #include "scratch_dir.hpp"
 
+#include "shipped_schema_or_throw.hpp"   // the ONE load-or-fail-this-test helper
+
 #include <gtest/gtest.h>
 
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -44,9 +47,13 @@ using dss::test_support::Location;
 using dss::test_support::ScratchDir;
 
 [[nodiscard]] std::shared_ptr<GrammarSchema const> shipped(std::string_view name) {
-    auto loaded = GrammarSchema::loadShipped(name);
-    if (!loaded) { ADD_FAILURE() << "loadShipped(" << name << ") failed"; std::abort(); }
-    return *loaded;
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // ✔MEASURED against an emptied shipped config, the abort took the whole
+    // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
+    // no summary -- every sibling test in this executable lost its verdict.
+    auto const loaded = dss::test_support::shippedSchemaOrThrow(name);
+    return loaded;
 }
 
 [[nodiscard]] std::string extName(Hir const& hir, HirNodeId id) {

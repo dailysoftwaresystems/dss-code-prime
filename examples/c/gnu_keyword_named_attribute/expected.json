@@ -1,0 +1,16 @@
+{
+  "$comment": "D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED (P32 lane A): an attribute clause NAME spelled with a KEYWORD. `__const__` maps to `ConstKeyword` in this language's keyword table, and the clause-name position admitted `Identifier` only — so `__attribute__ ((__const__))` was `P0009 expected 'Identifier' or 'ParenClose' — got '__const__'`. ✔MEASURED: ONE `gcc -E -P` `_GNU_SOURCE` TU (stdlib/string/strings/math/byteswap/sched) carries FIFTY occurrences of that ONE spelling, and neutralising it alone took the TU from 50 parse errors to 0 — the top parse blocker for real glibc headers. The file covers the bare form, the keyword name in a TRAILING clause of a multi-clause run (a DIFFERENT reader from the first-clause one), the TWO-RUN form `math.h` writes on `atan`, and the C23 `[[gnu::const]]` spelling, which reaches the same position through `stdAttrItem`. The attributes are honest GNU function attributes that genuinely hold of these functions, so both references accept them without a warning: idem(20)+twice(6)+thrice(2)+quad(1) = 20+12+6+4 = 42. RED-ON-DISABLE: revert the clause-name position in `src/dss-config/sources/c.lang.json` (`attrSpec` / `attrClauseTail` / `stdAttrItem`) from `{\"tokenClass\": \"attributeClauseName\"}` back to `\"Identifier\"` -> the first prototype fails P0009 -> compile failure, not exit 42. ★★ WHAT THIS EXAMPLE DELIBERATELY CANNOT WITNESS, and where that half lives: an example must BUILD, so it exercises only the ACCEPTING half — and a GRAMMAR-ONLY widening passes every line here while each keyword-named clause matches no effect row and is then SILENTLY DROPPED, which is worse than the refusal it replaced. The pins that separate the two are REFUSALS and live in `tests/analysis/semantic/test_attribute_clause_name_token_class.cpp` (an UNMODELLED keyword-spelled name must reach the strict gate and fail loud; its MODELLED sibling must not). Neither file is sufficient alone. ★ VERIFIED clean against BOTH references (`-std=c2x -Wall -Wextra`): gcc 13.3.0 and clang 19.1.7 each compile it with zero errors and zero warnings, and each binary exits 42. The release arm re-witnesses that the attributed declarations survive the shipped optimizer pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

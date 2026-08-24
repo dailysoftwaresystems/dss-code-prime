@@ -302,3 +302,13 @@ target_link_libraries(dss_core_test_type_kind_vocabulary_projection
 # No config, no shipped JSON: the subject is the interner itself.
 dss_add_test(NAME core/test_primitive_builder_leaf_kind_gate
              SOURCES test_primitive_builder_leaf_kind_gate.cpp)
+
+# D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT — the ONE
+# checked whole-file read, its per-site ROUTING pins, and the source scan that
+# stops a new loader reintroducing a hand-written `<< …rdbuf()` drain.
+# ★ The input-error arm drives a streambuf that really FAILS mid-read: an
+#   `ifstream` badbit cannot be forced by truncating a file (a short file reads
+#   cleanly to EOF and sets no bit), which is why the hole was invisible to a
+#   truncate hammer and why the failure had to be constructed instead.
+dss_add_test(NAME core/test_checked_file_read
+             SOURCES test_checked_file_read.cpp)

@@ -9,8 +9,8 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-24 — cycles **P14 … P31**. ★★★ **P31: THE CONFORMANCE LANDED, AND SIX OF THIS PROJECT'S OWN INSTRUMENTS WERE FOUND LYING** — eight lanes (A–H) in waves of four; gate **1603/1603 in 482.78 s (Windows x86_64, build+ctest chained) · 1603/1603 in 363.08 s (WSL x86_64 + qemu arm64, CLEAN build)**; balance **1023 → 1032** (closed 9 — ⚠ **FOUR of those are bookkeeping-only**, work that pre-dated the cycle, so the cycle's own credit is **5** — against **18** opened, and the guard's verdict is that it CREATED **13** more open rows than it closed); suite **1584 → 1603 tests**. ⚠ the authority is `python scripts/check-anchor-balance/check-anchor-balance.py`, which prints every one of these numbers on every run; RE-MEASURE rather than re-quote this line. ★★★ **THREE CORRECTIONS TO THE RED-ON-DISABLE PROOF STANDARD IN ONE CYCLE, EACH FAILING IN THE FLATTERING DIRECTION** — the check PASSES, so the lane believes it holds proof and stops looking: a PE image's md5 moved **between two builds of IDENTICAL sources** (a link timestamp) so it is not a compiled-in proof; a moved **OBJECT** md5 is not a reached-the-binary proof either, because the LINK can fail and ctest then runs the PREVIOUS binary; and **a run is void when ANY shared input moves under it, not only when a BUILD does** — one gate read **1102 passed / 501 failed with nothing building at any point**, and **1602/1603** on a quiesced re-run. ⇒ *the image moves when nothing changed, and the object moves when nothing shipped.* ★★ **THREE MORE WERE THE ORCHESTRATOR'S OWN:** it edited `.plans/**` under a running lane and flipped that lane's gate red→green (⇒ **ask what a file is an INPUT to, not which directory it lives in** — `.plans/**` is an input to five GUARDS, and a guard is a ctest entry), and its own *"103 misglyphed registry rows"* census was a keyword sieve mistaken for a verdict — ✔re-measured, the real number was **4**, because **a PARTIAL CLOSURE LEADS WITH THE PART THAT CLOSED**; and its own fold gate **exited 8 while its notification said 0**, because the invocation ended `…; echo "RUNGATE_EXIT=$?"` and the echo BECAME the terminal state — ⇒ **never append a command after `run-gate.sh`**. ★★★ **CONFORMANCE, CHOSEN BY AN IMPACT INSTRUMENT RATHER THAN BY INSPECTION** (`gcc -E` over ordinary TUs + a `/usr/include` census with a positive control per row): **`__extension__`** — 261 occurrences across 40 C headers — and ★★ **it is NOT a declaration specifier**, the shape this repository reaches for first, which would have accepted **four spellings no reference accepts** with every POSITIVE test still passing; plus **GNU statement expressions `({ … })`** — 59 across 15 headers, **7 sites writing the two together** — landing on a `HirKind::SeqExpr` whose own header comment already named them: **zero new HirKinds, zero MIR, zero LIR**. A real 1819-line `gcc -E -P` glibc TU now produces **zero** parse errors from either. ★★ **THE FLAKY TEST WAS US:** `ffi/test_c_header_parser` holds the live 478 KB `c.lang.json` open **76.6% of its wall time** because **no `loadShipped` entry point caches**, and what tears it is our OWN red-on-disable convention rewriting a shipped document in place — truncate hammer **156/156 red**, atomic `os.replace` **0/18**. See §0.0000000000000000000000000000000000. ★★★ **P30: THREE SILENT MISCOMPILES CLOSED, AND THE ENCODING TABLE LEARNS TO STATE A SEQUENCE INSTEAD OF ONE INSTRUCTION** — gate **1584/1584** in 461.72 s, balance **1022 → 1023** (closed 6, opened 7, one disclosed-pre-existing and exempt). See §0.000000000000000000000000000000000.
-**Branch:** `feature/c23-conformance-burndown-4` · **HEAD:** this commit (Cycle P29). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ **Likewise, any `c-subset` in a commit message or a row older than 2026-08-24 is HISTORICAL, not stale** — the C front end has been named `c` since that date, and the mapping is MECHANICAL — ✔MEASURED 2026-08-24 by applying it to every path-shaped mention in `.plans/**` + `.claude/**` and asking the filesystem: **834 of 862 resolve**, the 28-mention residue being examples deleted or renamed for reasons unrelated to this rename, so a miss is pre-existing staleness rather than a hole in the rule: `examples/c-subset/…` reads `examples/c/…`, `tests/corpus/c-subset/…` reads `tests/corpus/c/…`, `tests/corpus/diagnostics/c-subset/…` reads `tests/corpus/diagnostics/c/…`, `c-subset.lang.json` reads `c.lang.json`, and `--language c-subset` reads `--language c`. ⚠ `tsql-subset` is a DIFFERENT language and is spelled correctly — it is not part of this mapping. ★★ **BOTH `D-C-*` AND `D-CSUBSET-*` ANCHOR-ID PREFIXES DENOTE THE C LANGUAGE**: the 426 `D-CSUBSET-*` ids are FROZEN by operator ruling and are never to be renamed, so a grep for either prefix ALONE misses part of the language's rows.
+**Last updated:** 2026-08-24 — cycles **P14 … P32**. ★★★ **P32: THE FIRST NET-NEGATIVE CYCLE OF THIS RUN, AFTER THE OPERATOR SAID SO MID-CYCLE** — balance **1032 → 1023** (**closed 10, opened 1**, plus two rows filed BORN CLOSED, which correctly move neither tally); gate **1622/1622 (Windows x86_64)**; suite **1603 → 1622**. ⚠ the authority is `python scripts/check-anchor-balance/check-anchor-balance.py`; RE-MEASURE rather than re-quote this line. ★★★ **THE OPERATOR'S MID-CYCLE INSTRUCTION IS THE REASON AND IT IS NOW A STANDING ORDER** — verbatim: *“every time opens more anchors than closes, seems incapable of solving problems”*, said on seeing this orchestrator FILE `D-GATE-NO-CTEST-ENTRY-SEES-THE-MULTI-HOST-CARRIAGE-SCRIPTS` instead of fixing it, in the same cycle that had just caused the break it described. ⇒ **A NEW ROW IS A LAST RESORT, NOT A DELIVERABLE**; if it can be fixed inside owned paths without breaking the bar, FIX IT and record it inside a row already being closed; **“refused but not fixed” is NOT closed**. That row was taken by the orchestrator and closed the same day; the four lanes launched after it opened **ZERO** new rows between them while closing eight. ★★ **THE `dsscp` RENAME LANDED AND OVER-REACHED, AND THE OVER-REACH IS THE LESSON:** it rewrote THIRTEEN REPOSITORY CHECKOUT PATHS — `wsl-leg.sh`'s `SRC`/`DST`, `remote-leg.sh`'s `REMOTE_DIR`, `profile-compile-dispatch.sh`'s `RREPO` for all three legs, the sqlite harness's `SRC_DIR`, the citation inventory's skill-directory key — pointing the ENTIRE MULTI-HOST CARRIAGE at directories that exist on no host, **with ctest 1603/1603 GREEN**. Exactly one of the thirteen reddened anything, by accident. ⇒ the protect list enumerated five SPELLINGS and so could not discover a sixth CLASS; `carriage_paths_guard` now refuses that class offline on every leg. ★★ **AND TWO LANES OVERTURNED THE PREMISE OF THE ROW THEY WERE CLOSING** — the shipped-config row's *“3 checked, 6 unchecked”* split was counting COMMENTS (`in.bad()` after `buf << in.rdbuf()` is FALSE even when the streambuf THROWS, so 9 of 9 were unchecked), and the corpus row's named witness for a one-sided runner implementation **stays GREEN under one**. ★★★ **P31: THE CONFORMANCE LANDED, AND SIX OF THIS PROJECT'S OWN INSTRUMENTS WERE FOUND LYING** — eight lanes (A–H) in waves of four; gate **1603/1603 in 482.78 s (Windows x86_64, build+ctest chained) · 1603/1603 in 363.08 s (WSL x86_64 + qemu arm64, CLEAN build)**; balance **1023 → 1032** (closed 9 — ⚠ **FOUR of those are bookkeeping-only**, work that pre-dated the cycle, so the cycle's own credit is **5** — against **18** opened, and the guard's verdict is that it CREATED **13** more open rows than it closed); suite **1584 → 1603 tests**. ⚠ the authority is `python scripts/check-anchor-balance/check-anchor-balance.py`, which prints every one of these numbers on every run; RE-MEASURE rather than re-quote this line. ★★★ **THREE CORRECTIONS TO THE RED-ON-DISABLE PROOF STANDARD IN ONE CYCLE, EACH FAILING IN THE FLATTERING DIRECTION** — the check PASSES, so the lane believes it holds proof and stops looking: a PE image's md5 moved **between two builds of IDENTICAL sources** (a link timestamp) so it is not a compiled-in proof; a moved **OBJECT** md5 is not a reached-the-binary proof either, because the LINK can fail and ctest then runs the PREVIOUS binary; and **a run is void when ANY shared input moves under it, not only when a BUILD does** — one gate read **1102 passed / 501 failed with nothing building at any point**, and **1602/1603** on a quiesced re-run. ⇒ *the image moves when nothing changed, and the object moves when nothing shipped.* ★★ **THREE MORE WERE THE ORCHESTRATOR'S OWN:** it edited `.plans/**` under a running lane and flipped that lane's gate red→green (⇒ **ask what a file is an INPUT to, not which directory it lives in** — `.plans/**` is an input to five GUARDS, and a guard is a ctest entry), and its own *"103 misglyphed registry rows"* census was a keyword sieve mistaken for a verdict — ✔re-measured, the real number was **4**, because **a PARTIAL CLOSURE LEADS WITH THE PART THAT CLOSED**; and its own fold gate **exited 8 while its notification said 0**, because the invocation ended `…; echo "RUNGATE_EXIT=$?"` and the echo BECAME the terminal state — ⇒ **never append a command after `run-gate.sh`**. ★★★ **CONFORMANCE, CHOSEN BY AN IMPACT INSTRUMENT RATHER THAN BY INSPECTION** (`gcc -E` over ordinary TUs + a `/usr/include` census with a positive control per row): **`__extension__`** — 261 occurrences across 40 C headers — and ★★ **it is NOT a declaration specifier**, the shape this repository reaches for first, which would have accepted **four spellings no reference accepts** with every POSITIVE test still passing; plus **GNU statement expressions `({ … })`** — 59 across 15 headers, **7 sites writing the two together** — landing on a `HirKind::SeqExpr` whose own header comment already named them: **zero new HirKinds, zero MIR, zero LIR**. A real 1819-line `gcc -E -P` glibc TU now produces **zero** parse errors from either. ★★ **THE FLAKY TEST WAS US:** `ffi/test_c_header_parser` holds the live 478 KB `c.lang.json` open **76.6% of its wall time** because **no `loadShipped` entry point caches**, and what tears it is our OWN red-on-disable convention rewriting a shipped document in place — truncate hammer **156/156 red**, atomic `os.replace` **0/18**. See §0.0000000000000000000000000000000000. ★★★ **P30: THREE SILENT MISCOMPILES CLOSED, AND THE ENCODING TABLE LEARNS TO STATE A SEQUENCE INSTEAD OF ONE INSTRUCTION** — gate **1584/1584** in 461.72 s, balance **1022 → 1023** (closed 6, opened 7, one disclosed-pre-existing and exempt). See §0.000000000000000000000000000000000.
+**Branch:** `feature/c23-conformance-burndown-4` · **HEAD:** this commit (Cycle P32). ⚠ **Any `dss-code-prime` spelled as the BUILT COMMAND in a row or commit message older than 2026-08-24 is HISTORICAL, not stale** — the tool is named `dsscp` since that date, while the PROJECT and the REPOSITORY keep `dss-code-prime` (`project(…)`, the GitHub URLs, the funding and issue-template identity, `.claude/skills/dss-code-prime/`, and **every checkout path on every host**). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ **Likewise, any `c-subset` in a commit message or a row older than 2026-08-24 is HISTORICAL, not stale** — the C front end has been named `c` since that date, and the mapping is MECHANICAL — ✔MEASURED 2026-08-24 by applying it to every path-shaped mention in `.plans/**` + `.claude/**` and asking the filesystem: **834 of 862 resolve**, the 28-mention residue being examples deleted or renamed for reasons unrelated to this rename, so a miss is pre-existing staleness rather than a hole in the rule: `examples/c-subset/…` reads `examples/c/…`, `tests/corpus/c-subset/…` reads `tests/corpus/c/…`, `tests/corpus/diagnostics/c-subset/…` reads `tests/corpus/diagnostics/c/…`, `c-subset.lang.json` reads `c.lang.json`, and `--language c-subset` reads `--language c`. ⚠ `tsql-subset` is a DIFFERENT language and is spelled correctly — it is not part of this mapping. ★★ **BOTH `D-C-*` AND `D-CSUBSET-*` ANCHOR-ID PREFIXES DENOTE THE C LANGUAGE**: the 426 `D-CSUBSET-*` ids are FROZEN by operator ruling and are never to be renamed, so a grep for either prefix ALONE misses part of the language's rows.
 
 ---
 
@@ -467,6 +467,206 @@ second pattern beside the one P23 built and pinned.**
 
 ---
 
+## 0.00000000000000000000000000000000000 ★★★ CYCLE P32 — THE FIRST NET-NEGATIVE CYCLE, AND THE OPERATOR HAD TO SAY SO
+
+**Balance: 1032 → 1023 — closed 10, opened 1**, plus two rows filed BORN CLOSED (which move
+neither tally, correctly). **Gate 1622/1622 on Windows x86_64**; suite 1603 → 1622.
+⚠ RE-MEASURE, never re-quote: `python scripts/check-anchor-balance/check-anchor-balance.py`.
+
+### ★★★ THE INSTRUCTION THAT CHANGED THE CYCLE, MID-CYCLE
+
+Verbatim, on seeing this orchestrator FILE a row rather than fix it: *“and this?
+D-GATE-NO-CTEST-ENTRY-SEES-THE-MULTI-HOST-CARRIAGE-SCRIPTS... I HATE your way to do things...
+every time opens more anchors than closes, seems incapable of solving problems.... it's getting
+me on my nerves”*.
+
+✔The complaint is MEASURED, not a mood: P31 closed **5 earned** rows against **18** opened.
+And the trigger was the worst possible instance — the orchestrator had just BROKEN the
+multi-host carriage with its own rename, and its response was to write a row about it.
+
+**The standing order that follows, and it belongs in every lane brief:**
+- **A new row is a LAST RESORT, not a deliverable.** Fixable inside owned paths without breaking
+  the bar ⇒ **FIX IT**, and record it inside a row already being closed.
+- **Open a row only when all three hold:** outside owned paths, needs an operator decision or
+  another subsystem, AND leaving it unrecorded loses a measured fact. Say which.
+- **“Refused but not fixed” is NOT closed** and is not an acceptable resting state for
+  anything the cycle was asked to close. Report it as NOT DONE with what the real fix needs.
+- ★ It does NOT repeal *anchor every issue found*. What changed is WHERE the fact is
+  recorded — inside the row you are closing, not as a new open one.
+
+✔**IT WORKED, MEASURABLY:** the carriage row was taken by the orchestrator and closed the same
+day; the four lanes launched afterwards opened **ZERO** rows between them while closing eight, and
+three of them fixed additional defects they found and wrote them into the row they were already
+closing.
+
+### ★★ THE RENAME LANDED — AND OVER-REACHED BEHIND A GREEN SUITE
+
+`ff9746f0`, its own commit on a clean tree. Width **COMMAND IDENTITY** (operator-ruled): `dsscp`
+wherever the string is the TOOL'S name; `dss-code-prime` wherever it is the PROJECT'S or the
+REPOSITORY'S. 96 files, 91 of them verified to carry ONLY lines that gain `dsscp` or lose
+`dss-code-prime`, the other five exempt BY NAME with a reason.
+
+⚠⚠ **IT REWROTE THIRTEEN REPOSITORY CHECKOUT PATHS ACROSS SIX FILES** —
+`wsl-leg.sh` (`SRC`, `DST`), `remote-leg.sh` (`REMOTE_DIR`, twice),
+`profile-compile-dispatch.sh` (`RREPO`, all three legs), the sqlite harness's `SRC_DIR` in two
+drivers plus a self-test fixture, and the citation inventory's `.claude/skills/dss-code-prime/`
+key — pointing the entire multi-host carriage at directories that exist on no host.
+★★★ **AND THE SUITE WAS 1603/1603 GREEN WHILE THAT WAS TRUE.** Exactly one of the
+thirteen reddened anything, and by accident: `plan_citations_guard`, because its ceiling key
+stopped naming a real document. `ctest` does not run the WSL leg, the remote legs, or the sqlite
+harness driver, so the other twelve reddened nothing at all — two thirds of this project's
+standing 3-leg gate removed without a diagnostic.
+
+★ **THE CAUSE IS THE REUSABLE PART: the instrument's protect list ENUMERATED FIVE SPELLINGS,
+and a list of spellings cannot discover a class it does not contain.** A GitHub URL, `project(`,
+the funding line and two prose phrases were all its author thought of. The reviewer's question is
+not *“is this list right?”* but ***“what CLASS of string does this rename have no
+authority over?”*** — and a checkout path is the repository's identity in the most
+literal form available: `~/src/dss-code-prime` names a directory that EXISTS on four real hosts,
+which nobody renamed and which this repository cannot rename.
+
+⚠ This is the SECOND consecutive cycle in which a rename broke an instrument no gate covers.
+P31's rule — *classify by whether the file EXECUTES, not by which directory it sits in* —
+was applied correctly here; these files DO execute. The hole is new and different: **the file
+executes, but the STRING inside it is a FOREIGN identity.**
+
+### ✅ `carriage_paths_guard` — OPENED AND CLOSED IN THE SAME CYCLE
+
+`d157f5b5`. **The invariant is AGREEMENT, not RESOLUTION**, and that is what lets it be a `ctest`
+entry at all: checking that a path resolves would need the host it names, which is exactly why
+nothing checked it. Every repository path a carriage script names must end in the name `project()`
+declares in `CMakeLists.txt`. ⚠ Deliberately NOT *“match the checkout's own basename”*
+— a fork, a worktree or a CI runner's `s/` directory is an honest tree with a different name,
+and a guard that reds those gets disabled.
+
+It keys on the **variable's ROLE**, never a file list, so a NEW carriage script is covered the day
+it lands; it has FLOORS, because a role-keyed scan's failure mode is to find nothing and report
+success over an empty set. ✔MEASURED: 9 repository-root constants and 3 skill-directory
+references. ✔RED-ON-DISABLE through `ctest` on a REAL mutation with the subject proved read:
+`remote-leg.sh` md5 `99d8eb5c…` → `78af0ab9…`, guard FAILED naming ``dsscp`` (a
+string that exists only in the mutant), restored, PASSED. Seven self-test arms, each asserting the
+MESSAGE — including **two that pin what it must NOT red on** (an interpolated tail is not a
+claim it can check; a relative `src/…` is not a checkout path), because the expensive failure
+for a guard is not missing a defect, it is crying wolf until somebody disables it.
+
+★ **TWO `dss-state` DEFECTS WERE FIXED THERE RATHER THAN FILED**, both the same species —
+an instrument no ctest entry exercises, silently not working. Its CLI search named
+`build/bin/dss/`, `build-rel/` and `build-dbg/`, none of which exist under this repository's
+one-root layout, so **`dss-state` exited 2 before running a single probe** and had done so since
+the layout changed; it now ENUMERATES `build/*/bin/dss/`. And its `engineSiblings` staleness list
+named `dsscp.dll` while the build produces `libdsscp.dll` — with the `lib` prefix — so
+`.filter(existsSync)` yielded the EMPTY list and the verdict collapsed to the exe alone, **which
+is exactly what the comment three lines above it forbids**. It now lists every real spelling AND
+**REFUSES on an empty list**: the extra spelling repairs today, the refusal is what makes the next
+one loud. ✔Both verified by execution — 143 probes, report renders.
+
+### ★★ WAVE 1 — FOUR LANES, EIGHT ROWS CLOSED, ZERO OPENED
+
+★★★ **THE BINDING CONSTRAINT ON PARTITIONING IS NOT FILE OVERLAP, IT IS
+`DSS_CONFIG_ROOT`, AND IT IS NOW MEASURED RATHER THAN ASSUMED.** ✔`tests/CMakeLists.txt`
+gives every test entry `ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}"` and
+`findShippedConfig()` prefers that over its cwd-walk ⇒ **every test in every lane's private
+`build/<lane>` reads the ONE LIVE `src/dss-config/` in the shared source tree.** A per-lane build
+tree isolates artifacts; it does NOT isolate configuration. ⇒ **at most ONE lane per wave may
+edit `src/dss-config/**`.** ✔THREE separate lanes caught `c.lang.json` mid-write during this
+wave, one of them unparseable outright (a raw LF inside a `$comment`), each producing a large
+corpus red that was NOT a defect. **A corpus number taken while another lane holds the config is
+not attributable to anything.**
+
+**Lane A — the C attribute surface (4 closed, 1 NOT DONE).**
+`__attribute__((__const__))` now compiles — the single top parse blocker for real glibc
+headers, 50 occurrences in one 1819-line preprocessed TU. ★★ **BOTH SIDES MOVED
+BECAUSE THE LOADER NOW REFUSES A CONFIG WHERE ONLY ONE DID:** a new Clause-C check walks the rules
+reachable from the attribute shapes and reds on EITHER one-sided state with its own actionable
+message, so the *grammar parses it and the reader silently drops it* hazard is closed by a guard
+rather than by care. Both directions exercised. A new shape-language element form
+(`{"tokenClass": …}` + a top-level `tokenClasses` block, `allKeywordKinds: true` unioning the
+document's OWN keyword kinds) is the mechanism. ✔It also CORRECTED the row's reference figures
+by probing separately: gcc refuses ~**30** reserved words in the GNU spelling, not four —
+conclusion unchanged, DSS takes clang's superset per §A.3b.
+⚠ `D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES` is **NOT DONE** and is reported as such: part of it
+already works at HEAD and its remedy column is stale, and the real fix needs an emit-gate design
+inside `resolveTypeNodeImpl`, which runs speculatively, repeatedly and under reporter rollback.
+It stopped rather than half-land it on the hottest path in the semantic tier. **That is the
+correct answer to “refused is not closed” — not a refusal dressed as a closure.**
+
+**Lane B — shipped-config reads (2 closed).** ★★★ **THE ROW'S OWN PREMISE WAS
+HALF WRONG AND THE CORRECTION IS THE FINDING.** It said 6 of 9 drains were unchecked and 3 were
+checked. ✔MEASURED by execution with a purpose-built four-stream probe:
+`ostream::operator<<(streambuf*)` extracts THROUGH THE STREAMBUF POINTER and never touches the
+`istream` object, so `in.bad()` after `buf << in.rdbuf()` is **false in every case, including one
+where the streambuf THROWS mid-read** ⇒ the 3/6 split was counting COMMENTS, and **9 of 9 were
+unchecked in the only sense that matters**. Worse, libstdc++'s `basic_filebuf` maps an OS read
+error to `eof()` rather than throwing, so a SHORT READ sets no bit at all: **the only detector for
+a truncated read is a BYTE COUNT.** One helper, nine sites, zero hand-written drains left in
+`src/`, plus a source-scan guard that fails closed. Two live defects fixed in passing and recorded
+in the row: `loadShippedPipeline` opened in TEXT mode (Windows translated CRLF before the parser
+saw the bytes), and `readResourceBytes` — the `#embed` reader, a BYTE-EXACT consumer — had
+only the vacuous check, so a torn resource embedded a silent prefix. **That one was a silent
+miscompile.** The torn-config crash was ATTRIBUTED before it was fixed, as its row demanded:
+neither suite was a `noexcept` escape and neither was a product defect. It also burned
+`D-TEST-ABORT-IN-A-FIXTURE-HAS-NO-GUARD` down **61→44 sites, 29→24 files** without opening
+anything.
+
+**Lane C — the corpus consumes a foreign archive (1 closed).** A new `prebuiltLibraries`
+manifest key in BOTH runners, with a `containerWitness` the bytes must contain; the example links
+two real BSD archives DSS did not build (`__.SYMDEF` + ELF members, `__.SYMDEF SORTED` + Mach-O
+members) and exits 42 from symbols defined nowhere in the repository. 1264/1264 on Windows and on
+Linux; four mutations, each red then restored. ★★ **AND IT REFUTED ITS BRIEF WITH A
+MEASUREMENT, WHICH IS WORTH MORE THAN THE ROW:** the FF1 row claimed
+`integrated_tests/coverage-boundary` *“would catch a one-sided implementation”*, and this
+orchestrator relayed that claim into the brief WITHOUT RUNNING IT. Under a deliberate one-sided
+mutation it stayed **GREEN** — it compares COMPILE-COVERAGE sets over a subject that never
+includes this example. What caught it is `runRunnerVocabularyPin` inside
+`integrated_tests/cli-surface`, which diffs the two runner sources' manifest-key literals.
+★ **`coverage-boundary` catches one-sided COMPILE COVERAGE; `runRunnerVocabularyPin` catches
+one-sided MANIFEST VOCABULARY. They are not substitutes.** It also DECLINED to teach the `ar`
+writer BSD, with a reason rather than a shrug: the flavour is chosen in `compile_pipeline.cpp` and
+belongs on the `.format.json` documents, and the CLI runner links `nlohmann_json` alone, so a
+`Bsd` arm would have shipped with NO CALLER.
+
+**Lane D — the outgoing-argument cursor (1 closed).** ONE pass owns every outgoing-argument
+byte offset now, and the refusal that stood in for the repair is **DELETED, not kept beside one**.
+★★ **A SECOND SILENT MISCOMPILE OF THE SAME ROOT CAUSE WAS FOUND AND FIXED IN THE SAME
+CHANGE:** `fixedOperandCount` is a POSITION boundary and that pass RENUMBERS positions, so DSS
+emitted `mov $0x0,%rax` — AL=0 — where gcc 13.3.0 emits `mov $0x1,%eax` for the identical
+variadic call, and gcc's own callee prologue gates its xmm spill on `test %al,%al`.
+⚠ **INVISIBLE DSS-TO-DSS, which is why it survived:** DSS's own variadic prologue spills
+xmm0–7 UNCONDITIONALLY, so no corpus of DSS callers and DSS callees can ever see it.
+Red-on-disable ×2 with both mutant exit codes PREDICTED from the ABI layout before being
+measured. ⚠ It also stated the honest limit of its own example: **under the mutant the
+`examples/` arm stayed GREEN on Windows**, because this host only COMPILES the ELF and Mach-O legs
+and a silent miscompile compiles fine; the runtime red was taken on WSL.
+
+### ★ WHAT ELSE LANDED
+
+- **`scripts/examples-census/examples-census.py`** — the corpus-manifest census, as an
+  INSTRUMENT rather than the fourth throwaway parser. `examples/README.md` records that the same
+  census had been re-derived ad hoc at least three times, once returning *“a plausible
+  zero”* for every manifest and once publishing four figures that were already stale when they
+  shipped. ✔Its whole block is re-derived at this commit (**634** manifests, **2,129** target
+  entries, **707** optimizer arms), and `prebuiltLibraries` is documented there.
+
+### ⚠ WHAT P32 OWES P33 — A QUEUE, NOT A MOOD
+
+1. **`D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES`** — lane A's NOT DONE, with the design named:
+   thread the flag onto the TAG/typedef symbol at the Pass-1 mint, and emit inside
+   `resolveTypeNodeImpl`'s tag/alias arms, which needs an emit-gate because they run
+   speculatively and under reporter rollback. ⚠ Part of the row is ALREADY CLOSED at HEAD and
+   its remedy column is stale — re-read it before starting.
+2. **The remaining rows P31 opened**, re-derived from the guard rather than from any list:
+   the imaginary-literal suffix, `__COUNTER__`, the cast-operand budget cliff, the gcc
+   linemarkers, the two `D-LK-*` rows (both need `.format.json` vocabulary, so they are a config
+   lane), `D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED` (**runs ALONE**
+   — its honest closure changes how EVERY test resolves its config), and the two `.plans/`
+   rows.
+3. **The `D-FF1-` namespace decision** — still a genuine operator fork, still not invented
+   around.
+4. ★ **A candidate worth considering rather than assuming:** make the `examples/README.md`
+   census a GENERATED block checked by `examples-census --check` in `ctest`, so it cannot rot a
+   fifth time. Not done here because it restructures a user-facing document, which is a decision
+   rather than a fix.
+
 ## 0.0000000000000000000000000000000000 ★★★ CYCLE P31 — THE CONFORMANCE LANDED, AND SIX OF THIS PROJECT'S OWN INSTRUMENTS WERE FOUND LYING
 
 **Eight lanes (A–H), in waves of four.** Gate **1603/1603 in 482.78 s (Windows x86_64, build+ctest chained) · 1603/1603 in 363.08 s (WSL x86_64 + qemu arm64, CLEAN build)**. Balance **1023 → 1032** — closed 9 (⚠ **four of them bookkeeping-only**, marked `✅🧾`: the work pre-dated this cycle, so the cycle is credited with nothing for them) against **18** opened, which the guard reports as **13 more OPEN rows created than closed**. Suite **1584 → 1603 tests**. 74 tracked files modified, 19 added, +4103/−525. ⚠ Every number in this section is re-derivable: `python scripts/check-anchor-balance/check-anchor-balance.py` prints the balance figures on every run. **RE-MEASURE. Do not re-quote.**
@@ -509,7 +709,7 @@ second pattern beside the one P23 built and pinned.**
 
 ⚠ **BALANCE IS ADVERSE AND IT IS PRESENTED, NOT WIDENED AWAY.** 18 rows opened against 5 earned closes. **16 of the 18 are defects FOUND, not work deferred** — several found by instruments this cycle built for other purposes, which is what a cycle spent auditing its own measuring equipment produces. Under [[feedback-open-anchors-roll-into-the-next-cycle]] they roll into P32, which takes them first.
 
-★★★ **WHAT P32 TAKES, IN ORDER.**
+✅★★★ **WHAT P32 TOOK, IN ORDER — ALL THREE ITEMS LANDED; kept as written because the WIDTH RULING in item 1 still governs every future mention of the two names.**
 1. **The binary rename to `dsscp` — AN EXPLICIT OPERATOR REQUEST, not a queue item this cycle invented** (*"please also add a cycle so dss code prime build artifact output name is dsscp instead of dss-code-prime. CI and cmake should know this"*). ⚠ Its width was RULED by the operator and the ruling is narrower than the word "rename" suggests: **"Command identity"** — `dsscp` for everything typed or read as the TOOL'S NAME (the built artifact, CI invocations, CMake target and install names, documentation that shows a command line); **`dss-code-prime` STAYS** wherever the string is the PROJECT'S or the REPOSITORY'S identity. Do not widen it to a global search-and-replace. ⓘ The instruments exist and were re-dry-run against the grown tree at this commit: `scratchpad/p32/orch/hand_rewrites.py` then `scratchpad/p32/orch/rename_to_dsscp.py` — **487 substitutions across 97 files, 8 protected sites, 28 prose files skipped, 3 refused correctly**; the refusal arm MUST disappear once the hand rewrites land, and if it does not, the rename is incomplete rather than done. ★ It gets its OWN commit on a clean tree, because a mechanical rename mixed into feature work is unreviewable.
 2. **The 18 rows P31 opened**, per the roll-forward rule above.
 3. **The 12 rows `check-anchor-balance` reports as ALREADY UNBLOCKED** — an opener that has closed or a trigger that has fired, so they are schedulable NOW and are not deferrals at all. Re-derive the list from the guard, never from this line: `python scripts/check-anchor-balance/check-anchor-balance.py`. ⓘ One of them, `D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES`, already carries an operator ruling (2026-08-24): **accept the wider immediate AND always diagnose** — so it needs implementation, not a decision.

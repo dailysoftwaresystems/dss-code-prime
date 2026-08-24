@@ -109,3 +109,13 @@ dss_add_test(NAME lir/test_lir_asm_memory_output
 # the AAPCS64 control green.
 dss_add_test(NAME lir/test_lir_apple_stack_arg_packing
              SOURCES test_lir_apple_stack_arg_packing.cpp)
+
+# D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: ONE pass owns
+# every outgoing-argument byte offset. `lowerWideCallArgs` states each stacked
+# aggregate's offset on its carrier and stamps the Call; callconv reads those
+# offsets and refuses to place anything of its own. The pins drive the REAL
+# pipeline (lowerWideCallArgs included -- the defect lives between that pass and
+# callconv, so a fixture that skips it cannot see this row) and assert that no
+# outgoing-argument byte is written twice.
+dss_add_test(NAME lir/test_lir_outgoing_arg_cursor
+             SOURCES test_lir_outgoing_arg_cursor.cpp)

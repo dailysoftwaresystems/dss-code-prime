@@ -36,3 +36,24 @@ dss_add_test(NAME hir/test_hir_text_vocabulary_and_capability SOURCES test_hir_t
 # declared letter with a false reason. It therefore links the MIR lowering.
 dss_add_test(NAME hir/test_hir_text_operand_form_reaches_mir
              SOURCES test_hir_text_operand_form_reaches_mir.cpp)
+
+# D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT — the two
+# suites that DIED (0xC0000409, `__fastfail`) on an emptied shipped config must
+# now REPORT it. The property is how a test binary TERMINATES, and a process
+# cannot observe its own abort, so both subjects are spawned as CHILDREN.
+#
+# ★ The paths are BAKED, not searched: `$<TARGET_FILE:…>` resolves to the real
+#   executable at generate time (with `.exe` on Windows) so this entry cannot
+#   pick up a stale binary from another lane's build tree. `add_dependencies` is
+#   NOT optional — `dss_add_test` links the LIBRARY, so without it a fresh ctest
+#   could run this against subjects that were never built, which reads as a
+#   harness bug rather than a missing build step. Both subject targets are
+#   already defined here: tests/CMakeLists.txt adds `tokenizer` before `hir`.
+dss_add_test(NAME hir/test_torn_shipped_config_reds_not_crashes
+             SOURCES test_torn_shipped_config_reds_not_crashes.cpp)
+target_compile_definitions(dss_hir_test_torn_shipped_config_reds_not_crashes
+    PRIVATE
+        DSS_TOKENIZER_TEST_BINARY="$<TARGET_FILE:dss_tokenizer_test_tokenizer>"
+        DSS_HIR_LOWERING_C_TEST_BINARY="$<TARGET_FILE:dss_hir_test_hir_lowering_c>")
+add_dependencies(dss_hir_test_torn_shipped_config_reds_not_crashes
+                 dss_tokenizer_test_tokenizer dss_hir_test_hir_lowering_c)

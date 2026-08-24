@@ -650,7 +650,6 @@ int dss_enum_fixed_probe(void) { return (int)DSS_FIXED_B; }
 @min-stdc 202311
 @families gnu,msvc
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: `[[maybe_unused]] int p` in a PARAMETER declaration is rejected by DSS while clang 18/19 (C23) and cl /std:clatest accept it. Its LEADING-position twin (a_standard_attribute_leading_c23) is accepted, so this is a position-specific hole, not absent C23 attribute support. RECORDED, not fixed -- this lane builds the detector.
 @why C23 6.7.12.1 [[maybe_unused]] on a PARAMETER declaration.
 @code
 int dss_attr_param_probe([[maybe_unused]] int unused_param);

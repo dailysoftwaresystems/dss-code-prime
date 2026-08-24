@@ -22,12 +22,15 @@
 #include "hir/hir_text.hpp"
 #include "repo_root.hpp"
 
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+
 #include <gtest/gtest.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -542,10 +545,17 @@ namespace {
 }
 
 [[nodiscard]] std::string readFile(fs::path const& p) {
-    std::ifstream in{p, std::ios::binary};
-    if (!in) { ADD_FAILURE() << "cannot open " << p.string(); std::abort(); }
-    std::ostringstream buf; buf << in.rdbuf();
-    std::string s = std::move(buf).str();
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
+    // `std::abort()` here killed the whole binary, so one unreadable golden
+    // cost every sibling test its verdict. THROW -- GoogleTest reports an
+    // escaping exception as a failure of the ONE running test. The read itself
+    // goes through the ONE checked read, so a golden that reads SHORT is named
+    // as a torn read instead of surfacing as a golden mismatch.
+    auto text = dss::core::readFileChecked(p);
+    if (!text) {
+        throw std::runtime_error("golden: " + std::move(text).error().message);
+    }
+    std::string s = *std::move(text);
     // Normalize CRLF→LF: `emitHir` always writes LF, and `.dsshir` carries no
     // legitimate `\r`. A Windows checkout with core.autocrlf=true can rewrite the
     // LF-in-repo golden to CRLF on disk despite the `.gitattributes eol=lf`, so

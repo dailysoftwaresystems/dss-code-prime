@@ -3648,6 +3648,36 @@ void collectAttrNodes(SemanticConfig const& cfg, Tree const& tree, NodeId root,
     }
 }
 
+// D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
+// THE ONE ANSWER to "may this token SPELL an attribute clause name?", shared by
+// every reader below (`collectAttrClauses`'s trailing-clause detector,
+// `extractOneAttrClause`'s name scan and its sibling-clause skip, and the
+// composite `packed`/`aligned` scan).
+//
+// ★★ THE SET IS THE GRAMMAR'S OWN. `cfg.attributeClauseNameTokens` is resolved
+// from `tokenClasses.<clauseNameTokenClass>` — the SAME declaration the
+// `{"tokenClass": …}` grammar slot compiles from — so the parser and these
+// readers cannot disagree about what a name is. That is the entire point of the
+// row: `__attribute__((__const__))` spells its clause name with a KEYWORD token
+// (glibc writes it 50 times in ONE preprocessed TU), and admitting it in the
+// grammar while these readers still looked for `identifierToken` alone would have
+// made the clause parse, match no effect row, and DISAPPEAR — a silently dropped
+// attribute, which is worse than the parse error it replaced. The loader refuses
+// a config where only one side moved.
+//
+// EMPTY class ⇒ `identifierToken` alone, byte-identical to the behaviour before
+// the class existed (every language that declares no class: toy, tsql, shader,
+// asm).
+[[nodiscard]] inline bool isAttrClauseNameToken(SemanticConfig const& cfg,
+                                                SchemaTokenId kind) noexcept {
+    if (!cfg.attributeClauseNameTokens.empty()) {
+        for (SchemaTokenId const k : cfg.attributeClauseNameTokens)
+            if (k.v == kind.v) return true;
+        return false;
+    }
+    return cfg.identifierToken.valid() && kind == cfg.identifierToken;
+}
+
 // TF-C73: enumerate the CLAUSES of ONE attribute node, and report which FORM it
 // is (return true = the C23 `[[...]]` standard form, whose unknown names are
 // standard-IGNORABLE; false = the GNU `__attribute__` form, whose unknown names
@@ -3685,10 +3715,9 @@ collectAttrClauses(SemanticConfig const& cfg, Tree const& tree, NodeId attrNode,
     if (!cfg.attrSpecRule.valid() || r.v != cfg.attrSpecRule.v) return false;
     out.push_back(attrNode);   // clause #1 — its name is a direct child
     auto const ownsName = [&](NodeId n) {
-        if (!cfg.identifierToken.valid()) return false;
         for (NodeId g : visibleChildren(tree, n))
             if (tree.kind(g) == NodeKind::Token
-                && tree.tokenKind(g) == cfg.identifierToken)
+                && isAttrClauseNameToken(cfg, tree.tokenKind(g)))
                 return true;
         return false;
     };
@@ -3713,10 +3742,13 @@ collectAttrClauses(SemanticConfig const& cfg, Tree const& tree, NodeId attrNode,
 // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): extract ONE attribute clause from a
 // clause node — a whole `attrSpec` (`__attribute__((deprecated("m")))` is ONE
 // clause) or one `stdAttrItem` (`deprecated("m")` / `gnu::packed` inside a
-// `[[...]]`). The NAME is the LAST identifier among the node's DIRECT visible
-// children (the `::`-namespaced form's final segment — `gnu::packed` → `packed`;
-// both shapes inline their sequences, so the identifier(s) land flat),
-// dunder-normalized via the shared `stripDunder`. A clause with no identifier
+// `[[...]]`). The NAME is the LAST CLAUSE-NAME TOKEN among the node's DIRECT
+// visible children (the `::`-namespaced form's final segment — `gnu::packed` →
+// `packed`; both shapes inline their sequences, so the name token(s) land flat),
+// dunder-normalized via the shared `stripDunder`. Which KINDS count as a name is
+// `isAttrClauseNameToken`'s answer, resolved from the SAME token class the
+// grammar's clause-name slot compiles from — so `__attribute__((__const__))`,
+// whose name is a KEYWORD token, is read here exactly as the parser accepted it. A clause with no identifier
 // (an empty `__attribute__(())`) yields nullopt. The name is resolved to its
 // `attributeEffects` ROW here (`row` — nullptr = a name the language does not
 // model), so the clause's effect and its argument validity are decided at ONE
@@ -3792,9 +3824,8 @@ extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
     NodeId nameTok{};
     for (NodeId c : visibleChildren(tree, clauseNode)) {
         if (tree.kind(c) != NodeKind::Token) continue;
-        if (cfg.identifierToken.valid()
-            && tree.tokenKind(c) == cfg.identifierToken) {
-            nameTok = c;   // LAST identifier wins → the ::-final segment
+        if (isAttrClauseNameToken(cfg, tree.tokenKind(c))) {
+            nameTok = c;   // LAST name token wins → the ::-final segment
         }
     }
     if (!nameTok.valid()) return std::nullopt;
@@ -3822,10 +3853,9 @@ extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
     };
     // A nested node with its OWN direct name identifier is a SIBLING clause.
     auto const startsOwnClause = [&](NodeId n) {
-        if (!cfg.identifierToken.valid()) return false;
         for (NodeId c : visibleChildren(tree, n)) {
             if (tree.kind(c) == NodeKind::Token
-                && tree.tokenKind(c) == cfg.identifierToken)
+                && isAttrClauseNameToken(cfg, tree.tokenKind(c)))
                 return true;
         }
         return false;
@@ -4334,8 +4364,9 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         clauses.clear();
         bool const stdForm = collectAttrClauses(cfg, tree, attr, clauses);
         for (NodeId cl : clauses) {
-            // The clause NAME is the LAST identifier among its DIRECT visible
-            // children — the same reading `extractOneAttrClause` uses (the
+            // The clause NAME is the LAST clause-name token among its DIRECT
+            // visible children — the same reading `extractOneAttrClause` uses,
+            // through the same `isAttrClauseNameToken` predicate (the
             // `::`-namespaced form's final segment: `gnu::packed` → `packed`),
             // dunder-normalized through the shared `stripDunder`. Reading DIRECT
             // children only is what keeps a string ARGUMENT (`section("packed")`)
@@ -4343,8 +4374,7 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             NodeId nameTok{};
             for (NodeId g : visibleChildren(tree, cl)) {
                 if (tree.kind(g) == NodeKind::Token
-                    && cfg.identifierToken.valid()
-                    && tree.tokenKind(g) == cfg.identifierToken)
+                    && isAttrClauseNameToken(cfg, tree.tokenKind(g)))
                     nameTok = g;
             }
             if (!nameTok.valid()) continue;   // an empty `__attribute__(())`
@@ -8010,10 +8040,15 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         }
                         // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a VARIABLE's alignas.
                         // Only for a NON-field declaration (`!bitfieldSuffix` — a
-                        // field is handled above); a PARAMETER carries its own
-                        // `param` DeclarationRule (no specifierPrefix + no alignasSpec
-                        // in the param grammar) so it never reaches here with an
-                        // alignas. 6.7.5p2: an alignas on a FUNCTION (a definition or a
+                        // field is handled above); a PARAMETER never reaches here with
+                        // an alignas because the param grammar admits no `alignasSpec`
+                        // at all. ⚠ THE OTHER HALF OF THIS SENTENCE WAS RETIRED BY P32
+                        // ([[D-CSUBSET-ATTRIBUTE-PARAM-POSITION]]) AND IS CORRECTED
+                        // RATHER THAN LEFT TO ROT: it used to read "no specifierPrefix
+                        // + no alignasSpec", and the `param` row now DOES declare a
+                        // `specifierPrefix` (its attribute run). Only the alignasSpec
+                        // half was ever load-bearing; the prefix half was incidental
+                        // and is no longer true. 6.7.5p2: an alignas on a FUNCTION (a definition or a
                         // prototype — FnSig-typed / function-form declarator) or a
                         // TYPEDEF (kind Type) is a constraint violation →
                         // S_AlignasInvalidContext. Otherwise store the validated
@@ -12192,36 +12227,112 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // discarded-result warning, in the DIRECT-symbol tail (calleeSym in scope;
     // fn-pointer / expression callees are the named deferral
     // D-CSUBSET-NODISCARD-INDIRECT-CALLEE — the isDirectNoreturnCall scope
-    // precedent). The discard context is the TWO-hop shape (design-audit F1):
-    // the expression engine materializes an `expression` node between the call
-    // and its statement, so the call's result is discarded iff
-    // parent(call)==expressionRule AND grandparent(call)==discardStatementRule.
-    // By construction this makes `(void)f();` silent (a castExpr interposes)
-    // and `x=f()` / `g(f())` / `return f()` no-fire (wrong parent/grandparent).
-    // Comma/paren-wrapped discards (`(f());`, `f(), g();`) are the named
-    // deferral D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT (warning-only
-    // miss, never wrong bytes). Suppressible Warning; `.actual` = name or
-    // "name: msg".
+    // precedent).
+    //
+    // ── P32 [[D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT]] ──────────────────
+    // The test WAS two-hop-EXACT: parent(call)==expressionRule AND
+    // grandparent(call)==discardStatementRule. That is right for the dominant
+    // `f();` idiom and MISSES every discard reached through an interposed
+    // wrapper — ✔MEASURED at HEAD through the shipped CLI, one TU per shape:
+    // `(g());`, `g(), 1;`, `for(;;g())` and `for(g();;)` all compiled with NO
+    // warning while gcc 13.3.0 and clang 19.1.7 warn on all four.
+    //
+    // It is now a BOUNDED PARENT-CHAIN WALK, and the bound on what it may pass
+    // through is entirely config: the `expressionRule` the expression engine
+    // materializes, plus `discardTransparentRules` — wrappers the discarded value
+    // flows through unchanged. Everything else STOPS the walk, which is what keeps
+    // the miss direction conservative: `x = g();`, `h(g())` and `return g();` still
+    // never fire, because an assignment, an argument list and a return statement
+    // are not transparent and never will be.
+    //
+    // ★ THE COMMA IS AN OPERATOR, NOT A RULE, and that distinction is load-bearing.
+    // `binaryExpr` is the SHARED Pratt wrapper for every binary operator, so
+    // declaring the RULE transparent would make `x + g();` warn about `g`'s result
+    // the way `g(), 1;` does — a different question with a different answer. The
+    // config entry therefore names the operator TOKEN as well, and only a wrapper
+    // built on that token is transparent.
+    //
+    // ★ THE `for` CLAUSES ARE A THIRD CASE because the init, condition and step are
+    // the SAME rule in the SAME node: init and step discard, the CONDITION does
+    // not, and nothing but the clause INDEX separates them. `discardClauseHosts`
+    // names the host rule and which `;`-separated clauses discard, and the index is
+    // counted with `hirLowering.forClauseSeparator` — the SAME key the CST→HIR
+    // `for` prologue segments the header with, so a language cannot have two
+    // opinions about where clause 1 ends.
+    //
+    // ★ `(void)g();` STAYS SILENT, deliberately: no cast rule is transparent, so
+    // the walk stops at the cast. ✔MEASURED that the references DISAGREE here —
+    // gcc warns, clang does not — and the cast is the universal idiom for "I meant
+    // to discard this", so the silent reading is the one that does not fight the
+    // programmer. Suppressible Warning; `.actual` = name or "name: msg".
     if (s.symbols.at(calleeSym).isNodiscard
         && cfg.nodiscardExpressionRule.valid()
         && cfg.nodiscardDiscardStatementRule.valid()) {
-        NodeId const p1 = tree.parent(node);
-        if (p1.valid() && tree.kind(p1) == NodeKind::Internal
-            && tree.rule(p1).v == cfg.nodiscardExpressionRule.v) {
-            NodeId const p2 = tree.parent(p1);
-            if (p2.valid() && tree.kind(p2) == NodeKind::Internal
-                && tree.rule(p2).v == cfg.nodiscardDiscardStatementRule.v) {
-                auto const& ndRec = s.symbols.at(calleeSym);
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::S_NodiscardResultDiscarded;
-                d.severity = DiagnosticSeverity::Warning;
-                d.buffer   = tree.source().id();
-                d.span     = tree.span(node);
-                d.actual   = ndRec.nodiscardMessage.empty()
-                    ? resolved.name
-                    : resolved.name + ": " + ndRec.nodiscardMessage;
-                s.reporter.report(std::move(d));
+        auto const& hirCfgND = tree.schema().hirLowering();
+        // Is `n` a wrapper the discarded value flows through unchanged?
+        auto const isTransparent = [&](NodeId n) {
+            std::uint32_t const rv = tree.rule(n).v;
+            for (auto const& t : cfg.nodiscardDiscardTransparentRules) {
+                if (t.rule.v != rv) continue;
+                if (!t.operatorToken.has_value()) return true;
+                // An operator-qualified entry: this node must carry that operator
+                // token as a DIRECT child (the Pratt wrapper's own operator).
+                for (NodeId c : visibleChildren(tree, n)) {
+                    if (tree.kind(c) != NodeKind::Token) continue;
+                    if (tree.tokenKind(c).v == t.operatorToken->v) return true;
+                }
             }
+            return false;
+        };
+        // The 0-based `;`-separated clause index `child` sits in, within `host`.
+        auto const clauseIndexOf = [&](NodeId host, NodeId child) {
+            std::uint32_t seg = 0;
+            for (NodeId c : visibleChildren(tree, host)) {
+                if (tree.kind(c) == NodeKind::Token) {
+                    if (hirCfgND.forClauseSeparator.valid()
+                        && tree.tokenKind(c).v == hirCfgND.forClauseSeparator.v) {
+                        ++seg;
+                    }
+                    continue;
+                }
+                if (c == child) break;
+            }
+            return seg;
+        };
+        bool discarded = false;
+        NodeId cur = node;
+        for (int guard = 0; guard < 64; ++guard) {
+            NodeId const p = tree.parent(cur);
+            if (!p.valid() || tree.kind(p) != NodeKind::Internal) break;
+            std::uint32_t const pv = tree.rule(p).v;
+            if (pv == cfg.nodiscardDiscardStatementRule.v) { discarded = true; break; }
+            bool clauseHost = false;
+            for (auto const& h : cfg.nodiscardDiscardClauseHosts) {
+                if (h.rule.v != pv) continue;
+                clauseHost = true;
+                std::uint32_t const seg = clauseIndexOf(p, cur);
+                for (std::uint32_t d : h.discardSegments)
+                    if (d == seg) { discarded = true; break; }
+                break;
+            }
+            if (clauseHost) break;
+            if (pv == cfg.nodiscardExpressionRule.v || isTransparent(p)) {
+                cur = p;
+                continue;
+            }
+            break;   // a node that CONSUMES the value — never a discard
+        }
+        if (discarded) {
+            auto const& ndRec = s.symbols.at(calleeSym);
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_NodiscardResultDiscarded;
+            d.severity = DiagnosticSeverity::Warning;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(node);
+            d.actual   = ndRec.nodiscardMessage.empty()
+                ? resolved.name
+                : resolved.name + ": " + ndRec.nodiscardMessage;
+            s.reporter.report(std::move(d));
         }
     }
     // Direct symbol call: the shared tail does the result-type stamp,
@@ -12902,6 +13013,88 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             result = resolveTypeNode(mut, sem, tree, kids[cl.typeChild], scope,
                                      /*emitOnMiss=*/false);
             mut.reporter.truncateTo(snap);
+            return;
+        }
+        // ── P32 [[D-C-SUBTREE-TYPE-WALKS-INTO-A-STATEMENT-EXPRESSION-BODY]] ──
+        //
+        // A GNU statement expression's children are STATEMENTS, and its type is
+        // the LAST item's expression — never whatever the generic wrapper descent
+        // happens to reach first. Without this arm the Wrapper fallthrough walks
+        // INTO the body, meets a DECLARATION, and takes the DECLARATOR's type, so
+        // the construct is judged as the wrong operand:
+        //   ✔MEASURED through the shipped CLI, bisected —
+        //     `*({ *q; })`                          ✅ (no declaration in the body)
+        //     `*({ int *r = p; r; })`               ✅ (declarator type == yielded type)
+        //     `int x = *({ int **q = &p; *q; });`   ✗ false `S0003` at HEAD
+        //   The trigger is a declaration whose type DIFFERS from the body's
+        //   yielded type: `q` is `int **`, the body yields `int *`, and the deref
+        //   check was handed the declarator's.
+        //
+        // ★ THE VALUE IS DERIVED THE WAY THE LOWERING DERIVES IT, and that is what
+        // keeps the two tiers from disagreeing about what a body yields:
+        // `stmtExprItems` (cst_to_hir.cpp) takes the LAST non-token item, peels it
+        // to its core, and requires that core to map to HIR kind `ExprStmt` — the
+        // value is then that item's first non-token child. Recognition is by HIR
+        // KIND, not by a config key naming a rule, exactly as over there; a second
+        // key would be a second place to keep in step.
+        //
+        // ★ THE `void` CASE IS A CASE, not a fallthrough. A body whose last item
+        // is a declaration, a loop, or nothing at all has type `void` (GNU C 6.1),
+        // and the lowering REFUSES it in value position (S_StatementExprHasNoValue).
+        // Returning InvalidType here is what makes the two agree: leaving the old
+        // descent in place for that shape would let `sizeof(({ int y = 1; }))` fold
+        // to 4 — a silent answer to a question the language says has none.
+        if (hirCfg.stmtExprRule.valid() && r.v == hirCfg.stmtExprRule.v) {
+            NodeId lastItem{};
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) == NodeKind::Token) continue;   // ( { } )
+                lastItem = c;
+            }
+            // Peel transparent single-child wrappers to the item's core, stopping
+            // where the lowering stops: at a token, at an expression node, or at
+            // the first rule that carries a HIR mapping of its own.
+            NodeId core = lastItem;
+            for (int guard = 0; guard < 128 && core.valid(); ++guard) {
+                if (tree.kind(core) != NodeKind::Internal) break;
+                std::uint32_t const cv = tree.rule(core).v;
+                if (cv == hirCfg.binaryExprRule.v || cv == hirCfg.unaryExprRule.v
+                    || cv == hirCfg.postfixExprRule.v || cv == hirCfg.operandRule.v
+                    || (hirCfg.ternaryExprRule.valid()
+                        && cv == hirCfg.ternaryExprRule.v)) {
+                    break;
+                }
+                bool mapped = false;
+                for (auto const& m : hirCfg.ruleMappings) {
+                    if (m.rule.v == cv) { mapped = true; break; }
+                }
+                if (mapped) break;
+                NodeId sole{};
+                bool many = false;
+                for (NodeId c : visibleChildren(tree, core)) {
+                    if (tree.kind(c) == NodeKind::Token) continue;
+                    if (sole.valid()) { many = true; break; }
+                    sole = c;
+                }
+                if (many || !sole.valid()) break;
+                core = sole;
+            }
+            NodeId valueNode{};
+            if (core.valid() && tree.kind(core) == NodeKind::Internal) {
+                for (auto const& m : hirCfg.ruleMappings) {
+                    if (m.rule.v != tree.rule(core).v) continue;
+                    if (m.hirKind != "ExprStmt") break;
+                    for (NodeId c : visibleChildren(tree, core)) {
+                        if (tree.kind(c) == NodeKind::Token) continue;
+                        valueNode = c;
+                        break;
+                    }
+                    break;
+                }
+            }
+            if (!valueNode.valid()) { result = InvalidType; return; }   // `void`
+            std::vector<NodeId> only{valueNode};
+            work.push_back(Frame{node, Frame::Kind::Wrapper, 0, {}, {}, nullptr,
+                                 std::move(only), 0, {}});
             return;
         }
         // ── binary: [lhs(Internal), OP-token, rhs(Internal)] ──

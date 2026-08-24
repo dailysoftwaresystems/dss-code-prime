@@ -5,6 +5,7 @@
 #include "core/types/token.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_builder.hpp"
+#include "shipped_schema_or_throw.hpp"   // the ONE load-or-fail-this-test helper
 #include "tokenizer/tokenizer.hpp"
 
 #include <gtest/gtest.h>
@@ -24,20 +25,32 @@ struct H {
 };
 
 [[nodiscard]] H loadToy(std::string text) {
-    auto loaded = GrammarSchema::loadShipped("toy");
-    EXPECT_TRUE(loaded.has_value()) << "toy.lang.json load failed";
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT.
+    // This used to be a NON-FATAL `EXPECT_TRUE` followed by
+    // `.schema = loaded.has_value() ? *loaded : nullptr` -- so on a torn
+    // shipped config the fixture recorded a failure and then handed a NULL
+    // schema to `Tokenizer`, whose `tokenizerFatal("schema is null")`
+    // correctly refuses and aborts. ✔MEASURED: the whole binary exited
+    // 0xC0000409 with no `[  FAILED  ]` line and no case name. The product
+    // guard was right; the fixture drove it there.
     return H{
         .src    = SourceBuffer::fromString(std::move(text), "<test>"),
-        .schema = loaded.has_value() ? *loaded : nullptr,
+        .schema = dss::test_support::shippedSchemaOrThrow("toy"),
     };
 }
 
 [[nodiscard]] H loadC(std::string text) {
-    auto loaded = GrammarSchema::loadShipped("c");
-    EXPECT_TRUE(loaded.has_value()) << "c.lang.json load failed";
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT.
+    // This used to be a NON-FATAL `EXPECT_TRUE` followed by
+    // `.schema = loaded.has_value() ? *loaded : nullptr` -- so on a torn
+    // shipped config the fixture recorded a failure and then handed a NULL
+    // schema to `Tokenizer`, whose `tokenizerFatal("schema is null")`
+    // correctly refuses and aborts. ✔MEASURED: the whole binary exited
+    // 0xC0000409 with no `[  FAILED  ]` line and no case name. The product
+    // guard was right; the fixture drove it there.
     return H{
         .src    = SourceBuffer::fromString(std::move(text), "<test>"),
-        .schema = loaded.has_value() ? *loaded : nullptr,
+        .schema = dss::test_support::shippedSchemaOrThrow("c"),
     };
 }
 
@@ -1019,11 +1032,17 @@ TEST(TokenizerDeath, NullSchemaAborts) {
 namespace {
 
 [[nodiscard]] H loadTsql(std::string text) {
-    auto loaded = GrammarSchema::loadShipped("tsql-subset");
-    EXPECT_TRUE(loaded.has_value()) << "tsql-subset.lang.json load failed";
+    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT.
+    // This used to be a NON-FATAL `EXPECT_TRUE` followed by
+    // `.schema = loaded.has_value() ? *loaded : nullptr` -- so on a torn
+    // shipped config the fixture recorded a failure and then handed a NULL
+    // schema to `Tokenizer`, whose `tokenizerFatal("schema is null")`
+    // correctly refuses and aborts. ✔MEASURED: the whole binary exited
+    // 0xC0000409 with no `[  FAILED  ]` line and no case name. The product
+    // guard was right; the fixture drove it there.
     return H{
         .src    = SourceBuffer::fromString(std::move(text), "<test>"),
-        .schema = loaded.has_value() ? *loaded : nullptr,
+        .schema = dss::test_support::shippedSchemaOrThrow("tsql-subset"),
     };
 }
 

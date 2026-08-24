@@ -2572,6 +2572,27 @@ struct DSS_EXPORT SemanticConfig {
     // c before TF-C73) — never a silent behavior change. Source-AGNOSTIC:
     // WHICH rule is per-language config; the engine never names `attrArgs`.
     RuleId attributeArgRule{};      std::string attributeArgRuleName;
+    // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
+    // the token kinds admissible as an attribute clause NAME, resolved from the
+    // document's `tokenClasses.<clauseNameTokenClass>` — the SAME declaration the
+    // GRAMMAR's `{"tokenClass": …}` slot compiles from. Sorted, deduplicated.
+    //
+    // EMPTY (the default, and every language that declares no class) ⇒ the reader
+    // falls back to `identifierToken` alone, which is byte-identical to the
+    // behaviour before this key existed.
+    //
+    // ★★ WHY IT IS A SET AND NOT A SECOND TOKEN FIELD: `__attribute__((__const__))`
+    // — 50 occurrences in ONE preprocessed glibc TU — spells its clause name with
+    // a KEYWORD token, and which keywords a language has is the language's own
+    // business. A per-spelling engine list would have to be re-read every time the
+    // keyword table grew; a class derived from that table cannot fall behind it.
+    //
+    // ⚠ THE TWO SIDES MOVE TOGETHER OR NOT AT ALL, and the loader enforces it
+    // (see the bidirectional guard beside the `clauseNameTokenClass` arm): a
+    // grammar that admits a name this reader cannot see DROPS the attribute
+    // silently, which is strictly worse than the parse error it replaced.
+    std::vector<SchemaTokenId>      attributeClauseNameTokens;
+    std::string                     attributeClauseNameTokenClassName;
     std::vector<AttributeSemanticsRow> attributeEffects;
     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): the nodiscard DISCARD-CONTEXT rule
     // ids (the `semantics.nodiscard` block). A WarnOnDiscard-flagged call's
@@ -2585,6 +2606,50 @@ struct DSS_EXPORT SemanticConfig {
     // Either invalid ⇒ WarnOnDiscard rows never fire.
     RuleId nodiscardDiscardStatementRule{}; std::string nodiscardDiscardStatementRuleName;
     RuleId nodiscardExpressionRule{};       std::string nodiscardExpressionRuleName;
+    // P32 [[D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT]]: the TWO-hop-EXACT test
+    // above MISSES every discard reached through an interposed wrapper. These two
+    // lists generalize it to a BOUNDED PARENT-CHAIN WALK without widening what
+    // counts as a discard:
+    //
+    //   * `nodiscardDiscardTransparentRules` — rules the walk may pass THROUGH,
+    //     because the discarded value flows through them unchanged. A bare rule
+    //     name matches any node of that rule (c's `parenExpr`); an entry that also
+    //     names an OPERATOR TOKEN matches only a Pratt-wrapper node built on that
+    //     operator, which is how the COMMA is expressed without making every
+    //     binary operator transparent (`x + f();` must not warn about `f`'s
+    //     result the way `f(), g();` does).
+    //   * `nodiscardDiscardClauseHosts` — a rule whose children are split into
+    //     `;`-separated CLAUSES, some of which are discard positions and some of
+    //     which are not. c's `for` is the case: the init and step clauses discard,
+    //     the CONDITION does not, and the three are the same `expression` rule in
+    //     the same node, so nothing but the clause INDEX can tell them apart. The
+    //     index is counted with the SAME separator token the CST→HIR `for`
+    //     prologue segments on (`hirLowering.forClauseSeparator`) — reusing that
+    //     key rather than declaring a second one is what stops the two tiers from
+    //     disagreeing about which clause is which.
+    //
+    // ✔MEASURED against both references, one TU per shape: gcc 13.3.0 and clang
+    // 19.1.7 BOTH warn for `(g());`, `g(), 1;`, `for(;;g())` and `for(g();;)`, and
+    // NEITHER warns for the condition `for(;g();)`. `(void)g();` stays SILENT
+    // here — gcc warns, clang does not, and the cast is the idiom for "I meant to
+    // discard this", so the disjunction rule leaves it silent by construction (no
+    // cast rule is transparent).
+    //
+    // BOTH EMPTY ⇒ byte-identical to the two-hop-exact behaviour (every language
+    // that declares neither: toy, tsql).
+    struct NodiscardTransparentRule {
+        RuleId                       rule{};
+        std::string                  ruleName;
+        std::optional<SchemaTokenId> operatorToken;   // unset = any node of `rule`
+        std::string                  operatorTokenName;
+    };
+    std::vector<NodiscardTransparentRule> nodiscardDiscardTransparentRules;
+    struct NodiscardClauseHost {
+        RuleId                     rule{};
+        std::string                ruleName;
+        std::vector<std::uint32_t> discardSegments;   // 0-based `;`-separated clause indices
+    };
+    std::vector<NodiscardClauseHost> nodiscardDiscardClauseHosts;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. `vaArgRule`
     // = the `va_arg(ap,T)` form; pass 2 resolves+stamps its `vaArgTypeChild`
     // castTypeRef (so the HIR lowering recovers the read type T) + stamps the node

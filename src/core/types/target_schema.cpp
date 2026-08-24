@@ -1,5 +1,6 @@
 #include "core/types/target_schema.hpp"
 
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/relocation_table.hpp"
 #include "core/types/ascii_case.hpp"
 #include "core/types/config_path_walk.hpp"
@@ -64,15 +65,17 @@ std::string acceptedRelocFormulaList() {
 
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromFile(
     std::filesystem::path const& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    // THE ONE CHECKED READ (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    // A failed read never reaches `loadFromText`: a truncated document reported
+    // as a parse error points the reader at the config's CONTENTS when the fault
+    // was the read.
+    auto text = core::readFileChecked(path);
+    if (!text) {
         return std::unexpected(std::vector<ConfigDiagnostic>{
             {DiagnosticCode::C_MissingField, DiagnosticSeverity::Error,
-             path.string(), "cannot open file"}});
+             path.string(), std::move(text).error().message}});
     }
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    return loadFromText(std::move(buf).str(), path.string());
+    return loadFromText(*std::move(text), path.string());
 }
 
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadShipped(

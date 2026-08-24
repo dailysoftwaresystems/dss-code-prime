@@ -1,5 +1,6 @@
 #include "link/object_format_schema.hpp"
 
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/relocation_table.hpp"
 #include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList — the ONE closed-set renderer
 #include "core/types/config_path_walk.hpp"
@@ -95,15 +96,17 @@ namespace dss {
 
 LoadResult<std::shared_ptr<ObjectFormatSchema>>
 ObjectFormatSchema::loadFromFile(std::filesystem::path const& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    // THE ONE CHECKED READ (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    // `.format.json` is the MOST-read shipped document class in the tree, so a
+    // torn read here is the one most likely to be met in the field — and it must
+    // say the READ failed, not that the format description is malformed.
+    auto text = core::readFileChecked(path);
+    if (!text) {
         return std::unexpected(std::vector<ConfigDiagnostic>{
             {DiagnosticCode::C_MissingField, DiagnosticSeverity::Error,
-             path.string(), "cannot open file"}});
+             path.string(), std::move(text).error().message}});
     }
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    return loadFromText(std::move(buf).str(), path.string());
+    return loadFromText(*std::move(text), path.string());
 }
 
 LoadResult<std::shared_ptr<ObjectFormatSchema>>

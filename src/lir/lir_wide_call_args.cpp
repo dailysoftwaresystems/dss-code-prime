@@ -23,15 +23,31 @@ namespace {
 
 using dss::report;
 
-// PROTOTYPE scope note: this pass materializes SCALAR overflow args only.
-// A ByValueStackAgg carrier (a Reg immediately followed by a
-// ByValueStackAgg marker) is ALREADY forced wholly to the stack by
-// lir_callconv's placement loop and is NOT a register operand at regalloc
-// pressure — so it is left on the Call untouched and its slot span advances
-// the shared overflow cursor exactly as callconv does, keeping the scalar
-// overflow indices this pass assigns consistent with the carriers callconv
-// still places. (A production version folds ALL overflow placement — scalars
-// here + carriers — into this single pre-regalloc site; see the design.)
+// D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: THIS PASS OWNS
+// EVERY OUTGOING-ARGUMENT BYTE OFFSET, and it is the only tier that can.
+//
+// A stacked SCALAR is materialized here as a `store_outgoing_arg` carrier whose
+// payload IS its byte offset. A stacked by-value AGGREGATE stays on the Call —
+// it is not a register operand at regalloc pressure, and its byte-copy needs
+// physical registers that do not exist yet — but its byte offset is decided HERE
+// too and STATED on the carrier as a trailing `MemOffset` operand, which
+// `lir_callconv` then reads rather than re-deriving.
+//
+// ⚠⚠ THE ALTERNATIVE IS THE SILENT MISCOMPILE THIS ROW NAMES, and it shipped.
+// While the aggregate's placement was re-derived in `lir_callconv`, that
+// derivation ran over the list this pass had ALREADY SHORTENED — the scalars it
+// removed were no longer there to advance a cursor — so the second cursor
+// restarted inside bytes the first had handed out. One stacked scalar followed
+// by one stacked aggregate was enough: `stur x20,[sp]` placed the scalar at
+// outgoing +0 and the aggregate's first eightbyte was then written over the same
+// bytes, destroying the argument before the call, on both shipped pipelines,
+// with no diagnostic.
+//
+// ★ THE PROTOTYPE NOTE THIS REPLACED said a production version would fold ALL
+// overflow placement into this single pre-regalloc site. That is what happened;
+// what stays in `lir_callconv` is the MATERIALIZATION of the byte-copy (which
+// genuinely needs post-regalloc physical registers), never the DECISION of where
+// it lands.
 
 // The outgoing-arg slot QUANTUM — the unit the overflow area is reserved and
 // aligned in. Every current ABI (SysV/Win64/AAPCS64/Apple) uses a pointer-width
@@ -134,88 +150,94 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 keepOps.push_back(ops[k]);
 
             ArgCursors argCursors{schema, cc};
-            // ★ THE SAME OBJECT the three other stacked-arg walks use, so the
-            // placement rule is stated ONCE (D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED).
+            // ★★★ THE ONE CURSOR OVER THIS CALL'S OUTGOING-ARGUMENT AREA.
+            // Scalars AND aggregates are placed from it, in source order, and
+            // nothing downstream places anything
+            // (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES); the
+            // packing rule it applies is the shipped CC's
+            // (D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED).
             StackArgCursor stackCursor{cc, kOutgoingSlotBytes};
-            // The cursor lir_callconv will independently run over the SHRUNKEN call
-            // — carriers only, because the scalars are removed here. Kept beside the
-            // real one so "the two passes agree" is CHECKED rather than assumed; see
-            // the refusal below.
-            StackArgCursor carrierOnlyCursor{cc, kOutgoingSlotBytes};
             std::uint32_t argRegionIdx = 0;  // 0-based arg position
+            // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: the
+            // vararg boundary is a POSITION, and this pass RENUMBERS positions.
+            // `fixedOperandCount` counts arg positions produced by the callee's
+            // FIXED parameters; every walk downstream tests `argRegionIdx >=
+            // fixedOperandCount` against the SHRUNKEN list, so the boundary has to
+            // be restated in the shrunken list's own numbering or those walks read
+            // a vararg as a named argument. `keptFixedArgs` is that restatement:
+            // the kept positions are an order-preserving subsequence, so the first
+            // `keptFixedArgs` of them are exactly the ones the fixed region
+            // produced.
+            std::uint32_t keptFixedArgs = 0;
             for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
                 LirOperand const& argOp = ops[k];
-                if (argOp.kind == LirOperandKind::ByValueStackAgg) {
-                    keepOps.push_back(argOp);   // kept with its carrier
-                    continue;
+                if (lirIsByValueStackAggDescriptor(ops, k)) {
+                    // A descriptor is consumed WITH its carrier by the arm
+                    // below, which emits the whole triple and steps past it — so
+                    // reaching one HERE means it has no carrier in front of it.
+                    // Passing it through would leave a size marker describing
+                    // nothing; dropping it would lose an argument silently.
+                    report(reporter,
+                           DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format(
+                               "lowerWideCallArgs: call inst {} carries a "
+                               "by-value stacked-aggregate descriptor at operand "
+                               "{} with no address register in front of it — the "
+                               "carrier is a (Reg, ByValueStackAgg[, MemOffset]) "
+                               "group and this one is malformed", inst.v, k));
+                    return false;
                 }
-                bool const isByValCarrier =
-                    argOp.kind == LirOperandKind::Reg
-                    && (k + 1) < ops.size()
-                    && ops[k + 1].kind == LirOperandKind::ByValueStackAgg;
-                if (isByValCarrier) {
+                // One kept ARG POSITION, recorded before any `continue`. Only
+                // positions the FIXED region produced move the vararg boundary,
+                // and `argRegionIdx` is still the ORIGINAL numbering at every
+                // call site below — which is what makes the restatement exact.
+                auto const noteKeptPosition = [&] {
+                    if (argRegionIdx < fixedOps) ++keptFixedArgs;
+                };
+                if (lirIsByValueStackAggCarrier(ops, k)) {
                     // Wholly-stacked aggregate: not a register operand at
-                    // pressure — leave on the Call for callconv to byte-copy.
-                    // Advance the shared cursors exactly as callconv does.
-                    keepOps.push_back(argOp);
+                    // pressure, and its byte-copy needs physical registers that do
+                    // not exist yet — so it stays on the Call for callconv to
+                    // MATERIALIZE. Its byte OFFSET is decided here, from the one
+                    // cursor, and STATED on the carrier so callconv reads it
+                    // instead of re-deriving it over a list this pass shortened.
                     std::uint32_t const aggBytes = ops[k + 1].byValueAggBytes;
-                    // ⚠⚠ D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES
-                    // — A LIVE SILENT MISCOMPILE, PRE-EXISTING, AND THIS IS THE
-                    // MISSING HALF OF A REFUSAL THAT ALREADY EXISTS ON THE OTHER
-                    // SIDE. This pass removes scalar overflow args from the Call and
-                    // places them from ITS cursor; the CARRIERS stay on the Call and
-                    // lir_callconv places them from a cursor of its own, which
-                    // necessarily restarts at 0 because the scalars are no longer
-                    // there to advance it. So the moment a stacked SCALAR precedes a
-                    // stacked AGGREGATE in one call, the two passes hand out the SAME
-                    // bytes twice.
-                    // ✔MEASURED 2026-08-24 at cycle P31 on
-                    // `arm64:elf64-aarch64-linux-exec`, calling a function POINTER of
-                    // type `void(*)(int×8, int, struct{int,int,int})` (a direct call
-                    // cannot reach it — HIR→MIR already refuses the CALLEE of this
-                    // shape with D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS,
-                    // which is exactly the refusal this one mirrors):
-                    //     stur x20, [sp]        <- the scalar `9` at outgoing +0
-                    //     ldur x0,  [x19]
-                    //     stur x0,  [sp]        <- the aggregate's first eightbyte,
-                    //                              SAME BYTES, scalar destroyed
-                    //     stur x0,  [sp, #8]
-                    // No diagnostic, both shipped pipelines. Refuse rather than emit
-                    // it: the real repair is ONE pass owning ALL overflow placement
-                    // (scalars AND carriers), which is a design change with its own
-                    // row, not something to smuggle in behind a stacked-arg cycle.
-                    if (stackCursor.bytes() != carrierOnlyCursor.bytes()) {
+                    if (lirByValueStackAggPlacedOffset(ops, k).has_value()) {
                         report(reporter,
                                DiagnosticCode::L_UnsupportedLoweringForOpcode,
                                DiagnosticSeverity::Error,
                                std::format(
-                                   "lowerWideCallArgs: call inst {} passes a "
-                                   "by-value aggregate on the stack AFTER a scalar "
-                                   "argument that also overflowed onto the stack. "
-                                   "The scalar's placement is decided here and the "
-                                   "aggregate's in lir_callconv, from cursors that "
-                                   "cannot see each other ({} vs {} bytes consumed) "
-                                   "— the two would be written to overlapping "
-                                   "outgoing-argument bytes. Refusing rather than "
-                                   "emitting the overlap",
-                                   inst.v, stackCursor.bytes(),
-                                   carrierOnlyCursor.bytes()));
+                                   "lowerWideCallArgs: call inst {} arg {} already "
+                                   "states an outgoing-argument placement — this "
+                                   "pass is the one that assigns it, so an input "
+                                   "that carries one has been through here before "
+                                   "and a second placement would be taken from a "
+                                   "cursor that restarts at zero", inst.v,
+                                   argRegionIdx));
                         return false;
                     }
-                    (void)carrierOnlyCursor.placeNamedAggregate(aggBytes);
-                    (void)stackCursor.placeNamedAggregate(aggBytes);
+                    std::uint32_t const aggOffset =
+                        stackCursor.placeNamedAggregate(aggBytes);
+                    keepOps.push_back(argOp);         // the temp's address Reg
+                    keepOps.push_back(ops[k + 1]);    // size + exhaust class
+                    keepOps.push_back(LirOperand::makeMemOffset(
+                        static_cast<std::int32_t>(aggOffset)));
                     std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
                     if (ex == kByValueStackArgExhaustGpr)
                         argCursors.exhaust(LirRegClass::GPR);
                     else if (ex == kByValueStackArgExhaustFpr)
                         argCursors.exhaust(LirRegClass::FPR);
+                    noteKeptPosition();
                     ++argRegionIdx;
+                    ++k;   // the marker is consumed with its carrier
                     continue;
                 }
                 if (argOp.kind != LirOperandKind::Reg) {
                     // Non-Reg/non-marker scalar operand — a future isel bug the
                     // callconv gate reports loud; keep verbatim (don't split).
                     keepOps.push_back(argOp);
+                    noteKeptPosition();
                     ++argRegionIdx;
                     continue;
                 }
@@ -234,6 +256,7 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                     variadicForcesStack && argRegionIdx >= fixedOps;
                 if (argIndex < poolSize && !forceStack) {
                     keepOps.push_back(argOp);      // register-resident
+                    noteKeptPosition();
                 } else {
                     // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: a
                     // VARARG and a NAMED scalar are DIFFERENT axes — ✔MEASURED,
@@ -284,11 +307,31 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 b.addInst(storeOutgoingOp, InvalidLirReg, so, s.byteOffset,
                           s.widthFlags);
             }
+            // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: the
+            // shrunken Call carries the RENUMBERED vararg boundary and says, in
+            // its flags, that its outgoing stack arguments are already placed.
+            // Both restate a fact about POSITIONS that stopped being true the
+            // moment operands left the list; a consumer reading the ORIGINAL
+            // boundary against the shrunken list reads a vararg as a named
+            // argument (which is how the SysV variadic vector count silently
+            // under-counted), and a consumer that places anything of its own
+            // writes into bytes this cursor already handed out.
+            // ⚠ The boundary is restated ONLY for a variadic call, because
+            // `fixedOperandCount` is consulted only when `isVariadic` and a
+            // non-variadic call's payload is 0 — leaving it byte-identical.
+            std::uint32_t const outPayload =
+                ::dss::call_payload::isVariadic(payload)
+                    ? ::dss::call_payload::encode(
+                          true, keptFixedArgs,
+                          ::dss::call_payload::hasIndirectResult(payload))
+                    : payload;
+            std::uint8_t const outFlags =
+                static_cast<std::uint8_t>(flags | kLirInstFlagOutgoingArgsPlaced);
             // D-LIR-PER-INST-REG-CONSTRAINTS: 1 → N `store_outgoing_arg`
             // carriers + 1 shrunken Call. The side data belongs to the CALL —
             // the carriers are this pass's own outgoing-arg plumbing.
             LirInstId const dstCall =
-                b.addInst(op, result, keepOps, payload, flags);
+                b.addInst(op, result, keepOps, outPayload, outFlags);
             lir_pass_util::carryInstSideData(src, inst, b, dstCall);
         }
     }

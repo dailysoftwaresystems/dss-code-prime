@@ -263,11 +263,11 @@ classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
     std::uint32_t argRegionIdx = 0;
     for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
         LirOperand const& argOp = ops[k];
-        if (argOp.kind == LirOperandKind::ByValueStackAgg) continue;  // marker
-        bool const isByValCarrier =
-            argOp.kind == LirOperandKind::Reg && (k + 1) < ops.size()
-            && ops[k + 1].kind == LirOperandKind::ByValueStackAgg;
-        if (isByValCarrier) {
+        // The marker, and the MemOffset stating where its aggregate was placed,
+        // are consumed WITH the carrier below — never argument positions of their
+        // own (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES).
+        if (lirIsByValueStackAggDescriptor(ops, k)) continue;
+        if (lirIsByValueStackAggCarrier(ops, k)) {
             // Wholly-stacked aggregate — NOT a register arg (keep scratch path).
             // Advance the shared cursors + class-exhaust clamp as callconv does.
             std::uint8_t const ex = ops[k + 1].byValueAggExhaust;

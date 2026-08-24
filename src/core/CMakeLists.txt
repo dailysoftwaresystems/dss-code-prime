@@ -2,6 +2,9 @@ add_library(core OBJECT
     compiler.cpp
 
     # ── substrate/ — host/OS utilities (the first non-header-only one) ──
+    # The ONE checked whole-file read
+    # (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    substrate/checked_file_read.cpp
     substrate/large_stack_call.cpp
     substrate/path_identity.cpp
     substrate/phase_timers.cpp

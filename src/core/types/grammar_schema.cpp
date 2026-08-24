@@ -1,6 +1,7 @@
 #include "core/types/grammar_schema.hpp"
 
 #include "core/crypto/sha256.hpp"   // crypto::sha256Hex — the retained content digest
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/types/config_path_walk.hpp"
 #include "core/types/grammar_schema_json.hpp"
 
@@ -144,16 +145,19 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
 LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadFromFile(
     std::filesystem::path const& path) {
 
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    // THE ONE CHECKED READ (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    // A failed read is reported AS a read failure and never reaches
+    // `loadFromText` -- a truncated document handed to the parser produces a
+    // syntax error about the config's CONTENTS, which sends the reader to the
+    // wrong file entirely.
+    auto text = core::readFileChecked(path);
+    if (!text) {
         return std::unexpected(std::vector<ConfigDiagnostic>{
             {DiagnosticCode::C_MissingField, DiagnosticSeverity::Error,
              path.string(),
-             "cannot open file"}});
+             std::move(text).error().message}});
     }
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    return loadFromText(std::move(buf).str(), path.string());
+    return loadFromText(*std::move(text), path.string());
 }
 
 LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadShipped(std::string_view name) {
@@ -363,7 +367,12 @@ SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const n
     while (true) {
         auto const& p = positions[curPosId];
         if (p.slotKind() == SlotKind::TokenLeaf) {
-            if (p.tokenId().v == tok.v) {
+            // A token leaf admits the kinds in its `expectedSet` — exactly one
+            // for the ordinary single-token form, a config-declared SET for a
+            // `{"tokenClass": …}` leaf. The bitset is the same O(1) membership
+            // test the AltChoice arm below already uses, and for a single-token
+            // leaf it is `{tokenId()}`, so the two forms answer identically.
+            if (detail::tokenBitsContain(p.expectedBits(), tok.v)) {
                 return SchemaCursor{cur.rule(), p.nextPos()};
             }
             return SchemaCursor{};

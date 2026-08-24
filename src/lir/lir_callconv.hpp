@@ -489,6 +489,21 @@ private:
 // depends on each datum's own size and alignment and a fifth spelling is a
 // silent miscompile. So the rule is spelled ONCE, here.
 //
+// ⚠⚠ ONE OBJECT IS NOT ONE CURSOR, AND THE DIFFERENCE WAS A LIVE MISCOMPILE
+// (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES). Two of those
+// walks ran over the SAME call: `lowerWideCallArgs` placed its stacked scalars
+// and REMOVED them from the operand list, and the call arm then placed the
+// by-value aggregate carriers that remained — from a fresh instance of this
+// class, which necessarily restarted at 0 because the scalars were no longer
+// there to advance it. Identical rule, identical object, overlapping bytes.
+// ⇒ For ANY ONE CALL exactly one instance places anything. `lowerWideCallArgs`
+// owns it (it is the last tier holding the complete argument list), states every
+// aggregate's offset on its carrier and stamps `kLirInstFlagOutgoingArgsPlaced`
+// on the Call; the call arm then READS those offsets and REFUSES if asked to
+// place anything at all. The pre-scan and the callee's `arg` arm walk different
+// argument lists (the caller's reservation, the callee's own incoming region) and
+// are unaffected.
+//
 // ★ THE ACCESS WIDTH IS PART OF THE PLACEMENT, NOT A SEPARATE DECISION. Under
 // `Slot` the datum owns the whole pointer-width slot — the caller stored a whole
 // register into it — so the access stays the 8-byte one every existing target

@@ -1,5 +1,6 @@
 #include "opt/optimizer.hpp"
 
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/types/config_key_vocabulary.hpp"  // the ONE closed-key check + the `$` carve-out
 #include "core/types/config_path_walk.hpp"
@@ -483,17 +484,21 @@ loadShippedPipeline(std::string_view name) {
         return std::unexpected(std::move(pathR).error());
     }
     auto const path = pathR.value();
-    std::ifstream in{path};
-    if (!in) {
+    // THE ONE CHECKED READ (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+    // ★ This site also opened in TEXT mode, alone among the shipped-config
+    // loaders. On Windows that silently translated CRLF, so the bytes the parser
+    // saw were not the bytes on disk — harmless for JSON, but it made this the
+    // one loader whose read could not be size-checked at all. The shared helper
+    // is unconditionally binary.
+    auto text = core::readFileChecked(path);
+    if (!text) {
         substrate::DiagnosticCollector coll;
         coll.emit(DiagnosticCode::X_PipelineNameResolutionFailed,
                   path.string(),
-                  "failed to open pipeline file for reading");
+                  "pipeline file: " + std::move(text).error().message);
         return std::unexpected(std::move(coll).release());
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return loadPipelineFromText(ss.str(), path.string());
+    return loadPipelineFromText(*std::move(text), path.string());
 }
 
 } // namespace dss::opt

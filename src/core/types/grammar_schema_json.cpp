@@ -1,5 +1,6 @@
 #include "core/types/grammar_schema_json.hpp"
 
+#include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -694,10 +695,17 @@ NodeFlags parseFlagList(json const& arr, std::string const& path, Collector& c) 
 // Recursively collect every string atom that appears in a shape body.
 // These are *references* — names that must resolve to either a rule
 // (RuleInterner) or a schema-token-kind (SchemaTokenInterner).
+// D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
+// `outClassRefs`, when non-null, collects every `{"tokenClass": "<name>"}` atom.
+// A class name is NEITHER a rule NOR a token kind, so it must not join `outRefs`
+// — Pass B would report it as an unknown reference. It is validated against
+// `data.tokenClasses` by the caller that has `data` (see Pass B). Null for the
+// languageReferences pre-scan, which asks only "which RULES does the host reach".
 void collectReferences(json const& body,
                        std::string const& path,
                        std::vector<std::string>& outRefs,
-                       Collector& c) {
+                       Collector& c,
+                       std::vector<std::string>* outClassRefs = nullptr) {
     if (body.is_string()) {
         outRefs.push_back(body.get<std::string>());
         return;
@@ -723,19 +731,19 @@ void collectReferences(json const& body,
         }
         for (std::size_t i = 0; i < arr.size(); ++i) {
             collectReferences(arr[i], std::format("{}/{}/{}", path, kind, i),
-                              outRefs, c);
+                              outRefs, c, outClassRefs);
         }
     };
 
-    // The five shape kinds are mutually exclusive — a body declares one of
-    // sequence|alt|optional|repeat|expr, never two — and a body must declare
-    // at least one. A body with zero kinds silently produces a no-op rule
+    // The six shape kinds are mutually exclusive — a body declares one of
+    // sequence|alt|optional|repeat|expr|tokenClass, never two — and a body must
+    // declare at least one. A body with zero kinds silently produces a no-op rule
     // (the position builder falls through to `return cont`); a body with
     // multiple kinds silently runs every matching branch. Both are surface
     // misfires that this guard turns into load errors.
     {
         constexpr std::string_view kShapeKinds[] = {
-            "sequence", "alt", "optional", "repeat", "expr",
+            "sequence", "alt", "optional", "repeat", "expr", "tokenClass",
         };
         std::vector<std::string_view> present;
         for (auto k : kShapeKinds) {
@@ -743,7 +751,7 @@ void collectReferences(json const& body,
         }
         if (present.empty()) {
             c.emit(DiagnosticCode::C_UnknownShape, path,
-                   "shape body declares no kind — expected exactly one of sequence|alt|optional|repeat|expr");
+                   "shape body declares no kind — expected exactly one of sequence|alt|optional|repeat|expr|tokenClass");
         } else if (present.size() > 1) {
             std::string joined;
             for (std::size_t i = 0; i < present.size(); ++i) {
@@ -751,7 +759,7 @@ void collectReferences(json const& body,
                 joined += present[i];
             }
             c.emit(DiagnosticCode::C_UnknownShape, path,
-                   std::format("shape body declares multiple kinds ({}) — exactly one of sequence|alt|optional|repeat|expr must be present",
+                   std::format("shape body declares multiple kinds ({}) — exactly one of sequence|alt|optional|repeat|expr|tokenClass must be present",
                                joined));
         }
     }
@@ -760,11 +768,27 @@ void collectReferences(json const& body,
     if (body.contains("alt"))      recurseArray(body.at("alt"),      "alt");
     if (body.contains("optional")) {
         collectReferences(body.at("optional"),
-                          std::format("{}/optional", path), outRefs, c);
+                          std::format("{}/optional", path), outRefs, c,
+                          outClassRefs);
     }
     if (body.contains("repeat")) {
         collectReferences(body.at("repeat"),
-                          std::format("{}/repeat", path), outRefs, c);
+                          std::format("{}/repeat", path), outRefs, c,
+                          outClassRefs);
+    }
+    // `{"tokenClass": "<name>"}` — one slot admitting any token kind in the
+    // named class. The NAME resolves against `tokenClasses`, not against rules
+    // or token kinds, so it is collected separately (see the parameter's note).
+    if (body.contains("tokenClass")) {
+        json const& tc = body.at("tokenClass");
+        if (!tc.is_string() || tc.get<std::string>().empty()) {
+            c.emit(DiagnosticCode::C_MissingField,
+                   std::format("{}/tokenClass", path),
+                   "'tokenClass' must be the non-empty NAME of a "
+                   "'tokenClasses' entry");
+        } else if (outClassRefs != nullptr) {
+            outClassRefs->push_back(tc.get<std::string>());
+        }
     }
     // `expr` body is `{ atom: <rule>, minPrecedence?: <int>,
     // wrapperRules: { binary, unary, postfix } }`. The loader validates
@@ -992,6 +1016,11 @@ bool nullableOfBody(json const& body,
     if (body.contains("expr")) {
         return nullableOfBody(body.at("expr").at("atom"), data);
     }
+    // A `{"tokenClass": …}` slot consumes EXACTLY ONE token, exactly as a
+    // single-token reference does, so it is never nullable. (Falling through to
+    // the `return false` below would give the same answer today; stating it is
+    // what keeps the answer right if that default ever changes.)
+    if (body.contains("tokenClass")) return false;
     return false;
 }
 
@@ -1051,6 +1080,15 @@ std::vector<SchemaTokenId> firstOfBody(json const& body,
             }
         }
         return result;
+    }
+    // FIRST({"tokenClass": C}) = C's declared kind set. An UNDECLARED name
+    // yields the empty set here, which would make the slot silently
+    // never-matching — Pass B rejects that name before any FIRST set is asked
+    // for, so this arm is only ever reached for a class that exists.
+    if (body.contains("tokenClass") && body.at("tokenClass").is_string()) {
+        auto const it = data.tokenClasses.find(body.at("tokenClass").get<std::string>());
+        if (it != data.tokenClasses.end()) return it->second;
+        return {};
     }
     return {};
 }
@@ -1248,6 +1286,19 @@ struct PositionBuilder {
             // Pratt operator-climbing step is the parser's job, not the
             // cursor's.
             return build(body.at("expr").at("atom"), cont);
+        }
+        if (body.contains("tokenClass") && body.at("tokenClass").is_string()) {
+            // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
+            // one slot admitting any kind in the declared class. Validated in
+            // Pass B (the name exists, the class is non-empty), so a miss here
+            // is unreachable; it falls through to `cont` — the same no-op every
+            // other malformed body reaches — rather than inventing a slot.
+            auto const it =
+                data.tokenClasses.find(body.at("tokenClass").get<std::string>());
+            if (it != data.tokenClasses.end() && !it->second.empty()) {
+                return emplace(detail::Position::makeTokenClassLeaf(
+                    it->second, cont));
+            }
         }
         return cont;
     }
@@ -2025,14 +2076,20 @@ void validateBodyDefaultKindsOffGrammar(GrammarSchemaData& data, Collector& coll
         const auto ruleName = data.rules->name(RuleId{ruleIdV});
         for (auto const& p : rule.positions) {
             if (p.slotKind() != SlotKind::TokenLeaf) continue;
-            if (!bodyKinds.contains(p.tokenId())) continue;
+            // Every kind the leaf admits — one for a single-token reference, the
+            // whole declared set for a `{"tokenClass": …}` slot. Reading
+            // `tokenId()` here would see the invalid id on a class slot and skip
+            // it, which is exactly the silent miss this guard exists to prevent.
+            for (auto const tokId : p.expectedSet()) {
+            if (!bodyKinds.contains(tokId)) continue;
             coll.emit(DiagnosticCode::C_BodyDefaultKindInShape,
                       shapePointer(data, ruleName),
                       std::format("token '{}' is declared as a lexer mode's "
                                   "defaultToken.kind and is therefore off-"
                                   "grammar — referencing it from a shape "
                                   "would silently never match",
-                                  data.schemaTokens->name(p.tokenId())));
+                                  data.schemaTokens->name(tokId)));
+            }
         }
     }
 
@@ -2487,7 +2544,7 @@ constexpr std::uint32_t kMaxSchemaVersion = 4;
 // ENTIRE phase. Every name here is a key the loader genuinely reads.
 // Shared with the referenced-document check so a fragment gets the same
 // typo discrimination its host does.
-constexpr std::array<std::string_view, 24> kDocumentKeys{
+constexpr std::array<std::string_view, 25> kDocumentKeys{
     // identity + loader gates
     "dssSchemaVersion", "language", "reservedWordPolicy", "parser",
     // ⚠ `isa` MUST be in this table, and its reason is the sharpest one here.
@@ -2512,6 +2569,12 @@ constexpr std::array<std::string_view, 24> kDocumentKeys{
     // lexical surface
     "lexerModes", "tokens", "keywords", "operators", "scopes",
     "syncTokens", "numberStyle",
+    // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
+    // named SETS of token kinds. It sits with the lexical surface because that is
+    // what it describes — a class is a statement about the token vocabulary, not
+    // about the grammar — and it is parsed after `tokens`/`keywords` (both of
+    // which it may draw from) and before `shapes` (which reference it).
+    "tokenClasses",
     // ⚠ `identifierClass` shares `numberStyle`'s reason for being in this
     // table: it is OPTIONAL and its absence means the universal ASCII rule, so
     // a typo'd `identifierClasses` would load perfectly clean and silently
@@ -3119,19 +3182,19 @@ void mergeLanguageReferences(
             continue;
         }
         const std::string docLabel = resolved->filename().string();
-        std::string text;
-        {
-            std::ifstream in(*resolved, std::ios::binary);
-            if (!in) {
-                coll.emit(DiagnosticCode::C_MalformedJson, refPath,
-                          std::format("cannot open referenced language document "
-                                      "'{}'", resolved->string()));
-                continue;
-            }
-            std::ostringstream buf;
-            buf << in.rdbuf();
-            text = std::move(buf).str();
+        // THE ONE CHECKED READ
+        // (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+        // A referenced document that read short used to arrive at `json::parse`
+        // below as a truncated document, so the operator was told the REFERENCED
+        // LANGUAGE was malformed when the fault was the read of it.
+        auto readText = core::readFileChecked(*resolved);
+        if (!readText) {
+            coll.emit(DiagnosticCode::C_MalformedJson, refPath,
+                      std::format("referenced language document: {}",
+                                  std::move(readText).error().message));
+            continue;
         }
+        std::string text = *std::move(readText);
         json refDoc;
         try {
             refDoc = json::parse(text);
@@ -4707,6 +4770,133 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // tokenClasses ──
+    //
+    // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED
+    //
+    // A NAMED SET OF TOKEN KINDS, declared ONCE and resolved by every tier that
+    // needs it: the GRAMMAR through the `{"tokenClass": "<name>"}` shape element,
+    // and the SEMANTIC tier through a key that names the class
+    // (`semantics.attributeSemantics.clauseNameTokenClass`). Both read THIS map.
+    //
+    // ★ WHY THE SHARED DECLARATION IS THE WHOLE MECHANISM, and why a second
+    // hand-written list would have been the defect rather than the fix: the row
+    // that opened this exists because a grammar position admitted only
+    // `Identifier` as an attribute clause NAME while the semantic reader looked
+    // for that same single kind, and widening EITHER side alone is worse than the
+    // refusal it replaces — widen the grammar and a keyword-named clause parses,
+    // matches no effect row and VANISHES; widen the reader and it never sees a
+    // clause the grammar still rejects. One declaration cannot drift from itself.
+    //
+    // ★ `allKeywordKinds` DERIVES FROM THE DOCUMENT'S OWN `keywords` TABLE, which
+    // is what keeps this source-agnostic: the engine never spells a keyword, a
+    // dunder convention, or a language name. Add a keyword to the language and
+    // every class that opted in grows with it, in the same commit, with no second
+    // place to remember. It is read from the raw `keywords` array rather than from
+    // `lexemeTable` deliberately — that table also holds every `tokens` entry, so
+    // it cannot answer "which kinds did the KEYWORD table produce?".
+    //
+    // ⚠ PARSED HERE, between `keywords` and `shapes`, and the ordering is load-
+    // bearing in both directions: a class may draw on the token + keyword
+    // vocabulary (so both must already be interned), and a shape may name a class
+    // (so the map must be complete before `buildPositionTables` runs).
+    if (doc.contains("tokenClasses") && !doc.at("tokenClasses").is_object()) {
+        coll.emit(DiagnosticCode::C_ConflictingField, "/tokenClasses",
+                  "'tokenClasses' must be an object keyed by class name");
+    }
+    if (doc.contains("tokenClasses") && doc.at("tokenClasses").is_object()) {
+        // The distinct token KINDS this document's `keywords` table produces.
+        std::vector<SchemaTokenId> keywordKinds;
+        if (doc.contains("keywords") && doc.at("keywords").is_array()) {
+            for (json const& kw : doc.at("keywords")) {
+                if (!kw.is_object() || !kw.contains("kind")
+                    || !kw.at("kind").is_string()) continue;
+                insertSorted(keywordKinds,
+                             data.schemaTokens->intern(
+                                 kw.at("kind").get<std::string>()));
+            }
+        }
+        for (auto const& [className, spec] : doc.at("tokenClasses").items()) {
+            if (isDocumentationKey(className)) continue;
+            const auto classPath = std::format("/tokenClasses/{}", className);
+            if (!spec.is_object()) {
+                coll.emit(DiagnosticCode::C_ConflictingField, classPath,
+                          "a 'tokenClasses' entry must be an object with "
+                          "'tokens' and/or 'allKeywordKinds'");
+                continue;
+            }
+            {
+                static constexpr std::array<std::string_view, 2>
+                    kTokenClassKeys{"tokens", "allKeywordKinds"};
+                DSS_CHECK_KEY_VOCABULARY(kTokenClassKeys);
+                (void)checkKeysAgainst(spec, kTokenClassKeys, classPath,
+                                       "a 'tokenClasses' entry",
+                                       DiagnosticCode::C_ConflictingField, coll);
+            }
+            std::vector<SchemaTokenId> members;
+            if (spec.contains("tokens")) {
+                if (!spec.at("tokens").is_array()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/tokens", classPath),
+                              "'tokens' must be an array of token-kind names");
+                } else {
+                    for (std::size_t i = 0; i < spec.at("tokens").size(); ++i) {
+                        json const& t = spec.at("tokens").at(i);
+                        const auto tPath =
+                            std::format("{}/tokens/{}", classPath, i);
+                        if (!t.is_string()) {
+                            coll.emit(DiagnosticCode::C_ConflictingField, tPath,
+                                      "a 'tokens' entry must be a token-kind "
+                                      "name");
+                            continue;
+                        }
+                        const auto kindName = t.get<std::string>();
+                        // ★ DECLARED kinds only — never `intern`. Interning a
+                        // typo would mint a kind the tokenizer can never emit,
+                        // so the class would silently admit one fewer spelling
+                        // than the author wrote and the slot would quietly
+                        // narrow with no diagnostic anywhere.
+                        if (!data.schemaTokens->contains(kindName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, tPath,
+                                      std::format("unknown token kind '{}' — a "
+                                                  "token class may only name "
+                                                  "kinds this document declares",
+                                                  kindName));
+                            continue;
+                        }
+                        insertSorted(members, data.schemaTokens->find(kindName));
+                    }
+                }
+            }
+            if (spec.contains("allKeywordKinds")) {
+                if (!spec.at("allKeywordKinds").is_boolean()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/allKeywordKinds", classPath),
+                              "'allKeywordKinds' must be a boolean");
+                } else if (spec.at("allKeywordKinds").get<bool>()) {
+                    if (keywordKinds.empty()) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  std::format("{}/allKeywordKinds", classPath),
+                                  "'allKeywordKinds' is set but this document "
+                                  "declares no 'keywords' — the class would "
+                                  "silently contribute nothing");
+                    }
+                    mergeSorted(members, keywordKinds);
+                }
+            }
+            if (members.empty()) {
+                coll.emit(DiagnosticCode::C_ConflictingField, classPath,
+                          std::format("token class '{}' resolves to NO token "
+                                      "kind — a grammar slot built from it could "
+                                      "never match, so the construct it admits "
+                                      "would fail as though unsupported",
+                                      className));
+                continue;
+            }
+            data.tokenClasses.emplace(className, std::move(members));
+        }
+    }
+
     // Pass 2: populate per-mode tokens + defaultToken. "main" inherits
     // top-level lexemeTable; other modes parse inline.
     if (mainModeId.valid()) {
@@ -5915,13 +6105,26 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             for (auto const& [shapeName, body] : shapes.items()) {
                 const auto shapePath = shapePointer(data, shapeName);
                 std::vector<std::string> refs;
-                collectReferences(body, shapePath, refs, coll);
+                std::vector<std::string> classRefs;
+                collectReferences(body, shapePath, refs, coll, &classRefs);
 
                 for (auto const& r : refs) {
                     if (data.rules->contains(r))        continue;
                     if (data.schemaTokens->contains(r)) continue;
                     coll.emit(DiagnosticCode::C_UnknownShape, shapePath,
                               std::format("unknown reference '{}'", r));
+                }
+                // A `{"tokenClass": …}` name resolves against `tokenClasses`
+                // ONLY. An unknown one would compile to `cont` — a slot that
+                // consumes nothing and matches nothing — so the construct it was
+                // written to admit would fail with a diagnostic naming the wrong
+                // thing entirely. Reject it here, where the name is still visible.
+                for (auto const& r : classRefs) {
+                    if (data.tokenClasses.contains(r)) continue;
+                    coll.emit(DiagnosticCode::C_UnknownShape, shapePath,
+                              std::format("unknown token class '{}' — declare it "
+                                          "under the document's 'tokenClasses'",
+                                          r));
                 }
             }
 
@@ -6055,10 +6258,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             (void)ruleIdV;
             for (auto const& p : rule.positions) {
                 if (p.slotKind() != SlotKind::TokenLeaf) continue;
-                if (p.tokenId().v == intLitId.v || p.tokenId().v == floatLitId.v) {
-                    usesNumericLiteralTokens = true;
-                    break;
+                // The leaf's whole admitted set, not `tokenId()` — a
+                // `{"tokenClass": …}` slot that admits IntLiteral uses numeric
+                // literals just as a bare `"IntLiteral"` reference does, and
+                // missing it would leave `numberStyle` unrequired for a
+                // language that genuinely lexes numbers.
+                for (auto const tokId : p.expectedSet()) {
+                    if (tokId.v == intLitId.v || tokId.v == floatLitId.v) {
+                        usesNumericLiteralTokens = true;
+                        break;
+                    }
                 }
+                if (usesNumericLiteralTokens) break;
             }
             if (usesNumericLiteralTokens) break;
         }
@@ -12667,10 +12878,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // Closed keys (typo discriminator) — the `$`-prefixed
                     // documentation convention stays exempt, exactly as in
                     // `declarators` and the enclosing `semantics` object.
-                    static constexpr std::array<std::string_view, 5>
+                    static constexpr std::array<std::string_view, 6>
                         kAttributeSemanticsKeys{"attrSpecRule", "stdAttrRule",
                                                 "bareStatementRule", "effects",
-                                                "attributeArgRule"};
+                                                "attributeArgRule",
+                                                "clauseNameTokenClass"};
                     DSS_CHECK_KEY_VOCABULARY(kAttributeSemanticsKeys);
                     (void)checkKeysAgainst(
                         as, kAttributeSemanticsKeys,
@@ -12741,6 +12953,47 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             } else {
                                 cfg.attributeArgRule = data.rules->find(nm);
                                 cfg.attributeArgRuleName = std::move(nm);
+                            }
+                        }
+                    }
+                    // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
+                    // the TOKEN CLASS whose kinds may spell an attribute clause
+                    // NAME. OPTIONAL — absent means the reader's historical
+                    // behaviour, "the language's `identifierToken` and nothing
+                    // else", which is exactly right for a language whose
+                    // attribute names are plain identifiers.
+                    //
+                    // ★★ IT IS THE SAME DECLARATION THE GRAMMAR RESOLVES, AND
+                    // THE BIDIRECTIONAL GUARD BELOW IS WHAT MAKES THAT A FACT
+                    // RATHER THAN A CONVENTION. Widening only the grammar makes
+                    // `__attribute__((__const__))` PARSE, match no effect row and
+                    // then VANISH — an attribute the program may depend on,
+                    // silently dropped. Widening only the reader leaves it
+                    // rejected at the grammar, so the reader's extra reach is
+                    // dead config. Neither half is detectable from the other side
+                    // at runtime; both are detectable HERE.
+                    if (as.contains("clauseNameTokenClass")) {
+                        json const& cn = as.at("clauseNameTokenClass");
+                        if (!cn.is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/attributeSemantics/"
+                                      "clauseNameTokenClass",
+                                      "'clauseNameTokenClass' must be a string "
+                                      "naming a 'tokenClasses' entry");
+                        } else {
+                            std::string nm = cn.get<std::string>();
+                            auto const it = data.tokenClasses.find(nm);
+                            if (it == data.tokenClasses.end()) {
+                                coll.emit(DiagnosticCode::C_UnknownShape,
+                                          "/semantics/attributeSemantics/"
+                                          "clauseNameTokenClass",
+                                          std::format("'attributeSemantics."
+                                                      "clauseNameTokenClass' "
+                                                      "references unknown token "
+                                                      "class '{}'", nm));
+                            } else {
+                                cfg.attributeClauseNameTokens = it->second;
+                                cfg.attributeClauseNameTokenClassName = std::move(nm);
                             }
                         }
                     }
@@ -13087,6 +13340,23 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.nodiscard' must be an object "
                               "{ discardStatementRule, expressionRule }");
                 } else {
+                    // CLOSED KEYS (typo discriminator). This block never had one, and
+                    // the two OPT-IN lists below are exactly the shape that makes it
+                    // matter: their absence is meaningful and their default is the
+                    // MISS this row exists to close, so a misspelled
+                    // `discardTransparentRule` would load perfectly clean and leave
+                    // every wrapped discard unwarned, with nothing anywhere saying so.
+                    {
+                        static constexpr std::array<std::string_view, 4>
+                            kNodiscardKeys{"discardStatementRule", "expressionRule",
+                                           "discardTransparentRules",
+                                           "discardClauseHosts"};
+                        DSS_CHECK_KEY_VOCABULARY(kNodiscardKeys);
+                        (void)checkKeysAgainst(nd, kNodiscardKeys,
+                                               "/semantics/nodiscard",
+                                               "the 'nodiscard' block",
+                                               DiagnosticCode::C_InvalidSemantics, coll);
+                    }
                     auto readRule = [&](char const* key, char const* path,
                                         RuleId& outRule, std::string& outName) {
                         if (!nd.contains(key) || !nd.at(key).is_string()) {
@@ -13105,6 +13375,165 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         outRule = data.rules->find(outName);
                     };
+                    // ── P32 [[D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT]] ──
+                    // The two optional lists that turn the two-hop-EXACT test into
+                    // a bounded parent-chain walk. Both OPTIONAL: absent leaves the
+                    // shipped two-hop behaviour byte-identical, which is what every
+                    // language that declares neither relies on.
+                    if (nd.contains("discardTransparentRules")) {
+                        json const& tr = nd.at("discardTransparentRules");
+                        if (!tr.is_array()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/nodiscard/discardTransparentRules",
+                                      "'discardTransparentRules' must be an array of "
+                                      "rule names or { rule, operatorToken } objects");
+                        } else {
+                            for (std::size_t i = 0; i < tr.size(); ++i) {
+                                json const& e = tr.at(i);
+                                const auto ePath = std::format(
+                                    "/semantics/nodiscard/discardTransparentRules/{}", i);
+                                SemanticConfig::NodiscardTransparentRule row;
+                                std::string ruleName;
+                                if (e.is_string()) {
+                                    ruleName = e.get<std::string>();
+                                } else if (e.is_object()) {
+                                    static constexpr std::array<std::string_view, 2>
+                                        kKeys{"rule", "operatorToken"};
+                                    DSS_CHECK_KEY_VOCABULARY(kKeys);
+                                    (void)checkKeysAgainst(
+                                        e, kKeys, ePath,
+                                        "a 'discardTransparentRules' entry",
+                                        DiagnosticCode::C_InvalidSemantics, coll);
+                                    if (!e.contains("rule") || !e.at("rule").is_string()) {
+                                        coll.emit(DiagnosticCode::C_MissingField, ePath,
+                                                  "a 'discardTransparentRules' entry "
+                                                  "needs a string 'rule'");
+                                        continue;
+                                    }
+                                    ruleName = e.at("rule").get<std::string>();
+                                    if (e.contains("operatorToken")) {
+                                        json const& ot = e.at("operatorToken");
+                                        if (!ot.is_string()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      std::format("{}/operatorToken", ePath),
+                                                      "'operatorToken' must be a token-kind "
+                                                      "name");
+                                            continue;
+                                        }
+                                        // ★ DECLARED kinds only. Interning a typo here would
+                                        // mint a kind the tokenizer can never emit, so the
+                                        // entry would match NOTHING and the discard it was
+                                        // written for would go on being missed — silently,
+                                        // which is the failure this row exists to close.
+                                        const auto tn = ot.get<std::string>();
+                                        if (!data.schemaTokens->contains(tn)) {
+                                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                                      std::format("{}/operatorToken", ePath),
+                                                      std::format("unknown token kind '{}'", tn));
+                                            continue;
+                                        }
+                                        row.operatorToken     = data.schemaTokens->find(tn);
+                                        row.operatorTokenName = tn;
+                                    }
+                                } else {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, ePath,
+                                              "a 'discardTransparentRules' entry must be a "
+                                              "rule name or a { rule, operatorToken } object");
+                                    continue;
+                                }
+                                if (!data.rules->contains(ruleName)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape, ePath,
+                                              std::format("'nodiscard.discardTransparentRules' "
+                                                          "references unknown shape '{}'",
+                                                          ruleName));
+                                    continue;
+                                }
+                                row.rule     = data.rules->find(ruleName);
+                                row.ruleName = std::move(ruleName);
+                                cfg.nodiscardDiscardTransparentRules.push_back(std::move(row));
+                            }
+                        }
+                    }
+                    if (nd.contains("discardClauseHosts")) {
+                        json const& ch = nd.at("discardClauseHosts");
+                        if (!ch.is_array()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/nodiscard/discardClauseHosts",
+                                      "'discardClauseHosts' must be an array of "
+                                      "{ rule, discardSegments } objects");
+                        } else {
+                            for (std::size_t i = 0; i < ch.size(); ++i) {
+                                json const& e = ch.at(i);
+                                const auto ePath = std::format(
+                                    "/semantics/nodiscard/discardClauseHosts/{}", i);
+                                if (!e.is_object()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, ePath,
+                                              "a 'discardClauseHosts' entry must be an object "
+                                              "{ rule, discardSegments }");
+                                    continue;
+                                }
+                                {
+                                    static constexpr std::array<std::string_view, 2>
+                                        kKeys{"rule", "discardSegments"};
+                                    DSS_CHECK_KEY_VOCABULARY(kKeys);
+                                    (void)checkKeysAgainst(
+                                        e, kKeys, ePath, "a 'discardClauseHosts' entry",
+                                        DiagnosticCode::C_InvalidSemantics, coll);
+                                }
+                                if (!e.contains("rule") || !e.at("rule").is_string()) {
+                                    coll.emit(DiagnosticCode::C_MissingField, ePath,
+                                              "a 'discardClauseHosts' entry needs a string "
+                                              "'rule'");
+                                    continue;
+                                }
+                                const auto ruleName = e.at("rule").get<std::string>();
+                                if (!data.rules->contains(ruleName)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape, ePath,
+                                              std::format("'nodiscard.discardClauseHosts' "
+                                                          "references unknown shape '{}'",
+                                                          ruleName));
+                                    continue;
+                                }
+                                if (!e.contains("discardSegments")
+                                    || !e.at("discardSegments").is_array()
+                                    || e.at("discardSegments").empty()) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              std::format("{}/discardSegments", ePath),
+                                              "'discardSegments' must be a NON-EMPTY array of "
+                                              "0-based clause indices — an empty list makes the "
+                                              "host entry match nothing, which reads as a "
+                                              "working declaration and is not one");
+                                    continue;
+                                }
+                                SemanticConfig::NodiscardClauseHost host;
+                                host.rule     = data.rules->find(ruleName);
+                                host.ruleName = ruleName;
+                                bool bad = false;
+                                for (json const& sgv : e.at("discardSegments")) {
+                                    if (!sgv.is_number_unsigned()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  std::format("{}/discardSegments", ePath),
+                                                  "each clause index must be a non-negative "
+                                                  "integer");
+                                        bad = true;
+                                        break;
+                                    }
+                                    host.discardSegments.push_back(
+                                        sgv.get<std::uint32_t>());
+                                }
+                                if (bad) continue;
+                                // ⚠ THE CLAUSE INDEX IS COUNTED WITH THE CST→HIR `for`
+                                // PROLOGUE'S OWN SEPARATOR (`hirLowering.forClauseSeparator`),
+                                // and without it the index means nothing at all — every child
+                                // would land in clause 0 and the CONDITION would be treated as
+                                // a discard, warning on legal C that neither reference warns
+                                // about. That key is parsed AFTER this block, so the
+                                // cross-check cannot run here; it runs where `hirLowering` is
+                                // finished (search `discardClauseHosts` there).
+                                cfg.nodiscardDiscardClauseHosts.push_back(std::move(host));
+                            }
+                        }
+                    }
                     readRule("discardStatementRule",
                              "/semantics/nodiscard/discardStatementRule",
                              cfg.nodiscardDiscardStatementRule,
@@ -14691,6 +15120,105 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+                // ── Clause C: the CLAUSE-NAME class must be the SAME on both
+                // sides (D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED)
+                //
+                // The grammar decides which tokens may SPELL an attribute clause
+                // name; the semantic reader decides which tokens it will READ as
+                // one. They are separate mechanisms in separate files and neither
+                // can observe the other at runtime — which is precisely how the
+                // row this closes came to exist. Both failure directions are
+                // silent, and they are silent in different ways:
+                //
+                //   • GRAMMAR WIDER THAN READER — a keyword-named clause parses,
+                //     the reader's name scan finds nothing, the clause matches no
+                //     effect row and VANISHES. `__attribute__((__const__))` would
+                //     be accepted and then IGNORED. That is strictly worse than
+                //     the parse error it replaced: a refusal is loud, a dropped
+                //     attribute is a program compiled against a promise the
+                //     compiler quietly declined to keep.
+                //   • READER WIDER THAN GRAMMAR — the reader can see kinds the
+                //     grammar refuses, so the extra reach is dead config that
+                //     reads as a working feature.
+                //
+                // Both are decidable HERE, from the compiled position tables plus
+                // the resolved class, so neither can ship.
+                //
+                // ⓘ A TokenLeaf carrying MORE THAN ONE admissible kind can only
+                // have come from a `{"tokenClass": …}` element — an ordinary token
+                // reference compiles to a one-element set. A one-element CLASS
+                // would evade the second direction, and that is stated rather than
+                // patched around: such a class is indistinguishable from naming the
+                // token directly, so there is nothing for the reader to miss.
+                if (cfg.attrSpecRule.valid() || cfg.stdAttrRule.valid()) {
+                    // Rules reachable from the attribute-specifier shapes, via
+                    // RuleLeaf edges. The clause NAME may live in a nested rule
+                    // (c's trailing `attrClauseTail`, the `[[…]]` item rule), so a
+                    // direct-children check would miss the very positions that
+                    // matter.
+                    std::vector<std::uint32_t> work;
+                    std::unordered_set<std::uint32_t> seen;
+                    auto push = [&](RuleId r) {
+                        if (r.valid() && seen.insert(r.v).second) work.push_back(r.v);
+                    };
+                    push(cfg.attrSpecRule);
+                    push(cfg.stdAttrRule);
+                    bool sawDeclaredClass = false;
+                    bool sawSomeClass     = false;
+                    while (!work.empty()) {
+                        const auto rid = work.back();
+                        work.pop_back();
+                        auto const it = data.compiledRules.find(rid);
+                        if (it == data.compiledRules.end()) continue;
+                        for (auto const& pos : it->second.positions) {
+                            if (pos.slotKind() == SlotKind::RuleLeaf) {
+                                push(pos.ruleId());
+                                continue;
+                            }
+                            if (pos.slotKind() != SlotKind::TokenLeaf) continue;
+                            auto const set = pos.expectedSet();
+                            if (set.size() > 1) sawSomeClass = true;
+                            if (!cfg.attributeClauseNameTokens.empty()
+                                && std::ranges::equal(
+                                       set, cfg.attributeClauseNameTokens,
+                                       [](SchemaTokenId a, SchemaTokenId b) {
+                                           return a.v == b.v;
+                                       })) {
+                                sawDeclaredClass = true;
+                            }
+                        }
+                    }
+                    if (!cfg.attributeClauseNameTokens.empty() && !sawDeclaredClass) {
+                        coll.emit(
+                            DiagnosticCode::C_InvalidSemantics,
+                            "/semantics/attributeSemantics/clauseNameTokenClass",
+                            std::format(
+                                "attribute clause-name drift: the reader is told "
+                                "to accept token class '{}' as a clause name, but "
+                                "no grammar slot reachable from the attribute "
+                                "shapes admits that class — every name outside "
+                                "the grammar's own set is refused at the parser, "
+                                "so the reader's extra reach is unreachable "
+                                "config. Give the clause-name position a "
+                                "'{{\"tokenClass\": \"{}\"}}' element, or drop "
+                                "the key",
+                                cfg.attributeClauseNameTokenClassName,
+                                cfg.attributeClauseNameTokenClassName));
+                    }
+                    if (cfg.attributeClauseNameTokens.empty() && sawSomeClass) {
+                        coll.emit(
+                            DiagnosticCode::C_InvalidSemantics,
+                            "/semantics/attributeSemantics",
+                            "attribute clause-name drift: the attribute grammar "
+                            "admits a TOKEN CLASS where the semantic reader still "
+                            "reads only 'identifierToken', so a clause the parser "
+                            "now accepts would match no effect row and be dropped "
+                            "in SILENCE. Declare "
+                            "'attributeSemantics.clauseNameTokenClass' naming the "
+                            "same class the grammar uses");
+                    }
+                }
+
             data.semantics = std::move(cfg);
         }
     }
@@ -15362,6 +15890,30 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             }
 
             data.hirLowering = std::move(cfg);
+
+            // P32 [[D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT]] — the cross-block
+            // check `semantics.nodiscard.discardClauseHosts` cannot make from inside
+            // its own block, because `hirLowering` is parsed AFTER `semantics`.
+            //
+            // A clause host says "children of THIS rule sitting in THESE `;`-separated
+            // clauses are discard positions". The separator is not restated there on
+            // purpose — it is already declared ONCE as
+            // `hirLowering.forClauseSeparator`, and the CST→HIR `for` prologue
+            // segments the very same header with it, so the two tiers cannot disagree
+            // about which clause is which. ⚠ WITHOUT that key every child counts as
+            // clause 0, and clause 0 is a DISCARD position for c's `for` — so the
+            // CONDITION would start warning on legal code that neither gcc nor clang
+            // warns about. A declaration that silently inverts into a false positive
+            // is worse than one that does nothing, so it is a load error.
+            if (!data.semantics.nodiscardDiscardClauseHosts.empty()
+                && !data.hirLowering.forClauseSeparator.valid()) {
+                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                          "/semantics/nodiscard/discardClauseHosts",
+                          "'discardClauseHosts' counts its clause indices with "
+                          "'hirLowering.forClauseSeparator', which this document does "
+                          "not declare — every child would count as clause 0 and a "
+                          "non-discarding clause would warn");
+            }
         }
     }
 

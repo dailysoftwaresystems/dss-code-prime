@@ -695,24 +695,37 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
             // could not have been written at all, because the size of an item now
             // depends on the item.
             StackArgCursor stackCursor{cc, outgoingSlotSize};
+            // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: the
+            // byte past the end of the furthest STATED aggregate placement. A
+            // placed carrier does NOT advance the cursor — its offset was decided
+            // by `lowerWideCallArgs` over the complete argument list, and this
+            // walk sees the shortened one — so the reservation takes the max of
+            // what the cursor consumed and what the statements reach.
+            std::uint32_t statedEndBytes = 0;
             std::uint32_t argRegionIdx = 0;             // 0-based arg position
             for (std::size_t k = 1; k < ops.size(); ++k) {
                 LirOperand const& argOp = ops[k];
-                if (argOp.kind == LirOperandKind::ByValueStackAgg) {
-                    // Marker — accounted with its preceding Reg; never a position.
+                if (lirIsByValueStackAggDescriptor(ops, k)) {
+                    // Accounted with the preceding Reg; never a position.
                     continue;
                 }
                 // A Reg immediately FOLLOWED by a ByValueStackAgg marker is a
                 // by-value-stack aggregate carrier (the address Reg). It occupies
                 // overflow slots, NOT a register; advance argRegionIdx (it IS an arg
                 // position for the forced-vararg boundary) but skip the class tally.
-                bool const isByValCarrier =
-                    argOp.kind == LirOperandKind::Reg
-                    && (k + 1) < ops.size()
-                    && ops[k + 1].kind == LirOperandKind::ByValueStackAgg;
-                if (isByValCarrier) {
-                    (void)stackCursor.placeNamedAggregate(
-                        ops[k + 1].byValueAggBytes);
+                if (lirIsByValueStackAggCarrier(ops, k)) {
+                    std::uint32_t const aggBytes = ops[k + 1].byValueAggBytes;
+                    if (auto const placed =
+                            lirByValueStackAggPlacedOffset(ops, k)) {
+                        std::uint32_t const span =
+                            ((aggBytes + outgoingSlotSize - 1u) / outgoingSlotSize)
+                            * outgoingSlotSize;
+                        std::uint32_t const end =
+                            static_cast<std::uint32_t>(*placed) + span;
+                        if (end > statedEndBytes) statedEndBytes = end;
+                    } else {
+                        (void)stackCursor.placeNamedAggregate(aggBytes);
+                    }
                     // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64
                     // EXHAUSTS the carrier's class — a later same-class arg also stacks.
                     // PAD the class count up to its pool so the "count - pool" overflow
@@ -758,9 +771,15 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
             }
 
             // The cursor already accounts carriers, forced varargs and
-            // pool-overflowing register args, in placement order.
-            std::uint32_t const overflow =
-                stackCursor.slotAlignedBytes() / outgoingSlotSize;
+            // pool-overflowing register args, in placement order — plus, for a
+            // call whose placements were STATED upstream, the furthest byte any
+            // statement reaches.
+            std::uint32_t const cursorBytes = stackCursor.slotAlignedBytes();
+            std::uint32_t const endBytes =
+                std::max(cursorBytes,
+                         ((statedEndBytes + outgoingSlotSize - 1u)
+                          / outgoingSlotSize) * outgoingSlotSize);
+            std::uint32_t const overflow = endBytes / outgoingSlotSize;
             if (overflow > maxOverflow) maxOverflow = overflow;
         }
     }
@@ -3504,11 +3523,22 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // FP-dup path and AAPCS64/Apple arm64 always-stack, none of which read
                 // this counter).
                 std::uint32_t fpVarargsInVectorArgRegs = 0;
+                // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES:
+                // did `lowerWideCallArgs` already lay this call's outgoing area
+                // out? If so THIS walk places NOTHING — every stacked argument
+                // states where it goes, and `stackCursor` below stays untouched.
+                // The bit is what makes that CHECKED instead of argued: the
+                // scalars that would have advanced the cursor are no longer in
+                // the operand list, so a cursor asked to place anything here is
+                // restarting inside bytes already handed out.
+                bool const outgoingArgsPlaced =
+                    lirCallOutgoingArgsArePlaced(src.instFlags(inst));
                 for (std::size_t i = firstArgIdx; i < ops.size(); ++i) {
                     LirOperand const& argOp = ops[i];
-                    // FC12a-struct: the ByValueStackAgg marker is consumed WITH its
-                    // preceding Reg (below) — never on its own. Skip it here.
-                    if (argOp.kind == LirOperandKind::ByValueStackAgg) continue;
+                    // FC12a-struct: the ByValueStackAgg marker — and the MemOffset
+                    // stating where its aggregate was placed — are consumed WITH
+                    // the preceding Reg (below), never on their own.
+                    if (lirIsByValueStackAggDescriptor(ops, i)) continue;
                     // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SpillSlotRef is a
                     // SPILLED register-passed arg the rewriter deferred. Its class
                     // rides `spillSlotClass`; it has no source register (it loads
@@ -3548,13 +3578,40 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // arg register (the class/slot counters do NOT advance) and reserves
                     // ceil(bytes / slot) overflow slots. This is the force-to-stack
                     // lever the greedy register-then-overflow placement otherwise lacks.
-                    if (!isSpillRef && (i + 1) < ops.size()
-                        && ops[i + 1].kind == LirOperandKind::ByValueStackAgg) {
+                    if (!isSpillRef && lirIsByValueStackAggCarrier(ops, i)) {
                         std::uint32_t const aggBytes = ops[i + 1].byValueAggBytes;
+                        // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES:
+                        // READ the placement, never re-derive it. `lowerWideCallArgs`
+                        // decided it over the call's COMPLETE argument list; this walk
+                        // sees the list with every stacked scalar already removed, so a
+                        // cursor here restarts at a byte the scalars already own — the
+                        // exact overlap this row records (`stur x20,[sp]` for the
+                        // scalar, then the aggregate's first eightbyte over the same
+                        // bytes, on both shipped pipelines, silently).
+                        auto const placed = lirByValueStackAggPlacedOffset(ops, i);
+                        if (!placed.has_value() && outgoingArgsPlaced) {
+                            report(reporter,
+                                   DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                                   DiagnosticSeverity::Error,
+                                   std::format(
+                                       "callconv: call inst {} arg {} is a by-value "
+                                       "stacked aggregate with no stated "
+                                       "outgoing-argument placement, on a call whose "
+                                       "outgoing arguments were already laid out by "
+                                       "lowerWideCallArgs. Placing it here would use "
+                                       "a cursor that cannot see the stacked scalars "
+                                       "that pass removed, and would overlap them",
+                                       inst.v, argRegionIdx));
+                            return false;
+                        }
+                        std::uint32_t const relOffset =
+                            placed.has_value()
+                                ? static_cast<std::uint32_t>(*placed)
+                                : stackCursor.placeNamedAggregate(aggBytes);
                         std::int32_t const dstOffset =
                             static_cast<std::int32_t>(
                                 static_cast<std::uint32_t>(cc.shadowSpaceBytes)
-                                + stackCursor.placeNamedAggregate(aggBytes));
+                                + relOffset);
                         byValStackCopies.push_back({srcReg, dstOffset, aggBytes});
                         // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: AAPCS64
                         // EXHAUSTS the carrier's class (NGRN/NSRN←pool) — CLAMP the
@@ -3677,6 +3734,30 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                                "reload classifier disagreed with the "
                                                "callconv arg walk (c77 invariant "
                                                "break)", inst.v, argRegionIdx));
+                            return false;
+                        }
+                        // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES:
+                        // on a call whose outgoing area was ALREADY laid out, this
+                        // branch must be unreachable — `lowerWideCallArgs` removes
+                        // every stacked scalar into a `store_outgoing_arg` carrier
+                        // using the same cursor and the same predicate, so an
+                        // argument arriving here means the two walks DISAGREED about
+                        // which arguments get registers. Placing it from a cursor
+                        // that never saw the removed scalars is how the two passes
+                        // hand out the same bytes twice, so refuse instead.
+                        if (outgoingArgsPlaced) {
+                            report(reporter,
+                                   DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                                   DiagnosticSeverity::Error,
+                                   std::format(
+                                       "callconv: call inst {} arg {} overflows onto "
+                                       "the stack here, but this call's outgoing "
+                                       "arguments were already placed by "
+                                       "lowerWideCallArgs — which means the two arg "
+                                       "walks disagree about what fits in registers. "
+                                       "Refusing rather than placing it from a cursor "
+                                       "that cannot see the arguments that pass "
+                                       "already removed", inst.v, argRegionIdx));
                             return false;
                         }
                         // D-ML7-2.2 stack-arg overflow: spill srcReg

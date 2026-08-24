@@ -176,6 +176,61 @@ struct DependsOnArtifact {
     bool                     mustDifferFromBaseline = false;
 };
 
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+// one library input the corpus CONSUMES WITHOUT BUILDING IT.
+//
+// ★★★ WHY THIS IS NOT A `dependsOn` WITH THE SOURCES LEFT OUT. Every
+// `dependsOn` entry names `sources` and the runner COMPILES them with DSS, so
+// every library the corpus links is one DSS produced from C in this same run.
+// That makes an entire class of input unreachable by the corpus: an archive
+// somebody ELSE built. The BSD `ar` container (`__.SYMDEF` / `__.SYMDEF
+// SORTED`, `#1/N` inline member names) is exactly such a class — DSS's own `ar`
+// writer emits the GNU/SysV container only, so no `dependsOn` entry can ever
+// produce one, and the BSD reader arms therefore shipped with driver-level
+// witnesses but NO corpus example. That is regression coverage, not
+// correctness: nothing in the standing suite would notice if those arms broke.
+//
+// PER-TARGET, like `dependsOn`, because an archive is format-specific: the
+// llvm-ar fixture holds ELF members and the Apple-ar one holds Mach-O members,
+// and neither is linkable into the other's image.
+//
+// ⚠ THE PATH IS REPO-ROOT-RELATIVE, NOT EXAMPLE-RELATIVE, AND THAT IS A
+// DELIBERATE CHOICE WITH A MEASURED REASON. The corpus normally keeps an
+// example's inputs beside it (`stageExampleTree` mirrors the whole neighborhood
+// into the scratch dir, which is how `environ_alias_object_identity` ships its
+// prebuilt gcc `.so`s). A foreign-built ARCHIVE cannot follow that rule today:
+// ✔`.gitignore` ignores `*.a` tree-wide and re-includes exactly one directory,
+// `!tests/ffi/data/*.a` — so a `.a` dropped into an example dir is SILENTLY
+// un-committable, the same trap [[D-FF1-AR-BSD-VARIANT]] hit and had to add a
+// negation for. Copying those bytes into `examples/` would also give ONE file
+// TWO provenances, and a fixture whose provenance is a README rather than a
+// build rule is a thing that rots. So the manifest points at the canonical
+// fixture instead, and the two consumers (the hermetic reader tests and this
+// corpus) read the same bytes with one README describing where they came from.
+struct PrebuiltLibrary {
+    // Path to the library, relative to the REPOSITORY ROOT. A path that could
+    // leave the tree, or that only opens on one host, is refused at parse time
+    // — `prebuiltLibraryPathRefusal` owns that rule and says why each clause is
+    // there.
+    std::string path;
+    // ★★★ THE FIELD THAT KEEPS THIS ENTRY FROM ROTTING INTO A VACUOUS PASS, and
+    // the reason it is REQUIRED rather than optional. An ASCII token that MUST
+    // appear in the file's bytes. The example's whole claim is *"DSS consumed an
+    // archive in the BSD container"* — but if that fixture were ever regenerated
+    // in the GNU container, the example would go on passing, because the GNU
+    // reader would resolve the same two symbols and produce the same exit code.
+    // The corpus witness for the BSD arms would evaporate with every suite still
+    // green, which is the precise failure this row exists to close. So the
+    // manifest STATES the property that makes its input the thing it claims to
+    // be, and both runners CHECK it — `__.SYMDEF SORTED` for the Apple fixture,
+    // `__.SYMDEF` for the llvm one.
+    //
+    // ⚠ A SUBSTRING PIN, NOT A PARSER, ON PURPOSE: a runner that decoded the
+    // container would be a second implementation of `ar_reader.cpp` living in a
+    // test harness, and it would agree with itself by construction.
+    std::string containerWitness;
+};
+
 // The IDENTITY of one prerequisite within an arm's build, used to match the
 // baseline arm's image for a dependency against an optimized arm's image for
 // THE SAME dependency.
@@ -217,6 +272,12 @@ struct ExampleTarget {
     // `--resolve-library` (`Program::setResolveLibraries`). Empty (the
     // default) ⇒ a plain single-artifact build (every pre-c171 example).
     std::vector<DependsOnArtifact> dependsOn;
+    // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+    // library inputs this target links WITHOUT BUILDING — resolved against the
+    // repo root, verified, and threaded into the SAME `--resolve-library` set
+    // the `dependsOn` artifacts go into. Empty (the default) ⇒ every pre-P32
+    // example's build is byte-identical to what it was.
+    std::vector<PrebuiltLibrary> prebuiltLibraries;
     // D-LK10-ENTRY-ARM64: optional emulator command (e.g.
     // "qemu-aarch64") used when the target arch differs from the host
     // arch. Empty ⇒ native execution only (the pre-V2-1 default).
@@ -511,6 +572,106 @@ parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
         }
     }
     return dep;
+}
+
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+// parse ONE `prebuiltLibraries` entry. Mirrored field-for-field by the
+// CLI-subprocess sibling's `parsePrebuiltLibraryEntry`
+// (integrated_tests/runner.cpp), because a manifest one runner accepts and the
+// other rejects is the silent-harness-bug class
+// [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] exists to catch. Returns nullopt
+// (ADD_FAILURE already fired) on any malformed field.
+//
+// ⚠ BOTH FIELDS ARE REQUIRED, and neither requirement is ceremony: a missing
+// `path` has nothing to link, and a missing `containerWitness` is an input
+// nobody stated a property of — see the field's own note for why an unwitnessed
+// prebuilt archive is a green that means nothing.
+
+// ★★★ THE PATH RULE, AND WHY IT JUDGES THE STRING RATHER THAN ASKING
+// `std::filesystem`. A corpus manifest must mean the SAME THING on every host,
+// and ✔MEASURED (this pin caught it, on the first run): `fs::path{"/abs/x"}
+// .is_absolute()` is TRUE on Linux and FALSE on Windows, because a Windows
+// absolute path needs a root NAME as well as a root directory. A rule built on
+// it would have refused a manifest on the Linux leg and accepted the very same
+// bytes on the Windows one — a corpus vocabulary that is a property of the host
+// reading it. So the four refusals below are pure string facts:
+//   * a leading '/' or '\'  — a root-relative path on some host;
+//   * any ':'               — a drive letter or device/stream spec;
+//   * any '\'               — a Windows-only spelling that cannot open on POSIX;
+//   * any ".."             — a reach outside the repository, which would make
+//                             the example's result depend on what is beside the
+//                             checkout rather than in it.
+// Returns the refusal clause, or an empty string when the path is acceptable.
+// Mirrored by the CLI-subprocess sibling's copy of the same name.
+[[nodiscard]] std::string prebuiltLibraryPathRefusal(std::string const& path) {
+    // Callers check emptiness first and report it with its own message; the
+    // guard is here anyway because `front()` on an empty string is undefined,
+    // and a helper that is only safe by its caller's discipline is a defect
+    // waiting for its second caller.
+    if (path.empty()) return "must not be empty";
+    if (path.front() == '/' || path.front() == '\\') {
+        return "must be RELATIVE to the repository root, and this one begins at"
+               " a root directory";
+    }
+    if (path.find(':') != std::string::npos) {
+        return "must be RELATIVE to the repository root, and ':' can only"
+               " introduce a drive or device";
+    }
+    if (path.find('\\') != std::string::npos) {
+        return "must be spelled with '/' separators — a '\\' opens on Windows"
+               " and not on POSIX, so the manifest would mean two things";
+    }
+    if (path.find("..") != std::string::npos) {
+        return "must not contain '..' — a corpus example must not reach outside"
+               " the repository";
+    }
+    return {};
+}
+
+[[nodiscard]] std::optional<PrebuiltLibrary>
+parsePrebuiltLibraryEntry(nlohmann::json const& p, fs::path const& manifestPath) {
+    if (!p.is_object()) {
+        ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                      << " prebuiltLibraries entries must be objects";
+        return std::nullopt;
+    }
+    // ★ THE CLOSED PER-ENTRY KEY SET RUNS FIRST HERE, AND THE ORDER IS A
+    // MEASURED CORRECTION rather than a style choice. Its sibling on the
+    // `dependsOn` entry runs after the required-field check, which is fine
+    // there because a typo'd `mustDifferFromBaseLine` leaves every required
+    // field intact. Here the required field IS the one that gets typo'd:
+    // ✔MEASURED, `containerWitnesss` made `containerWitness` read empty, so the
+    // required-field refusal fired first and the author was told a field was
+    // MISSING while the typo that made it missing went unnamed. Checking the
+    // key set first names the actual mistake.
+    for (auto const& [k, unusedV] : p.items()) {
+        (void)unusedV;
+        if (k == "path" || k == "containerWitness" || k.starts_with("$")) continue;
+        ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                      << " prebuiltLibraries entry declares unknown key '" << k
+                      << "' — the runner reads path / containerWitness (plus"
+                         " $comment keys). An expectation the runner does not"
+                         " read is an assertion that never fires.";
+        return std::nullopt;
+    }
+    PrebuiltLibrary lib;
+    lib.path             = p.value("path", "");
+    lib.containerWitness = p.value("containerWitness", "");
+    if (lib.path.empty() || lib.containerWitness.empty()) {
+        ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                      << " prebuiltLibraries entry needs non-empty 'path'"
+                         " (repo-root-relative) and 'containerWitness' (an"
+                         " ASCII token that must appear in the file's bytes)";
+        return std::nullopt;
+    }
+    if (std::string const why = prebuiltLibraryPathRefusal(lib.path);
+        !why.empty()) {
+        ADD_FAILURE() << "manifest " << manifestPath.generic_string()
+                      << " prebuiltLibraries 'path' " << why << " (got '"
+                      << lib.path << "')";
+        return std::nullopt;
+    }
+    return lib;
 }
 
 // ★★★ THE THREE LOAD-TIME REFUSALS THAT MAKE THE `optimizationObservable`
@@ -808,7 +969,8 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
             (void)unusedV;
             if (k == "spec" || k == "artifact" || k == "runOn"
                 || k == "emulator" || k == "expectedStdout" || k == "exitCode"
-                || k == "dependsOn" || k.starts_with("$")) {
+                || k == "dependsOn" || k == "prebuiltLibraries"
+                || k.starts_with("$")) {
                 continue;
             }
             ADD_FAILURE() << "manifest " << path.generic_string()
@@ -816,9 +978,9 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
                           << "' declares unknown key '" << k
                           << "' — the runner reads spec / artifact / runOn /"
                              " emulator / expectedStdout / exitCode /"
-                             " dependsOn (plus $comment keys). An expectation"
-                             " the runner does not read is an assertion that"
-                             " never fires.";
+                             " dependsOn / prebuiltLibraries (plus $comment"
+                             " keys). An expectation the runner does not read"
+                             " is an assertion that never fires.";
             return m;
         }
         if (t.contains("runOn") && t.at("runOn").is_array()) {
@@ -861,6 +1023,25 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
                 auto parsed = parseDependsOnEntry(d, path);
                 if (!parsed.has_value()) return m;  // ADD_FAILURE already fired
                 et.dependsOn.push_back(std::move(*parsed));
+            }
+        }
+        // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+        // optional library inputs this target links WITHOUT building — an
+        // archive this repository did not produce. Parsed by the SAME helper the
+        // CLI-subprocess sibling mirrors.
+        if (t.contains("prebuiltLibraries")) {
+            if (!t.at("prebuiltLibraries").is_array()
+                || t.at("prebuiltLibraries").empty()) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " target 'prebuiltLibraries' must be a"
+                                 " NON-EMPTY array — an empty one declares a"
+                                 " capability the build then never exercises";
+                return m;
+            }
+            for (auto const& p : t.at("prebuiltLibraries")) {
+                auto parsed = parsePrebuiltLibraryEntry(p, path);
+                if (!parsed.has_value()) return m;  // ADD_FAILURE already fired
+                et.prebuiltLibraries.push_back(std::move(*parsed));
             }
         }
         m.targets.push_back(std::move(et));
@@ -1532,6 +1713,84 @@ struct ArtifactIdentityTally {
     std::size_t              depImagesIdentical = 0;
 };
 
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+// resolve ONE declared prebuilt library against the repository root and PROVE
+// it is the file the manifest says it is. Returns the absolute path, or nullopt
+// (ADD_FAILURE already fired) — the caller poisons the arm.
+//
+// ★★★ EVERY FAILURE HERE IS A HARD RED, NEVER A SKIP, and that is the one
+// design decision in this function. A missing prebuilt input is exactly the
+// shape that tempts a harness into "the fixture is not here, so there is
+// nothing to check" — and the corpus already learned this the expensive way:
+// `environ_alias_object_identity` spends an exit code (10) on *the witness is
+// absent* precisely so a deleted `.so` cannot read as a pass. An input the
+// manifest ASKED FOR and the tree could not supply is a defect in the tree.
+//
+// The three checks are three DIFFERENT failures and each names itself, because
+// they send a reader to three different places: the path is wrong / the file is
+// unreadable or truncated / the file is no longer the container it claims.
+//
+// Mirrored behaviourally by the CLI-subprocess sibling
+// (integrated_tests/runner.cpp `resolvePrebuiltLibraryCli`) — same resolution
+// rule, same three checks, same order.
+[[nodiscard]] std::optional<fs::path>
+resolvePrebuiltLibrary(PrebuiltLibrary const& lib, fs::path const& exampleDir) {
+    fs::path root;
+    try {
+        root = ::dss::test::repoRoot();
+    } catch (std::exception const& e) {
+        ADD_FAILURE() << "prebuiltLibraries: cannot resolve the repository root"
+                         " that '" << lib.path << "' is relative to ("
+                      << exampleDir.generic_string() << "): " << e.what();
+        return std::nullopt;
+    }
+    auto const resolved = root / lib.path;
+    std::error_code ec;
+    if (!fs::is_regular_file(resolved, ec) || ec) {
+        ADD_FAILURE() << "prebuiltLibraries: '" << lib.path
+                      << "' declared by " << exampleDir.generic_string()
+                      << " is not a regular file at "
+                      << resolved.generic_string()
+                      << (ec ? " (" + ec.message() + ")" : "")
+                      << " — a library input the manifest asked for and the"
+                         " tree could not supply is a FAILURE, never a skip";
+        return std::nullopt;
+    }
+    std::error_code sizeEc;
+    auto const declaredSize = fs::file_size(resolved, sizeEc);
+    auto const bytes        = readArtifactBytes(resolved);
+    // Cross-checked against `file_size` and required non-empty, the SAME rule
+    // the dependency-image capture applies: a short read reaches the witness
+    // search as a PREFIX, and a prefix that happens to stop before the witness
+    // would report "this is not a BSD archive" about a file that is one.
+    if (sizeEc || !bytes.has_value() || bytes->empty()
+        || static_cast<std::uintmax_t>(bytes->size()) != declaredSize) {
+        ADD_FAILURE() << "prebuiltLibraries: could not read "
+                      << resolved.generic_string() << " whole (file_size "
+                      << (sizeEc ? std::string{"<unreadable>"}
+                                 : std::to_string(declaredSize))
+                      << " bytes, read "
+                      << (bytes.has_value() ? std::to_string(bytes->size())
+                                            : std::string{"<failed>"})
+                      << ") — a partial read cannot witness anything about the"
+                         " file's container";
+        return std::nullopt;
+    }
+    if (bytes->find(lib.containerWitness) == std::string::npos) {
+        ADD_FAILURE() << "prebuiltLibraries: " << resolved.generic_string()
+                      << " (" << bytes->size()
+                      << " bytes) does not contain the declared"
+                         " containerWitness '" << lib.containerWitness
+                      << "'. The manifest links this file for the sake of the"
+                         " container it is in; a regenerated fixture in a"
+                         " DIFFERENT container would still resolve the same"
+                         " symbols and the example would go on passing with the"
+                         " property it exists to witness no longer present";
+        return std::nullopt;
+    }
+    return resolved;
+}
+
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: build ONE
 // prerequisite LIBRARY artifact into `outDir`, RECURSIVELY building its own
 // nested `dependsOn` FIRST (into the same `outDir`) and threading their output
@@ -1894,7 +2153,19 @@ compileAndRunArm(fs::path const& exampleDir,
     // the arm witnessing the pipeline over only part of its own program. See
     // the ★ note on buildDependencyArtifact.
     std::vector<fs::path> resolveLibs;
-    resolveLibs.reserve(t.dependsOn.size());
+    resolveLibs.reserve(t.prebuiltLibraries.size() + t.dependsOn.size());
+    // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
+    // the PREBUILT inputs first, then the ones this arm built. Order is fixed
+    // (and identical in the CLI-subprocess sibling) so the `--resolve-library`
+    // sequence a manifest produces is a property of the manifest alone.
+    for (auto const& lib : t.prebuiltLibraries) {
+        auto resolved = resolvePrebuiltLibrary(lib, exampleDir);
+        if (!resolved.has_value()) {
+            armResult.verdict = ArmVerdict::Poisoned;
+            return armResult;
+        }
+        resolveLibs.push_back(std::move(*resolved));
+    }
     for (auto const& dep : t.dependsOn) {
         auto depArtifact = buildDependencyArtifact(dep, scratch.path(), outDir,
                                                    exampleDir, m.language,
@@ -3349,6 +3620,128 @@ TEST(ExamplesCorpusLint, DependsOnEntryRefusesAnUnknownKeyAtEveryDepth) {
     }
 }
 
+// ── THE PREBUILT-LIBRARY ENTRY'S OWN REFUSALS ──────────────────────────────
+//
+// D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS
+//
+// ★★ WHY THIS ENTRY NEEDS PINNING AT ALL, given that a corpus example already
+// exercises it: the example proves the HAPPY path — an archive resolved, a
+// program linked, an exit code. It cannot prove a REFUSAL, and every refusal
+// here exists because its absence would produce a green that means nothing:
+//
+//   * no `containerWitness`  -> a prebuilt input nobody stated a property of.
+//     The example links a BSD archive FOR ITS CONTAINER; regenerate that
+//     fixture in the GNU container and the GNU reader resolves the same two
+//     symbols, the same exit code comes back, and the BSD arms lose their only
+//     corpus witness with every suite still green.
+//   * a `..` or absolute path -> an example whose result depends on a file
+//     outside the repository, i.e. on one machine's filesystem.
+//   * an unknown key          -> the same typo class the `dependsOn` pin above
+//     closes: `containerWitnesss` would parse clean and arm nothing.
+//
+// Mirrored, refusal for refusal, by the CLI-subprocess sibling's
+// `runPrebuiltLibraryParserPin` — a manifest one runner accepts and the other
+// rejects is [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]].
+TEST(ExamplesCorpusLint, PrebuiltLibraryEntryIsRefusedUnlessItIsWitnessed) {
+    ScratchDir sandbox{Location::Temp, "prebuilt-library-keys"};
+    auto const dir = sandbox.path();
+
+    // AGNOSTIC BY CONSTRUCTION, like every fixture in this file: the language,
+    // arch and format spellings are placeholders, because `readManifest` stores
+    // them as opaque strings and naming a real one here would put target
+    // identity into a file that has none. The PATH is a placeholder too — these
+    // directions are all refused at PARSE time, before any file is opened.
+    auto const plantAndRead = [&dir](char const* body) {
+        fs::path const mp = dir / "expected.json";
+        std::ofstream mf(mp);
+        mf << R"({
+  "language": "<fixture-language>",
+  "source": "<fixture-source>",
+  "exitCode": 0,
+  "targets": [{"spec": "<fixture-arch>:<fixture-format>",
+               "artifact": "<fixture-artifact>", "runOn": ["<fixture-host>"],
+               "prebuiltLibraries": [)" << body << R"(]}]
+})";
+        mf.close();
+        EXPECT_TRUE(mf.good()) << "could not plant " << mp.generic_string();
+        return readManifest(mp);
+    };
+
+    // DIRECTION 1 — a prebuilt input with NO declared witness is REFUSED. The
+    // load-bearing one: this is the entry that would otherwise rot silently.
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(R"({"path": "<fixture-dir>/<fixture-lib>"})");
+        },
+        "containerWitness");
+
+    // DIRECTION 2 — a path that leaves the repository, or that only opens on
+    // one host, is REFUSED. FOUR separate expectations because they are four
+    // different mistakes, and a check catching one would look like it caught
+    // all four. ★ The root-directory case is the one that made this pin worth
+    // writing: it caught `fs::path::is_absolute()` answering DIFFERENTLY on
+    // Windows and Linux for the same manifest bytes.
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                R"({"path": "../outside/<fixture-lib>",
+                    "containerWitness": "<fixture-witness>"})");
+        },
+        "must not contain '..'");
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                R"({"path": "/absolute/<fixture-lib>",
+                    "containerWitness": "<fixture-witness>"})");
+        },
+        "begins at a root directory");
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                R"({"path": "X:/drive/<fixture-lib>",
+                    "containerWitness": "<fixture-witness>"})");
+        },
+        "drive or device");
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                R"({"path": "tests/<fixture-dir>\\<fixture-lib>",
+                    "containerWitness": "<fixture-witness>"})");
+        },
+        "opens on Windows");
+
+    // DIRECTION 3 — an unknown key is REFUSED and the message NAMES it, so an
+    // author reads the fix off the failure. The spelling is the realistic typo:
+    // `containerWitnesss` blanks the very field it typo'd, so before the closed
+    // key set ran FIRST this reported a MISSING field and never named the key.
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                R"({"path": "<fixture-dir>/<fixture-lib>",
+                    "containerWitnesss": "<fixture-witness>"})");
+        },
+        "containerWitnesss");
+
+    // DIRECTION 4 — a well-formed entry PARSES, keeps a `$` documentation key,
+    // and BOTH of its values arrive on the target. Without this the three
+    // refusals above would be satisfied by a parser that refused everything.
+    {
+        auto const parsed = plantAndRead(
+            R"({"$comment": "why this archive and not another",
+                "path": "<fixture-dir>/<fixture-lib>",
+                "containerWitness": "<fixture-witness>"})");
+        ASSERT_EQ(parsed.targets.size(), 1u);
+        ASSERT_EQ(parsed.targets[0].prebuiltLibraries.size(), 1u)
+            << "a `$`-prefixed key must not cost the entry its parse";
+        EXPECT_EQ(parsed.targets[0].prebuiltLibraries[0].path,
+                  "<fixture-dir>/<fixture-lib>");
+        EXPECT_EQ(parsed.targets[0].prebuiltLibraries[0].containerWitness,
+                  "<fixture-witness>")
+            << "the witness must survive the parse — a field the runner drops"
+               " here is a check that never runs later";
+    }
+}
+
 // ── THE SAME REFUSAL, ONE AND TWO LEVELS UP ────────────────────────────────
 //
 // ★★ The `dependsOn` pin above closes the innermost of three closed key sets.
@@ -3360,10 +3753,16 @@ TEST(ExamplesCorpusLint, DependsOnEntryRefusesAnUnknownKeyAtEveryDepth) {
 // silently stops witnessing the optimizer; `expectedStdOut` on a target never
 // asserts the pin.
 //
-// ✔MEASURED 2026-08-20, all 611 corpus manifests parsed: the corpus declares
-// exactly the 10 non-`$` top-level keys and the 7 non-`$` per-target keys that
-// the runners read — nothing orphaned in either direction, so both sets fit
-// exactly rather than being supersets with slack.
+// ✔RE-MEASURED 2026-08-24 (not re-quoted — the figure below was 611 manifests
+// and 7 per-target keys four days ago, and BOTH numbers moved), all 629 corpus
+// manifests parsed: the corpus declares exactly the 10 non-`$` top-level keys
+// and the 8 non-`$` per-target keys that the runners read — nothing orphaned in
+// either direction, so both sets fit exactly rather than being supersets with
+// slack. The eighth per-target key is `prebuiltLibraries`
+// (D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS).
+// ⚠ A closed set is exactly the kind of code whose correctness is a property of
+// a corpus that moves underneath it: parse the tree before concluding anything
+// from this sentence.
 TEST(ExamplesCorpusLint, ManifestRefusesAnUnknownKeyAtTopLevelAndPerTarget) {
     ScratchDir sandbox{Location::Temp, "manifest-closed-keys"};
     auto const dir = sandbox.path();
