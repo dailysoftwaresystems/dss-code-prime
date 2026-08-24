@@ -536,6 +536,29 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/scripts/check-scripts-index/check-scripts-index.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    # Multi-host carriage gate (2026-08-24 -
+    # D-GATE-NO-CTEST-ENTRY-SEES-THE-MULTI-HOST-CARRIAGE-SCRIPTS).
+    # ★★ THE THING THIS ENTRY EXISTS FOR IS THAT NOTHING ELSE IN THIS SUITE READS
+    # A CARRIAGE SCRIPT AT ALL. Every script that reaches another host carries a
+    # hard-coded repository directory name, and a global rename rewrote thirteen
+    # of them at once while ctest reported 1603/1603 PASS -- so the WSL leg, both
+    # remote legs and the sqlite harness were all pointed at directories that
+    # exist on no host, silently, behind a green suite.
+    # ⚠ The check is deliberately NOT "does the path resolve": that would need
+    # the host it names, which is the whole reason nothing checked it. It asserts
+    # AGREEMENT with `project()` in this file instead, which is decidable offline
+    # on every leg.
+    # ★★ AND IT SELF-TESTS ON EVERY RUN, against a mirror, with each of the seven
+    # arms asserting the MESSAGE rather than merely a non-zero exit -- including
+    # two arms that pin what it must NOT red on (an interpolated path tail is not
+    # a claim; a relative `src/...` is not a checkout), because a guard that
+    # cries wolf is a guard somebody disables.
+    add_test(
+        NAME carriage_paths_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-carriage-paths/check-carriage-paths.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     # Closed-vocabulary well-formedness gate (2026-08-21 -
     # D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE).
     # An `EnumNameTable<E, N>` written with N-1 initializers COMPILES: the missing

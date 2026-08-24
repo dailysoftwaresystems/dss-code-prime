@@ -136,7 +136,30 @@ function findCli() {
     return explicit;
   }
   const exe = process.platform === 'win32' ? 'dsscp.exe' : 'dsscp';
+  // ⚠ THIS LIST MATCHED NOTHING IN THIS REPOSITORY, so `dss-state` could not
+  // find a CLI at all and exited 2 before running a single probe. MEASURED
+  // 2026-08-24: the five paths below name `build/bin/dss/`, `build-rel/` and
+  // `build-dbg/`, while the repository's ONE-ROOT build layout puts trees at
+  // `build/<name>/bin/dss/` — `build/dbg`, `build/rel`, `build/lane-a`. The
+  // list predates that layout and nothing re-checked it.
+  //
+  // ★ THE FIX IS TO ENUMERATE THE ROOT RATHER THAN GUESS ITS CHILDREN. Any
+  // directory under `build/` may be a build tree (lane trees are created and
+  // deleted every cycle), so listing names can only ever be right until the
+  // next one appears. The legacy spellings stay, so a checkout still carrying
+  // an old tree keeps working.
+  const buildRoot = join(repoRoot, 'build');
+  const treeCandidates = existsSync(buildRoot)
+    ? readdirSync(buildRoot, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .flatMap((e) => [
+          join(buildRoot, e.name, 'bin', 'dss', exe),
+          join(buildRoot, e.name, 'bin', 'dss', 'Debug', exe),
+          join(buildRoot, e.name, 'bin', 'dss', 'Release', exe),
+        ])
+    : [];
   const candidates = [
+    ...treeCandidates,
     join(repoRoot, 'build', 'bin', 'dss', 'Debug', exe),
     join(repoRoot, 'build', 'bin', 'dss', 'Release', exe),
     join(repoRoot, 'build', 'bin', 'dss', exe),
@@ -364,8 +387,32 @@ function newestCodeMtimeUnder(dir) {
   }
   return newest;
 }
-const engineSiblings = ['dsscp.dll', 'libdsscp.so', 'libdsscp.dylib']
+// ⚠ THIS LIST WAS VACUOUS ON WINDOWS FOR AS LONG AS IT HAS EXISTED, and the
+// comment three lines up is what convicts it: it says compare the exe AND its
+// engine sibling, "not the exe alone". MEASURED — the list read `dsscp.dll`
+// (before 2026-08-24, `dss-code-prime.dll`) while the build produces
+// `libdsscp.dll`, WITH the `lib` prefix. `.filter(existsSync)` then yielded the
+// EMPTY list and `binMtime` collapsed to `cliMtime`, i.e. exactly what the
+// comment forbids. A filter that silently empties is indistinguishable from one
+// that found everything, which is why nothing ever reported it — and it matters
+// because the exe is ~1 MB of thin main while the engine is ~460 MB: an
+// incremental build moves one without the other in both directions.
+//
+// ★ THE REFUSAL BELOW IS THE ACTUAL FIX. Adding the missing spelling repairs
+// today; refusing on an empty list makes the NEXT spelling change loud instead
+// of silent. Do NOT derive these names from the CLI's basename — the `lib`
+// prefix is a property of the LINKER, not of the command, so deriving it would
+// re-introduce the same guess wearing a principled face.
+const engineSiblingNames = ['libdsscp.dll', 'dsscp.dll', 'libdsscp.so', 'libdsscp.dylib'];
+const engineSiblings = engineSiblingNames
   .map((n) => join(dirname(cli), n)).filter(existsSync);
+if (engineSiblings.length === 0) {
+  console.error(`fatal: no engine sibling beside ${cli}.\n` +
+    `  searched ${dirname(cli)} for: ${engineSiblingNames.join(', ')}\n` +
+    `  The CLI is a thin main over the engine shared library, so a staleness\n` +
+    `  verdict taken from the exe alone is wrong. Add this platform's spelling.`);
+  process.exit(1);
+}
 const binMtime = Math.max(cliMtime.getTime(), ...engineSiblings.map((p) => statSync(p).mtimeMs));
 const cliStale = binMtime < newestCodeMtimeUnder(join(repoRoot, 'src'));
 const wsl = wslAvailable();
