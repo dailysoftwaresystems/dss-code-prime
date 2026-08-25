@@ -125,23 +125,51 @@ else
     CONFIGURE_EXTRA=""
 fi
 
+# ★★ ccache — THE CLEAN BUILD IS CORRECT AND ONLY ITS COST WAS EVER THE
+# PROBLEM. The `rm -rf "$BUILD"` below stays (see the mtime note in the header);
+# ccache removes the cost WITHOUT trusting an mtime, because it keys on CONTENT
+# and its object cache survives the wipe. Inert when absent, and it INSTALLS
+# NOTHING -- it prints the one line to type.
+# D-SCRIPT-REMOTE-LEG-REBUILT-FROM-SCRATCH-WITH-AN-INSTALLED-CCACHE-UNUSED
+CACHE_ARGS=""
+CCACHE=$(command -v ccache 2>/dev/null || true)
+if [ -n "$CCACHE" ]; then
+    printf 'ccache : %s\n' "$CCACHE"
+    CACHE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=$CCACHE"
+    CACHE_ARGS="$CACHE_ARGS -DCMAKE_CXX_COMPILER_LAUNCHER=$CCACHE"
+else
+    printf 'ccache : ABSENT -- this leg recompiles every TU from scratch.\n'
+    printf '         One line in WSL:  sudo apt-get install -y ccache\n'
+fi
+
 say "clean configure + build ($BUILD${CONFIGURE_EXTRA:+, $CONFIGURE_EXTRA})"
 rm -rf "$BUILD"
 cmake -S . -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Debug -DDSS_BUILD_TESTS=ON \
-      $CONFIGURE_EXTRA > /tmp/wsl-leg-configure.log 2>&1 \
+      $CONFIGURE_EXTRA $CACHE_ARGS > /tmp/wsl-leg-configure.log 2>&1 \
     || { tail -25 /tmp/wsl-leg-configure.log; die "configure failed"; }
-cmake --build "$BUILD" > /tmp/wsl-leg-build.log 2>&1 \
+# ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".  (a bare `cmake --build` means ninja's all-cores default)
+cmake --build "$BUILD" --parallel "${DSS_JOBS:-6}" > /tmp/wsl-leg-build.log 2>&1 \
     || { tail -30 /tmp/wsl-leg-build.log; die "build failed"; }
 printf 'build: %s\n' "$(tail -1 /tmp/wsl-leg-build.log)"
 
 # ── test, through run-gate so a silent no-run cannot report success ──────────
-say "ctest${FILTER:+ (-R $FILTER)}"
+# ★★ THE REPO GUARDS ARE SKIPPED, by operator ruling 2026-08-25: WSL is an INDIRECT leg.
+# They check the SOURCE TREE and this tree was rsynced FROM the root host, which already
+# checked it -- ✔MEASURED 18 entries / 159.1 s of pure repetition. `DSS_LEG_GUARDS=1`
+# restores them.
+# ⓘ WHAT THIS COSTS, said out loud: CMakeLists dispatches on WIN32, so the root host runs
+# the `.ps1` guards and this leg used to be the only place the `.sh` twins ran. They are now
+# exercised in CI only. The twins HAVE silently diverged before.
+GUARD_SKIP=""
+[[ "${DSS_LEG_GUARDS:-0}" == "1" ]] || GUARD_SKIP="-LE repo-guard"
+say "ctest${FILTER:+ (-R $FILTER)}${GUARD_SKIP:+ (guards skipped)}"
+# shellcheck disable=SC2086
 if [[ -n "$FILTER" ]]; then
     bash scripts/run-gate/run-gate.sh /tmp/wsl-leg-ctest.log 'tests passed' \
-        ctest --test-dir "$BUILD" --output-on-failure -R "$FILTER"
+        ctest --test-dir "$BUILD" --output-on-failure -R "$FILTER" $GUARD_SKIP
 else
     bash scripts/run-gate/run-gate.sh /tmp/wsl-leg-ctest.log '100% tests passed' \
-        ctest --test-dir "$BUILD" --output-on-failure
+        ctest --test-dir "$BUILD" --output-on-failure $GUARD_SKIP
 fi
 rc=$?
 grep -E "tests passed|tests failed|The following tests FAILED" -A20 /tmp/wsl-leg-ctest.log | tail -25

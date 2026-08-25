@@ -357,6 +357,11 @@ constexpr std::string_view kWhyEncodingBytes =
 constexpr std::string_view kWhyImmediateRange =
     "silenced, a too-wide immediate is truncated into a wrong "
     "machine-code constant, a wrong syscall number for instance";
+constexpr std::string_view kWhyImmediateNarrowed =
+    "the one statement that a shipped instruction carries a DIFFERENT "
+    "constant than the one written; silenced, the narrowing becomes "
+    "indistinguishable from the reference assembler's own silence, which is "
+    "the arm the operator's ruling exists to reject";
 constexpr std::string_view kWhyIncompleteType =
     "silenced, an object or member of an incomplete composite folds its "
     "size to zero, a wrong-bytes layout";
@@ -472,7 +477,12 @@ constexpr std::string_view kWhyOperatorNameNotDefinable =
 // ⓘ EXTENT 163 → 164 (2026-08-19, cycle P20): `S_InlineAsmDuplicateSymbolicName`
 // (0xE06C) joined on prong (1) — see its row below. ✔The explicit extent did its
 // job again: the row was written first and the build failed until this line moved.
-constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
+// ⓘ EXTENT 164 → 165 (2026-08-25, cycle P34): `A_ImmediateNarrowedToOperandField`
+// (0x1009) joined on prong (1) — see its row below, and note it is the FIRST
+// WARNING-severity member, which strengthens rather than stretches the prong.
+// ✔The explicit extent did its job a third time: `too many initializers for
+// 'UnsuppressableEntry [164]'` was the build's answer until this line moved.
+constexpr std::array<UnsuppressableEntry, 165> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1100,6 +1110,41 @@ constexpr std::array<UnsuppressableEntry, 164> kUnsuppressableCodes{{
     // truncated to a wrong machine-code constant (e.g. wrong syscall
     // number). Same bytes-on-disk-invariant band as the others above.
     {DiagnosticCode::A_ImmediateOperandOutOfRange, kWhyImmediateRange},
+    // D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES (cycle P34).
+    //
+    // ★★★ THE STRONGEST PRONG-(1) MEMBER IN THIS TABLE, AND ITS SEVERITY IS
+    // WHY. Every other member above is an ERROR: suppress it and the build
+    // still fails, so no wrong bytes ship by that route alone. This one is a
+    // WARNING — the build SUCCEEDS and the narrowed instruction goes to disk
+    // by design. Prong (1) reads "wrong artifact ships green"; here the green
+    // is not a hypothetical consequence of silencing the code, it is the
+    // code's own normal operating condition. The diagnostic is the ONLY thing
+    // standing between a narrowed immediate and a silent one.
+    //
+    // ★★ AND THE ARCHITECTURAL REASON, WHICH IS THE DECIDING ONE. The
+    // operator ruled a THIRD arm over two opposed ones: (A) match the
+    // reference and truncate silently, (B) keep refusing what the reference
+    // assembles. The third arm is (A)'s acceptance plus (B)'s loudness. If
+    // `--suppress=0x1009` could silence the warning, the third arm would
+    // COLLAPSE BACK INTO ARM (A) at the flick of one flag — the ruling would
+    // ship as a default rather than as a behaviour, and the arm the operator
+    // rejected would be one command line away. A ruling that a flag can undo
+    // was not a ruling.
+    //
+    // ⓘ THE COUNTER-ARGUMENT, CONSIDERED AND REJECTED: "an unsilenceable
+    // warning breaks a -Werror build of legitimate code." It does not. This
+    // is not an error and does not gate `ok`; and every value that trips it
+    // has an exact, local, zero-cost remedy — write the constant that fits
+    // (`$0x7fff` for `$-32769`). A diagnostic whose remedy is one edit in the
+    // line that caused it is precisely the kind that may be made
+    // unsuppressable; one that merely hides advice about code the author
+    // cannot change is not, which is why P_PreprocessorWarningDirective and
+    // S_DeprecatedSymbolUsed stay suppressable below.
+    //
+    // ⓘ It needs no `DiagnosticDelivery::Guaranteed`: membership already
+    // bypasses the volume cap (`mustDeliver`), and a narrowing warning lost
+    // to a cap is as silent as a suppressed one.
+    {DiagnosticCode::A_ImmediateNarrowedToOperandField, kWhyImmediateNarrowed},
     {DiagnosticCode::A_AsmTextUnsupported, kWhyAsmTextUnsupported},
 
     // S_* semantic band — silent-MISCOMPILE guards.

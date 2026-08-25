@@ -253,8 +253,23 @@ struct DSS_EXPORT RelocationDecodeTable {
 // `__TEXT,__text` = section `__text` in segment `__TEXT`); ELF
 // and PE leave `segment` empty. This split was anchored as plan
 // 14 §3.1 **D-LK3-1** during LK1; closed by LK3.
+// `sectionKindUniqueRow`'s "this kind has no UNIQUE row" marker. A distinct
+// value rather than an erased entry, because erasing would make "declared
+// twice" and "never declared" the same observation, and the diagnostics the
+// two deserve are opposites.
+inline constexpr std::uint16_t kAmbiguousSectionRow = 0xFFFFu;
+
 struct DSS_EXPORT ObjectFormatSectionInfo {
     SectionKind   kind{};            // universal kind enum
+    // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE: the
+    // WIRE ENCODING of this row's contents, for the kinds whose role does not
+    // determine it. `Unspecified` (the absent key) on every row that predates
+    // the axis. A reader that must know the encoding DISPATCHES on this field
+    // and refuses `Unspecified` by name -- it never tests the section's NAME,
+    // which is the format-identity leak this field exists to prevent. See the
+    // `SectionEncoding` docblock in `core/types/section_kind.hpp` for the
+    // measurement that made a second axis necessary.
+    SectionEncoding encoding = SectionEncoding::Unspecified;
     std::string   name;              // section name
                                      //   ELF/PE: ".text" / ".rdata"
                                      //   Mach-O: "__text" / "__data"
@@ -1193,11 +1208,40 @@ struct DSS_EXPORT ObjectFormatData {
     std::unordered_map<RelocationKind, std::uint16_t> relocationKindIndex;
 
     // Sections row (D-LK4-2). The walker reads sections by
-    // SectionKind; `kind` must be unique across rows so the lookup
-    // is unambiguous. `name`/`type`/`flags`/`addrAlign`/`entrySize`
+    // SectionKind; `name`/`type`/`flags`/`addrAlign`/`entrySize`
     // are format-specific (interpreted by the walker for its format).
     std::vector<ObjectFormatSectionInfo> sections;
-    std::unordered_map<SectionKind, std::uint16_t> sectionKindIndex;
+
+    // ★ THE ROW IDENTITY IS THE (KIND, ENCODING) PAIR, NOT THE KIND.
+    // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE: an
+    // x86_64 Mach-O relocatable carries TWO `unwind` sections in two
+    // encodings, so a kind-keyed index refused the document outright. Both
+    // maps are DERIVED-AT-LOAD from `sections` by `addSectionRow`, which is
+    // their ONE owner -- the same relationship the `runtimeLibraries` note
+    // below describes for its own derived copies.
+    std::unordered_map<SectionKindEncoding, std::uint16_t> sectionKindIndex;
+
+    // kind -> the index of its ONLY row, or `kAmbiguousSectionRow` when the
+    // document declares MORE THAN ONE row of that kind. `sectionByKind` --
+    // which every WRITER uses and which cannot name an encoding -- reads this,
+    // so an ambiguous kind makes it answer "no unique row" instead of silently
+    // picking whichever row loaded first. `validate()` additionally refuses a
+    // multi-row kind that `sectionKindIsEncodingDiscriminated` rejects, so no
+    // kind a writer resolves by kind alone can reach the ambiguous state.
+    std::unordered_map<SectionKind, std::uint16_t> sectionKindUniqueRow;
+
+    // Append `info` as the next section row and maintain BOTH indexes.
+    // Returns false -- appending nothing -- when a row with the same
+    // (kind, encoding) identity is already present; `duplicateOfOut` then
+    // names the index of the row that already holds it.
+    //
+    // ⚠ THE ONE OWNER OF THE INDEX-MAINTENANCE RULE, deliberately. The loader
+    // and the hand-built schemas in `tests/` both go through here, so a test
+    // fixture cannot drift into a `sections`/index disagreement that the
+    // shipped path would never produce.
+    [[nodiscard]] DSS_EXPORT bool
+    addSectionRow(ObjectFormatSectionInfo info,
+                  std::uint16_t& duplicateOfOut);
 
     // Per-format identity sub-blocks. Each is populated ONLY when
     // `kind` matches; otherwise zero-defaulted. The walker reads
@@ -1780,10 +1824,20 @@ public:
     [[nodiscard]] std::size_t
     sectionCount() const noexcept { return d_.sections.size(); }
 
+    // The UNIQUE row of this kind, or null when the document declares NONE --
+    // or (D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE)
+    // more than one, which the kind alone cannot tell apart. `validate()`
+    // guarantees the second case is reachable only for a kind
+    // `sectionKindIsEncodingDiscriminated` accepts, and ✔MEASURED 2026-08-25
+    // that no such kind is asked for here: `SectionKind::Unwind` appears in
+    // the two relocatable-object readers and in no writer.
     [[nodiscard]] ObjectFormatSectionInfo const*
     sectionByKind(SectionKind kind) const noexcept {
-        auto it = d_.sectionKindIndex.find(kind);
-        if (it == d_.sectionKindIndex.end()) return nullptr;
+        auto it = d_.sectionKindUniqueRow.find(kind);
+        if (it == d_.sectionKindUniqueRow.end()
+            || it->second == kAmbiguousSectionRow) {
+            return nullptr;
+        }
         return &d_.sections[it->second];
     }
 

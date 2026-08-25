@@ -1154,9 +1154,15 @@ makeElfExecFormatData(bool withProcessExit) {
         s.addrAlign      = addrAlign;
         s.entrySize      = entrySize;
         s.virtualAddress = va;
-        data.sectionKindIndex[kind] =
-            static_cast<std::uint16_t>(data.sections.size());
-        data.sections.push_back(std::move(s));
+        // ⚠ THROUGH THE SCHEMA'S OWN REGISTRAR, never by writing the index.
+        // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE made
+        // the row identity the (kind, encoding) PAIR and added a second derived
+        // index; a fixture that maintained one of them by hand would build a
+        // schema the shipped loader could never produce, and pass.
+        std::uint16_t duplicateOf = 0;
+        ASSERT_TRUE(data.addSectionRow(std::move(s), duplicateOf))
+            << "fixture declares two rows of section kind "
+            << sectionKindName(kind);
     };
     // SHT_PROGBITS(1), SHF_ALLOC|SHF_EXECINSTR(6)
     addSection(SectionKind::Text,     ".text",     1, 6, 16,  0, 0x401000);

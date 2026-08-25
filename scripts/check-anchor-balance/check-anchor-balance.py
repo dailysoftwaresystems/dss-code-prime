@@ -25,7 +25,7 @@ star star star WHAT THE DENOMINATOR IS, AND WHY IT IS NOT JUST THE REGISTRY (202
 `dss-cycle` SKILL.md section F.2 sanctions MORE THAN ONE HOME for a deferral:
 a feature-area anchor belongs in its plan's own deferred-items table, a project-level
 known-open item in plan-00 section 0.2, an orphan/cross-cutting anchor in
-`_deferred-anchor-registry.md`.  Section F.4 then lets a `src/` citation resolve to
+`_deferred-anchor-registry*.md`.  Section F.4 then lets a `src/` citation resolve to
 EITHER home.  This tool used to count ONLY registry rows -- so a cycle that closed a
 registry row and deferred the actual work into a plan-side row was reported as an
 IMPROVEMENT.  That is `D-GATE-BALANCE-COUNTS-ONLY-THE-REGISTRY`, and it is the THIRD
@@ -109,7 +109,14 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 PLANS_DIR = ".plans"
-REG_REL = ".plans/_deferred-anchor-registry.md"
+REG_REL = ".plans/_deferred-anchor-registry-production.md"
+# ⚠ THE REGISTRY IS TWO FILES SINCE 2026-08-25 (operator: production vs
+# tools/harness). `REG_REL` stays as the SELF-TEST document label; the PREFIX below
+# is what decides whether a scanned row lives in a registry, and it is a prefix
+# rather than a list of two paths so a third split costs nothing and no reader can
+# silently see half the registry. `scan_worktree` needed no change at all -- it
+# already enumerates every `.md` under `.plans/`.
+REG_PREFIX = ".plans/_deferred-anchor-registry"
 
 # The ONLY marker that means closed. Everything else in a status cell is open.
 CLOSED_MARK = "✅"  # white heavy check mark
@@ -198,9 +205,9 @@ class Shape(object):
 # ── The sanctioned deferral-table shapes, ✔MEASURED across all 39 files in .plans/ ──
 #
 # 1. REGISTRY-SHAPED  `| Anchor | Trigger | Closing work | Cross-refs |`
-#    `_deferred-anchor-registry.md` (both "Anchor Index" tables) and
+#    `_deferred-anchor-registry*.md` (both "Anchor Index" tables) and
 #    `17-shader-gpu-plan` section 5.4, which says so in prose: "Column shape matches
-#    `_deferred-anchor-registry.md`". The HEADER says cell 2 is "Trigger"; in PRACTICE
+#    `_deferred-anchor-registry*.md`". The HEADER says cell 2 is "Trigger"; in PRACTICE
 #    every row leads cell 2 with its status, and that de-facto usage is the contract
 #    the old gate already relied on.
 #
@@ -1080,6 +1087,23 @@ class Scan(object):
         return self
 
 
+def row_key(relpath, name):
+    """The identity of a row, for the purpose of "did this row open or close".
+
+    ⚠⚠ EVERY REGISTRY FILE CANONICALISES TO ONE KEY PATH, AND THAT IS THE WHOLE POINT.
+    The registry became TWO files on 2026-08-25 (production / tools-harness). A row's
+    identity is its ANCHOR ID -- which file currently holds it is a filing decision, not a
+    fact about the defect. Keying on the real path made the split read as
+    `closed 692, opened 689`: every row deleted from the old file and added to a new one,
+    a 1400-row phantom churn that would have buried any real movement completely.
+    ★ It also means MOVING a row between the two registries is correctly a no-op here,
+    which is what lets the buckets be corrected later without the gate objecting.
+    """
+    if relpath.startswith(REG_PREFIX):
+        return "%s#%s" % (REG_PREFIX, name)
+    return "%s#%s" % (relpath, name)
+
+
 def scan_document(text, relpath):
     """-> Scan
 
@@ -1180,7 +1204,7 @@ def scan_document(text, relpath):
                 if len(cells) < 3:
                     continue
                 name = row_name(cells[1])
-                key = "%s#%s" % (relpath, name)
+                key = row_key(relpath, name)
                 scan.names.add(key)
                 if shape.status_col is None:
                     # No status column exists in this shape, so nothing can close a
@@ -1221,7 +1245,7 @@ def scan_document(text, relpath):
                 # ANY of its rows is open. Same behaviour as the predecessor, and it is
                 # the safe direction: a closed duplicate cannot mask an open original.
                 if opened:
-                    rows["%s#%s" % (relpath, name)] = (True, excerpt, shape.kind)
+                    rows[row_key(relpath, name)] = (True, excerpt, shape.kind)
         elif header not in EXCLUDED_HEADERS:
             # Unrecognized shape. Only a table that LOOKS like an anchor table is a
             # finding -- ordinary prose tables are none of this gate's business.
@@ -1293,7 +1317,9 @@ def scan_worktree(root):
 
 
 def is_registry(key):
-    return key.startswith(REG_REL + "#")
+    # Any of the registry files: `-production.md#...`, `-harness.md#...`, and the
+    # pre-split `.md#...` that older transcripts still name.
+    return key.startswith(REG_PREFIX)
 
 
 def split_homes(rows):

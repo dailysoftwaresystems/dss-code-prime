@@ -10545,12 +10545,43 @@ TEST(SemanticAnalyzerC, ConstexprAggregateNonConstantElementFailsLoud) {
 // MODIFIED type has no compile-time size, so no element walk can make it a
 // constant object — gcc ("'constexpr' object has variably modified type") and
 // clang ("constexpr variable cannot have type 'const int[argc]'") both refuse it.
-// ⚠ MEASURED, and this is why the guard reads the DECLARATOR and not the type:
-// with an initializer present the declarator resolver drops the written `argc`
-// bound and re-sizes the object from the brace list, so by validation time the
-// declared type is a plain `int[3]` and `isVlaArray` is FALSE.
-// RED-ON-DISABLE: delete the declarator scan and this test accepts.
+//
+// ⚠ THE FIXTURE MOVED IN P34, AND THE REASON IS THE POINT. This test used to use
+// `constexpr int a[argc] = {1,2,3};` and assert S_ConstexprUnsupportedType,
+// because the declarator resolver DROPPED the written `argc` bound and re-sized
+// the object from the brace list — so the constexpr guard's declarator scan was
+// the only thing that could see the variable modification. That dropped bound was
+// itself the defect D-CSUBSET-VLA-INITIALIZER closed: the non-empty form is now a
+// constraint violation (S_VlaInitializerNotEmpty) refused BEFORE this validator
+// runs, exactly as gcc 13.3.0, clang 19.1.1 and clang 18.1.3 refuse it. Asserting
+// the old code on the old fixture would now be asserting that the earlier bug is
+// still present.
+//   The fixture is therefore the EMPTY initializer — the one form C23 6.7.10p4
+// permits, which really is a legal VLA and really does reach this validator, so
+// the constexpr constraint is still the thing under test. The declarator-scan
+// arm is separately exercised below.
+// RED-ON-DISABLE: delete BOTH the `isVlaArray` test and the declarator scan and
+// this test accepts.
 TEST(SemanticAnalyzerC, ConstexprVariablyModifiedAggregateFailsLoud) {
+    auto model = analyzeShipped("c", {
+        "int main(int argc, char **argv) {\n"
+        "    constexpr int a[argc] = {};\n"
+        "    return a[0];\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprUnsupportedType), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_VlaInitializerNotEmpty), 0u)
+        << "the EMPTY initializer is legal for a VLA — what is refused here is "
+           "the `constexpr`, not the initializer";
+}
+
+// ...and the NON-empty sibling, which is now refused one tier earlier. Kept as
+// its own pin so a future change that re-admitted the dropped bound would have to
+// break a test that names the exact construct, rather than quietly re-greening
+// the one above.
+TEST(SemanticAnalyzerC, ConstexprVariablyModifiedWithNonEmptyInitIsRefusedEarlier) {
     auto model = analyzeShipped("c", {
         "int main(int argc, char **argv) {\n"
         "    constexpr int a[argc] = {1, 2, 3};\n"
@@ -10558,7 +10589,10 @@ TEST(SemanticAnalyzerC, ConstexprVariablyModifiedAggregateFailsLoud) {
         "}\n",
     });
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_ConstexprUnsupportedType), 1u);
+                        DiagnosticCode::S_VlaInitializerNotEmpty), 1u)
+        << "all three references refuse this for the INITIALIZER, before the "
+           "`constexpr` is even considered";
+    EXPECT_TRUE(model.hasErrors());
 }
 
 // isConstexpr IMPLIES isConst end-to-end: assigning to a constexpr object is
@@ -12012,9 +12046,11 @@ TEST(SemanticAnalyzerC, ThreadLocalInvalidCombinationsFailLoud) {
 // VLA C4a-local (D-CSUBSET-VLA): a pointer-to-VLA assignability compare stays EXACT — a
 // FIXED-pointee `int (*p)[5]` initialized from a VLA object `int b[2][n]` (rows int[n])
 // is a MISMATCH (`Ptr<int[5]>` vs `array(vlaArray(int),2)`; int[5] != int[n]) and must
-// REJECT with S_TypeMismatch, never silently decay-accept. Forward-guard for the deferred
-// init form (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING): whatever makes `= b` work must NOT
-// weaken this exact-row compare. RED-ON-DISABLE: broaden the array-to-pointer decay
+// REJECT with S_TypeMismatch, never silently decay-accept. ★ This was written as the
+// forward-guard for the then-deferred init form (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING):
+// whatever made `= b` work must not weaken this exact-row compare. That row CLOSED in
+// P34 and the guard HELD — `int (*p)[n] = b;` is accepted while this stays a reject, so
+// the compare narrowed on the POINTEE's row length rather than being loosened. RED-ON-DISABLE: broaden the array-to-pointer decay
 // branch to ignore the element type → this stops firing.
 TEST(SemanticAnalyzerC, PtrToVlaFixedPointeeFromVlaObjectRejects) {
     auto model = analyzeShipped("c", {
@@ -12031,8 +12067,9 @@ TEST(SemanticAnalyzerC, PtrToVlaFixedPointeeFromVlaObjectRejects) {
            "must reject with S_TypeMismatch (the decay compare stays exact)";
 }
 
-// VLA C4a-local (D-CSUBSET-VLA): the ptr-to-VLA init-form work (and its deferred fix,
-// D-CSUBSET-VLA-PTR-INIT-FORM-TYPING) must NEVER regress ordinary aggregate brace-init —
+// VLA C4a-local (D-CSUBSET-VLA): the ptr-to-VLA init-form work
+// (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING, CLOSED in P34) must NEVER regress ordinary
+// aggregate brace-init —
 // `int a[3]={1,2,3}` / nested / a scalar init all stay clean (no false S_TypeMismatch
 // from a subtreeType descent into a braceInitList). The CRITICAL-1 control that keeps the
 // eventual init-form fix guarded. RED-ON-DISABLE: an unguarded subtreeType override on the
@@ -12414,28 +12451,60 @@ TEST(SemanticAnalyzerC, MultiDimParamInnerStaticSizesCorrectly) {
            "analyzes clean — the decoration is skipped, `m` sizes the inner dim";
 }
 
-// D-CSUBSET-VLA-PTR-INIT-FORM-TYPING boundary guard: the INITIALIZER form
-// `int (*p)[n] = b;` is DEFERRED (the initializer node is pre-stamped decayed, defeating
-// the init-compat derivation; C4a-local witnesses via the assignment form `p = b;`). It
-// must FAIL LOUD at the semantic tier (S_TypeMismatch) — NOT silently accept. ★ This pin
-// is the safety boundary for the deferral: a future PARTIAL fix that makes `= b`
-// assignable WITHOUT also fixing the body-typing wrinkle would silently convert this safe
-// reject into a wrong-STRIDE miscompile at the subscript. This test goes RED on exactly
-// that dangerous partial change; when the init form PROPERLY lands it is flipped to
-// accept + a runtime witness. (Assignment-form `int (*p)[n]; p = b; p[i][j]` RUNS today.)
-TEST(SemanticAnalyzerC, PtrToVlaInitFormDeferredStillFailsLoud) {
+// D-CSUBSET-VLA-PTR-INIT-FORM-TYPING — ✅ CLOSED IN P34, AND THE DEFERRAL'S OWN
+// SAFETY BOUNDARY IS WHAT CAUGHT IT. This test used to be
+// `PtrToVlaInitFormDeferredStillFailsLoud`, asserting that `int (*p)[n] = b;` FAILS
+// LOUD, and it warned in these words: "a future PARTIAL fix that makes `= b`
+// assignable WITHOUT also fixing the body-typing wrinkle would silently convert
+// this safe reject into a wrong-STRIDE miscompile at the subscript. This test goes
+// RED on exactly that dangerous partial change." It DID go red, on
+// D-CSUBSET-VLA-INITIALIZER's un-merge — and the change turned out to be the WHOLE
+// fix, not a partial one, which was then proven by EXECUTION rather than argued.
+//
+// ★ THE ROW'S RECORDED ROOT CAUSE WAS WRONG, and that is why a cycle was spent on
+// a fix that "proved INERT". It blamed the Pass-2 initializer stamp ("`b` is
+// pre-stamped with its decayed type"). The real blocker was on the DECLARATOR
+// side: with the flexible-array flag tested ABOVE the VLA arm and an initializer
+// present, `(*p)[n]` built `Ptr<incompleteArray<int>>` — so `type_rules`'
+// `Ptr<vlaArray> <- array(array)` decay compare could never match no matter what
+// the initializer's stamp said, and `storePtrToVlaStride`'s `typeContainsVla`
+// gate (which tests for the -2 sentinel) never fired either. Both halves of the
+// deferral were one defect. `p` now declares as `Ptr<vlaArray<int>>`, the compare
+// matches, and the runtime row stride is frozen at the decl exactly as the
+// assignment form's already was.
+//
+// ★ THE ASSERTION IS THE OFF-DIAGONAL, DELIBERATELY. `p[1][0] == 20` (not 11 — a
+// stride of one ELEMENT instead of a runtime ROW — and not 21 — a transposed
+// read) is the only shape that discriminates a correct stride from a plausible
+// wrong one. ✔MEASURED end-to-end through the shipped CLI in BOTH pipeline arms,
+// and against gcc 13.3.0 and clang 19.1.1: all four exit 42
+// (`examples/c/c99_vla_ptr_init` carries the runnable witness).
+TEST(SemanticAnalyzerC, PtrToVlaInitFormIsAcceptedAndKeepsItsVlaPointee) {
     auto model = analyzeShipped("c", {
         "int main(void) {\n"
         "  volatile int vn = 3;\n"
         "  int n = vn;\n"
         "  int b[2][n];\n"
-        "  int (*p)[n] = b;\n"          // the INIT form (deferred) — must reject, not run
+        "  int (*p)[n] = b;\n"          // the INIT form — accepted since P34
         "  return p[1][0];\n"
         "}\n",
     });
-    EXPECT_TRUE(model.hasErrors())
-        << "the pointer-to-VLA INIT form `int (*p)[n] = b` is deferred and must fail loud "
-           "(S_TypeMismatch) — never a silent accept that would mis-stride the subscript";
+    EXPECT_FALSE(model.hasErrors())
+        << "the pointer-to-VLA INIT form `int (*p)[n] = b` is the natural spelling and "
+           "both references accept it";
+    auto const* p = findSymbolNamed(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->type.valid());
+    TypeInterner const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(p->type), TypeKind::Ptr);
+    auto const pops = in.operands(p->type);
+    ASSERT_FALSE(pops.empty());
+    EXPECT_TRUE(in.isVlaArray(pops[0]))
+        << "the POINTEE must stay the VLA row — an accepted init form whose pointee "
+           "quietly became an incomplete array is the wrong-stride miscompile the "
+           "deferral's boundary pin existed to catch";
+    EXPECT_FALSE(in.isIncompleteArray(pops[0]))
+        << "and specifically not the incomplete array the merged flag produced";
 }
 
 // ─── FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the per-format long-double axis ──────
@@ -16735,4 +16804,277 @@ TEST(SemanticAnalyzerC, InlineAsmQualifierScanStopsAtTemplateAndIgnoresOperandKe
         });
     }
     EXPECT_TRUE(checked) << "the fixture must contain one asmStmt";
+}
+
+// -- P34 D-CSUBSET-VLA-INITIALIZER (C23 6.7.10p4) ---------------------------
+// "An entity of variable length array type shall not be initialized except by
+// an empty initializer." ONE root cause put DSS on the wrong side of this in
+// BOTH directions, and the pins below are split so a partial regression cannot
+// hide behind a passing sibling.
+//
+// The root cause: `applyDeclaratorSuffix` tested the flexible-array flag ABOVE
+// its VLA arm, and the declarator loop handed that parameter the OR of the
+// row's own `allowFlexibleArray` and "this declarator has an initializer". So a
+// PRESENT-but-non-constant bound with an initializer was read as an ABSENT one
+// -> incomplete array -> re-sized from the brace list. The two signals now
+// travel separately and the init-inference half is gated on the bound being
+// ABSENT, which is what C 6.7.9p22 actually says.
+
+// REFUSING PIN. All three references refuse this (gcc 13.3.0, clang 19.1.1,
+// clang 18.1.3 -- MEASURED 2026-08-25, both -std=gnu17 and -std=c2x). DSS used
+// to ACCEPT it at a compile-time sizeof of 12.
+// RED-ON-DISABLE: re-merge the two signals at the declarator loop and this
+// compiles clean with no diagnostic at all.
+TEST(SemanticAnalyzerC, VlaWithNonEmptyInitializerIsRefused) {
+    auto model = analyzeShipped("c", {
+        "int main(int argc, char **argv) {\n"
+        "    int a[argc] = {1, 2, 3};\n"
+        "    return a[0];\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_VlaInitializerNotEmpty), 1u)
+        << "a variably modified object may not carry a non-empty initializer";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 0u)
+        << "and it must not be reported as a length problem -- the bound is fine";
+}
+
+// The constraint is on a VARIABLY MODIFIED entity, not on a top-level VLA:
+// `int a[n][2]` interns as vlaArray(array(int,2)) and `int a[5][n]` as
+// array(vlaArray(int),5). Both references refuse both forms.
+// RED-ON-DISABLE: narrow the guard from `typeContainsVla` to `isVlaArray` and
+// the second declarator below stops being reported.
+TEST(SemanticAnalyzerC, VlaInitializerConstraintIsTransitiveThroughArrayLevels) {
+    auto model = analyzeShipped("c", {
+        "int main(int argc, char **argv) {\n"
+        "    int a[argc][2] = {{1, 2}};\n"
+        "    int b[5][argc] = {{1}};\n"
+        "    return a[0][0] + b[0][0];\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_VlaInitializerNotEmpty), 2u)
+        << "an outer-VLA and an inner-VLA multi-dimensional form are both "
+           "variably modified, and both are refused by gcc and clang";
+}
+
+// ACCEPTING PIN -- the half that was a REJECTION before. `int a[n] = {};` is the
+// one initializer 6.7.10p4 permits, and gcc 13.3.0, clang 19.1.1 and clang
+// 18.1.3 all accept it. DSS answered S000C, because the same dropped-bound path
+// re-sized the object to ZERO elements and then rejected the zero.
+// The type assertion is the load-bearing half: accepting the FORM while
+// silently keeping a fixed-size type would still be the original bug.
+TEST(SemanticAnalyzerC, VlaWithEmptyInitializerIsAcceptedAndStaysAVla) {
+    auto model = analyzeShipped("c", {
+        "int main(int argc, char **argv) {\n"
+        "    int a[argc] = {};\n"
+        "    return a[0];\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "the EMPTY initializer is the form C23 6.7.10p4 REQUIRES to be legal";
+    auto const* a = findSymbolNamed(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->type.valid());
+    TypeInterner const& in = model.lattice().interner();
+    EXPECT_TRUE(in.isVlaArray(a->type))
+        << "the written `argc` bound must survive the initializer -- an accepted "
+           "form whose type quietly became int[0] or int[3] is the same defect";
+    EXPECT_FALSE(in.isIncompleteArray(a->type))
+        << "and it must not be the incomplete array the merged flag produced";
+}
+
+// THE THREE NEIGHBOURS THE UN-MERGE COULD HAVE BROKEN, stated separately
+// because each rides a DIFFERENT one of the two signals.
+//
+// (1) c34 init-inference (D-CSUBSET-ARRAY-SIZE-INFERENCE, C 6.7.9p22): an
+// ABSENT bound with an initializer is still sized from it. This is the arm the
+// gate narrowed, so it is the one most likely to have been narrowed too far.
+TEST(SemanticAnalyzerC, InitInferredArraySizingSurvivesTheVlaUnmerge) {
+    auto model = analyzeShipped("c", {
+        "int main(void) {\n"
+        "    int a[] = {1, 2, 3};\n"
+        "    char s[] = \"abc\";\n"
+        "    return a[0] + (int)sizeof(s);\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    TypeInterner const& in = model.lattice().interner();
+    auto const* a = findSymbolNamed(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_EQ(in.kind(a->type), TypeKind::Array);
+    EXPECT_EQ(in.scalars(a->type)[0], 3)
+        << "a brace list still sizes an absent bound";
+    auto const* s = findSymbolNamed(model, "s");
+    ASSERT_NE(s, nullptr);
+    ASSERT_EQ(in.kind(s->type), TypeKind::Array);
+    EXPECT_EQ(in.scalars(s->type)[0], 4)
+        << "and a string literal still sizes one, body + NUL";
+}
+
+// (2) The struct-field flexible array member rides the ROW's own
+// `allowFlexibleArray`, which the un-merge handed back its original meaning.
+// A FAM must still be an incomplete array, and a `[0]` GNU zero-length member
+// must still route to the SAME mechanism.
+TEST(SemanticAnalyzerC, FlexibleArrayMemberSurvivesTheVlaUnmerge) {
+    auto model = analyzeShipped("c", {
+        "struct F { int n; char c[]; };\n"
+        "struct Z { int n; char c[0]; };\n"
+        "int main(void) { return (int)sizeof(struct F) + (int)sizeof(struct Z); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a flexible array member and its GNU `[0]` spelling both stay legal";
+}
+
+// (3) THE `[0]`-WITH-INITIALIZER EXCLUSION, and it is not redundant. `externDecl`
+// declares `allowFlexibleArray: true` AND takes an init-declarator list, so both
+// bools can be true on one declarator; without the exclusion the written `[0]`
+// would be replaced by an incomplete array carrying an initializer.
+// RED-ON-DISABLE: drop `!allowInitInferredArray` from the `[0]` arm and the
+// extern declarator below stops being reported.
+TEST(SemanticAnalyzerC, ZeroBoundWithInitializerStaysOutOfRange) {
+    auto model = analyzeShipped("c", {
+        "extern int g[0] = {1};\n"
+        "int main(void) { int a[0] = {1}; return a[0] + g[0]; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 2u)
+        << "a WRITTEN zero bound is never silently re-sized by its initializer";
+}
+
+// -- P34 D-CSUBSET-ATTRIBUTE-TYPE-POSITION -- the enum after-keyword slot ----
+// C23 6.7.3.1 puts a tag's attribute after the composite keyword. `structSpec`
+// and `unionSpec` have carried `compositeAttrLead` since TF-C73; `enumSpec` was
+// the last composite row without it, so BOTH spellings were PARSE errors
+// (P0009 for `[[...]]`, P0001 for `__attribute__((...))`) on a position gcc
+// 13.3.0 and clang 19.1.1 both accept and both warn on (MEASURED 2026-08-25).
+TEST(SemanticAnalyzerC, EnumAfterKeywordDeprecatedWarnsAtEveryUse) {
+    auto model = analyzeShipped("c", {
+        "enum [[deprecated]] E1 { A1 = 1 };\n"
+        "enum __attribute__((deprecated)) E2 { A2 = 2 };\n"
+        "int main(void) {\n"
+        "    enum E1 e1 = A1;\n"
+        "    enum E2 e2 = A2;\n"
+        "    return (int)e1 + (int)e2;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "the slot must PARSE -- this was P0009 / P0001 before P34";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 2u)
+        << "one warning per deprecated TAG use, both spellings, exactly as the "
+           "struct and union rows already produce";
+}
+
+// THE INDEX PIN, and it is the one that would fail SILENTLY. An always-emitted
+// lead slot shifts the row's tag from visible-child 1 to 2. If the row's `name`
+// index had not moved with the shape, `extractNameNode` would hand
+// `anonymousNameAllowed` a non-identifier node and a TAGGED enum would bind
+// ANONYMOUSLY with its tag discarded -- a program using only the enumerators
+// would still compile. Naming the tag in a TYPE position is what catches it.
+TEST(SemanticAnalyzerC, EnumTagStillBindsWithAndWithoutTheLeadDecoration) {
+    auto model = analyzeShipped("c", {
+        "enum Plain { P0 = 1 };\n"
+        "enum [[deprecated]] Decorated { D0 = 2 };\n"
+        "enum [[deprecated]] Underlying : unsigned char { U0 = 3 };\n"
+        "enum [[deprecated]] { ANON0 = 4 };\n"
+        "int main(void) {\n"
+        "    enum Plain p = P0;\n"
+        "    enum Decorated d = D0;\n"
+        "    enum Underlying u = U0;\n"
+        "    return (int)p + (int)d + (int)u + ANON0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an UNdecorated enum, a decorated one, a decorated one carrying the "
+           "C23 underlying-type clause, and a decorated ANONYMOUS one must all "
+           "keep binding -- the lead slot makes the tag index constant, not shifted";
+    EXPECT_NE(findSymbolNamed(model, "Decorated"), nullptr)
+        << "the decorated tag binds under its own NAME, not anonymously";
+}
+
+// The layout attributes are ACCEPTED (both references compile them) and
+// reported IGNORED rather than silently dropped -- DSS's enum width comes from
+// its underlying type, which neither attribute feeds. Admitting the slot
+// without this arm would have traded a loud parse error for a quiet wrong
+// layout, which is the exact trade `compositeAttrLead`'s design note forbids.
+TEST(SemanticAnalyzerC, EnumLayoutAttributeIsAcceptedAndReportedIgnored) {
+    auto model = analyzeShipped("c", {
+        "enum __attribute__((packed)) P1 { B1 = 1 };\n"
+        "enum __attribute__((aligned(16))) P2 { B2 = 2 };\n"
+        "int main(void) { enum P1 a = B1; enum P2 b = B2; return (int)a + (int)b; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "gcc and clang both accept these -- DSS may not refuse them";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 2u)
+        << "one report per ignored layout attribute -- never silence";
+}
+
+// The strict-unknown typo guard the row opted into reaches the enum slot too:
+// a misspelled GNU attribute there must fail loud rather than leave the tag
+// quietly undecorated. The C23 `[[...]]` spelling stays standard-ignorable.
+TEST(SemanticAnalyzerC, EnumLeadSlotKeepsTheStrictUnknownAttributeGuard) {
+    auto strict = analyzeShipped("c", {
+        "enum __attribute__((deprected)) E { A = 1 };\n"
+        "int main(void) { enum E e = A; return (int)e; }\n",
+    });
+    EXPECT_EQ(countCode(strict.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+        << "a GNU-form typo on an enum fails loud, as it does on a struct";
+    auto ignorable = analyzeShipped("c", {
+        "enum [[vendor::whatever]] E { A = 1 };\n"
+        "int main(void) { enum E e = A; return (int)e; }\n",
+    });
+    EXPECT_EQ(countCode(ignorable.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u)
+        << "an unrecognized C23 attribute stays standard-ignorable";
+}
+
+// -- P34 D-DIAG-ARRAY-SUFFIX-REPORTS-ONLY-THE-LEXEME ------------------------
+// THE DEFECT WAS VISIBLE ONLY ONCE THE LEXEME HAPPENED TO BE EMPTY-LOOKING.
+// The two array-suffix `emit` lambdas and `completeIncompleteArrayFromInit`'s
+// `failUnsized` put the RAW SOURCE TEXT of the offending node into `actual`, and
+// `actual` is the whole rendered body for a semantic-band code (the renderer's
+// own contract at `appendExpectedActual`: these codes "carry a full prose
+// sentence in `actual` and leave `expected` empty by design"). So the reports
+// read `error[S000C]: [0]` — and, for `int a[argc] = {};`, `error[S000C]: {}`, a
+// diagnostic whose entire message is the two braces it is complaining about.
+//
+// The property pinned here is the one that matters and the one a `.diag` golden
+// CANNOT see: those goldens record code + span only, so the message body could
+// regress to a bare lexeme with every golden still green.
+// RED-ON-DISABLE: restore `d.actual = std::string{tree.text(...)}` in either
+// lambda and the length assertion below fails with the lexeme as its message.
+TEST(SemanticAnalyzerC, ArrayDiagnosticsCarryProseNotOnlyTheOffendingLexeme) {
+    auto model = analyzeShipped("c", {
+        "int main(int argc, char **argv) {\n"
+        "    int a[0] = {1};\n"      // S_ArrayLengthOutOfRange, lexeme "[0]"
+        "    int b[] = {};\n"        // S_ArrayLengthOutOfRange, lexeme "{}"
+        "    int c[argc][0];\n"      // S_ArrayLengthOutOfRange again
+        "    return a[0] + b[0] + c[0][0];\n"
+        "}\n",
+    });
+    std::size_t seen = 0;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_ArrayLengthOutOfRange
+            && d.code != DiagnosticCode::S_NonConstantArrayLength) {
+            continue;
+        }
+        ++seen;
+        EXPECT_TRUE(d.expected.empty())
+            << "a semantic-band code contrasts with nothing, so `expected` stays "
+               "empty and `actual` is rendered alone";
+        EXPECT_NE(d.actual, "[0]")
+            << "the message body must not BE the offending lexeme";
+        EXPECT_NE(d.actual, "{}")
+            << "the case that made this class visible: a body of two braces";
+        EXPECT_GT(d.actual.size(), 40u)
+            << "expected a prose sentence, got: " << d.actual;
+        EXPECT_NE(d.actual.find(' '), std::string::npos)
+            << "expected a prose sentence, got: " << d.actual;
+    }
+    EXPECT_GE(seen, 3u)
+        << "the fixture must actually reach the array-suffix diagnostics";
 }

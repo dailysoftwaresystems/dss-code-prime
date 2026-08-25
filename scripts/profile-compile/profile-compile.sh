@@ -123,7 +123,8 @@ export DSS_CONFIG_ROOT
 
 OUT="${OUT:-$REPO/build/perf/$LABEL}"
 BUILD_DIR="${BUILD_DIR:-$REPO/build/rel}"
-JOBS="${JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
+# ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
+JOBS="${JOBS:-${DSS_JOBS:-6}}"
 mkdir -p "$OUT" || die "cannot create $OUT"
 PY="$(command -v python3 || command -v python)"
 [[ -n "$PY" ]] || die "no python3/python on this host"

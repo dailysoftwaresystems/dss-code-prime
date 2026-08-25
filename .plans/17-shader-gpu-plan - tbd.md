@@ -569,7 +569,7 @@ Rev 4 adds the real-ISA half. These are gated on Track A having measured the ISA
 
 ### 5.4 Deferred anchors introduced by rev 4
 
-Per the registry's own rule, anchors whose feature area maps cleanly onto a plan live in that plan; these are that set. Column shape matches `_deferred-anchor-registry.md` (`Anchor | Trigger | Closing work | Cross-refs`). **All rows are OPEN** — none carries `✅`.
+Per the registry's own rule, anchors whose feature area maps cleanly onto a plan live in that plan; these are that set. Column shape matches `_deferred-anchor-registry-production.md` (`Anchor | Trigger | Closing work | Cross-refs`). **All rows are OPEN** — none carries `✅`.
 
 | Anchor | Trigger | Closing work | Cross-refs |
 |---|---|---|---|

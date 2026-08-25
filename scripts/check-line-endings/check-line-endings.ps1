@@ -290,5 +290,5 @@ Write-Host "      Do NOT reach for ``eol=crlf``: MEASURED - a ``text eol=crlf`` 
 Write-Host "      still stages as an LF blob, so it cannot make this red go away."
 Write-Host ""
 Write-Host "See D-REPO-GITATTRIBUTES-PINS-EOL-FOR-CONFIGS-BUT-NOT-FOR-SOURCES in"
-Write-Host ".plans/_deferred-anchor-registry.md for why this is machine-checked."
+Write-Host ".plans/_deferred-anchor-registry*.md for why this is machine-checked."
 exit 1

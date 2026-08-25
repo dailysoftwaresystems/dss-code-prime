@@ -1660,11 +1660,26 @@ enum class EncodingSlotKind : std::uint8_t {
     // instruction stream with no diagnostic anywhere. That is the failure
     // this slot exists to make impossible, not merely a missing convenience.
     //
-    // ENCODE CONTRACT (x86_variable.cpp `wireImm16`): the wired value must
-    // fit the 2-byte field read either as SIGNED or as UNSIGNED —
-    // [-32768, 65535] — because AT&T writes both `$-1` and `$65535` for the
-    // same halfword. Anything outside fails loud
-    // (`A_ImmediateOperandOutOfRange`); it never silently truncates.
+    // ENCODE CONTRACT (x86_variable.cpp `wireImm16`): the wired value is
+    // SILENT while it fits the 2-byte field read either as SIGNED or as
+    // UNSIGNED — [-32768, 65535] — because AT&T writes both `$-1` and
+    // `$65535` for the same halfword.
+    //
+    // ⚠ UPDATED cycle P34 (D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES).
+    // This paragraph used to end "Anything outside fails loud
+    // (`A_ImmediateOperandOutOfRange`); it never silently truncates", and the
+    // FIRST half of that stopped being true: outside the window the encoder no
+    // longer FAILS. It emits the low 16 bits — the bytes GNU as emits for the
+    // same source — and reports `A_ImmediateNarrowedToOperandField` (Warning,
+    // and UNSUPPRESSABLE, because a flag that could silence it would collapse
+    // the operator's ruling back into "match gas exactly, silently").
+    // ★ The SECOND half is unchanged and is the property this slot was created
+    // to hold: it never truncates SILENTLY. What changed is that a spelling a
+    // working reference assembles is no longer REFUSED.
+    // ⚠ A 16-bit field under a WIDER operation — `guard.width` != 16, i.e. the
+    // field is a fixed narrow PARAMETER rather than the operation's own value —
+    // still fails loud with `A_ImmediateOperandOutOfRange`. That distinction is
+    // the whole mechanism and it is read from config, never from the arch.
     //
     // GENERIC BY CONSTRUCTION: any variable-length ISA with a 2-byte
     // trailing immediate wires this slot. The variant GUARD vocabulary is

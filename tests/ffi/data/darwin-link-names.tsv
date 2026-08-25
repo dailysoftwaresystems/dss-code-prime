@@ -1,0 +1,291 @@
+# DARWIN LINK-NAME ORACLE — what a REAL platform compiler emits for each C
+# identifier the shipped descriptors import on Mach-O, per arch.
+#
+# D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME. This file is MEASUREMENT, not
+# policy: `tests/ffi/test_darwin_link_name_oracle.cpp` reads it and requires
+# every Mach-O-visible imported function in `src/dss-config/shippedLibs/**` to
+# have a row here AND to declare the `linkName` this row implies. A symbol added
+# to a descriptor without a row here goes RED — which is the whole point: the
+# fixed table in `test_shipped_lib_descriptor.cpp` pins the eight names that
+# diverge TODAY, and this file pins that no NEW symbol has started to.
+#
+# WHY AN ORACLE AND NOT AN EXPORT CHECK. "verify the symbol is exported" does NOT
+# catch this class: BOTH `_fstat` and `_fstat$INODE64` exist in libSystem's
+# x86_64 slice, so an export check answers YES for the WRONG one. Declaring the
+# plain name there binds the LEGACY 32-bit-inode callee while DSS compiles the
+# modern 144-byte `struct stat` — 120 bytes written into 144, `st_size` read at
+# 96 and written at 72, `fstat` returns 0, and sqlite calls every database
+# "database disk image is malformed". It links clean and loads clean. The only
+# question that separates the two spellings is the one this file answers.
+#
+# COLUMNS  symbol <TAB> probeHeader <TAB> emitted-x86_64 <TAB> emitted-arm64
+#   `symbol`      the C identifier a descriptor declares (keyed by NAME, not by
+#                 descriptor: 41 identifiers are declared by two descriptors —
+#                 math/tgmath, string/memory, unistd/sys.sysctl — and the link
+#                 name is a property of the PLATFORM, so the two must agree).
+#   `probeHeader` the header the measurement included. USUALLY the descriptor's
+#                 own `header`, but 16 rows differ because DSS's shipped headers
+#                 are a deliberate SUPERSET of the platform's: `statfs`/`fstatfs`
+#                 live in DSS's <unistd.h> and in Darwin's <sys/mount.h>,
+#                 `setlocale` in DSS's <stdlib.h> and Darwin's <locale.h>, and so
+#                 on. Recorded per row because a probe that guesses the header
+#                 reports `<compile-failed>` and would silently measure NOTHING
+#                 for exactly the symbols most likely to be renamed — `statfs`
+#                 and `fstatfs` are TWO OF THE EIGHT that diverge.
+#   `emitted-*`   the EXACT undefined symbol `nm -u` printed, DECORATED (Mach-O's
+#                 leading `_` included) because that is what the tool printed and
+#                 a table of measurements must not silently edit its readings.
+#                 The test strips the format's decoration itself, through the
+#                 same `ffi::applyCMangling` rule the compiler uses.
+#
+# HOW TO REGENERATE (needs a real Mac; `scripts/ssh-macos/ssh-macos.sh` reaches
+# the operator's). Per symbol, per arch:
+#     printf '#include <%s>\nvoid *p(void){return (void*)&%s;}\n' HEADER SYM > t.c
+#     cc -arch <x86_64|arm64> -fno-builtin -fno-stack-protector -w -c -o t.o t.c
+#     nm -u t.o
+# Exactly one undefined symbol comes back; that is the cell. A `<compile-failed>`
+# means the probe header is wrong for THIS platform — fix `probeHeader`, never
+# drop the row.
+#
+# MEASURED 2026-08-25 on macOS 26.5.2 (Darwin 25.5.0, arm64 host), Apple `cc`
+# from /Applications/Xcode.app/.../MacOSX.sdk — 236 identifiers x 2 arches, 472
+# probes, every one returning exactly one undefined symbol. EIGHT diverge:
+# stat fstat lstat statfs fstatfs opendir readdir (x86_64 only, `$INODE64`) and
+# realpath (BOTH arches, `$DARWIN_EXTSN`). No other identifier is renamed on
+# either arch.
+__error	errno.h	___error	___error
+abort	stdlib.h	_abort	_abort
+abs	stdlib.h	_abs	_abs
+access	unistd.h	_access	_access
+acos	math.h	_acos	_acos
+acosf	math.h	_acosf	_acosf
+acosh	math.h	_acosh	_acosh
+asin	math.h	_asin	_asin
+asinf	math.h	_asinf	_asinf
+asinh	math.h	_asinh	_asinh
+atan	math.h	_atan	_atan
+atan2	math.h	_atan2	_atan2
+atan2f	math.h	_atan2f	_atan2f
+atanf	math.h	_atanf	_atanf
+atanh	math.h	_atanh	_atanh
+atexit	stdlib.h	_atexit	_atexit
+atof	stdlib.h	_atof	_atof
+atoi	stdlib.h	_atoi	_atoi
+atol	stdlib.h	_atol	_atol
+bsearch	stdlib.h	_bsearch	_bsearch
+calloc	stdlib.h	_calloc	_calloc
+ceil	math.h	_ceil	_ceil
+ceilf	math.h	_ceilf	_ceilf
+chdir	unistd.h	_chdir	_chdir
+chmod	sys/stat.h	_chmod	_chmod
+clearerr	stdio.h	_clearerr	_clearerr
+clock	time.h	_clock	_clock
+close	unistd.h	_close	_close
+closedir	dirent.h	_closedir	_closedir
+cos	math.h	_cos	_cos
+cosf	math.h	_cosf	_cosf
+cosh	math.h	_cosh	_cosh
+dlclose	dlfcn.h	_dlclose	_dlclose
+dlerror	dlfcn.h	_dlerror	_dlerror
+dlopen	dlfcn.h	_dlopen	_dlopen
+dlsym	dlfcn.h	_dlsym	_dlsym
+exit	stdlib.h	_exit	_exit
+exp	math.h	_exp	_exp
+expf	math.h	_expf	_expf
+fabs	math.h	_fabs	_fabs
+fabsf	math.h	_fabsf	_fabsf
+fchmod	sys/stat.h	_fchmod	_fchmod
+fchown	unistd.h	_fchown	_fchown
+fclose	stdio.h	_fclose	_fclose
+fcntl	fcntl.h	_fcntl	_fcntl
+feof	stdio.h	_feof	_feof
+ferror	stdio.h	_ferror	_ferror
+fflush	stdio.h	_fflush	_fflush
+fgetc	stdio.h	_fgetc	_fgetc
+fgets	stdio.h	_fgets	_fgets
+fgetws	wchar.h	_fgetws	_fgetws
+fileno	stdio.h	_fileno	_fileno
+flock	sys/file.h	_flock	_flock
+floor	math.h	_floor	_floor
+floorf	math.h	_floorf	_floorf
+fmod	math.h	_fmod	_fmod
+fmodf	math.h	_fmodf	_fmodf
+fopen	stdio.h	_fopen	_fopen
+fprintf	stdio.h	_fprintf	_fprintf
+fputc	stdio.h	_fputc	_fputc
+fputs	stdio.h	_fputs	_fputs
+fputws	wchar.h	_fputws	_fputws
+fread	stdio.h	_fread	_fread
+free	stdlib.h	_free	_free
+freopen	stdio.h	_freopen	_freopen
+fsctl	unistd.h	_fsctl	_fsctl
+fseek	stdio.h	_fseek	_fseek
+fstat	sys/stat.h	_fstat$INODE64	_fstat
+fstatfs	sys/mount.h	_fstatfs$INODE64	_fstatfs
+fsync	unistd.h	_fsync	_fsync
+ftell	stdio.h	_ftell	_ftell
+ftruncate	unistd.h	_ftruncate	_ftruncate
+futimes	sys/time.h	_futimes	_futimes
+fwrite	stdio.h	_fwrite	_fwrite
+getc	stdio.h	_getc	_getc
+getchar	stdio.h	_getchar	_getchar
+getcwd	unistd.h	_getcwd	_getcwd
+getenv	stdlib.h	_getenv	_getenv
+geteuid	unistd.h	_geteuid	_geteuid
+gethostname	unistd.h	_gethostname	_gethostname
+getpagesize	unistd.h	_getpagesize	_getpagesize
+getpid	unistd.h	_getpid	_getpid
+getpwuid	pwd.h	_getpwuid	_getpwuid
+getrusage	sys/resource.h	_getrusage	_getrusage
+gettimeofday	sys/time.h	_gettimeofday	_gettimeofday
+getuid	unistd.h	_getuid	_getuid
+gmtime	time.h	_gmtime	_gmtime
+gmtime_r	time.h	_gmtime_r	_gmtime_r
+ioctl	sys/ioctl.h	_ioctl	_ioctl
+isalnum	ctype.h	_isalnum	_isalnum
+isalpha	ctype.h	_isalpha	_isalpha
+isatty	unistd.h	_isatty	_isatty
+iscntrl	ctype.h	_iscntrl	_iscntrl
+isdigit	ctype.h	_isdigit	_isdigit
+isgraph	ctype.h	_isgraph	_isgraph
+islower	ctype.h	_islower	_islower
+isprint	ctype.h	_isprint	_isprint
+ispunct	ctype.h	_ispunct	_ispunct
+isspace	ctype.h	_isspace	_isspace
+isupper	ctype.h	_isupper	_isupper
+isxdigit	ctype.h	_isxdigit	_isxdigit
+labs	stdlib.h	_labs	_labs
+ldexp	math.h	_ldexp	_ldexp
+ldexpf	math.h	_ldexpf	_ldexpf
+localtime	time.h	_localtime	_localtime
+localtime_r	time.h	_localtime_r	_localtime_r
+log	math.h	_log	_log
+log10	math.h	_log10	_log10
+log10f	math.h	_log10f	_log10f
+log2	math.h	_log2	_log2
+logf	math.h	_logf	_logf
+longjmp	setjmp.h	_longjmp	_longjmp
+lseek	unistd.h	_lseek	_lseek
+lstat	sys/stat.h	_lstat$INODE64	_lstat
+malloc	stdlib.h	_malloc	_malloc
+malloc_create_zone	malloc/malloc.h	_malloc_create_zone	_malloc_create_zone
+malloc_default_zone	malloc/malloc.h	_malloc_default_zone	_malloc_default_zone
+malloc_set_zone_name	malloc/malloc.h	_malloc_set_zone_name	_malloc_set_zone_name
+malloc_size	malloc/malloc.h	_malloc_size	_malloc_size
+malloc_zone_free	malloc/malloc.h	_malloc_zone_free	_malloc_zone_free
+malloc_zone_malloc	malloc/malloc.h	_malloc_zone_malloc	_malloc_zone_malloc
+malloc_zone_realloc	malloc/malloc.h	_malloc_zone_realloc	_malloc_zone_realloc
+memchr	memory.h	_memchr	_memchr
+memcmp	memory.h	_memcmp	_memcmp
+memcpy	memory.h	_memcpy	_memcpy
+memmove	memory.h	_memmove	_memmove
+memset	memory.h	_memset	_memset
+mkdir	sys/stat.h	_mkdir	_mkdir
+mktime	time.h	_mktime	_mktime
+mmap	sys/mman.h	_mmap	_mmap
+munmap	sys/mman.h	_munmap	_munmap
+nanosleep	time.h	_nanosleep	_nanosleep
+open	fcntl.h	_open	_open
+opendir	dirent.h	_opendir$INODE64	_opendir
+pclose	stdio.h	_pclose	_pclose
+perror	stdio.h	_perror	_perror
+popen	stdio.h	_popen	_popen
+pow	math.h	_pow	_pow
+powf	math.h	_powf	_powf
+pread	unistd.h	_pread	_pread
+printf	stdio.h	_printf	_printf
+pthread_cond_destroy	pthread.h	_pthread_cond_destroy	_pthread_cond_destroy
+pthread_cond_init	pthread.h	_pthread_cond_init	_pthread_cond_init
+pthread_cond_signal	pthread.h	_pthread_cond_signal	_pthread_cond_signal
+pthread_cond_wait	pthread.h	_pthread_cond_wait	_pthread_cond_wait
+pthread_create	pthread.h	_pthread_create	_pthread_create
+pthread_detach	pthread.h	_pthread_detach	_pthread_detach
+pthread_equal	pthread.h	_pthread_equal	_pthread_equal
+pthread_join	pthread.h	_pthread_join	_pthread_join
+pthread_mutex_destroy	pthread.h	_pthread_mutex_destroy	_pthread_mutex_destroy
+pthread_mutex_init	pthread.h	_pthread_mutex_init	_pthread_mutex_init
+pthread_mutex_lock	pthread.h	_pthread_mutex_lock	_pthread_mutex_lock
+pthread_mutex_trylock	pthread.h	_pthread_mutex_trylock	_pthread_mutex_trylock
+pthread_mutex_unlock	pthread.h	_pthread_mutex_unlock	_pthread_mutex_unlock
+pthread_mutexattr_destroy	pthread.h	_pthread_mutexattr_destroy	_pthread_mutexattr_destroy
+pthread_mutexattr_init	pthread.h	_pthread_mutexattr_init	_pthread_mutexattr_init
+pthread_mutexattr_settype	pthread.h	_pthread_mutexattr_settype	_pthread_mutexattr_settype
+pthread_self	pthread.h	_pthread_self	_pthread_self
+putc	stdio.h	_putc	_putc
+putchar	stdio.h	_putchar	_putchar
+puts	stdio.h	_puts	_puts
+pwrite	unistd.h	_pwrite	_pwrite
+qsort	stdlib.h	_qsort	_qsort
+raise	signal.h	_raise	_raise
+rand	stdlib.h	_rand	_rand
+random	stdlib.h	_random	_random
+read	unistd.h	_read	_read
+readdir	dirent.h	_readdir$INODE64	_readdir
+readlink	unistd.h	_readlink	_readlink
+realloc	stdlib.h	_realloc	_realloc
+realpath	stdlib.h	_realpath$DARWIN_EXTSN	_realpath$DARWIN_EXTSN
+remove	stdio.h	_remove	_remove
+rename	stdio.h	_rename	_rename
+rewind	stdio.h	_rewind	_rewind
+rmdir	unistd.h	_rmdir	_rmdir
+sched_yield	sched.h	_sched_yield	_sched_yield
+setenv	stdlib.h	_setenv	_setenv
+setjmp	setjmp.h	_setjmp	_setjmp
+setlocale	locale.h	_setlocale	_setlocale
+setvbuf	stdio.h	_setvbuf	_setvbuf
+signal	signal.h	_signal	_signal
+sin	math.h	_sin	_sin
+sinf	math.h	_sinf	_sinf
+sinh	math.h	_sinh	_sinh
+sleep	unistd.h	_sleep	_sleep
+snprintf	stdio.h	_snprintf	_snprintf
+sprintf	stdio.h	_sprintf	_sprintf
+sqrt	math.h	_sqrt	_sqrt
+sqrtf	math.h	_sqrtf	_sqrtf
+srand	stdlib.h	_srand	_srand
+srandomdev	stdlib.h	_srandomdev	_srandomdev
+sscanf	stdio.h	_sscanf	_sscanf
+stat	sys/stat.h	_stat$INODE64	_stat
+statfs	sys/mount.h	_statfs$INODE64	_statfs
+strcat	string.h	_strcat	_strcat
+strchr	string.h	_strchr	_strchr
+strcmp	string.h	_strcmp	_strcmp
+strcpy	string.h	_strcpy	_strcpy
+strcspn	string.h	_strcspn	_strcspn
+strdup	string.h	_strdup	_strdup
+strerror	string.h	_strerror	_strerror
+strftime	time.h	_strftime	_strftime
+strlcat	string.h	_strlcat	_strlcat
+strlcpy	string.h	_strlcpy	_strlcpy
+strlen	string.h	_strlen	_strlen
+strncat	string.h	_strncat	_strncat
+strncmp	string.h	_strncmp	_strncmp
+strncpy	string.h	_strncpy	_strncpy
+strrchr	string.h	_strrchr	_strrchr
+strspn	string.h	_strspn	_strspn
+strstr	string.h	_strstr	_strstr
+strtod	stdlib.h	_strtod	_strtod
+strtol	stdlib.h	_strtol	_strtol
+strtoll	stdlib.h	_strtoll	_strtoll
+strtoul	stdlib.h	_strtoul	_strtoul
+swab	unistd.h	_swab	_swab
+symlink	unistd.h	_symlink	_symlink
+sysconf	unistd.h	_sysconf	_sysconf
+sysctl	sys/sysctl.h	_sysctl	_sysctl
+sysctlbyname	sys/sysctl.h	_sysctlbyname	_sysctlbyname
+system	stdlib.h	_system	_system
+tan	math.h	_tan	_tan
+tanf	math.h	_tanf	_tanf
+tanh	math.h	_tanh	_tanh
+time	time.h	_time	_time
+tolower	ctype.h	_tolower	_tolower
+toupper	ctype.h	_toupper	_toupper
+trunc	math.h	_trunc	_trunc
+ungetc	stdio.h	_ungetc	_ungetc
+unlink	unistd.h	_unlink	_unlink
+unsetenv	stdlib.h	_unsetenv	_unsetenv
+usleep	unistd.h	_usleep	_usleep
+utime	utime.h	_utime	_utime
+utimes	sys/time.h	_utimes	_utimes
+vfprintf	stdio.h	_vfprintf	_vfprintf
+write	unistd.h	_write	_write

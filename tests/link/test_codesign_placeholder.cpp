@@ -628,7 +628,7 @@ TEST(MachOCodeSignPlaceholder, ShippedX86DarwinExecEmitsAdHocSignature) {
 // ── FLIP MARKER: the static exec arm DROPS an ad-hoc request ─────────
 //
 // D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM — the REGISTERED id, read
-// back from .plans/_deferred-anchor-registry.md rather than restated from
+// back from .plans/_deferred-anchor-registry*.md rather than restated from
 // memory. ⚠ This comment used to CARRY the withdrawn "proposed anchor"
 // spelling, and said the guard could not catch that because it scanned src/,
 // examples/ and real-examples/, never tests/. Both halves were right, and it

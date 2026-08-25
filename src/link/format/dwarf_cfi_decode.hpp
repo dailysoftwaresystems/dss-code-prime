@@ -133,7 +133,35 @@ inline constexpr std::uint8_t kDwCfaLoUser           = 0x1c;
 // FORMAT half (sdata4 vs absptr) says how many bytes the field is, and the
 // APPLICATION half (pcrel vs absolute) says what they mean.
 inline constexpr std::uint8_t kDwEhPeAbsPtr = 0x00;
+// ★ APPLE'S THIRD SPELLING, AND A REFUTATION OF THIS FILE'S OWN "the two
+//   encodings every measured producer emits". ✔MEASURED 2026-08-25 on real
+//   Apple Silicon (macOS 26.5.2), `/usr/bin/cc -arch x86_64 -c` with no other
+//   flag: the CIE's `R` augmentation byte is **0x10** — pcrel like gcc's, but
+//   with the FORMAT half left at absptr, so the field is EIGHT bytes and not
+//   four. It was refused outright, which is the fail-loud arm working: this
+//   decoder read no field of the wrong width, it declined to read at all. The
+//   fix is one row here, because the two halves were already separate concerns
+//   — the 8-byte read arm below is the `absptr` arm unchanged, and `pcrel` is
+//   the CALLER'S half (this file never resolves an address; see the header's
+//   note on why the pointer's APPLICATION cannot be decided here).
+inline constexpr std::uint8_t kDwEhPePcRel8 = 0x10;  // pcrel | absptr (8-byte)
 inline constexpr std::uint8_t kDwEhPeOmit   = 0xff;
+
+// Is `enc` a pointer encoding whose field is EIGHT bytes wide? The one place
+// the format half is interpreted — the gate and the reader must agree about
+// the width or the gate admits an encoding the reader mis-reads.
+[[nodiscard]] constexpr bool dwEhPeIsEightByteField(std::uint8_t enc) noexcept {
+    return enc == kDwEhPeAbsPtr || enc == kDwEhPePcRel8;
+}
+
+// Is the stored value a DELTA FROM ITS OWN FIELD'S ADDRESS (pcrel), rather
+// than an address? The APPLICATION half of the encoding — the question the
+// CALLER answers, because only the caller knows the field's address. Stated
+// here beside the encodings themselves so a caller cannot reach for a bit
+// test of its own and get the mask subtly wrong.
+[[nodiscard]] constexpr bool dwEhPeIsPcRelative(std::uint8_t enc) noexcept {
+    return enc == kDwEhPePcRel4 || enc == kDwEhPePcRel8;
+}
 
 // One decoded FDE: the function's unwind description plus everything the
 // caller needs to bind it to a reconstructed function.
@@ -872,16 +900,17 @@ decodeEhFrame(std::span<std::uint8_t const> section,
                 cie.fdePointerEncoding = kDwEhPeAbsPtr;
             }
             if (cie.fdePointerEncoding != kDwEhPePcRel4
-                && cie.fdePointerEncoding != kDwEhPeAbsPtr) {
+                && !dwEhPeIsEightByteField(cie.fdePointerEncoding)) {
                 return fail(
                     "CIE at byte offset " + std::to_string(recStart)
                     + " declares FDE pointer encoding 0x"
                     + std::string(1, "0123456789abcdef"[(cie.fdePointerEncoding >> 4) & 0xFu])
                     + std::string(1, "0123456789abcdef"[cie.fdePointerEncoding & 0xFu])
-                    + ". This decoder resolves the two encodings every measured "
-                      "producer emits — pcrel|sdata4 (0x1b) and absptr (0x00) — "
-                      "and refuses the rest rather than read a field of the wrong "
-                      "width and bind every FDE to the wrong function");
+                    + ". This decoder resolves the three encodings every measured "
+                      "producer emits — pcrel|sdata4 (0x1b, gcc on ELF), "
+                      "pcrel|absptr (0x10, Apple clang on Mach-O) and absptr "
+                      "(0x00) — and refuses the rest rather than read a field of "
+                      "the wrong width and bind every FDE to the wrong function");
             }
 
             std::vector<CfiOp> unusedOps;
@@ -955,7 +984,21 @@ decodeEhFrame(std::span<std::uint8_t const> section,
             fde.pointerEncoding = cie->fdePointerEncoding;
             fde.initialLocationFieldOffset = static_cast<std::uint32_t>(pos);
             std::uint64_t addressRange = 0;
-            if (cie->fdePointerEncoding == kDwEhPePcRel4) {
+            // ⚠ THE WIDTH IS DECIDED BY THE ONE PREDICATE, at this site AND at
+            // the CIE gate above. Spelling the set twice is how the gate comes
+            // to admit an encoding this arm then reads at the wrong width —
+            // and a mis-read `initial_location` binds every FDE to the wrong
+            // function while reporting success.
+            if (dwEhPeIsEightByteField(cie->fdePointerEncoding)) {
+                std::uint64_t abs64 = 0;
+                if (!detail::readU64LE(section, pos, abs64)) {
+                    return fail("truncated FDE initial_location");
+                }
+                fde.storedInitialLocation = static_cast<std::int64_t>(abs64);
+                if (!detail::readU64LE(section, pos, addressRange)) {
+                    return fail("truncated FDE address_range");
+                }
+            } else {
                 std::uint32_t lo32 = 0;
                 if (!detail::readU32LE(section, pos, lo32)) {
                     return fail("truncated FDE initial_location");
@@ -967,15 +1010,6 @@ decodeEhFrame(std::span<std::uint8_t const> section,
                     return fail("truncated FDE address_range");
                 }
                 addressRange = range;
-            } else {
-                std::uint64_t abs64 = 0;
-                if (!detail::readU64LE(section, pos, abs64)) {
-                    return fail("truncated FDE initial_location");
-                }
-                fde.storedInitialLocation = static_cast<std::int64_t>(abs64);
-                if (!detail::readU64LE(section, pos, addressRange)) {
-                    return fail("truncated FDE address_range");
-                }
             }
             if (addressRange > 0xFFFFFFFFull) {
                 return fail("FDE at byte offset " + std::to_string(recStart)

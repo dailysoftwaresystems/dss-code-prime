@@ -32,8 +32,11 @@
 // note is about a node the earlier pass already STAMPED with a decayed pointer
 // type, which `subtreeType` short-circuits on BEFORE any structural arm runs; it
 // is a stamped-node question, not a descent question, and no boundary in the walk
-// can reach it. It stays its own deferral
-// ([[D-CSUBSET-VLA-PTR-INIT-FORM-TYPING]]).
+// can reach it. It stayed its own deferral
+// ([[D-CSUBSET-VLA-PTR-INIT-FORM-TYPING]]) — and CLOSED in P34 from a THIRD place
+// again: not this walk and not that stamp, but the DECLARATOR resolver, which had
+// been building `Ptr<incompleteArray<int>>` for `(*p)[n]` whenever an initializer
+// was present. The conclusion recorded here — that it is not this bug — held.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"

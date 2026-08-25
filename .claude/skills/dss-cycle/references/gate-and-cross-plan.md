@@ -299,7 +299,7 @@ Keep the plans honest in the **same commit** as the code:
 - Update plan 00 §0 status table + §0.1 stepper row (flip status, update ctest count).
 - Update the owning sub-plan: flip the §0 status row AND stamp the §3.1 deferred-items row
   (status flip in §0; `✅ CLOSED` stamp in §3.1 — update both, not one).
-- In `_deferred-anchor-registry.md`: mark closed anchors `✅ CLOSED <date>` with the commit;
+- In `_deferred-anchor-registry*.md`: mark closed anchors `✅ CLOSED <date>` with the commit;
   **never delete a row** (the audit trail is load-bearing); add new anchors.
 - Record the cycle in the running cycle-log (memory entry per the established convention).
 - Update the `dss-code-prime` skill if a convention changed.
@@ -369,10 +369,10 @@ The handoff is the only channel between them, so it carries — **measured, not 
   one is THIS branch**; a reader who cannot tell ours from theirs will rebase the wrong way.
 - For each *other* active PR: `gh pr view <n> --json files` → the **overlap set** with what this
   cycle touched. Name the individual files, not a count — "59 files" tells a rebaser nothing;
-  `.plans/_deferred-anchor-registry.md`, `src/link/format/macho.cpp` tells them everything.
+  `.plans/_deferred-anchor-registry*.md`, `src/link/format/macho.cpp` tells them everything.
 - **What that branch is DOING** — its goal in one line, so its edits are interpretable rather than
   merely conflicting. A conflict you understand is a merge; one you do not is a coin flip.
-- ⚠ **Call out the known-hot files explicitly.** `_deferred-anchor-registry.md` is edited by every
+- ⚠ **Call out the known-hot files explicitly.** `_deferred-anchor-registry*.md` is edited by every
   session every cycle and is the most likely conflict in the repo. Plan 00 and the shared
   `CMakeLists.txt`/`parse_diagnostic.hpp` slot tables are next.
 - 📄 **Restate the staging rule**, because it is the mitigation: **stage by explicit path, never
@@ -407,7 +407,7 @@ what makes "two cycles running shipped on one leg" visible as a pattern instead 
   someone with no context, which is precisely when an unlabelled inference does the most damage.
 - **Name what is NOT known and NOT run.** "WSL and native-arm64 legs not run" belongs in the
   handoff louder than anything that passed. The reader's first question is what to trust.
-- **It does not duplicate the registry.** Anchors live in `_deferred-anchor-registry.md`; the
+- **It does not duplicate the registry.** Anchors live in `_deferred-anchor-registry*.md`; the
   handoff carries only the *few* that gate the next cycle, by name, with a link.
 - **Keep it short enough to be read in full** — target one screen per section. If a section
   cannot be compressed, that is a signal the project has more open fronts than priorities, and

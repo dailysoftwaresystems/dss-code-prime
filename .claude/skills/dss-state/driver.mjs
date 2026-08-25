@@ -8,7 +8,8 @@
 //   2. Cross-target emit/run matrix (5 exec specs) with a canonical program.
 //   3. Plan axis: `.plans/23-full-c-plan - tbd.md` FC-phase ✅/⏳ markers,
 //      cycle-weighted via the calibration table below.
-//   4. Anchor axis: `.plans/_deferred-anchor-registry.md` open vs ✅ rows.
+//   4. Anchor axis: `.plans/_deferred-anchor-registry*.md` open vs ✅ rows
+//      (TWO documents since 2026-08-25: production + tools-harness).
 //   5. Test axis: ctest LastTest.log (or `--ctest` for a live run).
 //   6. Velocity: git commits matching /^v0.0.2/ (one commit per dev cycle
 //      by repo convention) → cycles/day → ETA extrapolation for the
@@ -298,15 +299,40 @@ function parsePlan23() {
 }
 
 function parseRegistry() {
-  const p = join(repoRoot, '.plans', '_deferred-anchor-registry.md');
-  if (!existsSync(p)) return null;
-  let total = 0, closed = 0;
-  for (const line of readFileSync(p, 'utf8').split('\n')) {
-    if (!/^\|\s*`D-/.test(line)) continue;
-    total++;
-    if (line.includes('✅')) closed++;
+  // ★ THE REGISTRY IS TWO DOCUMENTS since 2026-08-25 (production / tools-harness)
+  // and may become more, so this globs the directory rather than naming a file.
+  // Reading one document by name reports a confident HALF, which is worse than no
+  // number at all -- a half looks exactly like a whole.
+  const dir = join(repoRoot, '.plans');
+  if (!existsSync(dir)) return null;
+  const docs = readdirSync(dir)
+    .filter((f) => /^_deferred-anchor-registry.*\.md$/.test(f))
+    .sort();
+  // ⚠ A `.plans/` that carries NO registry document is DRIFT, not an absence to
+  // shrug at. The old `return null` rendered as `n/a`, which reads as "not
+  // applicable" rather than "this axis is blind" -- and that is precisely how this
+  // driver stayed broken through an entire rename once before. Same fatal shape as
+  // parsePlan23()'s format-drift exit.
+  if (docs.length === 0) {
+    console.error('fatal: .plans/ carries no _deferred-anchor-registry*.md — the anchor axis has no subject, fix parseRegistry()');
+    process.exit(2);
   }
-  return { total, closed };
+  let total = 0, closed = 0;
+  for (const f of docs) {
+    for (const line of readFileSync(join(dir, f), 'utf8').split('\n')) {
+      if (!/^\|\s*`D-/.test(line)) continue;
+      const cells = line.split('|');
+      if (cells.length < 3) continue;
+      total++;
+      // ★ A row is CLOSED iff its STATUS CELL begins with ✅ -- not if a ✅
+      // appears anywhere on the line. The closing-work and cross-ref cells
+      // routinely cite ANOTHER anchor's closure, and counting those
+      // over-reported this axis by 99 rows (1338 against a true 1239): about
+      // five percentage points, always in the flattering direction.
+      if (/^✅/.test(cells[2].replace(/^[\s*_]+/, ''))) closed++;
+    }
+  }
+  return { total, closed, docs: docs.length };
 }
 
 // The ctest axes MUST target the SAME build dir the chosen CLI came from —

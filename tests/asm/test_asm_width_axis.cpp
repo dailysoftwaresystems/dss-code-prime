@@ -868,24 +868,72 @@ TEST(WidthAxisX86, ShiftImm8OutOfRangeFailsLoudNeverTruncates) {
     // Defense-in-depth: a value that doesn't fit one byte must fail
     // loud at the walker (the lowering routes such counts through the
     // CL form; this pins the walker's own guard).
+    //
+    // ★★★ AND SINCE CYCLE P34 THIS TEST CARRIES A SECOND, HEAVIER JOB —
+    // D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES. That row made
+    // the `imm8` slot NARROW-AND-WARN instead of refuse *where the config
+    // says the field carries the operation's whole value* (`movb $-1, %al`
+    // is `guard.width` 8 and now assembles to gas's own `b0 ff`). A shift
+    // count is the OPPOSITE case: the same 8-bit slot under a `guard.width`
+    // 32/64 variant, where the byte is a fixed PARAMETER and the reference
+    // refuses an out-of-range one outright (✔MEASURED, GNU as 2.42:
+    // `shl $256, %rax` and `shl $-1, %rax` are BOTH "Error: operand type
+    // mismatch"). ⇒ THIS IS THE ONLY END-TO-END WITNESS FOR THE PARAMETER
+    // ARM, because the shipped AT&T dialect declares no shift spelling at
+    // all (✔MEASURED: 68 mnemonics, not one a shift) — no `.s` can reach it,
+    // so it is reached here, through the LIR.
+    //
+    // ⚠ THE CODE MOVED WITH THE MECHANISM AND THE MOVE IS A CORRECTION, not
+    // a rename: this used to report `A_NoMatchingEncodingVariant`, which was
+    // always the wrong noun — a variant DID match, the immediate simply did
+    // not fit its field. It now reports `A_ImmediateOperandOutOfRange`, the
+    // code the 16-bit sibling already used for the identical condition.
     auto schema = loadX86();
     ASSERT_NE(schema, nullptr);
     auto const rax = gpr(*schema, "rax");
-    DiagnosticReporter rep;
-    (void)buildLegalizeAssemble(*schema, rep, [&](LirBuilder& b) {
-        LirOperand const ops[] = {LirOperand::makeReg(rax),
-                                  LirOperand::makeImmInt32(300)};
-        (void)b.addInst(*schema->opcodeByMnemonic("shl"), rax, ops);
-    });
-    EXPECT_GT(rep.errorCount(), 0u);
-    bool sawRangeReject = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::A_NoMatchingEncodingVariant
-            && d.actual.find("imm8") != std::string::npos) {
-            sawRangeReject = true;
+
+    // Both ends of the parameter window, because they fail for DIFFERENT
+    // reasons and an implementation could easily catch one and not the
+    // other: 300 overflows 8 bits, while -1 FITS 8 bits and is refused
+    // because a fixed narrow parameter of a wider operation is a MAGNITUDE
+    // (the operation's own width carries the sign). The reference refuses
+    // both, and the negative one is the case a naive "widen the window"
+    // fix would silently start encoding as a 255-bit shift.
+    for (int count : {300, -1}) {
+        DiagnosticReporter rep;
+        auto const bytes = buildLegalizeAssemble(
+            *schema, rep, [&](LirBuilder& b) {
+                LirOperand const ops[] = {LirOperand::makeReg(rax),
+                                          LirOperand::makeImmInt32(count)};
+                (void)b.addInst(*schema->opcodeByMnemonic("shl"), rax, ops);
+            });
+        EXPECT_GT(rep.errorCount(), 0u) << "shl $" << count;
+        bool sawRangeReject = false;
+        bool sawNarrowing   = false;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::A_ImmediateOperandOutOfRange
+                && d.actual.find("imm8") != std::string::npos) {
+                sawRangeReject = true;
+            }
+            if (d.code
+                == DiagnosticCode::A_ImmediateNarrowedToOperandField) {
+                sawNarrowing = true;
+            }
         }
+        EXPECT_TRUE(sawRangeReject)
+            << "shl $" << count << " must be REFUSED by the immediate "
+               "window, naming the field — gas refuses it too";
+        EXPECT_FALSE(sawNarrowing)
+            << "★ shl $" << count << " must NOT narrow. A shift count is a "
+               "fixed parameter of a wider operation, not the operation's "
+               "value; narrowing it would encode a DIFFERENT SHIFT and "
+               "would put DSS above the reference union, which is an "
+               "invented extension";
+        EXPECT_TRUE(bytes.empty())
+            << "★ and it must emit NO BYTES — a refused instruction that "
+               "still contributes to the stream is the miscompile the "
+               "refusal exists to prevent";
     }
-    EXPECT_TRUE(sawRangeReject);
 }
 
 TEST(WidthAxisArm64, ShiftVariableWordsXAndWForms) {

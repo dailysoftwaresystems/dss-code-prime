@@ -192,7 +192,42 @@ ConfigDiagnostic makeProblem(std::string path, std::string message) {
     };
 }
 
+// The kinds a document MAY declare twice, rendered for a diagnostic.
+// D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE.
+//
+// ⚠ DERIVED FROM THE PREDICATE, NEVER SPELLED. A literal "unwind" here would
+// be a second owner of the membership rule, and the day a second role becomes
+// encoding-discriminated the messages would keep naming the old set while the
+// loader accepted the new one — the exact drift shape `namesWhere` exists to
+// prevent one vocabulary over.
+[[nodiscard]] std::string encodingDiscriminatedKindList() {
+    return renderAllowedList(kEncodingDiscriminatedKindNames);
+}
+
 } // namespace
+
+// D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE. Both
+// indexes are maintained HERE and nowhere else, so `sections` and its two
+// projections cannot disagree — the derived-at-load relationship the field's
+// own docblock claims.
+bool ObjectFormatData::addSectionRow(ObjectFormatSectionInfo info,
+                                     std::uint16_t& duplicateOfOut) {
+    SectionKindEncoding const id{info.kind, info.encoding};
+    auto const idx = static_cast<std::uint16_t>(sections.size());
+    auto [it, fresh] = sectionKindIndex.emplace(id, idx);
+    if (!fresh) {
+        duplicateOfOut = it->second;
+        return false;
+    }
+    // A SECOND row of a kind retires that kind's unique-row answer rather than
+    // overwriting it. Overwriting would make `sectionByKind` return whichever
+    // row happened to load LAST — a silent choice between two correct-looking
+    // answers, which is worse than no answer.
+    auto [uit, uFresh] = sectionKindUniqueRow.emplace(info.kind, idx);
+    if (!uFresh) uit->second = kAmbiguousSectionRow;
+    sections.push_back(std::move(info));
+    return true;
+}
 
 std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     std::vector<ConfigDiagnostic> problems;
@@ -454,18 +489,28 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
-    // Sections: kind unique cross-row + name non-empty. The format
+    // Sections: (kind, encoding) unique cross-row + name non-empty. The format
     // walker resolves `sectionByKind(SectionKind::Text)` to find
     // the format-native section name + structural fields.
+    //
+    // ★ THE UNIQUENESS KEY IS THE PAIR SINCE
+    //   D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE, and
+    //   the three rules below are what keep `sectionByKind` -- the kind-only
+    //   lookup every WRITER uses -- honest afterwards. Without them a second
+    //   row of ANY kind would make that accessor answer "no such section" for
+    //   a section the document plainly declares.
     {
-        std::unordered_map<SectionKind, std::size_t> seenSection;
+        std::unordered_map<SectionKindEncoding, std::size_t> seenSection;
+        std::unordered_map<SectionKind, std::size_t> rowsPerKind;
         for (std::size_t i = 0; i < sections.size(); ++i) {
             auto const& s = sections[i];
             if (s.name.empty()) {
                 fail(std::format("/sections/{}/name", i),
                      "section row: 'name' must be a non-empty string");
             }
-            auto [it, fresh] = seenSection.emplace(s.kind, i);
+            ++rowsPerKind[s.kind];
+            auto [it, fresh] =
+                seenSection.emplace(SectionKindEncoding{s.kind, s.encoding}, i);
             if (!fresh) {
                 fail(std::format("/sections/{}/kind", i),
                      std::format("section '{}': duplicate 'kind' value "
@@ -473,6 +518,57 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "/sections/{})",
                                  s.name, sections[it->second].name,
                                  it->second));
+            }
+            // (b) AN ENCODING ON A ROLE THAT DOES NOT HAVE ONE IS INERT
+            // CONFIG, and inert config is rejected BY NAME here exactly as
+            // `charSignedness` rejects a second-owner key rather than letting
+            // it sit and read as meaningful. Declaring `"encoding"` on a
+            // `text` row states a discriminator nothing will ever dispatch on.
+            if (s.encoding != SectionEncoding::Unspecified
+                && !sectionKindIsEncodingDiscriminated(s.kind)) {
+                fail(std::format("/sections/{}/encoding", i),
+                     std::format("section '{}': 'kind' \"{}\" has exactly one "
+                                 "wire encoding, so declaring 'encoding' "
+                                 "\"{}\" states a discriminator no reader "
+                                 "dispatches on. Only these kinds are "
+                                 "encoding-discriminated: {}",
+                                 s.name, sectionKindName(s.kind),
+                                 sectionEncodingName(s.encoding),
+                                 encodingDiscriminatedKindList()));
+            }
+        }
+        for (std::size_t i = 0; i < sections.size(); ++i) {
+            auto const& s = sections[i];
+            if (rowsPerKind[s.kind] < 2u) continue;
+            // (c) A KIND MAY REPEAT ONLY WHERE THE ROLE HAS SEVERAL ENCODINGS.
+            if (!sectionKindIsEncodingDiscriminated(s.kind)) {
+                fail(std::format("/sections/{}/kind", i),
+                     std::format("section '{}': 'kind' \"{}\" is declared by "
+                                 "{} rows. A kind may appear more than once "
+                                 "only when its ROLE has several wire "
+                                 "encodings, because every other kind is "
+                                 "resolved by kind alone and a second row "
+                                 "makes that lookup answer nothing. "
+                                 "Encoding-discriminated kinds: {}",
+                                 s.name, sectionKindName(s.kind),
+                                 rowsPerKind[s.kind],
+                                 encodingDiscriminatedKindList()));
+                continue;
+            }
+            // (d) …AND THEN EVERY ONE OF THEM MUST SAY WHICH ENCODING IT IS.
+            // The pair rule alone would admit one `Unspecified` row beside one
+            // declared row: pair-unique, yet the `Unspecified` row is exactly
+            // the one no reader can identify.
+            if (s.encoding == SectionEncoding::Unspecified) {
+                fail(std::format("/sections/{}/encoding", i),
+                     std::format("section '{}': this document declares {} "
+                                 "rows of kind \"{}\", so each must say which "
+                                 "wire encoding it carries -- this row says "
+                                 "nothing, and a reader would have to guess "
+                                 "between them. One of: {}",
+                                 s.name, rowsPerKind[s.kind],
+                                 sectionKindName(s.kind),
+                                 renderAllowedList(kDeclarableSectionEncodingNames)));
             }
         }
     }

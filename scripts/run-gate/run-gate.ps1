@@ -248,7 +248,8 @@ if ($null -eq $CommandArgs) { $CommandArgs = @() }
 $__cplPrev = $env:CTEST_PARALLEL_LEVEL
 $__cplSet  = $false
 if (-not $env:CTEST_PARALLEL_LEVEL) {
-    $env:CTEST_PARALLEL_LEVEL = '8'
+    # ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
+    $env:CTEST_PARALLEL_LEVEL = '6'
     $__cplSet = $true
 }
 

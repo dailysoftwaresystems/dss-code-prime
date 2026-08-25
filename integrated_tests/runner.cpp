@@ -4586,8 +4586,25 @@ void runRunnerVocabularyPin() {
         bool hasDeps = false;
         for (auto const& t : m.targets) hasDeps = hasDeps || !t.dependsOn.empty();
         if (hasDeps) continue;
-        // (3) at least one target this runner BINDS here — otherwise the two
-        //     harnesses share no executed spec and clause C5 is judging nothing.
+        // (3) at least one target this host can actually RUN — otherwise the
+        //     two harnesses share no executed spec and clause C5 is judging
+        //     nothing.
+        //     ★★ RUNNABLE MEANS OS *AND* ARCH, AND IT SAID ONLY "OS" UNTIL
+        //     2026-08-25 (cycle P34). `runOn` names operating systems, so a
+        //     spec was called bindable the moment its `runOn` listed this
+        //     host's OS — no matter what processor the spec targets.
+        //     ⚠ ✔MEASURED on the aarch64 Linux leg: this selected
+        //     `asm/asm_arith_return42`, whose two specs are BOTH x86_64, one of
+        //     them `runOn: [linux]`. Neither could execute on an arm64 host, so
+        //     both runners reported `ran=-`, and C5 refused over the empty
+        //     overlap — the guard working exactly as designed, on a subject the
+        //     selector should never have handed it.
+        //     ★ The bug is invisible on x86_64 hosts because there the OS test
+        //     and the arch test agree by accident. ✔MEASURED across the corpus:
+        //     making this arch-aware changes the chosen subject on EXACTLY the
+        //     two hosts where the old answer was vacuous (linux/arm64 and
+        //     darwin/x86_64) and on no other.
+        //     D-TEST-COVERAGE-BOUNDARY-SELECTOR-READ-THE-HOST-OS-BUT-NOT-THE-HOST-ARCH
         // (4) at least one target `runOn` EXCLUDES from this host, AND OF A
         //     FOREIGN ARCH. The cross-OS half alone would qualify a subject
         //     whose every spec targets this machine's own processor — and the
@@ -4598,7 +4615,8 @@ void runRunnerVocabularyPin() {
         bool bindable = false, excludedForeignArch = false;
         for (auto const& t : m.targets) {
             bool const admits =
-                std::find(t.runOn.begin(), t.runOn.end(), host) != t.runOn.end();
+                std::find(t.runOn.begin(), t.runOn.end(), host) != t.runOn.end()
+                && specTargetArch(t.spec) == currentHostArch();
             bindable = bindable || admits;
             if (!admits && specTargetArch(t.spec) != currentHostArch()) {
                 excludedForeignArch = true;
@@ -5405,7 +5423,7 @@ int main(int argc, char* argv[]) {
     // ── Harness self-test: recursive neighbour staging ──
     //
     // Deliberately UNNUMBERED. The `[Test N]` labels in this file are cited
-    // from outside it — `.plans/_deferred-anchor-registry.md` names `[Test 4]`
+    // from outside it — `.plans/_deferred-anchor-registry*.md` names `[Test 4]`
     // as where the manifest emulator lint lives — so slotting a new number in
     // before the corpus would silently invalidate a registry citation, and
     // appending it at the end would put a HARNESS check after the 581 examples
@@ -5435,7 +5453,7 @@ int main(int argc, char* argv[]) {
     // ── Harness self-test: the per-dependency opt-in parses here too ──
     //
     // UNNUMBERED for the same reason the staging self-test above is: the
-    // `[Test N]` labels are cited from `.plans/_deferred-anchor-registry.md`,
+    // `[Test N]` labels are cited from `.plans/_deferred-anchor-registry*.md`,
     // so inserting a number would silently invalidate a registry citation. Runs
     // BEFORE the corpus so a parser that stopped honouring the key announces
     // itself rather than letting every dependency comparison go quietly inert.
@@ -5443,14 +5461,14 @@ int main(int argc, char* argv[]) {
     // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
     // the prebuilt-input entry's refusals. UNNUMBERED for the same reason its
     // neighbours are — the `[Test N]` labels are cited from
-    // `.plans/_deferred-anchor-registry.md`, so inserting a number would
+    // `.plans/_deferred-anchor-registry*.md`, so inserting a number would
     // silently invalidate a registry citation. It runs on EVERY host, which is
     // what makes it the CLI half's witness where no target of the corpus
     // example binds (a Windows host binds neither the ELF nor the Mach-O one).
     runPrebuiltLibraryParserPin(outputBase / "harness-prebuilt-library-parser");
     runManifestClosedKeySetPin(outputBase / "harness-manifest-keys");
     // UNNUMBERED for the same reason its two neighbours are: the `[Test N]`
-    // labels are cited from `.plans/_deferred-anchor-registry.md`, so inserting
+    // labels are cited from `.plans/_deferred-anchor-registry*.md`, so inserting
     // a number would silently invalidate a registry citation. It runs with the
     // CLI surface rather than in the walk because it is ONE existence claim
     // about the driver's argv handling, not a property of any example — and

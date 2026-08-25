@@ -391,42 +391,69 @@ wireImm32(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
 }
 
 // FC3.5 sweep-c1 (shifts): stash an ImmInt operand's value for a
-// 1-byte immediate slot (`SHL/SHR/SAR r/m, imm8` — C1 /4 /5 /7 ib).
-// RANGE-CHECKED [0, 255] fail-loud: silently truncating a wider
-// immediate to one byte would emit a valid-looking instruction with a
-// wrong count. (The MIR→LIR shift lowering only selects the imm form
-// for counts it verified fit; this is the defense-in-depth half.)
+// 1-byte immediate slot (`SHL/SHR/SAR r/m, imm8` — C1 /4 /5 /7 ib — and the
+// byte-width ALU/mov forms). RANGE-CHECKED fail-loud: silently truncating a
+// wider immediate to one byte would emit a valid-looking instruction with a
+// wrong count. (The MIR→LIR shift lowering only selects the imm form for
+// counts it verified fit; this is the defense-in-depth half.)
+//
+// ★★ ONE SLOT, TWO MACHINE MEANINGS, AND THE CONFIG ALREADY SEPARATES THEM
+// — D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES. `imm8` is wired
+// by the byte-width ALU/mov forms (`movb $5, %al` — `guard.width` 8, so the
+// byte IS the operation's value) AND by the shift counts (`shl` — those
+// variants declare `guard.width` 32/64, so the byte is a fixed PARAMETER of
+// a wider operation). The old window here was a flat `0..255` written for
+// the shift reading, and it made `movb $-1, %al` a hard error although
+// ✔GNU as 2.42 assembles it to `b0 ff`. Routing through the shared resolver
+// gives each reading its own window off the DECLARED width:
+//   `guard.width` == 8  -> [-128, 255], narrows-and-warns outside it
+//   `guard.width` != 8  -> [0, 255] as before, refuses outside it
+// ✔MEASURED that this is the reference's own split, not an approximation:
+// `movb $-1, %al` -> b0 ff (accepted), `shl $-1, %rax` -> Error, and
+// `shl $256, %rax` -> Error.
 [[nodiscard]] bool
-wireImm8(EncodingState& st, std::int32_t v,
+wireImm8(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
+         std::uint8_t guardWidthBits,
          std::string_view mnemonic, DiagnosticReporter& reporter) {
-    if (v < 0 || v > 255) {
-        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-               DiagnosticSeverity::Error,
-               std::format("opcode '{}': immediate {} does not fit the "
-                           "imm8 slot (0..255) — the lowering must "
-                           "route out-of-range counts through the "
-                           "register form",
-                           mnemonic, v));
-        return false;
-    }
-    st.imm8s.push_back(static_cast<std::uint8_t>(v));
+    auto const bits = walker_util::resolveImmediateForField(
+        v, slot, guardWidthBits, mnemonic, reporter);
+    if (!bits.has_value()) return false;
+    st.imm8s.push_back(static_cast<std::uint8_t>(*bits));
     return true;
 }
 
 // D-ASM-X86-NO-16BIT-IMMEDIATE-SLOT: stash an ImmInt operand's value for
 // the 2-byte immediate slot (`66 C7 /0 iw`, `66 81 /N iw`).
 //
-// ★ THE ACCEPTED WINDOW IS THE UNION OF THE SIGNED AND UNSIGNED READINGS
-// OF THE SAME 16 BITS — [-32768, 65535] — and that is a measurement, not a
-// convenience: ✔GNU as 2.42 assembles BOTH `movw $-1, %cx` and
-// `movw $65535, %cx` to the identical `66 b9 ff ff`, so a range that
-// admitted only one of them would refuse input the reference takes.
-// Outside the union it fails LOUD: silently truncating a wider constant to
-// two bytes emits a valid-looking instruction carrying a different number,
-// which is the exact failure mode this slot was created to prevent (using
-// `imm32` here would have emitted FOUR bytes and corrupted the stream).
+// ★ THE WINDOW IS THE UNION OF THE SIGNED AND UNSIGNED READINGS OF THE SAME
+// 16 BITS — [-32768, 65535] — and that much IS a measurement: ✔GNU as 2.42
+// assembles BOTH `movw $-1, %cx` and `movw $65535, %cx` to the identical
+// `66 b9 ff ff`, so a range admitting only one of them would refuse input
+// the reference takes.
+//
+// ★★★ WHAT THE WINDOW GATES CHANGED IN CYCLE P34, AND THE WINDOW ITSELF DID
+// NOT MOVE — D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES. It used
+// to be the ACCEPTANCE threshold: outside it the encoder refused. But the
+// reference does not refuse — ✔MEASURED, `mov $0x10000, %cx` assembles rc=0
+// to `66 b9 00 00` (with a warning) and `mov $-32769, %cx` assembles rc=0 to
+// `66 b9 ff 7f` with NO DIAGNOSTIC AT ALL. Refusing what a working reference
+// assembles is a conformance defect; matching it exactly would have imported
+// its silence on the case where 0x8000 of magnitude disappears. The operator
+// ruled a THIRD arm: accept what gas accepts, and diagnose where gas is
+// silent. So this window is now the SILENCE threshold — outside it the low
+// 16 bits (the reference's own bytes) are emitted with an unsuppressable
+// `A_ImmediateNarrowedToOperandField` warning.
+//
+// ⚠ THE RANGE LITERALS ARE GONE ON PURPOSE. The window is derived from the
+// slot's declared field width in `walker_util::immediateFitsFieldWindow`,
+// and whether narrowing is even legal here is decided by the CONFIG —
+// `guard.width == 16` says this field carries the operation's whole value.
+// A 16-bit field under a wider operation (a fixed narrow parameter, as an
+// x86 shift count's `ib` is) still refuses, because the reference refuses
+// that too.
 [[nodiscard]] bool
 wireImm16(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
+          std::uint8_t guardWidthBits,
           std::string_view mnemonic, DiagnosticReporter& reporter) {
     if (slot != EncodingSlotKind::Imm16Bytes) {
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
@@ -437,18 +464,10 @@ wireImm16(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
                            mnemonic, encodingSlotKindName(slot)));
         return false;
     }
-    if (v < -32768 || v > 65535) {
-        report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
-               DiagnosticSeverity::Error,
-               std::format("opcode '{}': immediate {} does not fit the "
-                           "2-byte immediate slot (-32768..65535) — a wider "
-                           "constant needs the 4-byte form of this "
-                           "instruction",
-                           mnemonic, v));
-        return false;
-    }
-    st.imm16s.push_back(static_cast<std::uint16_t>(
-        static_cast<std::uint32_t>(v) & 0xFFFFu));
+    auto const bits = walker_util::resolveImmediateForField(
+        v, slot, guardWidthBits, mnemonic, reporter);
+    if (!bits.has_value()) return false;
+    st.imm16s.push_back(static_cast<std::uint16_t>(*bits));
     return true;
 }
 
@@ -821,12 +840,21 @@ bool encode(Lir const&                  lir,
             // forms) emits TWO; everything else goes through the
             // Imm32 path (which rejects non-Imm32 slots loudly).
             if (wire.slotKind == EncodingSlotKind::Imm8) {
-                if (!wireImm8(st, srcOp.immInt32,
+                if (!wireImm8(st, wire.slotKind, srcOp.immInt32,
+                              selected->guardWidthBits,
                               info->mnemonic, reporter)) {
                     return false;
                 }
             } else if (wire.slotKind == EncodingSlotKind::Imm16Bytes) {
+                // The SELECTED variant's declared operation width is what
+                // decides whether this field may narrow — see
+                // `walker_util::fieldCarriesWholeOperationValue`. Read off
+                // the elected variant, never off `instWidth`: a
+                // width-ABSENT variant matches any width and therefore
+                // proves nothing, which is exactly the case that must keep
+                // refusing.
                 if (!wireImm16(st, wire.slotKind, srcOp.immInt32,
+                               selected->guardWidthBits,
                                info->mnemonic, reporter)) {
                     return false;
                 }

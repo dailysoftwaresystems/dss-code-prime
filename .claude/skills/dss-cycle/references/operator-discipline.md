@@ -45,7 +45,7 @@ operator**.
    claim wear the voice of a measured one. "I verified X" and "X is documented to be true"
    and "X follows from Y" are three different statements with three different failure modes.
 1b. **★★ BEFORE COMMISSIONING AN EXPERIMENT, GREP THE REGISTRY FOR A MATCHED CONTROL THAT
-   ALREADY EXISTS.** Search `_deferred-anchor-registry.md` for the failing artefact, the leg,
+   ALREADY EXISTS.** Search `_deferred-anchor-registry*.md` for the failing artefact, the leg,
    the test family and the symptom — then CITE what you find, or state explicitly that nothing
    matched. ✔MEASURED 2026-08-06: a 2×2 attribution (compiler × rundir filesystem) was
    commissioned from scratch for 57 sqlite failures; the identical experiment with the identical

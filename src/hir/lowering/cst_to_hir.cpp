@@ -6693,10 +6693,35 @@ struct Lowerer {
             }
             TypeId const elemT = ops[0];
             auto   const len   = scals[0];
+            // ★★ D-HIR-SENTINEL-ARRAY-LENGTH-EXPANDED-AS-A-COUNT — the twin of the
+            // `initSlotAsAggregate` guard. `scalars()` is `std::int64_t`, so the two
+            // negative sentinels arrive here as lengths: `kIncompleteArrayLength`
+            // (-1) and `kVlaLength` (-2). Unguarded, `reserve(static_cast<size_t>
+            // (len))` asks for 2^64-1 elements and THROWS `std::length_error` — the
+            // compiler terminates, which is the one outcome worse than a wrong
+            // answer. ✔MEASURED at 8cb9afbd on `struct S { int n; char c[]; };
+            // struct S s = {};`, a program both references compile.
+            //   BOTH sentinels mean ZERO statically-known elements, and that is the
+            // right answer for each, for DIFFERENT reasons:
+            //   • INCOMPLETE (`[]`, a flexible array member): C 6.7.2.1p18 gives the
+            //     tail no storage in `sizeof`, so an all-zero object has nothing to
+            //     write there. gcc and clang agree — `sizeof(struct S)` is 4 and the
+            //     initializer is legal.
+            //   • VLA (`[n]`): the element count is a RUN-TIME value, so no static
+            //     child list can represent it. The empty `ConstructAggregate` is a
+            //     TYPED marker meaning "zero this whole object"; the MIR VarDecl arm
+            //     recognises it by TYPE (D-CSUBSET-VLA-INITIALIZER) and expands it
+            //     into a runtime byte loop over the object's real size. ⚠ IF THAT
+            //     ARM IS EVER REMOVED THIS BECOMES A SILENT NO-OP — an uninitialized
+            //     VLA where C23 6.7.10p4 promises zeros — which is why the MIR side
+            //     fails loud rather than falling through when it cannot size the
+            //     object.
             std::vector<HirNodeId> children;
-            children.reserve(static_cast<std::size_t>(len));
-            for (std::uint32_t i = 0; i < len; ++i) {
-                children.push_back(synthZeroOrError(at, elemT));
+            if (len > 0) {
+                children.reserve(static_cast<std::size_t>(len));
+                for (std::int64_t i = 0; i < len; ++i) {
+                    children.push_back(synthZeroOrError(at, elemT));
+                }
             }
             return builder.makeConstructAggregate(children, type, HirFlags::Synthetic);
         }
@@ -7457,8 +7482,19 @@ struct Lowerer {
         } else if (k == TypeKind::Array) {
             auto ops   = interner.operands(s.slotType);
             auto scals = interner.scalars(s.slotType);
-            if (!ops.empty() && !scals.empty()) {
-                s.nested.resize(scals[0]);
+            // ★★ D-HIR-SENTINEL-ARRAY-LENGTH-EXPANDED-AS-A-COUNT: `scals[0]` is a
+            // SIGNED length that carries the interner's two negative sentinels —
+            // `kIncompleteArrayLength` (-1, `T x[]`) and `kVlaLength` (-2, `T x[n]`)
+            // — and this `resize` used to take it unguarded. ✔MEASURED at 8cb9afbd:
+            // `struct S { int n; char c[]; }; struct S s = {};` reaches the -1 arm
+            // through the Struct recursion and the compiler DIES —
+            // `terminate called after throwing an instance of 'std::length_error'`
+            // — a C++ terminate, not a diagnostic, on a program gcc and clang both
+            // compile. A runtime-sized array has NO static element count to expand
+            // into slots, so leave `nested` EMPTY: `flattenInitSlot` then routes the
+            // slot through `synthZeroOrError`, which owns the two sentinels.
+            if (!ops.empty() && !scals.empty() && scals[0] >= 0) {
+                s.nested.resize(static_cast<std::size_t>(scals[0]));
                 for (auto& n : s.nested) n.slotType = ops[0];
             }
         }
@@ -7693,6 +7729,22 @@ struct Lowerer {
     //     a scalar), or a NESTED brace list `{{42}}` (audit N2: 6.7.10p12
     //     requires a SINGLE expression; a brace list is not one) —
     //     → S_InvalidScalarInitializer (0xE03F), never a silent guess.
+    // The TOP-LEVEL element count of a brace list, through the SAME
+    // `initElementRule` filter every brace-init path in this file uses (the
+    // `{`/`}`/`,` tokens are not elements). Its one caller is the runtime-sized
+    // array gate in `lowerBraceInit`, which needs "is this the EMPTY initializer"
+    // and must not answer it with a second reading of what an element is.
+    [[nodiscard]] std::size_t braceInitElementCount(NodeId braceInitListNode) const {
+        std::size_t n = 0;
+        for (NodeId elem : visible(braceInitListNode)) {
+            if (tree().kind(elem) != NodeKind::Internal) continue;
+            if (!cfg.initElementRule.valid()
+             || tree().rule(elem).v != cfg.initElementRule.v) continue;
+            ++n;
+        }
+        return n;
+    }
+
     [[nodiscard]] HirNodeId lowerScalarBraceInit(NodeId braceInitListNode,
                                                  TypeId contextType) {
         // Collect the initElement children — the SAME rule filter the
@@ -7819,6 +7871,36 @@ struct Lowerer {
         // path; the rest of this function handles struct + array.
         if (isUnion) {
             return lowerUnionBraceInit(braceInitListNode, contextType);
+        }
+        // ★★ D-HIR-SENTINEL-ARRAY-LENGTH-EXPANDED-AS-A-COUNT — the THIRD site of
+        // the same class (`initSlotAsAggregate` and `synthZeroOrError` carry the
+        // other two; the HIR verifier's Array child-count rule is the fourth).
+        // A RUNTIME-SIZED array — `kVlaLength` (-2) or `kIncompleteArrayLength`
+        // (-1) in `scalars()[0]` — has NO static slot count, and the positional
+        // machinery below is built entirely out of one: `slotCount` is a
+        // `std::uint32_t`, so -2 became 4,294,967,294 and the very next statement
+        // (`std::vector<bool> positionallySkippable(slotCount, false)`) allocated
+        // half a gigabyte before looping over four billion slots. ✔MEASURED: the
+        // compiler simply never returned on `int a[argc] = {};` — a HANG, which is
+        // the one failure mode worse than a crash because no watchdog reports it.
+        //   The EMPTY brace initializer is the whole of what may legally arrive
+        // here on such a type (C23 6.7.10p4 for the VLA; an incomplete array with a
+        // NON-empty initializer was already sized from that initializer by the
+        // semantic tier, so it reaches this function as a SIZED array). Route it to
+        // `synthZeroOrError`, whose sentinel arm mints the empty typed
+        // `ConstructAggregate` the MIR tier expands — one owner for "zero this
+        // runtime-sized object", not a second copy here. Anything else is a
+        // semantic-tier invariant break: fail LOUD.
+        if (isArray) {
+            auto const ctxScals = interner.scalars(contextType);
+            if (!ctxScals.empty() && ctxScals[0] < 0) {
+                if (braceInitElementCount(braceInitListNode) != 0) {
+                    return reportedError(braceInitListNode,
+                        "a runtime-sized array may be brace-initialized only by "
+                        "the empty initializer `{}` (C23 6.7.10p4)");
+                }
+                return synthZeroOrError(braceInitListNode, contextType);
+            }
         }
         std::uint32_t slotCount = 0;
         TypeId elemTypeForArray{};

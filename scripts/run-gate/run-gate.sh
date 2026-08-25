@@ -107,7 +107,10 @@ run_gate_looks_like_a_windows_path() {   # <path>
 # Windows ctest leg and a WSL leg CONCURRENTLY on the same machine on purpose
 # (serializing them was rejected by name), so the default leaves headroom for
 # the other leg instead of claiming the box.
-: "${CTEST_PARALLEL_LEVEL:=8}"
+# ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
+# The former 8 was a workstation number justified by "leaving headroom" for a
+# concurrent leg. The ruling is stronger than headroom: never claim the box.
+: "${CTEST_PARALLEL_LEVEL:=6}"
 export CTEST_PARALLEL_LEVEL
 
 # ★★ AND ACROSS THE WSL BOUNDARY, which an export alone does NOT cross.

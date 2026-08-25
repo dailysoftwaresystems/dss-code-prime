@@ -73,6 +73,80 @@ bool isTrivia(Token const& t) {
 }
 bool isNewline(Token const& t) { return t.coreKind == CoreTokenKind::Newline; }
 
+// ══ D-PERF-PP-OFF-GRAMMAR-BODY-RUN-IS-ONE-TOKEN-PER-CODEPOINT ═══════════════
+//
+// TRUE when `next` may be folded into `prev` — i.e. the two are consecutive
+// codepoints of ONE non-coalesced, off-grammar body run (a comment). The caller
+// (`tokenizeToPP`) then widens `prev`'s span over `next` instead of appending a
+// second token, so a comment costs ONE token rather than one per character.
+//
+// ★★ WHY THIS IS THE PREPROCESSOR'S JOB AND NOT A WORKAROUND FOR THE
+// TOKENIZER. C 5.1.1.2p1 translation phase 3 is explicit: "Each comment is
+// replaced by one space character." Phase 3 belongs to THIS pass, and this
+// function sits at the point where the pass materializes its own view of the
+// token stream. The tokenizer is RIGHT to emit one token per body codepoint —
+// a body mode is a general mechanism, and a string body's codepoints are
+// VALUE-BEARING and must stay separable (which is why `defaultToken.coalesce`
+// exists and why a comment mode deliberately does not set it). What is wrong is
+// carrying per-codepoint granularity through a pass in which every consumer
+// already treats the whole run as one space.
+//
+// ⚠ ✔MEASURED (cycle P34, sqlite 103 TU, Release, Windows/MinGW): of the
+// 106.3 M tokens the preprocessor materialized, 93.1 M — 89% — were
+// single-CHARACTER comment-body tokens, and the stream handed to the PARSER was
+// 86.2 M tokens of which 82.2 M were non-newline trivia. Every one of those
+// became an off-grammar AST leaf.
+//
+// ★ AGNOSTIC BY CONSTRUCTION — no token kind, comment spelling, language,
+// architecture or object-format is named. The fold is admitted by exactly two
+// schema-supplied facts: the kind is a `lexerModes.<name>.defaultToken.kind`
+// (`GrammarSchema::isBodyDefaultKind`, the loader's own single source of truth
+// for "off-grammar body token"), and the schema flags it `EmptySpace` (via
+// `isTrivia`). A language that spells comments differently folds by the same
+// rule; one that declares no such mode is inert here.
+//
+// ★★ THE FOUR EXCLUSIONS ARE EACH LOAD-BEARING, AND THREE OF THEM ARE THE
+// REASON THIS PREDICATE IS NOT SIMPLY `isTrivia && isTrivia`:
+//   • SAME KIND ONLY, AND THE KIND IS CARRIED FORWARD UNCHANGED. Widening a
+//     span changes the token's LEXEME, and `TreeBuilder::resolveMeaning`
+//     resolves a kind through the per-lexeme table first. Folding a
+//     mode-OPENING token (`//`, whose meaning is the global table's entry for
+//     that exact lexeme) into its body makes that lookup miss, and the
+//     builder's drift guard then fatal-aborts — ✔MEASURED, exactly that abort,
+//     on the first cut of this change. A body-default kind is resolved by KIND
+//     (the synthesis path's `bodyKinds` arm), never by lexeme, so a widened one
+//     resolves identically. The opener and closer therefore stay their own
+//     tokens; only the BODY folds.
+//   • VALUE-BEARING BODIES NEVER FOLD. `isTrivia` is what excludes them: a
+//     string / char / header body is a body-default kind too, and its
+//     codepoints are decoded downstream. Only a body the schema itself declares
+//     `EmptySpace` is foldable.
+//   • A NEWLINE NEVER FOLDS. The preprocessor is line-oriented — `firstOnLine`
+//     and every `lineEnd` walk read Newline tokens — and `isTrivia` answers
+//     TRUE for one (the schema flags `"\n"` `EmptySpace`), so a fold keyed on
+//     triviality alone would erase directive-line structure. A newline INSIDE a
+//     block comment is a body token, not a Newline token, and folds — which is
+//     the pre-existing behaviour this preserves exactly.
+//   • A NON-ADJACENT PAIR NEVER FOLDS. Tokens from one tokenize are contiguous
+//     by construction, so the test is nearly free; it is here so that a future
+//     emitter leaving a gap cannot silently produce a token whose span covers
+//     bytes it does not represent.
+//
+// ★ SPANS ARE PRESERVED EXACTLY. The folded token spans precisely the bytes of
+// the run it replaces, so every downstream offset question — the line map, the
+// dead-region byte oracle, `__LINE__`, a diagnostic's position, an AST leaf's
+// extent — resolves to the same bytes as before. The fold removes TOKENS, never
+// bytes and never a byte's attribution.
+[[nodiscard]] bool foldsIntoPrecedingBodyRun(GrammarSchema const& schema,
+                                             Token const&         prev,
+                                             Token const&         next) noexcept {
+    return prev.schemaKind.valid()
+        && prev.schemaKind == next.schemaKind
+        && schema.isBodyDefaultKind(prev.schemaKind)
+        && isTrivia(prev) && !isNewline(prev)
+        && prev.span.end() == next.span.start();
+}
+
 // Phase-2 line-continuation splice: delete every backslash-newline pair,
 // recording 1:1 line-map segments per verbatim run so synth offsets remap to
 // the ORIGINAL file. Appends to out/map based at out.size().
@@ -137,6 +211,19 @@ std::vector<PPToken> tokenizeToPP(
     while (!result.stream.isAtEnd()) {
         Token t = result.stream.advance();
         if (t.coreKind == CoreTokenKind::Eof) break;
+        // D-PERF-PP-OFF-GRAMMAR-BODY-RUN-IS-ONE-TOKEN-PER-CODEPOINT: one
+        // comment is ONE token here, not one per character (C 5.1.1.2p1 phase
+        // 3). See `foldsIntoPrecedingBodyRun` for why the opener/closer and
+        // every value-bearing body are excluded, and why the folded token keeps
+        // the run's own kind.
+        if (!out.empty()
+            && foldsIntoPrecedingBodyRun(*schema, out.back().tok, t)) {
+            Token& prev     = out.back().tok;
+            prev.span       = SourceSpan::of(prev.span.start(), t.span.end());
+            prev.flags      = prev.flags | t.flags;
+            out.back().text = buffer->slice(prev.span);
+            continue;
+        }
         out.push_back(PPToken{t, buffer->slice(t.span)});
     }
     return out;

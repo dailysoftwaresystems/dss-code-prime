@@ -61,3 +61,22 @@ target_link_libraries(dss_ffi_test_environ_data_object_binding
 # link: it reads binary bytes, not shipped descriptors.
 dss_add_test(NAME ffi/test_binary_reader_ar_bsd
              SOURCES test_binary_reader_ar_bsd.cpp)
+
+# D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME (P34): the DARWIN LINK-NAME ORACLE —
+# the census that covers every FUTURE symbol, not only the eight that diverge
+# today. It enumerates every Mach-O-visible imported function in the shipped
+# descriptors (hence the same json link as its four siblings above) and requires
+# each to be accounted for by a MEASURED row in tests/ffi/data/darwin-link-names.tsv,
+# which records what a real Apple `cc` emits for that identifier per arch. Runs on
+# every host: the measurement is DATA, so no Mach-O has to execute.
+dss_add_test(NAME ffi/test_darwin_link_name_oracle
+             SOURCES test_darwin_link_name_oracle.cpp)
+target_link_libraries(dss_ffi_test_darwin_link_name_oracle
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# Shipped-source resolution reports WHY it failed. The pinned property is a NEGATIVE
+# one -- a path the filesystem could not be asked about must never be reported as
+# absent -- plus its mirror, that a genuine absence is still called an absence, so a
+# fix cannot over-correct into "everything is an I/O error".
+dss_add_test(NAME ffi/test_shipped_source_lookup
+             SOURCES test_shipped_source_lookup.cpp)

@@ -33,6 +33,7 @@
 #include <format>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -380,5 +381,179 @@ struct BlockSymPatch {
     SymbolId      symbol;       // the synthetic per-block local symbol
     std::uint32_t targetBlock;  // LirBlockId.v of the address-taken block
 };
+
+// ─────────────────────────────────────────────────────────────────────
+// IMMEDIATE NARROWING — D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES
+// ─────────────────────────────────────────────────────────────────────
+//
+// ★★★ THE QUESTION THIS ANSWERS IS NOT "IS THE VALUE TOO BIG". It is
+// "IS THIS FIELD THE VALUE'S OWN HOME?", and the config already answers it
+// without a single new key. A wire names a SLOT (field width) and its
+// variant names `guard.width` (the operation width). When the two are EQUAL
+// the field is where the operation's whole value lives, so an overflowing
+// value is a NARROWING — the reference assembles it, keeping the low bits.
+// When they DIFFER the field is a fixed narrow PARAMETER of a wider
+// operation (an x86 shift count's `ib` under a 64-bit shift), the value was
+// never going to live there, and the reference REFUSES it outright.
+//
+// ✔MEASURED, GNU as 2.42, 20 spellings assembled ONE AT A TIME so no
+// diagnostic could be misattributed. The equality rule reproduces every one:
+//   NARROWING (field == op width)      `movb $300,%al`   -> b0 2c, warns
+//                                      `movw $0x10000,%cx` -> 66 b9 00 00, warns
+//                                      `movl $0x100000000,%eax` -> b8 00.., warns
+//   PARAMETER (field != op width)      `shl  $256,%rax`  -> ERROR, refused
+//                                      `shl  $-1,%rax`   -> ERROR, refused
+//                                      `add  $128,%rax`  -> gas declines to
+//                                          narrow into the imm8 form and picks
+//                                          the imm32 one instead
+// ⇒ this is the reference's OWN boundary, read off DSS's own config, not an
+// approximation of it and not an x86 special case. Any target declaring a
+// slot whose field width equals its variant's operation width gets the
+// narrowing treatment by the same three lines.
+//
+// ⚠ WHY THE DEFAULT ARM IS THE REFUSAL. `guardWidthBits == 0` means the
+// variant is width-ABSENT and matches an instruction of any width, so the
+// encoder CANNOT PROVE the field is the value's home. An unprovable case
+// takes the loud arm: refuse. Widening by default would have turned every
+// pre-width-axis variant in every target into a silent truncator at once.
+
+// The N of a slot's appended immediate field, in bits, or 0 when the slot
+// is not an appended-immediate field at all. Single-sourced here so the
+// window and the emitted byte count can never disagree — they used to be
+// two independent literals in `x86_variable.cpp` (`-32768..65535` beside a
+// `std::uint16_t` push), which is one edit away from a window that admits a
+// value the field cannot hold.
+//
+// ⚠ `Imm32` IS LISTED BUT NOTHING ROUTES THROUGH THE RESOLVER FOR IT YET,
+// AND THAT IS A DECISION RATHER THAN AN OMISSION. `wireImm32` carries NO
+// window at all today: its value arrives as a `std::int32_t`, so it cannot
+// overflow the field it is heading for, and the sign-extended `imm32` of a
+// 64-bit operation (`movq $-1, %rax`) is a legitimate NEGATIVE parameter —
+// the one shape the parameter arm's unsigned window would refuse. Giving it
+// a window here would turn a correct instruction into an error. It stays
+// listed because the width is a true fact about the slot and the next
+// caller should read it, not re-derive it.
+[[nodiscard]] constexpr std::uint8_t
+immediateFieldBits(EncodingSlotKind s) noexcept {
+    switch (s) {
+        case EncodingSlotKind::Imm8:       return 8;
+        case EncodingSlotKind::Imm16Bytes: return 16;
+        case EncodingSlotKind::Imm32:      return 32;
+        default:                           return 0;
+    }
+}
+
+// The config-declared narrowing predicate. See the block comment above.
+[[nodiscard]] constexpr bool
+fieldCarriesWholeOperationValue(std::uint8_t fieldBits,
+                                std::uint8_t guardWidthBits) noexcept {
+    return fieldBits != 0 && fieldBits == guardWidthBits;
+}
+
+// The window, and THE TWO ARMS DO NOT SHARE ONE.
+//
+// NARROWING field (the field is the operation's own value): the union of the
+// signed and the unsigned reading of the same N bits, [-2^(N-1), 2^N - 1].
+// AT&T writes both `$-1` and `$65535` for the same halfword, so a window
+// admitting only one of them would refuse input the reference takes.
+// ★ THIS IS THE SAME NUMBER THE ENCODER USED TO REFUSE OUTSIDE OF — it was
+// the ACCEPTANCE threshold and is now the SILENCE threshold. Nothing was
+// widened; what the threshold GATES changed. Keeping it (rather than
+// adopting gas's wider silent band, ✔MEASURED as |v| <= 2^N - 1) is what
+// makes DSS loud on the case gas does not mention: `$-32769` into a 16-bit
+// field, where 0x8000 of magnitude disappears with nothing on gas's stderr.
+//
+// PARAMETER field (a fixed narrow field of a WIDER operation): unsigned
+// only, [0, 2^N - 1]. ★★ THIS IS NOT A NARROWER WINDOW FOR CAUTION'S SAKE,
+// IT IS A DIFFERENT MACHINE FACT. The operation's own width carries the
+// sign; a parameter field left over beside it is a MAGNITUDE, and a negative
+// magnitude is meaningless rather than merely large. ✔MEASURED (GNU as
+// 2.42): `shl $-1, %rax` and `shl $256, %rax` are BOTH `Error: operand type
+// mismatch` — the reference refuses the negative one exactly as hard as the
+// oversized one, while it happily assembles `movb $-1, %al` to `b0 ff` where
+// the same 8 bits ARE the operation's value. Same field width, opposite
+// answers, and only the config's `guard.width` tells them apart.
+// ⚠ The `1 <= fieldBits < 64` precondition is ENFORCED rather than assumed:
+// `1 << 64` and `1 << (0 - 1)` are both undefined behaviour, and this is a
+// public helper in a shared header, so the next walker to reach for it will
+// not have `resolveImmediateForField`'s guard in front of it. An
+// out-of-contract width admits NOTHING, which routes the caller to its loud
+// arm instead of to a silently wrong window.
+[[nodiscard]] constexpr bool
+immediateFitsFieldWindow(std::int64_t v, std::uint8_t fieldBits,
+                         bool narrowingField) noexcept {
+    if (fieldBits == 0 || fieldBits >= 64) return false;
+    std::int64_t const lo =
+        narrowingField ? -(std::int64_t{1} << (fieldBits - 1)) : 0;
+    std::int64_t const hi = (std::int64_t{1} << fieldBits) - 1;
+    return v >= lo && v <= hi;
+}
+
+// Resolve an immediate against its declared field. Returns the bit pattern
+// to emit (already masked to `fieldBits`), or nullopt when the value is
+// REFUSED — in which case a diagnostic has been reported.
+//
+// Three outcomes, and the middle one is the whole point of the row:
+//   * inside the window            -> emit, silent
+//   * outside, narrowing field     -> emit the LOW N BITS (the reference's
+//                                     own bytes) + `A_ImmediateNarrowed-
+//                                     ToOperandField` at Warning
+//   * outside, parameter field     -> nullopt + `A_ImmediateOperandOutOf-
+//                                     Range` at Error, exactly as before
+[[nodiscard]] inline std::optional<std::uint64_t>
+resolveImmediateForField(std::int64_t        v,
+                         EncodingSlotKind    slot,
+                         std::uint8_t        guardWidthBits,
+                         std::string_view    mnemonic,
+                         DiagnosticReporter& reporter) {
+    using dss::report;
+    std::uint8_t const fieldBits = immediateFieldBits(slot);
+    if (fieldBits == 0) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': slot '{}' is not an appended "
+                           "immediate field — no immediate window is "
+                           "declared for it",
+                           mnemonic, encodingSlotKindName(slot)));
+        return std::nullopt;
+    }
+    bool const narrowing =
+        fieldCarriesWholeOperationValue(fieldBits, guardWidthBits);
+    std::uint64_t const mask = (fieldBits >= 64)
+        ? ~std::uint64_t{0}
+        : ((std::uint64_t{1} << fieldBits) - 1);
+    std::uint64_t const bits = static_cast<std::uint64_t>(v) & mask;
+    if (immediateFitsFieldWindow(v, fieldBits, narrowing)) return bits;
+
+    if (!narrowing) {
+        report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': immediate {} does not fit the "
+                           "{}-bit '{}' field, and that field is a fixed "
+                           "parameter of a {} operation rather than the "
+                           "operation's own value — narrowing it would "
+                           "change the instruction's meaning, so it is "
+                           "refused",
+                           mnemonic, v, fieldBits,
+                           encodingSlotKindName(slot),
+                           guardWidthBits == 0
+                               ? std::string{"width-unconstrained"}
+                               : std::format("{}-bit", guardWidthBits)));
+        return std::nullopt;
+    }
+
+    report(reporter, DiagnosticCode::A_ImmediateNarrowedToOperandField,
+           DiagnosticSeverity::Warning,
+           std::format("opcode '{}': immediate {} narrowed to {} — it does "
+                       "not fit the {}-bit operand field, so the {} "
+                       "low-order bits are emitted and the instruction "
+                       "carries a different constant than the one written. "
+                       "GNU as narrows here too (silently, on the negative "
+                       "side); write the value that fits, or use the wider "
+                       "form of this instruction",
+                       mnemonic, v, static_cast<std::int64_t>(bits),
+                       fieldBits, fieldBits));
+    return bits;
+}
 
 } // namespace dss::walker_util

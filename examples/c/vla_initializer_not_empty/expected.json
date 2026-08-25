@@ -1,0 +1,11 @@
+{
+  "$comment": "D-CSUBSET-VLA-INITIALIZER (C23 6.7.10p4) — a variably modified object with a NON-EMPTY initializer is a constraint violation, refused with S_VlaInitializerNotEmpty (S0071). All three references refuse it (gcc 13.3.0, clang 19.1.1, clang 18.1.3 — MEASURED 2026-08-25, both -std=gnu17 and -std=c2x). Before this cycle DSS ACCEPTED it at a compile-time sizeof of 12, silently discarding the written `argc` bound. The diagnostic carries a real span at the INITIALIZER, which is the token the programmer must change. The load-bearing pin is the CODE plus a REJECTED compile: a regression that re-merged the flexible-array and init-inference signals compiles this clean, and the example goes red with no diagnostic at all.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "S_VlaInitializerNotEmpty", "line": 19, "col": 19, "positioned": true }
+  ]
+}

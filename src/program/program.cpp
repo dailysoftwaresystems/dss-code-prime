@@ -1908,19 +1908,23 @@ struct CuBuildKey {
     while (!pending.empty()) {
         std::string const rel = std::move(pending.back());
         pending.pop_back();
-        auto const resolved = dss::ffi::resolveShippedSourcePath(rel);
-        if (!resolved) {
+        auto const resolved = dss::ffi::resolveShippedSource(rel);
+        if (!resolved.resolved()) {
             // R1's descriptor-read-time refusal owns the diagnostic and has
             // already fired by the time we get here (the semantic phase read the
             // descriptor). This arm exists so a discovery failure cannot silently
             // drop a body: it says so, in the driver's own voice.
-            emitDriver(rep, DiagnosticCode::D_FileNotFound,
+            // ★ THE CODE FOLLOWS THE FINDING, because `D_FileNotFound` is itself
+            // a claim. An I/O failure is not a missing file, and reporting one as
+            // the other is what sent a reader hunting for `unistd.c` while it sat
+            // in place (✔MEASURED 2026-08-25 under concurrent gate load).
+            emitDriver(rep,
+                       dss::ffi::diagnosticCodeForShippedSourceLookup(resolved),
                        "shipped-source realization: a descriptor this build "
                        "resolved names '" + rel
-                       + "' for object format '" + formatKey
-                       + "', but no readable file is there (resolved against "
-                         "src/dss-config/) — the program would link against a "
-                         "symbol with no body");
+                       + "' for object format '" + formatKey + "', but "
+                       + dss::ffi::describeShippedSourceLookup(resolved, rel)
+                       + " — the program would link against a symbol with no body");
             continue;
         }
         // ★ THE LANGUAGE COMES FROM THE EXTENSION, through the SAME mechanism
@@ -1931,7 +1935,8 @@ struct CuBuildKey {
         // than picking — that ambiguity is a real future fork for a hand-written
         // assembly runtime unit, and it needs the ARCH rather than the language,
         // so it is refused here instead of guessed.
-        auto const langGrammar = resolveShippedSourceGrammar(*resolved, grammarCache, rep);
+        auto const langGrammar =
+            resolveShippedSourceGrammar(resolved.path, grammarCache, rep);
         if (!langGrammar) continue;
 
         CompilationUnit cu = substrate::callOnLargeStack(
@@ -1944,7 +1949,7 @@ struct CuBuildKey {
                     {targetPredefines.begin(), targetPredefines.end()});
                 builder.setFormatPredefinedMacros(
                     {formatPredefines.begin(), formatPredefines.end()});
-                builder.addFile(*resolved);
+                builder.addFile(resolved.path);
                 return std::move(builder).finish();
             });
         // ★★★ A RUNTIME UNIT THAT DOES NOT COMPILE FAILS THE BUILD *HERE*,

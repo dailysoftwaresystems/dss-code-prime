@@ -2205,13 +2205,14 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     // as a bare "file not found": the message names BOTH sides,
                     // because either half alone leaves the reader guessing which
                     // one is wrong.
-                    if (!resolveShippedSourcePath(src).has_value()) {
+                    if (auto const look = resolveShippedSource(src);
+                        !look.resolved()) {
                         emitMalformed(reporter,
                             "shipped-lib descriptor '" + path.generic_string() + "' "
                             + ctx + " declares a shipped-source realization naming '"
-                            + src + "' for the object format '" + fmt
-                            + "', but no readable file exists there (resolved "
-                              "against src/dss-config/) — that format would carry a "
+                            + src + "' for the object format '" + fmt + "', but "
+                            + describeShippedSourceLookup(look, src)
+                            + " — that format would carry a "
                               "DECLARED symbol with no body "
                               "(D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R1)");
                     }
@@ -3658,16 +3659,78 @@ std::optional<std::filesystem::path> findShippedConfigRootDir() {
     return findShippedConfigDir("");
 }
 
-std::optional<std::filesystem::path>
-resolveShippedSourcePath(std::string_view configRelativePath) {
-    auto const root = findShippedConfigRootDir();
-    if (!root) return std::nullopt;
-    std::filesystem::path const p =
-        (*root / std::filesystem::path{std::string{configRelativePath}})
-            .lexically_normal();
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(p, ec)) return std::nullopt;
-    return p;
+ShippedSourceLookup
+resolveShippedSource(std::string_view configRelativePath) {
+    ShippedSourceLookup out;
+    auto const          root = findShippedConfigRootDir();
+    if (!root) {
+        out.status = ShippedSourceResolution::NoConfigRoot;
+        return out;
+    }
+    out.path = (*root / std::filesystem::path{std::string{configRelativePath}})
+                   .lexically_normal();
+    // ★ `status()` RATHER THAN `is_regular_file()`, and the difference is the whole
+    // repair: the predicate form answers false for "absent" and for "I could not
+    // look" alike. `status()` reports `not_found` for a clean absence and sets `ec`
+    // when the query itself failed, so the two stop being one answer.
+    // ⚠ Keyed on the returned TYPE rather than on `ec` alone, because
+    // implementations differ over whether a clean not-found also clears `ec`; the
+    // type is unambiguous on every platform this ships to.
+    std::error_code          ec;
+    std::filesystem::file_status const st = std::filesystem::status(out.path, ec);
+    if (st.type() == std::filesystem::file_type::not_found) {
+        out.status = ShippedSourceResolution::NotPresent;
+        return out;
+    }
+    if (ec || st.type() == std::filesystem::file_type::none) {
+        out.status = ShippedSourceResolution::QueryFailed;
+        out.error  = ec;
+        return out;
+    }
+    out.status = std::filesystem::is_regular_file(st)
+                     ? ShippedSourceResolution::Resolved
+                     : ShippedSourceResolution::NotAFile;
+    return out;
+}
+
+DiagnosticCode
+diagnosticCodeForShippedSourceLookup(ShippedSourceLookup const& lookup) {
+    // ★ ONLY QueryFailed earns the read-failure code. NoConfigRoot, NotPresent and
+    // NotAFile are all statements that the body is genuinely not there, which is what
+    // `D_FileNotFound` has always meant; QueryFailed is the one outcome where the
+    // filesystem never answered, and reporting THAT as not-found is the defect.
+    return lookup.status == ShippedSourceResolution::QueryFailed
+               ? DiagnosticCode::D_FileReadFailed
+               : DiagnosticCode::D_FileNotFound;
+}
+
+std::string
+describeShippedSourceLookup(ShippedSourceLookup const& lookup,
+                            std::string_view           configRelativePath) {
+    switch (lookup.status) {
+    case ShippedSourceResolution::Resolved:
+        return "resolved to '" + lookup.path.generic_string() + "'";
+    case ShippedSourceResolution::NoConfigRoot:
+        return "the shipped-config root (src/dss-config/) was not found from here — "
+               "that is a statement about this ENVIRONMENT, not about the descriptor, "
+               "and '"
+               + std::string{configRelativePath} + "' was never looked for";
+    case ShippedSourceResolution::NotPresent:
+        return "no file exists at '" + lookup.path.generic_string()
+               + "' (resolved against src/dss-config/)";
+    case ShippedSourceResolution::NotAFile:
+        return "'" + lookup.path.generic_string()
+               + "' exists but is not a regular file";
+    case ShippedSourceResolution::QueryFailed:
+        break;
+    }
+    // ★ THE ARM THIS WHOLE TYPE EXISTS FOR. Say what happened and explicitly refuse
+    // to claim absence: the file is very often right there, held by antivirus, a
+    // network share, or another process mid-write.
+    return "'" + lookup.path.generic_string()
+           + "' could not be examined (" + lookup.error.message()
+           + ") — this is an I/O failure, NOT a missing file; the body may well be "
+             "present. Retry before treating it as absent";
 }
 
 std::vector<std::string>
@@ -3733,16 +3796,16 @@ bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
     // than a partial one that assumes every descriptor has been read.
     std::unordered_set<core::PathIdentity> claimedPaths;
     for (auto const& c : claims) {
-        auto const resolved = resolveShippedSourcePath(c.source);
-        if (resolved) {
-            claimedPaths.insert(core::PathIdentity::of(*resolved));
+        auto const look = resolveShippedSource(c.source);
+        if (look.resolved()) {
+            claimedPaths.insert(core::PathIdentity::of(look.path));
             continue;
         }
         emitMalformed(reporter,
             "shipped-lib descriptor '" + c.where + "." + c.format
             + "' declares a shipped-source realization naming '" + c.source
-            + "', but no readable file exists there (resolved against "
-              "src/dss-config/) — the object format '" + c.format
+            + "', but " + describeShippedSourceLookup(look, c.source)
+            + " — the object format '" + c.format
             + "' would be left with a DECLARED symbol and no body "
               "(D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R1)");
     }

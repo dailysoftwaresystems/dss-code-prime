@@ -472,18 +472,17 @@ TEST(ShippedRuntimeCompiles, EveryDeclaredRealizationSourceCompilesForItsFormat)
                "compiled and would be silently skipped by a weaker gate.";
         if (machines.empty()) continue;
 
-        auto const resolved = dss::ffi::resolveShippedSourcePath(unit.source);
-        EXPECT_TRUE(resolved.has_value())
+        auto const resolved = dss::ffi::resolveShippedSource(unit.source);
+        EXPECT_TRUE(resolved.resolved())
             << "SHIPPED RUNTIME COMPILE GATE [unit " << (index + 1) << " of "
             << units.size() << "]: descriptor " << joined(unit.descriptors)
             << " declares realization." << unit.formatKey << ".source = '"
-            << unit.source
-            << "', but no readable file is there (resolved against "
-               "src/dss-config/) — the format would carry a DECLARED symbol "
-               "with no body.";
-        if (!resolved) continue;
+            << unit.source << "', but "
+            << dss::ffi::describeShippedSourceLookup(resolved, unit.source)
+            << " — the format would carry a DECLARED symbol with no body.";
+        if (!resolved.resolved()) continue;
 
-        auto const language = languageClaiming(*resolved);
+        auto const language = languageClaiming(resolved.path);
         if (!language) continue;   // languageClaiming already ADD_FAILURE'd
 
         bool attemptedThisUnit = false;
@@ -516,7 +515,7 @@ TEST(ShippedRuntimeCompiles, EveryDeclaredRealizationSourceCompilesForItsFormat)
                 program.setCompileConfig(config);
                 DiagnosticReporter rep;
                 int const rc = program.compileFiles(
-                    std::vector<std::string>{resolved->string()}, *language,
+                    std::vector<std::string>{resolved.path.string()}, *language,
                     std::vector<std::string>{spec}, rep);
 
                 bool const compiled = (rc == 0) && !rep.hasErrors();
@@ -551,7 +550,7 @@ TEST(ShippedRuntimeCompiles, EveryDeclaredRealizationSourceCompilesForItsFormat)
                     << head << "the archive sibling schema failed to load";
                 if (!siblingSchema) continue;
                 fs::path const artifact =
-                    outDir / (resolved->stem().generic_string()
+                    outDir / (resolved.path.stem().generic_string()
                               + std::string{parsed->outputExtension(**siblingSchema)});
 
                 std::error_code statEc;

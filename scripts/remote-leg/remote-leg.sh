@@ -34,6 +34,14 @@
 # It holds the private keys for these very carriages; pushing it would copy the macOS
 # key onto the VPS and vice versa. An exclude here is the only thing preventing that.
 #
+# ★★ `/.claude/worktrees` IS EXCLUDED, AND IT IS THE LARGEST ONE. An agent worktree is
+# a FULL COPY OF THE REPO -- ✔MEASURED 2026-08-25 on the macOS host, 9,638 files across
+# the live worktrees, pushed on every leg. A gate host must never hold one: the examples
+# runner GLOBS `examples/<lang>/*`, so a worktree's own `examples/` tree is visible to a
+# suite that has no idea it is looking at somebody's uncommitted lane. ⓘ rsync's
+# `--delete` means this host never ACCUMULATED the way the tar-transported Mac did, so
+# this exclude is about transport cost and glob hygiene rather than about staleness.
+#
 # ⚠ EVERY EXCLUDE IS ANCHORED (`/build`, not `build`). An unanchored `build*` once
 # silently skipped `src/program/build_scripts.cpp` and a leg was configured against a
 # tree missing a changed `.cpp`.
@@ -170,14 +178,12 @@ printf 'remote : %s\n' "$remote_uname"
 # `sysctl -n hw.ncpu` (BSD-only): ✔MEASURED to answer on BOTH carriages, which
 # is the whole reason a carriage table can stay one row per host.
 if [[ -z "$JOBS" ]]; then
-    JOBS=$(carriage "getconf _NPROCESSORS_ONLN" 2>&1 | tail -1 | tr -dc '0-9')
-    # A probe that cannot answer is NOT silently treated as "run serially" --
-    # that is the exact failure this block exists to end. Fall back to a level
-    # every host can sustain and SAY that the probe failed.
-    if [[ -z "$JOBS" || "$JOBS" -lt 1 ]]; then
-        printf '⚠ could not read the remote core count; falling back to -j 4\n'
-        JOBS=4
-    fi
+    # ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
+    # ⚠ THE CORE-COUNT PROBE IS GONE, DELIBERATELY. It answered "how many cores exist",
+    # which is the wrong question -- the right one is "how many may this process take",
+    # and the operator has answered it. Probing also made the level DIFFER per host
+    # (macOS 10, VPS 4), so a leg was never comparable to another leg.
+    JOBS="${DSS_JOBS:-6}"
 fi
 printf 'jobs   : %s (ctest -j)\n' "$JOBS"
 
@@ -237,6 +243,7 @@ if [[ "$MODE" != "test-only" ]]; then
         --exclude='/build' --exclude='/build-*' --exclude='/target' \
         --exclude='/.dss-deps' --exclude='/scratchpad' --exclude='/Testing' \
         --exclude='/test-scratch' \
+        --exclude='/.claude/worktrees' \
         "$REPO_ROOT/" "$REMOTE_DIR" \
         || die "rsync failed (rc=$?)"
 
@@ -258,12 +265,41 @@ fi
 # MTIMES, so an incremental build over a pushed tree can silently skip the very
 # file the leg exists to exercise.
 BUILD="build/dbg"
+
+# ★★ ccache — THE CLEAN BUILD IS CORRECT AND ONLY ITS COST WAS EVER THE PROBLEM.
+# `rm -rf $BUILD` above stays: a synced tree carries the SOURCE's mtimes, so an
+# incremental ninja can silently skip the very file the leg exists to exercise
+# (D-SYNC-RSYNC-PRESERVED-MTIME-DEFEATS-THE-REBUILD). ccache removes the cost
+# WITHOUT trusting an mtime, because it keys on CONTENT — the object cache
+# survives `rm -rf $BUILD`, so an unchanged TU is a cache hit rather than a
+# recompile, and correctness is unchanged.
+#
+# ⚠ ✔MEASURED 2026-08-25 (cycle P34): ccache was ALREADY INSTALLED on the arm64
+# VPS at /usr/bin/ccache and this script contained ZERO references to it, so
+# every leg run rebuilt ~504 translation units on 4 Neoverse-N1 cores from
+# scratch. The cache was sitting there unused.
+# D-SCRIPT-REMOTE-LEG-REBUILT-FROM-SCRATCH-WITH-AN-INSTALLED-CCACHE-UNUSED
+#
+# ★ PROBED IN ITS OWN ROUND TRIP rather than inline in the configure command:
+# the configure line is already ONE ssh argument with its own quoting rules, and
+# a `$(command -v ...)` folded into it would be expanded on the WRONG side. The
+# `grep -E "^/"` keeps a login banner from being mistaken for a path.
+CACHE_ARGS=""
+REMOTE_CCACHE=$(carriage "command -v ccache 2>/dev/null || true" 2>/dev/null | tr -d '\r' | grep -E '^/' | tail -1)
+if [[ -n "$REMOTE_CCACHE" ]]; then
+    printf 'ccache : %s (on %s)\n' "$REMOTE_CCACHE" "$CARRIAGE"
+    CACHE_ARGS=" -DCMAKE_C_COMPILER_LAUNCHER=$REMOTE_CCACHE"
+    CACHE_ARGS="$CACHE_ARGS -DCMAKE_CXX_COMPILER_LAUNCHER=$REMOTE_CCACHE"
+else
+    printf 'ccache : ABSENT on %s -- this leg recompiles every TU from scratch.\n' "$CARRIAGE"
+    printf '         One line on that host:  sudo apt-get install -y ccache\n'
+fi
 if [[ "$MODE" == "full" ]]; then
     say "clean configure + build ($BUILD) on $CARRIAGE"
     # ONE argument: see the ssh-quoting note in the header.
-    carriage "${REMOTE_ENV}cd $REMOTE_DIR && rm -rf $BUILD && cmake -S . -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Debug -DDSS_BUILD_TESTS=ON > /tmp/remote-leg-configure.log 2>&1 || { tail -25 /tmp/remote-leg-configure.log; exit 20; }" \
+    carriage "${REMOTE_ENV}cd $REMOTE_DIR && rm -rf $BUILD && cmake -S . -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Debug -DDSS_BUILD_TESTS=ON$CACHE_ARGS > /tmp/remote-leg-configure.log 2>&1 || { tail -25 /tmp/remote-leg-configure.log; exit 20; }" \
         || die "configure failed on $CARRIAGE (rc=$?)"
-    carriage "${REMOTE_ENV}cd $REMOTE_DIR && cmake --build $BUILD > /tmp/remote-leg-build.log 2>&1 || { tail -30 /tmp/remote-leg-build.log; exit 21; }; tail -1 /tmp/remote-leg-build.log" \
+    carriage "${REMOTE_ENV}cd $REMOTE_DIR && cmake --build $BUILD --parallel ${DSS_JOBS:-6} > /tmp/remote-leg-build.log 2>&1 || { tail -30 /tmp/remote-leg-build.log; exit 21; }; tail -1 /tmp/remote-leg-build.log" \
         || die "build failed on $CARRIAGE (rc=$?)"
 fi
 
@@ -273,6 +309,10 @@ LOG="build/remote-leg-$CARRIAGE.log"
 ctest_cmd="${REMOTE_ENV}cd $REMOTE_DIR && ctest --test-dir $BUILD --output-on-failure"
 [[ -n "$JOBS"   ]] && ctest_cmd="$ctest_cmd -j $JOBS"
 [[ -n "$FILTER" ]] && ctest_cmd="$ctest_cmd -R '$FILTER'"
+# ★★ THE REPO GUARDS ARE SKIPPED, by operator ruling 2026-08-25: every carriage this script
+# drives is an INDIRECT leg. A guard checks the SOURCE TREE, and the tree was pushed FROM the
+# root host, which already checked it. `DSS_LEG_GUARDS=1` restores them.
+[[ "${DSS_LEG_GUARDS:-0}" == "1" ]] || ctest_cmd="$ctest_cmd -LE repo-guard"
 
 # ★ The witness is TOOL-EMITTED (ctest's own summary line), never a string this
 # script writes -- run-gate REFUSES a caller-authored witness for that reason.

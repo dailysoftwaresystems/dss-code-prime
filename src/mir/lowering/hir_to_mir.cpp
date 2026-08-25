@@ -5075,17 +5075,8 @@ struct Lowerer {
         // Effective alignment from the BASE element (the VLA levels have no static
         // layout) + any `alignas` override on the decl. 0 = "no info". Mirrors the
         // fixed path's payload2 channel; the PRIMARY payload stays 0 (runtime-sized).
-        std::uint32_t effectiveAlign = 0;
-        if (config.aggregateLayoutLoaded && baseElemTy.valid())
-            if (auto const lay = computeLayout(baseElemTy, interner,
-                                               config.aggregateLayout,
-                                               config.dataModel);
-                lay.has_value())
-                effectiveAlign = lay->align.bytes();
-        if (alignmentMap != nullptr && anchor.valid())
-            if (auto const* p = alignmentMap->tryGet(anchor);
-                p != nullptr && p->alignmentBytes > effectiveAlign)
-                effectiveAlign = p->alignmentBytes;
+        std::uint32_t const effectiveAlign =
+            vlaEffectiveAlign(baseElemTy, anchor);
         std::array<MirInstId, 1> aops{bytes};
         MirInstId const a =
             mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
@@ -5169,16 +5160,7 @@ struct Lowerer {
         // Effective alignment from the BASE element (`walk` = the innermost non-array
         // element) + any `alignas` override — mirror `vlaAllocaForLocal` (the VLA levels
         // have no static layout; the PRIMARY payload stays 0 = runtime-sized).
-        std::uint32_t effectiveAlign = 0;
-        if (config.aggregateLayoutLoaded && walk.valid())
-            if (auto const lay = computeLayout(walk, interner, config.aggregateLayout,
-                                               config.dataModel);
-                lay.has_value())
-                effectiveAlign = lay->align.bytes();
-        if (alignmentMap != nullptr && anchor.valid())
-            if (auto const* p = alignmentMap->tryGet(anchor);
-                p != nullptr && p->alignmentBytes > effectiveAlign)
-                effectiveAlign = p->alignmentBytes;
+        std::uint32_t const effectiveAlign = vlaEffectiveAlign(walk, anchor);
         std::array<MirInstId, 1> aops{total};
         MirInstId const av =
             mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
@@ -6798,6 +6780,151 @@ struct Lowerer {
             MirInstId const z = constIntOfType(0, chunkTy);
             if (!z.valid()) return false;
             std::array<MirInstId, 2> st{z, dp};
+            mir.addInst(MirOpcode::Store, st, InvalidType, /*payload=*/0, vf);
+            return true;
+        });
+    }
+
+    // ── ONE derivation of a VLA object's BASE ELEMENT and its EFFECTIVE ALIGNMENT ──
+    // Peel the array levels (a `vlaArray` is a `TypeKind::Array` carrying the
+    // `kVlaLength` scalar, so one loop covers fixed and runtime levels alike) down
+    // to the innermost non-array element. The VLA levels have no static layout, so
+    // the base element is the only thing that CAN answer "how is this object
+    // aligned"; an `alignas` on the declaration then raises it.
+    //   ★ FACTORED, NOT ADDED: `vlaAllocaForLocal` and `vlaAllocaFromTypedef` each
+    // carried a byte-identical copy of the alignment ladder, and P34 needed a THIRD
+    // reader for the zero-fill's chunk width. Three copies of "how wide may I store
+    // into this object" is how a fill and an allocation come to disagree; one
+    // function is how they cannot.
+    [[nodiscard]] TypeId vlaBaseElementType(TypeId t) const {
+        TypeId cur = t;
+        for (int guard = 0;
+             guard < 64 && cur.valid() && interner.kind(cur) == TypeKind::Array;
+             ++guard) {
+            auto const ops = interner.operands(cur);
+            if (ops.empty() || !ops[0].valid()) break;
+            cur = ops[0];
+        }
+        return cur;
+    }
+
+    [[nodiscard]] std::uint32_t vlaEffectiveAlign(TypeId baseElemTy,
+                                                  HirNodeId anchor) {
+        std::uint32_t effectiveAlign = 0;   // 0 = "no info"
+        if (config.aggregateLayoutLoaded && baseElemTy.valid())
+            if (auto const lay = computeLayout(baseElemTy, interner,
+                                               config.aggregateLayout,
+                                               config.dataModel);
+                lay.has_value())
+                effectiveAlign = lay->align.bytes();
+        if (alignmentMap != nullptr && anchor.valid())
+            if (auto const* p = alignmentMap->tryGet(anchor);
+                p != nullptr && p->alignmentBytes > effectiveAlign)
+                effectiveAlign = p->alignmentBytes;
+        return effectiveAlign;
+    }
+
+    // ★★ D-CSUBSET-VLA-INITIALIZER (C23 §6.7.10p4: "An entity of variable length
+    // array type shall not be initialized except by an empty initializer") — the
+    // RUNTIME-SIZED twin of `lowerByteWiseZeroFill`. That helper walks a
+    // COMPILE-TIME byte count; a VLA has none, so this one loops over the object's
+    // real size at run time through `emitLimbLoopN` (the same runtime-count loop
+    // the wide-multiply inner loop uses), one `Char` store per byte.
+    //
+    // ★ THE ZEROING IS AN OBLIGATION, NOT AN OPTIMISATION. ✔MEASURED 2026-08-25:
+    // gcc 13.3.0 and clang 19.1.1 BOTH zero the object — a 16-element VLA declared
+    // `int a[n] = {};` in a frame deliberately dirtied with 0x5A5A5A5A beforehand
+    // sums to 0 under each. Skipping the fill would compile the same program to a
+    // garbage read, which is exactly the silent miscompile the semantic tier's
+    // accept arm was landed on the promise of avoiding.
+    //
+    // The byte count comes from the SAME side table `sizeof a` and `a[i]` read —
+    // `vlaStrideSlot` keyed by (symbol, level-0 type), the whole-object slot
+    // `computeVlaByteSize` froze when the dynamic alloca was emitted. Reusing it
+    // rather than recomputing is what keeps the fill, the allocation and `sizeof`
+    // agreeing on one number by construction. An ABSENT slot is an internal
+    // desync: fail LOUD (never a partial or zero-length fill of a live object).
+    [[nodiscard]] bool lowerVlaZeroFill(HirNodeId anchor, SymbolId sym, TypeId ty,
+                                        MirInstId dstPtr, MirInstFlags vf) {
+        auto const it = vlaStrideSlot.find(vlaSlotKey(sym.v, ty.v));
+        if (it == vlaStrideSlot.end()) {
+            unsupported(anchor, "empty-initializing a variable length array found no "
+                                "whole-object runtime size slot (internal side-table "
+                                "desync)");
+            return false;
+        }
+        std::array<MirInstId, 1> ld{it->second};
+        MirInstId const bytes = mir.addInst(MirOpcode::Load, ld, i64Ty());
+        if (!bytes.valid()) return false;
+        // ★ WIDE CHUNKS THEN A BYTE TAIL — the runtime shape of what
+        // `walkByteChunks` does for a compile-time size. A byte-at-a-time loop
+        // would be correct and would also be an 8x-slower `memset` on every VLA in
+        // the program, which is a workaround wearing a correct answer's clothes.
+        //
+        // ★★ THE CHUNK WIDTH IS THE OBJECT'S OWN ALIGNMENT, THROUGH THE SAME
+        // `vlaEffectiveAlign` THE ALLOCA USED — the fill and the allocation read
+        // one function, so they cannot disagree about how this object is aligned.
+        // ⚠ It is NOT safe to assume 8: a `char a[n]` slot is 1-aligned and an
+        // `int a[n]` slot is 4-aligned, so a blanket I64 store would be an
+        // unaligned access on every target that has an opinion about it. An
+        // alignment the layout engine could not compute arrives as 0, which lands
+        // in the byte arm — the conservative direction.
+        std::uint32_t const objAlign =
+            vlaEffectiveAlign(vlaBaseElementType(ty), anchor);
+        TypeKind const chunkKind = (objAlign >= 8) ? TypeKind::I64
+                                : (objAlign >= 4) ? TypeKind::I32
+                                                  : TypeKind::Char;
+        std::int64_t const chunkShift = (chunkKind == TypeKind::I64) ? 3
+                                      : (chunkKind == TypeKind::I32) ? 2 : 0;
+        TypeId const chunkTy  = interner.primitive(chunkKind);
+        TypeId const chunkPtr = interner.pointer(chunkTy);
+        MirInstId const zChunk = constIntOfType(0, chunkTy);
+        if (!zChunk.valid()) return false;
+        // `n >> k` and `n & (2^k - 1)` rather than a divide: the loaded size is the
+        // BYTE COUNT of a live object — the same value the dynamic alloca just
+        // reserved — so it is non-negative by construction, and the shift/mask pair
+        // is exact over that range. `LShr` (logical) states the non-negativity
+        // rather than leaning on the sign bit being clear.
+        MirInstId const chunks =
+            (chunkShift == 0) ? bytes
+                              : i64bin(MirOpcode::LShr, bytes, ci64(chunkShift));
+        if (!chunks.valid()) return false;
+        // A runtime Gep offset is the ordinary array-index shape
+        // (`combineIndexAddr` passes a Mul'd runtime stride the same way).
+        bool const wide = emitLimbLoopN(chunks, [&](MirInstId iv) -> bool {
+            MirInstId const off =
+                (chunkShift == 0) ? iv
+                                  : i64bin(MirOpcode::Shl, iv, ci64(chunkShift));
+            if (!off.valid()) return false;
+            std::array<MirInstId, 2> g{dstPtr, off};
+            MirInstId const dp = mir.addInst(MirOpcode::Gep, g, chunkPtr);
+            if (!dp.valid()) return false;
+            std::array<MirInstId, 2> st{zChunk, dp};
+            mir.addInst(MirOpcode::Store, st, InvalidType, /*payload=*/0, vf);
+            return true;
+        });
+        if (!wide) return false;
+        if (chunkShift == 0) return true;   // byte arm already wrote every byte
+        // The 0..(2^k - 1)-byte tail. `emitLimbLoopN` guards with
+        // `ICmpSlt(i, count)`, so a ZERO remainder runs the body zero times — no
+        // compile-time special case, and no branch of this lowering that can leave
+        // bytes unwritten.
+        std::int64_t const tailMask = (std::int64_t{1} << chunkShift) - 1;
+        MirInstId const tailCount = i64bin(MirOpcode::And, bytes, ci64(tailMask));
+        if (!tailCount.valid()) return false;
+        MirInstId const tailBase = i64bin(MirOpcode::Shl, chunks, ci64(chunkShift));
+        if (!tailBase.valid()) return false;
+        TypeId const byteTy  = interner.primitive(TypeKind::Char);
+        TypeId const bytePtr = interner.pointer(byteTy);
+        MirInstId const zByte = constIntOfType(0, byteTy);
+        if (!zByte.valid()) return false;
+        return emitLimbLoopN(tailCount, [&](MirInstId iv) -> bool {
+            MirInstId const off = i64bin(MirOpcode::Add, tailBase, iv);
+            if (!off.valid()) return false;
+            std::array<MirInstId, 2> g{dstPtr, off};
+            MirInstId const dp = mir.addInst(MirOpcode::Gep, g, bytePtr);
+            if (!dp.valid()) return false;
+            std::array<MirInstId, 2> st{zByte, dp};
             mir.addInst(MirOpcode::Store, st, InvalidType, /*payload=*/0, vf);
             return true;
         });
@@ -10926,7 +11053,33 @@ struct Lowerer {
                     // VarDecl object annotation (c21) — flag every init Store.
                     MirInstFlags const initVf =
                         volatileFlagFor(node) | volatileFlagForType(ty);
-                    if (hir.kind(*initN) == HirKind::ConstructAggregate
+                    // ★★ D-CSUBSET-VLA-INITIALIZER (C23 6.7.10p4) — CHECKED FIRST,
+                    // AND KEYED ON THE TYPE RATHER THAN ON THE HIR SHAPE. The
+                    // semantic tier refuses every VLA initializer except the empty
+                    // one, so the ONLY thing that can arrive here is the `{}` the
+                    // HIR lowered to an empty `ConstructAggregate` typed as the VLA
+                    // — and an empty ConstructAggregate falling into the ordinary
+                    // array arm below would iterate ZERO children and emit NOTHING,
+                    // leaving a live object uninitialized where C23 promises zeros.
+                    // Matching the TYPE means that silent path is unreachable by
+                    // construction instead of by the semantic tier's good behaviour.
+                    // The predicate is the SAME one that routed the dynamic alloca a
+                    // few lines up (a ptr-to-VLA is deliberately not matched by
+                    // either — it is a fixed 8-byte slot with an ordinary store).
+                    // Anything else on a VLA is an internal invariant break: fail
+                    // LOUD rather than lower a wrong object.
+                    if (interner.isVlaArray(ty) || interner.typeContainsVla(ty)) {
+                        if (hir.kind(*initN) != HirKind::ConstructAggregate
+                            || !hir.children(*initN).empty()) {
+                            unsupported(*initN,
+                                "an object of variable length array type may be "
+                                "initialized only by the empty initializer `{}` "
+                                "(C23 6.7.10p4)");
+                            return false;
+                        }
+                        if (!lowerVlaZeroFill(node, sym, ty, alloca, initVf))
+                            return false;
+                    } else if (hir.kind(*initN) == HirKind::ConstructAggregate
                         && (initKind == TypeKind::Struct
                             || initKind == TypeKind::Union)) {
                         if (!lowerAggregateInitIntoSlot(*initN, alloca, ty, initVf))

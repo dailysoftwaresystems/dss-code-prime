@@ -71,6 +71,7 @@ python scripts/check-scripts-index/check-scripts-index.py --write
 | **`examples-census`** | `examples-census.py` | re-derive every corpus-manifest figure examples/README.md states, by parsing the manifests. |
 | **`local-build`** | `local-build.ps1`, `local-build.sh` | build dsscp incrementally on this host, and optionally run ctest. |
 | **`macho-alias-ld64-matrix`** | `macho-alias-ld64-matrix.remote.sh`, `macho-alias-ld64-matrix.sh` | measure what Apple's ld64 does with a SECOND defined symbol at the same address as a canonical one, with and without -dead_strip. |
+| **`macos-leg`** | `macos-leg.ps1`, `macos-leg.sh` | run a DSS gate leg on the operator's macOS host -- push the tree, build clean, run ctest. |
 | **`pragma-profile-census`** | `pragma-profile-census.ps1`, `pragma-profile-census.py`, `pragma-profile-census.sh` | census `#pragma` usage across the corpus and hold the profile to its expected shape. |
 | **`profile-compile`** | `profile-compile-dispatch.sh`, `profile-compile-support.py`, `profile-compile.sh` | compile one fixed subject with a RELEASE dsscp on this host and report where the time went, so the HOST is the only variable across legs. |
 | **`refresh_landing_log`** | `refresh_landing_log.py`, `test_refresh_landing_log.py` | regenerate the PR landing-log hash anchors in the plans from git log. |

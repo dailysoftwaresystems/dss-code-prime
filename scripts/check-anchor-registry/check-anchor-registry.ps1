@@ -5,7 +5,7 @@
 # Contract: every `D-*` identifier cited in a SCANNED ROOT (`src/`, `examples/`,
 # `tests/`, `integrated_tests/`, `real-examples/`, `scripts/`, `.claude/` - see
 # the roots table below)
-# MUST resolve to a row in `.plans/_deferred-anchor-registry.md` OR a citation
+# MUST resolve to a row in `.plans/_deferred-anchor-registry*.md` OR a citation
 # in any `.plans/*.md` file.
 #
 # Exit codes, matching the `.sh` exactly: 0 clean · 1 an anchor resolves nowhere ·
@@ -62,8 +62,31 @@ $AnchorRegex = '\b' + $AnchorCore
 # The cell-width half of this file already passes `-Force` for `.plans/`, and the
 # two halves disagreeing about how to walk a dotted root is exactly the kind of
 # drift `D-GATE-SCRIPT-PS1-CONTENT-DRIFT-UNCHECKED` is open about.
+# ⚠ A GIT WORKTREE IS ANOTHER CHECKOUT OF THIS SAME REPO. An agent creates one
+# under `.claude/worktrees/`, so the `.claude` root gets walked TWICE and every
+# document faces its own duplicate. ✔MEASURED 2026-08-25: that produced six false
+# "a quotation declaration LEAKED" failures -- each file accusing its own copy of
+# exempting a name on its behalf -- on a tree that was entirely correct. The guard
+# went red because a TOOL was running, which is the worst kind of false red: it
+# trains a reader to disbelieve the guard.
+# ★ Not a new judgement call. `.gitignore` calls these "throwaway checkouts an agent
+# creates for an isolated build", and `check-plan-citations` already prunes
+# `worktrees` as "another checkout". This brings the anchor guard in line.
+# ★★ ONE FUNCTION, FOUR CALLERS. PowerShell has no `--exclude-dir` -- `-Exclude`
+# filters NAMES and does not prune recursion -- so the filter runs on the RESULT, by
+# path SEGMENT (never a substring: a directory legitimately named `my-worktrees-notes`
+# must not vanish). The `.sh` twin has the same single owner in `_root_include_args`;
+# adding this per call site would leave whichever site is added next as the hole.
+$ScanExcludeDirs = @('worktrees', '__pycache__', '.git')
+function Select-ScannableFile($Items) {
+    return @($Items | Where-Object {
+        $segs = ($_.FullName -replace '\\', '/') -split '/'
+        -not ($segs | Where-Object { $ScanExcludeDirs -contains $_ })
+    })
+}
+
 function Get-Anchors([string]$Path, [string[]]$Filters) {
-    $files = Get-ChildItem -Path $Path -Recurse -File -Force -Include $Filters -ErrorAction SilentlyContinue
+    $files = Select-ScannableFile @(Get-ChildItem -Path $Path -Recurse -File -Force -Include $Filters -ErrorAction SilentlyContinue)
     $anchors = @{}
     foreach ($f in $files) {
         $content = Get-Content -Raw -LiteralPath $f.FullName -ErrorAction SilentlyContinue
@@ -719,8 +742,8 @@ if ($scanFailed) { exit 2 }
 $wrapRecords = [System.Collections.ArrayList]::new()
 foreach ($spec in $RootSpecs) {
     if (-not (Test-Path -LiteralPath $spec.Root -PathType Container)) { continue }
-    foreach ($f in @(Get-ChildItem -Path $spec.Root -Recurse -File -Force `
-                                   -Include $spec.Filters -ErrorAction SilentlyContinue)) {
+    foreach ($f in (Select-ScannableFile @(Get-ChildItem -Path $spec.Root -Recurse -File -Force `
+                                   -Include $spec.Filters -ErrorAction SilentlyContinue))) {
         foreach ($r in (JoinWrappedInFile $f.FullName (RelPath $f.FullName))) { [void]$wrapRecords.Add($r) }
     }
 }
@@ -738,8 +761,8 @@ foreach ($r in $wrapRecords) {
 $declRecords = [System.Collections.ArrayList]::new()
 foreach ($spec in $RootSpecs) {
     if (-not (Test-Path -LiteralPath $spec.Root -PathType Container)) { continue }
-    foreach ($f in @(Get-ChildItem -Path $spec.Root -Recurse -File -Force `
-                                   -Include $spec.Filters -ErrorAction SilentlyContinue)) {
+    foreach ($f in (Select-ScannableFile @(Get-ChildItem -Path $spec.Root -Recurse -File -Force `
+                                   -Include $spec.Filters -ErrorAction SilentlyContinue))) {
         $head = Get-Content -Raw -LiteralPath $f.FullName -ErrorAction SilentlyContinue
         if (-not $head) { continue }
         if ($head -cnotmatch "(?m)$QuoteDeclRx") { continue }
@@ -827,7 +850,7 @@ function Build-CitationIndex {
     $locFiles = @()
     foreach ($spec in $RootSpecs) {
         if (-not (Test-Path -LiteralPath $spec.Root -PathType Container)) { continue }
-        $locFiles += @(Get-ChildItem -Path $spec.Root -Recurse -File -Force `
+        $locFiles += Select-ScannableFile @(Get-ChildItem -Path $spec.Root -Recurse -File -Force `
                                      -Include $spec.Filters -ErrorAction SilentlyContinue)
     }
     $locRx = [regex]::new($AnchorRegex, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
@@ -923,8 +946,18 @@ $srcAnchors = @($srcAnchorSet.Keys | Sort-Object)
 # ★★ FAIL-CLOSED on a collapsed extraction, like every other scan here. The
 # registry carries retired rows; zero means the marker drifted or the table shape
 # changed, never that the check has nothing to do.
-$retiredIds = @(RetiredIdsIn ([IO.File]::ReadAllLines(
-    (Join-Path $RepoRoot '.plans/_deferred-anchor-registry.md'), [Text.Encoding]::UTF8)))
+# ⚠ GLOB, not one file: the registry split into production/harness on 2026-08-25
+# and a retired id may live in either. Naming one file here would silently stop
+# matching half of them -- an invisible narrowing, which is the failure mode this
+# repository treats as the dangerous one. The fail-closed count below still applies
+# to the UNION, so a collapsed read of either file is still refused.
+$registryLines = @(
+    Get-ChildItem -LiteralPath (Join-Path $RepoRoot '.plans') `
+                  -Filter '_deferred-anchor-registry*.md' -File |
+        Sort-Object Name |
+        ForEach-Object { [IO.File]::ReadAllLines($_.FullName, [Text.Encoding]::UTF8) }
+)
+$retiredIds = @(RetiredIdsIn $registryLines)
 if ($retiredIds.Count -lt 1) {
     Write-Host "anchor-registry: FAIL - the retired-id scan found 0 marked rows."
     Write-Host "  This does NOT mean no id is retired - it means THIS scan collapsed (the ``RETIRED-ID`` token was renamed, or the registry's column layout moved)."
@@ -1031,8 +1064,9 @@ foreach ($a in $missing) {
 }
 Write-Host ""
 Write-Host "Fix: either"
-Write-Host "  (a) add a row in .plans/_deferred-anchor-registry.md naming the"
-Write-Host "      trigger + closing work, OR"
+Write-Host "  (a) add a row in the deferred-anchor registry naming the"
+Write-Host "      trigger + closing work -- .plans/_deferred-anchor-registry-production.md"
+Write-Host "      if a USER of the compiler could hit it, -harness.md if only WE can, OR"
 # ⚠ THESE FOUR LINES WRAP EXACTLY AS THE `.sh`'s DO, and that is not fussiness:
 # the twins are verified by DIFFING their output, so a report that differs on four
 # lines for no reason is four lines of noise a real divergence could hide inside.
@@ -1042,7 +1076,7 @@ Write-Host "  (c) if the string is a code-internal pin not deferred work, add it
 Write-Host "      to the Allowlist section of the registry."
 Write-Host ""
 Write-Host "Discipline: this leak recurred TWICE before this guard landed."
-Write-Host "See .plans/_deferred-anchor-registry.md for the discipline rationale."
+Write-Host "See .plans/_deferred-anchor-registry-production.md for the discipline rationale."
 # ★ BOTH halves report on every run. But an exit code can carry only ONE number,
 # so when both fail the precedence is DELIBERATE rather than whichever branch
 # happens to run last: a COLLAPSED scan (2) beats a missing anchor (1) beats

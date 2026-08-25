@@ -20,3 +20,12 @@ dss_add_test(NAME analysis/preprocess/test_include_bare_relative_includer_dir
 target_include_directories(
     dss_analysis_preprocess_test_include_bare_relative_includer_dir
     PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# [[D-PERF-PP-OFF-GRAMMAR-BODY-RUN-IS-ONE-TOKEN-PER-CODEPOINT]]: the preprocessor
+# folds each off-grammar `EmptySpace` body run (a comment) into ONE token, so a
+# comment costs one token rather than one per character. A separate binary rather
+# than more cases in test_preprocessor.cpp because the pin is a COMPARISON of two
+# whole preprocess runs that differ only in a comment's LENGTH, while that file's
+# fixtures all assert on the contents of a single run.
+dss_add_test(NAME analysis/preprocess/test_comment_body_run_is_one_token
+             SOURCES test_comment_body_run_is_one_token.cpp)

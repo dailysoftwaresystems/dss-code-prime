@@ -9,6 +9,7 @@ add_library(core OBJECT
     substrate/path_identity.cpp
     substrate/phase_timers.cpp
     substrate/process_spawn.cpp
+    substrate/stack_sized_thread.cpp
     substrate/thread_pool.cpp
 
     # ── types/ — universal in-memory model ──

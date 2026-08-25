@@ -37,6 +37,7 @@
 
 #include "asm/asm.hpp"
 #include "asm_text_fixture.hpp"
+#include "core/types/unsuppressable_codes.hpp"
 #include "mutate_target_schema.hpp"
 
 #include <gtest/gtest.h>
@@ -107,22 +108,46 @@ bytesOfWith(std::shared_ptr<TargetSchema> target, std::string const& line) {
 
 struct Refusal { bool refused; std::string why; };
 
-// How many errors the ENCODER reports for `line`. ⚠ SEPARATE FROM `refusalOf`
-// ON PURPOSE: the operand-shape refusals live in the text->LIR lowering, but an
-// immediate that does not FIT its slot is caught by the walker, one tier later.
-// A test that only asked `refusalOf` would read "the lowering accepted it" as
+// D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES: what the ENCODER
+// said about `line`, split by the axis the row turns on. `errors` is the
+// REFUSAL arm; `narrowings` counts `A_ImmediateNarrowedToOperandField`
+// specifically rather than warnings in general, so an unrelated future
+// warning cannot make a narrowing pin pass by standing in for it.
+//
+// ⚠ SEPARATE FROM `refusalOf` ON PURPOSE, and this predates the row: the
+// operand-SHAPE refusals live in the text->LIR lowering, but an immediate
+// that does not fit its slot is the WALKER's business, one tier later. A
+// test that only asked `refusalOf` would read "the lowering accepted it" as
 // "nothing refused it" and pass while a truncated immediate shipped.
-[[nodiscard]] std::size_t assembleErrorsOf(std::string const& line) {
+//
+// ⓘ SUPERSEDES the former `assembleErrorsOf`, which returned only the error
+// count. Under the ruling an error count of zero is no longer the same
+// statement as "nothing was said" — the whole point is that a narrowing
+// assembles AND is reported — so a helper that could not see warnings would
+// now read a loud narrowing as a silent success.
+struct EncodeReport { std::size_t errors; std::size_t narrowings; };
+
+[[nodiscard]] EncodeReport encodeReportOf(std::string const& line) {
     auto const doc = shippedDialectDoc("asm-x86_64-att");
     auto const src = std::string{"\t.globl main\n\t.type main, @function\n"
                                  "main:\n\t"} + line + "\n\tret\n";
     auto const run = lowerAsmTextWithTarget(doc, src, shippedX86());
     EXPECT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
-    if (!run->module.has_value()) return 1;  // refused a tier earlier
+    if (!run->module.has_value()) return {1, 0};  // refused a tier earlier
     DiagnosticReporter     asmRep;
     std::vector<MirInstId> lirToMir(run->module->lir.instCount());
     (void)assemble(run->module->lir, *run->target, lirToMir, asmRep);
-    return asmRep.errorCount();
+    std::size_t narrowings = 0;
+    for (auto const& d : asmRep.all()) {
+        if (d.code == DiagnosticCode::A_ImmediateNarrowedToOperandField) {
+            ++narrowings;
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning)
+                << "a narrowing must be a WARNING — an Error would refuse "
+                   "the input gas assembles, which is arm (B) the operator "
+                   "rejected: " << line;
+        }
+    }
+    return {asmRep.errorCount(), narrowings};
 }
 
 [[nodiscard]] Refusal refusalOf(std::string const& line) {
@@ -207,45 +232,198 @@ TEST(AsmX86WidthAndDirection, SixteenBitImmediatesEmitExactlyTwoBytes) {
 }
 
 TEST(AsmX86WidthAndDirection, SixteenBitImmediateTakesTheWholeSignedAndUnsignedWindow) {
-    // ★★ THE SLOT ACCEPTS THE UNION OF BOTH READINGS OF THE SAME 16 BITS, and
-    // THAT much is a MEASURED conformance fact rather than a convenience: ✔GNU
-    // as 2.42 assembles `movw $-1, %cx` AND `movw $65535, %cx` to the IDENTICAL
-    // `66 b9 ff ff`. A range admitting only one of them would refuse input the
-    // reference takes.
+    // ★★ THE SLOT IS SILENT ACROSS THE UNION OF BOTH READINGS OF THE SAME 16
+    // BITS, and THAT much is a MEASURED conformance fact: ✔GNU as 2.42
+    // assembles `movw $-1, %cx` AND `movw $65535, %cx` to the IDENTICAL
+    // `66 b9 ff ff`. A window admitting only one of them would refuse input
+    // the reference takes.
     EXPECT_EQ(soleHex("movw $-1, %cx"), "66c7c1ffff");
     EXPECT_EQ(soleHex("movw $65535, %cx"), "66c7c1ffff");
-    // ⚠⚠ THE INTERIOR OF THE WINDOW IS CONFORMANCE; ITS EDGE IS NOT, AND AN
-    // EARLIER DRAFT OF THIS COMMENT PRESENTED BOTH AS ONE MEASURED FACT. What
-    // was measured there was DSS's own behaviour. ✔RE-MEASURED against GNU as
-    // 2.42, one spelling at a time, and the reference DISAGREES at the edge:
+    EXPECT_EQ(encodeReportOf("movw $-1, %cx").narrowings, 0u)
+        << "inside the window nothing is narrowed, so nothing is said";
+    EXPECT_EQ(encodeReportOf("movw $65535, %cx").narrowings, 0u);
+
+    // ⚠⚠ THE EDGE OF THIS WINDOW IS **NOT** A CONFORMANCE FACT, AND TWO
+    // EARLIER DRAFTS OF THIS COMMENT SAID IT WAS — the first presented the
+    // whole window as "MEASURED", the second corrected that but then called
+    // the refusal at the edge settled. What was measured BOTH times was DSS's
+    // OWN CHOICE, and the reference disagrees with it. ✔RE-MEASURED against
+    // GNU as 2.42, one spelling at a time:
     //   `mov $0x10000, %cx` → gas rc=0, `66 b9 00 00`, warning "0x10000
     //                         shortened to 0x0"
     //   `mov $-32769, %cx`  → gas rc=0, `66 b9 ff 7f`, NO DIAGNOSTIC AT ALL
-    // DSS refuses both with `A_ImmediateOperandOutOfRange`. So the assertions
-    // below pin a DIVERGENCE, not an agreement, and they are written to keep
-    // pinning DSS's current behaviour rather than to bless it.
-    // ★ WHY THE DIVERGENCE IS NOT RESOLVED HERE: the two standing rules point
-    // opposite ways. One working reference makes an input REQUIRED (bar §A.3b);
-    // fail-loud forbids silently keeping the low half of a value that has no
-    // 2-byte representation, which is exactly what gas does — it drops 0x8000
-    // of magnitude on the negative case without saying anything. That fork is
-    // an OPERATOR decision, filed as
-    // [[D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES]] (§B, OPEN). ⛔ Do
-    // not close it by widening the window — the row says so, and widening is
-    // the arm that adopts gas's silent truncation.
-    // ★ The range check lives in the ENCODER, not the lowering — `refusalOf`
-    // would report "not refused" here and the pin would assert nothing.
+    //
+    // ★★★ RULED BY THE OPERATOR 2026-08-24 — NEITHER "MATCH gas" NOR "KEEP
+    // REFUSING", BUT A THIRD ARM: ACCEPT WHAT gas ACCEPTS, AND DIAGNOSE WHERE
+    // gas IS SILENT. Matching gas exactly would have shipped a silently
+    // narrowed immediate (the shape this project calls a miscompile);
+    // refusing would have rejected a `.s` a working reference assembles. The
+    // third arm is available because the disjunction rule constrains what DSS
+    // must COMPILE, never what it must stay QUIET about — a reference's
+    // SILENCE is not part of the behaviour it licenses.
+    //
+    // ⇒ THE WINDOW ABOVE DID NOT MOVE; IT CHANGED WHAT IT GATES. It was the
+    // ACCEPTANCE threshold and is now the SILENCE threshold. The row's ⛔ "do
+    // NOT close this by widening the window" is honoured literally: nothing
+    // was widened.
+    //
+    // ★ The check lives in the ENCODER, not the lowering — `refusalOf` would
+    // report "not refused" here and the pin would assert nothing.
     EXPECT_EQ(refusalOf("movw $65536, %cx").refused, false)
-        << "the LOWERING accepts it — the range check is the encoder's";
-    EXPECT_GT(assembleErrorsOf("movw $65536, %cx"), 0u)
-        << "DSS refuses an immediate wider than the 2-byte slot rather than "
-           "silently keeping its low half (gas truncates it to $0 with a "
-           "warning). The fork is an OPEN operator decision -- see "
-           "D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES; "
-           "if this red is deliberate, change the ROW first";
-    EXPECT_GT(assembleErrorsOf("movw $-32769, %cx"), 0u)
-        << "and the negative end too, where gas truncates to $0x7fff with NO "
-           "diagnostic at all — same open row, same instruction";
+        << "the LOWERING accepts it — the window is the encoder's";
+
+    // ✔MEASURED byte-for-byte against GNU as 2.42 (immediate field compared
+    // after disassembly, since gas contracts to `66 b9 iw` and DSS emits the
+    // ModR/M form — a size difference that predates this row):
+    //   gas `mov $0x10000,%cx` → $0x0     | DSS → $0x0     ✔same
+    //   gas `mov $-32769,%cx`  → $0x7fff  | DSS → $0x7fff  ✔same
+    struct NarrowRow { char const* written; char const* bytes;
+                       char const* note; };
+    static constexpr NarrowRow kNarrowed[] = {
+        {"movw $65536, %cx",  "66c7c10000",
+         "gas warns here too — 0x10000 shortened to 0x0"},
+        {"movw $-32769, %cx", "66c7c1ff7f",
+         "★ THE CASE THE RULING EXISTS FOR: gas emits these bytes with NO "
+         "diagnostic at all, dropping 0x8000 of magnitude in silence. DSS "
+         "emits the same bytes and SAYS SO"},
+    };
+    for (auto const& r : kNarrowed) {
+        EXPECT_EQ(soleHex(r.written), r.bytes)
+            << r.written << " must emit the low 16 bits, i.e. gas's own "
+            << "bytes: " << r.note;
+        auto const rep = encodeReportOf(r.written);
+        EXPECT_EQ(rep.errors, 0u)
+            << r.written << " must ASSEMBLE — refusing input a working "
+               "reference accepts is the defect this row records";
+        EXPECT_EQ(rep.narrowings, 1u)
+            << r.written << " must emit exactly one "
+               "A_ImmediateNarrowedToOperandField: " << r.note;
+    }
+}
+
+// ══ SUBJECT 2b — THE NARROWING RULE IS CONFIG-DRIVEN, NOT AN x86 PATCH ═════
+
+TEST(AsmX86WidthAndDirection, ImmediateNarrowsOnlyWhereTheFieldIsTheOperationsValue) {
+    // ★★★ THE PAIR OF ARMS IS THE ASSERTION, AND NEITHER ARM ALONE SEES THE
+    // MECHANISM. `imm8` is wired by TWO kinds of variant, and the ONLY thing
+    // separating them is config: the byte-width forms declare `guard.width` 8
+    // (the byte IS the operation's value ⇒ a wider constant NARROWS, exactly
+    // as the reference narrows it), while the shift counts declare
+    // `guard.width` 32/64 (the byte is a fixed PARAMETER of a wider operation
+    // ⇒ a value that does not fit is REFUSED, exactly as the reference
+    // refuses it). A fix that widened the window per SLOT would pass the
+    // first arm and silently break the second.
+    //
+    // ✔MEASURED, GNU as 2.42, one spelling at a time:
+    //   `movb $-1, %al`   → rc=0, `b0 ff`, silent      (DSS used to REFUSE)
+    //   `movb $300, %al`  → rc=0, `b0 2c`, warns
+    //   `movb $-129, %al` → rc=0, `b0 7f`, SILENT      (DSS warns — louder)
+    //   `shl  $-1, %rax`  → rc=1, Error: operand type mismatch
+    //   `shl  $256, %rax` → rc=1, Error: operand type mismatch
+
+    // ARM 1 — the field IS the operation's value: accept, and match gas.
+    // `movb` carries the deliberate bare REX (see the file header), so the
+    // DSS spelling is `40c6c0<ib>` where gas emits `b0 <ib>`; the IMMEDIATE
+    // byte is the subject and it is identical.
+    EXPECT_EQ(soleHex("movb $-1, %al"), "40c6c0ff")
+        << "gas assembles this to b0 ff. Refusing it was a conformance "
+           "defect of the same family as the 16-bit row, found by measuring "
+           "the sibling width";
+    EXPECT_EQ(encodeReportOf("movb $-1, %al").narrowings, 0u)
+        << "-1 is INSIDE [-128,255], the union of the two readings of the "
+           "same 8 bits — it is not narrowed and must not be mentioned";
+    EXPECT_EQ(soleHex("movb $255, %al"), "40c6c0ff")
+        << "and the unsigned reading of the same 8 bits encodes identically";
+
+    struct Row { char const* written; char const* bytes; };
+    static constexpr Row kNarrowed[] = {
+        {"movb $300, %al",  "40c6c02c"},   // gas: b0 2c, warns
+        {"movb $-129, %al", "40c6c07f"},   // gas: b0 7f, SILENT
+    };
+    for (auto const& r : kNarrowed) {
+        EXPECT_EQ(soleHex(r.written), r.bytes) << r.written;
+        auto const rep = encodeReportOf(r.written);
+        EXPECT_EQ(rep.errors, 0u) << r.written << " must assemble";
+        EXPECT_EQ(rep.narrowings, 1u)
+            << r.written << " must report the narrowing";
+    }
+
+    // ARM 2 — the field is a fixed PARAMETER of a wider operation: REFUSE,
+    // and match gas there too.
+    //
+    // ⚠ REACHED BY MUTATING THE CONFIG, WHICH IS THE ONLY HONEST WAY TO STATE
+    // THIS ARM AND IS ALSO A STRONGER PIN THAN THE SHIPPED SHIFT WOULD BE.
+    // The shipped AT&T dialect declares NO shift spelling at all (✔MEASURED:
+    // 68 mnemonics, not one of them a shift), so no `.s` can reach the
+    // shipped parameter-arm variant. Rather than assert the predicate at unit
+    // level — which would prove the helper agrees with itself and nothing
+    // about the pipeline — re-point `mov`'s width-16 immediate wire at the
+    // 1-byte slot. The variant still declares `guard.width` 16 while its
+    // field is now 8 bits wide, which is EXACTLY the shape of a fixed narrow
+    // parameter, and the same spelling goes through the real encoder.
+    //
+    // ⓘ The obvious mutation — moving the width-8 variant's `guard.width` to
+    // 64 — is REFUSED AT LOAD, and that refusal is itself correct: `mov`
+    // already declares a width-64 same-kind variant, so the two would shadow
+    // each other under first-match dispatch. Mutating the SLOT instead keeps
+    // the document well-formed and isolates the one axis under test.
+    auto asParameterField = test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            auto* vs = variantsOf(doc, "mov");
+            ASSERT_NE(vs, nullptr) << "x86_64 declares no `mov`";
+            for (auto& v : *vs) {
+                if (v.at("guard").value("width", 0) != 16) continue;
+                for (auto& w : v.at("wires")) {
+                    if (w.at("slotKind") == "imm16.bytes") {
+                        w["slotKind"] = "imm8";
+                    }
+                }
+            }
+        });
+    ASSERT_TRUE(asParameterField.has_value())
+        << "the mutant must still LOAD — the point is that the document is "
+           "well-formed and only the MEANING of the field moved";
+
+    // Under the SHIPPED config `movw $-1, %cx` and `movw $300, %cx` both
+    // assemble silently (the union window admits them). Under the mutant the
+    // field is a parameter of a 16-bit operation, so the signed reading is
+    // gone and the window is [0,255] — the same two spellings must now be
+    // REFUSED, which is what gas does for `shl $-1` and `shl $256`.
+    EXPECT_EQ(soleHex("movw $-1, %cx"), "66c7c1ffff")
+        << "shipped: accepted";
+    EXPECT_EQ(hexOfWith(*asParameterField, "movw $-1, %cx"),
+              "<NOTHING-EMITTED>")
+        << "★ THE MECHANISM IN ONE ASSERTION: the same spelling and the same "
+           "value, the opposite answer, and the ONLY thing that changed is a "
+           "slot name in JSON. If this ever emits bytes, the narrowing rule "
+           "has stopped reading the config and every width-absent variant in "
+           "every target has quietly become a silent truncator";
+    EXPECT_EQ(hexOfWith(*asParameterField, "movw $300, %cx"),
+              "<NOTHING-EMITTED>")
+        << "and the oversized end of the parameter window too";
+    // ⚠ THE CONTROL: the mutant is not simply broken. A value inside the
+    // parameter window still encodes, so the two refusals above are the
+    // WINDOW talking and not the mutation having disabled the variant.
+    EXPECT_EQ(hexOfWith(*asParameterField, "movw $200, %cx"), "66c7c1c8")
+        << "an in-window value must still assemble under the mutant — "
+           "otherwise the refusals above prove nothing about the window";
+}
+
+// ══ SUBJECT 2c — THE NARROWING DIAGNOSTIC CANNOT BE SILENCED ═══════════════
+
+TEST(AsmX86WidthAndDirection, NarrowingDiagnosticIsUnsuppressable) {
+    // ★★★ WITHOUT THIS THE RULING IS A DEFAULT, NOT A BEHAVIOUR. The operator
+    // chose a third arm over (A) "match gas and truncate silently"; if
+    // `--suppress` could silence the warning, arm (A) would be one flag away
+    // and the arm that was REJECTED would still be reachable. Every other
+    // member of the unsuppressable table is an Error, where suppression still
+    // leaves a failing build; this one is a WARNING whose build SUCCEEDS by
+    // design, which makes the diagnostic the only thing standing between a
+    // narrowed immediate and a silent one.
+    EXPECT_TRUE(isUnsuppressable(
+        DiagnosticCode::A_ImmediateNarrowedToOperandField))
+        << "a suppressible narrowing warning collapses the operator's third "
+           "arm back into the arm they rejected";
 }
 
 TEST(AsmX86WidthAndDirection, TheEightAndSixteenBitAluFamilyIsComplete) {

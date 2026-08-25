@@ -3225,26 +3225,30 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
     // PERMANENT constraint is justified by the text that imposes it, which cannot
     // close. Cite a row for WORK OUTSTANDING; cite the standard for A RULE.
     //
-    // ★★ TWO TESTS, AND THE SECOND ONE IS THE LOAD-BEARING ONE — MEASURED. The
-    // obvious `isVlaArray(declTy)` test alone does NOT catch `constexpr int
-    // a[argc] = {1,2,3};`, because by the time this validator runs the DECLARED
-    // TYPE IS NO LONGER VARIABLY MODIFIED: with an initializer present the
-    // declarator resolver takes the c34 init-inference relaxation, the written
-    // `argc` bound is dropped, and `completeIncompleteArrayFromInit` re-sizes the
-    // object from the brace list — ✔MEASURED through the shipped CLI, `int
-    // a[argc] = {1,2,3}; return sizeof(a);` exits **12**, a COMPILE-TIME size, and
-    // `int a[argc];` (no initializer) exits 4 for argc==1. So the type test asks a
-    // question the type can no longer answer, and the DECLARATOR is the only
-    // surviving witness of what the programmer wrote.
-    //   ⚠ THAT DROPPED BOUND IS A PRE-EXISTING SILENT WRONGNESS OF ITS OWN, NOT
-    // CREATED HERE and not scoped to `constexpr`: `const int a[argc] = {1,2,3};`
-    // is accepted at HEAD with the same wrong compile-time size, while gcc and
-    // clang BOTH refuse ("variable-sized object may not be initialized"). It is
-    // reported to the operator rather than fixed inside this row, because the
-    // honest fix lives in the array-suffix resolver and the two references DISAGREE
-    // on its one remaining corner (gcc admits `int a[n] = {};`, clang refuses it) —
-    // a fork, not an implementation detail. What this arm guarantees is only that
-    // admitting constexpr aggregates does not WIDEN that hole.
+    // ★★ TWO TESTS, AND WHY THE SECOND ONE IS NOW A BELT AND NOT THE BRACES.
+    // ⚠ THE HISTORY MATTERS BECAUSE THIS COMMENT USED TO SAY THE OPPOSITE, AND
+    // WAS CORRECT WHEN IT DID. It read: the obvious `isVlaArray(declTy)` test
+    // alone does NOT catch `constexpr int a[argc] = {1,2,3};`, because with an
+    // initializer present the declarator resolver dropped the written `argc`
+    // bound and `completeIncompleteArrayFromInit` re-sized the object from the
+    // brace list — so by validation time the declared type was a plain `int[3]`
+    // and the DECLARATOR was the only surviving witness. It then recorded the
+    // dropped bound as "a pre-existing silent wrongness of its own", reported to
+    // the operator rather than fixed here, and named the blocker as a reference
+    // FORK ("gcc admits `int a[n] = {};`, clang refuses it").
+    //   ★ P34 CLOSED IT, AND THE CLAIMED FORK WAS NOT ONE — ✔MEASURED 2026-08-25,
+    // four cases x three compilers x two standards: gcc 13.3.0, clang 19.1.1 AND
+    // clang 18.1.3 ALL accept `int a[n] = {};` and ALL refuse the non-empty form,
+    // which is exactly what C23 6.7.10p4 says. The resolver no longer drops the
+    // bound (D-CSUBSET-VLA-INITIALIZER), so the DECLARED TYPE is variably modified
+    // again and `isVlaArray` answers the question directly for every form that
+    // reaches this validator — including the now-legal `constexpr int a[argc] =
+    // {};`, whose non-empty sibling is refused before it ever gets here.
+    //   The declarator scan is KEPT anyway, deliberately: it is the check that
+    // does not depend on the resolver getting the type right, and a silent
+    // constexpr object of variably modified type is a wrong-size miscompile. Two
+    // independent witnesses of one constraint is the posture this file already
+    // takes wherever silence would be expensive.
     //
     // The bound is located through the SHARED `arraySuffixBoundNode` (the one
     // locator every array-suffix site agrees on) and folded by the SHARED
@@ -3469,13 +3473,23 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     }
     if (!suffix.valid()) return base;  // this declarator has no `[..]`
 
-    auto emit = [&](DiagnosticCode code) {
+    // ★ D-DIAG-ARRAY-SUFFIX-REPORTS-ONLY-THE-LEXEME: `what` is the PROSE, and the
+    // suffix lexeme is quoted after it — the render contract the SEMANTIC band
+    // already documents at `appendExpectedActual` ("those codes carry a full prose
+    // sentence in `actual` and leave `expected` empty by design"). Both array-suffix
+    // lambdas used to put the BARE lexeme in `actual`, so the entire rendered body
+    // was the offending source text: `error[S000C]: [0]`, and — the case that made
+    // it visible — `error[S000C]: {}`, a report whose whole message is two braces.
+    // The twin in `applyDeclaratorSuffix` carries the identical change; the two are
+    // kept arm-for-arm in step on purpose.
+    auto emit = [&](DiagnosticCode code, std::string_view what) {
         ParseDiagnostic d;
         d.code     = code;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(suffix);
-        d.actual   = std::string{tree.text(suffix)};
+        d.actual   = std::string{what} + ": `"
+                     + std::string{tree.text(suffix)} + "`";
         s.reporter.report(std::move(d));
     };
 
@@ -3491,7 +3505,9 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     if (cfg != nullptr && cfg->declarators.has_value()
         && arraySuffixHasModifier(tree, suffix,
                                   cfg->declarators->arraySuffixModifierTokens)) {
-        emit(DiagnosticCode::S_ArrayParamQualifierNonParameter);
+        emit(DiagnosticCode::S_ArrayParamQualifierNonParameter,
+             "an array declarator's `static` / type-qualifier / `*` decoration is "
+             "permitted only on a function parameter (C 6.7.6.2p1, 6.7.6.3p7)");
         return InvalidType;
     }
 
@@ -3554,7 +3570,9 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
             // right-to-left suffix fold already produced `base` as the inner type.
             return in.vlaArray(base);
         }
-        emit(DiagnosticCode::S_NonConstantArrayLength);
+        emit(DiagnosticCode::S_NonConstantArrayLength,
+             "an array declarator in this position needs a length, and it must be "
+             "an integer constant expression (C 6.7.6.2)");
         return InvalidType;
     }
     // D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18 zero-length arrays): a bound
@@ -3571,7 +3589,9 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     // expression. Negative folds (e.g. `int a[-1]`) and zero are
     // out-of-range; fail loud rather than wrap to a giant unsigned.
     if (*len <= 0) {
-        emit(DiagnosticCode::S_ArrayLengthOutOfRange);
+        emit(DiagnosticCode::S_ArrayLengthOutOfRange,
+             "an array length must be a POSITIVE integer constant expression "
+             "(C 6.7.6.2p1)");
         return InvalidType;
     }
     // FC6 (C99 §6.7.2.1p18): a FAM-bearing struct may not be an array element
@@ -3579,7 +3599,9 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     // struct as a complete object (`struct F f;`) stays valid — only the array
     // ELEMENT is rejected. Mirrors the struct-composition in-aggregate check.
     if (typeContainsFlexibleArray(s.lattice.interner(), base)) {
-        emit(DiagnosticCode::S_FlexibleArrayInAggregate);
+        emit(DiagnosticCode::S_FlexibleArrayInAggregate,
+             "a structure with a flexible array member may not be an array "
+             "element (C 6.7.2.1p18)");
         return InvalidType;
     }
     // VLA C3 (D-CSUBSET-VLA): a CONSTANT outer bound over a VLA element (`int a[5][n]`
@@ -5278,14 +5300,19 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         return s.lattice.interner().incompleteArray(inner);
     }
     if (r == dc.arraySuffixRule) {
-        auto const emit = [&](DiagnosticCode code) {
+        // ★ D-DIAG-ARRAY-SUFFIX-REPORTS-ONLY-THE-LEXEME — see the twin lambda in
+        // `applyArraySuffix` for the full note. `what` is the prose sentence the
+        // semantic band's render contract requires; the suffix lexeme is quoted
+        // after it instead of BEING the whole message.
+        auto const emit = [&](DiagnosticCode code, std::string_view what) {
             if (!emitOnMiss) return;
             ParseDiagnostic d;
             d.code     = code;
             d.severity = DiagnosticSeverity::Error;
             d.buffer   = tree.source().id();
             d.span     = tree.span(suffix);
-            d.actual   = std::string{tree.text(suffix)};
+            d.actual   = std::string{what} + ": `"
+                         + std::string{tree.text(suffix)} + "`";
             s.reporter.report(std::move(d));
         };
         // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the array-PARAMETER
@@ -5302,7 +5329,10 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         // parameter), which carries its own copy of this gate.
         if (!paramDecay
             && arraySuffixHasModifier(tree, suffix, dc.arraySuffixModifierTokens)) {
-            emit(DiagnosticCode::S_ArrayParamQualifierNonParameter);
+            emit(DiagnosticCode::S_ArrayParamQualifierNonParameter,
+                 "an array declarator's `static` / type-qualifier / `*` decoration "
+                 "is permitted only on a function parameter (C 6.7.6.2p1, "
+                 "6.7.6.3p7)");
             return InvalidType;
         }
         // The length is whichever of the suffix's visible children
@@ -5352,7 +5382,20 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // error — the declarator-mode twin of the legacy `applyArraySuffix` FAM
             // branch. Only the field's OWN array suffix inherits this; a nested fn-ptr
             // param's array never does (the group recursion passes false).
-            if (allowFlexibleArray)
+            //   ★★ D-CSUBSET-VLA-INITIALIZER — `!hasPresentLength` GUARDS THE
+            // INIT-INFERENCE HALF, AND ONLY THAT HALF. `allowFlexibleArray` is
+            // now the ROW's own FAM flag again (`structField` / `externDecl`),
+            // unchanged in both bound positions. `allowInitInferredArray` is the
+            // c34 relaxation, and C 6.7.9p22 scopes it to an array of UNKNOWN
+            // size — an ABSENT bound. Before this guard the merged flag swallowed
+            // a PRESENT-but-non-constant bound as well, so `int a[argc] = {…};`
+            // never reached the VLA arm below: the written bound was dropped and
+            // `completeIncompleteArrayFromInit` re-sized the object from the brace
+            // list (sizeof 12 for `{1,2,3}`, and S000C for `{}` because the count
+            // was 0). Both are now the VLA the programmer wrote, and the
+            // initializer constraint is judged at the declarator loop where the
+            // initializer is in scope.
+            if (allowFlexibleArray || (allowInitInferredArray && !hasPresentLength))
                 return s.lattice.interner().incompleteArray(inner);
             // VLA C1a (D-CSUBSET-VLA): a PRESENT-but-non-constant length on a NON-FAM,
             // NON-param declarator is a VARIABLE-LENGTH array (C99/C11 §6.7.6.2
@@ -5389,7 +5432,9 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // a non-last / sole member keeps S_FlexibleArrayNotLast / SoleMember.
             if (typeAliasRow)
                 return s.lattice.interner().incompleteArray(inner);
-            emit(DiagnosticCode::S_NonConstantArrayLength);
+            emit(DiagnosticCode::S_NonConstantArrayLength,
+                 "an array declarator in this position needs a length, and it "
+                 "must be an integer constant expression (C 6.7.6.2)");
             return InvalidType;
         }
         // D-CSUBSET-ZERO-LENGTH-ARRAY-MEMBER (GNU 6.18 zero-length arrays): a
@@ -5405,25 +5450,35 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         // identical to /usr/bin/clang) and on POSITION (a non-trailing `[0]` is
         // S_FlexibleArrayNotLast, a sole one S_FlexibleArraySoleMember — both from
         // the shared composite-composition guard, neither special-cased here).
-        //   `allowInitInferredArray` EXCLUDES the init-inference relaxation. That
-        // bool is why the flag reaching this function is `decl.allowFlexibleArray
-        // || initNode.valid()`: without the exclusion `int a[0] = {1};` would stop
-        // being S_ArrayLengthOutOfRange and get SILENTLY re-sized to `int[1]` by
-        // the initializer backfill — a written bound overwritten without a word.
+        //   `allowInitInferredArray` EXCLUDES the init-inference relaxation, and it
+        // is STILL LOAD-BEARING after D-CSUBSET-VLA-INITIALIZER un-merged the two
+        // signals — ✔MEASURED, not assumed. `externDecl` is a row that declares
+        // `allowFlexibleArray: true` AND takes an `initDeclaratorList`, so BOTH
+        // bools can be true on one declarator; drop this conjunct and
+        // `extern int a[0] = {1};` stops being S_ArrayLengthOutOfRange and becomes
+        // an incomplete array carrying an initializer — a written bound overwritten
+        // without a word. (`int a[0] = {1};` on an ordinary local/global is now
+        // excluded a second way, by `allowFlexibleArray` no longer carrying the
+        // init relaxation at all; belt AND braces is deliberate here, because the
+        // failure mode is silent.)
         //   A `[0]` on any other row (a plain local/global object, a parameter)
         // keeps the out-of-range reject below.
         if (*len == 0 && allowFlexibleArray && !allowInitInferredArray) {
             return s.lattice.interner().incompleteArray(inner);
         }
         if (*len <= 0) {
-            emit(DiagnosticCode::S_ArrayLengthOutOfRange);
+            emit(DiagnosticCode::S_ArrayLengthOutOfRange,
+                 "an array length must be a POSITIVE integer constant "
+                 "expression (C 6.7.6.2p1)");
             return InvalidType;
         }
         // FC6 (C99 §6.7.2.1p18): a FAM-bearing element type may not be an
         // array element (the declarator-mode twin of the `applyArraySuffix`
         // check — both array-forming sites reject it, by construction).
         if (typeContainsFlexibleArray(s.lattice.interner(), inner)) {
-            emit(DiagnosticCode::S_FlexibleArrayInAggregate);
+            emit(DiagnosticCode::S_FlexibleArrayInAggregate,
+                 "a structure with a flexible array member may not be an array "
+                 "element (C 6.7.2.1p18)");
             return InvalidType;
         }
         // VLA C3 (D-CSUBSET-VLA): a CONSTANT outer bound over a VLA element
@@ -5516,8 +5571,13 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // c47 (D-CSUBSET-FNPTR-ARRAY-SIZE-INFERENCE): an INIT-INFERRED `[]` DOES
         // cross in — `int (*const arr[])(T) = {…}` (an inferred-size array of
         // fn-ptrs) carries its `[]` on THIS inner declarator and is sized from the
-        // top-level initializer. Propagate ONLY that init-inference signal as the
-        // inner's flexible flag; a NO-init grouped `[]` keeps it false ⇒ S000B.
+        // top-level initializer. It rides its OWN parameter now
+        // (D-CSUBSET-VLA-INITIALIZER un-merged the two): this recursion used to
+        // pass `allowInitInferredArray` as the inner's FLEXIBLE flag, which is what
+        // made the two indistinguishable one level down. The inner declarator is
+        // never a FAM, so the flexible flag is FALSE here — a NO-init grouped `[]`
+        // still keeps it false ⇒ S000B, and an init-inferred one is admitted by the
+        // init-inference arm instead, which (correctly) requires an ABSENT bound.
         // VLA C4a-param FIX-1 (D-CSUBSET-VLA): param decay applies ONLY to the
         // OUTERMOST dim (C 6.7.6.3p7); a grouped/parenthesized inner declarator is
         // NOT the decaying dim, so RESET `paramDecay=false` here (the two witnesses
@@ -5526,7 +5586,7 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // over-lenient accept on an exotic `int (*p[])[n]`). `allowInitInferredArray`
         // stays a DISTINCT signal (c47 init-inferred fn-ptr arrays), not collapsed.
         return declaratorDeclaredType(s, cfg, tree, inner, t, scope, emitOnMiss,
-                                      /*allowFlexibleArray=*/allowInitInferredArray,
+                                      /*allowFlexibleArray=*/false,
                                       /*allowInitInferredArray=*/allowInitInferredArray,
                                       /*paramDecay=*/false,
                                       /*typeAliasRow=*/typeAliasRow);
@@ -7100,6 +7160,45 @@ initializerNodeOf(Tree const& tree, NodeId dNode, DeclaratorConfig const& dc) {
     return {};
 }
 
+// D-CSUBSET-VLA-INITIALIZER (C23 §6.7.10p4): the TOP-LEVEL element count of a
+// brace initializer, or nullopt when this initializer is not a brace list at all
+// (a string literal, a scalar expression, an absent init). `{}` returns 0 — the
+// EMPTY initializer C23 6.7.10p4 names as the one form a variably modified object
+// may take — and that is the whole reason the return is an optional rather than a
+// count with 0 doubling as "no braces": those two are opposite answers here.
+//
+// It walks the SAME descent `completeIncompleteArrayFromInit` walks (transparent
+// `initValue` / paren wrappers down to the first `braceInitList`, counting its
+// direct `initElement` children) and reads the SAME two schema indexes, so the
+// two sites can never disagree about what "the initializer's element count" means
+// — the property that matters, because one of them SIZES an array from that count
+// and the other REFUSES an initializer based on it.
+[[nodiscard]] std::optional<std::int64_t>
+initializerBraceElementCount(Tree const& tree, SchemaIndexes const& idx,
+                             NodeId initNode) {
+    if (!initNode.valid()) return std::nullopt;
+    if (!idx.braceInitListRule.valid() || !idx.initElementRule.valid())
+        return std::nullopt;
+    std::vector<NodeId> stack{initNode};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId const c = stack.back();
+        stack.pop_back();
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c).v == idx.braceInitListRule.v) {
+            std::int64_t count = 0;
+            for (NodeId e : visibleChildren(tree, c)) {
+                if (tree.kind(e) == NodeKind::Internal
+                    && tree.rule(e).v == idx.initElementRule.v) {
+                    ++count;
+                }
+            }
+            return count;
+        }
+        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    }
+    return std::nullopt;
+}
+
 // c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE, C 6.7.9p22): complete an INCOMPLETE-ARRAY
 // declared type from its initializer's shape. Returns the SIZED `Array<elem, N>`
 // when `declTy` is `T[]` (incomplete) AND `initNode` is a recognizable initializer
@@ -7137,13 +7236,22 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
     // -1 sentinel length. Fail LOUD here instead (an inferred 0-or-undeterminable
     // length is exactly the non-positive `int a[0]` case → S_ArrayLengthOutOfRange),
     // matching the no-initializer path's clean error rather than a compiler hang.
+    // ★ D-DIAG-ARRAY-SUFFIX-REPORTS-ONLY-THE-LEXEME — THIS IS THE SITE THAT MADE
+    // THE CLASS VISIBLE. `actual` was the initializer's raw source text, so an
+    // empty brace initializer rendered as `error[S000C]: {}` — a diagnostic whose
+    // entire message is the two characters it is complaining about, which reads as
+    // a compiler that printed nothing. The semantic band's render contract wants a
+    // prose sentence in `actual` (see `appendExpectedActual`); the source text is
+    // still quoted, but after the sentence rather than instead of it.
     auto failUnsized = [&]() -> TypeId {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::S_ArrayLengthOutOfRange;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(initNode);
-        d.actual   = std::string{tree.text(initNode)};
+        d.actual   = "an array of unknown size needs an initializer that "
+                     "determines a POSITIVE length (C 6.7.9p22): `"
+                     + std::string{tree.text(initNode)} + "`";
         s.reporter.report(std::move(d));
         return InvalidType;
     };
@@ -7773,8 +7881,36 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // adjustment below rewrites any top-level array to
                         // Ptr<element>, so the incomplete/VLA form never escapes
                         // as the bound type.
-                        bool const allowIncomplete =
-                            decl.allowFlexibleArray || initNode.valid();
+                        // ★★ D-CSUBSET-VLA-INITIALIZER (C23 6.7.10p4: "An entity
+                        // of variable length array type shall not be initialized
+                        // except by an empty initializer") — THE TWO SIGNALS ARE
+                        // NO LONGER MERGED HERE, AND THE MERGE IS WHAT WAS WRONG.
+                        // This used to read `decl.allowFlexibleArray ||
+                        // initNode.valid()` and hand the OR to the resolver's
+                        // `allowFlexibleArray` parameter. The resolver tests that
+                        // parameter ABOVE its VLA arm (deliberately — a struct
+                        // field's non-constant bound is a FAM, not a VLA member),
+                        // so ANY initialized declarator with a PRESENT-but-non-
+                        // constant bound took the FAM path: the written `argc`
+                        // bound was DISCARDED and the object re-sized from the
+                        // brace list. ✔MEASURED at 8cb9afbd through the shipped
+                        // CLI, one root cause and BOTH directions wrong —
+                        // `int a[argc] = {1,2,3};` compiled clean at sizeof 12
+                        // (gcc 13.3.0, clang 19.1.1 and clang 18.1.3 all REFUSE
+                        // it), and `int a[argc] = {};` was S000C because the same
+                        // path re-sized it to 0 (all three references ACCEPT it,
+                        // and 6.7.10p4 REQUIRES it).
+                        //   The relaxation the c34 init-inference rule actually
+                        // needs is narrower than the flag it was riding: C 6.7.9p22
+                        // sizes an array of UNKNOWN size, i.e. an ABSENT bound. So
+                        // `allowInitInferredArray` travels ALONE (it already did,
+                        // for the `[0]` exclusion below) and the resolver applies it
+                        // only when no bound is written; `allowFlexibleArray` goes
+                        // back to meaning exactly what its name says — this ROW may
+                        // bear a flexible array member. `structField` and
+                        // `externDecl` are the only two rows that declare it, and
+                        // both keep byte-identical behaviour.
+                        bool const allowIncomplete = decl.allowFlexibleArray;
                         // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF: a row that declares a
                         // TYPE rather than an object may name an INCOMPLETE array
                         // (C 6.7.6.2p1) — `typedef int T[];`. Config-declared via
@@ -7795,6 +7931,53 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         if (!decl.allowFlexibleArray)
                             declTy = completeIncompleteArrayFromInit(
                                 s, s.idx(), tree, initNode, declTy);
+                        // ★★ D-CSUBSET-VLA-INITIALIZER (C23 §6.7.10p4: "An entity
+                        // of variable length array type shall not be initialized
+                        // except by an empty initializer"). The resolver above now
+                        // builds the VLA the programmer wrote instead of dropping
+                        // its bound, which is what makes this check POSSIBLE: the
+                        // declared type is the surviving witness that the object is
+                        // variably modified, and the initializer is in scope only
+                        // here, at the declarator.
+                        //   `typeContainsVla` and NOT `isVlaArray`, because the
+                        // constraint is on a VARIABLY MODIFIED entity, not on a
+                        // top-level VLA: `int a[argc][2] = {…}` interns as
+                        // `vlaArray(array(int,2))` and `int a[5][argc] = {…}` as
+                        // `array(vlaArray(int),5)` — the transitive predicate is
+                        // the only one that sees both, and BOTH references refuse
+                        // both forms (✔MEASURED gcc 13.3.0 + clang 19.1.1).
+                        //   THE EMPTY FORM IS REQUIRED, NOT MERELY TOLERATED:
+                        // `int a[argc] = {};` is ACCEPTED by gcc 13.3.0, clang
+                        // 19.1.1 and clang 18.1.3 (✔MEASURED, both -std=gnu17 and
+                        // -std=c2x), and both references ZERO the object — a
+                        // 16-element VLA read back after the frame was dirtied sums
+                        // to 0 under each (✔MEASURED). So the accept arm is a real
+                        // obligation on the lowering, not a permission to ignore
+                        // the initializer.
+                        //   The type is INVALIDATED on the reject arm rather than
+                        // left standing: a suppressed diagnostic must not be able
+                        // to ship an object whose initializer was silently dropped,
+                        // and an untyped symbol reaches the HIR verifier as
+                        // H_TypeUnresolved. This is what keeps the code off
+                        // `unsuppressable_codes.cpp` honestly.
+                        if (initNode.valid() && declTy.valid()
+                            && s.lattice.interner().typeContainsVla(declTy)) {
+                            auto const braced = initializerBraceElementCount(
+                                tree, s.idx(), initNode);
+                            if (!braced.has_value() || *braced != 0) {
+                                ParseDiagnostic d;
+                                d.code = DiagnosticCode::S_VlaInitializerNotEmpty;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(initNode);
+                                d.actual   =
+                                    "an object of variable length array type may "
+                                    "be initialized only by the empty initializer "
+                                    "`{}` (C23 6.7.10p4)";
+                                s.reporter.report(std::move(d));
+                                declTy = InvalidType;
+                            }
+                        }
                         // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (p7) +
                         // D-CSUBSET-PARAM-FN-TYPE-ADJUSTMENT (p8): the
                         // definitive adjustment — the bound param symbol
@@ -9226,40 +9409,106 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                                             // unsuppressable error
                                                             // fails the build.
                                 }
+                                // ★★ P34 (D-CSUBSET-ATTRIBUTE-TYPE-POSITION) — THE
+                                // SCAN NOW RUNS FOR EVERY COMPOSITE KIND, INCLUDING
+                                // `enum`, AND ONLY THE CONSUMPTION STAYS SPLIT.
+                                // `enumSpec` was the last composite row with no
+                                // after-keyword attribute surface at all, so
+                                // `enum [[deprecated]] E { … }` was a PARSE error;
+                                // now that the row carries `compositeAttrLead` the
+                                // clause reaches the semantic tier, and a fact that
+                                // arrives and is not read is exactly the silent drop
+                                // `compositeAttrLead`'s own comment was written about.
+                                // `scanCompositePacked` is a pure reader (it writes
+                                // nothing and its only side effect is the
+                                // strict-unknown typo diagnostic this row now opts
+                                // into), so hoisting it costs nothing for struct and
+                                // union: their arm below reads the SAME struct it
+                                // read before, field for field.
+                                //
+                                // The composite's ENCLOSING scope is the right lookup
+                                // context for the alignment operand — an `aligned(N)`
+                                // naming a constant / a type-name
+                                // (`aligned(_Alignof(double))`) resolves where the
+                                // composite is DECLARED, not inside its own member
+                                // scope (the enum-underlying arm's precedent).
+                                ScopeId const attrScope =
+                                    srec.structScope.valid()
+                                        ? s.scopes.scopes()[srec.structScope.v].parent
+                                        : ScopeId{};
+                                auto const composedAttrs = scanCompositePacked(
+                                    s, cfg, tree, specNode,
+                                    /*emitDiagnostics=*/true, attrScope);
+                                // ★ THE TAG'S `warnOnUse` FACT IS KIND-INDEPENDENT.
+                                // C23 6.7.3.1 puts a tag's attribute after the
+                                // keyword for struct, union AND enum alike, and both
+                                // references warn at every use of a deprecated enum
+                                // tag (✔MEASURED 2026-08-25, gcc 13.3.0 and clang
+                                // 19.1.1). Written on the SYMBOL, never on the TypeId
+                                // — C 6.2.3 gives two same-named tags in different
+                                // scopes two symbols, and deprecation belongs to the
+                                // DECLARATION. From here the EXISTING consumers do
+                                // the rest, unchanged.
+                                if (composedAttrs.deprecated) {
+                                    srec.isDeprecated = true;
+                                    if (srec.deprecatedMessage.empty())
+                                        srec.deprecatedMessage =
+                                            composedAttrs.deprecatedMessage;
+                                }
+                                if (ck == CompositeKind::Enum
+                                    && (composedAttrs.packed
+                                        || composedAttrs.alignment.has_value())) {
+                                    // ★★ LOUDLY IGNORED, NOT SILENTLY DROPPED, AND
+                                    // THE CHOICE IS MEASURED IN BOTH DIRECTIONS.
+                                    // `packed` / `aligned(N)` on an ENUM are accepted
+                                    // by gcc 13.3.0 and clang 19.1.1 (✔MEASURED
+                                    // 2026-08-25, both compile clean), so REFUSING
+                                    // them would break the bar — DSS may not reject
+                                    // what a reference accepts. But DSS's enum has
+                                    // exactly one layout channel, the underlying
+                                    // TypeKind that the C23 `enum E : T` clause sets,
+                                    // and neither attribute feeds it: honouring them
+                                    // would mean choosing a narrower underlying type,
+                                    // which is its own capability with its own
+                                    // range-check consequences for every enumerator.
+                                    // So the attribute is IGNORED and SAID SO,
+                                    // through the shared decl-kind gate's existing
+                                    // code — the `S_AsmLabelOnAutomaticVariable`
+                                    // posture (a loudly-ignored annotation), not
+                                    // silence. ⚠ RECORDED DIVERGENCE: a program that
+                                    // depends on `-fshort-enums`-style packing gets a
+                                    // 4-byte enum here and a 1-byte one under gcc.
+                                    // Before this cycle the same source did not
+                                    // compile at all (error[P0001]), so nothing
+                                    // regresses; `--warnings-as-errors` gives the
+                                    // strict posture for anyone who needs it.
+                                    ParseDiagnostic d;
+                                    d.code = DiagnosticCode::
+                                        S_AttributeIgnoredForDeclarationKind;
+                                    d.severity = DiagnosticSeverity::Warning;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(specNode);
+                                    d.actual =
+                                        "a layout attribute on an enumeration is "
+                                        "accepted and IGNORED — an enum's width is "
+                                        "set by its underlying type (C23 6.7.2.2 "
+                                        "`enum E : T`): `"
+                                        + std::string{srec.name} + "`";
+                                    s.reporter.report(std::move(d));
+                                }
                                 if (ck == CompositeKind::Struct
                                     || ck == CompositeKind::Union) {
-                                    // The composite's ENCLOSING scope is the right
-                                    // lookup context for the alignment operand — an
-                                    // `aligned(N)` naming a constant / a type-name
-                                    // (`aligned(_Alignof(double))`) resolves where the
-                                    // composite is DECLARED, not inside its own member
-                                    // scope (the enum-underlying arm's precedent).
-                                    ScopeId const attrScope =
-                                        srec.structScope.valid()
-                                            ? s.scopes.scopes()[srec.structScope.v].parent
-                                            : ScopeId{};
-                                    auto const composedAttrs = scanCompositePacked(
-                                        s, cfg, tree, specNode,
-                                        /*emitDiagnostics=*/true, attrScope);
+                                    // ★ THE LAYOUT CHANNELS ARE STRUCT/UNION-ONLY,
+                                    // AND THAT IS THE WHOLE REASON THIS ARM SURVIVED
+                                    // THE P34 HOIST: `completeComposite` takes
+                                    // `packed` and `aligned(N)` for a composite with
+                                    // FIELDS. An enum has none, so it reads the
+                                    // `warnOnUse` fact above and reports these two as
+                                    // ignored; struct and union consume them here,
+                                    // byte-identically to before the hoist (the
+                                    // P33 `warnOnUse` write moved UP, unchanged).
                                     composedPacked = composedAttrs.packed;
                                     composedAlign  = composedAttrs.alignment;
-                                    // ★★ P33 (D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES):
-                                    // the TAG carries the `warnOnUse` fact, exactly as
-                                    // an ordinary declarator's symbol does. From here
-                                    // the EXISTING consumers do the rest — Pass 2's
-                                    // reference-resolution chokepoint already routes a
-                                    // tag reference through the Tag namespace, and
-                                    // `resolveTypeNodeImpl`'s tag arm is the
-                                    // type-position counterpart. Written on the SYMBOL
-                                    // (never on the TypeId): C 6.2.3 gives two
-                                    // same-named tags in different scopes two symbols,
-                                    // and deprecation belongs to the DECLARATION.
-                                    if (composedAttrs.deprecated) {
-                                        srec.isDeprecated = true;
-                                        if (srec.deprecatedMessage.empty())
-                                            srec.deprecatedMessage =
-                                                composedAttrs.deprecatedMessage;
-                                    }
                                     if (composedPacked) {
                                         bool anyBitfieldMember = false;
                                         for (std::int64_t const w : fieldBitWidths)
@@ -11254,17 +11503,32 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         if (!initTy.valid() && !walkEndIsBraceInit) {
                             initTy = subtreeType(s, tree, initNode, here);
                         }
-                        // VLA C4a-local (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING, DEFERRED):
-                        // the natural init form `int (*p)[n] = b` does NOT compile — the
-                        // typeAt walk (and `subtreeType`, which short-circuits on the same
-                        // stamped node) yields `b`'s DECAYED pointer type, not the raw
-                        // `array(vlaArray(int),2)` the `Ptr<vlaArray> ← array(array)` decay
-                        // compare needs, so S_TypeMismatch fires (a CLEAN fail-loud, never
-                        // a silent miscompile). A guarded `subtreeType` override was tried
-                        // (CRITICAL-1) but is inert here because `b`'s initializer node is
-                        // pre-stamped decayed by an earlier pass. Deferred; the C4a-local
-                        // witness uses the ASSIGNMENT form (`int (*p)[n]; p = b;`), which
-                        // passes assignability and reaches the runtime-stride path.
+                        // VLA C4a-local (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING) — ✅ CLOSED
+                        // 2026-08-25 (P34), AND THE DIAGNOSIS THIS COMMENT USED TO CARRY
+                        // WAS WRONG, WHICH IS WHY A CYCLE WAS SPENT ON AN INERT FIX.
+                        // It read: the natural init form `int (*p)[n] = b` does NOT
+                        // compile, because the typeAt walk (and `subtreeType`, which
+                        // short-circuits on the same stamped node) yields `b`'s DECAYED
+                        // pointer type rather than the raw `array(vlaArray(int),2)` the
+                        // `Ptr<vlaArray> ← array(array)` decay compare needs — and a
+                        // guarded `subtreeType` override was tried here and proved INERT.
+                        //   It was inert because the blocker was never on THIS side. With
+                        // the flexible-array flag tested ABOVE the VLA arm and an
+                        // initializer present, `(*p)[n]` declared as
+                        // `Ptr<incompleteArray<int>>`, so the decay compare could not have
+                        // matched whatever the initializer's stamp said, and
+                        // `storePtrToVlaStride`'s `typeContainsVla` gate (which tests the
+                        // -2 sentinel) never fired either. D-CSUBSET-VLA-INITIALIZER
+                        // un-merged those signals; `p` now declares as
+                        // `Ptr<vlaArray<int>>`, the compare matches, and the runtime row
+                        // stride is frozen at the decl exactly as the assignment form's
+                        // already was. ✔MEASURED end-to-end: the off-diagonal `p[1][0]`
+                        // reads 20 (not 11, not 21) in BOTH pipeline arms, agreeing with
+                        // gcc 13.3.0 and clang 19.1.1 — `examples/c/c99_vla_ptr_init`.
+                        //   ⚠ The exactness of the compare is UNCHANGED and separately
+                        // pinned: a FIXED pointee from a VLA object
+                        // (`int (*p)[5] = b;` where b's rows are `int[n]`) still rejects
+                        // (`PtrToVlaFixedPointeeFromVlaObjectRejects`).
                         if (!rec.type.valid()) {
                             if (initTy.valid()) {
                                 rec.type = initTy;

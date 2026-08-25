@@ -1,8 +1,11 @@
 // D-CSUBSET-VLA C4a-local: a LOCAL pointer-to-VLA `int (*p)[n]` RUNS — the subscript p[i]
 // steps by the RUNTIME pointee row size (n*sizeof(int)), frozen ONCE at p's decl (the
 // C3 vlaStrideSlot/scaleIndexToBytes substrate, now populated for pointers). The witness
-// is the ASSIGNMENT form `int (*p)[n]; p = b;` (the natural `= b` init form is deferred,
-// D-CSUBSET-VLA-PTR-INIT-FORM-TYPING). `volatile` defeats const-fold so n is genuinely
+// is the ASSIGNMENT form `int (*p)[n]; p = b;`. (The natural `= b` INIT form was
+// deferred when this example was written, D-CSUBSET-VLA-PTR-INIT-FORM-TYPING; that row
+// CLOSED in P34 as a side effect of D-CSUBSET-VLA-INITIALIZER and now has its own
+// runnable witness, `examples/c/c99_vla_ptr_init`. This example keeps the ASSIGNMENT
+// form deliberately, so the two spellings stay separately pinned.) `volatile` defeats const-fold so n is genuinely
 // runtime; main is a LEAF (the C1b VLA frame-model scope). The KEY correctness witness is
 // the OFF-DIAGONAL write p[1][0] vs p[0][2] (DISTINCT cells) — a wrong row stride would
 // alias/transpose them. Each `return k` is a strict in-program pin; only all-pass -> 42.

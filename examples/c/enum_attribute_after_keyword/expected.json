@@ -1,0 +1,15 @@
+{
+  "$comment": "D-CSUBSET-ATTRIBUTE-TYPE-POSITION — the after-keyword attribute slot on `enum`, in both the C23 `[[...]]` and GNU `__attribute__((...))` spellings, proven end-to-end. Before this cycle `enumSpec` was the only composite row with no such slot, so both spellings were PARSE errors (P0009 / P0001) on the position C23 6.7.3.1 defines for a tag's attribute — a position gcc 13.3.0 and clang 19.1.1 both accept and both warn on at every use (MEASURED 2026-08-25). The runnable half pins what a diagnostic golden cannot: that adding an ALWAYS-EMITTED lead slot (which shifts the row's tag index 1 -> 2) did not silently make the tags bind ANONYMOUSLY — every tag is used in a TYPE position, so a discarded tag cannot reach an exit code. Also covers the adjacent C23 underlying-type clause (`enum [[deprecated]] E3 : unsigned char`), an ANONYMOUS decorated enum, and the accepted-and-loudly-ignored layout attributes (`packed` / `aligned(16)`, warning[S005F]). The runner asserts rc==0 AND errorCount()==0, and errorCount() counts only Error severity, so the warnings are tolerated by construction — if any of them became an error this test goes red with no binary at all.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

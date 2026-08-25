@@ -957,6 +957,35 @@ if(DSS_BUILD_TESTS)
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()
 
+# ── `repo-guard`: the label that lets an indirect leg skip what it cannot learn ──
+# OPERATOR RULING 2026-08-25: *"the root is whichever the host is using you (claude). every
+# indirect leg (wsl, vps, macos, whatever), do not need guards!"* A repo guard checks the
+# SOURCE TREE, and the tree is byte-identical on every leg, so a second host re-checking it
+# learns nothing while paying the most expensive entries in the suite -- ✔MEASURED 18
+# entries / 159.1 s on Windows, and on macOS the three biggest had not finished after 367 s.
+#
+# ⚠ THE SCAN IS OVER TESTS THAT ACTUALLY EXIST, not a hand-kept list. `set_tests_properties`
+# on a name some `if(WIN32)` branch did not define is a hard CMake error, so a hand-kept list
+# would have to track every branch -- the drift shape this repo has been bitten by
+# repeatedly. The count is printed so `ctest -N -L repo-guard` can be CHECKED against it
+# rather than trusted.
+#
+# ★ An unlabelled new guard is NOT skipped anywhere -- it simply runs on every leg. The
+# failure direction of this mechanism is "too much testing", the only direction a gate may
+# fail in.
+get_property(_dss_all_tests DIRECTORY PROPERTY TESTS)
+set(_dss_guard_tests "")
+foreach(_t IN LISTS _dss_all_tests)
+    if(_t MATCHES "guard$")
+        list(APPEND _dss_guard_tests "${_t}")
+    endif()
+endforeach()
+if(_dss_guard_tests)
+    set_tests_properties(${_dss_guard_tests} PROPERTIES LABELS "repo-guard")
+    list(LENGTH _dss_guard_tests _dss_guard_count)
+    message(STATUS "repo-guard label applied to ${_dss_guard_count} test(s)")
+endif()
+
 # ── The install set (D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE) ──
 # Kept whole in its own module rather than interleaved here: it owns what a
 # package ships (the CLI, its shared library, and `src/dss-config/`), it forwards

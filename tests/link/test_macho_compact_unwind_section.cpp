@@ -40,6 +40,7 @@
 //      a DIFFERENT segment, so the pair no longer matches.
 
 #include "asm/asm.hpp"
+#include "core/types/cfi.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
@@ -79,15 +80,27 @@ struct Leg {
     // arm64's clang emitted `ltmp1`; x86_64's emitted no local label at all.
     // Stated per leg because it is a PRODUCER fact, measured off the bytes.
     std::size_t                      unwindLabels;
+    // Does this arch's stock object ALSO carry `__TEXT,__eh_frame`?
+    // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE.
+    // ✔MEASURED 2026-08-25 on real Apple Silicon (macOS 26.5.2),
+    // `/usr/bin/cc -arch <a> -c` with NO other flag -- and re-measured off
+    // these very fixture bytes: x86_64 YES, arm64 NO. A PRODUCER fact, the
+    // second one this struct carries, and the reason the two legs must assert
+    // OPPOSITE outcomes rather than the same one.
+    bool                             carriesDwarfUnwind;
+    // How many `unwind` rows this arch's SHIPPED DOCUMENT declares. A DOCUMENT
+    // fact rather than a producer one, and it must track `carriesDwarfUnwind`:
+    // the document declares a row for each encoding the objects carry.
+    std::size_t                      unwindRows;
 };
 
 [[nodiscard]] Leg arm64Leg() {
     return Leg{"arm64", "macho64-arm64-darwin",
-               dss::test::appleClangMachoCompactUnwindArm64Object(), 1};
+               dss::test::appleClangMachoCompactUnwindArm64Object(), 1, false, 1};
 }
 [[nodiscard]] Leg x86Leg() {
     return Leg{"x86_64", "macho64-x86_64-darwin",
-               dss::test::appleClangMachoCompactUnwindX86_64Object(), 0};
+               dss::test::appleClangMachoCompactUnwindX86_64Object(), 0, true, 2};
 }
 
 struct Loaded {
@@ -208,8 +221,13 @@ void stockObjectReadsCleanAndSaysWhatItDrops(Leg const& leg) {
         << "a label on bytes the image does not carry must not name an address "
            "in it";
 
-    // The loss is LOUD. A dropped unwind table produces a binary that links,
-    // runs, and cannot be unwound -- invisible until a core dump.
+    // ── THE UNWIND OUTCOME, AND THE TWO LEGS DISAGREE ON PURPOSE ──────
+    //
+    // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE.
+    // ✔MEASURED: the x86_64 object carries `__TEXT,__eh_frame` BESIDE its
+    // compact section and the arm64 object does not, so on x86_64 every
+    // function arrives DESCRIBED and there is nothing to warn about, while on
+    // arm64 the loss is real and must still be loud.
     std::size_t warned = 0;
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::K_UnwindRuleUnrepresentable
@@ -217,18 +235,56 @@ void stockObjectReadsCleanAndSaysWhatItDrops(Leg const& leg) {
             ++warned;
         }
     }
-    EXPECT_EQ(warned, 1u)
-        << "exactly one warning per unwind section -- silence is the defect "
-           "this row exists to prevent, and one per RECORD would bury it"
-        << rendered(rep);
-    EXPECT_TRUE(anyDiagnosticContains(rep, "__LD,__compact_unwind"));
-    EXPECT_TRUE(anyDiagnosticContains(rep, "3 function unwind record(s)"))
-        << "the count comes from the document's own `entrySize` (0x60 / 32), so "
-           "a message without it means the schema field went unread";
-    EXPECT_TRUE(anyDiagnosticContains(
-        rep, "D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE"))
-        << "the warning must name the row that owns the remaining gap, or the "
-           "next reader has nowhere to go";
+    std::size_t described = 0;
+    for (auto const& f : mod->functions) {
+        if (f.cfi.has_value()) ++described;
+    }
+
+    if (leg.carriesDwarfUnwind) {
+        EXPECT_EQ(described, mod->functions.size())
+            << "every function this object contributes is described by an FDE "
+               "in its `__TEXT,__eh_frame`, so every one must arrive carrying "
+               "call-frame information"
+            << rendered(rep);
+        // ★★ AND THEN THE WARNING MUST BE GONE. A warning saying these
+        //    functions reach the image undescribed would be FALSE -- and a
+        //    false alarm on the common case is how a reader learns to ignore
+        //    the one that is real. ⓘ This arm caught an ordering defect in the
+        //    reader itself: `__LD,__compact_unwind` sits at a LOWER address
+        //    than `__TEXT,__eh_frame`, so a single wire-order loop warned
+        //    before the carry had happened.
+        EXPECT_EQ(warned, 0u)
+            << "nothing is lost on this leg, so nothing may be reported lost"
+            << rendered(rep);
+        EXPECT_EQ(rep.all().size(), 0u)
+            << "a stock object whose unwind information is fully carried must "
+               "read in silence"
+            << rendered(rep);
+    } else {
+        EXPECT_EQ(described, 0u)
+            << "compact unwind has no PC dimension and is deliberately NOT "
+               "converted, so no function may arrive carrying call-frame "
+               "information invented from it"
+            << rendered(rep);
+        // The loss is LOUD. A dropped unwind table produces a binary that
+        // links, runs, and cannot be unwound -- invisible until a core dump.
+        EXPECT_EQ(warned, 1u)
+            << "exactly one warning per unwind section -- silence is the defect "
+               "this row exists to prevent, and one per RECORD would bury it"
+            << rendered(rep);
+        EXPECT_TRUE(anyDiagnosticContains(rep, "__LD,__compact_unwind"));
+        EXPECT_TRUE(anyDiagnosticContains(rep, "3 function unwind record(s)"))
+            << "the count comes from the document's own `entrySize` (0x60 / 32), so "
+               "a message without it means the schema field went unread";
+        EXPECT_TRUE(anyDiagnosticContains(rep, "3 function(s) this object"))
+            << "the warning counts FUNCTIONS THAT REACH THE IMAGE UNDESCRIBED, "
+               "not records -- the record count alone was a false alarm on the "
+               "leg whose sibling section carries";
+        EXPECT_TRUE(anyDiagnosticContains(
+            rep, "D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE"))
+            << "the warning must name the row that owns the remaining gap, or the "
+               "next reader has nowhere to go";
+    }
 }
 
 TEST(MachoCompactUnwind, Arm64StockObjectReadsCleanAndSaysWhatItDrops) {
@@ -287,12 +343,21 @@ void documentMinusItsUnwindRowRefusesAgain(Leg const& leg,
     nlohmann::json doc = nlohmann::json::parse(text);
     auto& secs = doc.at("sections");
     std::size_t const before = secs.size();
-    for (auto it = secs.begin(); it != secs.end(); ++it) {
-        if (it->at("kind").get<std::string>() == "unwind") { secs.erase(it); break; }
+    // ⚠ EVERY `unwind` ROW, NOT THE FIRST ONE. Since
+    // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE the
+    // x86_64 document declares TWO (compact + dwarf-cfi), and a `break` after
+    // the first would leave the mutant still holding the vocabulary it claims
+    // to have removed -- a mutant that does not mutate, reading green.
+    nlohmann::json kept = nlohmann::json::array();
+    for (auto const& row : secs) {
+        if (row.at("kind").get<std::string>() != "unwind") kept.push_back(row);
     }
-    ASSERT_EQ(secs.size(), before - 1u)
-        << leg.formatName << " must declare exactly one `unwind` section row -- "
-           "if this fires, the row was dropped and the whole suite is vacuous";
+    std::size_t const removed = before - kept.size();
+    secs = kept;
+    ASSERT_EQ(removed, leg.unwindRows)
+        << leg.formatName << " must declare exactly " << leg.unwindRows
+        << " `unwind` section row(s) -- if this fires, the document moved and "
+           "this mutant no longer removes what it claims to";
 
     auto stripped = ObjectFormatSchema::loadFromText(
         doc.dump(), std::string{leg.formatName} + "-no-unwind-row");
@@ -408,6 +473,327 @@ TEST(MachoCompactUnwind, ARowUnderTheWrongSegmentDoesNotClassifyTheSection) {
         << rendered(rep);
     EXPECT_TRUE(anyDiagnosticContains(
         rep, "resolves to no known code/data section kind"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE — the
+// MACH-O half: `__TEXT,__eh_frame` is CARRIED into `CfiFunction`.
+// ═══════════════════════════════════════════════════════════════════════
+//
+// ✔MEASURED 2026-08-25 on real Apple Silicon (macOS 26.5.2), `/usr/bin/cc
+// -arch <a> -c foreign.c` with NO other flag: an x86_64 object carries BOTH
+// `__LD,__compact_unwind` AND `__TEXT,__eh_frame`; its arm64 sibling from the
+// SAME compiler and SAME source carries compact only. That is the whole reason
+// the section-row identity had to become the (kind, encoding) PAIR, and it is
+// why the two legs below assert OPPOSITE outcomes.
+
+// ── 7. THE CARRY IS REAL, AND ITS CONTENT IS PINNED ───────────────────
+//
+// ★ "every function has a `cfi`" would pass on a decoder that attached an
+//   EMPTY description to each. So this asserts what clang actually SAID:
+//   the x86_64 CIE's entry state (CFA = rsp+8, return address at CFA-8 -- the
+//   psABI's at-entry frame) and the three-op `push rbp; mov rsp,rbp` prologue
+//   every one of these functions has. ✔MEASURED by hand-decoding the CIE and
+//   FDEs of a fresh `cc -arch x86_64 -c` object: CIE `0c 07 08` = def_cfa r7
+//   +8, `90 01` = offset r16 at CFA-8; each FDE `41 0e 10 86 02 43 0d 06` =
+//   advance 1 / def_cfa_offset 16 / offset r6 at CFA-16 / advance 3 /
+//   def_cfa_register r6.
+TEST(MachoCompactUnwind, X86_64StockObjectCarriesItsDwarfUnwindIntoCfi) {
+    Leg const leg = x86Leg();
+    ASSERT_TRUE(leg.carriesDwarfUnwind);
+    auto loaded = loadShipped(leg.targetName, leg.formatName);
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    DiagnosticReporter rep;
+    auto mod = macho::readRelocatableObject(leg.object, *loaded.target,
+                                            *loaded.format, rep);
+    ASSERT_TRUE(mod.has_value()) << rendered(rep);
+    ASSERT_EQ(mod->functions.size(), 3u);
+
+    for (std::size_t i = 0; i < mod->functions.size(); ++i) {
+        auto const& fn = mod->functions[i];
+        SCOPED_TRACE("function #" + std::to_string(i));
+        ASSERT_TRUE(fn.cfi.has_value())
+            << "an FDE describes this function in the object; it must arrive "
+               "carrying that description"
+            << rendered(rep);
+        auto const& cfi = *fn.cfi;
+
+        // The ENTRY state, from the CIE. A decoder that lost it would still
+        // produce a plausible op stream, and every unwind would start from the
+        // wrong CFA.
+        EXPECT_EQ(cfi.initial.cfaOffset, 8)
+            << "x86_64 at function entry: CFA = rsp + 8 (the pushed return "
+               "address)";
+        ASSERT_TRUE(cfi.initial.returnAddressAtCfaOffset.has_value())
+            << "the CIE states where the return address is; losing it is the "
+               "one thing that stops a walk dead";
+        EXPECT_EQ(*cfi.initial.returnAddressAtCfaOffset, -8);
+
+        // The PROLOGUE, from the FDE. Three ops, in DWARF order.
+        ASSERT_EQ(cfi.ops.size(), 3u)
+            << "clang's `push rbp; mov rsp,rbp` prologue is exactly three rule "
+               "changes; a different count means the op stream was not decoded "
+               "but invented";
+        EXPECT_EQ(cfi.ops[0].kind, CfiOpKind::DefCfaOffset);
+        EXPECT_EQ(cfi.ops[0].pcOffset, 1u) << "after `push %rbp`";
+        EXPECT_EQ(cfi.ops[0].offset, 16);
+        EXPECT_EQ(cfi.ops[1].kind, CfiOpKind::RegAtCfaOffset);
+        EXPECT_EQ(cfi.ops[1].offset, -16) << "the saved rbp is at CFA-16";
+        EXPECT_EQ(cfi.ops[2].kind, CfiOpKind::DefCfaRegister);
+        EXPECT_EQ(cfi.ops[2].pcOffset, 4u) << "after `mov %rsp,%rbp`";
+
+        // ★ AND THE DECODED DESCRIPTION MUST BE ONE THE REST OF THE PIPELINE
+        //   ACCEPTS. `validateCfiFunction` is the shared invariant every
+        //   format writer's encoder spends; a decode that satisfies this test's
+        //   field-by-field reading and not that predicate would be caught
+        //   later, in a writer, with the object's identity already gone.
+        EXPECT_EQ(validateCfiFunction(cfi), std::string{})
+            << "the decoded description must satisfy the same invariant a "
+               "DSS-produced one does";
+    }
+}
+
+// ── 8. CONFIG-LEVEL RED-ON-DISABLE FOR THE CARRY ITSELF ───────────────
+//
+// The shipped x86_64 document MINUS exactly its `dwarf-cfi` row, in memory. The
+// same bytes, the same binary, ONE row of vocabulary removed:
+//   * every function arrives with NO call-frame information, and
+//   * the compact section's warning -- silent in the control -- comes back.
+// ★ THE OBJECT STILL READS. That is the point of removing only ONE of the two
+//   rows: `__compact_unwind` is still classified, so this is not the old
+//   "unclassified section" refusal wearing a new hat, it is the CARRY being
+//   switched off and nothing else.
+TEST(MachoCompactUnwind, X86_64DocumentMinusItsDwarfRowStopsCarrying) {
+    Leg const leg = x86Leg();
+    std::string const text = shippedFormatText(leg.formatName);
+    ASSERT_FALSE(text.empty());
+    auto loaded = loadShipped(leg.targetName, leg.formatName);
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    {   // CONTROL: with the row, these exact bytes carry, in silence.
+        DiagnosticReporter rep;
+        auto ok = macho::readRelocatableObject(leg.object, *loaded.target,
+                                               *loaded.format, rep);
+        ASSERT_TRUE(ok.has_value()) << rendered(rep);
+        for (auto const& fn : ok->functions) {
+            EXPECT_TRUE(fn.cfi.has_value()) << "control" << rendered(rep);
+        }
+        EXPECT_EQ(rep.all().size(), 0u) << "control" << rendered(rep);
+    }
+
+    nlohmann::json doc = nlohmann::json::parse(text);
+    auto& secs = doc.at("sections");
+    nlohmann::json kept = nlohmann::json::array();
+    std::size_t removed = 0;
+    for (auto const& row : secs) {
+        bool const isDwarfUnwind =
+            row.at("kind").get<std::string>() == "unwind"
+            && row.contains("encoding")
+            && row.at("encoding").get<std::string>() == "dwarf-cfi";
+        if (isDwarfUnwind) { ++removed; continue; }
+        kept.push_back(row);
+    }
+    ASSERT_EQ(removed, 1u)
+        << "the shipped x86_64 relocatable document must declare exactly one "
+           "`dwarf-cfi` unwind row -- if this fires the mutant removes nothing";
+    secs = kept;
+
+    auto stripped = ObjectFormatSchema::loadFromText(
+        doc.dump(), std::string{leg.formatName} + "-no-dwarf-unwind-row");
+    ASSERT_TRUE(stripped.has_value())
+        << "one unwind row is a legal document -- that is what the arm64 "
+           "sibling ships";
+
+    DiagnosticReporter rep;
+    auto mod = macho::readRelocatableObject(leg.object, *loaded.target,
+                                            **stripped, rep);
+    ASSERT_TRUE(mod.has_value())
+        << "the compact row still classifies `__LD,__compact_unwind`, so the "
+           "object must still READ -- this mutant switches off the CARRY, not "
+           "the classification"
+        << rendered(rep);
+    for (auto const& fn : mod->functions) {
+        EXPECT_FALSE(fn.cfi.has_value())
+            << "with no `dwarf-cfi` row the section is not classified as "
+               "unwind metadata at all, so nothing may be carried from it";
+    }
+    EXPECT_TRUE(anyDiagnosticContains(rep, "3 function(s) this object"))
+        << "and the loss the control had nothing to report is loud again"
+        << rendered(rep);
+}
+
+// ── 9. AN UNWIND ROW THAT DOES NOT SAY WHICH ENCODING IS REFUSED ──────
+//
+// ★ THE ONE PLACE THIS COULD HAVE BECOME A GUESS. Reading a compact body as
+//   DWARF resynchronizes onto record bytes and produces a confident table of
+//   noise, which is strictly WORSE than the silence this row exists to end --
+//   the unwinder trusts a table that is present. So an unwind row with no
+//   `encoding` is refused BY NAME, and the arm64 document (whose single row
+//   makes the key optional as far as `validate()` is concerned) is the one
+//   that proves the READER, not the loader, holds that line.
+TEST(MachoCompactUnwind, AnUnwindRowWithNoDeclaredEncodingIsRefused) {
+    Leg const leg = arm64Leg();
+    std::string const text = shippedFormatText(leg.formatName);
+    ASSERT_FALSE(text.empty());
+    auto loaded = loadShipped(leg.targetName, leg.formatName);
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    nlohmann::json doc = nlohmann::json::parse(text);
+    bool erased = false;
+    for (auto& row : doc.at("sections")) {
+        if (row.at("kind").get<std::string>() != "unwind") continue;
+        ASSERT_EQ(row.at("encoding").get<std::string>(), "compact-unwind")
+            << "if the shipped encoding moved, this mutant no longer removes "
+               "what it claims to";
+        row.erase("encoding");
+        erased = true;
+    }
+    ASSERT_TRUE(erased);
+
+    auto mutated = ObjectFormatSchema::loadFromText(
+        doc.dump(), "macho64-arm64-unwind-row-without-encoding");
+    ASSERT_TRUE(mutated.has_value())
+        << "a SINGLE unwind row may legally omit the key -- `validate()` only "
+           "requires it where a kind repeats. The refusal below is therefore "
+           "the READER declining to guess, which is the claim under test";
+
+    DiagnosticReporter rep;
+    auto refused = macho::readRelocatableObject(leg.object, *loaded.target,
+                                                **mutated, rep);
+    EXPECT_FALSE(refused.has_value()) << rendered(rep);
+    EXPECT_TRUE(anyDiagnosticContains(rep, "does not "
+                                           "say which WIRE ENCODING it is in"))
+        << "the refusal must name the missing key, because adding it is the "
+           "whole fix"
+        << rendered(rep);
+}
+
+// ── 10. THE SCHEMA RULES THAT KEEP `sectionByKind` HONEST ─────────────
+//
+// The kind-only lookup is what every WRITER uses and it cannot name an
+// encoding, so a second row of a kind it can be asked about would make it
+// answer "no such section" for a section the document plainly declares. Four
+// rules hold that line, and each is exercised against the SHIPPED document
+// rather than a hand-built one, so none of them can pass over a fixture the
+// loader would never see.
+[[nodiscard]] std::vector<std::string>
+loadErrorsFor(nlohmann::json const& doc, std::string_view label) {
+    auto r = ObjectFormatSchema::loadFromText(doc.dump(), std::string{label});
+    std::vector<std::string> out;
+    if (r.has_value()) return out;
+    for (auto const& d : r.error()) out.push_back(d.message);
+    return out;
+}
+
+[[nodiscard]] bool anyErrorContains(std::vector<std::string> const& errs,
+                                    std::string_view needle) {
+    return std::any_of(errs.begin(), errs.end(), [&](std::string const& e) {
+        return e.find(needle) != std::string::npos;
+    });
+}
+
+TEST(MachoSectionEncoding, TheSamePairTwiceIsRefused) {
+    nlohmann::json doc = nlohmann::json::parse(
+        shippedFormatText("macho64-x86_64-darwin"));
+    // Duplicate the dwarf row VERBATIM: same kind, same encoding.
+    nlohmann::json dup;
+    for (auto const& row : doc.at("sections")) {
+        if (row.at("kind").get<std::string>() == "unwind"
+            && row.value("encoding", "") == "dwarf-cfi") {
+            dup = row;
+        }
+    }
+    ASSERT_FALSE(dup.is_null());
+    dup["name"] = "__eh_frame_again";
+    doc.at("sections").push_back(dup);
+
+    auto const errs = loadErrorsFor(doc, "macho-dup-pair");
+    ASSERT_FALSE(errs.empty()) << "two rows with the SAME (kind, encoding) are "
+                                 "indistinguishable and must be refused";
+    EXPECT_TRUE(anyErrorContains(errs, "duplicate section kind 'unwind' with "
+                                       "encoding 'dwarf-cfi'"))
+        << "the message must name BOTH halves -- 'duplicate kind' alone would "
+           "send the author to remove the row that is legitimately there";
+}
+
+TEST(MachoSectionEncoding, ASecondRowOfANonDiscriminatedKindIsRefused) {
+    nlohmann::json doc = nlohmann::json::parse(
+        shippedFormatText("macho64-x86_64-darwin"));
+    nlohmann::json extraText;
+    for (auto const& row : doc.at("sections")) {
+        if (row.at("kind").get<std::string>() == "text") extraText = row;
+    }
+    ASSERT_FALSE(extraText.is_null());
+    extraText["name"]     = "__text2";
+    extraText["encoding"] = "dwarf-cfi";   // pair-unique, and still illegal
+    doc.at("sections").push_back(extraText);
+
+    auto const errs = loadErrorsFor(doc, "macho-two-text-rows");
+    ASSERT_FALSE(errs.empty())
+        << "`sectionByKind(Text)` cannot name an encoding, so a second `text` "
+           "row would make it answer nothing for a section that exists";
+    EXPECT_TRUE(anyErrorContains(errs, "is declared by 2 rows"))
+        << "the refusal must be the MULTIPLICITY rule and not the inert-key "
+           "one -- both fire here and only one of them is the point";
+}
+
+TEST(MachoSectionEncoding, AnEncodingOnAKindThatHasNoneIsRefused) {
+    nlohmann::json doc = nlohmann::json::parse(
+        shippedFormatText("macho64-x86_64-darwin"));
+    for (auto& row : doc.at("sections")) {
+        if (row.at("kind").get<std::string>() == "text") {
+            row["encoding"] = "dwarf-cfi";
+        }
+    }
+    auto const errs = loadErrorsFor(doc, "macho-text-with-encoding");
+    ASSERT_FALSE(errs.empty())
+        << "inert config is rejected BY NAME here, exactly as a second-owner "
+           "key is elsewhere in this schema -- a discriminator nothing "
+           "dispatches on reads as meaningful and is not";
+    EXPECT_TRUE(anyErrorContains(errs, "states a discriminator no reader "
+                                       "dispatches on"));
+}
+
+TEST(MachoSectionEncoding, OneOfTwoRowsOfAKindMayNotStaySilent) {
+    nlohmann::json doc = nlohmann::json::parse(
+        shippedFormatText("macho64-x86_64-darwin"));
+    for (auto& row : doc.at("sections")) {
+        if (row.at("kind").get<std::string>() == "unwind"
+            && row.value("encoding", "") == "compact-unwind") {
+            row.erase("encoding");
+        }
+    }
+    // The PAIR is still unique -- (unwind, unspecified) and (unwind, dwarf-cfi)
+    // are different keys -- which is exactly why the pair rule alone is not
+    // enough: the silent row is the one no reader can identify.
+    auto const errs = loadErrorsFor(doc, "macho-unwind-one-row-silent");
+    ASSERT_FALSE(errs.empty())
+        << "pair-uniqueness admits this document; the rule that refuses it is "
+           "the one that says every row of a REPEATED kind must speak";
+    EXPECT_TRUE(anyErrorContains(errs, "so each must say which "
+                                       "wire encoding it carries"));
+}
+
+// ── 11. A SPELLED `unspecified` IS NOT A SECOND WAY TO SAY NOTHING ────
+//
+// The sentinel is the ABSENCE of the key. Accepting the spelling would give
+// one state two spellings, which is the shape this schema rejects by name
+// wherever a second owner appears.
+TEST(MachoSectionEncoding, TheSentinelSpellingIsNotDeclarable) {
+    nlohmann::json doc = nlohmann::json::parse(
+        shippedFormatText("macho64-arm64-darwin"));
+    for (auto& row : doc.at("sections")) {
+        if (row.at("kind").get<std::string>() == "unwind") {
+            row["encoding"] = "unspecified";
+        }
+    }
+    auto const errs = loadErrorsFor(doc, "macho-encoding-unspecified-spelled");
+    ASSERT_FALSE(errs.empty());
+    EXPECT_TRUE(anyErrorContains(errs, "unknown SectionEncoding name"));
+    EXPECT_TRUE(anyErrorContains(errs, "omit the key"))
+        << "the message must say what to do instead, because 'unspecified' is "
+           "a spelling a reader of the enum would reasonably try";
 }
 
 // ── The taxonomy's own claim, at compile time ─────────────────────────

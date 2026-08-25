@@ -20,7 +20,7 @@
 | **`real-examples/`** | **★ The real-world repository registry — see §2.1. Known upstream projects DSS compiles from unmodified source and whose own test suites it runs** |
 | `integrated_tests/` | The CLI-subprocess examples runner (live ctest entry `integrated_tests`) — sibling of the in-process `tests/examples/examples_runner.cpp`; **a capability added to one MUST be added to the other** |
 | `docs/` | User-facing onboarding docs |
-| `.plans/` | Internal design records, roadmap, and `_deferred-anchor-registry.md` |
+| `.plans/` | Internal design records, roadmap, and `_deferred-anchor-registry*.md` |
 | `scripts/`, `packaging/` | Every repo script — one directory per script, siblings inside — plus build/publish tooling. Index: `scripts/README.md` |
 | `build*/` | CMake build dirs (gitignored). Windows Debug gate dir is **`build-dbg`** |
 

@@ -713,7 +713,7 @@ TEST(Arm64Encoder, RbitX3X4EncodesDataProc1Source) {
 // `REV32` is the trap: it is X-form only and reverses each 32-bit half
 // independently — NOT a 32-bit byte swap (that is REV at sf=0).
 // ⚠ MEASURED, and it is not hypothetical: the `D-CSUBSET-INTRINSIC-BSWAP` row of
-// `.plans/_deferred-anchor-registry.md` states arm64 declares "16/32/64
+// `.plans/_deferred-anchor-registry*.md` states arm64 declares "16/32/64
 // (REV16/REV32/REV)" — i.e. it prescribes REV32 for the WIDTH-32 slot, which is
 // the wrong instruction (and, being X-form, not even a 32-bit encoding). The
 // shipped config is correct; the registry prose is not. The width-32 test below

@@ -13,6 +13,7 @@
 #include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> + namesWhere (leaf header — no target_schema cycle)
 
 #include <cstdint>
+#include <functional>   // std::hash — specialized for SectionKindEncoding at the foot of this file
 #include <optional>
 #include <string_view>
 
@@ -159,6 +160,140 @@ sectionKindName(SectionKind k) noexcept {
 sectionKindFromName(std::string_view s) noexcept {
     return kSectionKindTable.fromName(s);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// The WIRE ENCODING of a section's contents — the SECOND half of a section
+// row's identity, for the kinds whose ROLE does not determine it.
+//
+// D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE.
+// ═══════════════════════════════════════════════════════════════════════
+//
+// ★★ WHY THE ENCODING IS A SECOND AXIS AND NOT TWO MORE `SectionKind` ROWS.
+//   ✔MEASURED 2026-08-25 against Apple clang on real Apple Silicon (macOS
+//   26.5.2), `/usr/bin/cc -arch <a> -c foreign.c` with no other flag: the
+//   x86_64 object carries BOTH `__LD,__compact_unwind` AND
+//   `__TEXT,__eh_frame`; the arm64 object from the SAME compiler and the SAME
+//   source carries compact ONLY. Two sections, ONE role ("per-function unwind
+//   metadata"), TWO encodings -- so the kind alone stopped identifying a row,
+//   and the loader's kind-uniqueness rule refused the document outright.
+//
+//   An `UnwindCompact` / `UnwindDwarf` split of `SectionKind` is the arm THIS
+//   FILE'S OWN docblock vetoes: the enum is the set of "format-blind names the
+//   substrate engine speaks", and "per-format JSON owns the name + flags".
+//   Compact-vs-DWARF is precisely a per-format ENCODING fact, so moving it
+//   into the ROLE taxonomy would re-encode FORMAT IDENTITY into the shared
+//   vocabulary every tier speaks.
+//
+//   ⚠ `ShStrtab` SPLITTING FROM `Strtab` LOOKS LIKE THE PRECEDENT AND IS NOT
+//   ONE. That pair splits on CONSUMER PATH -- "find the names of OTHER
+//   SECTIONS" versus "find SYMBOL names" -- and BOTH concepts exist in every
+//   format. An unwind encoding does not divide that way, and the measurement
+//   above is the proof: DWARF CFI is not an ELF fact (a Mach-O object carries
+//   it) and compact unwind is not a Mach-O fact (it is an encoding a format
+//   may adopt). They are encodings, and this is the encoding axis.
+//
+// ★ THE PAYOFF IS THE NEXT ONE, NOT THIS ONE. ARM EHABI (`.ARM.exidx`) and
+//   Win64 SEH (`.pdata`/`.xdata`) are further encodings of the SAME role.
+//   Each becomes a row in this table plus a decoder -- never an edit to
+//   `SectionKind`, and never a reader testing a section NAME.
+enum class SectionEncoding : std::uint8_t {
+    // The document makes NO encoding claim about this row. EVERY section row
+    // that predates this axis carries it, and it stays CORRECT for them: a
+    // kind whose format declares exactly one row needs no discriminator. A
+    // reader that MUST know the encoding refuses an `Unspecified` row BY NAME
+    // rather than assuming whichever encoding its own format happens to use --
+    // assuming is how a decoder reads a table of noise and reports success.
+    Unspecified   = 0,
+    // DWARF Call Frame Information: CIE + FDE records, PC-keyed, one FDE per
+    // described function (ELF `.eh_frame`, Mach-O `__TEXT,__eh_frame`).
+    DwarfCfi      = 1,
+    // Apple compact unwind: fixed-width `{fnStart, len, encoding, personality,
+    // lsda}` records with NO PC dimension -- it describes the frame in the
+    // function BODY only (Mach-O `__LD,__compact_unwind`).
+    CompactUnwind = 2,
+};
+
+inline constexpr EnumNameTable<SectionEncoding, 3> kSectionEncodingTable{{{
+    { SectionEncoding::Unspecified,   "unspecified"    },
+    { SectionEncoding::DwarfCfi,      "dwarf-cfi"      },
+    { SectionEncoding::CompactUnwind, "compact-unwind" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR.
+DSS_CHECK_ENUM_NAME_TABLE(kSectionEncodingTable);
+
+[[nodiscard]] constexpr std::string_view
+sectionEncodingName(SectionEncoding e) noexcept {
+    return kSectionEncodingTable.name(e);
+}
+[[nodiscard]] constexpr std::optional<SectionEncoding>
+sectionEncodingFromName(std::string_view s) noexcept {
+    return kSectionEncodingTable.fromName(s);
+}
+
+// May a format document SPELL this encoding on a section row? `Unspecified`
+// is the ABSENCE of the key, so spelling it would give one state two
+// spellings -- the second-owner shape this schema rejects by name elsewhere.
+[[nodiscard]] constexpr bool
+sectionEncodingIsDeclarable(SectionEncoding e) noexcept {
+    return e != SectionEncoding::Unspecified;
+}
+
+// The spellings an `encoding` key may use. Same sentinel shape as
+// `kSelectableObjectFormatKindNames` one vocabulary over: the rejected set is
+// the single `Unspecified` row, so the constant is `1` and the `static_assert`
+// pins the REJECTED count against the table's own row total -- two numbers
+// with different owners, not a tautology.
+inline constexpr auto kDeclarableSectionEncodingNames =
+    namesWhere<2>(kSectionEncodingTable, sectionEncodingIsDeclarable);
+static_assert(kSectionEncodingTable.rows.size()
+                  == kDeclarableSectionEncodingNames.size() + 1,
+              "kSectionEncodingTable must have exactly ONE row that a format "
+              "document may NOT spell (`Unspecified`, which IS the absence of "
+              "the key). A second unspellable row leaves `namesWhere`'s "
+              "literal count matching while every 'the closed set is …' "
+              "message silently stops describing what the loader accepts.");
+
+// May a format document declare MORE THAN ONE section row of this KIND,
+// told apart by their declared `SectionEncoding`?
+//
+// ★ TRUE FOR EXACTLY THE KINDS WHOSE CONTENTS ARE A *DESCRIPTION* WITH MORE
+//   THAN ONE STANDARD WIRE ENCODING -- and which therefore no WRITER resolves
+//   by kind alone. That second clause is what makes this predicate load-bearing
+//   rather than decorative: `ObjectFormatSchema::sectionByKind` answers "the
+//   row of this kind", and it can only stay honest if every kind a writer asks
+//   it about is unique. ✔MEASURED 2026-08-25 (grep over `src/`):
+//   `SectionKind::Unwind` appears in the two relocatable-object READERS and
+//   nowhere else -- no writer emits into an unwind row, because DSS states its
+//   own functions' unwind rules in the neutral `CfiFunction` vocabulary and
+//   each format writer encodes its table from that.
+//
+// ⚠ NOT A LIST OF FORMATS AND NOT A LIST OF ENCODINGS -- a property of the
+// ROLE. A format that declares one unwind row is unaffected; the discriminator
+// exists for the document that declares two.
+[[nodiscard]] constexpr bool
+sectionKindIsEncodingDiscriminated(SectionKind k) noexcept {
+    return k == SectionKind::Unwind;
+}
+
+// The kinds a document may declare TWICE, rendered from the predicate rather
+// than retyped. `namesWhere` refuses a literal that disagrees with the number
+// of accepted rows AT COMPILE TIME, so promoting a second role to
+// encoding-discriminated cannot leave a diagnostic naming only the old one.
+inline constexpr auto kEncodingDiscriminatedKindNames =
+    namesWhere<1>(kSectionKindTable, sectionKindIsEncodingDiscriminated);
+
+// The full identity of a section ROW: its universal ROLE, plus the WIRE
+// ENCODING where the role does not determine it. THIS -- never the kind alone
+// -- is what a format document's rows must be unique on.
+struct SectionKindEncoding {
+    SectionKind     kind{};
+    SectionEncoding encoding = SectionEncoding::Unspecified;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(SectionKindEncoding, SectionKindEncoding) noexcept = default;
+};
 
 // Narrow subset of `SectionKind` that a producer can legitimately
 // emit via `AssembledData`. Closes D-LK4-RODATA-SECTION-NARROW.
@@ -414,3 +549,21 @@ static_assert(relocBearingGlobalSection(false, true)  == DataSectionKind::RelRoC
 static_assert(relocBearingGlobalSection(false, false) == DataSectionKind::Data);
 
 } // namespace dss
+
+// `SectionKindEncoding` is a MAP KEY (the format schema's row index), so it
+// needs a hash. Two `std::uint8_t` fields pack losslessly into 16 bits, which
+// makes this exact rather than a mix -- and the `static_assert` refuses the
+// packing the day either field outgrows a byte, instead of letting two
+// distinct identities silently collide into one row.
+template <>
+struct std::hash<dss::SectionKindEncoding> {
+    [[nodiscard]] std::size_t
+    operator()(dss::SectionKindEncoding v) const noexcept {
+        static_assert(sizeof(dss::SectionKind) == 1
+                          && sizeof(dss::SectionEncoding) == 1,
+                      "the packing below is lossless only while both halves "
+                      "are one byte wide");
+        return static_cast<std::size_t>(
+            (static_cast<unsigned>(v.kind) << 8) | static_cast<unsigned>(v.encoding));
+    }
+};

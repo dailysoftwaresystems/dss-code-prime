@@ -47,6 +47,41 @@ hardening (SH1–SH4) are the substrate underneath it, not the whole product.
 Windows dev uses MinGW GCC 13.2 (ucrt); CI exercises Linux/GCC-13, Linux/Clang-19+ASan,
 Windows/MSVC and macOS/AppleClang on every PR.
 
+## ★★★ TWO ANCHOR REGISTRIES — AND PRODUCTION OUTRANKS HARNESS, ALWAYS
+
+Deferrals live in **two** files under `.plans/`, split on 2026-08-25 at the operator's instruction
+(*"the priority is real errors, not cosmetics"*):
+
+| file | holds |
+|---|---|
+| `_deferred-anchor-registry-production.md` | a defect **a user of the compiler could hit** — in the shipped binary, or in the config it reads |
+| `_deferred-anchor-registry-harness.md` | a defect **only we can hit** — tests, gates, guards, cycle machinery, plans, scripts, carriages, CI |
+
+⚠ A row's bucket follows the **DEFECT, never the instrument that found it**. `D-CONFIG-*` and
+`D-DIAG-*` are PRODUCTION deliberately: in this architecture a `.lang/.target/.format.json` document
+IS the compiler's behaviour, and a diagnostic IS its output to a user.
+
+**★★★ THE RULE (operator, 2026-08-25):** *"the priority is always production anchors. ALWAYS.
+harness we fix as we need when we face the problem (NEVER LATER)."*
+
+- **Production is the only queue.** A harness row is never worked *because it is next*.
+- **A harness defect is fixed AT THE MOMENT IT IS FACED** — in that cycle, in that lane. "NEVER
+  LATER" is the whole instruction: a gate that lies, a guard blind to its subject, a script that
+  blocks the work in front of you, gets fixed NOW. Filing it and routing around it is the failure
+  the ruling names.
+- **So the harness registry is a RECORD, not a backlog** — drained by encounter, not by scheduling.
+  A harness row is normally written already ✅ CLOSED, naming a fix that landed the same cycle.
+- ⚠ **This does not repeal "anchor every issue found".** Still file the row: a harness defect fixed
+  silently teaches nobody. The ruling governs what gets **SCHEDULED**, not what gets **RECORDED**.
+- ★ **The measure of a cycle is its production movement.** One whose closures are all harness rows
+  has hardened the workshop and shipped nothing.
+
+Every instrument globs `_deferred-anchor-registry*.md`, so `check-anchor-balance`, the registry
+guard and `burndown-queue` read both with no flag — but **a human reading one file is reading half
+the registry**, and the production half is the one that ranks. ⚠ **Never quote a per-bucket count
+from prose; re-derive it** (`check-anchor-balance.py --breakdown --denominator registry`, whose
+registry total the two buckets must sum to) — the P34 handoff's own production figure was wrong by
+20, and that sum is what caught it.
 ## The rules that actually break things when ignored
 
 These three cause real damage, so they get the emphasis rather than every convention:

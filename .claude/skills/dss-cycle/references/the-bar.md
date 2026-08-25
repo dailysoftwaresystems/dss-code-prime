@@ -330,7 +330,8 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    fix belongs to a later cycle.** "Not my cycle" / "I'll remember it" / "I excluded the failing
    test" / "it passes on the other leg" / "green modulo X" is *precisely the trigger to anchor*,
    never license to drop. Two obligations, BOTH mandatory, BOTH in **this** cycle:
-   - **(a) Anchor it now** — a real registry row in `_deferred-anchor-registry.md` (name +
+   - **(a) Anchor it now** — a real registry row in the deferred-anchor registry: `-production.md`
+     if a USER of the compiler could hit it, `-harness.md` if only WE can (name +
      what/why + trigger + closing-work), committed THIS cycle. A prose-only note in a commit
      message, a chat reply, or a code comment is **NOT** an anchor: an un-anchored issue is
      invisible to the next cycle, to the anchor guard, and to the plan sweep — so it *will* be

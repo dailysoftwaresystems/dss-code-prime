@@ -115,7 +115,7 @@ jobs:
         #
         # The asan leg is not hung and windows is not broken: asan is Debug + ASan +
         # UBSan, ✔11,314 CPU-seconds against gcc-release's 935 (12x), and at
-        # `--parallel 4` that is 47 minutes of PERFECT packing against a 50-minute
+        # `--parallel 6` that is 47 minutes of PERFECT packing against a 50-minute
         # budget. Windows compiled 453 of 786 ninja edges in 45 minutes from a cold
         # cache. Neither number was ever wrong about its own leg; one number for five
         # legs was.
@@ -389,7 +389,9 @@ jobs:
         # PCH-using TU is "uncacheable" and the cache silently does nothing.
         env:
           CCACHE_SLOPPINESS: ${{ 'pch_defines,time_macros' }}
-        run: cmake --build "${{ 'build' }}" --parallel
+        # OPERATOR RULING 2026-08-25: build + tests + run always at 6 cpus.
+        # A BARE `--parallel` means "all cores"; the number is required.
+        run: cmake --build "${{ 'build' }}" --parallel 6
         timeout-minutes: ${{ matrix.build_timeout_min }}
 
       - name: Test
@@ -401,7 +403,7 @@ jobs:
           # surface in stdout but ctest still reports success.
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        # `--parallel 4` runs the suite concurrently (the build step is already
+        # `--parallel 6` runs the suite concurrently (the build step is already
         # parallel). Verified parallel-safe (isolated per-test temp dirs) at -j4;
         # cuts the wall time ~4x. `4` is portable across the Linux/Windows/macOS
         # matrix (unlike a shell `$(nproc)`), and on the ubuntu-latest runner it
@@ -502,7 +504,7 @@ jobs:
           # is not worth an exit-status hazard.
           _t0=$SECONDS
           set +e
-          ctest --stop-time "$STOP" ${{ '--output-on-failure --no-tests=error --parallel 4' }}
+          ctest --stop-time "$STOP" ${{ '--output-on-failure --no-tests=error --parallel 6' }}
           _rc=$?
           set -e
           _used=$(( SECONDS - _t0 ))

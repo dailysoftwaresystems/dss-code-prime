@@ -102,6 +102,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_StatementExprHasNoValue";
         case DiagnosticCode::S_StatementExprAtFileScope:
             return "S_StatementExprAtFileScope";
+        case DiagnosticCode::S_VlaInitializerNotEmpty:
+            return "S_VlaInitializerNotEmpty";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -285,6 +287,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_ConflictingInlineAttributes:
             return "S_ConflictingInlineAttributes";   // TF-C81
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
+        case DiagnosticCode::D_FileReadFailed:           return "D_FileReadFailed";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
         case DiagnosticCode::D_UnresolvedImport:         return "D_UnresolvedImport";
@@ -378,6 +381,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::A_NoMatchingEncodingVariant:    return "A_NoMatchingEncodingVariant";
         case DiagnosticCode::A_RoundTripMismatch:            return "A_RoundTripMismatch";
         case DiagnosticCode::A_ImmediateOperandOutOfRange:   return "A_ImmediateOperandOutOfRange";
+        case DiagnosticCode::A_ImmediateNarrowedToOperandField: return "A_ImmediateNarrowedToOperandField";
         case DiagnosticCode::A_AsmTextUnsupported:           return "A_AsmTextUnsupported";
         case DiagnosticCode::K_SymbolUndefined:              return "K_SymbolUndefined";
         case DiagnosticCode::K_RelocationKindMismatch:       return "K_RelocationKindMismatch";

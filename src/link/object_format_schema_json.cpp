@@ -2735,9 +2735,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 // 0 with no diagnostic anywhere. The largest closed set in the
                 // file, and the one where absence and typo were least
                 // distinguishable.
-                static constexpr std::array<std::string_view, 8> kSectionRowKeys{
-                    "kind", "name", "segment", "type", "flags", "addrAlign",
-                    "entrySize", "virtualAddress"};
+                static constexpr std::array<std::string_view, 9> kSectionRowKeys{
+                    "kind", "encoding", "name", "segment", "type", "flags",
+                    "addrAlign", "entrySize", "virtualAddress"};
                 DSS_CHECK_KEY_VOCABULARY(kSectionRowKeys);
                 rejectUnknownKeys(s, kSectionRowKeys,
                                   std::format("/sections/{}", i),
@@ -2764,6 +2764,44 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     continue;
                 }
                 info.kind = *kOpt;
+                // ── `encoding`: the row's SECOND identity half ──────────
+                //
+                // D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE.
+                // OPTIONAL, and its absence is an ANSWER (`Unspecified`), not a
+                // default that stands in for one: every row that predates this
+                // axis omits it, and a reader that must know the encoding
+                // refuses `Unspecified` by name rather than assuming. Which
+                // KINDS may carry it — and which MUST — is `validate()`'s rule,
+                // stated once there; this arm only resolves the spelling.
+                if (s.contains("encoding")) {
+                    if (!s.at("encoding").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/sections/{}/encoding", i),
+                                  std::format("'encoding' must be a string "
+                                              "(one of {})",
+                                              allowedList(
+                                                  kDeclarableSectionEncodingNames)));
+                        continue;
+                    }
+                    auto const eOpt = sectionEncodingFromName(
+                        s.at("encoding").get<std::string>());
+                    // ★ `Unspecified` IS NOT SPELLABLE, and the check is the
+                    //   membership predicate rather than a second name test:
+                    //   the absent key and the spelled sentinel would otherwise
+                    //   be two spellings of one state.
+                    if (!eOpt.has_value()
+                        || !sectionEncodingIsDeclarable(*eOpt)) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/sections/{}/encoding", i),
+                                  std::format("unknown SectionEncoding name — "
+                                              "expected one of {} (omit the key "
+                                              "to make no encoding claim)",
+                                              allowedList(
+                                                  kDeclarableSectionEncodingNames)));
+                        continue;
+                    }
+                    info.encoding = *eOpt;
+                }
                 if (!s.contains("name") || !s.at("name").is_string()) {
                     coll.emit(DiagnosticCode::C_MissingField,
                               std::format("/sections/{}/name", i),
@@ -2815,18 +2853,29 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 readU64("addrAlign", info.addrAlign);
                 readU64("entrySize", info.entrySize);
                 readU64("virtualAddress", info.virtualAddress);
-                std::uint16_t const idx =
-                    static_cast<std::uint16_t>(data.sections.size());
-                auto [it, fresh] =
-                    data.sectionKindIndex.emplace(info.kind, idx);
-                if (!fresh) {
+                // ★ THE IDENTITY IS THE (KIND, ENCODING) PAIR since
+                //   D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE,
+                //   and `addSectionRow` is the ONE place that says so — this
+                //   loader no longer touches either index directly, so a hand
+                //   -built schema in `tests/` cannot get the rule differently
+                //   right. The message names the encoding too: without it a
+                //   document with two `unwind` rows in ONE encoding reads as
+                //   "duplicate kind", which is the state this axis exists to
+                //   make legal, and the author would take the wrong repair.
+                SectionKind const dupKind = info.kind;
+                SectionEncoding const dupEnc = info.encoding;
+                std::uint16_t dupOf = 0;
+                if (!data.addSectionRow(std::move(info), dupOf)) {
                     coll.emit(DiagnosticCode::C_MalformedJson,
                               std::format("/sections/{}/kind", i),
-                              std::format("duplicate section kind '{}'",
-                                          std::string{sectionKindName(info.kind)}));
+                              std::format("duplicate section kind '{}' with "
+                                          "encoding '{}' (already declared by "
+                                          "section '{}' at /sections/{})",
+                                          std::string{sectionKindName(dupKind)},
+                                          std::string{sectionEncodingName(dupEnc)},
+                                          data.sections[dupOf].name, dupOf));
                     continue;
                 }
-                data.sections.push_back(std::move(info));
             }
         }
     }

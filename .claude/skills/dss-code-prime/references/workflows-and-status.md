@@ -88,7 +88,7 @@ Species: [[D-PLANS-SKILL-REFERENCE-ASSERTS-UNRECHECKED-STATUS]].
 |---|---|---|
 | % complete, empirical C coverage, plan-23 arc %, SQLite-readiness, the cross-target emit/run matrix, an ETA | the **`dss-state`** skill — it runs a 104-probe C-feature battery through the REAL CLI and re-derives every axis at the commit you are standing on | any figure written in a document |
 | What the last cycle did, what it owes the next one, the live operator queue | `.plans/_handoff.md` — **READ FIRST**, rewritten every cycle | a plan's §0 summary, which lags |
-| Whether one specific defect is open | that row's own status cell in `.plans/_deferred-anchor-registry.md` | any list, queue or summary that names the row |
+| Whether one specific defect is open | that row's own status cell in `.plans/_deferred-anchor-registry*.md` | any list, queue or summary that names the row |
 | Anchor open/closed counts | `python scripts/check-anchor-balance/check-anchor-balance.py` | a count quoted in prose |
 | Suite size, pass count, timings | run the gate | this file |
 

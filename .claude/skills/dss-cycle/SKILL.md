@@ -37,6 +37,104 @@ Operator ruling 2026-08-19: *"we must never crash on correct code, even if gcc f
 
 **The test is the DISJUNCTION, not the consensus.** If ANY reference (gcc, clang, MSVC, …) compiles and runs a correct construct, DSS must too. A reference's FAILURE is therefore never evidence against DSS — when DSS accepts what one reference rejects and another accepts, DSS is **right**, and the divergence is a **NON-DSS CONFOUND** to attribute and record. **Never make DSS fail in order to match a failing reference.** This bounds the bidirectional rule: "accepting what no reference accepts is a defect" turns on **NO** — not one. The implementation still owes the full bar (agnostic, config-driven, best-long-term, fail-loud, strictly tested): "it works" is the requirement, not the excuse. ⚠ Probe references **separately** — "the reference" is not one voice, and P14 nearly narrowed a working header chain because only gcc's failure was on file and MSVC's success was not. Full case: `references/the-bar.md` §A.3b.
 
+## ★★★ PRODUCTION ANCHORS ARE THE PRIORITY, ALWAYS — operator ruling 2026-08-25
+
+> *"the priority is always production anchors. ALWAYS. harness we fix as we need when we face the
+> problem (NEVER LATER)."*
+
+The registry is **two files** since 2026-08-25, split at the operator's instruction (*"the priority
+is real errors, not cosmetics"*):
+
+| file | holds |
+|---|---|
+| `.plans/_deferred-anchor-registry-production.md` | a defect **a user of the compiler could hit** — in the shipped binary, or in the config it reads |
+| `.plans/_deferred-anchor-registry-harness.md` | a defect **only we can hit** — tests, gates, guards, cycle machinery, plans, scripts, carriages, CI |
+
+⚠ A row's bucket follows the **DEFECT, never the instrument that found it**. `D-CONFIG-*` and
+`D-DIAG-*` are PRODUCTION deliberately: in this architecture a `.lang/.target/.format.json` document
+IS the compiler's behaviour, and a diagnostic IS its output to a user.
+
+**How the ruling binds this loop, clause by clause:**
+
+1. **Step 1 picks from PRODUCTION.** A harness row is never picked *because it is next*. If §0.1 is
+   dry, promote an eligible **production** anchor. `scripts/burndown-queue/burndown-queue.py`
+   already bands production errors highest — the ruling makes the FILE the outer sort key, above
+   any band.
+2. **"NEVER LATER" is the load-bearing half.** A harness defect is fixed **at the moment it is
+   faced** — this cycle, in the lane that hit it, as part of that lane's work. A gate that lies, a
+   guard blind to its subject, a script that blocks the work in front of you: fix it NOW. **Filing
+   it and routing around it is exactly the failure this ruling names.**
+3. **The harness registry is a RECORD, not a backlog.** It is drained by encounter, not by
+   scheduling. A harness row is normally written already ✅ CLOSED, naming a fix that landed in the
+   same cycle.
+4. **Still file the row.** *Anchor every issue found* is not repealed — a harness defect fixed
+   silently teaches nobody, and the row is what makes the fix auditable. This ruling governs what
+   gets **SCHEDULED**, not what gets **RECORDED**.
+5. **Step 2's "clear blockers FIRST" is unchanged, and is now the ONLY route a harness row takes
+   into a cycle** — it is worked because it BLOCKS the production priority, never on its own ticket.
+6. **The cycle report states production movement SEPARATELY**, because a single total cannot answer
+   the question the operator is actually asking. ★ A cycle whose closures are all harness rows has
+   hardened the workshop and shipped nothing; say so plainly rather than letting a healthy total
+   imply otherwise.
+
+⚠ **Do not quote a per-bucket count from here or from the handoff — re-derive it.** ✔MEASURED
+2026-08-25, and the correction is the reason this warning is here: the P34 handoff's own
+"475 production OPEN" was wrong by 20, caught only by cross-checking the per-bucket split against
+`check-anchor-balance`'s registry total. The instrument, which reuses that gate's own row scanner
+rather than re-typing the "is this row open" vocabulary:
+
+```
+python scripts/check-anchor-balance/check-anchor-balance.py --breakdown --denominator registry
+```
+
+⚠ That gate canonicalises BOTH registry files to ONE key — deliberately, so that MOVING a row
+between buckets is correctly a no-op — so its breakdown gives the registry TOTAL, and a per-bucket
+split must sum to it. ★ **That sum is the cross-check that catches a mis-bucketed or double-counted
+row, and it is the only reason the P34 error surfaced at all.**
+## ★★★ A GATE HOST HOLDS THE REPO AND NOTHING ELSE — operator ruling 2026-08-25
+
+*"keep macos and vps linux arm64 updated with our repo files, and free of stale files/worktrees.
+you own the cleanup."*
+
+**The remote checkout is not a place work accumulates. It is a MIRROR of the tree under test,
+and the cycle owns keeping it one.** A leg that runs against a host holding anything else is
+not testing the tree it reports on.
+
+⚠ **✔MEASURED 2026-08-25 (cycle P34), and it produced a RED that looked like a code defect:**
+the macOS host held **16,312 files against a local 6,660**. `--push` is a `tar` extract and
+**tar extraction never deletes**, so that tree was the UNION of every tree ever pushed —
+including `.plans/_deferred-anchor-registry.md`, deleted locally in the same cycle and still
+sitting there at 6.7 MB. `plan_citations_guard` counted **4908 citations across 213 documents**
+where the live tree has **2853 across 212**, and reddened. The identical guard was `rc=0`
+locally. ★ **The failure named the guard, and the guard was innocent** — hours can go into a
+subject that was never wrong, because a stale remote file is invisible from the driver.
+
+⚠ **AND 9,638 OF THOSE FILES WERE `.claude/worktrees/**` — A FULL COPY OF THE REPO PER LIVE
+AGENT, shipped to the gate host on every push.** That is not merely transport cost: the
+examples runner **globs `examples/<lang>/*`**, and a worktree carries its own `examples/`
+tree, so a gate host holding one can run a corpus belonging to somebody's uncommitted lane
+and report the result as the cycle's.
+
+**The three rules:**
+- **A push is a SYNC, never an accumulation.** `ssh-macos.{sh,ps1}` take `--prune`/`-Prune`
+  and `macos-leg` passes it; the VPS path already had `rsync --delete`. A transport that only
+  adds is a transport that silently diverges.
+- **Worktrees are excluded at the transport, on BOTH carriages.** An agent worktree never
+  belongs on a gate host. ⓘ rsync does NOT delete excluded paths, so adding the exclude does
+  not clean a host that already holds one — that needs an explicit removal, once.
+- **The cleanup is the CYCLE's job, not a thing to notice later.** Before a leg is trusted,
+  the host holds the repo and nothing else.
+
+★ **The general form, which is the part worth carrying: ask what the remote tree IS, not what
+you last sent it.** Every reasoning error here came from thinking about the PUSH — "I sent the
+right files" — when the question is what the far side now CONTAINS. The same distinction that
+makes `git status` worth reading after a merge you are sure about.
+
+⚠ **This narrows, and does not repeal, the standing order against cleaning those hosts.** No
+`git clean`, no `reset --hard`, no `checkout --` on either machine unless the operator names it
+(`macos-leg --reset-to` stays opt-in for exactly that reason). What is authorised is removing
+what the repo does not have: stale files and worktrees.
+
 ## The pause-and-ask gate — the most important behavioral rule
 
 The loop is autonomous for **execution** and escalates **decisions**. When any of these appears,
@@ -101,6 +199,9 @@ hand-typing every edit or reading every subsystem.
 1. **Pick the next priority** from §0.1, top-to-bottom. An explicit argument overrides the auto-pick
    but is still subject to the bar, the pause gate, and the hard-stop checks. If §0.1 is dry, promote
    an *eligible* anchor (unconditional, or trigger already fired) into §0.1, then pick it.
+   ★★★ **The candidate set is `_deferred-anchor-registry-production.md` — ALWAYS** (operator, 2026-08-25). A harness row
+   enters a cycle only by BLOCKING the production priority (step 2), never on its own ticket; and a
+   harness defect you FACE is fixed in this cycle, never filed for later. See the ruling above.
 2. **Clear blockers FIRST** — from the §0.1 "Blocked by" column *and* the registry *and* any
    "requires deferrals" note. Highest-priority blocker first, before the priority itself.
 3. **Plan it** — delegate to `/feature-dev:feature-dev` or a `Plan` / `code-architect` agent.

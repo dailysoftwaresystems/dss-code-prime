@@ -17,6 +17,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -97,6 +98,14 @@ namespace dss {
 class DiagnosticReporter;
 class TypeInterner;
 class TypeRegistry;
+// ⚠ DECLARED, NOT INCLUDED — see `diagnosticCodeForShippedSourceLookup` below.
+// `parse_diagnostic.hpp` is large and this header is widely included; a scoped enum
+// with a declared underlying type is exactly the forward-declarable case, so the
+// dependency stays in the `.cpp` where it already was.
+// ★ It belongs HERE, in `dss`, beside the other diagnostics forward declarations —
+// declaring it inside `dss::ffi` mints a SECOND, distinct type and makes every
+// existing `DiagnosticCode` reference in the ffi tree ambiguous.
+enum class DiagnosticCode : std::uint16_t;
 
 namespace ffi {
 
@@ -586,11 +595,63 @@ struct DSS_EXPORT ShippedLibDescriptor {
 [[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path>
 findShippedConfigRootDir();
 
-// Resolve a descriptor's config-root-relative `realization.<fmt>.source` to an
-// absolute path. nullopt ⇒ discovery failed OR no readable file is there — the
-// two are one answer to the caller, which is R1's whole question.
-[[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path>
-resolveShippedSourcePath(std::string_view configRelativePath);
+// Why a shipped-source path did not resolve.
+//
+// ★★ THESE USED TO BE ONE `nullopt`, AND THE COLLAPSE WAS A MISATTRIBUTION WITH
+// TEETH. The predecessor returned `optional<path>` and its docblock called the
+// collapse deliberate — "discovery failed OR no readable file is there — the two are
+// one answer to the caller". It was really THREE answers: `is_regular_file(p, ec)`
+// reports false both when nothing is there AND when the query itself failed, and the
+// `ec` that distinguishes them was discarded unread. Every caller then stated ABSENCE
+// as fact.
+// ✔MEASURED 2026-08-25 on the Windows gate under concurrent load: two entries failed
+// naming `runtime/platform/src/unistd.c` and `dirent.c` as files that are not there,
+// while both were present, regular and readable seconds later. A user with antivirus,
+// a network share, a locked file or a concurrent writer gets sent hunting for a file
+// sitting exactly where it belongs.
+// ★ The fix is the TYPE, not the message: a caller cannot report a difference its
+// return value cannot carry.
+enum class ShippedSourceResolution : std::uint8_t {
+    Resolved,      // an absolute path to a regular file
+    NoConfigRoot,  // `src/dss-config/` was not discovered — about the ENVIRONMENT
+    NotPresent,    // the root resolved and nothing exists at that path
+    NotAFile,      // something exists there, but it is not a regular file
+    QueryFailed,   // the filesystem could not answer — carries the `error_code`
+};
+
+struct ShippedSourceLookup {
+    ShippedSourceResolution status{ShippedSourceResolution::NotPresent};
+    std::filesystem::path   path{};   // the resolved absolute path when known
+    std::error_code         error{};  // set iff `status == QueryFailed`
+
+    [[nodiscard]] bool resolved() const noexcept {
+        return status == ShippedSourceResolution::Resolved;
+    }
+};
+
+// Resolve a descriptor's config-root-relative `realization.<fmt>.source`.
+[[nodiscard]] DSS_EXPORT ShippedSourceLookup
+resolveShippedSource(std::string_view configRelativePath);
+
+// One clause naming what ACTUALLY happened, for a diagnostic to embed. Never claims
+// absence unless absence was established.
+[[nodiscard]] DSS_EXPORT std::string
+describeShippedSourceLookup(ShippedSourceLookup const& lookup,
+                            std::string_view           configRelativePath);
+
+// The diagnostic CODE this outcome deserves.
+//
+// ★ A CODE IS A CLAIM IN THE SAME WAY ITS MESSAGE IS, which is why this is a named
+// function and not a ternary at the emit site: anything that filters, counts or
+// suppresses `D_FileNotFound` was silently counting I/O failures as missing files, and
+// no amount of message rewording reaches that. Naming it also makes it PINNABLE —
+// `check-diagnostic-codes` refuses a code no compiled test names, and it is right to.
+//
+// ⚠ Forward-declared rather than including `parse_diagnostic.hpp`: that header is
+// large and this one is widely included. A scoped enum with a declared underlying type
+// is precisely the forward-declarable case, so the dependency stays in the `.cpp`.
+[[nodiscard]] DSS_EXPORT DiagnosticCode
+diagnosticCodeForShippedSourceLookup(ShippedSourceLookup const& lookup);
 
 // The interner-free FAST reader the DRIVER uses: every config-root-relative
 // shipped SOURCE path the descriptor at `path` realizes on `formatName`, from the

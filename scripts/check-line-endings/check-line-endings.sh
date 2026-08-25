@@ -333,5 +333,5 @@ echo "      Do NOT reach for \`eol=crlf\`: MEASURED — a \`text eol=crlf\` file
 echo "      still stages as an LF blob, so it cannot make this red go away."
 echo ""
 echo "See D-REPO-GITATTRIBUTES-PINS-EOL-FOR-CONFIGS-BUT-NOT-FOR-SOURCES in"
-echo ".plans/_deferred-anchor-registry.md for why this is machine-checked."
+echo ".plans/_deferred-anchor-registry*.md for why this is machine-checked."
 exit 1

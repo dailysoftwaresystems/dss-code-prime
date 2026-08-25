@@ -8,13 +8,13 @@
 # `tests/`, `integrated_tests/`, `real-examples/`, `scripts/`, `.claude/` — see
 # the roots table below)
 # MUST resolve to a row in
-# `.plans/_deferred-anchor-registry.md` OR a citation in any `.plans/*.md`
+# `.plans/_deferred-anchor-registry*.md` OR a citation in any `.plans/*.md`
 # file. The script greps source/, extracts each unique `D-*` anchor name,
 # and fails-loud listing every anchor that has no plan-side counterpart.
 #
 # Allowlist: anchor-shaped strings that are NOT deferred-work markers
 # (in-code constants, diagnostic-message identifiers) live in
-# `.plans/_deferred-anchor-registry.md` under the "Allowlist" section. The
+# `.plans/_deferred-anchor-registry*.md` under the "Allowlist" section. The
 # script reads them from the table rows starting with `| `.
 #
 # Quotation declaration: a document that QUOTES a dead anchor id as evidence —
@@ -696,6 +696,18 @@ _root_include_args() {
     set -f
     for _g in $1; do _inc+=(--include="${_g}"); done
     [[ "${_noglob_was_set}" -eq 1 ]] || set +f
+    # ⚠ A GIT WORKTREE IS ANOTHER CHECKOUT OF THIS SAME REPO. An agent creates one
+    # under `.claude/worktrees/`, so the `.claude` root would be scanned TWICE and every
+    # document would face its own duplicate. ✔MEASURED 2026-08-25: that produced six
+    # "a quotation declaration LEAKED" failures, each file accusing its own copy of
+    # exempting a name on its behalf, on a tree that was entirely correct -- the guard
+    # went red because a TOOL was running, which is the worst kind of false red because
+    # it trains a reader to disbelieve the guard.
+    # ★ Not a new judgement: `.gitignore` calls these "throwaway checkouts", and
+    # `check-plan-citations` already prunes `worktrees` as "another checkout".
+    # Set HERE rather than per call site because this is the one place all four
+    # `grep -r` passes get their filters; the last one added would otherwise be the hole.
+    _inc+=(--exclude-dir=worktrees --exclude-dir=__pycache__ --exclude-dir=.git)
 }
 _scan_one_root() {
     local _root="$1" _floor="$2" _globs="$3" _out="$4" _hits _n
@@ -1366,7 +1378,11 @@ _retired_tmp="$(mktemp)"; _tmps+=("${_retired_tmp}")
 # the two false positives the note above records, instead of asserting that a
 # copy of it behaves. Both of those false positives appeared in production, one of
 # them within minutes of the fix for the other.
-LC_ALL=C awk -F'|' "${RETIRED_ID_AWK}" .plans/_deferred-anchor-registry.md > "${_retired_tmp}"
+# ⚠ GLOB, not one file: the registry split into production/harness on 2026-08-25
+# and a retired id may live in either. Naming one file here would silently stop
+# matching half of them -- an invisible narrowing, which is the failure mode this
+# repository treats as the dangerous one.
+LC_ALL=C awk -F'|' "${RETIRED_ID_AWK}" .plans/_deferred-anchor-registry*.md > "${_retired_tmp}"
 _retired_count="$(grep -c . "${_retired_tmp}" || true)"
 # FAIL-CLOSED on a collapsed extraction, like every other scan here. The registry
 # carries retired rows; zero means the marker drifted or the table shape changed,
@@ -1523,15 +1539,16 @@ FILENAME == idxf {
 ' "${_locator_tmp}" "${_missing_tmp}"
 echo ""
 echo "Fix: either"
-echo "  (a) add a row in .plans/_deferred-anchor-registry.md naming the"
-echo "      trigger + closing work, OR"
+echo "  (a) add a row in the deferred-anchor registry naming the"
+echo "      trigger + closing work -- .plans/_deferred-anchor-registry-production.md"
+echo "      if a USER of the compiler could hit it, -harness.md if only WE can, OR"
 echo "  (b) cite the anchor in a per-plan section 3.1 row (preferred when the"
 echo "      anchor maps to a specific plan's feature area), OR"
 echo "  (c) if the string is a code-internal pin not deferred work, add it"
 echo "      to the Allowlist section of the registry."
 echo ""
 echo "Discipline: this leak recurred TWICE before this guard landed."
-echo "See .plans/_deferred-anchor-registry.md for the discipline rationale."
+echo "See .plans/_deferred-anchor-registry-production.md for the discipline rationale."
 # ★ BOTH halves report on every run — that is settled above. But an exit code
 # can carry only ONE number, so when both fail the precedence is DELIBERATE
 # rather than whichever branch happens to run last: a COLLAPSED scan (2) beats a

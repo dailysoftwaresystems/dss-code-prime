@@ -265,7 +265,9 @@ jobs:
         timeout-minutes: 15
 
       - name: Build
-        run: cmake --build "${{ 'build' }}" --parallel
+        # OPERATOR RULING 2026-08-25: build + tests + run always at 6 cpus.
+        # A BARE `--parallel` means "all cores"; the number is required.
+        run: cmake --build "${{ 'build' }}" --parallel 6
         timeout-minutes: 90
 
       # ── Stage the INSTALL SET, and tar THAT ───────────────────────────────

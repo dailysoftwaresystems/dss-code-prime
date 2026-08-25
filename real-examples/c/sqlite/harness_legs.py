@@ -65,6 +65,7 @@ USAGE
 
 import argparse
 import hashlib
+import glob
 import json
 import os
 import platform
@@ -10411,6 +10412,24 @@ def _registry_row_matches(row_lower, token):
                      % re.escape(token), row_lower) is not None
 
 
+def _registry_documents(registry_path):
+    """The registry document(s) this lookup should read.
+
+    ★ THE REGISTRY BECAME TWO FILES on 2026-08-25 (production / tools-harness), so a
+    lookup that opens ONE of them silently misses half the controls. This lookup is
+    FAIL-SOFT by design, which is exactly what makes that dangerous: "I could not read
+    it" and "I read it and nothing matched" both come back as no rows, so a blind
+    instrument is indistinguishable from a working one that found nothing.
+
+    A path carrying a glob metacharacter expands and every match is read; a plain path
+    stays itself, which is what keeps the self-test fixtures reading exactly what they
+    name and keeps any older caller behaving as before.
+    """
+    if any(ch in registry_path for ch in "*?["):
+        return sorted(p for p in glob.glob(registry_path) if os.path.isfile(p))
+    return [registry_path] if os.path.isfile(registry_path) else []
+
+
 def registry_controls(registry_path, legs, tests,
                       max_rows=REGISTRY_CONTROL_MAX_ROWS):
     """(lines, note) — the registry rows whose text names this failure.
@@ -10436,49 +10455,61 @@ def registry_controls(registry_path, legs, tests,
                     test_toks.append(tok)
         if not leg_toks and not test_toks:
             return [], "no leg or test-family name to look up"
-        if not os.path.isfile(registry_path):
+        docs = _registry_documents(registry_path)
+        if not docs:
             return [], ("registry not readable here (%s) — check it by hand for "
                         "a matched control" % registry_path)
-        size = os.path.getsize(registry_path)
+        size = sum(os.path.getsize(d) for d in docs)
         if size > REGISTRY_CONTROL_MAX_BYTES:
-            return [], ("registry is %d bytes, past this lookup's %d-byte cap — "
-                        "not read" % (size, REGISTRY_CONTROL_MAX_BYTES))
+            return [], ("registry is %d bytes across %d document(s), past this "
+                        "lookup's %d-byte cap — not read"
+                        % (size, len(docs), REGISTRY_CONTROL_MAX_BYTES))
+
+        def _rows():
+            # Flattened rather than nested so the row filter below keeps its shape:
+            # the document name rides along with the line number because a bare line
+            # number stopped being unique the moment the registry became two files.
+            for _doc in docs:
+                with open(_doc, "r", encoding="utf-8", errors="replace") as fh:
+                    for _n, _row in enumerate(fh, 1):
+                        yield os.path.basename(_doc), _n, _row
+
         hits = []
-        with open(registry_path, "r", encoding="utf-8", errors="replace") as fh:
-            for lineno, row in enumerate(fh, 1):
-                if not row.startswith("|"):
-                    continue
-                cells = row.split("|")
-                if len(cells) < 3:
-                    continue
-                anchor = re.search(r"`(D-[A-Z0-9-]+)`", cells[1] or "")
-                if not anchor:
-                    continue
-                low = row.lower()
-                hit_tests = [t for t in test_toks
-                             if _registry_row_matches(low, t.lower())]
-                hit_legs = [t for t in leg_toks
-                            if _registry_row_matches(low, t.lower())]
-                if test_toks and not hit_tests:
-                    continue          # the leg alone is not a matched control
-                if not hit_tests and not hit_legs:
-                    continue
-                matched = hit_tests + hit_legs
-                hits.append((len(hit_tests) * 3 + len(hit_legs),
-                             max(len(t) for t in matched),
-                             lineno, anchor.group(1), matched, cells[2]))
+        for docname, lineno, row in _rows():
+            if not row.startswith("|"):
+                continue
+            cells = row.split("|")
+            if len(cells) < 3:
+                continue
+            anchor = re.search(r"`(D-[A-Z0-9-]+)`", cells[1] or "")
+            if not anchor:
+                continue
+            low = row.lower()
+            hit_tests = [t for t in test_toks
+                         if _registry_row_matches(low, t.lower())]
+            hit_legs = [t for t in leg_toks
+                        if _registry_row_matches(low, t.lower())]
+            if test_toks and not hit_tests:
+                continue          # the leg alone is not a matched control
+            if not hit_tests and not hit_legs:
+                continue
+            matched = hit_tests + hit_legs
+            hits.append((len(hit_tests) * 3 + len(hit_legs),
+                         max(len(t) for t in matched),
+                         docname, lineno, anchor.group(1), matched, cells[2]))
         if not hits:
             named = ", ".join((test_toks + leg_toks)[:6])
             return [], ("no registry row names %s — nothing matched, which is "
                         "itself worth recording" % named)
-        hits.sort(key=lambda h: (-h[0], -h[1], h[2]))
+        hits.sort(key=lambda h: (-h[0], -h[1], h[2], h[3]))
         lines = []
-        for _, _, lineno, anchor, matched, cell in hits[:max_rows]:
+        for _, _, docname, lineno, anchor, matched, cell in hits[:max_rows]:
             excerpt = re.sub(r"\s+", " ", re.sub(r"[*`]", "", cell)).strip()
             if len(excerpt) > REGISTRY_CONTROL_EXCERPT:
                 excerpt = excerpt[:REGISTRY_CONTROL_EXCERPT] + " …"
-            lines.append("%s  [line %d, matched %s]\n      %s"
-                         % (anchor, lineno, " ".join(matched[:4]), excerpt))
+            lines.append("%s  [%s line %d, matched %s]\n      %s"
+                         % (anchor, docname, lineno,
+                            " ".join(matched[:4]), excerpt))
         if len(hits) > max_rows:
             lines.append("… and %d more row(s) — grep the registry for %s"
                          % (len(hits) - max_rows,
@@ -11413,7 +11444,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     _FX_A, _FX_B = _FX + "RUNDIR", _FX + "OTHER-LEG"
     _rdir = _rtf.mkdtemp(prefix="dss-regctl-")
     try:
-        _reg = os.path.join(_rdir, "_deferred-anchor-registry.md")
+        _reg = os.path.join(_rdir, "_deferred-anchor-registry-production.md")
         with open(_reg, "w", encoding="utf-8") as _fh:
             _fh.write(
                 "| Anchor | Status | Resolution | Files |\n"
@@ -11460,6 +11491,41 @@ def self_test(path=CATALOGUE, out=sys.stdout):
               in registry_controls(_reg, [], ["zzzznosuchfamily-1.0"])[1])
         check("a registry that is a DIRECTORY is fail-soft, not an exception",
               registry_controls(_rdir, ["elf64-x86_64"], [])[0] == [])
+        # ★★ THE REGISTRY IS TWO DOCUMENTS (production / tools-harness) since
+        # 2026-08-25, and this arm is what keeps the lookup able to see BOTH. Revert
+        # `_registry_documents` to a single-file check and every arm above still
+        # passes -- they each name one concrete file -- while the real lookup silently
+        # reads half the registry and reports "nothing matched". That is the exact
+        # shape of a fail-soft instrument going blind.
+        _FX_C = _FX + "SECOND-DOCUMENT"
+        _reg_b = os.path.join(_rdir, "_deferred-anchor-registry-harness.md")
+        with open(_reg_b, "w", encoding="utf-8") as _fh:
+            _fh.write(
+                "| Anchor | Status | Resolution | Files |\n"
+                "| --- | --- | --- | --- |\n"
+                "| `%s` | the elf64-x86_64 leg and " % _FX_C +
+                "walsetlk-2.1.3 again, filed in the OTHER document | x | y |\n")
+        _glob = os.path.join(_rdir, "_deferred-anchor-registry*.md")
+        _both, _bnote = registry_controls(_glob, ["elf64-x86_64"],
+                                          ["walsetlk-2.1.3"], max_rows=20)
+        check("a GLOB reads every registry document, not just the first",
+              _bnote == "" and any(_FX_A in ln for ln in _both)
+              and any(_FX_C in ln for ln in _both),
+              "note=%r lines=%r" % (_bnote, _both))
+        # Selected FIRST and counted, never asserted with a bare `all(... if ...)`:
+        # over an empty list that is vacuously true, so under a single-document
+        # regression this arm would have passed while finding nothing at all.
+        _c_lines = [ln for ln in _both if _FX_C in ln]
+        _a_lines = [ln for ln in _both if _FX_A in ln]
+        check("...and each row names WHICH document it came from, because a bare "
+              "line number stopped being unique when the registry split",
+              len(_c_lines) == 1 and "-harness.md" in _c_lines[0]
+              and len(_a_lines) == 1
+              and "_deferred-anchor-registry-production.md" in _a_lines[0],
+              "c=%r a=%r" % (_c_lines, _a_lines))
+        check("a glob matching NOTHING is fail-soft, like an absent file",
+              registry_controls(os.path.join(_rdir, "no-such-*.md"),
+                                ["elf64-x86_64"], [])[0] == [])
     finally:
         shutil.rmtree(_rdir, ignore_errors=True)
 
@@ -15056,7 +15122,7 @@ def main(argv=None):
                         "from the shipped drivers — on byte-identical input. "
                         "Prints `passed=N failed=N skipped=N`.")
     p.add_argument("--registry-controls", default=None, metavar="REGISTRY",
-                   help="print any _deferred-anchor-registry.md row whose text "
+                   help="print any _deferred-anchor-registry*.md row whose text "
                         "names one of the --for NAMEs (a leg label, a failing "
                         "test name or family). Called by both drivers AT the "
                         "point they report a failure, so a prior matched "

@@ -1831,6 +1831,35 @@ enum class DiagnosticCode : std::uint16_t {
     // call gone), which is the shape of silent miscompile this project refuses.
     S_StatementExprAtFileScope = 0xE070,
 
+    // P34 (D-CSUBSET-VLA-INITIALIZER, C23 §6.7.10p4: "An entity of variable
+    // length array type shall not be initialized except by an empty
+    // initializer"): an object whose DECLARED type is (or contains) a variable
+    // length array carries an initializer that is not the empty `{}` —
+    // `int a[argc] = {1,2,3};`. A VLA's length is a RUN-TIME value, so there is
+    // no compile-time element count for the initializer to be checked or laid
+    // out against; the standard's answer is to forbid the form outright, and all
+    // three references agree — ✔MEASURED 2026-08-25, gcc 13.3.0 ("variable-sized
+    // object may not be initialized except with an empty initializer"), clang
+    // 19.1.1 and clang 18.1.3 ("variable-sized object may not be initialized"),
+    // each in both `-std=gnu17` and `-std=c2x`.
+    //   ★ A DISTINCT CODE RATHER THAN S_NonConstantArrayLength (0xE00B), on this
+    // header's own stated grounds ("kept separate so the message matches
+    // reality"): the bound here is legal and the ARRAY is legal — `int a[argc];`
+    // is accepted two lines up. What is refused is the INITIALIZER, and a report
+    // naming the length would send the reader to fix the wrong token.
+    //   ★ WHAT IT REPLACED IS WORSE THAN SILENCE IN BOTH DIRECTIONS, MEASURED at
+    // `8cb9afbd`: the resolver treated a present-but-non-constant bound with an
+    // initializer as an ABSENT bound, so `int a[argc] = {1,2,3};` compiled CLEAN
+    // at a compile-time `sizeof` of 12 — the `argc` the programmer wrote was
+    // discarded without a word — while the LEGAL `int a[argc] = {};` was rejected
+    // S000C for having re-sized to zero.
+    //   NOT in `unsuppressable_codes.cpp`, deliberately: the emit site also
+    // leaves the declared type INVALID, so a suppressed report cannot ship an
+    // artifact — the symbol stays untyped and the HIR verifier's
+    // requiresValidType surfaces H_TypeUnresolved. The guarantee is structural
+    // rather than a suppression-list entry.
+    S_VlaInitializerNotEmpty = 0xE071,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
@@ -2781,6 +2810,20 @@ enum class DiagnosticCode : std::uint16_t {
     //   [[D-DIAG-SOLE-STATEMENT-REJECTS-MAY-SUPPRESS-TO-A-SILENT-EXIT]].
     D_LanguageTargetIsaMismatch  = 0xD02A,
 
+    // ★★ THE FILESYSTEM COULD NOT ANSWER — WHICH IS NOT THE SAME CLAIM AS
+    // `D_FileNotFound` (0xD001), and conflating them is the defect this code exists
+    // to end. A path held by antivirus, served by a flaking network share, or being
+    // rewritten by another process answers neither "here it is" nor "nothing is
+    // here"; reporting the second sends a reader hunting for a file that is sitting
+    // exactly where it belongs.
+    // ✔MEASURED 2026-08-25 on the Windows gate under concurrent load: two entries
+    // reported `runtime/platform/src/{unistd,dirent}.c` as files that are not there,
+    // while both were present, regular and readable seconds later.
+    // ⚠ A code is a CLAIM in the same way its message is: anything that filters or
+    // counts not-found codes was counting I/O failures as missing files. Message
+    // wording alone could not have fixed that.
+    D_FileReadFailed             = 0xD02B,
+
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
     // Codes emitted by HIR-tier subsystems — verifier, CST→HIR lowering,
@@ -3483,6 +3526,45 @@ enum class DiagnosticCode : std::uint16_t {
     //   multi-instruction sequence (MOVZ+MOVK / shifted MOVZ) once that
     //   lowering lands, or narrow the value. Unsuppressable.
     A_ImmediateOperandOutOfRange   = 0x1007,
+    // A_ImmediateNarrowedToOperandField
+    // (D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES, cycle P34):
+    //   the SIBLING of the code above, and the two are separated by ONE
+    //   question — can the encoder prove the field it is writing carries the
+    //   operation's WHOLE value? The wire's slot declares a field width; the
+    //   variant's `guard.width` declares the operation width. When they are
+    //   EQUAL the field is the value's own home, so a value that overflows it
+    //   is a NARROWING (the low bits are the instruction the reference
+    //   emits) and this code reports it at `Warning` while the bytes go out.
+    //   When they DIFFER — a fixed narrow parameter such as an x86 shift
+    //   count's `ib` on a 64-bit shift — the field was never the value's
+    //   home, the references REFUSE such an operand outright, and the
+    //   encoder keeps emitting `A_ImmediateOperandOutOfRange` at `Error`.
+    //
+    //   ★★★ WHY A WARNING AND NOT SILENCE, WHICH IS WHAT THE REFERENCE DOES.
+    //   ✔MEASURED, GNU as 2.42, one spelling at a time: `mov $-32769, %cx`
+    //   assembles rc=0 to `66 b9 ff 7f` with NO DIAGNOSTIC AT ALL — 0x8000 of
+    //   magnitude vanishes with nothing on stderr. Matching the reference
+    //   EXACTLY would have imported that silence, and a silently narrowed
+    //   immediate is the shape this project calls a miscompile. The operator
+    //   ruled a third arm: take the ACCEPTANCE from the reference and the
+    //   LOUDNESS from the old refusal. It is available because the
+    //   disjunction rule constrains what DSS must COMPILE, never what it must
+    //   stay QUIET about — a reference's SILENCE is not part of the behaviour
+    //   a reference licenses.
+    //
+    //   ⚠ DSS IS LOUDER THAN THE REFERENCE ON A STRICT SUPERSET, NEVER
+    //   QUIETER, AND THE TWO WINDOWS ARE NOT THE SAME WINDOW. gas is silent
+    //   while |v| <= 2^N - 1 (✔MEASURED at N = 8, 16 and 32); DSS is silent
+    //   only inside [-2^(N-1), 2^N - 1], the union of the signed and unsigned
+    //   readings of the same N bits — the window that was DSS's refusal
+    //   threshold before this code existed and is now its SILENCE threshold.
+    //   The window did not widen; it changed what it gates. Every value gas
+    //   warns about, DSS warns about; the band between the two windows
+    //   (`$-32769` at N = 16) is where DSS speaks and gas does not.
+    //
+    //   Fix: write the constant that actually fits, or use the wider form of
+    //   the instruction. Unsuppressable — see `unsuppressable_codes.cpp`.
+    A_ImmediateNarrowedToOperandField = 0x1009,
     // ── Standalone assembly TEXT → LIR (plan 29 P4; the `encode` tier) ──
     //
     // ★★ ONE CODE, MANY MESSAGES, AND THAT IS DELIBERATE. Every failure this

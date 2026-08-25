@@ -192,7 +192,11 @@ CLI_SMOKE="$SCRIPT_DIR/cli-smoke.py"
 # (D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE).
 # NOT required to exist: a checkout without .plans still runs, it just gets one
 # line saying the lookup found nothing to read.
-ANCHOR_REGISTRY="$SCRIPT_DIR/../../../.plans/_deferred-anchor-registry.md"
+# A GLOB, not a file: the registry became two documents (production /
+# tools-harness) on 2026-08-25, and reading one of them is reading half the
+# controls. Because the lookup is fail-soft, a blind one and an empty one report
+# the same thing -- so the breadth has to be built in here, not noticed later.
+ANCHOR_REGISTRY="$SCRIPT_DIR/../../../.plans/_deferred-anchor-registry*.md"
 # ── THE SHARED CORE ──────────────────────────────────────────────────────────
 # base-harness.sh holds the recipe derivation, the artifact read-back and the
 # per-(leg, artifact) verdict ledger — the decisions this driver and

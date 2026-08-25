@@ -113,7 +113,7 @@ Every file `git ls-files --cached --others --exclude-standard` reports, MINUS
   * ⚠⚠ WHY `.plans/` IS OUT, AND IT IS A MEASUREMENT RATHER THAN A CARVE-OUT.
     ✔MEASURED 2026-08-24 with the shipped predicate: 40 of the 49 tree-wide
     candidates live under `.plans/`, **27 of them in
-    `_deferred-anchor-registry.md` alone** and 5 more in `plan-00`. Those
+    `_deferred-anchor-registry*.md` alone** and 5 more in `plan-00`. Those
     documents are REWRITTEN EVERY CYCLE by design, so a per-file ceiling on them
     would move in BOTH directions on ordinary editing -- a new row reds as a
     regression, a swept row reds as unclaimed headroom -- and a guard that fires
