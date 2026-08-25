@@ -77,12 +77,12 @@ constexpr std::string_view kRationaleKey = "$absentKeyRationale";
 // The shipped-config tree, through the ONE test-side resolver so an
 // OUT-OF-TREE build finds it (the `test_c_symbol_decoration.cpp` precedent).
 [[nodiscard]] fs::path objectFormatsDir() {
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config" / "object-formats";
+    return *root / "object-formats";
 }
 
 struct Format {

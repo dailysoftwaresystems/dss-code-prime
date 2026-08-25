@@ -63,6 +63,23 @@
 # are recorded in `tests/ffi/data/README-bsd-archives.md`.
 !tests/ffi/data/*.a
 
+# ★ FOREIGN-UNWIND archive fixtures
+# (D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE), the same
+# negation as the BSD one above and for the same reason.
+# `examples/c/merged_foreign_unwind_carry` links a PREBUILT `gcc -c` + `ar rcs`
+# archive whose members carry a real `.eh_frame`, because the subject of that
+# row is a FOREIGN encoding: an archive DSS built itself would be reading back
+# this project's own writer and could not fail the way the row describes. The
+# manifest's `containerWitness` is the literal `.eh_frame`, so a fixture
+# regenerated with `-fno-asynchronous-unwind-tables` fails the manifest instead
+# of passing vacuously.
+# ★ WITHOUT THIS NEGATION both fixtures are silently un-committable, and the
+# example then fails on every machine except the one that built them — which is
+# worse than the pre-P32 state, because the failure looks like a defect in the
+# carry rather than a missing input. Scoped to this one directory on purpose.
+# Provenance + md5s are in the example's `expected.json`.
+!tests/link/data/*.a
+
 # Executables
 *.exe
 *.out

@@ -7605,6 +7605,145 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // absent leaves it empty, so a `#line` hits the generic
             // unsupported-directive fail-loud (the embed/pragma opt-in model).
             readOptWord("lineDirective",          cfg.lineDirective);
+            // ── D-C-PREPROCESSED-INPUT-REFUSES-GCC-LINEMARKERS: `lineMarker` ──
+            //
+            // The GNU LINEMARKER (`# 1 "file" 1 3 4`) — the same presumed-position
+            // facility as `#line`, spelled the way every `-E` pipeline emits it.
+            // OPTIONAL, the `pragmaEffects`/`lineDirective` opt-in model: absent
+            // leaves the block empty so the line falls through to the generic
+            // unsupported-directive fail-loud, which is what the C front end did
+            // before this cycle.
+            //
+            // The FLAG rows are the only content, and every rule below is one the
+            // references themselves enforce (both refuse an undeclared digit and
+            // refuse `1 2` together — measured, see the field doc). A row's `name`
+            // is quoted in the runtime diagnostics, so it is load-bearing text
+            // rather than a comment: rename it and the pinned message changes.
+            if (pp.contains("lineMarker")) {
+                json const& lm = pp.at("lineMarker");
+                if (!lm.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/lineMarker",
+                              "'preprocess.lineMarker' must be an object with a "
+                              "'flags' array");
+                } else {
+                    static constexpr std::array<std::string_view, 1>
+                        kLineMarkerKeys{"flags"};
+                    DSS_CHECK_KEY_VOCABULARY(kLineMarkerKeys);
+                    (void)checkKeysAgainst(
+                        lm, kLineMarkerKeys, "/preprocess/lineMarker",
+                        "the 'lineMarker' block",
+                        DiagnosticCode::C_InvalidPreprocess, coll);
+                    PreprocessConfig::LineMarkerConfig out;
+                    bool                                rowsOk = true;
+                    if (!lm.contains("flags") || !lm.at("flags").is_array()) {
+                        coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                  "/preprocess/lineMarker/flags",
+                                  "'preprocess.lineMarker.flags' must be an array "
+                                  "of { digits, name } rows — an EMPTY array is a "
+                                  "legal declaration and means the language admits "
+                                  "a linemarker but no flag tail");
+                        rowsOk = false;
+                    } else {
+                        static constexpr std::array<std::string_view, 3>
+                            kLineMarkerFlagKeys{"digits", "name",
+                                                "exclusiveGroup"};
+                        DSS_CHECK_KEY_VOCABULARY(kLineMarkerFlagKeys);
+                        std::unordered_set<std::string> seenDigits;
+                        std::unordered_set<std::string> seenNames;
+                        json const& flags = lm.at("flags");
+                        for (std::size_t fi = 0; fi < flags.size(); ++fi) {
+                            auto const fpath = std::format(
+                                "/preprocess/lineMarker/flags/{}", fi);
+                            json const& row = flags[fi];
+                            if (!row.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          fpath,
+                                          "a 'lineMarker.flags' entry must be an "
+                                          "object");
+                                rowsOk = false;
+                                continue;
+                            }
+                            (void)checkKeysAgainst(
+                                row, kLineMarkerFlagKeys, fpath,
+                                "a 'lineMarker.flags' entry",
+                                DiagnosticCode::C_InvalidPreprocess, coll);
+                            PreprocessConfig::LineMarkerFlagDef def;
+                            auto readStr = [&](std::string_view key,
+                                               std::string&     dst,
+                                               bool             required) {
+                                if (!row.contains(key)) {
+                                    if (required) {
+                                        coll.emit(DiagnosticCode::C_MissingField,
+                                                  std::format("{}/{}", fpath, key),
+                                                  std::format(
+                                                      "a 'lineMarker.flags' entry "
+                                                      "requires '{}'", key));
+                                        rowsOk = false;
+                                    }
+                                    return;
+                                }
+                                if (!row.at(key).is_string()
+                                    || row.at(key).get<std::string>().empty()) {
+                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                              std::format("{}/{}", fpath, key),
+                                              std::format("'lineMarker.flags.{}' "
+                                                          "must be a non-empty "
+                                                          "string", key));
+                                    rowsOk = false;
+                                    return;
+                                }
+                                dst = row.at(key).get<std::string>();
+                            };
+                            readStr("digits", def.digits, /*required=*/true);
+                            readStr("name", def.name, /*required=*/true);
+                            readStr("exclusiveGroup", def.exclusiveGroup,
+                                    /*required=*/false);
+                            // A flag SPELLING that is not a decimal run could
+                            // never be produced by the recognizer (which reaches
+                            // this arm only on a digit-led directive), so it is
+                            // dead config — the shape this loader refuses
+                            // everywhere else.
+                            if (!def.digits.empty()
+                                && def.digits.find_first_not_of("0123456789")
+                                       != std::string::npos) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          std::format("{}/digits", fpath),
+                                          std::format("'lineMarker.flags.digits' "
+                                                      "must be a decimal digit "
+                                                      "sequence — got '{}', which "
+                                                      "no linemarker tail can ever "
+                                                      "spell", def.digits));
+                                rowsOk = false;
+                            }
+                            if (!def.digits.empty()
+                                && !seenDigits.insert(def.digits).second) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          std::format("{}/digits", fpath),
+                                          std::format("linemarker flag '{}' is "
+                                                      "declared twice — which row "
+                                                      "names it would be decided by "
+                                                      "iteration order",
+                                                      def.digits));
+                                rowsOk = false;
+                            }
+                            if (!def.name.empty()
+                                && !seenNames.insert(def.name).second) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          std::format("{}/name", fpath),
+                                          std::format("linemarker flag name '{}' is "
+                                                      "used by two rows — the name "
+                                                      "is what a diagnostic quotes, "
+                                                      "so it must identify one flag",
+                                                      def.name));
+                                rowsOk = false;
+                            }
+                            out.flags.push_back(std::move(def));
+                        }
+                    }
+                    if (rowsOk) cfg.lineMarker = std::move(out);
+                }
+            }
             // D-CPP-ERROR-WARNING (`#error` C23 6.10.5 / `#warning` C23 6.10.6):
             // the DIAGNOSTIC directive words. OPTIONAL — absent leaves each empty
             // so the line hits the generic unsupported-directive fail-loud (the

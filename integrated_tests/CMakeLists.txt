@@ -101,8 +101,17 @@ foreach(MANIFEST ${DSS_EXAMPLE_MANIFESTS})
                 "--cells=${DSS_INTEGRATED_CELLS}"
     )
     set_tests_properties(${TEST_NAME} PROPERTIES
-        ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}"
         FIXTURES_REQUIRED DssIntegratedCells)
+    # D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED.
+    # This used to spell `DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}` by hand; it now
+    # comes from the ONE chokepoint, which points it at the run's snapshot
+    # instead of the live tree. ★ It matters MORE here than anywhere: the value
+    # is inherited by the SPAWNED `dsscp`, so each of these entries is a separate
+    # PROCESS resolving shipped config out of a tree other workstreams write to.
+    # ⚠ BEFORE `dss_strict_arm_verdicts` — that helper READS this entry's
+    # ENVIRONMENT and re-sets it, so the reverse order would drop the config root
+    # and take every config-level red-on-disable pin with it.
+    dss_use_config_snapshot(${TEST_NAME})
     dss_strict_arm_verdicts(${TEST_NAME})
     list(APPEND DSS_INTEGRATED_EXAMPLE_ENTRIES ${TEST_NAME})
 endforeach()
@@ -113,8 +122,7 @@ add_test(NAME integrated_tests/cli-surface
                  $<TARGET_FILE:dsscp>
                  ${CMAKE_SOURCE_DIR}/examples
                  --only=cli)
-set_tests_properties(integrated_tests/cli-surface PROPERTIES
-    ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}")
+dss_use_config_snapshot(integrated_tests/cli-surface)
 dss_strict_arm_verdicts(integrated_tests/cli-surface)
 
 # The adjudicator — ONE entry for every corpus-wide claim. It PARSES every
@@ -149,10 +157,12 @@ add_test(NAME integrated_tests/adjudicate
 # failing entry precisely so the corpus-wide floors can still be judged. `DEPENDS`
 # orders without coupling verdicts.
 set_tests_properties(integrated_tests/adjudicate PROPERTIES
-    ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}"
     FIXTURES_REQUIRED DssIntegratedCells
     SKIP_RETURN_CODE 77
     DEPENDS "${DSS_INTEGRATED_EXAMPLE_ENTRIES};integrated_tests/cells-reset")
+# APPENDS the second fixture rather than replacing DssIntegratedCells above —
+# this entry needs both, and FIXTURES_REQUIRED is a list.
+dss_use_config_snapshot(integrated_tests/adjudicate)
 
 # ── The SPAWNED CLI needs this in its ENVIRONMENT, not just baked ──────────
 # This runner's whole job is to invoke `dsscp` as a SUBPROCESS, and
@@ -224,8 +234,7 @@ add_test(NAME integrated_tests/coverage-boundary
                  ${CMAKE_SOURCE_DIR}/examples
                  --only=coverage-boundary
                  "--sibling-runner=$<TARGET_FILE:dss_examples_runner>")
-set_tests_properties(integrated_tests/coverage-boundary PROPERTIES
-    ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}")
+dss_use_config_snapshot(integrated_tests/coverage-boundary)
 # ORDER IS LOAD-BEARING, same as every call above: `dss_strict_arm_verdicts`
 # READS the entry's existing ENVIRONMENT and appends to it.
 dss_strict_arm_verdicts(integrated_tests/coverage-boundary)

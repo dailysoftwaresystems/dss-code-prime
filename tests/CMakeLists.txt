@@ -61,7 +61,7 @@ function(dss_add_test)
     # Shipped-config discovery: findShippedConfig() — and, since TF-C118, the
     # test-side resolver in tests/test_support/repo_root.hpp — prefers
     # $DSS_CONFIG_ROOT (a directory containing src/dss-config/) over its
-    # cwd-walk. Point it at the repo root so every test resolves shipped config
+    # cwd-walk. Setting it is what makes every test resolve shipped config
     # regardless of build location — an OUT-OF-TREE build's ctest cwd is a build
     # subdirectory with no src/dss-config/ in its ancestry, which would
     # otherwise null the loader (loadShipped → nullptr → downstream null-deref).
@@ -71,11 +71,24 @@ function(dss_add_test)
     # out-of-tree gap was first noticed, and an out-of-tree ctest still failed
     # 28 entries, because seventeen test-side helpers carried private cwd-walks
     # that never READ the variable. The fix was the shared resolver; this line
-    # is one of the three candidates it consults, not the mechanism.
+    # is one of the candidates it consults, not the mechanism.
+    #
+    # ★★★ AND IT NO LONGER NAMES THE LIVE SOURCE TREE.
+    # D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED:
+    # pointing it at ${CMAKE_SOURCE_DIR} made every one of these ~219 entries —
+    # and the ~1200 `loadShipped()` call sites they reach, none of which caches —
+    # a live reader of a tree several workstreams write to, so a neighbour
+    # rewriting a shipped document IN PLACE reddened whichever suite happened to
+    # open it inside that window, with nothing in the red naming the cause.
+    # `dss_use_config_snapshot` points it at a copy taken ONCE per ctest run
+    # instead (cmake/DssConfigSnapshot.cmake), which is the same wiring for the
+    # out-of-tree case and a single sample of the mutable tree for this one.
+    # ✔MEASURED by deprivation on this tree: move `sources/c.lang.json` out of
+    # the live tree 5 s into a run and 5 of the 6 census suites red; with the
+    # snapshot they do not notice.
     # (CTest ENVIRONMENT is a ';'-separated list; a repo path containing a
     # literal ';' would mis-split — impossible on normal Windows/WSL paths.)
-    set_tests_properties(${DSS_NAME} PROPERTIES
-        ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}")
+    dss_use_config_snapshot(${DSS_NAME})
 endfunction()
 
 # Shared PCH producer for the test executables (see DSS_PCH_HEADERS in the
@@ -287,11 +300,13 @@ function(dss_add_shuffle_arm)
 
     add_test(NAME ${DSS_NAME}_shuffled
              COMMAND ${target} --gtest_shuffle --gtest_repeat=${repeat})
-    # Mirrors dss_add_test's ENVIRONMENT (see the note at its set_tests_properties
-    # above): findShippedConfig() prefers $DSS_CONFIG_ROOT over its cwd-walk, so
-    # an out-of-tree build resolves shipped config identically.
-    set_tests_properties(${DSS_NAME}_shuffled PROPERTIES
-        ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}")
+    # Mirrors dss_add_test's wiring (see the note at its dss_use_config_snapshot
+    # call above): findShippedConfig() prefers $DSS_CONFIG_ROOT over its cwd-walk,
+    # so an out-of-tree build resolves shipped config identically — and it must
+    # read the SAME per-run snapshot as its plain sibling, because this arm is a
+    # SECOND concurrent process on the same binary and two processes of one suite
+    # reading two different config trees is a divergence nothing would report.
+    dss_use_config_snapshot(${DSS_NAME}_shuffled)
 endfunction()
 
 dss_add_shuffle_arm(NAME analysis/preprocess/test_preprocessor REPEAT 20)

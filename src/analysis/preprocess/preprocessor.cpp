@@ -3622,6 +3622,22 @@ private:
                    std::string{"#warning: "}
                        + std::string{directiveOperandText(in, p + 1, end)},
                    DiagnosticSeverity::Warning);
+        } else if (cfg().lineMarker.has_value() && isDecimalRun(word)) {
+            // D-C-PREPROCESSED-INPUT-REFUSES-GCC-LINEMARKERS. The GNU LINEMARKER
+            // `# N "file" [flags]`. Reached ONLY for a LIVE one (the dead-branch
+            // gate above already returned — the #define/#include/pragma/#embed/
+            // #line parity), and ONLY when the language DECLARES the surface: a
+            // config without `lineMarker` leaves a digit-led directive on the
+            // unsupported-directive fail-loud below, unchanged.
+            //
+            // ★ THE PREDICATE IS THE SHAPE, NOT A WORD, AND THAT IS FORCED: the
+            // GNU form has no directive word, so there is no lexeme to match a
+            // configured spelling against. `isDecimalRun` is therefore the
+            // recognizer, and it is placed LAST in this chain so it can never
+            // shadow a language whose directive word is spelled with digits.
+            // The line's tokens are NOT forwarded into `body`: a directive is not
+            // program text.
+            handleLineMarker(in, p, end);
         } else {
             emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported,
                    synth_->id(), in[p].span,
@@ -4521,23 +4537,161 @@ private:
             }
         }
 
-        // Key by the ORIGIN buffer the directive physically sits in, so a header
-        // and its includer keep independent numbering.
-        if (lineMap_ == nullptr || lineMap_->empty()) return;
-        // Resolve from the LAST token of the directive line, not the first: a
-        // directive may span several PHYSICAL lines (a `\` continuation, or a
-        // block comment across lines), and `#line N` renumbers the line after the
-        // directive ENDS. Keying on the first token made every such directive
-        // silently off-by-one per extra line. `end` is one past the terminating
-        // newline, so `end-1` is that newline (or the last real token at EOF with
-        // no trailing newline) — identical for the single-line case.
-        std::size_t const spanTok =
-            (end > 0 && end - 1 < in.size() && end - 1 >= dirTok) ? end - 1
-                                                                  : dirTok;
-        LineMap::Resolved const r = lineMap_->resolve(in[spanTok].span.start());
-        if (r.origin == nullptr) return;
-        rec.physLine = r.origin->lineCol(r.offset).line;
-        lineDirs_[static_cast<void const*>(r.origin)].push_back(std::move(rec));
+        recordPresumedPosition(in, dirTok, end, rec);
+    }
+
+    // A run of decimal digits and nothing else. The linemarker RECOGNIZER: the
+    // GNU form has no directive WORD to match a configured spelling against, so
+    // its shape is what identifies it (`# 1 "f"`, never `# line 1 "f"`).
+    [[nodiscard]] static bool isDecimalRun(std::string_view s) {
+        return !s.empty()
+               && s.find_first_not_of("0123456789") == std::string_view::npos;
+    }
+
+    // The declared linemarker flag whose spelling is `digits`, or nullptr.
+    // Config lookup, never a hard-coded `1`/`2`/`3`/`4` — an undeclared digit is
+    // refused by the caller, which is what both references do.
+    [[nodiscard]] PreprocessConfig::LineMarkerFlagDef const*
+    lineMarkerFlag(std::string_view digits) const {
+        if (!cfg().lineMarker.has_value()) return nullptr;
+        for (auto const& f : cfg().lineMarker->flags) {
+            if (f.digits == digits) return &f;
+        }
+        return nullptr;
+    }
+
+    // ── D-C-PREPROCESSED-INPUT-REFUSES-GCC-LINEMARKERS ────────────────────────
+    //
+    // The GNU LINEMARKER: `# N "file"` optionally followed by flag digits, which
+    // is what `gcc -E` / `clang -E` write in place of a `#line`. Same facility,
+    // same record, same `presumedLine`/`presumedFile` readers — only the spelling
+    // differs, which is why the tail below is `recordPresumedPosition` and not a
+    // second copy of it.
+    //
+    // ⚠ THREE PLACES THIS DELIBERATELY DIVERGES FROM `handleLine`, each measured:
+    //
+    //  (1) LINE ZERO IS LEGAL HERE AND ILLEGAL IN `#line`. C23 6.10.4p2 constrains
+    //      the `#line` digit sequence to 1..2147483647, and `handleLine` enforces
+    //      that. ✔MEASURED: gcc 13.3.0's OWN `-E` output opens with `# 0 "tu.c"`
+    //      and gcc recompiles that output with rc=0, so importing `#line`'s floor
+    //      would make DSS refuse the very bytes this row exists to read.
+    //  (2) THE FILE OPERAND IS REQUIRED, not optional. ✔MEASURED over 154 gcc and
+    //      177 clang linemarkers in one `_GNU_SOURCE` TU: every single one carries
+    //      a quoted name. A bare `# 5` is refused rather than guessed at.
+    //  (3) THE TAIL IS FLAGS, NOT JUNK. `handleLine` rejects anything after its
+    //      file operand; here the tail is a declared vocabulary and is validated
+    //      against it.
+    void handleLineMarker(std::vector<Token> const& in, std::size_t p,
+                          std::size_t end) {
+        std::size_t const dirTok = p;
+        // The caller reached this arm on `isDecimalRun`, so the range check is
+        // the only numeric failure left.
+        std::string_view const numTx = text(in[p]);
+        unsigned long long     n     = 0;
+        for (char const c : numTx) {
+            n = n * 10ull + static_cast<unsigned long long>(c - '0');
+            if (n > 2147483647ull) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), in[p].span,
+                       "linemarker line number out of range");
+                return;
+            }
+        }
+        LineDirectiveRec rec;
+        rec.presumedLine = static_cast<std::uint32_t>(n);
+
+        std::size_t const q = skipTrivia(in, p + 1);
+        if (q >= end || isNewline(in[q])) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   in[p].span,
+                   std::string{"a linemarker requires a \"quoted\" file name "
+                               "after the line number — got a bare '"}
+                       + std::string{numTx} + "'");
+            return;
+        }
+        // A quoted operand is THREE tokens, exactly as `#include`/`#embed`/`#line`
+        // see it: the OPENER (config kind `quoteIncludeToken`), the coalesced BODY
+        // whose text is the raw bytes between the quotes, and the CLOSER
+        // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN). Keyed on the CONFIG kind, never
+        // a hard-coded `"` scan.
+        if (!(quoteIncludeKind_.valid() && in[q].schemaKind == quoteIncludeKind_
+              && q + 1 < end && !isNewline(in[q + 1]))) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   in[q].span,
+                   "a linemarker's file operand must be a \"quoted\" string");
+            return;
+        }
+        rec.file    = std::string{text(in[q + 1])};
+        rec.hasFile = true;
+
+        // The FLAG TAIL. Every rule here is one BOTH references enforce —
+        // ✔MEASURED: gcc 13.3.0 and clang 19.1.1 each refuse `# 1 "f.c" 9` (an
+        // undeclared digit) and each refuse `# 1 "f.c" 1 2` (both members of the
+        // enter/return pair). Refusing is therefore matching the references, not
+        // being stricter than them.
+        std::unordered_set<std::string>                    seenFlags;
+        std::unordered_map<std::string, std::string>       claimedGroups;
+        std::size_t t = skipTrivia(in, pastBodyAndCloser(in, q + 1));
+        while (t < end && !isNewline(in[t])) {
+            std::string const flagTx{text(in[t])};
+            PreprocessConfig::LineMarkerFlagDef const* const def =
+                lineMarkerFlag(flagTx);
+            if (def == nullptr) {
+                std::string known;
+                if (cfg().lineMarker.has_value()) {
+                    for (auto const& f : cfg().lineMarker->flags) {
+                        if (!known.empty()) known += ", ";
+                        known += f.digits + " (" + f.name + ")";
+                    }
+                }
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), in[t].span,
+                       std::string{"unknown linemarker flag '"} + flagTx
+                           + "' — this language declares: "
+                           + (known.empty() ? std::string{"<none>"} : known));
+                return;
+            }
+            if (!seenFlags.insert(flagTx).second) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                       synth_->id(), in[t].span,
+                       std::string{"linemarker flag '"} + flagTx + "' ("
+                           + def->name + ") appears more than once");
+                return;
+            }
+            if (!def->exclusiveGroup.empty()) {
+                auto const [it, fresh] =
+                    claimedGroups.try_emplace(def->exclusiveGroup, flagTx);
+                if (!fresh) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                           synth_->id(), in[t].span,
+                           std::string{"linemarker flags '"} + it->second
+                               + "' and '" + flagTx
+                               + "' are mutually exclusive (both are '"
+                               + def->exclusiveGroup + "')");
+                    return;
+                }
+            }
+            t = skipTrivia(in, t + 1);
+        }
+
+        // ★ WHAT THE FLAGS DO, DECIDED AND STATED RATHER THAN DROPPED IN SILENCE.
+        // The enter/return pair describes the include-STACK transition; DSS's
+        // presumed-position model is per ORIGIN BUFFER and a preprocessed TU is
+        // one buffer, so both spellings mean the same thing to this record — the
+        // following lines come from the named file starting at the given number —
+        // and the pair is declared so that `1 2` together can be REFUSED.
+        // ✔`system-header` is RECOGNISED and carries no suppression, and that is a
+        // UNIFORM policy rather than a hole in this directive: MEASURED at HEAD,
+        // `src/` contains no system-header concept at all, so DSS already declines
+        // to suppress diagnostics inside an ordinary `#include <...>` header. A TU
+        // fed through `gcc -E` therefore reports exactly what DSS would report
+        // compiling the same headers directly — which is the property that makes
+        // this row's conformance census meaningful in the first place. If DSS ever
+        // gains a system-header posture, THIS is the flag that selects it, and the
+        // pin in tests/analysis/preprocess/test_preprocessor.cpp is what will go
+        // red when it does. `extern-c-linkage` is inert BY CONSTRUCTION, not by
+        // omission: a C front end has no second linkage to switch to.
+        recordPresumedPosition(in, dirTok, end, rec);
     }
 
     void handleUndef(std::vector<Token> const& in, std::size_t p,
@@ -5416,6 +5570,43 @@ private:
     };
     std::unordered_map<void const*, std::vector<LineDirectiveRec>> lineDirs_;
 
+    // D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED: the `counter`-kind expansion count for
+    // THIS translation unit. Owned by the expander, so its lifetime IS the TU's —
+    // see the long note at `PredefinedMacroKind::Counter` in
+    // `materializePredefined` for why that is the reset mechanism.
+    std::uint32_t counter_ = 0;
+
+    // The SHARED tail of every presumed-position directive: key the record by the
+    // ORIGIN buffer the directive physically sits in (so a header and its includer
+    // keep independent numbering) and stamp the physical line it ends on.
+    //
+    // ★ EXTRACTED SO THE `#line` AND LINEMARKER SPELLINGS CANNOT DRIFT
+    // (D-C-PREPROCESSED-INPUT-REFUSES-GCC-LINEMARKERS). They are ONE facility with
+    // two surfaces; a second copy of this arithmetic is exactly the kind of
+    // duplicate that stays correct until one of the two is fixed. It sits HERE,
+    // below `LineDirectiveRec`, because the record is a PARAMETER type — a member
+    // function BODY may name a nested type declared later, a parameter list may
+    // not.
+    //
+    // Resolve from the LAST token of the directive line, not the first: a
+    // directive may span several PHYSICAL lines (a `\` continuation, or a block
+    // comment across lines), and the renumbering applies to the line after the
+    // directive ENDS. Keying on the first token made every such directive silently
+    // off-by-one per extra line. `end` is one past the terminating newline, so
+    // `end-1` is that newline (or the last real token at EOF with no trailing
+    // newline) — identical for the single-line case.
+    void recordPresumedPosition(std::vector<Token> const& in, std::size_t dirTok,
+                                std::size_t end, LineDirectiveRec rec) {
+        if (lineMap_ == nullptr || lineMap_->empty()) return;
+        std::size_t const spanTok =
+            (end > 0 && end - 1 < in.size() && end - 1 >= dirTok) ? end - 1
+                                                                  : dirTok;
+        LineMap::Resolved const r = lineMap_->resolve(in[spanTok].span.start());
+        if (r.origin == nullptr) return;
+        rec.physLine = r.origin->lineCol(r.offset).line;
+        lineDirs_[static_cast<void const*>(r.origin)].push_back(std::move(rec));
+    }
+
     // The active record for (origin, physLine), or nullptr when no `#line`
     // precedes that line in that buffer.
     [[nodiscard]] LineDirectiveRec const* activeLineDir(
@@ -5497,6 +5688,34 @@ private:
                 if (c == '\\') c = '/';
             }
             return materializeSignificant(quoteCString(name));
+        }
+        case PredefinedMacroKind::Counter: {
+            // D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED. `__COUNTER__`: a per-TU
+            // monotonically increasing decimal that advances ONCE PER EXPANSION.
+            //
+            // ★★ THIS IS THE ONLY STATEFUL KIND, AND THAT IS THE WHOLE POINT OF
+            // GIVING IT A KIND RATHER THAN A `constant` ROW. Every other kind is a
+            // pure function of its argument — Line/File of the invocation OFFSET,
+            // Date/Time of a value fixed at construction — so a config could in
+            // principle carry them. A counter cannot BE a string in the config:
+            // its value depends on how many times it has already been read.
+            //
+            // ★ PER-TRANSLATION-UNIT RESET IS STRUCTURAL, NOT A `reset()` SOMEONE
+            // HAS TO REMEMBER TO CALL: the counter is a member of THIS expander,
+            // `preprocessRun` constructs exactly one expander per translation
+            // unit, and it is the only expansion path that materializes a
+            // predefined value at all (the include PRE-SCAN consults definedness
+            // only, never a value). So two TUs in one invocation cannot disagree
+            // about a name they both mint.
+            //
+            // ★ POST-INCREMENT — the FIRST expansion yields 0, matching both
+            // references. ✔MEASURED with gcc 13.3.0 and clang 18.1.3 / 19.1.1:
+            // all three start at 0 and step by 1. Nothing observable should depend
+            // on the specific integer (the construct's whole purpose is UNIQUENESS
+            // of the pasted identifier), but agreeing costs nothing and removes a
+            // reason for a real program's assumption to be surprised — so the
+            // answer is recorded here rather than left to be re-litigated.
+            return materializeSignificant(std::to_string(counter_++));
         }
         case PredefinedMacroKind::Constant:
             // A static integer-constant spelling carried verbatim.

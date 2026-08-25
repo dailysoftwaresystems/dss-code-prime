@@ -117,12 +117,12 @@ struct Loaded {
 // discipline this suite already uses for the `isCall` pin, so a mutant cannot
 // drift away from the document it stands in for.
 [[nodiscard]] std::string shippedFormatText(std::string_view formatName) {
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root.has_value()) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    auto const leaf = *root / "src" / "dss-config" / "object-formats"
+    auto const leaf = *root / "object-formats"
                     / (std::string{formatName} + ".format.json");
     std::ifstream in{leaf, std::ios::binary};
     if (!in.good()) {

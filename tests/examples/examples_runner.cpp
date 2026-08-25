@@ -3890,8 +3890,9 @@ TEST(ExamplesCorpusLint, StagingPrimitiveLivesOnlyInTheSharedHeader) {
         "tests/examples/examples_runner.cpp",
         "integrated_tests/runner.cpp",
     };
-    // Throws with `repoRootDiagnostic()` — which names all three resolution
-    // sources and the cwd — rather than failing as a puzzling absent file.
+    // Throws with `repoRootDiagnostic()` — which names both repo-root candidates,
+    // the cwd, and the config override it is NOT — rather than failing as a
+    // puzzling absent file.
     fs::path const root = ::dss::test::repoRoot();
 
     auto const slurp = [&root](char const* rel) -> std::string {

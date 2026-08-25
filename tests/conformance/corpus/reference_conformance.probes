@@ -979,11 +979,23 @@ __forceinline int dss_forceinline_probe(int n) { return n + 1; }
 @min-stdc 0
 @families gnu,msvc
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: `__COUNTER__` is undefined in DSS (S0001) and predefined by ALL FIVE oracles -- the only probe in this corpus that every located reference compiler accepts and DSS refuses.
-@why __COUNTER__ — a gcc/clang/MSVC-common predefined macro used for unique-name generation.
+@why __COUNTER__ — a gcc/clang/MSVC-common predefined macro used for unique-name generation. CLOSED 2026-08-24 (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED): it is now a `counter`-kind predefined macro, the one STATEFUL kind — the value advances once per EXPANSION and resets per translation unit, so it cannot be a constant row in the config. The probe uses it TWICE on purpose: a single use compiled CLEAN against the broken behaviour (it pasted the literal text and minted a wrongly-NAMED symbol), so only the second use could ever have shown the defect.
 @code
 int dss_counter_probe_a = __COUNTER__;
 int dss_counter_probe_b = __COUNTER__;
+@end
+
+@probe a_typeof_unqual_gnu_spelling
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU __typeof_unqual__ / __typeof_unqual — the pre-standard spellings of C23's qualifier-STRIPPING typeof_unqual, available at every -std level unlike the C23 keyword. CLOSED 2026-08-24 (D-CSUBSET-TYPEOF-UNQUAL-GNU-SPELLING): two keyword rows onto the EXISTING TypeofUnqualKeyword, so they reach the already-shipped stripping arm with no semantic change. ⚠ THE ROSTER IS SPLIT AND THAT IS NOT A RED HERE: MEASURED 2026-08-24, gcc 13.3.0 and clang 18.1.3 REJECT both spellings and clang 19.1.1 accepts both. `@expect-ref accept` is an EXISTENTIAL claim — a roster that does not witness it reports `not-witnessed`, never a failure — and the operator's disjunction rule (bar A.3b, one working reference makes the behaviour REQUIRED) is what makes the split roster a direction-A gap rather than a reason to abstain. The second spelling is exercised on purpose: it also proves the lexer takes the LONGEST match rather than reading __typeof_unqual__ as __typeof_unqual plus a stray identifier.
+@code
+const volatile int dss_typeof_unqual_gnu_src;
+__typeof_unqual__(dss_typeof_unqual_gnu_src) dss_typeof_unqual_gnu_probe;
+__typeof_unqual(dss_typeof_unqual_gnu_src) dss_typeof_unqual_gnu_probe2;
 @end
 
 @probe a_inline_asm_gnu

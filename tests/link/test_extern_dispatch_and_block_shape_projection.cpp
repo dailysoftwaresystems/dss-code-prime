@@ -96,12 +96,12 @@ constexpr char const* kElfExecFormat = "elf64-x86_64-linux-exec";
 constexpr char const* kPeExecFormat  = "pe64-x86_64-windows-exec";
 
 [[nodiscard]] json shippedFormatDoc(std::string_view name) {
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return json{};
     }
-    auto const p = *root / "src" / "dss-config" / "object-formats" /
+    auto const p = *root / "object-formats" /
                    (std::string{name} + ".format.json");
     std::ifstream in{p, std::ios::binary};
     if (!in) {

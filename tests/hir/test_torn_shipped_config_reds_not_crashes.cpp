@@ -30,8 +30,11 @@
 // ⇒ Which is also why the child's own output is required to NAME THE SCRATCH
 // PATH. Without that clause every claim here could be false while the test still
 // passed, because a child that quietly read the repo's real tree would look
-// identical from the outside. (The clause is lifted from
-// `tests/test_support/private_config_root.hpp`, which learned it the same way.)
+// identical from the outside. (The clause was lifted from the since-superseded
+// `tests/test_support/private_config_root.hpp`; it now lives in
+// `tests/test_support/test_config_snapshot.cpp`, which asserts the same thing
+// about the per-run snapshot every ctest entry reads —
+// D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED.)
 //
 // ⚠ IT WRITES ONLY INSIDE ITS OWN `ScratchDir`. The live `src/dss-config/` is
 // shared by every concurrent workstream in this tree; a pin that tore the real

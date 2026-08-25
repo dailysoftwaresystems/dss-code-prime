@@ -2889,12 +2889,12 @@ TEST(ObjectFormatSchemaContentDigest, ConstructionBypassingLoadFromTextLeavesItE
 namespace {
 
 [[nodiscard]] std::string shippedFormatText(std::string_view stem) {
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root.has_value()) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    auto const path = *root / "src" / "dss-config" / "object-formats"
+    auto const path = *root / "object-formats"
                     / (std::string{stem} + ".format.json");
     std::ifstream in{path, std::ios::binary};
     if (!in.good()) {

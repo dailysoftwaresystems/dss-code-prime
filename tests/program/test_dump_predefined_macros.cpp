@@ -826,10 +826,10 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
 // emits round-trips back to its enumerator, so the printed word is always a word
 // an operator can write into a config.
 TEST(DumpPredefinedMacros, EveryKindNameRoundTripsToItsEnumerator) {
-    constexpr std::array<PredefinedMacroKind, 5> kAll{
+    constexpr std::array<PredefinedMacroKind, 6> kAll{
         PredefinedMacroKind::Line, PredefinedMacroKind::File,
         PredefinedMacroKind::Constant, PredefinedMacroKind::Date,
-        PredefinedMacroKind::Time};
+        PredefinedMacroKind::Time, PredefinedMacroKind::Counter};
     for (PredefinedMacroKind const k : kAll) {
         auto const name = predefinedMacroKindName(k);
         EXPECT_FALSE(name.empty());
@@ -843,6 +843,10 @@ TEST(DumpPredefinedMacros, EveryKindNameRoundTripsToItsEnumerator) {
               predefinedMacroKindName(PredefinedMacroKind::File));
     EXPECT_NE(predefinedMacroKindName(PredefinedMacroKind::Date),
               predefinedMacroKindName(PredefinedMacroKind::Time));
+    // D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED: the STATEFUL kind must not collapse
+    // onto the offset-derived one it is most easily confused with.
+    EXPECT_NE(predefinedMacroKindName(PredefinedMacroKind::Counter),
+              predefinedMacroKindName(PredefinedMacroKind::Line));
     EXPECT_FALSE(predefinedMacroKindFromName("version").has_value())
         << "`version` is a LOAD-time lowering to Constant, not a runtime kind — "
            "a table row for it would claim a kind the engine cannot hold";

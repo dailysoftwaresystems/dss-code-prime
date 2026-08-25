@@ -643,11 +643,11 @@ TEST(CoffObjectReader, DeclaredIsCallRoleUpgradesAnExternWithNoTypeHint) {
     ASSERT_NE(gRec, 0u);
     wr16(obj, gRec + 14u, 0x0000);
 
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
     std::string text;
     {
-        std::ifstream in{*root / "src" / "dss-config" / "object-formats"
+        std::ifstream in{*root / "object-formats"
                              / "pe64-x86_64-windows.format.json",
                          std::ios::binary};
         ASSERT_TRUE(in.good());
@@ -726,11 +726,11 @@ TEST(CoffObjectReader, EmitOnlyAliasIsHonouredNotRefused) {
     ASSERT_TRUE(loaded.target && loaded.format);
     auto obj = validObject(loaded);
 
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
     std::string text;
     {
-        std::ifstream in{*root / "src" / "dss-config" / "object-formats"
+        std::ifstream in{*root / "object-formats"
                              / "pe64-x86_64-windows.format.json",
                          std::ios::binary};
         ASSERT_TRUE(in.good());

@@ -195,13 +195,13 @@ static_assert(std::is_reference_v<decltype(cSubset())>,
 // missed and every rebind test in this file went red at once, for a reason none
 // of them named.
 [[nodiscard]] std::string loadShippedCText() {
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
     std::filesystem::path const cand =
-        *root / "src" / "dss-config" / "sources" / "c.lang.json";
+        *root / "sources" / "c.lang.json";
     std::ifstream in(cand, std::ios::binary);
     if (!in) {
         ADD_FAILURE() << "cannot read the shipped c config: "
@@ -2797,8 +2797,15 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // __MINGW32__/__MINGW64__/__MSVCRT__, all pe-gated, in the same change that
     // gave pe the <unistd.h>/<dirent.h> surface those three promise;
     // D-LANG-PE64-HAS-NO-POSIX-DIRECTORY-API).
-    EXPECT_EQ(pms.size(), 35u)
-        << "c declares 19 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
+    // D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED: +1 UN-GATED row, `__COUNTER__`. It is
+    // on the LANGUAGE and un-gated for the same reason the __ORDER_* rows are:
+    // its value is a property of the TRANSLATION, not of the CPU or the object
+    // format, so it varies by nothing a target or format could decide. It is also
+    // the FIRST row of the `counter` kind — the only STATEFUL one — which is why
+    // it could not be expressed as a `constant` row.
+    // 20 un-gated, 13 pe-gated, 3 macho-gated = 36.
+    EXPECT_EQ(pms.size(), 36u)
+        << "c declares 20 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -2835,8 +2842,9 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
            "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
            "TargetConditionals.h conjunction that gates the whole Darwin ladder";
-    EXPECT_EQ(ungated, 19u)
-        << "the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
+    EXPECT_EQ(ungated, 20u)
+        << "__COUNTER__ (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED, the one `counter` "
+           "kind) + the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
            "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) + the 5 TF-C83 "
            "un-gated identity rows (__DSSCP__, __GNUC__, __GNUC_MINOR__, "
            "__GNUC_PATCHLEVEL__, __clang__) + the 3 TF-C115 __ORDER_* byte-order "
@@ -10992,4 +11000,255 @@ TEST(PreprocessorStringizeTokenSequence,
     PreprocessResult r13;
     EXPECT_EQ(ppConcat(ppLexemes(prelude + "XSTR()\n", r13)), "\"\"");
     EXPECT_FALSE(r13.diagnostics->hasErrors());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-C-PREPROCESSED-INPUT-REFUSES-GCC-LINEMARKERS — the GNU LINEMARKER form
+// `# N "file" [flags]`, which is what `gcc -E` / `clang -E` write where a
+// `#line` would go. Same presumed-position facility, different surface: both
+// spellings land in ONE `recordPresumedPosition`, so a drift between them is
+// structurally impossible rather than merely watched for.
+//
+// Config-driven (`preprocess.lineMarker`), so a language WITHOUT the block
+// leaves a digit-led directive on the generic unsupported-directive fail-loud —
+// which is exactly what every one of these TUs did before this cycle.
+// Every assertion below is RED-ON-DISABLE.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// THE headline: the marker renumbers the FOLLOWING line, same off-by-one rule
+// `#line` obeys. RED-ON-DISABLE: remove the `lineMarker` dispatch arm and this
+// TU goes red with P_PreprocessorUnsupported instead.
+TEST(PreprocessorLineMarker, RenumbersFollowingLineLikeHashLine) {
+    PreprocessResult r;
+    //                    line: 1              2
+    auto lexs = ppLexemes("# 100 \"virtual.h\"\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int x = 100 ;";
+    EXPECT_EQ(lexs[3], "100")
+        << "a linemarker numbers the FOLLOWING line N, exactly as `#line N` does";
+}
+
+// The FLAG TAIL must not disturb the numbering. An implementation that read the
+// number, then choked on (or mis-consumed) the flags would fail HERE while
+// passing the bare form above — which is the shape 39 of gcc's 154 markers take.
+TEST(PreprocessorLineMarker, FullGccFlagTailDoesNotDisturbTheNumbering) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("# 100 \"virtual.h\" 1 3 4\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "100");
+}
+
+// The presumed FILE drives `__FILE__`. Separate from the line pin on purpose:
+// an implementation that set one and not the other passes the other test.
+TEST(PreprocessorLineMarker, SetsThePresumedFileName) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("# 7 \"Alpha.h\" 2 3 4\n"
+                          "const char* f = __FILE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool sawAlpha = false;
+    for (auto const& s : lexs) {
+        if (s.find("Alpha.h") != std::string::npos) sawAlpha = true;
+    }
+    EXPECT_TRUE(sawAlpha) << "a linemarker's quoted operand must become __FILE__";
+}
+
+// ★ LINE ZERO IS LEGAL HERE AND ILLEGAL IN `#line`, and that divergence is
+// MEASURED, not chosen: gcc 13.3.0's own `-E` output opens with `# 0 "tu.c"` and
+// gcc recompiles that output rc=0. Importing C23 6.10.4p2's 1..2147483647 floor
+// would make DSS refuse the very bytes this row exists to read.
+// RED-ON-DISABLE: reuse `handleLine`'s `n == 0` arm and this goes red.
+TEST(PreprocessorLineMarker, LineZeroIsAcceptedUnlikeHashLine) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("# 0 \"builtin.h\"\nint x = __LINE__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "gcc emits `# 0 \"...\"` in its own -E output; refusing it defeats "
+           "the whole point of accepting linemarkers";
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "0");
+}
+
+// ...and the CONTROL that keeps the divergence honest: `#line 0` is still a
+// constraint violation. A shared implementation that relaxed BOTH would pass the
+// test above while quietly breaking C23 conformance for the ISO spelling.
+TEST(PreprocessorLineMarker, HashLineZeroStillFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("#line 0 \"f.c\"\nint x = __LINE__;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "`#line 0` is out of the C23 6.10.4p2 range even though a LINEMARKER "
+           "0 is legal — the two surfaces diverge here deliberately";
+}
+
+// An UNDECLARED flag digit fails loud. MEASURED: gcc 13.3.0 and clang 19.1.1
+// both refuse `# 1 "f.c" 9`, so this is matching the references rather than
+// out-stricting them. RED-ON-DISABLE: accept-and-ignore an unknown flag.
+TEST(PreprocessorLineMarker, UnknownFlagFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("# 1 \"f.c\" 9\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "an undeclared linemarker flag must FAIL LOUD (both references do)";
+}
+
+// Two members of the same `exclusiveGroup` may not co-occur. MEASURED: both
+// references refuse `# 1 "f.c" 1 2`. The rule is CONFIG-driven — it reads the
+// group id from `preprocess.lineMarker.flags`, never a hard-coded 1-vs-2.
+TEST(PreprocessorLineMarker, MutuallyExclusiveFlagsFailLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("# 1 \"f.c\" 1 2\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "`1` (enter-file) and `2` (return-to-file) share an exclusiveGroup";
+}
+
+// A repeated flag is refused: it is either a typo or a shape no reference emits,
+// and accepting it would mean the tail is not really being read.
+TEST(PreprocessorLineMarker, RepeatedFlagFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("# 1 \"f.c\" 3 3\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+}
+
+// The file operand is REQUIRED in this form (unlike `#line`'s, which C23
+// 6.10.4p3 makes optional). MEASURED: all 331 linemarkers in one real gcc and
+// clang `-E` census carry a quoted name, so a bare `# 5` is refused rather than
+// guessed at.
+TEST(PreprocessorLineMarker, MissingFileOperandFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("# 5\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+}
+
+// An UNQUOTED name is refused rather than read as a flag or as junk.
+TEST(PreprocessorLineMarker, UnquotedFileOperandFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("# 5 f.c\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+}
+
+// Out of range, the one numeric failure the recognizer leaves to the handler.
+TEST(PreprocessorLineMarker, OutOfRangeLineNumberFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes("# 99999999999 \"f.c\"\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+}
+
+// A linemarker inside an ELIDED branch is skipped with NO diagnostic and NO
+// renumbering — the #define/#include/#pragma/#embed/#line dead-branch parity
+// (C 6.10p1). The malformed flag makes this strictly stronger than a well-formed
+// fixture: it proves the arm is never REACHED, not merely that it succeeded.
+TEST(PreprocessorLineMarker, InDeadBranchIsInert) {
+    PreprocessResult r;
+    //                    line: 1      2             3       4
+    auto lexs = ppLexemes("#if 0\n# 500 \"f.c\" 9\n#endif\nint x = __LINE__;\n",
+                          r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a linemarker in a dead branch must not diagnose — not even a "
+           "malformed one";
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "4")
+        << "a dead-branch linemarker must NOT renumber";
+}
+
+// ★ THE `system-header` DECISION, PINNED SO IT CANNOT DRIFT SILENTLY.
+// gcc/clang use flag `3` to SUPPRESS warnings inside the marked region
+// (MEASURED: clang 19.1.1 warns -Wunused-variable under `1` and not under
+// `1 3`). DSS recognises the flag and suppresses NOTHING — a UNIFORM policy, not
+// a hole in this directive: DSS has no system-header posture anywhere, so it
+// already declines to suppress inside an ordinary `#include <...>` header, and a
+// TU fed through `gcc -E` therefore reports exactly what DSS reports compiling
+// the same headers directly. That is what makes a conformance census meaningful.
+// If DSS ever gains such a posture, THIS pin is what goes red and forces the
+// decision to be re-made deliberately.
+TEST(PreprocessorLineMarker, SystemHeaderFlagIsRecognisedAndSuppressesNothing) {
+    PreprocessResult r;
+    // `#warning` inside a region marked as a system header still fires.
+    (void)ppLexemes("# 10 \"sys.h\" 1 3 4\n#warning still audible\nint x;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorWarningDirective))
+        << "flag 3 marks a system header in gcc/clang and suppresses their "
+           "warnings there; DSS suppresses nothing ANYWHERE, so this must still "
+           "fire — change this pin only together with a real system-header "
+           "posture";
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a #warning is a Warning, not an Error";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED — `__COUNTER__`, the one STATEFUL
+// predefined-macro kind. Config-declared by NAME (`predefinedMacros` with
+// `"kind": "counter"`); the engine owns the count. Every assertion below is
+// RED-ON-DISABLE.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The core property, and the one a single-use fixture cannot see: two expansions
+// in ONE translation unit yield DIFFERENT values. At the pre-change HEAD the name
+// was not a macro at all and pasted as literal text, so a one-use pin passed.
+TEST(PreprocessorCounter, AdvancesOncePerExpansion) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("int a = __COUNTER__; int b = __COUNTER__; "
+                          "int c = __COUNTER__;\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 15u) << "expected: int a = 0 ; int b = 1 ; int c = 2 ;";
+    EXPECT_EQ(lexs[3], "0") << "the FIRST expansion is 0, matching gcc and clang";
+    EXPECT_EQ(lexs[8], "1");
+    EXPECT_EQ(lexs[13], "2");
+}
+
+// The idiom the row was opened for: `##`-pasting the counter into an identifier
+// must mint DISTINCT names. RED-ON-DISABLE: drop the `counter` kind and both
+// names become the literal `v___COUNTER__`, which is what HEAD produced.
+TEST(PreprocessorCounter, PastesIntoDistinctIdentifiers) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define DSS_CAT2(a,b) a##b\n"
+                          "#define DSS_CAT(a,b) DSS_CAT2(a,b)\n"
+                          "int DSS_CAT(v_, __COUNTER__);\n"
+                          "int DSS_CAT(v_, __COUNTER__);\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 6u) << "expected: int v_0 ; int v_1 ;";
+    EXPECT_EQ(lexs[1], "v_0");
+    EXPECT_EQ(lexs[4], "v_1");
+    EXPECT_NE(lexs[1], lexs[4])
+        << "the whole point of the construct is that the two names DIFFER";
+    for (auto const& s : lexs) {
+        EXPECT_EQ(s.find("__COUNTER__"), std::string::npos)
+            << "the token must never survive into the output as literal text — "
+               "that is the silent wrongness this row was opened for: `"
+            << s << "`";
+    }
+}
+
+// It is a genuine PREDEFINED macro, so `#ifdef` sees it. A value-context-only
+// implementation would leave `#ifdef __COUNTER__` false, and the universal
+// `#ifndef X / #define X` shim pattern would then shadow it.
+TEST(PreprocessorCounter, IsVisibleToIfdefWithoutConsumingACount) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#ifdef __COUNTER__\nint x = __COUNTER__;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "0")
+        << "a definedness TEST is not an expansion, so it must not burn a count";
+}
+
+// A predefined name may not be `#undef`'d (C 6.10.8.1p2) — the counter inherits
+// that guard from the shared predefined table rather than needing its own.
+TEST(PreprocessorCounter, MayNotBeUndefd) {
+    PreprocessResult r;
+    (void)ppLexemes("#undef __COUNTER__\nint x;\n", r);
+    EXPECT_TRUE(r.diagnostics->hasErrors());
+}
+
+// PER-TRANSLATION-UNIT RESET. Two independent preprocess runs must both start at
+// 0 — otherwise two TUs in one invocation would disagree about a name they both
+// mint, which is the failure the row names explicitly. RED-ON-DISABLE: make the
+// counter `static` and the second run starts at 1.
+TEST(PreprocessorCounter, ResetsPerTranslationUnit) {
+    PreprocessResult r1;
+    auto a = ppLexemes("int x = __COUNTER__; int y = __COUNTER__;\n", r1);
+    PreprocessResult r2;
+    auto b = ppLexemes("int x = __COUNTER__; int y = __COUNTER__;\n", r2);
+    ASSERT_EQ(a.size(), 10u);
+    ASSERT_EQ(b.size(), 10u);
+    EXPECT_EQ(a[3], "0");
+    EXPECT_EQ(a[8], "1");
+    EXPECT_EQ(b[3], "0")
+        << "a second translation unit must start its own count at 0";
+    EXPECT_EQ(b[8], "1");
 }

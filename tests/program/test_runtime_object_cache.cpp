@@ -369,9 +369,9 @@ constexpr SiblingCase kSiblingCases[] = {
 } // namespace
 
 TEST(RuntimeObjectCacheSibling, EveryShippedExecFormatResolvesItsExactSibling) {
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    fs::path const formatsDir = *root / "src" / "dss-config" / "object-formats";
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const formatsDir = *cfg / "object-formats";
     ASSERT_TRUE(fs::is_directory(formatsDir))
         << "the shipped object-format tree is the SUBJECT of this test; "
            "without it the case would silently pass over an empty scan: "
@@ -403,9 +403,9 @@ TEST(RuntimeObjectCacheSibling, EveryShippedExecFormatResolvesItsExactSibling) {
 // nothing.
 
 TEST(RuntimeObjectCacheSibling, SpirvHasNoArchiveSiblingAndRefusesByName) {
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    fs::path const formatsDir = *root / "src" / "dss-config" / "object-formats";
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const formatsDir = *cfg / "object-formats";
     ASSERT_TRUE(fs::is_directory(formatsDir)) << formatsDir.generic_string();
 
     auto const format = ObjectFormatSchema::loadShipped("spirv-1.6");
@@ -426,9 +426,9 @@ TEST(RuntimeObjectCacheSibling, SpirvHasNoArchiveSiblingAndRefusesByName) {
 }
 
 TEST(RuntimeObjectCacheSibling, WasmHasNoArchiveSiblingAndRefusesByName) {
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    fs::path const formatsDir = *root / "src" / "dss-config" / "object-formats";
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const formatsDir = *cfg / "object-formats";
     ASSERT_TRUE(fs::is_directory(formatsDir)) << formatsDir.generic_string();
 
     auto const format = ObjectFormatSchema::loadShipped("wasm32-v1");
@@ -448,9 +448,9 @@ TEST(RuntimeObjectCacheSibling, WasmHasNoArchiveSiblingAndRefusesByName) {
 // ── MORE THAN ONE: the arm a first-match rule would pass ────────────────────
 
 TEST(RuntimeObjectCacheSibling, TwoAgreeingArchiveFormatsRefuseAndNameBoth) {
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    fs::path const shippedStaticlib = *root / "src" / "dss-config"
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const shippedStaticlib = *cfg
                                     / "object-formats"
                                     / "elf64-x86_64-linux-staticlib.format.json";
     ASSERT_TRUE(fs::is_regular_file(shippedStaticlib))

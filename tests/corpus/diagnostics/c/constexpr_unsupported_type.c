@@ -1,2 +1,4 @@
-constexpr int a[3] = {1, 2, 3};
-int main(void) { return 0; }
+int main(int argc, char **argv) {
+    constexpr int a[argc] = {1, 2, 3};
+    return a[0];
+}

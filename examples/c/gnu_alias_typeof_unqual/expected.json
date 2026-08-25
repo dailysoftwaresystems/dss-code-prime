@@ -1,0 +1,33 @@
+{
+  "$comment": "D-CSUBSET-TYPEOF-UNQUAL-GNU-SPELLING: the GNU spellings `__typeof_unqual__` and `__typeof_unqual` are keyword-table ALIASES onto the C23 `typeof_unqual` kind (the qualifier-STRIPPING arm), the twin of examples/c/gnu_alias_typeof_alignof's preserving pair. FOUR arms. Arms 1+2 prove the STRIP through `_Generic` over a POINTER to the typeof result — MEASURED that this is the only observable channel in DSS, because only VolatileQual is interned on a TypeId (a `const`-sourced `typeof(g) x = 1; x = 2;` compiles clean under every spelling), so an alias wrongly bound to TypeofKeyword selects the `volatile unsigned char *` arm and scores 0 instead of 4: RED on a WRONG alias, not merely on a missing one. Arms 3+4 prove the resolved CORE is still `unsigned char` by a RUNTIME wrap at 256, and they COMPARE the wrapped value rather than summing it — a wrapped value differs from its unwrapped `int` self by exactly 256 and a POSIX exit status is taken `& 255`, so a summed wrap arm would be invisible on the linux legs and would pass against an `int` alias. ANTI-FOLD: `g_wrap` is a mutable `volatile` global and `argc` is a runtime argument, so the release pipeline proves real runtime work rather than a fold. Both spellings are load-bearing twice, so deleting either keyword row makes this example fail to compile. Data-model-independent (`unsigned char` is 8 bits under LP64 and LLP64), so the one exit code holds on all four targets and on the shipped release pipeline. exit = 4 + 4 + 14 + 20 = 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

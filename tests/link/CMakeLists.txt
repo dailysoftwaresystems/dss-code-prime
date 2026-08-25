@@ -396,3 +396,20 @@ dss_add_test(NAME link/test_macho_compact_unwind_section
              SOURCES test_macho_compact_unwind_section.cpp)
 target_link_libraries(dss_link_test_macho_compact_unwind_section
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE: a function
+# merged from a foreign object used to arrive in a DSS image with NO unwind
+# description, in SILENCE on ELF. Reads the two checked-in REAL `gcc -c`
+# objects (x86_64 + aarch64, default flags -- which is what makes them carry
+# `.eh_frame`), decodes their DWARF call-frame information back into the
+# neutral `CfiFunction` vocabulary, and ROUND-TRIPS it through the shipped
+# `buildEhFrame` writer. Mutates the SHIPPED format document in memory
+# (nlohmann consumer) rather than standing up a hand-written format-like
+# fixture that could rot against the real file.
+# MUST run through ctest, never a bare .exe: the config-level mutant reads the
+# shipped document off disk, and the resolver walks the cwd unless
+# `DSS_CONFIG_ROOT` is set -- only `dss_add_test` sets it.
+dss_add_test(NAME link/test_merged_foreign_unwind
+             SOURCES test_merged_foreign_unwind.cpp)
+target_link_libraries(dss_link_test_merged_foreign_unwind
+                      PRIVATE nlohmann_json::nlohmann_json)

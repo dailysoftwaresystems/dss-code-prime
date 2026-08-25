@@ -409,6 +409,24 @@ if(DSS_BUILD_TESTS)
             "a collapsed result silently empties the corpus suite. Refusing.")
     endif()
 
+    # ── THE RUN'S SHIPPED-CONFIG SNAPSHOT ────────────────────────────────
+    # D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED
+    #
+    # Registers the `config/snapshot` ctest entry — the `FIXTURES_SETUP` that
+    # copies `src/dss-config` ONCE per ctest run — and defines the
+    # `dss_use_config_snapshot()` that every config-reading entry in
+    # `tests/`, `tests/examples/` and `integrated_tests/` calls. The module's
+    # own header carries the whole rationale, including the one constraint
+    # that shapes it: the copy is taken at ctest RUN time and never at build
+    # time, because a build-time copy would silently green every config-level
+    # red-on-disable in this repository.
+    #
+    # ⚠ MUST PRECEDE the two add_subdirectory() calls below.
+    # `dss_use_config_snapshot()` names the fixture entry, and CMake can only
+    # set a property on a test that already exists.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DssConfigSnapshot.cmake")
+    dss_config_snapshot_init()
+
     add_subdirectory(integrated_tests)
     add_subdirectory(tests)
 

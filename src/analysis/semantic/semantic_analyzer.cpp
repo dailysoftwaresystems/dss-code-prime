@@ -246,7 +246,8 @@ struct EngineState {
           nodeToSelectedExpr{cu},
           nodeToFoldedConstant{cu},
           nullPointerConstantNodes{cu},
-          intPointeeCompatNodes{cu} {}
+          intPointeeCompatNodes{cu},
+          deprecatedTypeUseWarned{cu} {}
 
     DiagnosticReporter         reporter;
     TypeLattice                lattice;
@@ -318,6 +319,29 @@ struct EngineState {
     // UnitAttribute for the same cross-tree-aliasing reason as
     // `nullPointerConstantNodes` (NodeId is tree-local).
     UnitAttribute<bool>        intPointeeCompatNodes;
+    // ★★ P33 (D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES): the ONCE-PER-NODE LATCH for
+    // the deprecated-TYPEDEF use warning emitted by `resolveTypeNodeImpl`'s alias
+    // arm. Type-position resolution is NOT once-per-use, and this is ✔MEASURED
+    // rather than assumed — the arm was instrumented with a per-entry sequence
+    // number appended to `actual` (which defeats the reporter's dedup key) and the
+    // entries counted through the shipped CLI:
+    //   `int f(oldint a);` + its definition + `sizeof(oldint)` → 5 entries for 3
+    //   USE SITES: each PARAMETER type-name node is resolved TWICE.
+    // A `SymbolRecord` flag cannot latch that (a typedef used twice must warn
+    // twice, once per SITE), so the latch is keyed on the NODE.
+    //
+    // ⚠ IT IS NOT THE REPORTER'S `dedupWindow` DOING THIS WORK, AND THE
+    // DIFFERENCE IS OBSERVABLE — the first attempt to red-on-disable this latch
+    // came back GREEN because the repeats above are ADJACENT and the default
+    // 4-entry window collapses them. Push them apart and the window loses:
+    // ✔MEASURED, `int f(oldint a, oldint b, oldint c, oldint d, oldint e);`
+    // resolves all five parameters and then resolves all five AGAIN, so the
+    // repeats sit 5 apart and WITHOUT this latch the CLI reports **10** warnings
+    // where gcc 13.3.0 and clang 19.1.1 each report **5**. The window is a
+    // configurable NOISE cap; correctness may not rest on it.
+    // TREE-KEYED for the same cross-tree-aliasing reason as
+    // `nullPointerConstantNodes`. Purely internal — never moved into the model.
+    UnitAttribute<bool>        deprecatedTypeUseWarned;
     // FC3 c1: the analysis-time data model (`analyze()`'s parameter —
     // the active format's width triple). Read by `buildIndexes` (the
     // `coreByDataModel` overrides), the integer-literal ladder, and the
@@ -1467,7 +1491,7 @@ chooseExprSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tre
 [[nodiscard]] TypeId
 resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     NodeId node, ScopeId scope, bool emitOnMiss,
-                    bool& specifierDiagnosed) {
+                    bool emitTypeUse, bool& specifierDiagnosed) {
     if (!node.valid()) return InvalidType;
     auto const k = tree.kind(node);
     if (k == NodeKind::Internal) {
@@ -1488,7 +1512,8 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 return InvalidType;
             }
             TypeId inner = resolveTypeNodeImpl(s, cfg, tree, kids[shape.operandChild],
-                                               scope, emitOnMiss, specifierDiagnosed);
+                                               scope, emitOnMiss, emitTypeUse,
+                                               specifierDiagnosed);
             switch (shape.constructor) {
                 case TypeConstructor::Pointer:
                     return s.lattice.interner().pointer(inner);
@@ -1884,7 +1909,8 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // TYPE-NAME operand: recurse the SAME type resolver (an
                     // unknown type-name fails loud S_UnknownType for free).
                     raw = resolveTypeNodeImpl(s, cfg, tree, operandNode, scope,
-                                              emitOnMiss, specifierDiagnosed);
+                                              emitOnMiss, emitTypeUse,
+                                              specifierDiagnosed);
                 } else {
                     // EXPRESSION operand (UNEVALUATED, 6.7.2.5p2). C 6.7.2.5
                     // constraint: a bit-field member has no nameable type. Bounded
@@ -2077,8 +2103,17 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 continue;
             }
             if (!inner.valid()) {
+                // ★ `emitTypeUse` PROPAGATES HERE, `emitOnMiss` DOES NOT — and the
+                // difference is the whole point. `emitOnMiss=false` on this descent
+                // means "a MISS in this child is not fatal, another child may
+                // resolve"; it says nothing about whether this resolution is the one
+                // that owns a user-facing diagnostic. A deprecated-typedef USE is
+                // never speculative in that sense — the identifier is written in the
+                // source at this position either way — so it rides the separate flag,
+                // which the caller sets from whether its own resolve is under a
+                // reporter-rollback window.
                 auto t = resolveTypeNodeImpl(s, cfg, tree, child, scope,
-                                             /*emitOnMiss=*/false,
+                                             /*emitOnMiss=*/false, emitTypeUse,
                                              specifierDiagnosed);
                 if (t.valid()) inner = t;
             }
@@ -2191,7 +2226,67 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     auto const& r = s.symbols.at(cand);
                     return r.kind == DeclarationKind::Type && r.type.valid();
                 });
-            if (aliasSym.valid()) return s.symbols.at(aliasSym).type;
+            if (aliasSym.valid()) {
+                // ★★ P33 (D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES) — THE TYPEDEF'S USE
+                // SITE. A TAG use is warned by Pass 2's reference-resolution
+                // chokepoint (a tag reference is a `references` row, and that arm
+                // already routes it through the Tag namespace) — ✔MEASURED: threading
+                // the fact onto the tag symbol alone made every tag use warn, with no
+                // emit added here. A TYPEDEF NAME has no such chokepoint: in type
+                // position it is a BARE IDENTIFIER TOKEN under a type-specifier run,
+                // which the Pass-2 reference walker never visits (it dispatches on
+                // Internal nodes carrying a `references` rule). So this resolver IS
+                // the typedef's only use-recording site, and the warning belongs here.
+                //
+                // ★★ THE EMIT-GATE IS `emitTypeUse`, AND `emitOnMiss` WAS MEASURED
+                // UNUSABLE FOR IT. The obvious move is to reuse `emitOnMiss` — it
+                // already reads as "this resolve owns the user-facing diagnostic".
+                // ✔MEASURED FALSE: the generic child-descent above hard-codes
+                // `emitOnMiss=false` for EVERY child, because a miss in one child is
+                // not fatal while another child may still resolve. A type-name
+                // identifier under a specifier run is reached only through that
+                // descent, so an `emitOnMiss`-gated warning here NEVER fires — the
+                // first build of this arm was silent on every probe.
+                //
+                // `emitTypeUse` therefore says something `emitOnMiss` does not, and
+                // PROPAGATES through the descent unchanged: "the diagnostics of this
+                // resolution will survive". It is false at exactly the three
+                // reporter-ROLLBACK windows in this TU (the `subtreeType` cast arm,
+                // its compound-literal arm, and `selectGenericAssociation`), each of
+                // which already names a LOUD re-resolve outside the rollback as its
+                // sole emitter — so a cast / compound literal / `_Generic`
+                // association still warns, just from the surviving resolve.
+                //
+                // ★ THE LATCH IS THE OTHER HALF, AND IT IS LOAD-BEARING BY
+                // MEASUREMENT, NOT BY ARGUMENT. Type-position resolution is NOT
+                // once-per-use: an instrumented count (see
+                // `deprecatedTypeUseWarned`) shows each PARAMETER type-name node
+                // reaching this arm TWICE. Without the latch,
+                // `int f(oldint a, oldint b, oldint c, oldint d, oldint e);`
+                // reports 10 warnings where both references report 5. Gate AND
+                // latch: the gate keeps a rolled-back resolve from consuming the
+                // latch, the latch keeps the surviving resolves from repeating.
+                // Neither alone is enough.
+                //
+                // Both references warn at EVERY such position — ✔MEASURED gcc 13.3.0
+                // and clang 19.1.1 on declaration, parameter (proto AND definition),
+                // `sizeof`, a `_Generic` association and a cast.
+                auto const& arec = s.symbols.at(aliasSym);
+                if (emitTypeUse && arec.isDeprecated
+                    && !s.deprecatedTypeUseWarned.has(node)) {
+                    s.deprecatedTypeUseWarned.set(node, true);
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_DeprecatedSymbolUsed;
+                    d.severity = DiagnosticSeverity::Warning;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = arec.deprecatedMessage.empty()
+                        ? arec.name
+                        : arec.name + ": " + arec.deprecatedMessage;
+                    s.reporter.report(std::move(d));
+                }
+                return arec.type;
+            }
         }
         return InvalidType;
     }
@@ -2203,10 +2298,11 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // resolveTypeNodeImpl).
 [[nodiscard]] TypeId
 resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-                NodeId node, ScopeId scope, bool emitOnMiss = true) {
+                NodeId node, ScopeId scope, bool emitOnMiss = true,
+                bool emitTypeUse = true) {
     bool specifierDiagnosed = false;
     return resolveTypeNodeImpl(s, cfg, tree, node, scope, emitOnMiss,
-                               specifierDiagnosed);
+                               emitTypeUse, specifierDiagnosed);
 }
 
 // True for the core integer kinds (signed + unsigned). Array lengths must be
@@ -2921,6 +3017,125 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
     return r.value;
 }
 
+// ── P33: the two constexpr-initializer predicates ──────────────────────────
+//
+// Descend through the TRANSPARENT wrappers an initializer position interposes
+// (`initValue`'s alt node, paren groups, the expression carrier) to the first
+// node that actually says something — one with 0 or 2+ Internal children, or one
+// whose rule this engine recognizes. The SAME descent shape the FC17.5 empty-brace
+// arm uses, extracted so the brace-list arm and the empty-brace arm cannot drift
+// on what "the initializer node" means. Returns `node` itself when nothing is
+// interposed; never leaves the subtree.
+[[nodiscard]] NodeId
+descendInitWrappers(EngineState const& s, Tree const& tree, NodeId node) {
+    NodeId walk = node;
+    for (int guard = 0; guard < 64 && walk.valid(); ++guard) {
+        if (tree.kind(walk) != NodeKind::Internal) return walk;
+        if (s.idx().braceInitListRule.valid()
+            && tree.rule(walk).v == s.idx().braceInitListRule.v) return walk;
+        if (s.idx().stringLiteralExprRule.valid()
+            && tree.rule(walk).v == s.idx().stringLiteralExprRule.v) return walk;
+        NodeId sole{};
+        bool   multiple = false;
+        for (NodeId c : visibleChildren(tree, walk)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (sole.valid()) { multiple = true; break; }
+            sole = c;
+        }
+        if (multiple || !sole.valid()) return walk;
+        walk = sole;
+    }
+    return walk;
+}
+
+// ★★ P33 (D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL, C 6.3.2.3p3 + 6.6): is `node` a
+// CAST to a pointer type whose operand is an integer constant expression with
+// value 0 — `(int*)0`, `(void*)0`, `(int*)(2-2)`, and the chained `(int*)(void*)0`?
+// Such an expression has a compile-time-known null pointer VALUE, which is the
+// only question C23 6.7.1 asks of a constexpr pointer object's initializer.
+//
+// ★★★ WHY THIS IS **NOT** A WIDENING OF `admitsNullPointerConstant`, WHICH IS
+// WHAT THE REGISTRY ROW OFFERED AS ITS FIRST OPTION. That predicate is SHARED by
+// six call sites, and the audit the row demanded says the widening must not
+// happen there. Five of the six (Pass-2 decl-init ×2, the assignment-operator
+// check, `checkCallAgainstSig`'s argument arm, `checkReturn`) are reached ONLY
+// after `isAssignable` has already FAILED — so the only conversions a widening
+// could newly admit at those sites are the INCOMPATIBLE-POINTER ones, exactly the
+// cases both references diagnose: ✔MEASURED gcc 13.3.0 and clang 19.1.1 both warn
+// `-Wincompatible-pointer-types` on `int *p = (float*)0;`. Widening the shared
+// predicate would DELETE that diagnostic at five sites to buy one — a lost
+// diagnostic, which is the silent class this bar exists to refuse. The sixth site
+// is the constexpr Ptr arm, and it is the only one asking a CONSTANTNESS
+// question rather than an ASSIGNABILITY question. So the arm gets its own
+// predicate and the shared one is untouched.
+//
+// ★ IT ALSO DELIBERATELY DOES NOT MARK THE NODE. `admitsNullPointerConstant`
+// writes `nullPointerConstantNodes`, and the CST→HIR lowerer then materializes a
+// synthetic `Literal 0` IN PLACE of the marked subtree. Marking a cast would make
+// a constexpr pointer object lower DIFFERENTLY from the plain-`const` equivalent,
+// and "a validated constexpr object lowers byte-identically to a const object
+// with a foldable init" is the invariant [[D-CSUBSET-CONSTEXPR]] shipped on.
+// ✔MEASURED at HEAD: `int *p = (int*)0;` already compiles and links, so the
+// unmarked cast is a path the lowering tier already walks.
+[[nodiscard]] bool
+constexprPointerCastFoldsToNull(EngineState& s, SemanticConfig const& cfg,
+                                Tree const& tree, NodeId node, ScopeId here) {
+    NodeId cur = node;
+    for (int guard = 0; guard < 16 && cur.valid(); ++guard) {
+        cur = descendInitWrappers(s, tree, cur);
+        if (!cur.valid() || tree.kind(cur) != NodeKind::Internal) return false;
+        auto const it = s.idx().castByRule.find(tree.rule(cur).v);
+        if (it == s.idx().castByRule.end()) return false;
+        auto const& cr = tree.schema().semantics().castRules[it->second];
+        auto const kids = visibleChildren(tree, cur);
+        if (cr.typeChild >= kids.size() || cr.operandChild >= kids.size()) return false;
+        // The cast must PRODUCE a pointer — `(int)0` is an integer constant, not a
+        // pointer one, and must keep falling through to the arithmetic arm.
+        // `emitOnMiss=false` + `emitTypeUse=false`: this is a PROBE. Pass 2's own
+        // cast arm re-resolves the very same type-name loudly and owns every
+        // diagnostic it produces, including the deprecated-typedef use warning.
+        TypeId const castTy = resolveTypeNode(s, cfg, tree, kids[cr.typeChild], here,
+                                              /*emitOnMiss=*/false,
+                                              /*emitTypeUse=*/false);
+        if (!castTy.valid()
+            || s.lattice.interner().kind(castTy) != TypeKind::Ptr) return false;
+        NodeId const value = kids[cr.operandChild];
+        // An INTEGER constant expression with value 0 ends the walk (6.3.2.3p3);
+        // anything else non-zero or non-integer is not a null pointer constant, and
+        // a nested pointer cast (`(int*)(void*)0`) continues it.
+        if (auto const folded = constIntExpr(s, tree, value, here, &cfg);
+            folded.has_value()) {
+            return *folded == 0;
+        }
+        cur = value;
+    }
+    return false;
+}
+
+// ★★ P33 (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE): does ONE initializer EXPRESSION
+// carry a value C23 6.7.1p4 admits for a constexpr object's SCALAR slot? The one
+// predicate the top-level scalar arms and the aggregate element walk both read,
+// so a value form admitted at top level can never be refused one brace deep.
+//
+// PURE — it emits nothing and marks nothing. That is load-bearing for the
+// aggregate walk: the whole safety argument for admitting constexpr aggregates is
+// that a validated one lowers byte-identically to the `const` equivalent, and a
+// predicate with a lowering side effect would break exactly that.
+[[nodiscard]] bool
+constexprScalarInitIsConstant(EngineState& s, SemanticConfig const& cfg,
+                              Tree const& tree, NodeId node, ScopeId here) {
+    if (!node.valid()) return false;
+    // Arithmetic / enum / char / bool — the float-capable shared evaluator. This
+    // also covers the integer `0`, `-0` and `1-1` spellings of a null pointer
+    // constant, so no pointer-specific arm is needed for them.
+    if (constExprValue(s, tree, node, here, &cfg).has_value()) return true;
+    // `nullptr` — a NullptrT-typed constant (the top-level Ptr arm's own admission).
+    if (TypeId const t = subtreeType(s, tree, node, here);
+        t.valid() && s.lattice.interner().kind(t) == TypeKind::NullptrT) return true;
+    // `(T*)0` and friends.
+    return constexprPointerCastFoldsToNull(s, cfg, tree, node, here);
+}
+
 // FC17 (D-CSUBSET-CONSTEXPR): enforce the C23 6.7.1 constexpr-object
 // constraints for ONE declarator whose symbol was Pass-1-marked `isConstexpr`.
 // Runs from pass2Post's per-declarator loop — Pass 2, NOT Pass 1.5, because a
@@ -2939,18 +3154,26 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
 //     VolatileQual. A volatile POINTEE — `constexpr volatile int *p` — is
 //     Ptr at the top level and correctly stays legal; an east
 //     `int * volatile p` IS a volatile object and is rejected);
-//   * Array / Struct / Union     → S_ConstexprUnsupportedType — the NAMED loud
-//     aggregate deferral (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE; a UNIFORM
-//     boundary — `constexpr char s[] = "hi"` is deliberately NOT carved out);
+//   * Array / Struct / Union     → P33 (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE):
+//     ELEMENT-WISE validation of the brace initializer against the shared
+//     evaluator — every element must be a constant scalar, a nested brace list,
+//     or a string literal for a character (sub-)array (the UNIFORM boundary:
+//     `constexpr char s[] = "hi"` rides the SAME walk, not a carve-out). A
+//     non-constant element, or a non-brace non-string initializer such as
+//     `constexpr struct S s = s0;`, → S_ConstexprNonConstantInitializer at the
+//     offending element. A VARIABLY-MODIFIED aggregate keeps
+//     S_ConstexprUnsupportedType: a VLA has no compile-time size, so no element
+//     walk can make it a constant object;
 //   * missing initializer        → S_ConstexprMissingInitializer, fired PER
 //     DECLARATOR (`constexpr int a = 1, b;` errors on `b`);
 //   * Ptr                        → the initializer must be a null pointer
 //     constant: the shared `admitsNullPointerConstant` (structural `0` + the
 //     R2 folded integer-0 path, which also MARKS the node for the HIR
 //     literal-0 materialization) OR a Pass-2-stamped NullptrT (`nullptr` —
-//     mirroring the decl-init isAssignable site's admission). Anything else
-//     (`&g`; the `(T*)0` cast form = D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL,
-//     a named loud deferral) → S_ConstexprNonConstantInitializer;
+//     mirroring the decl-init isAssignable site's admission) OR — P33
+//     (D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL) — a pointer-typed CAST whose
+//     operand folds to integer 0 (`(int*)0` / `(void*)0` / `(int*)(2-2)`).
+//     Anything else (`&g`) → S_ConstexprNonConstantInitializer;
 //   * arithmetic scalar (integer / float / bool / char / Enum — F5: an
 //     enumerator initializer folds via the shared resolveSymbolValue arm) →
 //     the initializer must fold through `constExprValue` (float-capable,
@@ -2983,7 +3206,71 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         return;
     }
     TypeKind const k = in.kind(declTy);
-    if (k == TypeKind::Array || k == TypeKind::Struct || k == TypeKind::Union) {
+    bool const aggregate =
+        k == TypeKind::Array || k == TypeKind::Struct || k == TypeKind::Union;
+    // ★★ C23 6.7.10p4: "An entity of variable length array type shall not be
+    // initialized except by an empty initializer." A VARIABLY-MODIFIED type is the
+    // one aggregate shape that stays refused, and it is refused because the STANDARD
+    // forbids it — not because anything here is deferred. A VLA's LENGTH is a
+    // run-time value, so the object has no compile-time size at all; validating its
+    // elements would say nothing about the object. The references agree: ✔MEASURED
+    // gcc 13.3.0 ("'constexpr' object has variably modified type") and clang 19.1.1
+    // ("constexpr variable cannot have type 'const int[argc]'").
+    //
+    // ⚠ CITING THE STANDARD RATHER THAN A DEFERRAL ROW IS DELIBERATE, AND WAS PAID
+    // FOR. This comment first cited D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE, and
+    // stale_refusal_citations_guard went RED at the P33 fold the moment that row
+    // closed — correctly: a sentence asserting something is refused, anchored to a
+    // tracking row, becomes a lie about a deferral as soon as the work lands. A
+    // PERMANENT constraint is justified by the text that imposes it, which cannot
+    // close. Cite a row for WORK OUTSTANDING; cite the standard for A RULE.
+    //
+    // ★★ TWO TESTS, AND THE SECOND ONE IS THE LOAD-BEARING ONE — MEASURED. The
+    // obvious `isVlaArray(declTy)` test alone does NOT catch `constexpr int
+    // a[argc] = {1,2,3};`, because by the time this validator runs the DECLARED
+    // TYPE IS NO LONGER VARIABLY MODIFIED: with an initializer present the
+    // declarator resolver takes the c34 init-inference relaxation, the written
+    // `argc` bound is dropped, and `completeIncompleteArrayFromInit` re-sizes the
+    // object from the brace list — ✔MEASURED through the shipped CLI, `int
+    // a[argc] = {1,2,3}; return sizeof(a);` exits **12**, a COMPILE-TIME size, and
+    // `int a[argc];` (no initializer) exits 4 for argc==1. So the type test asks a
+    // question the type can no longer answer, and the DECLARATOR is the only
+    // surviving witness of what the programmer wrote.
+    //   ⚠ THAT DROPPED BOUND IS A PRE-EXISTING SILENT WRONGNESS OF ITS OWN, NOT
+    // CREATED HERE and not scoped to `constexpr`: `const int a[argc] = {1,2,3};`
+    // is accepted at HEAD with the same wrong compile-time size, while gcc and
+    // clang BOTH refuse ("variable-sized object may not be initialized"). It is
+    // reported to the operator rather than fixed inside this row, because the
+    // honest fix lives in the array-suffix resolver and the two references DISAGREE
+    // on its one remaining corner (gcc admits `int a[n] = {};`, clang refuses it) —
+    // a fork, not an implementation detail. What this arm guarantees is only that
+    // admitting constexpr aggregates does not WIDEN that hole.
+    //
+    // The bound is located through the SHARED `arraySuffixBoundNode` (the one
+    // locator every array-suffix site agrees on) and folded by the SHARED
+    // `constIntExpr` — no second reading of what an array bound is.
+    bool variablyModified = in.isVlaArray(declTy) || in.typeContainsVla(declTy);
+    if (aggregate && !variablyModified && cfg.declarators.has_value()) {
+        auto const& dc = *cfg.declarators;
+        std::vector<NodeId> stack{dNode};
+        for (int guard = 0; guard < 16384 && !stack.empty() && !variablyModified;
+             ++guard) {
+            NodeId const c = stack.back();
+            stack.pop_back();
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (tree.rule(c).v == dc.arraySuffixRule.v) {
+                auto const bound =
+                    arraySuffixBoundNode(tree, c, dc.arraySuffixModifierTokens);
+                if (bound.has_value()
+                    && !constIntExpr(s, tree, *bound, here, &cfg).has_value()) {
+                    variablyModified = true;
+                }
+                continue;   // a suffix's own bound is not a nested declarator
+            }
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+        }
+    }
+    if (aggregate && variablyModified) {
         emit(DiagnosticCode::S_ConstexprUnsupportedType, nameNode);
         return;
     }
@@ -3052,6 +3339,74 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
             if (!anyElement) return;   // `= {}` — zero, a valid constexpr value
         }
     }
+    // ★★ P33 (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE, C23 6.7.1p4): an ARRAY / STRUCT
+    // / UNION constexpr object is admitted when EVERY element of its brace
+    // initializer is itself a compile-time constant — the element-wise validation
+    // the row named. Both references accept the three forms and both REFUSE a
+    // non-constant element: ✔MEASURED gcc 13.3.0 ("initializer element is not
+    // constant") and clang 19.1.1 ("must be initialized by a constant expression")
+    // on `constexpr int a[3] = {1, argc, 3};` and on `constexpr struct S s = s0;`.
+    //
+    // ★ ZERO CODEGEN, WHICH IS THE WHOLE SAFETY ARGUMENT. Nothing below writes a
+    // type, a mark or a fold: this is a PREDICATE over an initializer the const
+    // path already lowers. A validated `constexpr int a[3] = {1,2,3};` is
+    // byte-identical to `const int a[3] = {1,2,3};`, exactly as
+    // [[D-CSUBSET-CONSTEXPR]] established for the scalar arms.
+    //
+    // ★ THE UNIFORM BOUNDARY THE ROW DEMANDED IS KEPT — the char-array-from-string
+    // form (`constexpr char s[] = "hi";`) is admitted by the SAME walk rather than
+    // carved out: a string-literal expression IS a constant initializer for a
+    // character (sub-)array, so it is one arm of the element predicate and not a
+    // special case bolted beside it. The array's LENGTH inference is untouched —
+    // `completeIncompleteArrayFromInit` sized `s[]` from the literal before this
+    // check ever runs, and it does so for `const` and `constexpr` identically.
+    if (aggregate) {
+        // The work-stack holds INITIALIZER VALUE nodes still to validate. A brace
+        // list expands to its elements' values; anything else must be a constant
+        // scalar or a string literal. Bounded: the tree is finite and every push
+        // is a strict descendant.
+        std::vector<NodeId> pending{initNode};
+        for (int guard = 0; guard < 100000 && !pending.empty(); ++guard) {
+            NodeId const raw = pending.back();
+            pending.pop_back();
+            NodeId const value = descendInitWrappers(s, tree, raw);
+            if (!value.valid()) {
+                emit(DiagnosticCode::S_ConstexprNonConstantInitializer, raw);
+                return;
+            }
+            bool const isBrace =
+                tree.kind(value) == NodeKind::Internal
+                && s.idx().braceInitListRule.valid()
+                && tree.rule(value).v == s.idx().braceInitListRule.v;
+            if (isBrace) {
+                for (NodeId el : visibleChildren(tree, value)) {
+                    if (tree.kind(el) != NodeKind::Internal) continue;
+                    if (s.idx().initElementRule.valid()
+                        && tree.rule(el).v != s.idx().initElementRule.v) continue;
+                    // An `initElement` is either `[designator…, '=', initValue]` or
+                    // a bare `initValue`; in BOTH alternatives the VALUE is the LAST
+                    // Internal child. Read positionally-from-the-end rather than by
+                    // designator rule id so a grammar that adds a designator form
+                    // needs no change here. A designator's own index expression is
+                    // C's own constant-expression requirement and is enforced by the
+                    // designator machinery, not by this walk.
+                    NodeId last{};
+                    for (NodeId c : visibleChildren(tree, el))
+                        if (tree.kind(c) == NodeKind::Internal) last = c;
+                    if (last.valid()) pending.push_back(last);
+                }
+                continue;   // an EMPTY list is zero-initialization — always constant
+            }
+            // A string literal initializing a character (sub-)array.
+            if (tree.kind(value) == NodeKind::Internal
+                && s.idx().stringLiteralExprRule.valid()
+                && tree.rule(value).v == s.idx().stringLiteralExprRule.v) continue;
+            if (constexprScalarInitIsConstant(s, cfg, tree, value, here)) continue;
+            emit(DiagnosticCode::S_ConstexprNonConstantInitializer, value);
+            return;
+        }
+        return;
+    }
     if (k == TypeKind::Ptr) {
         if (admitsNullPointerConstant(s, tree, declTy, initNode,
                                       tree.schema().semantics()
@@ -3061,6 +3416,15 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         }
         TypeId const initTy = subtreeType(s, tree, initNode, here);
         if (initTy.valid() && in.kind(initTy) == TypeKind::NullptrT) return;
+        // ★ P33 (D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL): the CAST-form null pointer
+        // constant — `(int*)0` / `(void*)0` / `(int*)(2-2)`. See
+        // `constexprPointerCastFoldsToNull` for why this is the constexpr Ptr arm's
+        // OWN predicate and NOT a widening of the six-site
+        // `admitsNullPointerConstant`. An INCOMPATIBLE cast (`constexpr int *p =
+        // (float*)0;`) still gets the pre-existing S_TypeMismatch from the Pass-2
+        // decl-init assignability check — one diagnostic, from the check that owns
+        // the question, exactly as the non-constexpr `int *p = (float*)0;` does.
+        if (constexprPointerCastFoldsToNull(s, cfg, tree, initNode, here)) return;
         emit(DiagnosticCode::S_ConstexprNonConstantInitializer, initNode);
         return;
     }
@@ -4263,6 +4627,14 @@ evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 struct CompositeAttrFacts {
     bool                         packed = false;
     std::optional<std::uint32_t> alignment;   // nullopt = no honored `aligned(N)`
+    // P33 (D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES): a `warnOnUse` effect row matched
+    // on one of the COMPOSITE's own attribute surfaces — `struct [[deprecated]] S
+    // {…}` / `struct __attribute__((deprecated)) S {…}`, the C23 6.7.3.1
+    // appertainment position for a TAG. Carried here rather than folded straight
+    // onto the symbol so this scan stays a pure reader; the composition site owns
+    // the write, exactly as it does for `packed` / `alignment`.
+    bool                         deprecated = false;
+    std::string                  deprecatedMessage;
 };
 
 // FC16 (D-CSUBSET-PACKED) + TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED): scan a
@@ -4371,18 +4743,47 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // dunder-normalized through the shared `stripDunder`. Reading DIRECT
             // children only is what keeps a string ARGUMENT (`section("packed")`)
             // and an argument IDENTIFIER (`format(printf,1,2)`) from false-matching.
-            NodeId nameTok{};
-            for (NodeId g : visibleChildren(tree, cl)) {
-                if (tree.kind(g) == NodeKind::Token
-                    && isAttrClauseNameToken(cfg, tree.tokenKind(g)))
-                    nameTok = g;
-            }
-            if (!nameTok.valid()) continue;   // an empty `__attribute__(())`
-            std::string_view const id = stripDunder(tree.text(nameTok));
+            // ★ P33 — ONE CLAUSE READER. The name, its matched `attributeEffects`
+            // row and its optional string argument all come from the SHARED
+            // `extractOneAttrClause` (the same reader `scanAttributeSemantics`
+            // uses), instead of a second hand-rolled last-name-token scan here.
+            // The two readings were required to agree BY REVIEW — the comment
+            // above said so — and a composite clause is now read exactly once, so
+            // they agree by construction. `emitDiagnostics` threads straight
+            // through as that reader's own double-fire gate.
+            auto const clause = extractOneAttrClause(s, cfg, tree, cl, emitDiagnostics);
+            if (!clause.has_value()) continue;   // an empty `__attribute__(())`
+            std::string_view const id = clause->name;
             bool named = false;
             for (std::string const& nm : cfg.packedAttributeNames)
                 if (id == nm) { named = true; break; }
             if (named) { facts.packed = true; continue; }
+            // ★★ P33 (D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES) — THE TAG'S OWN
+            // `warnOnUse` SURFACE. C23 6.7.3.1 puts a tag's attribute AFTER the
+            // struct/union keyword (`struct [[deprecated]] S { … };`), and BOTH
+            // references honor it there: ✔MEASURED gcc 13.3.0 and clang 19.1.1
+            // each warn at every USE of the tag. Before this arm the C23 spelling
+            // was parsed and SILENTLY DROPPED, and the GNU spelling fell to the
+            // strict-unknown arm below and failed loud S_UnknownTypeAttribute —
+            // a REFUSAL of a construct gcc accepts.
+            //
+            // VERB-DRIVEN, exactly like the `Align` arm beneath it: the spelling
+            // lives in the language's `attributeEffects` rows and only the row's
+            // EFFECT is tested here, so a second `warnOnUse` spelling is a config
+            // row. Every other effect keeps its current behavior — in particular
+            // an inapplicable GNU name still fails loud, which is the typo
+            // protection this function exists for.
+            //
+            // NOT gated on `emitDiagnostics`: this arm emits nothing. It records a
+            // fact the composition site writes onto the tag symbol, and the other
+            // caller (the member-alignas baseline probe) simply never reads it.
+            if (clause->row != nullptr
+                && clause->row->effect == AttributeEffect::WarnOnUse) {
+                facts.deprecated = true;
+                if (facts.deprecatedMessage.empty() && clause->message.has_value())
+                    facts.deprecatedMessage = *clause->message;
+                continue;
+            }
             // ★★ TF-C73 (D-CSUBSET-COMPOSITE-ALIGNED) — THE COMPOSITE `aligned(N)`
             // SINK. Until the interner grew a per-COMPOSITE alignment channel there
             // was nowhere to put this number, so the clause fell through to the
@@ -8842,6 +9243,23 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         /*emitDiagnostics=*/true, attrScope);
                                     composedPacked = composedAttrs.packed;
                                     composedAlign  = composedAttrs.alignment;
+                                    // ★★ P33 (D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES):
+                                    // the TAG carries the `warnOnUse` fact, exactly as
+                                    // an ordinary declarator's symbol does. From here
+                                    // the EXISTING consumers do the rest — Pass 2's
+                                    // reference-resolution chokepoint already routes a
+                                    // tag reference through the Tag namespace, and
+                                    // `resolveTypeNodeImpl`'s tag arm is the
+                                    // type-position counterpart. Written on the SYMBOL
+                                    // (never on the TypeId): C 6.2.3 gives two
+                                    // same-named tags in different scopes two symbols,
+                                    // and deprecation belongs to the DECLARATION.
+                                    if (composedAttrs.deprecated) {
+                                        srec.isDeprecated = true;
+                                        if (srec.deprecatedMessage.empty())
+                                            srec.deprecatedMessage =
+                                                composedAttrs.deprecatedMessage;
+                                    }
                                     if (composedPacked) {
                                         bool anyBitfieldMember = false;
                                         for (std::int64_t const w : fieldBitWidths)
@@ -12997,7 +13415,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             auto& mut = const_cast<EngineState&>(s);
             auto const snap = mut.reporter.snapshotForRollback();
             result = resolveTypeNode(mut, sem, tree, kids[cr.typeChild], scope,
-                                     /*emitOnMiss=*/false);
+                                     /*emitOnMiss=*/false,
+                                     /*emitTypeUse=*/false);
             mut.reporter.truncateTo(snap);
             return;
         }
@@ -13011,7 +13430,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             auto& mut = const_cast<EngineState&>(s);
             auto const snap = mut.reporter.snapshotForRollback();
             result = resolveTypeNode(mut, sem, tree, kids[cl.typeChild], scope,
-                                     /*emitOnMiss=*/false);
+                                     /*emitOnMiss=*/false,
+                                     /*emitTypeUse=*/false);
             mut.reporter.truncateTo(snap);
             return;
         }
@@ -13350,7 +13770,8 @@ selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
         TypeId assocTy = InvalidType;
         if (typeNode.valid()) {
             assocTy = resolveTypeNode(mutS, cfg, tree, typeNode, scope,
-                                      /*emitOnMiss=*/false);
+                                      /*emitOnMiss=*/false,
+                                      /*emitTypeUse=*/false);
             sel.typedAssocTypeNodes.push_back(typeNode);
             if (!assocTy.valid()) sel.anyBadType = true;
         }

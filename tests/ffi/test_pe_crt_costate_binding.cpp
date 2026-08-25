@@ -90,12 +90,12 @@ namespace {
 // unchanged: empty on a miss, both callers ASSERT on it; the ADD_FAILURE names
 // which of the three lookups came up short.
 [[nodiscard]] fs::path configRoot() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config";
+    return *cfg;
 }
 
 // The STATEFUL co-state group: every descriptor whose pe surface mints or

@@ -933,15 +933,15 @@ TEST(ShippedLibDescriptor, RealDescriptorsCarryTheirDarwinLinkNames) {
         {"stdlib.json",   "realpath", "realpath$DARWIN_EXTSN",
                                       "realpath$DARWIN_EXTSN"},
     }};
-    auto const shippedRoot = dss::test::findRepoRoot();
-    ASSERT_TRUE(shippedRoot.has_value()) << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
     // Reads the REAL descriptor for one (arch, macho) and returns `symbol`'s
     // resolved `linkName` — "<missing>" if the row is gone, so deleting a row
     // REDS here instead of silently satisfying an empty expectation.
     auto linkNameOf = [&](char const* descriptor, char const* symbol,
                           std::string_view arch) -> std::string {
         fs::path const p =
-            *shippedRoot / "src" / "dss-config" / "shippedLibs" / descriptor;
+            *cfg / "shippedLibs" / descriptor;
         TypeInterner       interner{CompilationUnitId{1}};
         TypeRegistry       typeReg;
         DiagnosticReporter rep;
@@ -2650,12 +2650,12 @@ sysvVaListBinding(TypeInterner& interner) {
 // diagnostic so the log names WHICH of the three lookups came up short, not
 // just the call site that noticed.
 [[nodiscard]] fs::path shippedLibsRoot() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config" / "shippedLibs";
+    return *cfg / "shippedLibs";
 }
 
 // ── Item 1: constants + typedefs decode (neutral shipped-header content) ─────

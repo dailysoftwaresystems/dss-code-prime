@@ -112,12 +112,12 @@ using json = nlohmann::json;
 namespace {
 
 [[nodiscard]] fs::path shippedLibsRoot() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config" / "shippedLibs";
+    return *cfg / "shippedLibs";
 }
 
 // Load one descriptor, FAIL-CLOSED: the file must exist and parse.

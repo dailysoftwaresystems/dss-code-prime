@@ -21,6 +21,16 @@ dss_add_test(NAME test_support/test_scoped_env SOURCES test_scoped_env.cpp)
 dss_add_test(NAME test_support/test_repo_root SOURCES test_repo_root.cpp)
 set_property(TEST test_support/test_repo_root APPEND PROPERTY
              ENVIRONMENT "GTEST_FILTER=-BakedRootOnly.*")
+# D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED — the
+# guard on the per-run shipped-config snapshot that `dss_add_test` now points
+# every entry at. It asserts the override was READ and not merely SET (a
+# set-but-miss falls THROUGH to the live tree and every test still passes), that
+# the COMPILER-side resolver landed in the same tree as the test-side one, and —
+# the clause that keeps the whole mechanism honest — that the snapshot still
+# matches the live tree file for file, which is what reds if the copy ever stops
+# being taken at ctest RUN time.
+dss_add_test(NAME test_support/test_config_snapshot
+             SOURCES test_config_snapshot.cpp)
 dss_add_test(NAME test_support/test_host_native_target
              SOURCES test_host_native_target.cpp)
 # D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR.

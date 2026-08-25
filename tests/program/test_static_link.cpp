@@ -1483,9 +1483,9 @@ void expectMemberFormatResolvesToTheWriterDocument(Schemas const&   s,
                                                    std::string_view familyLabel) {
     ASSERT_TRUE(s.target && s.exec && s.staticlib)
         << familyLabel << ": schemas must load";
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    fs::path const formatsDir = *root / "src" / "dss-config" / "object-formats";
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const formatsDir = *cfg / "object-formats";
     ASSERT_TRUE(fs::is_directory(formatsDir))
         << familyLabel
         << ": the shipped object-format tree is the SUBJECT of this assertion; "
@@ -1712,9 +1712,9 @@ TEST(ArchiveMemberObjectFormat,
     // A config root carrying exactly ONE object-format document — the image
     // one. Every schema this case needs is already loaded and held above, so
     // narrowing discovery affects only the member-format resolution.
-    auto const repoRoot = dss::test::findRepoRoot();
-    ASSERT_TRUE(repoRoot.has_value()) << dss::test::repoRootDiagnostic();
-    fs::path const shippedExec = *repoRoot / "src" / "dss-config"
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const shippedExec = *cfg
                                / "object-formats"
                                / "elf64-x86_64-linux-exec.format.json";
     ASSERT_TRUE(fs::is_regular_file(shippedExec)) << shippedExec.string();

@@ -26,6 +26,7 @@
 #include "golden_file.hpp"   // findCorpusRoot / readFile — the real consumers
 #include "repo_root.hpp"
 #include "scoped_env.hpp"    // the ONE env override (this file used to carry a copy)
+#include "scratch_dir.hpp"   // a real second root, so "honoured" differs from "ignored"
 
 #include <gtest/gtest.h>
 
@@ -41,7 +42,9 @@
 
 namespace fs = std::filesystem;
 
+using dss::test_support::Location;
 using dss::test_support::ScopedEnv;
+using dss::test_support::ScratchDir;
 
 // ── ordinary conditions ─────────────────────────────────────────────────
 
@@ -54,39 +57,88 @@ TEST(RepoRoot, ResolvesAndPointsAtRealTrees) {
         << dss::test::corpusRoot().string();
 }
 
-// The property that makes env-first SAFE. Without per-candidate validation, one
-// stale shell export would redden every test in the suite instead of falling
-// through to the baked value.
-TEST(RepoRoot, StaleEnvOverrideFallsThroughInsteadOfPoisoningTheRun) {
-    const auto expected = dss::test::repoRoot();
-    ScopedEnv  guard("DSS_CONFIG_ROOT",
-                     (fs::temp_directory_path() / "dss-nonexistent-root")
-                         .string());
-    EXPECT_EQ(dss::test::repoRoot(), expected)
+// The property that makes env-first SAFE on the CONFIG side. Without
+// per-candidate validation, one stale shell export would redden every test in
+// the suite instead of falling through to the checkout's own tree.
+TEST(RepoRoot, StaleConfigOverrideFallsThroughInsteadOfPoisoningTheRun) {
+    ScopedEnv guard("DSS_CONFIG_ROOT",
+                    (fs::temp_directory_path() / "dss-nonexistent-root")
+                        .string());
+    EXPECT_EQ(dss::test::configRoot(),
+              dss::test::repoRoot() / "src" / "dss-config")
         << "a DSS_CONFIG_ROOT that does not contain src/dss-config must be "
            "REJECTED by validation and fall through to the next candidate";
 }
 
 // An empty value is not an override. Guards the `env[0] != '\0'` check.
-TEST(RepoRoot, EmptyEnvOverrideIsIgnored) {
-    const auto expected = dss::test::repoRoot();
+TEST(RepoRoot, EmptyConfigOverrideIsIgnored) {
+    const auto expected = dss::test::repoRoot() / "src" / "dss-config";
     ScopedEnv  guard("DSS_CONFIG_ROOT", "");
-    EXPECT_EQ(dss::test::repoRoot(), expected);
+    EXPECT_EQ(dss::test::configRoot(), expected);
 }
 
-// An explicit, VALID override must win — this is the half of the contract the
-// operator's control run expected and did not get.
-TEST(RepoRoot, ValidEnvOverrideIsHonoured) {
-    const auto real = dss::test::repoRoot();
-    ScopedEnv  guard("DSS_CONFIG_ROOT", real.string());
-    EXPECT_EQ(dss::test::repoRoot(), real);
+// An explicit, VALID override must win on the CONFIG side — this is the half of
+// the contract the operator's control run expected and did not get, and it is
+// what the per-run config snapshot depends on.
+TEST(RepoRoot, ValidConfigOverrideIsHonoured) {
+    // A root that really does hold `src/dss-config` and is NOT the checkout: an
+    // override equal to the checkout could not tell "honoured" from "ignored".
+    ScratchDir      scratch(Location::Temp, "repo-root-config-override");
+    const fs::path  other = scratch.path() / "src" / "dss-config";
+    std::error_code ec;
+    fs::create_directories(other, ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    ScopedEnv guard("DSS_CONFIG_ROOT", scratch.path().string());
+    EXPECT_EQ(dss::test::configRoot(), other)
+        << "an explicit, valid DSS_CONFIG_ROOT must select the config tree";
 }
 
-TEST(RepoRoot, DiagnosticNamesAllThreeSources) {
+// ★★★ THE SPLIT ITSELF, and it is the assertion that lets the whole suite run
+// against a config-only snapshot.
+// D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED points
+// `$DSS_CONFIG_ROOT` at `<build>/dss-config-snapshot`, a root that holds
+// `src/dss-config` and `VERSION` and NOTHING ELSE. `repoRoot()` reaches
+// tests/corpus, tests/hir/lowering_goldens, examples/, scripts/, real-examples/
+// and src/ — so if the override relocated the checkout as well, every golden
+// file in the repository would resolve into a directory that does not have one.
+TEST(RepoRoot, ConfigOverrideDoesNotRelocateTheCheckout) {
+    const auto realRoot   = dss::test::repoRoot();
+    const auto realCorpus = dss::test::corpusRoot();
+
+    ScratchDir      scratch(Location::Temp, "repo-root-split");
+    std::error_code ec;
+    fs::create_directories(scratch.path() / "src" / "dss-config", ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    ScopedEnv guard("DSS_CONFIG_ROOT", scratch.path().string());
+
+    EXPECT_EQ(dss::test::repoRoot(), realRoot)
+        << "$DSS_CONFIG_ROOT names the shipped CONFIG tree; it must not move the "
+           "checkout the corpus and the sources live in";
+    EXPECT_EQ(dss::test::corpusRoot(), realCorpus)
+        << "the golden-file corpus followed the config override — under the "
+           "per-run config snapshot that directory does not exist, and every "
+           "golden test in the repository would fail for the wrong reason";
+    // ...while the config side DID follow it, so this is a split and not an
+    // override that quietly stopped working.
+    EXPECT_EQ(dss::test::configRoot(), scratch.path() / "src" / "dss-config");
+}
+
+TEST(RepoRoot, RepoDiagnosticNamesItsCandidatesAndTheConfigOverride) {
     const auto msg = dss::test::repoRootDiagnostic();
-    EXPECT_NE(msg.find("DSS_CONFIG_ROOT"), std::string::npos)      << msg;
     EXPECT_NE(msg.find("DSS_TEST_REPO_ROOT"), std::string::npos)   << msg;
     EXPECT_NE(msg.find("ancestor walk"), std::string::npos)        << msg;
+    // Named, and named as what it IS — the commonest wrong guess about this
+    // failure is that setting DSS_CONFIG_ROOT should have fixed it.
+    EXPECT_NE(msg.find("DSS_CONFIG_ROOT"), std::string::npos)      << msg;
+    EXPECT_NE(msg.find("NOT a repo-root candidate"), std::string::npos) << msg;
+}
+
+TEST(RepoRoot, ConfigDiagnosticNamesBothCandidates) {
+    const auto msg = dss::test::configRootDiagnostic();
+    EXPECT_NE(msg.find("DSS_CONFIG_ROOT"), std::string::npos)          << msg;
+    EXPECT_NE(msg.find("the repo root, resolved as"), std::string::npos) << msg;
 }
 
 // ── THE REGRESSION GUARD ────────────────────────────────────────────────

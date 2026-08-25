@@ -170,6 +170,16 @@ foreach(MANIFEST ${EXAMPLE_MANIFESTS})
              COMMAND dss_examples_runner ${EXAMPLE_DIR}
                      --gtest_filter=-${EXAMPLES_LINT_SUITE}.*
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED.
+    # ★ These entries carried NO `DSS_CONFIG_ROOT` at all: the runner's
+    # `ScratchDir(InsideRepo) + useAsCwd()` put the cwd under the repo, so every
+    # compile in every one of them resolved shipped config by the ancestor walk
+    # onto the LIVE tree — which makes this loop the single largest population of
+    # live-tree readers in the repository, and the one a `dss_add_test`-only fix
+    # would have left untouched. They now read the run's snapshot like everything
+    # else. ⚠ BEFORE `dss_strict_arm_verdicts`, which re-sets `ENVIRONMENT` from
+    # what it reads and would drop this if called first.
+    dss_use_config_snapshot(${TEST_NAME})
     dss_strict_arm_verdicts(${TEST_NAME})
     dss_refuse_a_vacuous_gtest_selection(${TEST_NAME})
 endforeach()
@@ -209,6 +219,7 @@ foreach(_pair ${EXAMPLES_LINT_NAMED_ENTRIES})
              COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
                      --gtest_filter=${EXAMPLES_LINT_SUITE}.${_lint_test}
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    dss_use_config_snapshot("${_lint_entry}")
     dss_refuse_a_vacuous_gtest_selection("${_lint_entry}")
     # The SAME iteration that gave this lint an entry takes it out of the
     # catch-all — the two halves of "moved, not dropped" are one statement pair.
@@ -230,4 +241,5 @@ add_test(NAME "examples/corpus-lints"
          COMMAND dss_examples_runner ${CMAKE_SOURCE_DIR}/examples
                  --gtest_filter=${_dss_lint_catchall}
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+dss_use_config_snapshot("examples/corpus-lints")
 dss_refuse_a_vacuous_gtest_selection("examples/corpus-lints")

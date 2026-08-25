@@ -116,12 +116,12 @@ namespace {
 // private cwd walk here would find nothing in an out-of-tree build, and a gate
 // with no tree to read is a hole rather than a pass.
 [[nodiscard]] fs::path configRoot() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config";
+    return *cfg;
 }
 
 [[nodiscard]] fs::path descriptorDir()    { return configRoot() / "shippedLibs"; }

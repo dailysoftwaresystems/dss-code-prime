@@ -21,39 +21,56 @@
 // fixed nothing. The fix has to be that every test-side lookup reads the same
 // resolver, which is this one. Do not re-open a local walk anywhere.
 //
-// ── PRECEDENCE: env, then baked, then walk ──────────────────────────────
+// ── TWO QUESTIONS, TWO RESOLVERS ────────────────────────────────────────
+//   D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED
 //
-// 1. `DSS_CONFIG_ROOT`          — the explicit, documented override
-// 2. `DSS_TEST_REPO_ROOT`       — baked from ${CMAKE_SOURCE_DIR} at configure
-//                                 time by `dss_add_test` (tests/CMakeLists.txt)
-// 3. the cwd ancestor walk      — what every one of these helpers used to do
+// ★★★ `$DSS_CONFIG_ROOT` ANSWERS "WHICH CONFIG TREE", NOT "WHICH CHECKOUT", AND
+// CONFLATING THE TWO WAS A LATENT DEFECT THIS HEADER USED TO CARRY. Its
+// documented meaning (`src/core/types/config_path_walk.hpp`) is "a directory
+// that CONTAINS src/dss-config/" — it says nothing about `tests/corpus`,
+// `tests/hir/lowering_goldens`, `examples/`, `scripts/`, `real-examples/` or
+// `src/`, all of which this header's consumers reach through `repoRoot()`. While
+// the only value anyone ever put in the variable was the repo root itself, the
+// conflation cost nothing and was invisible. It stopped being invisible the
+// moment the suite started running against a per-run SNAPSHOT of the config tree
+// (`cmake/DssConfigSnapshot.cmake`): that root holds `src/dss-config` and
+// `VERSION` and nothing else, so an env-first `repoRoot()` would have sent every
+// golden-file lookup in the repository into a directory that does not have one.
 //
-// ★ ENV FIRST, and the ordering is deliberate rather than incidental.
-// `src/core/types/config_path_walk.cpp` — the COMPILER side of exactly this
-// question — also resolves the environment FIRST. (It gained a third arm since
-// this note was written: env, then the INSTALLED layout relative to the running
-// executable, then the walk — [[D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE]].
-// The installed arm is inert here by construction: a test binary in
-// `build/bin/dss/` has no installed data directory beside it. What matters for
-// this header is unchanged and is the env-first half.) If the tests preferred
-// the baked value
-// while the compiler preferred the environment, then a developer pointing
-// `DSS_CONFIG_ROOT` at a second checkout would have the compiler reading tree A
-// while its own tests read tree B, with nothing anywhere reporting the split.
-// Env-first keeps the two halves of the program consulting one tree, and it
-// honours an explicit override — which is precisely what the operator's control
-// run above expected to happen and was surprised did not. The baked value still
-// guarantees the no-environment case resolves, which is the robustness the
-// out-of-tree failure actually called for; it just does not outrank an operator
-// who said where to look.
+// So the precedences are now stated separately, each for exactly the question it
+// answers:
+//
+//   configRoot()  — THE SHIPPED CONFIG TREE
+//     1. `$DSS_CONFIG_ROOT`      — the explicit, documented override
+//     2. `repoRoot()/src/dss-config`
+//
+//   repoRoot()    — THE CHECKOUT THESE BINARIES WERE BUILT FROM
+//     1. `DSS_TEST_REPO_ROOT`    — baked from ${CMAKE_SOURCE_DIR} at configure
+//                                  time by `dss_add_test` (tests/CMakeLists.txt)
+//     2. the cwd ancestor walk   — what every one of these helpers used to do
+//
+// ★ THE ENV-FIRST ARGUMENT SURVIVES INTACT WHERE IT APPLIES, which is why this
+// is a narrowing rather than a reversal. `src/core/types/config_path_walk.cpp` —
+// the COMPILER side of exactly this question — resolves the environment FIRST.
+// If the tests preferred a different config tree than the compiler, a developer
+// pointing `DSS_CONFIG_ROOT` at a second checkout would have the compiler
+// reading tree A while its own tests read tree B, with nothing anywhere
+// reporting the split. `configRoot()` still honours the override first, so the
+// two halves of the program still consult one config tree. What no longer
+// happens is the override silently relocating the corpus.
 //
 // ★ EVERY CANDIDATE IS VALIDATED, AND THAT IS WHAT MAKES ENV-FIRST SAFE.
 // A candidate counts only if it is a directory containing `src/dss-config`. A
 // stale, deleted, or simply wrong `DSS_CONFIG_ROOT` therefore FALLS THROUGH to
-// the baked value instead of poisoning the run — the same
+// the next candidate instead of poisoning the run — the same
 // "a set-but-miss never worsens discovery" property `config_path_walk.cpp`
 // gives the compiler. Without per-candidate validation, env-first would turn
 // one stale shell export into 787 red tests.
+// ⚠ AND THAT FALL-THROUGH IS PRECISELY WHY A MISSING SNAPSHOT MUST BE CAUGHT
+// SOMEWHERE ELSE: it is silent by design here, so nothing in this header can
+// tell you the isolation stopped working. The `config/snapshot` ctest fixture
+// fails loud when the copy cannot be made, and `test_config_snapshot.cpp`
+// asserts the override was READ rather than merely set.
 //
 // ★ NO CACHING, ON PURPOSE. Resolution is recomputed per call (a couple of
 // `stat`s). A cached first answer would be captured from whichever test ran
@@ -99,29 +116,40 @@ namespace detail {
 #endif
 }
 
+// `$DSS_CONFIG_ROOT` as a VALIDATED repo-shaped root, or nullopt. Shared by
+// `findConfigRoot()` and by the diagnostics, so there is one reading of the
+// variable rather than three.
+[[nodiscard]] inline std::optional<std::filesystem::path> envConfigTreeRoot() {
+    if (char const* env = std::getenv("DSS_CONFIG_ROOT");
+        env != nullptr && env[0] != '\0') {
+        std::filesystem::path const candidate{env};
+        if (isRepoRoot(candidate)) return candidate;
+    }
+    return std::nullopt;
+}
+
 } // namespace detail
 
-// Resolve the repo root, or `nullopt`. Non-throwing: this is the primitive the
-// throwing accessor and every "return empty, caller reports" helper share, so
-// there is exactly ONE copy of the precedence rules above.
+// Resolve the checkout these binaries were built from, or `nullopt`.
+// Non-throwing: this is the primitive the throwing accessor and every "return
+// empty, caller reports" helper share, so there is exactly ONE copy of the
+// precedence rules above.
+//
+// ⚠ DELIBERATELY DOES NOT CONSULT `$DSS_CONFIG_ROOT` — see the two-questions
+// note in the header block. That variable names a CONFIG tree, and under the
+// per-run config snapshot it names one that holds no corpus, no examples and no
+// sources.
 [[nodiscard]] inline std::optional<std::filesystem::path> findRepoRoot() {
     namespace fs = std::filesystem;
 
-    // (1) explicit override
-    if (char const* env = std::getenv("DSS_CONFIG_ROOT");
-        env != nullptr && env[0] != '\0') {
-        fs::path const candidate{env};
-        if (detail::isRepoRoot(candidate)) return candidate;
-    }
-
-    // (2) baked at configure time
+    // (1) baked at configure time
     if (char const* baked = detail::bakedRepoRoot();
         baked != nullptr && baked[0] != '\0') {
         fs::path const candidate{baked};
         if (detail::isRepoRoot(candidate)) return candidate;
     }
 
-    // (3) the ancestor walk these helpers used to do individually.
+    // (2) the ancestor walk these helpers used to do individually.
     // 12 hops, not 8: the sites being consolidated here used BOTH bounds (8 in
     // golden_file.hpp / test_import_resolver, 12 in test_header_name_matching /
     // test_hir_lowering_c / test_pe_crt_costate_binding), and narrowing a
@@ -140,10 +168,25 @@ namespace detail {
     return std::nullopt;
 }
 
-// The diagnostic for an unresolvable root. Names ALL THREE sources with the
+// Resolve the SHIPPED CONFIG TREE, or `nullopt`. The override first, then
+// whatever tree belongs to the resolved checkout.
+[[nodiscard]] inline std::optional<std::filesystem::path> findConfigRoot() {
+    if (auto const viaEnv = detail::envConfigTreeRoot()) {
+        return *viaEnv / "src" / "dss-config";
+    }
+    if (auto const root = findRepoRoot()) {
+        return *root / "src" / "dss-config";
+    }
+    return std::nullopt;
+}
+
+// The diagnostic for an unresolvable repo root. Names BOTH sources with the
 // value each actually held, plus the cwd, because the failure is always "which
-// of these three was I expecting to work" and a message that omits one sends
-// the reader to the wrong half of the system.
+// of these was I expecting to work" and a message that omits one sends the
+// reader to the wrong half of the system. `$DSS_CONFIG_ROOT` is reported too,
+// and reported as what it is — a CONFIG override that is not a repo-root
+// candidate — because the commonest wrong guess about this failure is that
+// setting it should have fixed it.
 [[nodiscard]] inline std::string repoRootDiagnostic() {
     std::error_code ec;
     char const* const env   = std::getenv("DSS_CONFIG_ROOT");
@@ -152,18 +195,36 @@ namespace detail {
     std::string msg =
         "could not locate the repo root (a directory containing "
         "src/dss-config). Tried, in order:\n"
-        "  1. $DSS_CONFIG_ROOT = ";
-    msg += (env == nullptr) ? "<unset>"
-         : (env[0] == '\0') ? "<empty>"
-                            : env;
-    msg += "\n  2. DSS_TEST_REPO_ROOT (baked by CMake) = ";
+        "  1. DSS_TEST_REPO_ROOT (baked by CMake) = ";
     msg += (baked == nullptr) ? "<not defined at compile time>"
          : (baked[0] == '\0') ? "<empty>"
                               : baked;
-    msg += "\n  3. ancestor walk (12 hops) from cwd = ";
+    msg += "\n  2. ancestor walk (12 hops) from cwd = ";
     msg += std::filesystem::current_path(ec).string();
     msg += "\nEach candidate is validated as a directory containing "
-           "src/dss-config; all three failed that check.";
+           "src/dss-config; both failed that check.\n"
+           "  note: $DSS_CONFIG_ROOT = ";
+    msg += (env == nullptr) ? "<unset>"
+         : (env[0] == '\0') ? "<empty>"
+                            : env;
+    msg += " — that variable selects the shipped CONFIG tree (configRoot()) and "
+           "is NOT a repo-root candidate; under the per-run config snapshot it "
+           "names a root that holds no corpus and no sources.";
+    return msg;
+}
+
+// The diagnostic for an unresolvable config tree.
+[[nodiscard]] inline std::string configRootDiagnostic() {
+    char const* const env = std::getenv("DSS_CONFIG_ROOT");
+    std::string       msg =
+        "could not locate the shipped config tree (src/dss-config). Tried, in "
+        "order:\n  1. $DSS_CONFIG_ROOT = ";
+    msg += (env == nullptr) ? "<unset>"
+         : (env[0] == '\0') ? "<empty>"
+                            : env;
+    msg += " (validated as a directory CONTAINING src/dss-config)\n"
+           "  2. the repo root, resolved as:\n";
+    msg += repoRootDiagnostic();
     return msg;
 }
 
@@ -175,12 +236,16 @@ namespace detail {
     throw std::runtime_error(repoRootDiagnostic());
 }
 
-// `<repo>/src/dss-config` — the shipped-config tree.
+// The shipped-config tree — `$DSS_CONFIG_ROOT/src/dss-config` when the override
+// is set and valid, else `<repo>/src/dss-config`.
 [[nodiscard]] inline std::filesystem::path configRoot() {
-    return repoRoot() / "src" / "dss-config";
+    if (auto const cfg = findConfigRoot()) return *cfg;
+    throw std::runtime_error(configRootDiagnostic());
 }
 
-// `<repo>/tests/corpus` — the golden-file corpus tree.
+// `<repo>/tests/corpus` — the golden-file corpus tree. Off `repoRoot()`, never
+// off the config override: the corpus belongs to the checkout, not to whichever
+// config tree this run happens to be reading.
 [[nodiscard]] inline std::filesystem::path corpusRoot() {
     return repoRoot() / "tests" / "corpus";
 }

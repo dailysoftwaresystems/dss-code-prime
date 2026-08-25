@@ -14,6 +14,203 @@
 
 ---
 
+## 0.000000000000000000000000000000000000 ★★★ THE PRIORITIZED BURNDOWN LOOP — PRODUCTION ERRORS FIRST
+
+**Operator instruction 2026-08-24, verbatim:** *"grab anchors from this list + the handoff, make a
+prioritized /loop considering production errors the most prioritized items and address all of them.
+best long term solution with no workaround, first class implementation, 100% config driven."*
+
+### ★★★ THE QUEUE IS AN INSTRUMENT, NOT A LIST — AND THAT IS THE WHOLE POINT
+
+```bash
+python scripts/burndown-queue/burndown-queue.py --band P0 --schedulable --evidence
+```
+
+⚠ **DO NOT READ THE NEXT PICK OFF THIS PAGE. RE-DERIVE IT.** This project's own memory carries the
+rule in capitals, and it was paid for **six** times — twice reaching the operator: a queue named an
+already-closed row; a backlog answer recommended a row closed months earlier; four claims in one
+handoff header went stale at once; and on 2026-08-24 alone three separate status claims in this file
+were wrong in three different directions. A written queue is stale the moment the next cycle closes a
+row. `burndown-queue` reads the rows and sorts them, so the queue is a **VIEW**, never a copy.
+
+★ It REUSES `check-anchor-balance` rather than re-implementing it — that script owns this
+repository's hard-won vocabulary for *is this row open*, *is it gated*, *has its trigger fired*,
+*is its opener discharged*, a regex family whose comments record six separate defects including two
+where a NEGATED or ATTRIBUTIVE mention flipped a verdict. ✔The two instruments agree on the
+population exactly: **1023 OPEN**, zero residue.
+
+### THE BANDS — "production error" means the shipped compiler does something WRONG, not that it is missing something
+
+| band | meaning |
+|---|---|
+| **P0 WRONG-OUTPUT** | DSS produces an incorrect result, drops something silently, or crashes on legal input. **Ships a bad binary. Nothing outranks these.** |
+| **P1 REFUSED** | DSS refuses, cannot parse, cannot link or cannot build something a reference accepts — real code that does not compile today. |
+| **P2 DIVERGENT** | a conformance divergence or an absent capability in a PRODUCT namespace. |
+| **P3 HARNESS** | the test / gate / build / cycle instruments. Costs confidence rather than correctness. |
+| **P4 RECORD** | plans, registry, documentation. |
+| **P5 ENV** | environment and upstream — explicitly not ours to fix in the compiler. |
+
+### ✔MEASURED 2026-08-24 at `a881b2a1` — RE-MEASURE, DO NOT RE-QUOTE
+
+```
+BAND       total  schedulable   RED  ORANGE  YELLOW  GREEN
+  P0         109           98    37      16       5      3   WRONG-OUTPUT
+  P1         161          143    40      34       5      1   REFUSED
+  P2         575          529    49      35      10     13   DIVERGENT
+  P3         150          148    51      52       6     19   HARNESS
+  P4          23           23    10       5       2      4   RECORD
+  P5           5            5     3       0       0      1   ENV
+                1023 OPEN — 946 SCHEDULABLE, 77 gated on a trigger that has not fired
+```
+
+★ **THE ARITHMETIC, STATED RATHER THAN AVOIDED:** *"address all of them"* over P0+P1 is **241
+schedulable rows**. At P32's measured rate — 8 rows closed by 4 lanes in one cycle — that is
+**≈30 cycles** for the production bands and roughly a hundred for the whole registry. The loop below
+is built to be run that many times, which is why its next pick is a COMMAND and not a bullet.
+
+### ⚠ THE BAND IS A SORT KEY, NOT A VERDICT, AND THE INSTRUMENT SAYS SO ON EVERY RUN
+
+✔MEASURED, and it is the same defect this project already caught once: the first draft banded **201**
+rows P0, and reading the head of that band showed the sieve counting rows that **explicitly deny**
+being production errors — *"NOT A MISCOMPILE"*, *"FAIL-LOUD, NEVER A MISCOMPILE"*, *"this is NOT a
+silent miscompile"*. Three negation classes had to be separated, and only the first is ordinary
+negation: **DENIAL** (*"not a miscompile"*), **REQUIREMENT** (*"must NOT silently truncate"* — a rule
+the FIX must satisfy, not a description of the defect), and **COUNTERFACTUAL** (*"would have SILENTLY
+ACCEPTED"* — a hazard avoided is not a hazard shipped). ⇒ **201 → 109**, a 92-row correction.
+★ Every demoted row is PRINTED under `DEMOTED OUT OF P0` with the phrase that demoted it: a sieve
+that hides what it disbelieved cannot be checked, and the direction it would hide in is the
+dangerous one. ⓘ Precedent: the *"103 misglyphed registry rows"* census whose true number was **4**.
+
+### ★★ HOW THE LOOP CONSUMES IT — THE NAMESPACE IS THE LANE PARTITION
+
+✔MEASURED: the P0+P1 schedulable set spreads over 35 and 38 namespaces respectively, and the
+namespace maps almost exactly onto a FILE SET — `D-CSUBSET-*`/`D-C-*` on the C front end and
+`c.lang.json`, `D-LK-*`/`D-LINK-*` on `src/link/**` and the format documents, `D-LIR-*`/`D-MIR-*` on
+the backend tiers, `D-DIAG-*` on the diagnostic vocabulary, `D-PP-*` on the preprocessor. So a wave
+is chosen by taking the highest band and dealing the rows out **by namespace**, one namespace per
+lane.
+
+⚠ **`D-CSUBSET-*` DOMINATES BOTH PRODUCTION BANDS — 29 in P0 and 47 in P1 — AND THAT IS THE
+BOTTLENECK, NOT THE PRIORITY.** Every one of them lands on `src/dss-config/sources/c.lang.json` or
+the C front end, and at most ONE lane per wave may write `src/dss-config/**` in a shared tree,
+because `tests/CMakeLists.txt` points every test in every lane's private `build/<lane>` at the ONE
+live config tree. Left alone, that caps the loop at one C lane per cycle and makes 76 rows serial.
+
+★★ **TWO THINGS LIFT THE CAP, AND P33 IS RUNNING BOTH:**
+1. **A lane in its own `git worktree` gets its own `src/dss-config/`**, so `DSS_CONFIG_ROOT` resolves
+   inside its tree and it may write config freely. The cost is a source copy plus a clean build; the
+   fold applies its diff by explicit path. P33 wave 1 runs two lanes this way.
+2. **`D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED`** — a ctest-RUN-time
+   config snapshot at the `dss_add_test` chokepoint — removes the exposure at the reader instead of
+   the writer, for all 1,258 `loadShipped` call sites in `tests/` at once. It is P33 wave 1 lane A.
+
+⇒ **The standing wave shape: 4 lanes, each its own worktree, dealt by namespace, in band order.**
+
+### THE NEXT PICKS — P0 RED, SCHEDULABLE, GROUPED BY THE LANE THAT WOULD TAKE THEM
+
+⚠ **Re-derive before starting any of these.** They are printed so a reader can see the SHAPE of the
+head of the queue, not so a cycle can copy them.
+
+**`D-CSUBSET-*` — 12 RED, the largest single lane's worth, and the C front end is the bottleneck:**
+`ZERO-WIDTH-BITFIELD-ALIGNMENT` (a MEASURED silent layout miscompile whose trigger has FIRED) ·
+`DARWIN-STRUCT-LAYOUT-DISAGREEMENT` · `SUPPRESSED-SHIPPED-ROW-SIGNATURE-UNCHECKED` (a live silent
+wrong-ABI call) · `SYNC-BUILTIN-BARRIER` (invisible on a single thread, which is why it survived) ·
+`TYPEDEF-HEAD-DECORATION-TYPE-HIJACK` · `LINKAGE-SPECIFIER-CONFLICT-SILENT-LAST-WINS` ·
+`INT128-DATA-GLOBAL`, `INT128-FLOAT-CONV`, `INT128-NARROWING-CAST-SITE-INCOMPLETE` (one arc) ·
+`ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT` · `BLOCK-SCOPE-UNKNOWN-ATTRIBUTE-SILENT` ·
+`GNU-DEPRECATED-MESSAGE-SILENTLY-DROPPED`.
+
+**`D-DIAG-*` — 4 RED, one lane, one vocabulary:** `CODE-PREFIX-DEFAULT-IS-SILENT` ·
+`LINE-NUMBERS-ARE-POST-EXPANSION-WHILE-THE-FILE-NAME-IS-ORIGINAL` · `MAXPERCODE-SILENT-COALESCE` ·
+`UNSUPPRESSABLE-FAMILY-UNDECIDED`.
+
+**`D-PP-*` — 3 RED, the preprocessor:** `DEFINED-VIA-MACRO-EXPANSION` ·
+`HEADER-CASE-NON-ASCII-NAME-NARROWING-THROW` · `REMAP-ORIGIN-OFFSET-UNVALIDATED`.
+
+**The backend tiers — 5 RED across two adjacent file sets:** `D-LIR-2ADDR-IGNORES-EMIT-TERMINATOR-FAILURE`
+(*a refusal that crashes is not a refusal*) · `D-LIR-PER-INSTRUCTION-OUTPUTS-NOT-ENFORCED-SUBSET-OF-CLOBBERED` ·
+`D-MIR-SYNTH-PASSES-UNVERIFIED-ON-SINGLE-CU-PATH` · `D-MIR-VERIFIER-STORE-CALLARG-TYPE-BLIND` ·
+`D-HIR-CONSTEVAL-UNSIGNED-WRAPAROUND-NOT-MODULAR`.
+
+**`D-FFI-*` — 2 RED:** `ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY` (⚠ also an
+agnosticism break by its own title) · `DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED`.
+
+**Singletons that still ship wrong output:** `D-ASM-BARE-OPERAND-WIDTH-DIVERGES-FROM-REFERENCE` ·
+`D-LANG-TYPE-IDENTITY-QUALIFIER-BLIND-VS-C23-REDECL` · `D-MIRTEXT-GLOBAL-FLAGS-DROPPED-BY-ROUNDTRIP` ·
+`D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO` (⚠ **same family as P33 lane D's row** — check whether one
+change closes both before scheduling it separately) · `D-CONF-REFERENCE-DIFFERENTIAL-ORACLE` ·
+`D-SQLITE-CLI-BUILT-ON-NO-LEG` · `D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS` ·
+`D-LINK-WRITER-DANGLING-SYMLINK-CLAIM-MISROUTE`.
+
+### ★★★ THE SEQUENCE AFTER THE BURNDOWN — OPERATOR-SET 2026-08-24, AND IT OVERRIDES THE PLAN'S OWN NUMBERING
+
+**1. THE ANCHOR BURNDOWN** — this loop, P0 first, until the production bands are clear.
+
+**2. FC20 — C STANDARDS BECOME LANGUAGE DOCUMENTS** (plan 23 FC20, operator-decided across four
+exchanges). ★ A `-std` ENUM would be `if (std >= C23)` scattered through the front end — a
+source-identity branch in shared substrate, i.e. the hard veto. A standard is a LANGUAGE DOCUMENT
+and the CLI flag is a document SELECTOR: `--language c23` resolves to *load `c23.lang.json`*, and
+the engine learns nothing about standards at all. ✔**THE SELECTOR ALREADY EXISTS AND ALREADY
+RESOLVES THAT EXACT FILENAME** — measured by running the shipped binary: `--language c23` fails
+with `error[C_InvalidLanguageName] c23: no shipped language config found`, having tried
+`src/dss-config/sources/c23.lang.json`. The mechanism is built; it has no document to find.
+⇒ FIRES: [[D-CSUBSET-BARE-ASM-ACCEPTANCE-IS-UNCONDITIONAL]] (gated on exactly a strict-conformance
+mode existing) · [[D-CONFIG-GRAMMAR-ISA-AND-IDENTIFIERCLASS-BELONG-IN-THE-LANGUAGE-BLOCK]] ·
+[[D-CONF-CORPUS-NO-DIRECTION-FOR-A-C23-REMOVED-CONSTRUCT]] (whose trigger cell names FC20 by name).
+⚠ FC20 **fires** that last one; it does not **close** it. Its closing work is in the CORPUS, not the
+compiler — a `@max-stdc` companion to `@min-stdc` so the two keys BRACKET a probe to a level band,
+plus a third direction arm. ⚠⚠ And the obvious shortcut is the trap the row spells out: filing a
+C23-REMOVED construct as `@direction B / @min-stdc 202311` goes GREEN while silently redefining what
+every other direction-B row asserts, and `@direction A / @min-stdc 0` is worse — gcc at 202000
+accepts, so if DSS also accepted, `pin()` returns **Agreement** and the corpus would CERTIFY a
+C23-removed construct as conformant.
+
+**3. FC19 — CONFORMANCE ON A BIG-ENDIAN TARGET (s390x)** — operator-sequenced HERE, 2026-08-24.
+⚠⚠ **THIS REVERSES THE PLAN'S NUMERIC ORDER AND THE REVERSAL IS DELIBERATE: FC19 RUNS AFTER FC20.**
+A future reader must not "correct" it back to numeric order — plan 23 numbers these 19 then 20, and
+the operator has since sequenced them 20 then 19.
+★★★ Why it matters, in the plan's own words: **every conformance claim this project makes has only
+ever been tested on little-endian machines.** Struct and union layout, bit-field allocation, integer
+representation, `unsigned char` aliasing and the `__BYTE_ORDER__` / `__LITTLE_ENDIAN__` /
+`__BIG_ENDIAN__` predefines are all C-VISIBLE and all endianness-dependent — so a whole class of C
+semantics is UNEXERCISED, not merely untested on one CPU.
+★ **s390x, and not something cheaper, because it is the only commercially live big-endian platform**
+— real distro ports, real glibc, and therefore the only one that can run the sqlite corpus, which is
+what "real support" has to mean. ✔**THE WHOLE CHAIN WAS VERIFIED BY EXECUTION on 2026-08-24 before
+the plan row was written**: `s390x-linux-gnu-gcc 13.3.0` links a hosted ELF64 big-endian IBM S/390
+binary, `qemu-s390x 8.2.2` RUNS it, and a program returning the first byte of `0x12345678` exits
+**18 (0x12)** — big-endianness observed by RUNNING, not read from a manual. `sizeof(long)==8`, so
+s390x is LP64 like the existing elf64 legs and brings NO data-model confound.
+★★ It is also big-endian in its INSTRUCTION STREAM (`eb bf f0 58 00 24  stmg %r11,%r15,88(%r15)`
+reads MSB-first), which is strictly more than `aarch64_be` can ever test — A64 instructions are
+little-endian in memory at both endiannesses.
+⚠ Plan 23 §2.F sizes it as **four phases, not one**. Do not plan it as a target-descriptor edit.
+⇒ FIRES / UNBLOCKS: [[D-ASM-TARGET-DECLARES-NO-BYTE-ORDER]] (gated until 2026-08-24 precisely
+BECAUSE no shipped target declared a byte order — now dischargeable by a target existing, not by
+argument) · the `endianness` target key the descriptors deliberately withheld (*"the day a consumer
+exists, it gets declared and THEN gets its coherence example"*) · [[D-PP-ENDIANNESS-PREDEFINES]]'s
+untested half · [[D-FULLC-STDBIT-BIG-ENDIAN-NATIVE]] · [[D-FFI-STDINT-PTR-WIDTH-ILP32]] (names
+itself the same shape) · [[D-LK4-RODATA-PRODUCER-EXOTIC]] (endianness per type width).
+
+### THE RULES THAT BIND EVERY CYCLE OF THIS LOOP
+
+- **Best long-term, no workaround, first-class, 100% config driven** — operator, restated
+  2026-08-24. Vocabulary goes in the `.lang`/`.target`/`.format` documents; the engine never
+  branches on language, arch or format identity.
+- **CLOSE, DO NOT FILE.** A new row is a LAST RESORT. Fixable inside owned paths without breaking
+  the bar ⇒ FIX IT and record it inside a row already being closed. *"Refused but not fixed"* is
+  **NOT** closed.
+- **A deferral trigger is a PREDICATE, not a ritual** — measure it, and if it is false the gate never
+  applied. ✔Two were measured false on 2026-08-24 before a lane started: the `__alignof__` row's
+  *"the references disagree"* (gcc 13.3.0, clang 19.1.1 and clang 18.1.3 all answer **64**), and the
+  `D-FF1-` row's *"anchor ids are FROZEN"* (that ruling covers the 426 `D-CSUBSET-*` ids only).
+- **77 rows are gated on a trigger that has NOT fired.** They are not in the queue and must not be
+  dragged into it; `--schedulable` is the flag that keeps them out.
+
+> ⚠ **SUPERSEDED BY THE P33 BURNDOWN LOOP ABOVE, 2026-08-25 — KEPT BECAUSE ITS TICKED ROWS ARE THIS
+> FILE'S ONLY RECORD THAT THOSE ITEMS WERE TAKEN.** Read it as HISTORY. The live queue is the
+> `burndown-queue` VIEW above; re-derive every pick from the registry, never from either list.
+
 ## 0.00000000000000000 ★★★ THE OPERATOR-SELECTED QUEUE — TICK EACH BOX AS IT LANDS
 
 **Selected by the operator 2026-08-19** from the AP5/AP6 commit + asm-feature (this PR) pending deferrals, in
@@ -466,6 +663,137 @@ second pattern beside the one P23 built and pinned.**
   same search over the sqlite real-example tree returns **0**. No corpus example exercises `"w"`.
 
 ---
+
+## 0.000000000000000000000000000000000000 ★★★ CYCLE P33 — SEVEN ROWS CLOSED, ZERO OPENED, AND FOUR "OPERATOR DECISIONS" DISSOLVED BY MEASUREMENT
+
+**Gate: registry 1023 → 1016, `closed 7, opened 0`, `anchor-balance: OK`.** Four wave-1 lanes,
+disjoint file sets, two in `git worktree`s. ★ **Zero new rows across four lanes** — the second
+consecutive cycle to meet [[feedback-close-do-not-file]], and this time three separate would-be
+rows were dissolved by measurement rather than filed.
+
+### ★★★ THE OPERATOR AMENDED THE BAR: `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C`
+
+> *"if no reference like gcc, clang or msvc accepts something that iso C does accept, we must accept"*
+> — and restated the same day: *"two ways: if any of references accept something, we must accept.
+> if none accept but isoc accepts, we must accept. the idea is to work. we are just as permissive as
+> our references + iso C"*
+
+§A.3b was a DISJUNCTION over the reference roster. It is now a **UNION with the standard**, and it
+binds BOTH ways: **below** the union is a conformance defect (refusing what works somewhere, or what
+ISO requires); **above** it is an invented extension. Neither side is the safe one — a refusal breaks
+real programs, an invention makes DSS the only compiler that takes a program, which nothing
+downstream can warn about. Written into `README.md`, `.claude/skills/dss-code-prime/SKILL.md` and
+[[feedback_reference_compilers_are_the_spec]] at operator request.
+
+⚠ **ONE SHARP CONSEQUENCE, NOT OBVIOUS FROM THE WORDING, AND IT IS WAVE-2 WORK.**
+`reference_conformance.probes` treats `@expect-ref accept` as an EXISTENTIAL claim: an unwitnessing
+roster reports **`not-witnessed`**, never a failure. Under the new clause that verdict **can no
+longer be read as "no obligation"** — a construct ISO C requires which no reference implements is
+still required of DSS, and the harness is currently SILENT about exactly that case. The corpus needs
+a distinct verdict for *"the standard requires it, the roster does not witness it, ship it anyway"*.
+
+### ★★★ FOUR ASKS WENT UP TO THE OPERATOR. THREE SHOULD NEVER HAVE, AND MEASURING SAID SO
+
+The operator's reply — *"as per my read, all of them are auto answerable, right?"* — was correct on
+every one. What the re-measurement found is that **my own framing was wrong on two of the three**:
+
+1. **`D-ASM-X86-IMMEDIATE-WINDOW-REFUSES-WHAT-GAS-TRUNCATES` — NO CONFLICT EXISTED.** I reported the
+   handoff and the row disagreeing about whether a ruling had been made. ✔They carry the SAME ruling;
+   I had read the closing cell TRUNCATED AT 1500 CHARS and reported the tail fragment as an anomaly.
+   ⇒ **A REGISTRY ROW IS ONE LINE OF MANY KB — cut the cell out (`tr '|' '\n' | sed -n '<N>p'`), never
+   read a prefix of the line.** ★ And it was derivable without the ruling: (A) truncate silently
+   breaks fail-loud, (B) keep refusing breaks §A.3b, so neither arm is defensible and it was never a
+   real fork. The third arm is FORCED, because **the disjunction rule constrains what DSS must
+   COMPILE, never what it must stay QUIET about.**
+2. **`D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME` — the undertaking is a STAND-IN, not a requirement.**
+   The row asks the operator to check an agent's report against three items. Its own words say why:
+   *"a fix reported landed is not a fix measured landed"*. The standing orders already name what beats
+   a report, and it is not a second pair of eyes — a MEASUREMENT plus a red-on-disable pin. Wave 2
+   builds it, so no confirmation is ever owed again.
+3. **THE `D-FF1-` RENAME — I PROPOSED IT AND IT WOULD HAVE BEEN DESTRUCTIVE.**
+   `D-PLANS-AN-FFI-ROW-IS-NAMESPACED-D-FF1-WITH-A-DIGIT-...` calls `D-FF1-AR-BSD-VARIANT` a digit-for-
+   letter typo of `D-FFI-`, sized at 15 sites. ✔MEASURED: **`FF1` is a DECLARED WORK-PACKAGE LABEL** —
+   the plans spell the family `FF1 → FF2 → … → FF6`, 211 bare `FF1` references — and `D-FF1-*` is that
+   package's namespace with **24 distinct ids** (`D-FF1-AR-READER`, `D-FF1-MACHO-FAT`, `D-FF1-PE-READER`,
+   …), every one about ARCHIVE / Mach-O / PE **file formats**, none about FFI. True size **39 registry
+   + 102 `src/` occurrences**, because the row measured ONE id and generalized. Renaming would have
+   pulled a row out of its own namespace and orphaned it from 23 siblings.
+   ⇒ close by refutation; keep candidate (c) with its rule INVERTED — derive the DECLARED namespace set
+   from the plans' work-package labels and red on any `D-<NS>-` not in it. The hazard is HIGHER than the
+   row thought: two confusable spellings that are both live and both correct.
+4. **LANE C RAISED A FOURTH MID-CYCLE, AND IT DISSOLVED TOO** — see below.
+
+### ★★ WAVE 1 — FOUR LANES: 7 CLOSED, 1 NARROWED, 1 NOT DONE, 0 OPENED
+
+- **Lane A** — `D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED`. A per-run
+  SNAPSHOT of `src/dss-config` (`cmake/DssConfigSnapshot.cmake`), `configRoot()` split from
+  `repoRoot()`, `private_config_root.hpp` deleted. Its worktree gate 1624/1624.
+- **Lane B** — `D-CSUBSET-TYPEOF-UNQUAL-GNU-SPELLING` · `D-C-PREPROCESSED-INPUT-REFUSES-GCC-LINEMARKERS`
+  · `D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED`. `__COUNTER__` is a new `counter` predefined-macro KIND —
+  the only STATEFUL one, state owned by the engine, name still in config. NOT DONE:
+  `D-CSUBSET-IMAGINARY-LITERAL-SUFFIX`, whose sequencing note it REFUTED on the way past.
+- **Lane C** — `D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES` · `D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE` ·
+  `D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL`.
+- **Lane D** — `D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE` **NOT CLOSED, materially
+  narrowed**: ELF now carries a merged foreign function's unwind description, witnessed by a running
+  `backtrace()` walking through two gcc-built frames on both ELF legs (exit 42 vs 2, 4 FDEs vs 2, under
+  a config mutant with NOTHING REBUILT). Mach-O and PE are the named remainder. It says NOT DONE plainly,
+  which is the standard.
+
+### ★★ LANE C'S "OPERATOR FORK" WAS REFUTED — AND DSS WAS WRONG IN BOTH DIRECTIONS AT ONCE
+
+Lane C reported `int a[n] = {…}` as needing a ruling, on the premise *"gcc admits `int a[n] = {};`,
+clang refuses even that"*. ✔RE-MEASURED, 4 cases × 3 compilers × 2 standards, two matched controls:
+
+| case | gcc 13.3.0 | clang 19.1.1 | clang 18.1.3 | DSS |
+|---|---|---|---|---|
+| `int a[argc] = {1,2,3};` | REFUSE | REFUSE | REFUSE | **ACCEPT, `sizeof` 12** |
+| `int a[argc] = {};` | ACCEPT | ACCEPT | ACCEPT | **REFUSE S000C** |
+
+**The roster is UNANIMOUS on both forms.** clang does not refuse the empty form at either standard in
+either version. ✔AND THE STANDARD SETTLES IT — N3220 §6.7.10p4: *"An entity of variable length array
+type shall not be initialized except by an empty initializer."* ⇒ the non-empty form is a CONSTRAINT
+VIOLATION, so the operator's new ISO clause does not engage; the empty form is obligated TWICE OVER.
+★★ **ONE ROOT CAUSE, BOTH DIVERGENCES:** `resolveArrayLength`'s `allowFlexibleArray \|\| initNode.valid()`
+arm is tested ABOVE the VLA arm, so a present-but-non-constant bound is read as ABSENT and the object
+is re-sized from the brace list — 3 elements in the first case, 0 in the second. ★ A THIRD defect fell
+out of the same probe: that `S000C` renders its message body as the literal `{}`.
+★★ **THE GENERAL LESSON, WORTH MORE THAN THE ROW: under the amended bar a UNANIMOUS REFUSAL must be
+checked against the standard TEXT before it is read as a gap — most unanimous refusals are a
+constraint being obeyed.** Fixed in wave 2; NO ROW MINTED.
+
+### ★★ LANE D'S ARCHITECTURAL FORK WAS RESOLVED, NOT FORWARDED — AND IT IS NOT A FORK
+
+A Mach-O x86_64 object carries `__TEXT,__eh_frame` ALONGSIDE `__LD,__compact_unwind`, but the loader
+enforces kind-uniqueness (`data.sectionKindIndex.emplace(info.kind, idx)` → *"duplicate section kind"*),
+so a format cannot declare two `unwind` rows. Candidates: (a) a second `SectionKind` enumerator,
+(b) a discriminating field on the section row.
+⇒ **(b), and (a) is not defensible.** `section_kind.hpp`'s own docblock: the taxonomy is *"format-blind
+names the substrate engine speaks"*, *"per-format JSON owns the name + flags"*. Compact-vs-DWARF is a
+per-format ENCODING fact ⇒ an `UnwindCompact`/`UnwindDwarf` split re-encodes FORMAT IDENTITY into the
+shared taxonomy, the hard veto. ⚠ The apparent precedent is not one: `ShStrtab` splits from `Strtab` on
+CONSUMER PATH, and both concepts exist in EVERY format — an unwind encoding does not.
+
+### ⚠ TWO DISCHARGES-BY-MEASUREMENT FOR OPERATOR VETO (§B predicate rule)
+
+1. **Lane B, `D-CSUBSET-TYPEOF-UNQUAL-GNU-SPELLING`** — closed by SUPERSESSION, not by its trigger.
+   ✔The roster has NOT moved (still 1-of-3); the **2026-08-19 §A.3b ruling retired the MAJORITY rule**
+   the row rested on. ✅ Operator asked and answered the same day: *"the rule keeps. clang 19 accepts,
+   right? and is more recent! so we must accept too!"*
+2. **Lane D, `D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS`** — predicate
+   MEASURED FALSE: `prebuiltLibraries` shipped in P32 in BOTH runners and lane D's example uses it.
+
+### ★ WHAT ELSE LANDED
+
+- **`scripts/burndown-queue/burndown-queue.py`** promoted (33 scripts, both indexes regenerated). It
+  REUSES `check-anchor-balance`'s row vocabulary; its negation sieve cut a naive 201-row P0 band to
+  **109** and it PRINTS what it disbelieved and what it could not read.
+- **The mixed-tree config residual CLOSED — 18 sites across 16 files**, driven by the composition site
+  rather than a file-wide substitution, so `test_object_format_backend_registry.cpp`'s SECOND
+  `findRepoRoot()` (a grep-shaped test over `src/`) correctly still reads the checkout.
+- ⚠ `sed -i` **reported success and silently did not apply an edit**, caught only by re-measuring the
+  cell count afterwards. And counting registry separators needs `total | minus grep -oF '\|'` — a BRE
+  reads `\|` as ALTERNATION, matches empty, and cheerfully reports zero.
 
 ## 0.00000000000000000000000000000000000 ★★★ CYCLE P32 — THE FIRST NET-NEGATIVE CYCLE, AND THE OPERATOR HAD TO SAY SO
 

@@ -680,9 +680,9 @@ TEST(MachoObjectReader, X86_64ExternClassComesFromTheDeclaredCallRole) {
 // document reads the SAME BYTES clean -- without which the refusal would prove
 // nothing about the erased key.
 TEST(MachoObjectReader, X86_64FormatMinusItsIsCallDeclarationRefusesRatherThanGuesses) {
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
-    auto const leaf = *root / "src" / "dss-config" / "object-formats"
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
+    auto const leaf = *root / "object-formats"
                     / "macho64-x86_64-darwin.format.json";
     std::ifstream in{leaf, std::ios::binary};
     ASSERT_TRUE(in.good()) << "cannot open " << leaf.string();
@@ -782,11 +782,11 @@ TEST(MachoObjectReader, X86_64FormatMinusItsIsCallDeclarationRefusesRatherThanGu
 // `relocationDecodeTable` and the spliced read below is refused with
 // "ambiguous reverse map" (this test + the COFF and ELF twins go red).
 TEST(MachoObjectReader, EmitOnlyAliasIsHonouredNotRefused) {
-    auto const root = dss::test::findRepoRoot();
-    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
     std::string text;
     {
-        std::ifstream in{*root / "src" / "dss-config" / "object-formats"
+        std::ifstream in{*root / "object-formats"
                              / "macho64-x86_64-darwin.format.json",
                          std::ios::binary};
         ASSERT_TRUE(in.good());

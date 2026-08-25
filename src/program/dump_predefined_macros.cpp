@@ -152,6 +152,17 @@ void appendLine(std::string&          out,
             // (`1`, `"<source>"`) would be trusted precisely because it looks
             // like an answer.
             return std::string{kNoSingleValueOffsetDerived};
+        case PredefinedMacroKind::Counter:
+            // D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED. STATE-DERIVED, which is a
+            // DIFFERENT reason from offset-derived and gets its own sentence: an
+            // offset-derived macro has one value per SITE, while this one has a
+            // different value at the SAME site depending on how many expansions
+            // preceded it in the translation unit. Collapsing the two would tell
+            // an operator auditing the dump that `__COUNTER__` is reproducible
+            // from its position, which is exactly the assumption the construct
+            // exists to break. Printing `0` (its first value) would be worse
+            // still — it is an answer that is right once and wrong afterwards.
+            return std::string{kNoSingleValueStateful};
     }
     // Unreachable: the kind set is closed and every enumerator is handled above.
     // Reached only if a new kind lands without visiting this switch — in which

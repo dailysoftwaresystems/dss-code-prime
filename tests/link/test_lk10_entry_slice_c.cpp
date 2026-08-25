@@ -208,12 +208,12 @@ loadPeExecWithEntryPoint(std::string const& entryName) {
     // is indistinguishable from the two config-drift causes the
     // caller's message names, so the miss must say so itself.
     namespace fs = std::filesystem;
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return nullptr;
     }
-    fs::path const shipped = *root / "src" / "dss-config"
+    fs::path const shipped = *root
         / "object-formats" / "pe64-x86_64-windows-exec.format.json";
     if (!fs::exists(shipped)) {
         ADD_FAILURE() << shipped.generic_string() << " does not exist";

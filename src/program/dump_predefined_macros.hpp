@@ -105,17 +105,26 @@ enum class PredefinedMacroOrigin : std::uint8_t {
 [[nodiscard]] DSS_EXPORT std::string_view
 predefinedMacroOriginName(PredefinedMacroOrigin o) noexcept;
 
-// The `value=` field when there IS no single value. Two DIFFERENT reasons, and
+// The `value=` field when there IS no single value. THREE DIFFERENT reasons, and
 // they are spelled differently on purpose: an operator who sees one needs to
 // know which question to ask next ("where is it invoked?" vs "with what
-// arguments?"). Neither spelling can be mistaken for a macro value: both begin
-// with the reserved `<no-single-value` prefix, which no config value has (they
-// are integer-constant spellings, string literals, or empty).
+// arguments?" vs "how many times has it already been read?"). No spelling can be
+// mistaken for a macro value: all begin with the reserved `<no-single-value`
+// prefix, which no config value has (they are integer-constant spellings, string
+// literals, or empty).
 inline constexpr std::string_view kNoSingleValueOffsetDerived =
     "<no-single-value: derived from the invocation offset at each use>";
 inline constexpr std::string_view kNoSingleValueFunctionLike =
     "<no-single-value: function-like — expands against its arguments at each "
     "call>";
+// D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED. Deliberately NOT folded into the
+// offset-derived spelling: an offset-derived macro is reproducible from its
+// POSITION, and this one is not — the same site yields a different value on a
+// second expansion. That distinction is the entire semantics of `__COUNTER__`,
+// so a dump that blurred it would misdescribe the one thing worth knowing.
+inline constexpr std::string_view kNoSingleValueStateful =
+    "<no-single-value: per-translation-unit counter — advances at each "
+    "expansion>";
 
 // ── ONE triple's dump request ───────────────────────────────────────────────
 //

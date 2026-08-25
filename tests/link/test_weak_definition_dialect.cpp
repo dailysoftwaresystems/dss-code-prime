@@ -166,12 +166,12 @@ struct ShippedFormatDoc {
 // `test_object_format_vocabulary_projection.cpp`, for the same reason.)
 [[nodiscard]] std::vector<ShippedFormatDoc> shippedFormatDocs() {
     std::vector<ShippedFormatDoc> out;
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return out;
     }
-    auto const dir = *root / "src" / "dss-config" / "object-formats";
+    auto const dir = *root / "object-formats";
     std::vector<fs::path> paths;
     std::error_code ec;
     for (auto const& entry : fs::directory_iterator{dir, ec}) {

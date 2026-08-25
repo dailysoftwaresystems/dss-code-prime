@@ -10394,8 +10394,7 @@ TEST(SemanticAnalyzerC, ConstexprFloatFolds) {
 
 // Pointer arm: nullptr and the folded integer-0 forms are null pointer
 // constants (accepted); an address-of initializer is not a compile-time
-// constant here (fail loud). The `(T*)0` cast form is the named loud deferral
-// D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL (falls into the same fail-loud arm).
+// constant here (fail loud).
 TEST(SemanticAnalyzerC, ConstexprPointerNullFormsAcceptedAddressRejected) {
     auto okModel = analyzeShipped("c", {
         "constexpr int *p1 = nullptr;\n"
@@ -10414,29 +10413,151 @@ TEST(SemanticAnalyzerC, ConstexprPointerNullFormsAcceptedAddressRejected) {
         << "&g is an address constant, not a supported constexpr pointer init";
 }
 
-// Aggregate deferral (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE): array/struct/union
-// constexpr objects fail loud — a UNIFORM boundary (the char-array string form
-// is deliberately not carved out).
-TEST(SemanticAnalyzerC, ConstexprAggregateTypesFailLoud) {
+// P33 (D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL, C 6.3.2.3p3 + 6.6): the CAST-form
+// null pointer constant initializes a constexpr pointer object. gcc 13.3.0 and
+// clang 19.1.1 both accept every accepted form here (MEASURED on WSL x86_64).
+// RED-ON-DISABLE: delete the `constexprPointerCastFoldsToNull` call from
+// `validateConstexprDeclarator`'s Ptr arm and all three accepted forms become
+// S_ConstexprNonConstantInitializer.
+TEST(SemanticAnalyzerC, ConstexprPointerCastNullFormsAccepted) {
+    auto model = analyzeShipped("c", {
+        "constexpr int *p1 = (int *)0;\n"
+        "constexpr int *p2 = (void *)0;\n"
+        "constexpr int *p3 = (int *)(2 - 2);\n"
+        "int main(void) { return (p1 == p2 && p2 == p3) ? 0 : 1; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u)
+        << "(T*)0 / (void*)0 / (T*)(ICE folding to 0) are constant null pointers";
+}
+
+// ★ THE WALL THE WIDENING MUST NOT BREACH. The registry row's first option was to
+// widen the SHARED `admitsNullPointerConstant`, which five other call sites reach
+// only after `isAssignable` has already FAILED — so widening it there would
+// silently ADMIT incompatible-pointer conversions that both references diagnose.
+// These pins prove the widening did NOT happen at those sites: a `(float*)0`
+// initializer, argument and return still fail loud.
+TEST(SemanticAnalyzerC, PointerCastNullWideningDidNotLeakToTheSharedSites) {
+    auto initModel = analyzeShipped("c", {
+        "int *p = (float *)0;\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(initModel.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "decl-init keeps the incompatible-pointer diagnostic";
+    auto argModel = analyzeShipped("c", {
+        "int f(int *p);\n"
+        "int main(void) { return f((float *)0); }\n",
+    });
+    EXPECT_EQ(countCode(argModel.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "checkCall keeps the incompatible-pointer diagnostic";
+    // ⚠ The return site spells its refusal S_ReturnTypeMismatch, NOT S_TypeMismatch
+    // — ✔MEASURED: this assertion was written against the wrong code and the suite
+    // caught it. `checkReturn` calls `admitsNullPointerConstant` and then
+    // `emitMismatch`, which is the return-specific code.
+    auto retModel = analyzeShipped("c", {
+        "int *f(void) { return (float *)0; }\n"
+        "int main(void) { return f() == 0 ? 0 : 1; }\n",
+    });
+    EXPECT_EQ(countCode(retModel.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 1u)
+        << "checkReturn keeps the incompatible-pointer diagnostic";
+}
+
+// P33 (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE, C23 6.7.1): a constexpr ARRAY / STRUCT
+// / UNION object is admitted when every element of its brace initializer folds.
+// The char-array-from-string form rides the SAME walk — the UNIFORM boundary the
+// row demanded, kept by NOT carving it out.
+// RED-ON-DISABLE: restore the blanket
+// `if (k == Array || k == Struct || k == Union) emit(S_ConstexprUnsupportedType)`
+// and every arm here becomes S_ConstexprUnsupportedType.
+TEST(SemanticAnalyzerC, ConstexprAggregateTypesValidateElementWise) {
     auto arrModel = analyzeShipped("c", {
         "constexpr int a[3] = {1, 2, 3};\n"
-        "int main(void) { return 0; }\n",
+        "int main(void) { return a[0] + a[1] + a[2] - 6; }\n",
     });
-    EXPECT_EQ(countCode(arrModel.diagnostics(),
-                        DiagnosticCode::S_ConstexprUnsupportedType), 1u);
+    EXPECT_FALSE(arrModel.hasErrors()) << "every element is a constant";
     auto strModel = analyzeShipped("c", {
         "constexpr char s[] = \"hi\";\n"
-        "int main(void) { return 0; }\n",
+        "int main(void) { return s[2]; }\n",
     });
-    EXPECT_EQ(countCode(strModel.diagnostics(),
-                        DiagnosticCode::S_ConstexprUnsupportedType), 1u)
-        << "the char-array-from-string form keeps the UNIFORM boundary";
+    EXPECT_FALSE(strModel.hasErrors())
+        << "the char-array-from-string form rides the same element walk";
     auto structModel = analyzeShipped("c", {
+        "struct S { int x; int y; };\n"
+        "constexpr struct S s = {1, 2};\n"
+        "int main(void) { return s.x + s.y - 3; }\n",
+    });
+    EXPECT_FALSE(structModel.hasErrors());
+    auto unionModel = analyzeShipped("c", {
+        "union U { int a; };\n"
+        "constexpr union U u = {5};\n"
+        "int main(void) { return u.a - 5; }\n",
+    });
+    EXPECT_FALSE(unionModel.hasErrors());
+    auto nestedModel = analyzeShipped("c", {
+        "constexpr int m[2][2] = {{1, 2}, {3, 4}};\n"
+        "int main(void) { return m[1][1] - 4; }\n",
+    });
+    EXPECT_FALSE(nestedModel.hasErrors()) << "a nested brace list recurses";
+    auto ptrMemberModel = analyzeShipped("c", {
+        "struct H { int *p; int tag; };\n"
+        "constexpr struct H h = {(int *)0, 3};\n"
+        "int main(void) { return h.p == 0 ? h.tag - 3 : 1; }\n",
+    });
+    EXPECT_FALSE(ptrMemberModel.hasErrors())
+        << "the element walk and the top-level Ptr arm admit the same value forms";
+}
+
+// The REFUSING half — a constexpr aggregate whose initializer is not a
+// compile-time constant still fails loud, per element. gcc 13.3.0 ("initializer
+// element is not constant") and clang 19.1.1 ("must be initialized by a constant
+// expression") refuse both of these (MEASURED).
+TEST(SemanticAnalyzerC, ConstexprAggregateNonConstantElementFailsLoud) {
+    auto elemModel = analyzeShipped("c", {
+        "int main(int argc, char **argv) {\n"
+        "    constexpr int a[3] = {1, argc, 3};\n"
+        "    return a[0];\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(elemModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "one diagnostic, at the offending ELEMENT";
+    auto copyModel = analyzeShipped("c", {
         "struct S { int x; };\n"
         "struct S s0;\n"
         "int main(void) { constexpr struct S s = s0; return 0; }\n",
     });
-    EXPECT_EQ(countCode(structModel.diagnostics(),
+    EXPECT_EQ(countCode(copyModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "a copy from a non-constant object is not a constant initializer";
+    auto addrModel = analyzeShipped("c", {
+        "int g;\n"
+        "struct H { int *p; };\n"
+        "constexpr struct H h = {&g};\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(addrModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "an address constant is refused one brace deep exactly as at top level";
+}
+
+// ★ THE ONE AGGREGATE SHAPE THAT STAYS S_ConstexprUnsupportedType. A VARIABLY
+// MODIFIED type has no compile-time size, so no element walk can make it a
+// constant object — gcc ("'constexpr' object has variably modified type") and
+// clang ("constexpr variable cannot have type 'const int[argc]'") both refuse it.
+// ⚠ MEASURED, and this is why the guard reads the DECLARATOR and not the type:
+// with an initializer present the declarator resolver drops the written `argc`
+// bound and re-sizes the object from the brace list, so by validation time the
+// declared type is a plain `int[3]` and `isVlaArray` is FALSE.
+// RED-ON-DISABLE: delete the declarator scan and this test accepts.
+TEST(SemanticAnalyzerC, ConstexprVariablyModifiedAggregateFailsLoud) {
+    auto model = analyzeShipped("c", {
+        "int main(int argc, char **argv) {\n"
+        "    constexpr int a[argc] = {1, 2, 3};\n"
+        "    return a[0];\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ConstexprUnsupportedType), 1u);
 }
 
@@ -10894,6 +11015,174 @@ TEST(SemanticAnalyzerC, DeprecatedObjectUseWarns) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_DeprecatedSymbolUsed), 1u)
         << "a deprecated object's use site must warn like a function's";
+}
+
+// ── P33 (D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES, C23 6.7.13.3) ────────────────
+//
+// A deprecated TYPE — a struct/union TAG or a typedef name — warns at every USE.
+// ★ THE TAG'S ATTRIBUTE POSITION IS AFTER THE KEYWORD, and that is not a stylistic
+// choice: ✔MEASURED, gcc 13.3.0 calls the PREFIX spelling `[[deprecated]] struct S
+// { … };` an "empty declaration" and DISCARDS the attribute, while clang 19.1.1
+// and clang 18.1.3 REFUSE it outright ("misplaced attributes"). Both references
+// honor `struct [[deprecated]] S { … };` and warn at every use of the tag, so that
+// is the spelling this pins.
+// RED-ON-DISABLE: drop the `srec.isDeprecated` write at the composite-composition
+// site and every tag arm here reports 0 warnings.
+TEST(SemanticAnalyzerC, DeprecatedCompositeTagUseWarns) {
+    auto model = analyzeShipped("c", {
+        "struct [[deprecated]] Legacy { int x; };\n"
+        "struct Legacy gv;\n"
+        "int main(void) { struct Legacy v; v.x = 1; return gv.x + v.x; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 2u)
+        << "one warning per tag USE site — the file-scope object and the local";
+}
+
+// The GNU spelling of the same position. ⚠ At HEAD this was a hard ERROR
+// (S_UnknownTypeAttribute): `deprecated` matched neither `packed` nor an `Align`
+// row in the composite attribute scan, so it fell to the strict-unknown arm — a
+// REFUSAL of a construct gcc accepts. The verb-driven `warnOnUse` arm makes the
+// two spellings agree.
+// RED-ON-DISABLE: remove the `WarnOnUse` arm from `scanCompositePacked` and this
+// reds with 1 S_UnknownTypeAttribute and 0 warnings.
+TEST(SemanticAnalyzerC, GnuDeprecatedCompositeTagUseWarns) {
+    auto model = analyzeShipped("c", {
+        "struct __attribute__((deprecated)) Legacy { int x; };\n"
+        "struct Legacy gv;\n"
+        "int main(void) { return gv.x; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u)
+        << "a modelled warnOnUse name is not an unknown composite attribute";
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+}
+
+TEST(SemanticAnalyzerC, DeprecatedCompositeTagMessageIncluded) {
+    auto model = analyzeShipped("c", {
+        "struct [[deprecated(\"use Legacy2\")]] Legacy { int x; };\n"
+        "struct Legacy gv;\n"
+        "int main(void) { return gv.x; }\n",
+    });
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed) {
+            EXPECT_EQ(diag.severity, DiagnosticSeverity::Warning);
+            EXPECT_EQ(diag.actual, "Legacy: use Legacy2");
+        }
+    }
+}
+
+// A deprecated TYPEDEF NAME. Unlike a tag, it has no Pass-2 reference chokepoint —
+// in type position it is a bare identifier token under a type-specifier run — so
+// the warning comes from the type resolver's alias arm.
+// RED-ON-DISABLE: delete that arm and every count here drops to 0.
+TEST(SemanticAnalyzerC, DeprecatedTypedefUseWarns) {
+    auto declModel = analyzeShipped("c", {
+        "typedef int oldint [[deprecated(\"use int32\")]];\n"
+        "oldint gi;\n"
+        "int main(void) { return gi; }\n",
+    });
+    EXPECT_FALSE(declModel.hasErrors());
+    ASSERT_EQ(countCode(declModel.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : declModel.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "oldint: use int32");
+    }
+    auto gnuModel = analyzeShipped("c", {
+        "typedef int oldint __attribute__((deprecated));\n"
+        "oldint gi;\n"
+        "int main(void) { return gi; }\n",
+    });
+    EXPECT_EQ(countCode(gnuModel.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u)
+        << "the GNU trailing spelling carries the same fact";
+}
+
+// ★★ THE POSITIONS BOTH REFERENCES WARN AT, and the two that exercise the
+// EMIT-GATE. A cast type-name and a `_Generic` association are resolved once
+// SPECULATIVELY under a reporter-rollback window and once LOUDLY outside it; a
+// warning emitted on the rolled-back resolve would vanish, and one emitted on
+// both without the per-node latch would double. Exactly one each is the proof
+// that the gate and the latch are both doing their job.
+// ✔MEASURED gcc 13.3.0 and clang 19.1.1: one warning at each of these positions.
+TEST(SemanticAnalyzerC, DeprecatedTypedefWarnsOncePerUsePosition) {
+    auto model = analyzeShipped("c", {
+        "typedef int oldint [[deprecated]];\n"
+        "int f(oldint a);\n"
+        "int f(oldint a) { return a; }\n"
+        "int main(void) {\n"
+        "    int x = 0;\n"
+        "    int c = (oldint)x;\n"
+        "    int g = _Generic(x, oldint: 0, default: 1);\n"
+        "    return f(0) + c + g + (int)sizeof(oldint) - 4;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 5u)
+        << "proto param, definition param, cast, _Generic association, sizeof — "
+           "each exactly once";
+}
+
+// ★★ THE LATCH'S OWN RED-ON-DISABLE, and it took a second attempt to build one
+// that is not vacuous. Each PARAMETER type-name node reaches the alias arm TWICE
+// (✔MEASURED by instrumenting the arm with a per-entry sequence number, which
+// defeats the reporter's dedup key). With ONE parameter the two entries are
+// ADJACENT and the reporter's default 4-entry `dedupWindow` collapses them, so
+// removing the latch changes nothing observable — the first mutant came back
+// GREEN. FIVE parameters push the repeats 5 apart, past the window: without
+// `deprecatedTypeUseWarned` this source reports 10. gcc 13.3.0 and clang 19.1.1
+// each report 5 (MEASURED).
+TEST(SemanticAnalyzerC, DeprecatedTypedefParamsWarnOncePerParameterNotTwice) {
+    auto model = analyzeShipped("c", {
+        "typedef int oldint [[deprecated]];\n"
+        "int f(oldint a, oldint b, oldint c, oldint d, oldint e);\n"
+        "int main(void) { return f(0, 0, 0, 0, 0); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 5u)
+        << "one warning per parameter — the per-node latch, not the dedup window";
+}
+
+// One type-name node shared by three declarators is ONE use site, so ONE warning
+// — the per-node latch, not the reporter's dedup window, is what makes this true.
+TEST(SemanticAnalyzerC, DeprecatedTypedefMultiDeclaratorWarnsOnce) {
+    auto model = analyzeShipped("c", {
+        "typedef int oldint [[deprecated]];\n"
+        "oldint a, b, c;\n"
+        "int main(void) { return a + b + c; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+}
+
+// The NEGATIVE wall: an undeprecated type must never warn, and a composite
+// attribute this engine does NOT model in the `warnOnUse` verb keeps its
+// pre-existing loud reject (the typo protection `scanCompositePacked` exists for).
+TEST(SemanticAnalyzerC, UndeprecatedTypesDoNotWarnAndUnknownStrictStillRefuses) {
+    auto cleanModel = analyzeShipped("c", {
+        "struct Plain { int x; };\n"
+        "typedef int myint;\n"
+        "struct Plain gp;\n"
+        "myint gi;\n"
+        "int main(void) { return gp.x + gi; }\n",
+    });
+    EXPECT_EQ(countCode(cleanModel.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 0u);
+    auto typoModel = analyzeShipped("c", {
+        "struct __attribute__((pakced)) S { char c; int x; };\n"
+        "int main(void) { return (int)sizeof(struct S); }\n",
+    });
+    EXPECT_EQ(countCode(typoModel.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+        << "an unmodelled GNU composite attribute still fails loud";
 }
 
 // C23 6.7.13.2: a `[[nodiscard]]` call whose result is DISCARDED — the call is

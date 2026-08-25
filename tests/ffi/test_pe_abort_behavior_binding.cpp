@@ -118,12 +118,12 @@ constexpr std::int64_t kWriteMsgValue   = 1;
 constexpr std::int64_t kCallReportValue = 2;
 
 [[nodiscard]] fs::path stdlibDescriptorPath() {
-    auto const root = dss::test::findRepoRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::repoRootDiagnostic();
+    auto const cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
         return {};
     }
-    return *root / "src" / "dss-config" / "shippedLibs" / "stdlib.json";
+    return *cfg / "shippedLibs" / "stdlib.json";
 }
 
 // ── AXIS 1: THE IMPORTED SYMBOL NAMES OF ONE PE IMAGE ────────────────────────

@@ -114,6 +114,7 @@ WITHDRAWN on that ruling.
 
 Before considering any change complete:
 
+- **Permissiveness matches the rule: `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C`.** If ANY reference accepts a correct construct, DSS must. If NONE accepts it but ISO C does, DSS must anyway — the standard needs no reference to witness it. And DSS must not go *above* that union either: accepting what neither any reference nor the standard sanctions is an invented extension. Probe the references SEPARATELY (“the reference” is not one voice), and check a UNANIMOUS refusal against the standard TEXT before reading it as a gap — most unanimous refusals are a constraint being obeyed. (Operator, 2026-08-25.)
 - Agnosticism holds — no language/arch/format branch entered shared substrate.
 - New behaviour has a test that goes **red when the change is reverted**, not merely one that passes.
 - Invariants fail loud through the local `*Fatal` helpers.

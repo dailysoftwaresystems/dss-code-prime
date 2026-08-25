@@ -144,6 +144,15 @@
       "flags": 3,
       "addrAlign": 8,
       "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE: PER-FUNCTION UNWIND METADATA -- the DWARF call-frame table `gcc -c` and `clang -c` emit BY DEFAULT for every function that has a frame. Its absence from this list is why a function merged out of an ordinary Linux `.a` used to arrive in a DSS image with NO unwind description at all: a backtrace stopped at it and an exception thrown through it terminated, and unlike the Mach-O arm this one did not even say so. ★ THE VOCABULARY IS THE SWITCH, NOT A NAME TEST: `elf_object_reader.cpp` finds this section by its universal `kind` and never by the string `.eh_frame`, which is the same shape the Mach-O `__LD,__compact_unwind` row uses; a format that declares no `unwind` row carries nothing, exactly as before. ✔MEASURED 2026-08-24 against gcc 13.3.0 (`gcc -c` and `aarch64-linux-gnu-gcc -c`, no flags, `readelf -S`/`-r`): sh_type = SHT_PROGBITS (1); sh_flags = SHF_ALLOC (2) -- allocated but NOT writable and NOT executable; sh_addralign = 8; and the FDE function references live in `.rela.eh_frame` as R_X86_64_PC32 / R_AARCH64_PREL32 against the code section symbol, one per function. ⚠ entrySize is 0 AND THAT IS A STATEMENT, NOT AN OMISSION: a CIE/FDE record is self-describing and VARIABLE-LENGTH (its first field is its own length), so there is no record width to declare and no record COUNT derivable by division -- the Mach-O `__compact_unwind` row's fixed 32 is the property of THAT encoding, not of unwind sections in general. ⚠ THIS ROW MAKES DSS CARRY THE INFORMATION, NOT THE BYTES: the reader decodes each FDE back into the neutral `CfiFunction` vocabulary and hands it to whichever format writer is emitting, so the merged function's unwind table is re-emitted rather than copied. `.eh_frame` in the IMAGE stays writer-owned (elf.cpp synthesizes every byte of it), which is why this row appears only on the RELOCATABLE documents.",
+      "kind": "unwind",
+      "name": ".eh_frame",
+      "type": 1,
+      "flags": 2,
+      "addrAlign": 8,
+      "entrySize": 0
     }
   ],
   "relocations": [

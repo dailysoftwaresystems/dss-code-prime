@@ -27,7 +27,15 @@ namespace dss {
 //   Date     -- the translation DATE, a string literal `"Mmm dd yyyy"` computed
 //               once at construction (C 6.10.8.1).
 //   Time     -- the translation TIME, a string literal `"hh:mm:ss"` computed once.
-enum class PredefinedMacroKind { Line, File, Constant, Date, Time };
+//   Counter  -- a per-TRANSLATION-UNIT monotonically increasing decimal that
+//               advances ONCE PER EXPANSION (gcc/clang `__COUNTER__`). The ONLY
+//               STATEFUL kind: `Line`/`File` are functions of the invocation
+//               OFFSET and `Date`/`Time` are fixed at construction, so every
+//               other kind is reproducible from its argument alone, while this
+//               one's value depends on how many times it has already been read.
+//               That is exactly why it cannot be a `constant` row in the config
+//               (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED).
+enum class PredefinedMacroKind { Line, File, Constant, Date, Time, Counter };
 
 // The kind's CONFIG SPELLING — the same verb `parsePredefinedMacroArray`
 // (`predefined_macro_json.cpp`) accepts for the `"kind"` key, in ONE table so the
@@ -44,12 +52,13 @@ enum class PredefinedMacroKind { Line, File, Constant, Date, Time };
 //
 // No fall-back row is reachable: `PredefinedMacroKind` has no invalid sentinel,
 // so every value the engine can hold is enumerated below.
-inline constexpr EnumNameTable<PredefinedMacroKind, 5> kPredefinedMacroKindTable{{{
+inline constexpr EnumNameTable<PredefinedMacroKind, 6> kPredefinedMacroKindTable{{{
     { PredefinedMacroKind::Line,     "line"     },
     { PredefinedMacroKind::File,     "file"     },
     { PredefinedMacroKind::Constant, "constant" },
     { PredefinedMacroKind::Date,     "date"     },
     { PredefinedMacroKind::Time,     "time"     },
+    { PredefinedMacroKind::Counter,  "counter"  },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -236,8 +245,11 @@ impliedSurfaceKindFromName(std::string_view s) noexcept {
 // audited across 39 rows, and a reason that cannot be audited is a `null` with
 // extra keystrokes.
 //
-// The three were enumerated from the real corpus census (rows / distinct names):
-// `erases-to-nothing` 8/8, `arch-property` 52/16, `standard-defined` 10/10.
+// The first three were enumerated from the real corpus census (rows / distinct
+// names): `erases-to-nothing` 8/8, `arch-property` 52/16, `standard-defined`
+// 10/10. `compiler-extension` was added 2026-08-24 with `__COUNTER__`
+// (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED), which none of the three could describe
+// truthfully — see its own note below.
 enum class ClaimsNothingReason {
     // The macro EXPANDS TO NOTHING -- a calling-convention or decoration
     // spelling the target does not need (`__stdcall`, `WINAPI`). It cannot imply
@@ -251,12 +263,26 @@ enum class ClaimsNothingReason {
     // that document (`__STDC__`, `__LINE__`, `__STDC_VERSION__`). Its backing is
     // the implementation's conformance, not a shipped header.
     StandardDefined,
+    // The macro is a documented REFERENCE-COMPILER EXTENSION that no language
+    // standard mandates, and whose meaning is fixed by the compiler that
+    // provides it (`__COUNTER__` — gcc and clang define it, ISO C does not).
+    // Its backing is this implementation's own preprocessor, so like the three
+    // above there is no header to point at.
+    //
+    // ★ WHY IT IS NOT `standard-defined`. That row's whole content is the claim
+    // "the language document fixes this meaning", which is exactly what an
+    // auditor of these 39 rows is reading them to check. Reusing it for an
+    // extension would put a FALSE claim into the one field built to make such
+    // claims auditable — the failure mode this closed set exists to prevent,
+    // one level up from the free-text reason it replaced.
+    CompilerExtension,
 };
 
-inline constexpr EnumNameTable<ClaimsNothingReason, 3> kClaimsNothingReasonTable{{{
-    { ClaimsNothingReason::ErasesToNothing, "erases-to-nothing" },
-    { ClaimsNothingReason::ArchProperty,    "arch-property"     },
-    { ClaimsNothingReason::StandardDefined, "standard-defined"  },
+inline constexpr EnumNameTable<ClaimsNothingReason, 4> kClaimsNothingReasonTable{{{
+    { ClaimsNothingReason::ErasesToNothing,   "erases-to-nothing"  },
+    { ClaimsNothingReason::ArchProperty,      "arch-property"      },
+    { ClaimsNothingReason::StandardDefined,   "standard-defined"   },
+    { ClaimsNothingReason::CompilerExtension, "compiler-extension" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -935,6 +961,48 @@ struct DSS_EXPORT PreprocessConfig {
     // (`P_PreprocessorUnsupported`; the `pragmaDirective`/`embedDirective`
     // opt-in model). The engine matches THIS string, never a hard-coded "line".
     std::string lineDirective;     // "line"
+
+    // ── D-C-PREPROCESSED-INPUT-REFUSES-GCC-LINEMARKERS: the LINEMARKER form ──
+    //
+    // `# 1 "file"` / `# 1 "file" 1 3 4` — what `gcc -E` and `clang -E` write in
+    // place of a `#line`. It is the SAME presumed-position facility with a
+    // different spelling: the digits and the quoted name set the presumed line
+    // and file for what follows, exactly as `#line N "f"` does, and the engine
+    // records both through the one shared `recordPresumedPosition`.
+    //
+    // ★ WHY IT NEEDS ITS OWN DECLARATION RATHER THAN RIDING ON `lineDirective`.
+    // The directive WORD is a digit sequence, not a word, so there is no lexeme
+    // to match against a configured spelling — the SHAPE is the recognizer. A
+    // language that does not declare this block therefore leaves `# 1 "f"` on the
+    // generic unsupported-directive fail-loud (`P_PreprocessorUnsupported`), the
+    // same opt-in model `pragmaDirective`/`embedDirective`/`lineDirective` use.
+    //
+    // ⚠ AND THE FLAGS ARE NOT DECORATION, which is why they are DECLARED and not
+    // skipped. ✔MEASURED 2026-08-24 over one `_GNU_SOURCE` TU (stdio + string +
+    // a local header): gcc 13.3.0 emits 154 linemarkers and clang 18.1.3 / 19.1.1
+    // emit 177, carrying the flag tails {}, {1}, {2}, {3}, {1,3,4}, {2,3,4},
+    // {3,4} — no other combination, and no digit outside 1..4. Both references
+    // REFUSE an undeclared digit (`# 1 "f.c" 9`) and refuse two members of the
+    // enter/return pair together (`# 1 "f.c" 1 2`), so the validation below is
+    // the references' own, not an invention.
+    //
+    // ✔AND FLAG 3 GENUINELY CHANGES OBSERVABLE BEHAVIOUR IN THE REFERENCES,
+    // measured rather than assumed: clang 19.1.1 warns `-Wunused-variable` for an
+    // unused local inside a region marked `1` and does NOT warn when the same
+    // region is marked `1 3`. That is why an implementation may not parse the
+    // line and discard the tail in silence. What DSS does with it is stated on
+    // `LineMarkerFlagDef::name` below and pinned by a test.
+    struct LineMarkerFlagDef {
+        std::string digits;          // the flag SPELLING, e.g. "3" (decimal)
+        std::string name;            // its meaning, quoted in diagnostics
+        std::string exclusiveGroup;  // empty = no exclusion; else the group id
+    };
+    struct LineMarkerConfig {
+        std::vector<LineMarkerFlagDef> flags;
+    };
+    // OPTIONAL — absent (nullopt) means the language declares no linemarker
+    // surface at all and the line stays a loud unsupported directive.
+    std::optional<LineMarkerConfig> lineMarker;
 
     // D-CPP-ERROR-WARNING (`#error`; C23 6.10.5 / `#warning`; C23 6.10.6): the
     // DIAGNOSTIC directive words, matched by lexeme TEXT against the token after

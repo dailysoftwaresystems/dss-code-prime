@@ -73,13 +73,13 @@ using dss::macho::test::readU64LE;
 // schema or nullptr (with an ADD_FAILURE) on miss.
 [[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
 loadDarwinExecByName(char const* fname) {
-    auto const root = dss::test::findRepoRoot();
+    auto const root = dss::test::findConfigRoot();
     if (!root) {
-        ADD_FAILURE() << fname << ": " << dss::test::repoRootDiagnostic();
+        ADD_FAILURE() << fname << ": " << dss::test::configRootDiagnostic();
         return nullptr;
     }
     fs::path const shipped =
-        *root / "src" / "dss-config" / "object-formats" / fname;
+        *root / "object-formats" / fname;
     if (!fs::exists(shipped)) {
         ADD_FAILURE() << shipped.generic_string() << " does not exist";
         return nullptr;
