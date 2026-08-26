@@ -313,3 +313,34 @@ dss_add_test(NAME core/test_primitive_builder_leaf_kind_gate
 #   truncate hammer and why the failure had to be constructed instead.
 dss_add_test(NAME core/test_checked_file_read
              SOURCES test_checked_file_read.cpp)
+
+# D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS -- the
+# content-addressed memo every schema load goes through, and the two failure
+# directions it has to hold apart: an over-eager memo serving a schema built
+# from superseded bytes (a SILENT MISCOMPILE -- the grammar drives every
+# front-end decision and nothing downstream would red), and an under-eager one
+# that never hits and is a no-op wearing a green suit.
+# * The referenced-document arm is the one the mechanism exists for: the host's
+#   own bytes are byte-identical across both loads, so its digest cannot see the
+#   edit, and only the per-entry dependency ledger separates the two.
+# ** It never touches a shipped config -- it COPIES the one fragment it needs
+#    into a scratch tree and points $DSS_CONFIG_ROOT at the copy, so a suite
+#    reading the live tree concurrently cannot observe it.
+dss_add_test(NAME core/test_config_document_memo
+             SOURCES test_config_document_memo.cpp)
+
+# D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS, the
+# other two families -- the memo above is driven through the GRAMMAR loader; this
+# is the guard for `TargetSchema` and `ObjectFormatSchema`, plus the three
+# `--time` phases (locate-config / load-config / build-config) that report what a
+# config load costs.
+# * The rewrite arms are the reason it exists: for a target document a stale hit
+#   is a silently wrong register file and calling convention, and for a format
+#   document a silently wrong on-disk artifact layout -- neither reds anything
+#   downstream, so only a differential over the document's BYTES catches it.
+# * `build-config`'s run count is the memo's MISS count, so the phase arm fails
+#   both when a Scope is missing and when the memo stops hitting.
+# ** Every document under test is a COPY in a per-test scratch dir, rewritten by
+#    an ATOMIC replace; the shipped tree is only ever READ.
+dss_add_test(NAME core/test_config_memo_all_families
+             SOURCES test_config_memo_all_families.cpp)

@@ -4,6 +4,7 @@
 #include "analysis/semantic/constant_symbol_fold.hpp" // Item 1: shared enum/constant Ref->literal builder
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
+#include "core/types/anon_member_name.hpp"       // isSyntheticAnonymousName (one owner)
 #include "core/types/attribute_naming.hpp"       // D-CSUBSET-PACKED (F4): stripDunder
 #include "core/types/data_model.hpp"
 #include "core/types/decl_prefix_strip.hpp"     // declRoleChildren / descendVisibleDecl / specifierPrefixChild
@@ -7944,7 +7945,10 @@ struct Lowerer {
             if (sscope.valid()) {
                 std::vector<bool> named(slotCount, false);
                 for (auto const& [bname, bsym] : model.scopeRecord(sscope).bindings) {
-                    if (bname.rfind("<anon:", 0) == 0) continue;   // synthetic anon name
+                    // ONE OWNER for this spelling (core/types/anon_member_name.hpp) —
+                    // it had three inline copies, and the third one going stale is
+                    // how a per-CU node id ended up inside a cross-CU type identity.
+                    if (isSyntheticAnonymousName(bname)) continue;
                     auto const* brec = model.recordFor(bsym);
                     if (brec == nullptr || brec->kind != DeclarationKind::Variable)
                         continue;

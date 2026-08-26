@@ -29,3 +29,15 @@ target_include_directories(
 # fixtures all assert on the contents of a single run.
 dss_add_test(NAME analysis/preprocess/test_comment_body_run_is_one_token
              SOURCES test_comment_body_run_is_one_token.cpp)
+
+# [[D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION]] +
+# [[D-PERF-PP-EVERY-INCLUDE-RE-READS-AND-RE-TOKENIZES-THE-SAME-HEADER]]: the two
+# REWORK defects, pinned by the SHAPE of the cost curve rather than by a
+# wall-clock threshold. A separate binary rather than more cases in
+# test_preprocessor.cpp because every case here is a RATIO of two timed
+# preprocess runs taken back to back in one process, and that only holds if the
+# process is not also being timed against unrelated fixtures.
+dss_add_test(NAME analysis/preprocess/test_preprocess_no_rework
+             SOURCES test_preprocess_no_rework.cpp)
+target_include_directories(dss_analysis_preprocess_test_preprocess_no_rework
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

@@ -1007,6 +1007,40 @@ struct Lowerer {
     }
     [[nodiscard]] TypeId i64Ty()  { return interner.primitive(TypeKind::I64); }
     [[nodiscard]] TypeId ptrI64() { return interner.pointer(i64Ty()); }
+    // ── THE VLA SIZE TYPE — ONE DECLARATION, READ BY BOTH SIDES OF THE SLOT ──
+    // D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE (the slot half).
+    //
+    // A VLA's runtime byte size and row strides are spilled to per-object slots.
+    // The four Alloca sites declared those slots `pointer(primitive(U64))` --
+    // a byte size IS a size_t -- while every value stored into them, and two of
+    // the three loads back out, were typed `i64Ty()`, the canonical limb type
+    // used for internal address arithmetic. So the slot's DECLARED type and the
+    // value's type disagreed at every VLA Store.
+    //
+    // ✔MEASURED (P36, whole examples/c corpus, elf64-x86_64-linux, baseline):
+    // that single disagreement produced I_StoreValueTypeMismatch in 11 VLA
+    // examples -- 10 declared-VLA plus vla_empty_initializer -- once Lane P's
+    // Store rule started checking value type against pointee type. It was not
+    // 11 defects; it was one type spelled two ways and reached by 11 TUs.
+    //
+    // ★ IT IS THE SAME FAMILY AS THIS ROW'S ORIGINAL DEFECT, ONE TIER OVER.
+    // There, a narrowed VALUE was typed from the canonical primitive instead of
+    // the cast's declared TypeId. Here, a value is typed from the canonical
+    // limb type instead of the SLOT's declared type. Both stayed invisible for
+    // the same reason: I64 and U64 are the same width and the same bits, so
+    // nothing miscompiled visibly -- only a later consumer's signedness-
+    // dependent choice (a division, a shift, a widening, a comparison) would
+    // have diverged, silently.
+    //
+    // ⓘ WHY A RETAG AT THE PRODUCER AND NOT A Bitcast AT THE SEAM: a cast that
+    // exists only to reconcile two spellings of one fact leaves the wrong
+    // spelling in place for the next reader. The size arithmetic is retyped at
+    // the instruction that PRODUCES it, so there is one spelling and nothing to
+    // reconcile. The multiply is exact either way -- same width, same bits, and
+    // fixed-width multiplication does not depend on signedness -- so no emitted
+    // value changes.
+    [[nodiscard]] TypeId vlaSizeTy()    { return interner.primitive(TypeKind::U64); }
+    [[nodiscard]] TypeId vlaSizePtrTy() { return interner.pointer(vlaSizeTy()); }
     [[nodiscard]] MirInstId ci64(std::int64_t v) { return constIntOfType(v, i64Ty()); }
     // A binary/unary i64 op (the workhorse limb emitter).
     [[nodiscard]] MirInstId i64bin(MirOpcode op, MirInstId a, MirInstId b) {
@@ -1307,8 +1341,16 @@ struct Lowerer {
     // source into limb 0, fill the higher limbs with the source's sign fill (signed
     // negative → ~0, else 0), mask the top limb. `srcVal` is a scalar MirInstId; its
     // SIGNEDNESS drives the extension (a signed source sign-extends into the wide value).
+    // `srcTy` is the source value's DECLARED TypeId, and it is NOT redundant with
+    // `srcKind` -- exactly the asymmetry `emitScalarFromWide` documents in the other
+    // direction. C spells four 64-bit names over two kinds, so `interner.primitive
+    // (kind)` is none of the declared rows; a 64-bit source therefore arrives already
+    // the right WIDTH but carrying a TypeId the canonical i64 limb substrate does not
+    // share. Callers pass what they already hold: the const arm passes `i64Ty()`
+    // because `ci64` mints exactly that, and the cast arm passes the operand's `srcTy`.
     [[nodiscard]] bool emitWideFromScalar(MirInstId dst, MirInstId srcVal,
-                                          TypeKind srcKind, TypeId bitIntTy) {
+                                          TypeKind srcKind, TypeId bitIntTy,
+                                          TypeId srcTy) {
         bool const srcSigned = isSignedIntKind(srcKind);
         // Widen the source to i64 (SExt signed / ZExt unsigned; a no-op if already 64).
         MirInstId src64 = srcVal;
@@ -1317,6 +1359,43 @@ struct Lowerer {
             if (conv == MirOpcode::Invalid) return false;
             std::array<MirInstId, 1> a{srcVal};
             src64 = mir.addInst(conv, a, i64Ty());
+            if (!src64.valid()) return false;
+        } else if (!srcTy.valid() || srcTy.v != i64Ty().v) {
+            // ★ THE 64-BIT FAST PATH USED TO FALL THROUGH WITH THE VALUE'S OWN
+            // DECLARED TypeId AND STORE IT INTO A CANONICAL i64 LIMB.
+            // D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE — this is that
+            // row's defect from the SLOT side, and the exact mirror of the VLA
+            // size-slot class fixed at `vlaSizeTy`: there the SLOT carried the
+            // convenience type and the value was canonical; here the VALUE
+            // carries its declared type and the SLOT is the convenience one. A
+            // fix that only ever asks "is the value right?" catches half of them.
+            //
+            // ✔MEASURED (P36, elf64-x86_64-linux, debug): 23 I_StoreValueTypeMismatch
+            // diagnostics survived the VLA fix — c_int128_arith 22, c23_bitint_wide 1
+            // — every one an already-64-bit source keeping a declared `unsigned long
+            // long`/`long` TypeId while `limbAddrConst` hands back a `ptr<i64>`.
+            // Width and bits agree; SIGNEDNESS does not, and signedness decides what
+            // a later division, shift, comparison or widening does.
+            //
+            // ⓘ WHY A CAST HERE, WHEN THE VLA CLASS DESERVED A RETAG AT THE
+            // PRODUCER. There the value never left its own domain, so a cast would
+            // only have reconciled two spellings of one fact. Here the value
+            // genuinely CROSSES DOMAINS: it leaves the C type system and enters the
+            // wide-integer LIMB substrate, whose every address — `limbAddrConst`,
+            // `loadLimb`, `storeLimb`, `emitWideFromWide`, `emitScalarFromWide` — is
+            // `ptr<i64>` by construction. The limb slot CANNOT carry the declared
+            // type without fracturing that substrate per source spelling, so
+            // materializing the crossing is the honest move rather than the
+            // convenient one. The slow path above already canonicalises to `i64Ty()`
+            // even when its own conversion targets U64, so this makes the two paths
+            // agree instead of introducing a new rule.
+            //
+            // Representation-free: `mapCast(I64|U64, I64)` is a Bitcast — same width,
+            // same bits, no emitted instruction cost at the machine level.
+            MirOpcode const retag = mapCast(srcKind, TypeKind::I64);
+            if (retag == MirOpcode::Invalid) return false;
+            std::array<MirInstId, 1> a{srcVal};
+            src64 = mir.addInst(retag, a, i64Ty());
             if (!src64.valid()) return false;
         }
         storeLimb(src64, limbAddrConst(dst, 0));
@@ -1967,7 +2046,8 @@ struct Lowerer {
                      : static_cast<std::int64_t>(std::get<std::uint64_t>(src.value));
         TypeKind const srcK =
             wideIntIsSigned(interner, t) ? TypeKind::I64 : TypeKind::U64;
-        return emitWideFromScalar(dst, ci64(payload), srcK, t)
+        // `ci64` mints the canonical i64 row, so the declared type IS `i64Ty()`.
+        return emitWideFromScalar(dst, ci64(payload), srcK, t, i64Ty())
                    ? dst : InvalidMirInst;
     }
 
@@ -2012,7 +2092,7 @@ struct Lowerer {
         } else {
             MirInstId const srcVal = lowerExpr(kids[0]);
             if (!srcVal.valid()) return InvalidMirInst;
-            ok = emitWideFromScalar(dst, srcVal, resolveScalarIntKind(srcTy), t);
+            ok = emitWideFromScalar(dst, srcVal, resolveScalarIntKind(srcTy), t, srcTy);
         }
         return ok ? dst : InvalidMirInst;
     }
@@ -5000,18 +5080,20 @@ struct Lowerer {
         }
         // Cumulative product BOTTOM-UP (see the doc comment). Each runtime-sized level is
         // frozen into a per-object (sym, levelType) slot ONLY when `freezeLevelSlots`.
-        MirInstId acc = ci64(static_cast<std::int64_t>(*baseStride));
+        // The cumulative byte size is typed as the SLOT's type from the moment it
+        // is produced (`vlaSizeTy`), seed included -- so a depth-0 walk that runs
+        // no Mul still yields a correctly-typed value rather than a stray i64.
+        MirInstId acc =
+            constIntOfType(static_cast<std::int64_t>(*baseStride), vlaSizeTy());
         for (std::size_t L = depth; L-- > 0;) {
             std::array<MirInstId, 2> mo{counts[L], acc};
-            acc = mir.addInst(MirOpcode::Mul, mo, i64ty);
+            acc = mir.addInst(MirOpcode::Mul, mo, vlaSizeTy());
             if (!acc.valid()) return std::nullopt;
             if (freezeLevelSlots
                 && (interner.isVlaArray(levelTypes[L])
                     || interner.typeContainsVla(levelTypes[L]))) {
-                TypeId const u64PtrTy =
-                    interner.pointer(interner.primitive(TypeKind::U64));
                 MirInstId const slot =
-                    mir.addInst(MirOpcode::Alloca, {}, u64PtrTy, /*payload=*/8,
+                    mir.addInst(MirOpcode::Alloca, {}, vlaSizePtrTy(), /*payload=*/8,
                                 MirInstFlags::None, /*payload2=*/8);
                 if (!slot.valid()) return std::nullopt;
                 std::array<MirInstId, 2> stOps{acc, slot};
@@ -5039,10 +5121,8 @@ struct Lowerer {
         auto const sz = computeVlaByteSize(sym, pointeeTy, anchor,
                                            /*freezeLevelSlots=*/false);
         if (!sz.has_value()) return false;   // a belt fail-loud already reported
-        TypeId const u64PtrTy =
-            interner.pointer(interner.primitive(TypeKind::U64));
         MirInstId const slot =
-            mir.addInst(MirOpcode::Alloca, {}, u64PtrTy, /*payload=*/8,
+            mir.addInst(MirOpcode::Alloca, {}, vlaSizePtrTy(), /*payload=*/8,
                         MirInstFlags::None, /*payload2=*/8);
         if (!slot.valid()) return false;
         std::array<MirInstId, 2> stOps{sz->totalBytes, slot};
@@ -5102,9 +5182,9 @@ struct Lowerer {
     // ordering that keeps this copy-down reading R's already-Stored (live) frozen slots.
     [[nodiscard]] MirInstId vlaAllocaFromTypedef(SymbolId a, SymbolId origin, TypeId ty,
                                                  TypeId ptrTy, HirNodeId anchor) {
-        TypeId const i64ty    = i64Ty();
-        TypeId const u64PtrTy =
-            interner.pointer(interner.primitive(TypeKind::U64));
+        // The slot's declared type is the ONE type both the Load and the Store
+        // below use -- see `vlaSizeTy`.
+        TypeId const sizeTy = vlaSizeTy();
         // Peel `ty`'s array spine into per-LEVEL shape types (level 0 = whole object,
         // each next via ops[0]) down to the non-array base — the SAME walk
         // `computeVlaByteSize` used when it froze R's slots (so the level TypeIds, hence
@@ -5138,10 +5218,10 @@ struct Lowerer {
                 vlaStrideSlot.find(vlaSlotKey(origin.v, levelTypes[L].v));
             if (it == vlaStrideSlot.end()) continue;   // R did not freeze this level
             std::array<MirInstId, 1> ld{it->second};
-            MirInstId const val = mir.addInst(MirOpcode::Load, ld, i64ty);
+            MirInstId const val = mir.addInst(MirOpcode::Load, ld, sizeTy);
             if (!val.valid()) return InvalidMirInst;
             MirInstId const slot =
-                mir.addInst(MirOpcode::Alloca, {}, u64PtrTy, /*payload=*/8,
+                mir.addInst(MirOpcode::Alloca, {}, vlaSizePtrTy(), /*payload=*/8,
                             MirInstFlags::None, /*payload2=*/8);
             if (!slot.valid()) return InvalidMirInst;
             std::array<MirInstId, 2> st{val, slot};
@@ -6167,31 +6247,37 @@ struct Lowerer {
                                   "tracked (deferred, D-CSUBSET-VLA)");
                 return InvalidMirInst;
             }
-            TypeId const i64ty = i64Ty();
+            // The stride Load carries the SLOT'S DECLARED TYPE (`vlaSizeTy`), not
+            // the canonical limb type -- the read side of the same one-type rule
+            // the Store side now follows. The whole byte-offset computation then
+            // stays in that one type, so nothing has to be reconciled afterwards.
+            TypeId const sizeTy = vlaSizeTy();
+            TypeKind const sizeK = interner.kind(sizeTy);
             std::array<MirInstId, 1> ld{it->second};
-            MirInstId const stride = mir.addInst(MirOpcode::Load, ld, i64ty);
+            MirInstId const stride = mir.addInst(MirOpcode::Load, ld, sizeTy);
             if (!stride.valid()) return InvalidMirInst;
-            // Widen the index to i64 so the byte-offset Mul matches the i64 runtime
-            // stride (a truncation to a narrower `indexTy` would drop the high bits of
-            // a large row size). The subscript was already integer-promoted in HIR.
-            MirInstId idx64 = idx;
-            if (!(indexTy.valid() && interner.kind(indexTy) == TypeKind::I64)) {
+            // Widen the index to the stride's type so the byte-offset Mul has two
+            // operands of one type (a truncation to a narrower `indexTy` would drop
+            // the high bits of a large row size). Already integer-promoted in HIR.
+            MirInstId idxWide = idx;
+            if (!(indexTy.valid() && interner.kind(indexTy) == sizeK)) {
                 TypeKind const fromK =
                     indexTy.valid() ? resolveScalarIntKind(indexTy) : TypeKind::I32;
-                if (fromK != TypeKind::I64) {
-                    MirOpcode const ext = mapCast(fromK, TypeKind::I64);
+                if (fromK != sizeK) {
+                    MirOpcode const ext = mapCast(fromK, sizeK);
                     if (ext == MirOpcode::Invalid) {
                         unsupported(node, "variable-length array subscript index has a "
-                                          "non-integer type with no widening to i64");
+                                          "non-integer type with no widening to the "
+                                          "VLA stride type");
                         return InvalidMirInst;
                     }
                     std::array<MirInstId, 1> eo{idx};
-                    idx64 = mir.addInst(ext, eo, i64ty);
-                    if (!idx64.valid()) return InvalidMirInst;
+                    idxWide = mir.addInst(ext, eo, sizeTy);
+                    if (!idxWide.valid()) return InvalidMirInst;
                 }
             }
-            std::array<MirInstId, 2> ops{idx64, stride};
-            return mir.addInst(MirOpcode::Mul, ops, i64ty);
+            std::array<MirInstId, 2> ops{idxWide, stride};
+            return mir.addInst(MirOpcode::Mul, ops, sizeTy);
         }
         std::optional<std::uint64_t> const stride = elementStride(elemTy);
         if (!stride.has_value()) {
@@ -6854,7 +6940,7 @@ struct Lowerer {
             return false;
         }
         std::array<MirInstId, 1> ld{it->second};
-        MirInstId const bytes = mir.addInst(MirOpcode::Load, ld, i64Ty());
+        MirInstId const bytes = mir.addInst(MirOpcode::Load, ld, vlaSizeTy());
         if (!bytes.valid()) return false;
         // ★ WIDE CHUNKS THEN A BYTE TAIL — the runtime shape of what
         // `walkByteChunks` does for a compile-time size. A byte-at-a-time loop

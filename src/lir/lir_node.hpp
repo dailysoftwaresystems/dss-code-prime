@@ -43,7 +43,7 @@ namespace dss {
 // ldrb/strb. kLirInstFlagWidth16 (D-LIR-INT-MEMORY-WIDTH-EXACT) adds the
 // half-word memory form (I16/U16): x86 0x66-prefixed mov / movzx r16,
 // arm64 STURH/LDURH. The width bits are mutually exclusive (narrowest
-// wins); the JSON loader accepts a guard width of 8, 16, 32, or 64.
+// wins); the JSON loader accepts a guard width of 8, 16, 32, 64, or 128.
 inline constexpr std::uint8_t kLirInstFlagWidth32 = 0x01;
 inline constexpr std::uint8_t kLirInstFlagWidth8  = 0x02;
 inline constexpr std::uint8_t kLirInstFlagWidth16 = 0x04;
@@ -167,11 +167,38 @@ inline constexpr std::uint8_t kLirInstFlagMemoryIsDestination = 0x10;
 // variant can match on it.
 inline constexpr std::uint8_t kLirInstFlagOutgoingArgsPlaced = 0x20;
 
+// ── THE 128-BIT OPERATION WIDTH ─────────────────────────────────────────────
+//
+// *** THIS BIT EXISTS SO THE WIDTH FIELD CAN DESCRIBE A REGISTER WIDER THAN A
+// GENERAL-PURPOSE ONE, and its absence was an LIR EXPRESSIVENESS DEFECT rather
+// than a missing optimization. Before it, `lirInstWidthBits` was a three-flag
+// field over {8, 16, 32, 64} and 128 was UNSAYABLE -- so no instruction could
+// state that it operates on a full 128-bit vector register, no target could
+// declare an encoding variant guarded on that width, and every consumer that
+// compares an operation width against a REGISTER width (x86-64 `xmm` is 16
+// bytes) was structurally unable to see a match.
+//
+// It was FOUND as a 121-instruction residue in the OPT8 peephole (a full-width
+// `movaps %xmm12,%xmm12` self-copy that the peephole could not prove was a
+// no-op), and it is fixed HERE rather than worked around there, because the
+// same limit blocks every future vector operation and not just those 121
+// copies. The flags byte had two spare bits; this takes one.
+//
+// *** IT IS DECLARED, NOT STAMPED. No shipped lowering sets it yet: the FPR
+// class moves on both shipped targets (`movaps`, `fmov`) declare encoding
+// variants with NO width guard, so they elect correctly at any width and have
+// no reason to state one. The day a real 128-bit operation needs the width to
+// elect its variant, it says so and every width-comparing consumer -- the
+// peephole included -- starts agreeing with no edit, because they all compare
+// DECLARED vocabulary rather than special-casing a class.
+inline constexpr std::uint8_t kLirInstFlagWidth128 = 0x40;
+
 // The instruction's operation width in bits, derived from its flags.
 [[nodiscard]] constexpr std::uint8_t
 lirInstWidthBits(std::uint8_t flags) noexcept {
-    if ((flags & kLirInstFlagWidth8) != 0)  return std::uint8_t{8};
-    if ((flags & kLirInstFlagWidth16) != 0) return std::uint8_t{16};
+    if ((flags & kLirInstFlagWidth8) != 0)   return std::uint8_t{8};
+    if ((flags & kLirInstFlagWidth16) != 0)  return std::uint8_t{16};
+    if ((flags & kLirInstFlagWidth128) != 0) return std::uint8_t{128};
     return (flags & kLirInstFlagWidth32) != 0 ? std::uint8_t{32}
                                               : std::uint8_t{64};
 }

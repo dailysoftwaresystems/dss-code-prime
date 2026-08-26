@@ -12,6 +12,7 @@
 #include "mir/mir_cfg.hpp"           // mirReversePostOrder
 #include "mir/mir_node.hpp"
 #include "mir/mir_struct_markers.hpp" // rederiveStructCfMarkers
+#include "opt/passes/mir_id_remap.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <cstdint>
@@ -72,8 +73,8 @@ public:
     // surviving pred (>= 1, by construction of reachability).
     [[nodiscard]] bool acceptPhiIncoming(
         MirPhiIncoming const& inc, MirBlockId /*oldPhiBlock*/,
-        std::unordered_map<std::uint32_t, MirBlockId> const& blockMap) override {
-        return blockMap.count(inc.pred.v) != 0;
+        MirBlockRemap const& blockMap) override {
+        return blockMap.contains(inc.pred.v);
     }
 };
 

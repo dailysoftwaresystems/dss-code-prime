@@ -322,10 +322,21 @@ TEST(DiagnosticBudgetThreadingSourceEnumeration,
         {"src/core/types/tree_builder.cpp", {}},
         {"src/analysis/preprocess/preprocessor.cpp",
          {
-             {"DiagnosticReporter scratch;", 5,
+             {"DiagnosticReporter scratch;", 6,
               "pre-scan / re-reported throwaways: their contents are either "
               "discarded or re-reported into a budgeted reporter, so they are "
-              "never an operator-visible budget"},
+              "never an operator-visible budget. RAISED 5 -> 6 (cycle P36) for "
+              "the sixth, in `preScanIncludeFile`: the per-file pre-scan memo "
+              "tokenizes each header ONCE and discards that tokenize's "
+              "diagnostics exactly as the per-occurrence call site it replaced "
+              "already did -- the authoritative pass re-tokenizes the same "
+              "bytes and owns every diagnostic about them, so memoizing moved "
+              "WHERE the throwaway is built and dropped nothing an operator "
+              "could see. ⚠ The count is the memo's ONE call site, not a "
+              "per-header multiplier: if this number ever has to rise because "
+              "a reporter was added per HEADER rather than per call site, that "
+              "is a budget escaping into a loop and the fix is the budget, not "
+              "this number"},
              {"DiagnosticReporter macroRep;   // throwaway - malformed surfaced downstream",
               1, "throwaway; the malformed macro is surfaced downstream"},
          }},

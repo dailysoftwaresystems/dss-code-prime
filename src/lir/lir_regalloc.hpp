@@ -29,12 +29,19 @@
 //
 // **Call-aware constraint**: a range that survives past the late
 // slot of a call instruction MUST NOT be assigned to a caller-saved
-// physical register (per the active `TargetCallingConvention`). The
-// allocator's tryAllocate always tries the callee-saved partition
-// first; for ranges that do NOT cross a call it then falls back to
-// caller-saved; for cross-call ranges it falls back directly to
-// spilling. Call detection is target-agnostic via
-// `TargetOpcodeInfo::isCall`.
+// physical register (per the active `TargetCallingConvention`), so a
+// cross-call range takes a callee-saved register or spills. Call
+// detection is target-agnostic via `TargetOpcodeInfo::isCall`.
+//
+// **Partition preference** (plan 22 OPT8): a range that does NOT cross a
+// call is offered the CALLER-SAVED partition first and falls back to
+// callee-saved. Both were always legal for such a range; the order is what
+// changed, and it changed because a callee-saved register is not free —
+// using one obliges the function to save and restore it (✔MEASURED 3352
+// prologue saves, 5.1% of the emitted `examples/c/**` instruction stream,
+// before the change) and spends a register that the cross-call ranges are
+// the only legitimate consumers of. See `tryAllocate`'s docblock in the
+// .cpp for the full argument and why the ABI envelope does not move.
 //
 // **Reserved registers**: registers that appear in no calling-
 // convention saved/arg/return set (e.g. `rsp`, `rflags`) are filtered

@@ -128,6 +128,26 @@
       "flags": 0,
       "addrAlign": 8,
       "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-CARRIES-NO-SUMMARY-OR-MIR-SECTION. The per-module LINK-TIME-OPTIMIZATION SUMMARY. flags = S_ATTR_DEBUG (0x02000000 = 33554432), which is Mach-O's spelling of non-ALLOC: it is a LINKER INSTRUCTION -- do not load these bytes into the image -- and it is the SAME value the `__LD,__compact_unwind` row already carries for the same reason, reused rather than re-decided. \u26a0 IT IS NOT A CLAIM THAT THESE BYTES ARE DEBUG INFO, and the distinction is load-bearing: `strip` must not be able to remove the link-time optimizer's input. The `SectionKind` is its own role for exactly that reason. Its OWN SEGMENT `__DSS` -- the `__LLVM,__bitcode` precedent -- so the pair never lands inside a segment ld64 lays out. PAIRED with the `__mir` row below; the SPLIT is the whole economy (see section_kind.hpp).",
+      "kind": "lto-summary",
+      "name": "__summary",
+      "segment": "__DSS",
+      "type": 33554432,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-CARRIES-NO-SUMMARY-OR-MIR-SECTION. The module's serialized MIR body -- the LARGE half of the pair, read only for the modules the summary pass selected. Same segment and S_ATTR_DEBUG declaration as the summary row above and for the same reasons; the two differ in PAYLOAD, never in wire treatment.",
+      "kind": "lto-ir",
+      "name": "__mir",
+      "segment": "__DSS",
+      "type": 33554432,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
     }
   ],
 

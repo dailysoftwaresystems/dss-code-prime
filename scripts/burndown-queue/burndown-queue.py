@@ -309,7 +309,22 @@ def load_row_text(root):
                 # its open set by -- anchor token when there is one, decoration-stripped
                 # cell otherwise. Deriving the key any other way is how the two
                 # instruments come to disagree about which row is which.
-                key = "%s#%s" % (rel, bal.row_name(cells[1]))
+                #
+                # ⚠⚠ AND THE PATH HALF IS PART OF THAT IDENTITY, WHICH THIS LINE USED TO
+                # HAND-ROLL AS `"%s#%s" % (rel, ...)`. ✔MEASURED 2026-08-26 (cycle P36):
+                # `bal.row_key` CANONICALISES both registry files to ONE prefix (a row's
+                # identity is its anchor id; which of the two files holds it is a filing
+                # decision), so a hand-built `rel#name` key NEVER matched a registry row
+                # -- and ALL 694 registry rows fell into `residue` and were banded by
+                # nothing. The queue reported a confident P0/P1/P2 census over the 324
+                # plan rows while the 500 PRODUCTION rows, which the standing operator
+                # ruling names as THE candidate set, were not in it at all.
+                # ★ The comment above was already right about reusing the scanner's
+                # identity function -- it was applied to the NAME half and hand-rolled
+                # for the PATH half, and the canonicalisation lives in the path half.
+                # A half-reused identity function is how two instruments that both look
+                # correct disagree about which rows exist.
+                key = bal.row_key(rel, bal.row_name(cells[1]))
                 flat = bal.strip_decoration(line)
                 status = bal.strip_decoration(cells[2])
                 out.setdefault(key, (flat, status))

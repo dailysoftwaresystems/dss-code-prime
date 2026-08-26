@@ -155,10 +155,11 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
         auto const& w = g.at("width");
         if (!w.is_number_integer()
             || (w.get<std::int64_t>() != 8 && w.get<std::int64_t>() != 16
-                && w.get<std::int64_t>() != 32 && w.get<std::int64_t>() != 64)) {
+                && w.get<std::int64_t>() != 32 && w.get<std::int64_t>() != 64
+                && w.get<std::int64_t>() != 128)) {
             coll.emit(DiagnosticCode::C_MalformedJson,
                       std::format("/opcodes/{}/encoding/variants/{}/guard/width", opIdx, vi),
-                      "'width' must be the integer 8, 16, 32, or 64 "
+                      "'width' must be the integer 8, 16, 32, 64, or 128 "
                       "(the shipped operation-width vocabulary; "
                       "D-CSUBSET-32BIT-ALU-FORMS / CHAR-STRING-VALUE-CODEGEN / "
                       "D-LIR-INT-MEMORY-WIDTH-EXACT)");
@@ -978,9 +979,10 @@ void parseLoweringStep(json const& st, std::string const& path,
         auto const& w = st.at("width");
         if (!w.is_number_integer()
             || (w.get<std::int64_t>() != 8  && w.get<std::int64_t>() != 16
-                && w.get<std::int64_t>() != 32 && w.get<std::int64_t>() != 64)) {
+                && w.get<std::int64_t>() != 32 && w.get<std::int64_t>() != 64
+                && w.get<std::int64_t>() != 128)) {
             coll.emit(DiagnosticCode::C_MalformedJson, path + "/width",
-                      "'width' must be the integer 8, 16, 32, or 64 (the same "
+                      "'width' must be the integer 8, 16, 32, 64, or 128 (the same "
                       "operation-width vocabulary the encoding-variant guards "
                       "key on); omit it for the 64-bit LIR default");
         } else {
@@ -1062,10 +1064,11 @@ void parseLoweringBlock(json const& low, std::size_t opIdx,
                     if (!w.is_number_integer()
                         || (w.get<std::int64_t>() != 8 && w.get<std::int64_t>() != 16
                             && w.get<std::int64_t>() != 32
-                            && w.get<std::int64_t>() != 64)) {
+                            && w.get<std::int64_t>() != 64
+                            && w.get<std::int64_t>() != 128)) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
                                   seqPath + "/guard/width",
-                                  "'width' must be the integer 8, 16, 32, or 64");
+                                  "'width' must be the integer 8, 16, 32, 64, or 128");
                     } else {
                         seq.guardWidthBits =
                             static_cast<std::uint8_t>(w.get<std::int64_t>());

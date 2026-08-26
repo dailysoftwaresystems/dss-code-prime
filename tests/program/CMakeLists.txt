@@ -270,3 +270,91 @@ dss_add_test(NAME program/test_driver_argument_supply
 # together.
 dss_add_test(NAME program/test_source_argument_shape
              SOURCES test_source_argument_shape.cpp)
+
+dss_add_test(NAME program/test_mode_routing_agreement
+             SOURCES test_mode_routing_agreement.cpp)
+
+# THE EXTENSION=>LANGUAGE RESOLUTION THE SHIPPED RUNTIME UNITS GO THROUGH
+# (D-DRIVER-SHIPPED-SOURCE-RESOLUTION-COMPILES-EVERY-SHIPPED-GRAMMAR). Its
+# subject is HOW the driver picks a front end for a source file DSS ships, and
+# what it does when the corpus cannot name exactly one.
+#
+# NOT a second spelling of `program/test_shipped_runtime_compiles`, which asserts
+# that every declared realization COMPILES for its format on every machine this
+# host can reach. That gate assumes the front-end choice and tests the compile;
+# this one tests the choice itself, including both refusals -- an extension no
+# shipped document claims, and one that two claim.
+#
+# Its central pin is a MECHANISM pin rather than an answer pin: a document with a
+# well-formed `language` block and an unloadable grammar body is a claimant to a
+# resolver that reads the declared field and INVISIBLE to one that constructs a
+# grammar to find out, so the two implementations give opposite answers and
+# exactly one of them can be green.
+dss_add_test(NAME program/test_shipped_source_language_resolution
+             SOURCES test_shipped_source_language_resolution.cpp)
+
+# THE RUNTIME OBJECT CACHE'S ctest FIXTURE
+# (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF). It materialises every shipped
+# runtime archive this suite can need, ONCE, before any test that reads an EXACT
+# `PhaseTimers::read(<phase>).runs` count.
+#
+# ★★★ WHY IT IS A FIXTURE AND NOT A RELAXED ASSERTION. `PhaseTimers` is
+# process-global, so an exact phase-count instrument's real precondition is "no
+# OTHER build ran in this process". That held for free until the shipped runtime
+# stopped being compiled inside the user's build: a cache MISS now runs a nested
+# `Program` build to materialise the archive, and ✔MEASURED a cold-cache pe64
+# release exec build reads `Optimize.runs` = 6 where a warm one reads 2.
+# Relaxing the comparison to `GE(2)` would pass a cold build with the driver's
+# program-stage call DELETED (5), i.e. it would blind the instrument to the
+# exact defect it exists for. The precondition broke, so the precondition is
+# repaired. The full argument is in the file's own docblock.
+#
+# ⓘ `FIXTURES_SETUP` makes ctest schedule it before anything that declares
+# `FIXTURES_REQUIRED dss_runtime_object_cache_warm`, whatever the -j ordering.
+# It is also an ordinary test, so a fixture that stops working is a RED rather
+# than a silently skipped precondition.
+dss_add_test(NAME program/test_runtime_cache_warm
+             SOURCES test_runtime_cache_warm.cpp)
+set_tests_properties(program/test_runtime_cache_warm PROPERTIES
+                     FIXTURES_SETUP dss_runtime_object_cache_warm)
+
+# The consumers. Listed here rather than beside each `dss_add_test` above so the
+# fixture and everything that depends on it read as one statement — and so a
+# future test that adds an exact phase-count assertion has one place to join.
+set_tests_properties(program/test_driver_argument_supply PROPERTIES
+                     FIXTURES_REQUIRED dss_runtime_object_cache_warm)
+
+# THE RUNTIME OBJECT CACHE'S **WIRING**
+# (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF). Its subject is the seam, not the
+# mechanism: that the DRIVER feeds the real key terms in, that a HIT actually
+# skips the compile, and that a change to any input the driver supplies produces
+# a MISS AND A RECOMPILE.
+#
+# ★★★ NOT A SECOND SPELLING OF `program/test_runtime_object_cache`, and the
+# distinction is the reason this file exists. That suite hands
+# `computeRuntimeObjectKey` a hand-built request and proves every term moves the
+# key — and every one of its cases was GREEN throughout the period in which the
+# cache had ZERO production call sites. A unit suite can prove a mechanism
+# correct; it cannot notice that nothing uses it.
+#
+# Its instrument is `PhaseTimers::read(Optimize).runs` rather than a clock: a
+# hit and a miss differ by exactly two optimize invocations per realized runtime
+# unit, which is deterministic where a wall-clock threshold on a drifting host is
+# not. Nothing in it names a target, a format or a language — the subject pair is
+# discovered from the descriptor corpus joined by `crossValidateTargetFormat`.
+#
+# ⓘ It declares NO fixture dependency and needs none: every case stages its own
+# config tree and points `DSS_RUNTIME_CACHE_DIR` at a private root, so it both
+# controls its own cold/warm state and cannot disturb — or be disturbed by — the
+# developer's real cache.
+dss_add_test(NAME program/test_runtime_cache_wiring
+             SOURCES test_runtime_cache_wiring.cpp)
+# `AHitAndAMissEmitTheSameImage` builds its probe source FROM the descriptor
+# that declares the discovered runtime unit — its `header` and one of its
+# `symbols` — so the subject actually demands the runtime on whatever corpus
+# this tree ships. Reading those two fields needs a JSON reader; the alternative
+# (`readShippedLibDescriptor`) wants a TypeInterner and a TypeRegistry to decode
+# signatures this case never looks at. Same nlohmann consumer the shipped-config
+# mutation tests in tests/core use.
+target_link_libraries(dss_program_test_runtime_cache_wiring
+                      PRIVATE nlohmann_json::nlohmann_json)

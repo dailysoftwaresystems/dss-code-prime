@@ -1252,65 +1252,82 @@ TEST(AsmDataSection, BitIntGlobalFailsLoud) {
         << "the narrow arm emits the SAME explicit deferral diagnostic";
 }
 
-// ── TF-C94 (D-CSUBSET-INT128-DATA-GLOBAL): a 128-bit integer global fails loud ──
-// The sibling `_BitInt` wall above keys on the VALUE's variant arm
-// (`holds_alternative<BitIntValue>`). Mirroring that here would be a SILENT MISS:
-// a 128-bit integer whose initializer FITS IN 64 BITS folds to a plain
-// `std::uint64_t` pool arm, so a variant-keyed gate never fires and control
-// reaches `appendLE(bytes, *bits, 16)` — `(value >> (j*8))` on a `std::uint64_t`
-// for j ∈ [0,16), i.e. shifts of 64..120 bits: UB that on both shipped host
-// arches masks the count and REPEATS the low 8 bytes into the high 8. Sixteen
-// plausible-looking WRONG bytes, no diagnostic. Hence this gate keys on the
-// TYPE KIND, and the fits-in-64 case below is the load-bearing pin: it is the one
-// a naive variant-keyed implementation misses while still looking green on the
-// wide case. Both cases pin the ANCHOR NAME, not just the error count — the
-// generic fallbacks share the same `DiagnosticCode` (the `_BitInt` sibling's
-// established red-on-disable discipline).
-TEST(AsmDataSection, Int128GlobalFailsLoud) {
+// ── D-CSUBSET-INT128-DATA-GLOBAL: a 128-bit integer global emits 16 REAL bytes ──
+// ⚠ THIS TEST USED TO ASSERT THE OPPOSITE, AND THE INVERSION IS THE POINT. TF-C94
+// walled this arm fail-loud because `appendLE` takes a `std::uint64_t`, so a
+// width-16 append shifted by 64..120 bits — UB that on both shipped host arches
+// masks the count to 6 bits and REPEATS the low 8 bytes into the high 8. The wall
+// was the right answer to "we cannot encode this"; it was never the answer to
+// "128-bit globals are unsupported". P36 widened the SOURCE instead of the shift
+// (two little-endian limbs, neither append exceeding width 8), so the arm is a
+// producer and the assertions turn over with it.
+//
+// ★ THE THREE CASES ARE THE THREE WAYS A 128-BIT INITIALIZER REACHES THIS ARM,
+// and the row's own history says why each is load-bearing:
+//   (1) FITS IN 64 BITS — folds into a PLAIN `std::uint64_t` pool arm, never a
+//       `BitIntValue`. A dispatch keyed on the value's VARIANT never fires for it
+//       (the miss the row recorded), and the UB shift made its high half a repeat
+//       of the low, so its high 8 bytes being ZERO is the pin.
+//   (2) WIDER THAN 64 BITS — the `BitIntValue` pool arm, the only one wide
+//       enough. Every byte of the fixture is distinct in position, so a
+//       byte-order error, a limb swap, or a repeat cannot cancel out.
+//   (3) NEGATIVE SIGNED — the high limb must be SIGN-extended, not zero-filled.
+//       Its `std::int64_t` arm carries no high limb at all, so the extension is a
+//       decision the encoder makes and can get silently wrong.
+// RED-ON-DISABLE: drop the high-limb append and every case loses 8 bytes; keep
+// the append but zero-fill the extension and only (3) reddens; swap the two
+// appends and only (2) reddens. Three cases, three distinct failure modes.
+TEST(AsmDataSection, Int128GlobalEmitsSixteenLittleEndianBytes) {
     TypeInterner ti{CompilationUnitId{1}};
 
-    // (1) FITS IN 64 BITS — `__uint128_t g = 5;`. The folded value is a plain
-    // u64 arm, NOT a BitIntValue: the case a mirrored variant-keyed gate misses.
+    auto const bytesOf = [](LoweredAgg const& r) {
+        return r.items.empty() ? std::vector<std::uint8_t>{} : r.items[0].bytes;
+    };
+
+    // (1) FITS IN 64 BITS — `__uint128_t g = 5;`.
     MirLiteralValue fits;
     fits.core  = TypeKind::U128;
     fits.value = std::uint64_t{5};
     auto const rf = lowerOneAggGlobal(ti, ti.primitive(TypeKind::U128),
                                       std::move(fits), kNatural16, DataModel::Lp64);
-    EXPECT_GE(rf.errors, 1u)
-        << "a u128 data-global whose initializer fits in 64 bits must STILL fail "
-           "loud — the value arm is a plain u64, so only a KIND-keyed gate sees it";
-    EXPECT_TRUE(rf.items.empty())
-        << "no bytes for a deferred 128-bit global — emitting would run appendLE "
-           "with width 16 over a u64 (the >>64 UB)";
-    EXPECT_NE(rf.messages.find("D-CSUBSET-INT128-DATA-GLOBAL"), std::string::npos)
-        << "red-on-disable: delete the kind-keyed 128-bit gate and this case emits "
-           "16 bytes with ZERO errors — the generic scalar path encodes it happily";
+    EXPECT_EQ(rf.errors, 0u) << rf.messages;
+    ASSERT_EQ(rf.items.size(), 1u);
+    std::vector<std::uint8_t> const wantFits{5, 0, 0, 0, 0, 0, 0, 0,
+                                             0, 0, 0, 0, 0, 0, 0, 0};
+    EXPECT_EQ(bytesOf(rf), wantFits)
+        << "the high 8 bytes must be ZERO — the UB shift repeated the low word "
+           "here, which is why a fits-in-64 value is the pin and not a triviality";
 
-    // (2) WIDER THAN 64 BITS — the value can only ride the `BitIntValue` pool arm
-    // (the sole arm wide enough). The 128-bit gate must win over the neighbouring
-    // `_BitInt` variant arm, or a `__uint128_t` global is reported as a `_BitInt`.
+    // (2) WIDER THAN 64 BITS — high 0x1122334455667788, low 0x99aabbccddeeff00.
     MirLiteralValue wide;
     wide.core  = TypeKind::U128;
-    wide.value = BitIntValue::fromU64(7, 128, /*isSigned=*/false);
+    wide.value = BitIntValue{
+        std::vector<std::uint64_t>{0x99aabbccddeeff00ull, 0x1122334455667788ull},
+        128, /*isSigned=*/false};
     auto const rw = lowerOneAggGlobal(ti, ti.primitive(TypeKind::U128),
                                       std::move(wide), kNatural16, DataModel::Lp64);
-    EXPECT_GE(rw.errors, 1u) << "a >64-bit 128-bit data-global must fail loud too";
-    EXPECT_TRUE(rw.items.empty()) << "no bytes for a deferred 128-bit global";
-    EXPECT_NE(rw.messages.find("D-CSUBSET-INT128-DATA-GLOBAL"), std::string::npos)
-        << "the 128-bit anchor, NOT the _BitInt one — red-on-disable: order this "
-           "gate after the BitIntValue arm and the message misnames the type";
-    EXPECT_EQ(rw.messages.find("D-CSUBSET-BITINT-DATA-GLOBAL"), std::string::npos)
-        << "a __uint128_t global must never be reported as a `_BitInt` deferral";
+    EXPECT_EQ(rw.errors, 0u) << rw.messages;
+    ASSERT_EQ(rw.items.size(), 1u);
+    std::vector<std::uint8_t> const wantWide{
+        0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99,
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11};
+    EXPECT_EQ(bytesOf(rw), wantWide)
+        << "every byte is distinct in position, so a swap or a reversal shows";
 
-    // (3) SIGNED twin — the gate is signedness-blind (both kinds are 16 bytes).
+    // (3) NEGATIVE SIGNED — `__int128 g = -3;`, high limb all ones.
     MirLiteralValue sig;
     sig.core  = TypeKind::I128;
     sig.value = std::int64_t{-3};
     auto const rs = lowerOneAggGlobal(ti, ti.primitive(TypeKind::I128),
                                       std::move(sig), kNatural16, DataModel::Lp64);
-    EXPECT_GE(rs.errors, 1u) << "an i128 data-global must fail loud as well";
-    EXPECT_NE(rs.messages.find("D-CSUBSET-INT128-DATA-GLOBAL"), std::string::npos)
-        << "the same anchor for the signed kind";
+    EXPECT_EQ(rs.errors, 0u) << rs.messages;
+    ASSERT_EQ(rs.items.size(), 1u);
+    std::vector<std::uint8_t> const wantSigned{
+        0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    EXPECT_EQ(bytesOf(rs), wantSigned)
+        << "a negative i128's high limb is SIGN-extended; zero-filling it would "
+           "turn -3 into 2^128-3 with no diagnostic anywhere";
 }
 
 // ── TF-C94: the 128-bit wall holds at the AGGREGATE-LEAF recursion too ──

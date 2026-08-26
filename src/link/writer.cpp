@@ -544,14 +544,56 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
             break;
         }
         // The open failed, and the two causes need opposite responses.
-        // If the candidate EXISTS, another writer (or a stale temp) holds
-        // that slot — take the next one. Otherwise this is a real error
+        // If the candidate NAME is occupied, another writer (or a stale temp)
+        // holds that slot — take the next one. Otherwise this is a real error
         // (permission denied, parent removed post-stat, path component is
         // not a directory, invalid filename, disk full) and spinning would
         // only turn it into a slow, misleading failure. Fail loud now.
+        //
+        // ── THE PROBE MUST ASK THE QUESTION THE CLAIM ASKED ───────────────
+        //    D-LINK-WRITER-DANGLING-SYMLINK-CLAIM-MISROUTE
+        //
+        // ★★ IT IS `symlink_status`, NOT `exists`, AND THE DIFFERENCE IS THE
+        // WHOLE DEFECT. `std::filesystem::exists(p)` FOLLOWS the link and
+        // answers about the TARGET; the exclusive create refuses a directory
+        // ENTRY. On a DANGLING symlink the two disagree, the loop believes the
+        // wrong one, and an occupied slot is reported as a real error.
+        //
+        // ✔MEASURED 2026-08-26 on glibc/ext4 (WSL, g++ 13.3.0) by driving the
+        // two probes and the claim primitive over one name each — the claim
+        // spelled exactly as `createExclusiveBinary` spells it:
+        //
+        //   candidate                claim    exists()   exists(symlink_status())
+        //   fresh name               OPENED   —          —
+        //   regular-file occupant    NULL     true       true
+        //   DANGLING symlink         NULL     **false**  **true**
+        //   symlink to a live file   NULL     true       true
+        //
+        // Only the dangling row diverges, and `symlink_status` is right on all
+        // four. The live-symlink row is worth stating because it shows the
+        // repair is not "symlinks are special": POSIX makes `O_CREAT|O_EXCL`
+        // fail on ANY symlink regardless of its target, so that row was already
+        // routed correctly and stays correct — it is the ENTRY-vs-TARGET
+        // question that was being asked wrongly, not the symlink-ness.
+        //
+        // ⚠ WINDOWS CANNOT REACH THIS ROW AT ALL, and it is a LIBRARY limit
+        // rather than a privilege one — which is not what the anchor predicted.
+        // ✔MEASURED 2026-08-26 on this host with the shipping toolchain
+        // (MinGW-W64 UCRT g++ 13.2.0): `std::filesystem::create_symlink`
+        // returns `ENOSYS` ("Function not implemented", 40) even though
+        // `mklink` succeeds in the same directory, so no test on that leg can
+        // construct the input. The pin is therefore POSIX-leg only and SAYS SO
+        // (D-GATE-INSTRUMENT-SCOPE-UNSTATED); see
+        // `tests/link/test_link_writer_exclusive_claim.cpp`.
+        //
+        // `status_known` is not used as the test: `symlink_status` reports a
+        // NON-EXISTENT name as `file_type::not_found`, which IS a known status,
+        // so `status_known` would answer true for every name and route a real
+        // error into the retry loop. `exists(file_status)` is the predicate
+        // that distinguishes them.
         std::error_code eec;
-        bool const      taken = std::filesystem::exists(candidate, eec);
-        if (!eec && taken) {
+        auto const      entry = std::filesystem::symlink_status(candidate, eec);
+        if (!eec && std::filesystem::exists(entry)) {
             continue;
         }
         emit(reporter, DiagnosticCode::K_ImageWriteOpenFailed,
@@ -560,7 +602,10 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
                  + pathForDiag(candidate)
                  + "' for binary write (permission denied, a path component "
                    "is not a directory, invalid filename, or parent removed "
-                   "post-stat). The artifact '"
+                   "post-stat). The name itself was probed as a directory "
+                   "ENTRY, so an occupant of ANY kind — a regular file, a "
+                   "directory, or a dangling symlink — would have been stepped "
+                   "over rather than reported here. The artifact '"
                  + pathForDiag(path) + "' was NOT written.");
         return false;
     }

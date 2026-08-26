@@ -9,6 +9,8 @@
 // is pinned against (the tests hex-render it themselves; see `hexOracle`).
 #include "core/crypto/sha256.hpp"
 #include "repo_root.hpp"
+// The ONE load-or-fail-this-test helper for a shipped grammar.
+#include "shipped_schema_or_throw.hpp"
 
 #include <gtest/gtest.h>
 
@@ -25,6 +27,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace dss;
 
@@ -6700,9 +6703,18 @@ TEST(GrammarSchemaContentDigest, IsSixtyFourLowercaseHexDigits) {
         << "not lowercase hex: " << digest;
 }
 
+// ⚠ THE TWO LABELS ARE LOAD-BEARING AS OF 2026-08-25 (cycle P35). The
+// content-addressed memo
+// (D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS)
+// keys on (schema family, sourceLabel, digest), so two loads of these bytes
+// under the DEFAULT label would be one build and one object — and the
+// `ASSERT_NE` below would fire, correctly, saying the equality had become a
+// tautology. Distinct labels force two INDEPENDENT builds, which is the only
+// shape under which "the digest is a deterministic function of the bytes"
+// means anything. The subject is unchanged and the guard below still guards.
 TEST(GrammarSchemaContentDigest, SameTextTwiceYieldsTheSameDigest) {
-    auto a = GrammarSchema::loadFromText(kHappyConfig);
-    auto b = GrammarSchema::loadFromText(kHappyConfig);
+    auto a = GrammarSchema::loadFromText(kHappyConfig, "digest-determinism-a");
+    auto b = GrammarSchema::loadFromText(kHappyConfig, "digest-determinism-b");
     ASSERT_TRUE(a.has_value()) << errorDiags(a.error());
     ASSERT_TRUE(b.has_value()) << errorDiags(b.error());
     ASSERT_NE(a->get(), b->get())
@@ -6747,4 +6759,737 @@ TEST(GrammarSchemaContentDigest, ConstructionBypassingLoadFromTextLeavesItEmpty)
     EXPECT_TRUE(schema.contentDigest().empty())
         << "a schema with no document bytes reported a digest: "
         << schema.contentDigest();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `configName()` / `configDocumentPath()` — the name the CONFIG TREE is
+// indexed by, and the document path composed from it
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ★★★ WHY THIS SECTION EXISTS. A language has TWO names. `name()` is what the
+// document DECLARES (`language.name`); `configName()` is the `.lang.json` STEM,
+// and only the stem is a valid `--language` argument or a valid path component.
+// A caller that reached for `name()` where a path was meant shipped a defect
+// that gated 1656/1656 GREEN on Windows and took 527 tests down on the WSL leg
+// (✔MEASURED 2026-08-25).
+//
+// ⚠⚠ AND THE DEFECT IS NOT A CASE PROBLEM — calling it one understates the
+// class by half. `ShippedCorpusStemAndDeclaredNameDivergeByMoreThanCase` below
+// MEASURES the corpus rather than restating a belief about it: THREE of the
+// FIVE nameable shipped languages have HYPHENS their declared names do not
+// (`asm-arm64-gas` → "AsmArm64Gas", `asm-x86_64-att` → "AsmX86_64Att",
+// `tsql-subset` → "TsqlSubset"), so for those the substitution resolves to
+// nothing on NTFS and APFS too. Only the case-only pairs (`c` → "C",
+// `toy` → "Toy") are host-dependent, which is precisely why a case-only pair is
+// the one that reached production.
+//
+// ⚠ NO SPELLING BELOW IS JUDGED BY THE FILESYSTEM. `fs::exists` on the
+// upper-case spelling is TRUE on two of the three hosts this repository gates
+// on, so a check built from it would reproduce the exact blindness that let the
+// defect ship. Every spelling claim here is a `std::string` comparison, which is
+// case-sensitive on every host.
+//   * `TheStemComesFromTheLabelVerbatim` is the one case where case-sensitivity
+//     is itself the property under test rather than the tool.
+//   * `EveryShippedLanguageNamesAFileThatExists` is the one case that DOES call
+//     the filesystem, and deliberately: its claim is EXISTENCE, not spelling —
+//     a cache key naming a document nobody can open is a key over a fiction. It
+//     asserts the exact string FIRST and existence second, so a case-insensitive
+//     host cannot let a wrong spelling through on the existence check alone.
+
+namespace {
+
+// One shipped language document, as the pair this section is about.
+struct ShippedLanguageRow {
+    std::string stem;      // the filename stem — what `--language` takes
+    std::string declared;  // `language.name` — what the document says
+};
+
+// ★★ THE CORPUS SPLITS IN TWO, AND THE SPLIT IS NOT A CONVENIENCE — ✔MEASURED
+// 2026-08-25, cycle P36, when the first cut of this helper called `loadShipped`
+// on every `sources/*.lang.json` and went red on `asm.lang.json`:
+//
+//     language 'asm' cannot be loaded standalone: 24 of its 'requires' names
+//     are UNSATISFIED … It also declares no 'root' shape …
+//
+// `asm.lang.json` is the SHARED assembly line grammar, designed to be reached
+// only through another document's `languageReferences` (`c.lang.json`,
+// `asm-arm64-gas.lang.json` and `asm-x86_64-att.lang.json` all bind its holes).
+// It is not a language a caller can name: `--language asm` is refused by the
+// same loader, so it can never be a `--language` argument, a `configName()` or
+// a `CuBuildKey::languageName`. Restricting the measurements below to the
+// STANDALONE set is therefore not a narrowing — it is exactly the set the
+// claims are about.
+//
+// ⚠ AND THE EXCLUSION IS ACCOUNTED FOR, NEVER SWALLOWED. A refusal is admitted
+// as "embedded-only" ONLY when some standalone document actually folds this
+// document in — asked of `referencedDocuments()`, the loader's own report, so a
+// document that stops loading for a DIFFERENT reason is UNACCOUNTED and fails
+// loudly. A helper that simply skipped what would not load is the vacuous-skip
+// shape: it would keep measuring a corpus that had silently shrunk to one row.
+struct ShippedLanguageCensus {
+    std::vector<ShippedLanguageRow> standalone;    // `loadShipped` succeeded
+    std::vector<std::string>        embeddedOnly;  // refused, and referenced
+    std::size_t                     documents = 0; // every `*.lang.json` on disk
+};
+
+// Every `sources/*.lang.json`, read THROUGH THE PRODUCTION LOADER. Sorted by
+// stem so the row order is a property of the CORPUS and not of the host
+// filesystem's iteration order (sorted on NTFS, hash-ordered on ext4).
+//
+// ⚠ The stem is taken from the FILENAME and the declared name from the LOADED
+// SCHEMA — two independent readings. Taking both off the schema would make
+// every assertion below a comparison of one value with itself.
+[[nodiscard]] ShippedLanguageCensus shippedLanguageCorpus() {
+    ShippedLanguageCensus census;
+    auto const            cfg = dss::test::findConfigRoot();
+    if (!cfg) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
+        return census;
+    }
+    constexpr std::string_view kSuffix{".lang.json"};
+
+    std::vector<std::string> stems;
+    std::error_code          ec;
+    for (std::filesystem::directory_iterator it{*cfg / "sources", ec}, end;
+         it != end; it.increment(ec)) {
+        if (ec) break;
+        std::error_code typeEc;
+        if (!it->is_regular_file(typeEc) || typeEc) continue;
+        std::string const leaf = it->path().filename().generic_string();
+        if (leaf.size() <= kSuffix.size() || !leaf.ends_with(kSuffix)) continue;
+        stems.push_back(leaf.substr(0, leaf.size() - kSuffix.size()));
+    }
+    std::sort(stems.begin(), stems.end());
+    census.documents = stems.size();
+
+    // Pass 1: the documents that load as a ROOT, and every document each of
+    // them folded in (the loader's own report — never a re-read of the JSON,
+    // which would be a second reading of `languageReferences` free to drift).
+    std::vector<std::string> refusedStems;
+    std::vector<std::string> referencedLeaves;
+    for (auto const& stem : stems) {
+        auto loaded = GrammarSchema::loadShipped(stem);
+        if (!loaded.has_value()) {
+            refusedStems.push_back(stem);
+            continue;
+        }
+        census.standalone.push_back(
+            ShippedLanguageRow{stem, std::string{(*loaded)->name()}});
+        for (auto const& dep : (*loaded)->referencedDocuments()) {
+            referencedLeaves.push_back(
+                std::filesystem::path{dep.path}.filename().generic_string());
+        }
+    }
+    std::sort(referencedLeaves.begin(), referencedLeaves.end());
+
+    // Pass 2: classify each refusal. Matching on the LEAF is exact enough here
+    // and stated rather than assumed — every referenced document lives in this
+    // one `sources/` directory, so two leaves cannot collide.
+    for (auto const& stem : refusedStems) {
+        std::string const leaf = stem + std::string{kSuffix};
+        if (std::binary_search(referencedLeaves.begin(), referencedLeaves.end(),
+                               leaf)) {
+            census.embeddedOnly.push_back(stem);
+            continue;
+        }
+        auto reason = GrammarSchema::loadShipped(stem);
+        ADD_FAILURE()
+            << "shipped language document '" << leaf
+            << "' cannot be loaded as a root AND is referenced by no shipped "
+               "document that can. It is therefore reachable by nothing — not "
+               "by `--language`, not through `languageReferences` — so the "
+               "corpus measurements in this file are being taken over a "
+               "SMALLER set than the tree ships, which is how a census stays "
+               "green while the thing it counts disappears. The loader's "
+               "reason:"
+            << (reason.has_value() ? std::string{" <it loaded on retry>"}
+                                   : errorDiags(reason.error()));
+    }
+    return census;
+}
+
+[[nodiscard]] std::string asciiLower(std::string_view s) {
+    std::string out{s};
+    for (char& ch : out) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    return out;
+}
+
+// The first value that occurs twice in `values`, or empty if all are distinct.
+[[nodiscard]] std::string firstDuplicate(std::vector<std::string> values) {
+    std::sort(values.begin(), values.end());
+    auto const dup = std::adjacent_find(values.begin(), values.end());
+    return dup == values.end() ? std::string{} : *dup;
+}
+
+} // namespace
+
+// ── The derivation, arm by arm ──────────────────────────────────────────────
+
+TEST(GrammarSchemaConfigName, AForwardSlashPathYieldsTheStem) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig,
+                                              "some/tree/sources/mini.lang.json");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->configName(), "mini");
+}
+
+// Windows hands `loadFromText` a `path.string()`, which is backslashed. A
+// separator scan that knew only `/` would return the WHOLE path as the "stem"
+// on the host this repository is developed on — a value that is not empty, so
+// no emptiness check anywhere would notice it.
+TEST(GrammarSchemaConfigName, ABackslashPathYieldsTheStem) {
+    auto result = GrammarSchema::loadFromText(
+        kHappyConfig, R"(C:\tree\src\dss-config\sources\mini.lang.json)");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->configName(), "mini");
+}
+
+// `fs::path::string()` on Windows mixes separators freely when a path was
+// composed from a forward-slashed root. The LAST separator of EITHER kind wins.
+TEST(GrammarSchemaConfigName, MixedSeparatorsTakeTheLastOneOfEitherKind) {
+    auto a = GrammarSchema::loadFromText(
+        kHappyConfig, R"(C:/tree/src\dss-config\sources\mini.lang.json)");
+    ASSERT_TRUE(a.has_value()) << errorDiags(a.error());
+    EXPECT_EQ((*a)->configName(), "mini");
+
+    auto b = GrammarSchema::loadFromText(
+        kHappyConfig, R"(C:\tree\src/dss-config/sources/mini2.lang.json)");
+    ASSERT_TRUE(b.has_value()) << errorDiags(b.error());
+    EXPECT_EQ((*b)->configName(), "mini2");
+}
+
+TEST(GrammarSchemaConfigName, ABareFilenameWithNoSeparatorYieldsTheStem) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig, "mini.lang.json");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->configName(), "mini");
+}
+
+// ★ A LEAF THAT IS EXACTLY THE SUFFIX NAMES NOTHING. Its stem is empty, and an
+// empty stem is not a name any walk could have resolved — `--language ""` names
+// nothing — so the honest answer is the documented "no document" state.
+//
+// ⚠ THIS DOES NOT PIN THE `>` IN `label.size() > kSuffix.size()`, and saying it
+// did would be a false claim about a real measurement. ✔MEASURED 2026-08-25 by
+// mutation: `>=` leaves this case GREEN, because at equality the stem is
+// `substr(0, 0)` — empty either way. What the length test actually decides is
+// an UNDERFLOW, pinned by `TheDefaultInlineLabelLeavesItEmpty` below: removing
+// the test entirely wraps `label.size() - kSuffix.size()` to
+// 18446744073709551614 for the 8-byte `<inline>` label and `compare` throws,
+// which took 106 cases of this file down.
+TEST(GrammarSchemaConfigName, ALeafThatIsExactlyTheSuffixLeavesItEmpty) {
+    auto bare = GrammarSchema::loadFromText(kHappyConfig, ".lang.json");
+    ASSERT_TRUE(bare.has_value()) << errorDiags(bare.error());
+    EXPECT_TRUE((*bare)->configName().empty())
+        << "a leaf that is exactly the suffix minted the stem '"
+        << (*bare)->configName() << "'";
+
+    auto pathed = GrammarSchema::loadFromText(kHappyConfig,
+                                              "some/tree/sources/.lang.json");
+    ASSERT_TRUE(pathed.has_value()) << errorDiags(pathed.error());
+    EXPECT_TRUE((*pathed)->configName().empty())
+        << "a PATH whose leaf is exactly the suffix minted the stem '"
+        << (*pathed)->configName() << "'";
+}
+
+// The other side of the same boundary, and this one IS observable: one
+// character more than the suffix is a one-character stem, and it must survive.
+// A length test that had drifted to `> kSuffix.size() + 1` would fail here and
+// nowhere else.
+TEST(GrammarSchemaConfigName, ALeafOneCharacterLongerThanTheSuffixYieldsThatCharacter) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig, "x.lang.json");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->configName(), "x");
+}
+
+// The compare is anchored at the END. A label that merely CONTAINS the suffix
+// is not a language document, and treating it as one would name a stem
+// (`c.lang.json.bak` -> `c`) for a file the loader never read.
+TEST(GrammarSchemaConfigName, TheSuffixMustBeAtTheEndAndNotMerelyPresent) {
+    for (std::string_view const label :
+         {"c.lang.json.bak", "sources/c.lang.json/inner", ".lang.jsonx",
+          "c.lang.jso", "c.lang.JSON"}) {
+        auto result = GrammarSchema::loadFromText(kHappyConfig, label);
+        ASSERT_TRUE(result.has_value()) << label << errorDiags(result.error());
+        EXPECT_TRUE((*result)->configName().empty())
+            << "label '" << label << "' was treated as a language document and "
+               "yielded the stem '" << (*result)->configName() << "'";
+    }
+}
+
+// ★★ THE STEM IS THE LABEL'S BYTES, NEVER A NORMALIZED FORM OF THEM. This is
+// the ONE assertion in this section that is deliberately case-SENSITIVE about
+// its subject rather than its comparison: `configName()` reports what the
+// document was loaded AS. A loader that lower-cased here would make
+// `--language C` resolve on Linux by accident, hiding the defect instead of
+// exposing it, and would make the value disagree with the path the walk used.
+TEST(GrammarSchemaConfigName, TheStemComesFromTheLabelVerbatim) {
+    auto upper = GrammarSchema::loadFromText(kHappyConfig,
+                                             "some/sources/C.lang.json");
+    ASSERT_TRUE(upper.has_value()) << errorDiags(upper.error());
+    EXPECT_EQ((*upper)->configName(), "C");
+
+    auto hyphenated = GrammarSchema::loadFromText(
+        kHappyConfig, "some/sources/asm-x86_64-att.lang.json");
+    ASSERT_TRUE(hyphenated.has_value()) << errorDiags(hyphenated.error());
+    EXPECT_EQ((*hyphenated)->configName(), "asm-x86_64-att");
+}
+
+// ── The "no document" contract ──────────────────────────────────────────────
+
+// ★★ THE DEFAULT LABEL — every `loadFromText` caller that names nothing, and
+// the case that catches the derivation's one real crash. `<inline>` is EIGHT
+// bytes, two fewer than `.lang.json`, so it is also the shortest label the
+// production API can produce: ✔MEASURED, dropping the length guard makes this
+// case throw `basic_string_view::substr: __pos (which is 18446744073709551614)`
+// rather than merely report a wrong name.
+TEST(GrammarSchemaConfigName, TheDefaultInlineLabelLeavesItEmpty) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig);
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_TRUE((*result)->configName().empty())
+        << "a grammar with no document behind it reported the config name '"
+        << (*result)->configName()
+        << "'. Empty is the documented 'no document' state, and a caller that "
+           "needs a path relies on it.";
+}
+
+// The public `GrammarSchemaData` ctor — the documented JSON bypass tests use.
+TEST(GrammarSchemaConfigName, ConstructionBypassingLoadFromTextLeavesItEmpty) {
+    GrammarSchema const schema{detail::GrammarSchemaData{}};
+    EXPECT_TRUE(schema.configName().empty())
+        << "a schema built with no document reported the config name '"
+        << schema.configName() << "'";
+}
+
+// ★★★ A MEMO HIT CANNOT HAND BACK A SCHEMA WITH AN UNSET CONFIG NAME.
+// `configName_` is assigned BEFORE `ConfigDocumentMemo<GrammarSchema>::store`,
+// and the memo key is (sourceLabel, digest) — the SAME label the name derives
+// from — so the hit and the miss agree by construction. This pins the property
+// rather than the reasoning: an edit that moved the assignment after the store,
+// or that keyed the memo on the digest ALONE, lands here.
+//
+// ⚠ THE HIT IS PROVEN TO BE A HIT, not assumed. Two loads of identical bytes
+// under identical labels return the SAME OBJECT on a hit and two objects on a
+// miss, so `ASSERT_EQ` on the pointers is what makes the rest of the case mean
+// anything — without it a cache that never hits would pass.
+TEST(GrammarSchemaConfigName, AMemoHitCarriesTheSameConfigNameAsTheMiss) {
+    constexpr std::string_view kLabel = "memo/sources/memo-probe.lang.json";
+    auto miss = GrammarSchema::loadFromText(kHappyConfig, kLabel);
+    ASSERT_TRUE(miss.has_value()) << errorDiags(miss.error());
+    ASSERT_EQ((*miss)->configName(), "memo-probe");
+
+    auto hit = GrammarSchema::loadFromText(kHappyConfig, kLabel);
+    ASSERT_TRUE(hit.has_value()) << errorDiags(hit.error());
+    ASSERT_EQ(miss->get(), hit->get())
+        << "the second load of identical bytes under an identical label built a "
+           "SECOND object, so the memo did not hit and this case asserts "
+           "nothing about a hit";
+    EXPECT_EQ((*hit)->configName(), "memo-probe");
+    EXPECT_EQ((*hit)->configDocumentPath(), (*miss)->configDocumentPath());
+}
+
+// A memo keyed on (label, digest) must NOT let one label's schema answer for
+// another's — that would be a hit returning the wrong config name, which is the
+// same wrong-path defect arriving through the cache instead of the derivation.
+TEST(GrammarSchemaConfigName, TwoLabelsOverIdenticalBytesKeepTheirOwnStems) {
+    auto a = GrammarSchema::loadFromText(kHappyConfig, "sources/stem-a.lang.json");
+    auto b = GrammarSchema::loadFromText(kHappyConfig, "sources/stem-b.lang.json");
+    ASSERT_TRUE(a.has_value()) << errorDiags(a.error());
+    ASSERT_TRUE(b.has_value()) << errorDiags(b.error());
+    EXPECT_EQ((*a)->configName(), "stem-a");
+    EXPECT_EQ((*b)->configName(), "stem-b");
+    EXPECT_EQ((*a)->contentDigest(), (*b)->contentDigest())
+        << "the two loads were given the same bytes, so a differing digest "
+           "means this case is no longer testing the label half of the key";
+}
+
+// ── `configDocumentPath()` — both arms, both reachable ──────────────────────
+
+TEST(GrammarSchemaConfigDocumentPath, ADocumentAnswersWithItsConfigRootRelativePath) {
+    auto result = GrammarSchema::loadFromText(
+        kHappyConfig, R"(C:\tree\src\dss-config\sources\mini.lang.json)");
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    EXPECT_EQ((*result)->configDocumentPath(), "sources/mini.lang.json");
+}
+
+// ★★ THE ARM THE DRIVER'S DELETED REFUSAL COULD NOT REACH.
+// `resolveShippedRuntimeArchives` carried an `if (configName().empty())` branch
+// that no driver route could exercise (every route is `loadShipped` ->
+// `loadFromFile`), so it was deleted in cycle P36 and the behaviour moved HERE,
+// where the case is one call away and is exercised on every run.
+//
+// ⚠ THE ANSWER MUST NOT LOOK LIKE A PATH. `sources/.lang.json` is a real path
+// SHAPE — an auditor reading a cache key document would take it for a document
+// that was loaded, and a file literally named `.lang.json` would collide with
+// it. Both halves are asserted: the declared name is present (so the term
+// identifies WHICH grammar), and no `.lang.json` appears anywhere in it.
+TEST(GrammarSchemaConfigDocumentPath, AGrammarWithNoDocumentAnswersWithANonPath) {
+    auto result = GrammarSchema::loadFromText(kHappyConfig);
+    ASSERT_TRUE(result.has_value()) << errorDiags(result.error());
+    std::string const term = (*result)->configDocumentPath();
+
+    EXPECT_FALSE(term.empty())
+        << "an empty term would put `doc=language::<digest>` in the cache key "
+           "line, which reads as a document with no path rather than as a "
+           "grammar with no document";
+    EXPECT_EQ(term.find(".lang.json"), std::string::npos)
+        << "a grammar with no document named one: '" << term << "'";
+    EXPECT_EQ(term.find("sources/"), std::string::npos)
+        << "a grammar with no document named a config subdirectory: '" << term
+        << "'";
+    EXPECT_NE(term.find((*result)->name()), std::string::npos)
+        << "the term does not identify WHICH grammar it stands for (declared "
+           "name '" << (*result)->name() << "'): '" << term << "'";
+}
+
+TEST(GrammarSchemaConfigDocumentPath, TheDataConstructorBypassAlsoAnswersWithANonPath) {
+    GrammarSchema const schema{detail::GrammarSchemaData{}};
+    std::string const   term = schema.configDocumentPath();
+    EXPECT_FALSE(term.empty());
+    EXPECT_EQ(term.find(".lang.json"), std::string::npos)
+        << "a schema built with no document named one: '" << term << "'";
+}
+
+// ── The shipped corpus: the measurements the docblocks cite ─────────────────
+
+// ★ THE COMPOSED PATH NAMES A FILE THAT EXISTS. This is the one place the
+// filesystem IS the right oracle, because the claim is about existence and not
+// about spelling: `configDocumentPath()` is what the runtime-cache key records,
+// and a key naming a document nobody can open is a key covering a fiction.
+TEST(GrammarSchemaConfigDocumentPath, EveryShippedLanguageNamesAFileThatExists) {
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    auto const census = shippedLanguageCorpus();
+    auto const& rows  = census.standalone;
+    ASSERT_FALSE(rows.empty()) << "no shipped language documents were found";
+    // Every document on disk is either a root or an embedded reference; the
+    // helper fails loudly for anything else, and this restates the accounting
+    // where a reader of the failure will see it.
+    EXPECT_EQ(rows.size() + census.embeddedOnly.size(), census.documents);
+
+    for (auto const& row : rows) {
+        auto loaded = GrammarSchema::loadShipped(row.stem);
+        ASSERT_TRUE(loaded.has_value()) << row.stem << errorDiags(loaded.error());
+        EXPECT_EQ((*loaded)->configName(), row.stem)
+            << "shipped language '" << row.stem
+            << "' reports a config name that is not its filename stem";
+        std::string const rel = (*loaded)->configDocumentPath();
+        EXPECT_EQ(rel, "sources/" + row.stem + ".lang.json");
+        EXPECT_TRUE(std::filesystem::is_regular_file(*cfg / rel))
+            << "the document path composed for shipped language '" << row.stem
+            << "' is '" << rel << "', which is not a file under the config root "
+            << cfg->generic_string();
+    }
+}
+
+// ★★★ THE C4 MEASUREMENT, TAKEN RATHER THAN RESTATED. Three docblocks used to
+// describe this divergence as a CASE difference. It is not, for half the
+// corpus, and a reader who takes the case framing literally concludes the class
+// is Linux-only — a conclusion that would have let the same substitution ship
+// again in a hyphenated language, failing on every host.
+//
+// This case asserts the SHAPE of the corpus, not a row list: that at least one
+// stem differs from its declared name by MORE than case, and that at least one
+// differs by case ALONE. Either going red is the day the docblocks change.
+TEST(GrammarSchemaConfigName, ShippedCorpusStemAndDeclaredNameDivergeByMoreThanCase) {
+    auto const  census = shippedLanguageCorpus();
+    auto const& rows   = census.standalone;
+    ASSERT_FALSE(rows.empty()) << "no shipped language documents were found";
+
+    std::vector<std::string> identical;
+    std::vector<std::string> caseOnly;
+    std::vector<std::string> structural;
+    for (auto const& row : rows) {
+        if (row.stem == row.declared) {
+            identical.push_back(row.stem);
+        } else if (asciiLower(row.stem) == asciiLower(row.declared)) {
+            caseOnly.push_back(row.stem);
+        } else {
+            structural.push_back(row.stem);
+        }
+    }
+
+    std::string censusText;
+    for (auto const& row : rows) {
+        censusText += "\n  " + row.stem + " -> \"" + row.declared + "\"";
+    }
+    for (auto const& stem : census.embeddedOnly) {
+        censusText += "\n  " + stem + "  (embedded-only: not nameable)";
+    }
+
+    EXPECT_FALSE(structural.empty())
+        << "EVERY shipped stem now agrees with its declared name up to case. "
+           "The 'differ in CASE' framing in `GrammarSchema::configName`, "
+           "`ShippedSourceLanguage` and this file would then be accurate — "
+           "update them, and this expectation, together." << censusText;
+
+    // A structural divergence is host-BLIND: `sources/AsmArm64Gas.lang.json`
+    // exists on no filesystem. A case-only divergence is host-DEPENDENT, and is
+    // the reason a green Windows gate proved nothing. Both must be present for
+    // the docblocks' two-part explanation to be the corpus's actual shape.
+    EXPECT_FALSE(caseOnly.empty())
+        << "no shipped stem differs from its declared name by case ALONE, so "
+           "the host-dependent half of the defect no longer has an example in "
+           "the corpus and the docblocks that cite one are stale." << censusText;
+}
+
+// ★★★ THE PROOF THAT `CuBuildKey::languageName` MAY KEY ON THE STEM: swapping
+// it from `name()` to `configName()` changes NO CU-build grouping on this
+// corpus.
+//
+// `CuBuildKey::languageName` decides whether two targets SHARE one parsed CU.
+// The swap is behaviour-preserving exactly when the two columns induce the SAME
+// partition of the corpus — which they do when both are injective, since each
+// then puts every document in its own class. The STEM is injective by
+// construction (two files in one directory cannot share a name); the DECLARED
+// name is injective only as long as nobody declares a duplicate, and this case
+// is the guard on that.
+//
+// ⚠ IT IS ALSO THE REASON FOR THE SWAP. A corpus that grew a duplicate
+// `language.name` would, under `name()`, silently MERGE two CU builds — a `.s`
+// parsed under one dialect and compiled for the other CPU. Under `configName()`
+// it cannot. So this case going red is informative either way: before the swap
+// it announced a live miscompile; after it, a stale docblock.
+TEST(GrammarSchemaConfigName, ShippedCorpusStemsAndDeclaredNamesAreBothInjective) {
+    // ⓘ THE STANDALONE SET IS THE RIGHT DOMAIN, not a convenient one. Only a
+    // document that loads as a ROOT can reach `resolveGrammarForTarget`, so
+    // only those can ever be compared inside a `CuBuildKey` — an embedded-only
+    // grammar such as `asm.lang.json` is folded into its host and never keyed.
+    auto const  census = shippedLanguageCorpus();
+    auto const& rows   = census.standalone;
+    ASSERT_FALSE(rows.empty()) << "no shipped language documents were found";
+
+    std::vector<std::string> stems;
+    std::vector<std::string> declared;
+    for (auto const& row : rows) {
+        stems.push_back(row.stem);
+        declared.push_back(row.declared);
+        EXPECT_FALSE(row.stem.empty());
+        EXPECT_FALSE(row.declared.empty())
+            << "shipped language '" << row.stem << "' declares no name";
+    }
+
+    EXPECT_TRUE(firstDuplicate(stems).empty())
+        << "two shipped documents share the filename stem '"
+        << firstDuplicate(stems)
+        << "', which the filesystem should have made impossible";
+    EXPECT_TRUE(firstDuplicate(declared).empty())
+        << "two shipped language documents declare the same `language.name` ('"
+        << firstDuplicate(declared)
+        << "'). `CuBuildKey::languageName` keys on the STEM precisely so this "
+           "cannot merge two CU builds — but every OTHER site that still "
+           "identifies a language by its declared name now has an ambiguity, "
+           "so audit them before accepting the duplicate.";
+}
+// ═══ Longest-match probe index ════════════════════════════════════════════
+//
+// D-PERF-TOK-LONGEST-MATCH-PROBES-EVERY-DECLARED-LENGTH-AT-EVERY-POSITION.
+// The tokenizer's longest-match scan used to ask the lexeme table about EVERY
+// length from `maxLexemeLength` down to 1 at EVERY token position;
+// `lexemeLengthsForLeadByte` now hands it only the lengths that can possibly
+// match. These pin the ALGORITHMIC property — the number of table lookups —
+// and deliberately time nothing: a wall-clock threshold in a test measures the
+// host's mood, and this box has been measured moving 1.33x on a phase nothing
+// touched.
+
+namespace {
+
+// Declares, on purpose:
+//   * three keys under one lead byte at TWO distinct lengths (`+` `++` `+=`)
+//     — the row must dedup to two probes, not three;
+//   * a GAP under one lead byte (`<` and `<<=`, no 2-byte key) — the row must
+//     not invent length 2;
+//   * two keywords of the SAME length under one lead byte (`if`, `in`) plus a
+//     longer one (`int`) — dedup again, and descending order;
+//   * a key past the 15-byte small-string threshold, the boundary at which the
+//     old per-probe `std::string` started calling malloc.
+constexpr std::string_view kProbeIndexConfig = R"({
+  "dssSchemaVersion": 1,
+  "language": {
+    "name": "ProbeIndexLang",
+    "version": "1.0.0",
+    "fileExtensions": [".pil"]
+  },
+  "tokens": {
+    " ":   [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "+":   [{ "kind": "Plus" }],
+    "++":  [{ "kind": "PlusPlus" }],
+    "+=":  [{ "kind": "PlusEq" }],
+    "<":   [{ "kind": "Lt" }],
+    "<<=": [{ "kind": "ShlEq" }],
+    ";":   [{ "kind": "EndCommand" }],
+    "=":   [{ "kind": "AssignmentOperator" }]
+  },
+  "keywords": [
+    { "word": "if",  "kind": "IfKeyword" },
+    { "word": "in",  "kind": "InKeyword" },
+    { "word": "int", "kind": "IntKeyword" },
+    { "word": "__builtin_very_long_name", "kind": "LongKeyword" }
+  ],
+  "shapes": {
+    "root":       { "sequence": [{ "repeat": "statement" }] },
+    "statement":  { "sequence": ["expression", "EndCommand"] },
+    "expression": { "sequence": ["Identifier"] }
+  }
+})";
+
+// Every (lead byte, length) pair `kProbeIndexConfig` declares — the GROUND
+// TRUTH the index is compared against, written out by hand rather than derived
+// from the same table the index was, so the two cannot agree by sharing a bug.
+[[nodiscard]] std::vector<std::uint32_t> expectedProbeRow(unsigned char lead) {
+    switch (lead) {
+        case ' ':  return {1};
+        case '+':  return {2, 1};        // "+", "++", "+=" -> two lengths
+        case '<':  return {3, 1};        // "<", "<<="      -> NO length 2
+        case ';':  return {1};
+        case '=':  return {1};
+        case 'i':  return {3, 2};        // "int", "if"/"in" -> deduped
+        case '_':  return {24};          // "__builtin_very_long_name"
+        default:   return {};
+    }
+}
+
+} // namespace
+
+TEST(GrammarSchemaProbeIndex, RowsAreExactForEveryLeadByteAndEveryLength) {
+    auto result = GrammarSchema::loadFromText(kProbeIndexConfig);
+    ASSERT_TRUE(result.has_value()) << "loadFromText failed: "
+        << (result.error().empty() ? "<no diagnostics>" : result.error()[0].message);
+    auto schema = *result;
+
+    // ★ ALL 256 ROWS, not the seven interesting ones. A row that INVENTS a
+    // length only costs time, but a row that OMITS one silently stops the
+    // tokenizer matching that lexeme — a wrong parse, not a parse error — so
+    // the check has to be total.
+    std::size_t total = 0;
+    for (int b = 0; b < 256; ++b) {
+        auto const lead = static_cast<unsigned char>(b);
+        auto const want = expectedProbeRow(lead);
+        auto const got  = schema->lexemeLengthsForLeadByte(lead);
+        ASSERT_EQ(got.size(), want.size())
+            << "row for byte 0x" << std::hex << b << std::dec
+            << " has the wrong number of probe lengths";
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            EXPECT_EQ(got[i], want[i])
+                << "row for byte 0x" << std::hex << b << std::dec
+                << " entry " << i << " (rows are longest-first)";
+        }
+        total += want.size();
+    }
+    EXPECT_EQ(schema->lexemeProbeCount(), total);
+    EXPECT_EQ(schema->maxLexemeLength(), 24u);
+
+    // The whole point, stated as a number: the unindexed scan asked about
+    // every length at every lead byte.
+    EXPECT_LT(schema->lexemeProbeCount(), 256u * schema->maxLexemeLength());
+}
+
+TEST(GrammarSchemaProbeIndex, RowsAreLongestFirstAndWithinTheDeclaredBound) {
+    auto schema = dss::test_support::shippedSchemaOrThrow("c");
+    ASSERT_GT(schema->maxLexemeLength(), 0u);
+
+    std::size_t counted = 0;
+    for (int b = 0; b < 256; ++b) {
+        auto const row = schema->lexemeLengthsForLeadByte(static_cast<unsigned char>(b));
+        counted += row.size();
+        for (std::size_t i = 0; i < row.size(); ++i) {
+            EXPECT_GE(row[i], 1u) << "byte 0x" << std::hex << b;
+            EXPECT_LE(row[i], schema->maxLexemeLength())
+                << "byte 0x" << std::hex << b << std::dec
+                << ": a probe length above `maxLexemeLength` would be a length "
+                   "the tokenizer's own window can never reach";
+            // STRICTLY descending — the scan returns the FIRST hit, so an
+            // out-of-order row would return a SHORTER match than the longest
+            // one, which is the classic `<` beating `<<=` miscompile.
+            if (i > 0) EXPECT_GT(row[i - 1], row[i]) << "byte 0x" << std::hex << b;
+        }
+    }
+    EXPECT_EQ(counted, schema->lexemeProbeCount());
+}
+
+TEST(GrammarSchemaProbeIndex, ShippedCScanIsAnOrderOfMagnitudeShorterThanUnindexed) {
+    auto schema = dss::test_support::shippedSchemaOrThrow("c");
+
+    // ★ THE LOOKUP-COUNT PIN, and deliberately not a timing one. Before the
+    // index, a longest-match scan asked the table about EVERY length at EVERY
+    // lead byte: `256 * maxLexemeLength` lookups, which for the shipped `c`
+    // grammar is 256 * 28 = 7168 (28 because KEYWORDS share the lexeme table
+    // with punctuation and `__builtin_types_compatible_p` is 28 bytes).
+    // `lexemeProbeCount()` is what the same scan asks now: ✔MEASURED 105.
+    //
+    // The bound is stated with slack rather than as `== 105` on purpose — a
+    // lane adding one keyword with a new (lead, length) pair moves 105 and
+    // must not redden this.
+    //
+    // ⚠ THIS BOUND CATCHES EXACTLY ONE DEGRADATION: an index that stopped
+    // filtering by lead byte, which scores the full 7168. It does NOT catch a
+    // WEAKER-BUT-STILL-FILTERING index — one giving every length from 1 to
+    // that byte's longest key scores ✔MEASURED 197, comfortably inside the
+    // bound. That design is caught by
+    // `RowsAreExactForEveryLeadByteAndEveryLength` instead, which asserts the
+    // `<` row is {3, 1} with NO length 2, and no bound on a total can do that
+    // job. Two tests, two failure modes, deliberately not one.
+    const std::size_t unindexed = 256u * schema->maxLexemeLength();
+    EXPECT_GT(unindexed, 0u);
+    EXPECT_LT(schema->lexemeProbeCount() * 10u, unindexed)
+        << "the probe index stopped filtering: " << schema->lexemeProbeCount()
+        << " lookups per lead-byte sweep against an unindexed " << unindexed;
+}
+
+TEST(GrammarSchemaProbeIndex, ModeRowsComeFromThatModesOwnTableNotAGlobalUnion) {
+    auto schema = dss::test_support::shippedSchemaOrThrow("c");
+
+    // `directive` overrides exactly ONE lexeme, `include` (7 bytes). A GLOBAL
+    // UNION index would have been conservative-correct and nearly useless
+    // here: the union row for `i` carries every length the global table
+    // declares under `i`, and all but one of them are guaranteed misses in a
+    // one-entry override table. This is the test that would go red if the
+    // per-mode index were ever collapsed into a union.
+    auto const directive = schema->findLexerMode("directive");
+    ASSERT_TRUE(directive.valid()) << "the shipped `c` grammar lost its "
+                                     "`directive` lexer mode";
+    auto const iRow = schema->lexemeLengthsForLeadByteInMode(directive, 'i');
+    ASSERT_EQ(iRow.size(), 1u) << "the `directive` override table declares one "
+                                  "key; its row must have one length";
+    EXPECT_EQ(iRow[0], 7u);
+    EXPECT_LT(iRow.size(), schema->lexemeLengthsForLeadByte('i').size())
+        << "the mode row is no shorter than the global row, which is what a "
+           "union index would produce";
+
+    // Every OTHER lead byte in that mode declares nothing at all, so a scan
+    // there does no work before falling back to the global table.
+    for (int b = 0; b < 256; ++b) {
+        if (b == 'i') continue;
+        EXPECT_TRUE(schema->lexemeLengthsForLeadByteInMode(
+                        directive, static_cast<unsigned char>(b)).empty())
+            << "byte 0x" << std::hex << b;
+    }
+
+    // `header-context` overrides `<` only — a 1-byte key whose GLOBAL row
+    // carries three lengths (`<`, `<<`/`<=`, `<<=`).
+    auto const headerCtx = schema->findLexerMode("header-context");
+    ASSERT_TRUE(headerCtx.valid());
+    auto const ltRow = schema->lexemeLengthsForLeadByteInMode(headerCtx, '<');
+    ASSERT_EQ(ltRow.size(), 1u);
+    EXPECT_EQ(ltRow[0], 1u);
+    EXPECT_GT(schema->lexemeLengthsForLeadByte('<').size(), ltRow.size());
+}
+
+TEST(GrammarSchemaProbeIndex, AByteNoDeclaredKeyStartsWithHasAnEmptyRow) {
+    auto schema = dss::test_support::shippedSchemaOrThrow("c");
+
+    // The scan's cheapest possible outcome, and the one that used to cost a
+    // full `maxLexemeLength` sweep of guaranteed misses. `@` and `` ` `` are
+    // not in C's lexical alphabet at all; the tokenizer's illegal-character
+    // path is what picks them up, and it must keep doing so — see
+    // `Tokenizer.IllegalCharEmitsErrorTokenAndContinues`.
+    EXPECT_TRUE(schema->lexemeLengthsForLeadByte('@').empty());
+    EXPECT_TRUE(schema->lexemeLengthsForLeadByte('`').empty());
+
+    // A UTF-8 continuation byte starts no declared key either — the row must
+    // be empty rather than out of range, because `lengthsFor` is indexed by
+    // the raw byte and a signed-char sign extension here would read off the
+    // front of the table.
+    EXPECT_TRUE(schema->lexemeLengthsForLeadByte(0x80).empty());
+    EXPECT_TRUE(schema->lexemeLengthsForLeadByte(0xFF).empty());
 }

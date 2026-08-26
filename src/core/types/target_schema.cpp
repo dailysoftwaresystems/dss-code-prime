@@ -1,8 +1,11 @@
 #include "core/types/target_schema.hpp"
 
+#include "core/crypto/sha256.hpp"                 // crypto::sha256Hex — the memo key
 #include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+#include "core/substrate/phase_timers.hpp"        // the load-config / build-config phases
 #include "core/substrate/relocation_table.hpp"
 #include "core/types/ascii_case.hpp"
+#include "core/types/config_document_memo.hpp"    // the ONE content-addressed schema memo
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -65,6 +68,11 @@ std::string acceptedRelocFormulaList() {
 
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromFile(
     std::filesystem::path const& path) {
+    // `load-config` — see `core/substrate/phase_timers.hpp`. Spans the read,
+    // the digest, the memo lookup and (miss only) the nested `build-config`.
+    substrate::PhaseTimers::Scope const loadScope{
+        substrate::CompilePhase::LoadConfig};
+
     // THE ONE CHECKED READ (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
     // A failed read never reaches `loadFromText`: a truncated document reported
     // as a parse error points the reader at the config's CONTENTS when the fault
@@ -75,7 +83,56 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromFile(
             {DiagnosticCode::C_MissingField, DiagnosticSeverity::Error,
              path.string(), std::move(text).error().message}});
     }
-    return loadFromText(*std::move(text), path.string());
+
+    // ── THE CONTENT-ADDRESSED MEMO, SECOND FAMILY ─────────────────────────
+    // D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS.
+    // ✔MEASURED 2026-08-25 (cycle P35), Windows Debug, `int main(void){return
+    // 0;}`: TWO loads of the 345 KB `x86_64.target.json` cost 60 ms — 11% of a
+    // 571 ms process, for a document that had already been built once. The
+    // key is the SHA-256 of the bytes just read, so a stale hit is not a policy
+    // question but a structural impossibility: an entry is reachable only from
+    // the bytes that produced it. See `config_document_memo.hpp`.
+    //
+    // ★ THE DEPENDENCY LEDGER IS EMPTY HERE, AND THAT IS A MEASURED FACT RATHER
+    // THAN AN OMISSION. A `.lang.json` may fold another document into its build
+    // (`languageReferences`), which is why the grammar family records one. ✔The
+    // target loader reads NO file at all: `target_schema_json.cpp` contains no
+    // `readFileChecked`, no `ifstream`, and does not include `<filesystem>`, so
+    // a built `TargetSchema` is a pure function of this document's own bytes and
+    // its digest identifies it completely. Should that loader ever resolve a
+    // referenced document, this ledger MUST grow the same entries the grammar
+    // loader records, or the memo would serve a schema built over a superseded
+    // fragment.
+    //
+    // ⓘ `loadFromText` digests these same bytes AGAIN on the MISS path, because
+    // the digest it retains for `contentDigest()` is computed inside
+    // `target_schema_json.cpp`. 🧠DERIVED from the ✔MEASURED Debug digest rate
+    // (30 ms for 2,068,338 bytes = 14.5 ns/byte, cycle P35): ~5 ms for the
+    // 345 KB `x86_64.target.json`, paid ONCE per distinct target document per
+    // process, against the 60 ms the memo removes. It is a real cost and it is
+    // bounded to the cold path; folding the memo INTO that loader (as the
+    // grammar family does) would remove it and would also cover the
+    // inline-text route this file cannot reach.
+    std::string const label  = path.string();
+    std::string       digest = crypto::sha256Hex(*text);
+    if (auto hit = detail::ConfigDocumentMemo<TargetSchema>::lookup(label, digest)) {
+        return hit;
+    }
+
+    // `build-config` — DEFINED as the work a memo hit skips.
+    auto schema = [&] {
+        substrate::PhaseTimers::Scope const buildScope{
+            substrate::CompilePhase::BuildConfig};
+        return loadFromText(*text, label);
+    }();
+    // ⚠ Stored only on the SUCCESS path — a failed load produced diagnostics and
+    // no schema, and the loader's own refusal already reports it every time.
+    if (schema) {
+        detail::ConfigDocumentMemo<TargetSchema>::store(
+            label, std::move(digest),
+            std::vector<detail::ConfigDocumentDependency>{}, *schema);
+    }
+    return schema;
 }
 
 LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadShipped(

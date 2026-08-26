@@ -1,7 +1,10 @@
 #include "link/object_format_schema.hpp"
 
+#include "core/crypto/sha256.hpp"                 // crypto::sha256Hex — the memo key
 #include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+#include "core/substrate/phase_timers.hpp"        // the load-config / build-config phases
 #include "core/substrate/relocation_table.hpp"
+#include "core/types/config_document_memo.hpp"    // the ONE content-addressed schema memo
 #include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList — the ONE closed-set renderer
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -96,6 +99,11 @@ namespace dss {
 
 LoadResult<std::shared_ptr<ObjectFormatSchema>>
 ObjectFormatSchema::loadFromFile(std::filesystem::path const& path) {
+    // `load-config` — see `core/substrate/phase_timers.hpp`. Spans the read,
+    // the digest, the memo lookup and (miss only) the nested `build-config`.
+    substrate::PhaseTimers::Scope const loadScope{
+        substrate::CompilePhase::LoadConfig};
+
     // THE ONE CHECKED READ (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
     // `.format.json` is the MOST-read shipped document class in the tree, so a
     // torn read here is the one most likely to be met in the field — and it must
@@ -106,7 +114,50 @@ ObjectFormatSchema::loadFromFile(std::filesystem::path const& path) {
             {DiagnosticCode::C_MissingField, DiagnosticSeverity::Error,
              path.string(), std::move(text).error().message}});
     }
-    return loadFromText(*std::move(text), path.string());
+
+    // ── THE CONTENT-ADDRESSED MEMO, THIRD FAMILY ──────────────────────────
+    // D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS.
+    // `.format.json` is the most-read shipped document class in the tree — ✔3
+    // loads for a one-line C compile (MEASURED 2026-08-25, cycle P35, Windows
+    // Debug, 7 ms) and one per declared sibling flavour on a link — so it is
+    // also the family that repeats itself most across a multi-target run.
+    // The key is the SHA-256 of the bytes just read; see
+    // `config_document_memo.hpp` for why that makes a stale hit structurally
+    // impossible rather than a policy to get right.
+    //
+    // ★ THE DEPENDENCY LEDGER IS EMPTY HERE FOR THE SAME MEASURED REASON AS THE
+    // TARGET FAMILY: ✔`object_format_schema_json.cpp` reads no file — no
+    // `readFileChecked`, no `ifstream`, no `<filesystem>` — so a built schema is
+    // a pure function of this document's own bytes. Sibling FLAVOURS are
+    // resolved by the caller through `loadShipped`, each one its own load with
+    // its own digest, so nothing is folded in behind this document's back.
+    //
+    // ⓘ The miss path digests these bytes twice (once here for the key, once
+    // inside `loadFromText` for `contentDigest()`) — bounded to the cold path,
+    // and 🧠DERIVED from the ✔MEASURED Debug digest rate (14.5 ns/byte) at well
+    // under a millisecond for a 20–46 KB format document; the same note on the
+    // target family carries the full reasoning.
+    std::string const label  = path.string();
+    std::string       digest = crypto::sha256Hex(*text);
+    if (auto hit =
+            detail::ConfigDocumentMemo<ObjectFormatSchema>::lookup(label, digest)) {
+        return hit;
+    }
+
+    // `build-config` — DEFINED as the work a memo hit skips.
+    auto schema = [&] {
+        substrate::PhaseTimers::Scope const buildScope{
+            substrate::CompilePhase::BuildConfig};
+        return loadFromText(*text, label);
+    }();
+    // ⚠ Stored only on the SUCCESS path — a failed load produced diagnostics and
+    // no schema, and the loader's own refusal already reports it every time.
+    if (schema) {
+        detail::ConfigDocumentMemo<ObjectFormatSchema>::store(
+            label, std::move(digest),
+            std::vector<detail::ConfigDocumentDependency>{}, *schema);
+    }
+    return schema;
 }
 
 LoadResult<std::shared_ptr<ObjectFormatSchema>>

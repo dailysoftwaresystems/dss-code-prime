@@ -117,6 +117,64 @@ elfHeaderVerbList(std::array<ElfHeaderVerb, N> const& rows,
         sep);
 }
 
+// ── `Elf64_Ehdr` geometry the BYTE PROBE reads (gABI Ch. 4, Fig. 4-3) ─────
+//
+// Offsets only, for the four bytes of magic, the two `e_ident` bytes that
+// declare how the rest of the file is spelled, and `e_type`. The probe reads
+// nothing else, so nothing else is declared here.
+//
+// ★ THE OFFSETS ARE THE SAME IN ELF32 AND ELF64 — that is a property of the
+// format, not an assumption: `e_ident[16]` is fixed-size and `e_type` is the
+// first half-word after it in both classes. The probe can therefore decide
+// `e_type` on a file whose class it has not yet accepted, which is what lets
+// it reject an ELF32 object by CLASS rather than by mis-reading it.
+constexpr std::size_t kElfEiClassOff = 4;   // e_ident[EI_CLASS]
+constexpr std::size_t kElfEiDataOff  = 5;   // e_ident[EI_DATA]
+constexpr std::size_t kElfETypeOff   = 16;  // e_type (half-word)
+
+// The EI_DATA and e_type wire values, PROJECTED rather than retyped. `lsb`/
+// `msb` come from the same `kElfDataEncodingRows` the loader resolves
+// `elf.data` through, and ET_REL from `ElfObjectType`, whose enumerators ARE
+// the gABI's `ET_*` values (see its declaration in object_format_schema.hpp).
+// Spelling `1` and `2` here would make this file a SECOND owner of both
+// facts; projecting them means a renamed row breaks the build (the `.value()`
+// on a disengaged optional is not a constant expression) instead of silently
+// leaving the probe reading the old number.
+constexpr std::uint8_t kElfData2Lsb =
+    elfHeaderVerbValue(kElfDataEncodingRows, "lsb").value();
+constexpr std::uint8_t kElfData2Msb =
+    elfHeaderVerbValue(kElfDataEncodingRows, "msb").value();
+constexpr std::uint16_t kElfEtRel = static_cast<std::uint16_t>(ElfObjectType::Rel);
+
+// Bounds-checked half-word read in the FILE's own declared byte order.
+//
+// ★ LOCAL, NOT `ffi/binary_readers/reader_common.hpp`'s `readU16`, for two
+// independent reasons and the first one is structural: `ffi` depends UP on
+// `link` (`ffi/ingest.hpp`, `ffi/abi/abi_catalog.hpp` and
+// `ffi/mangling/c_mangle.hpp` all include `link/object_format_schema.hpp`),
+// so a `link` -> `ffi` include closes a dependency CYCLE. That is the same
+// call `elf_object_reader.cpp` records at its own `kEhdrSz` block, and
+// `coff_object_reader.cpp` at its `kFileHeaderSz` block; this is the third
+// site, not a new opinion. The second reason: that helper indexes `b[off]`
+// UNCHECKED — correct for a reader that has already validated its buffer,
+// wrong for a `noexcept` predicate handed an arbitrary file.
+//
+// `msb` is a property of the FILE (its own `e_ident[EI_DATA]`), never of the
+// host: DSS has a live big-endian s390x leg, so "read it the way the machine
+// reads it" is a bug that only shows up on the leg nobody is watching.
+[[nodiscard]] constexpr std::optional<std::uint16_t>
+elfProbeReadU16(std::span<std::uint8_t const> b, std::size_t off,
+                bool msb) noexcept {
+    // Written as a SUBTRACTION on the size rather than `off + 2 > b.size()`
+    // so it stays correct for an `off` near `SIZE_MAX`, which a future caller
+    // could compute even though today's two call sites pass constants.
+    if (b.size() < 2u || off > b.size() - 2u) return std::nullopt;
+    auto const first  = static_cast<std::uint16_t>(b[off + 0]);
+    auto const second = static_cast<std::uint16_t>(b[off + 1]);
+    return static_cast<std::uint16_t>(
+        msb ? (first << 8) | second : (second << 8) | first);
+}
+
 class ElfBackend final : public ObjectFormatBackend {
 public:
     [[nodiscard]] std::string_view configName() const noexcept override {
@@ -192,6 +250,65 @@ public:
     [[nodiscard]] bool isRelocatableMember(
             detail::ObjectFormatData const& d) const noexcept override {
         return d.elf.objectType == ElfObjectType::Rel;
+    }
+
+    // ★★ THE BYTE PROBE. Three conditions, each DEFINITE:
+    //   (1) the file opens with `0x7F 'E' 'L' 'F'` — the gABI magic;
+    //   (2) its `e_ident[EI_CLASS]` and `e_ident[EI_DATA]` are the ones THIS
+    //       schema declares (`elf.class` / `elf.data`); and
+    //   (3) `e_type` is ET_REL.
+    //
+    // ★ WHY (2) IS PART OF THE ANSWER AND NOT PEDANTRY. The predicate's
+    // question is "could I have WRITTEN this", and `elf.cpp`'s header writer
+    // emits `fileClass` and `dataEncoding` straight out of the schema — so an
+    // ELF32 or big-endian object is a file this format demonstrably did not
+    // produce and cannot read back (`elf::readRelocatableObject` refuses both
+    // by name). Accepting it here would route it to a reader whose next act
+    // is to refuse it, and the operator would get a linker refusal about a
+    // file the driver claimed to recognize.
+    //
+    // ★ AND WHY (3) IS READ THROUGH THE FILE'S OWN EI_DATA. `e_type` is a
+    // half-word, so its bytes mean opposite things under the two encodings —
+    // ET_REL is `01 00` little-endian and `00 01` big-endian. Reading it in
+    // HOST order works on every host DSS is usually built on and silently
+    // inverts on the s390x leg. The encoding byte is validated first (only
+    // ELFDATA2LSB and ELFDATA2MSB are defined; anything else is not an ELF
+    // header this probe will decode), then used as the lens.
+    //
+    // ⚠ `e_machine` IS DELIBERATELY NOT CHECKED, and the omission is the
+    // difference between "is this MY family's object" and "will this link".
+    // A wrong-arch ET_REL is still a relocatable object, and handing it to
+    // the linker gets the operator the linker's arch-mismatch diagnostic —
+    // which names the two machines — instead of the tokenizer's `illegal
+    // character 0x7f`. Class and encoding are checked because they decide how
+    // the file is SPELLED (a reader cannot even decode the wrong-class
+    // header's tables); the machine only decides whether the link succeeds,
+    // and that is not this predicate's question.
+    //
+    // ⓘ FAIL-CLOSED ON A HAND-BUILT SCHEMA falls out with no extra arm: the
+    // validation-bypassing `ObjectFormatSchema{ObjectFormatData}` constructor
+    // leaves `fileClass`/`dataEncoding` at 0, and no real ELF file carries 0
+    // in either byte, so such a schema recognizes nothing.
+    [[nodiscard]] bool looksLikeRelocatableObject(
+            detail::ObjectFormatData const& d,
+            std::span<std::uint8_t const>   bytes) const noexcept override {
+        // The magic plus the two identity bytes occupy `[0, 6)`. Everything
+        // shorter is answered here, so the reads below are inside the buffer
+        // by construction and `elfProbeReadU16` re-checks the one after it.
+        if (bytes.size() <= kElfEiDataOff) return false;
+        if (bytes[0] != 0x7Fu || bytes[1] != 'E'
+         || bytes[2] != 'L'   || bytes[3] != 'F') {
+            return false;
+        }
+
+        std::uint8_t const eiData = bytes[kElfEiDataOff];
+        if (eiData != kElfData2Lsb && eiData != kElfData2Msb) return false;
+        if (bytes[kElfEiClassOff] != d.elf.fileClass) return false;
+        if (eiData != d.elf.dataEncoding) return false;
+
+        auto const eType =
+            elfProbeReadU16(bytes, kElfETypeOff, eiData == kElfData2Msb);
+        return eType.has_value() && *eType == kElfEtRel;
     }
 
     // ELF section headers carry a single name; the two-level (segment,

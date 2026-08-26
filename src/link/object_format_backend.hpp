@@ -245,6 +245,49 @@ public:
     [[nodiscard]] virtual bool
     isRelocatableMember(detail::ObjectFormatData const& d) const noexcept = 0;
 
+    // Do these RAW BYTES look like a relocatable object file this schema
+    // could have written? The same species of question as the four
+    // predicates above — *do I recognize my own relocatable-object shape* —
+    // asked of a byte span rather than of the schema, because the caller has
+    // a FILE and no other evidence about it.
+    //
+    // ★ WHY A CALLER NEEDS IT. A `.o` / `.obj` named as a compile input is
+    // handed to the tokenizer, which reports `illegal character 0x7f` — the
+    // first byte of the ELF magic, surfaced as if the author had typed it.
+    // Routing that file to the LINKER instead requires deciding what it is,
+    // and a driver cannot decide that without re-acquiring exactly the
+    // format identity this seam exists to keep out of the substrate. So it
+    // asks the backends, one question, and never learns who answered.
+    //
+    // ★★ DEFINITE, NEVER A GUESS — and that is what makes it a CAPABILITY
+    // query rather than a sniffer. Each implementation checks STRUCTURE
+    // against values THIS schema itself declares (`elf.class` + `elf.data`,
+    // `pe.machine`) plus the format's own object-file discriminator
+    // (`e_type == ET_REL`, `filetype == MH_OBJECT`, a COFF file header with
+    // no optional header). Nothing keys on a file NAME or an extension, and
+    // a backend that ships no relocatable-object reader answers false
+    // unconditionally instead of approximating. A `true` is therefore a fact
+    // about the bytes, and the caller may route on it.
+    //
+    // ⚠ IT DELIBERATELY DOES NOT ASK WHETHER THIS SCHEMA IS ITSELF
+    // RELOCATABLE. `isRelocatableMember()` above answers that, about the
+    // OUTPUT; this answers about an INPUT. The two must not be folded: a
+    // driver holds the format it is PRODUCING — commonly an image — and the
+    // `.o` it must recognize is an INPUT to that link. Gating this on the
+    // schema's own flavor would answer false for exactly the case the
+    // predicate exists to serve.
+    //
+    // ⚠ THE SPAN IS HOSTILE INPUT AND THIS METHOD IS `noexcept`. `bytes` is
+    // whatever the file held — empty, three bytes, a truncated header, or a
+    // deliberate near-miss — so every implementation bounds-checks every
+    // read and answers false rather than throwing or reading past the end.
+    // It emits no diagnostic either: it is asked BEFORE anybody has decided
+    // what the file is, so "no" is an ordinary answer here, not a failure.
+    [[nodiscard]] virtual bool
+    looksLikeRelocatableObject(detail::ObjectFormatData const& d,
+                               std::span<std::uint8_t const>   bytes)
+        const noexcept = 0;
+
     // Does this backend use the two-level (segment, section) naming, i.e. is
     // a non-empty `sections[].segment` MEANINGFUL here? Replaces
     // `if (kind == Elf || kind == Pe)` guarding the "segment must be empty"

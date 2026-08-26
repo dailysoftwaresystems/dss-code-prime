@@ -90,7 +90,11 @@ TEST(Reporter, DedupesIdenticalInWindow) {
     for (int i = 0; i < 3; ++i) {
         r.report(makeDiag(DiagnosticCode::P_UnexpectedToken, DiagnosticSeverity::Error, b, 5, 6));
     }
-    EXPECT_EQ(r.all().size(), 1u);
+    // 1 admitted + 1 elision marker (P36, D-DIAG-MAXPERCODE-SILENT-COALESCE).
+    // The COLLAPSE is unchanged and is still the property under test; the two
+    // dropped duplicates are now counted rather than discarded silently.
+    EXPECT_EQ(r.all().size(), 2u);
+    EXPECT_EQ(r.elisionFor(DiagnosticCode::P_UnexpectedToken).deduped, 2u);
 }
 
 TEST(Reporter, DistinctSpansAreNotDeduped) {
@@ -116,7 +120,11 @@ TEST(Reporter, RuleContextIsPartOfDedupKey) {
     r.report(d1);
     r.report(d2);
     r.report(d3);
-    EXPECT_EQ(r.all().size(), 2u);
+    // 2 admitted + 1 elision marker for the single deduped d3 (P36).
+    EXPECT_EQ(r.all().size(), 3u);
+    EXPECT_EQ(r.elisionFor(DiagnosticCode::P_PrematureEndOfInput).deduped, 1u)
+        << "exactly ONE of the three was a true duplicate; if this reads 2 the "
+           "ruleContext has fallen out of the dedup key";
 }
 
 TEST(Reporter, ActualIsPartOfDedupKey) {
@@ -132,7 +140,17 @@ TEST(Reporter, ActualIsPartOfDedupKey) {
     EXPECT_EQ(r.all().size(), 2u);
 }
 
-TEST(Reporter, PerCodeCapCoalescesSilently) {
+// ⚠ RENAMED 2026-08-26 (P36, D-DIAG-MAXPERCODE-SILENT-COALESCE). This test was
+// `PerCodeCapCoalescesSilently`, and it was PINNING THE DEFECT: its name
+// asserted the silence as a property, and its `size() == 3` was the shape a
+// reader would have had to break in order to fix the row. Left as it was, it
+// would have made the fix look like a regression.
+//
+// ★ A test that pins a defect is not neutral — it is an argument for keeping
+// it. The coalescing behaviour it really cared about (only `maxPerCode` of one
+// code are ADMITTED) is still pinned below; what changed is that the reporter
+// now also says so, and the test now says that too.
+TEST(Reporter, PerCodeCapCoalescesAndSaysSo) {
     DiagnosticReporter::Config cfg;
     cfg.maxPerCode = 3;
     DiagnosticReporter r{cfg};
@@ -142,8 +160,14 @@ TEST(Reporter, PerCodeCapCoalescesSilently) {
         r.report(makeDiag(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error,
                           b, i * 10, i * 10 + 1));
     }
-    EXPECT_EQ(r.all().size(), 3u);
+    // 3 admitted + 1 elision marker.
+    EXPECT_EQ(r.all().size(), 4u);
+    // ★ THE MARKER IS `Info`, SO IT MUST NOT INFLATE THE ERROR COUNT. This is
+    // the assertion that would catch a severity regression from the outside:
+    // errorCount stays 3 even though all() grew to 4.
     EXPECT_EQ(r.errorCount(), 3u);
+    EXPECT_TRUE(r.anyCountIsAFloor());
+    EXPECT_EQ(r.elisionFor(DiagnosticCode::P_UnknownToken).coalesced, 7u);
 }
 
 TEST(Reporter, ContextPrefixDoesNotPolluteDedupKey) {
@@ -177,10 +201,17 @@ TEST(Reporter, ContextPrefixDoesNotPolluteDedupKey) {
     r.report(std::move(d1));
     r.report(std::move(d2));
 
-    EXPECT_EQ(r.all().size(), 1u)
+    // 1 admitted + 1 elision marker (P36): the collapse is the property under
+    // test and it still happens; what changed is that the reporter now RECORDS
+    // the dropped duplicate instead of discarding it in silence. The dedup
+    // ledger below is the sharper assertion — it says the second report was
+    // collapsed rather than merely that one diagnostic survived.
+    EXPECT_EQ(r.all().size(), 2u)
         << "structurally-identical diagnostics with different "
            "contextPrefix must collapse via dedup; pre-fix this leaked "
            "to size==2 because the prefix was in `actual`";
+    EXPECT_EQ(r.elisionFor(DiagnosticCode::P_UnexpectedToken).deduped, 1u)
+        << "the collapse must be RECORDED, not silent";
 }
 
 TEST(Reporter, GlobalCapEmitsMarkerAndStops) {
@@ -1187,4 +1218,215 @@ TEST(DiagnosticReporterRender, ProseOnlyMessageHasNoGotPrefixButAContrastKeepsIt
     EXPECT_NE(renderedContrast.find("got '}'"), std::string::npos)
         << "the contrast form must KEEP its `got` half; got:\n"
         << renderedContrast;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// D-DIAG-MAXPERCODE-SILENT-COALESCE — the per-code elision marker.
+//
+// The global cap has always announced itself with `P_TooManyDiagnostics`. The
+// two gates that actually fire in an ordinary build — the per-code cap and the
+// recent-duplicate window — did not, and ✔MEASURED, `maxPerCode` is checked
+// BEFORE `maxDiagnostics`, so an ordinary tier is bounded at
+// (distinct codes x maxPerCode) and never reaches the global cap at all. The
+// cap that announced itself was the one that essentially never fired.
+//
+// These pins are written so that DELETING the marker reds them, and so that
+// weakening it in any single respect (severity, once-per-code, counting the
+// dedup route, exempting unsuppressable traffic) reds a DIFFERENT one.
+// ═════════════════════════════════════════════════════════════════════════
+namespace {
+
+// A suppressable, ordinary code — deliberately NOT an unsuppressable one, so
+// the volume gates actually apply.
+dss::ParseDiagnostic elidableDiag(std::size_t nth) {
+    dss::ParseDiagnostic d;
+    d.code     = dss::DiagnosticCode::P_UnknownToken;
+    d.severity = dss::DiagnosticSeverity::Warning;
+    d.buffer   = dss::BufferId{1};
+    // DISTINCT spans so the dedup window does not collapse these — this helper
+    // exercises the PER-CODE CAP only. A helper that accidentally tripped both
+    // gates would make every count below untraceable to a gate.
+    d.span     = dss::SourceSpan::of(static_cast<dss::ByteOffset>(nth),
+                                     static_cast<dss::ByteOffset>(nth + 1));
+    d.actual   = "tok" + std::to_string(nth);
+    return d;
+}
+
+const dss::ParseDiagnostic* findElisionMarker(dss::DiagnosticReporter const& r) {
+    for (auto const& d : r.all()) {
+        if (d.code == dss::DiagnosticCode::P_DiagnosticsElided) return &d;
+    }
+    return nullptr;
+}
+
+} // namespace
+
+TEST(ReporterElision, PerCodeCapMintsAMarkerNamingCodeCapAndCount) {
+    dss::DiagnosticReporter::Config cfg;
+    cfg.maxPerCode  = 3;
+    cfg.dedupWindow = 0;   // isolate the per-code gate
+    dss::DiagnosticReporter r{cfg};
+    for (std::size_t i = 0; i < 10; ++i) r.report(elidableDiag(i));
+
+    // 3 admitted + 1 marker. The marker occupies a slot, deliberately: it is a
+    // real diagnostic so it survives every merge and render path unchanged.
+    EXPECT_EQ(r.all().size(), 4u);
+
+    auto const* marker = findElisionMarker(r);
+    ASSERT_NE(marker, nullptr)
+        << "the per-code cap must announce itself; this is the whole row";
+
+    // The facts the marker owes a reader who does NOT already know the
+    // diagnostic engine has caps.
+    EXPECT_NE(marker->actual.find("P0003"), std::string::npos)
+        << "must name the ELIDED code in its rendered spelling: " << marker->actual;
+    EXPECT_NE(marker->actual.find("P_UnknownToken"), std::string::npos)
+        << marker->actual;
+    EXPECT_NE(marker->actual.find("7"), std::string::npos)
+        << "7 of 10 were coalesced past a cap of 3: " << marker->actual;
+    EXPECT_NE(marker->actual.find("--max-per-code"), std::string::npos)
+        << "a notice whose remedy an operator cannot type is barely better "
+           "than silence: " << marker->actual;
+    EXPECT_NE(marker->actual.find("FLOOR"), std::string::npos)
+        << "the marker must say the surviving count is a floor: " << marker->actual;
+
+    // The ledger, as DATA — limb (C). A census must be able to ask this
+    // without regex-sniffing for round numbers.
+    EXPECT_TRUE(r.anyCountIsAFloor());
+    EXPECT_EQ(r.elisionFor(dss::DiagnosticCode::P_UnknownToken).coalesced, 7u);
+    EXPECT_EQ(r.elisionFor(dss::DiagnosticCode::P_UnknownToken).deduped, 0u);
+}
+
+TEST(ReporterElision, ExactlyAtTheCapSaysNothing) {
+    // The strict red-on-disable partner of the test above: a marker that
+    // appears when nothing was elided would be noise, and would also make the
+    // previous test pass for the wrong reason.
+    dss::DiagnosticReporter::Config cfg;
+    cfg.maxPerCode  = 3;
+    cfg.dedupWindow = 0;
+    dss::DiagnosticReporter r{cfg};
+    for (std::size_t i = 0; i < 3; ++i) r.report(elidableDiag(i));
+
+    EXPECT_EQ(r.all().size(), 3u);
+    EXPECT_EQ(findElisionMarker(r), nullptr)
+        << "nothing was elided, so nothing must be announced";
+    EXPECT_FALSE(r.anyCountIsAFloor());
+}
+
+TEST(ReporterElision, MarkerIsMintedOncePerCodeNotOncePerDrop) {
+    // ★ The cure must not reproduce the noise the cap exists to prevent.
+    dss::DiagnosticReporter::Config cfg;
+    cfg.maxPerCode  = 1;
+    cfg.dedupWindow = 0;
+    dss::DiagnosticReporter r{cfg};
+    for (std::size_t i = 0; i < 500; ++i) r.report(elidableDiag(i));
+
+    int markers = 0;
+    for (auto const& d : r.all()) {
+        if (d.code == dss::DiagnosticCode::P_DiagnosticsElided) ++markers;
+    }
+    EXPECT_EQ(markers, 1) << "499 drops must yield ONE marker, rewritten in "
+                             "place, not 499 markers";
+    EXPECT_EQ(r.all().size(), 2u);
+    EXPECT_EQ(r.elisionFor(dss::DiagnosticCode::P_UnknownToken).coalesced, 499u);
+}
+
+TEST(ReporterElision, DedupWindowDropsAreCountedIntoTheSameMarker) {
+    // (P1) of the row: `dedupWindow` is a SECOND unannounced dropper in the
+    // same function, and it would have become this row's successor the moment
+    // the per-code cap was fixed. One mechanism covers both — and the marker
+    // reports them SEPARATELY, because "a distinct occurrence you did not see"
+    // and "a repeat of something on screen" mean different things.
+    dss::DiagnosticReporter::Config cfg;
+    cfg.maxPerCode  = 1000;   // out of the way: isolate the dedup gate
+    cfg.dedupWindow = 4;
+    dss::DiagnosticReporter r{cfg};
+    // IDENTICAL diagnostics — same code, buffer, span, actual.
+    for (int i = 0; i < 6; ++i) r.report(elidableDiag(0));
+
+    auto const* marker = findElisionMarker(r);
+    ASSERT_NE(marker, nullptr) << "the dedup window must announce itself too";
+    const auto led = r.elisionFor(dss::DiagnosticCode::P_UnknownToken);
+    EXPECT_EQ(led.coalesced, 0u) << "the per-code cap was not the gate here";
+    EXPECT_EQ(led.deduped, 5u);
+    EXPECT_EQ(led.total(), 5u);
+}
+
+TEST(ReporterElision, MarkerIsInfoAndDoesNotFlipHasErrors) {
+    // ⚠ SEVERITY IS A CONTRACT, not a detail. At Error this marker would fail a
+    // build whose only sin was emitting 51 warnings of one kind; at Warning,
+    // `--warnings-as-errors` would do the same. The elision is a fact ABOUT the
+    // diagnostics, not one more diagnostic.
+    dss::DiagnosticReporter::Config cfg;
+    cfg.maxPerCode  = 1;
+    cfg.dedupWindow = 0;
+    dss::DiagnosticReporter r{cfg};
+    for (std::size_t i = 0; i < 5; ++i) r.report(elidableDiag(i));
+
+    auto const* marker = findElisionMarker(r);
+    ASSERT_NE(marker, nullptr);
+    EXPECT_EQ(marker->severity, dss::DiagnosticSeverity::Info);
+    EXPECT_FALSE(r.hasErrors())
+        << "eliding warnings must not turn a warning-only run into a failing one";
+    EXPECT_EQ(r.errorCount(), 0u);
+}
+
+TEST(ReporterElision, UnsuppressableTrafficIsNeverElidedAndMintsNoMarker) {
+    // ★ PINS (P3): `mustDeliver` returns BEFORE all four volume gates, which is
+    // why `F_ShippedHeaderNotFound`'s counts were TRUE counts while other
+    // figures in the same arc were floors. This pin exists so a future refactor
+    // that accidentally routes unsuppressable codes through the gates REDS,
+    // instead of silently turning those counts into floors too.
+    dss::DiagnosticReporter::Config cfg;
+    cfg.maxPerCode  = 1;
+    cfg.dedupWindow = 4;
+    dss::DiagnosticReporter r{cfg};
+    for (int i = 0; i < 20; ++i) {
+        dss::ParseDiagnostic d;
+        d.code     = dss::DiagnosticCode::I_NotDominated;  // unsuppressable
+        d.severity = dss::DiagnosticSeverity::Error;
+        d.buffer   = dss::BufferId{1};
+        d.span     = dss::SourceSpan::of(0, 1);            // identical: dedup bait
+        d.actual   = "same";
+        r.report(std::move(d));
+    }
+    EXPECT_EQ(r.all().size(), 20u)
+        << "every unsuppressable instance must survive both gates";
+    EXPECT_EQ(findElisionMarker(r), nullptr)
+        << "nothing was elided, so there must be no marker to imply otherwise";
+    EXPECT_FALSE(r.anyCountIsAFloor())
+        << "an unsuppressable code's count is a TRUE count, and the census "
+           "question must answer accordingly";
+}
+
+TEST(ReporterElision, RollbackRestoresTheElisionLedger) {
+    // The ledger holds indices INTO `all_`, which `truncateTo` shrinks — so it
+    // must travel in the Snapshot exactly as `capMarkerIndex` does. Without
+    // this, a speculative parse's marker index stays live after the diagnostics
+    // it indexed are rolled away, and the next elision on that code rewrites
+    // whatever now sits at that index.
+    dss::DiagnosticReporter::Config cfg;
+    cfg.maxPerCode  = 1;
+    cfg.dedupWindow = 0;
+    dss::DiagnosticReporter r{cfg};
+    r.report(elidableDiag(0));
+
+    const auto snap = r.snapshotForRollback();
+    EXPECT_FALSE(r.anyCountIsAFloor());
+
+    for (std::size_t i = 1; i < 6; ++i) r.report(elidableDiag(i));
+    EXPECT_TRUE(r.anyCountIsAFloor());
+    EXPECT_EQ(r.elisionFor(dss::DiagnosticCode::P_UnknownToken).coalesced, 5u);
+
+    r.truncateTo(snap);
+    EXPECT_FALSE(r.anyCountIsAFloor())
+        << "the speculative elisions were rolled away; the ledger must agree";
+    EXPECT_EQ(r.elisionFor(dss::DiagnosticCode::P_UnknownToken).coalesced, 0u);
+
+    // And the reporter must still be USABLE afterwards: re-eliding mints a
+    // fresh marker at a valid index rather than rewriting a stale one.
+    for (std::size_t i = 1; i < 4; ++i) r.report(elidableDiag(i));
+    auto const* marker = findElisionMarker(r);
+    ASSERT_NE(marker, nullptr);
+    EXPECT_EQ(r.elisionFor(dss::DiagnosticCode::P_UnknownToken).coalesced, 3u);
 }

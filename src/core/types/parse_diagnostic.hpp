@@ -280,6 +280,46 @@ enum class DiagnosticCode : std::uint16_t {
     P_MaxSpeculationDepth         = 0x9004,
     P_UncommittedCheckpoint       = 0x9005,
     P_BacktrackFailed             = 0x9006,
+    // P36 (D-DIAG-MAXPERCODE-SILENT-COALESCE): the PER-CODE elision marker —
+    // the sibling `P_TooManyDiagnostics` (0x9001) has always had and this
+    // never did.
+    //
+    // ★★ THE ASYMMETRY THIS CLOSES WAS THE WHOLE BUG. `DiagnosticReporter`
+    // has FOUR gates that drop a diagnostic — `hitCap_`, `dedupWindow`,
+    // `maxPerCode`, `maxDiagnostics`. Only the last one announced itself.
+    // The other two that can fire in an ordinary build (`maxPerCode`,
+    // `dedupWindow`) said NOTHING, and they fire FIRST and FAR more often:
+    // ✔MEASURED, `maxPerCode` is checked BEFORE `maxDiagnostics`, so an
+    // ordinary tier is bounded at (distinct codes x 50) and NEVER reaches the
+    // global cap — meaning the cap that announces itself is the one that
+    // essentially never fires, and the silent one is the one that always does.
+    //
+    // ⚠ WHY A SILENT PER-CODE CAP IS NOT A DISPLAY LIMIT BUT A MEASUREMENT
+    // INVALIDATOR. Once a code saturates, its reported count is a FLOOR
+    // wearing the costume of a total, and the ONLY tell is that the number is
+    // round — a detection method with no false-negative bound, since a code
+    // capped at 50 out of 51 is indistinguishable from one that genuinely
+    // occurred 50 times. Worse, ✔MEASURED on the sqlite corpus: under the cap
+    // three whole MESSAGE CLASSES (`u_char`, `u_short`, `segsz_t`) appeared
+    // NOWHERE in the output, so a reader would not conclude "there are more of
+    // these" but "`u_char` is fine". And worst, a cap makes PROGRESS
+    // unmeasurable, not merely the absolute count: once saturated, fixing a
+    // real defect can leave the number at exactly 50, so a genuine improvement
+    // and a partial regression both render as no change.
+    //
+    // Carries, in its own prose: the elided code's rendered prefix and name,
+    // the per-code cap, how many were coalesced past it, how many were dropped
+    // as recent duplicates, and the flag that raises the cap. Emitted ONCE per
+    // code (rewritten in place as the counts grow, exactly as
+    // `P_TooManyDiagnostics` does) — once per DROP would reproduce the noise
+    // the cap exists to prevent.
+    //
+    // SEVERITY IS DELIBERATELY `Info`, NOT `Error`. This marker states that
+    // output was abbreviated; it is not itself a fault. At Error it would flip
+    // `hasErrors()` and change the exit code of a build whose only sin was
+    // emitting 51 warnings of one kind — turning a volume notice into a build
+    // failure. At Warning it would do the same under `--warnings-as-errors`.
+    P_DiagnosticsElided           = 0x9007,
 
     // ── C0xxx — config loader (see plan §5.12) ──
     C_MissingField                = 0xC001,
@@ -3245,6 +3285,23 @@ enum class DiagnosticCode : std::uint16_t {
     // the same TypeId — that is a POSITION error no type check can read — so it
     // supplements, never replaces, the per-body shim test pins.
     I_CallSignatureMismatch        = 0xA019,
+    // P36 (D-MIR-VERIFIER-STORE-CALLARG-TYPE-BLIND): a MIR `Store`/`AtomicStore`
+    // whose VALUE's type is not the type of the slot it lands in — the pointee of
+    // its address operand — under the ONE value-slot compatibility notion
+    // (`sameSlotType`, src/mir/mir_verifier.cpp) that the call-argument and
+    // call-result rules also use: identical TypeId, `sameRepresentation`, a
+    // `void*` on either side, or a qualifier skin one level down. Nothing looser.
+    // Until this code existed, `checkAtomicAccessLowered` walked every Store and
+    // read ONLY the pointee's atomic qualification, so a wrong `TypeId` on a
+    // stored value passed the verifier SILENTLY — which is how
+    // D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE hid: its `return` form was
+    // diagnosed as I_TerminatorTypeMismatch while the store-shaped form carried
+    // the SAME wrong TypeId with no diagnostic at all, and a hand probe over the
+    // one working site read as proof of a contract that held at one site of seven.
+    // ⚠ ONE NARROWING, stated: a `ptr<void>` pointee makes no type claim (MIR's
+    // spelling for "an address whose pointee is unknown"), so a store through one
+    // is not judged. Interner-gated.
+    I_StoreValueTypeMismatch       = 0xA01A,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //
@@ -3646,6 +3703,33 @@ enum class DiagnosticCode : std::uint16_t {
     //   so a malformed call never silently miscompiles into a wrong-arity
     //   splice (D-OPT7-INLINE-LEGALITY-GATE).
     X_InlineMalformedCallSite         = 0x2008,
+    // P36 (D-OPT-INLINING-FIXPOINT-TRUNCATES-BEFORE-CONVERGING, Lane R): the
+    // schedule interpreter's fixpoint node stopped iterating a pipeline that
+    // had NOT reached a fixed point, because it hit its configured `max`.
+    //
+    // ⚠ NOT the same fact as `X_OptPassSkipped` (0x2007), and the difference is
+    // WHO ACTED: 0x2007 is "a PASS declined on this module because of a feature
+    // carve-out"; this is "the ENGINE stopped iterating a pipeline that had not
+    // finished". Different actor, different remedy.
+    //
+    // ★ WHY IT EXISTS AT ALL, and it is this cycle's archetype exactly: the cap
+    // was previously SILENT, so a truncated optimization was indistinguishable
+    // in the output from a completed one. ✔MEASURED by Lane R: the
+    // program-stage inlining fixpoint does not merely truncate late, it
+    // DIVERGES — splices grow at asymptotically 2x per iteration (1.94, 1.97,
+    // 1.98, 1.996, 1.9964, 1.9990, 1.9995) and at `max=12` the compiler
+    // consumed 27,943 MB and produced no artifact. So the cap is not clipping a
+    // converging process; it is the only bound on code growth in the whole
+    // optimizer, and this code makes its cost visible instead of silent.
+    //
+    // SEVERITY Warning. SUPPRESSABLE, deliberately — see the verdict recorded
+    // beside `kUnsuppressableCodes`' two-prong rule in unsuppressable_codes.cpp
+    // (it fails BOTH prongs: the artifact is correct, merely less optimized,
+    // and the build does not fail). DELIVERY `Capped` (the default): it fires
+    // once per truncated fixpoint and the unit stage runs one pipeline per CU —
+    // 103 on sqlite — so it is exactly the repeated-advisory shape the dedup
+    // window and per-code cap exist to collapse.
+    X_OptFixpointTruncated            = 0x2009,
 
     // ── Linker (renders as `K`) ───────────────────────────────────────
     //
@@ -4606,9 +4690,57 @@ enum class DiagnosticCode : std::uint16_t {
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
 [[nodiscard]] DSS_EXPORT std::string_view diagnosticCodeName(DiagnosticCode c) noexcept;
 
+// What `diagnosticCodeName` returns for a 16-bit value that is not an
+// allocated enumerator. ★ THIS IS THE PROJECT'S ALLOCATION ORACLE, and it is
+// exact rather than approximate: `diagnosticCodeName` is a `default:`-less
+// switch over `DiagnosticCode`, so `-Werror=switch` (CMakeLists.txt) makes
+// every allocated enumerator carry an arm, and therefore
+// `diagnosticCodeName(c) == kUnallocatedDiagnosticCodeName` iff `c` is
+// unallocated. No hand-maintained list can drift from it because there is no
+// hand-maintained list.
+//
+// ⚠ PROMOTED HERE 2026-08-26 (cycle P36, D-DIAG-CODE-PREFIX-DEFAULT-IS-SILENT).
+// It previously lived as a file-local constant in `src/hir/hir_text.cpp`, the
+// single caller that had needed it. An oracle this load-bearing sitting inside
+// an unrelated lowering file meant the next caller either re-spelled the
+// literal `"Unknown"` (a second source of truth for the same fact) or, far more
+// likely, never discovered that an exact allocation test existed at all — which
+// is precisely what happened to `diagnosticCodePrefix`, whose whole defect was
+// guessing at a family it could have simply asked about.
+inline constexpr std::string_view kUnallocatedDiagnosticCodeName = "Unknown";
+
 // Formatted prefix like "P0001" / "C0010" — used by the renderer for the
 // header line ("error[P0001]: ...").
+//
+// ★★ TOTAL OVER THE FULL 16-BIT SPACE, AND DELIBERATELY SO — IT MUST NOT
+// ABORT ON AN UNALLOCATED CODE. `hir_text.cpp`'s `@diag(code N)` handler calls
+// this on a code it has ALREADY determined is unallocated, in order to tell the
+// operator what that code would have rendered as. Making an unallocated family
+// fatal here would convert that clean refusal into a compiler crash on a
+// `.dsshir` input. The fail-loud obligation is discharged by the RENDERING
+// instead: an unallocated family renders under `kUnallocatedFamilyLetter`,
+// which is not a letter, so the result cannot be mistaken for a real code by a
+// reader or by a regex. See `diagnosticCodePrefix`'s definition.
 [[nodiscard]] DSS_EXPORT std::string diagnosticCodePrefix(DiagnosticCode c);
+
+// The character an UNALLOCATED family nibble renders under. Not a letter, so
+// `?3000` can never be misread as a diagnostic code the way `P2002` was.
+// ⚠ Deliberately ASCII and deliberately not alphanumeric: every consumer that
+// scrapes codes out of compiler output keys on `[A-Z][0-9A-F]{4}`, so this
+// value makes an unallocated family INVISIBLE to those scrapers rather than
+// silently mis-attributed to the parser. (`scripts/corpus-census` was
+// mis-attributing the entire X_* optimizer family to the parser for exactly
+// that reason.)
+inline constexpr char kUnallocatedFamilyLetter = '?';
+
+// True iff `c` is an allocated enumerator — the oracle above, as a predicate.
+[[nodiscard]] DSS_EXPORT bool diagnosticCodeIsAllocated(DiagnosticCode c) noexcept;
+
+// The phase letter for a code's family ('P', 'S', 'X', …), or
+// `kUnallocatedFamilyLetter` when the code's high nibble names no family.
+// Exposed so a test can assert the renderer and the family table agree for
+// EVERY allocated code rather than for a hand-listed sample.
+[[nodiscard]] DSS_EXPORT char diagnosticFamilyLetter(DiagnosticCode c) noexcept;
 
 // A secondary location attached to a diagnostic — "matching opener here",
 // "previously declared here", etc. May reference a *different* buffer than

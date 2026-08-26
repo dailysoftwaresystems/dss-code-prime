@@ -1,5 +1,6 @@
 #include "mir/merge/mir_merge.hpp"
 
+#include "core/substrate/phase_timers.hpp"  // the merge-side whole-program verify's `--time` row
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_reintern.hpp"
 #include "link/cross_cu_resolve.hpp"   // resolveCrossCuDefs, CrossCuDef, LinkedSymbolKey
@@ -114,6 +115,12 @@ struct CuSymKeyHash {
 struct MergePlan {
     // Per-CU type-reintern memo (reused across that CU's functions/globals).
     std::vector<std::unordered_map<std::uint32_t, TypeId>> typeRemap;
+    // Cross-CU composite identity, SHARED by every CU and populated from EVERY
+    // source interner before the first reintern -- so a `typedef struct Bitvec
+    // Bitvec;` in one CU and the `struct Bitvec { ... }` in another land on ONE
+    // host TypeId whichever CU the merge walks first
+    // (D-MIR-MERGE-COMPOSITE-HOST-IDENTITY-IS-THE-DECLARATION-SITE).
+    CompositeIdentityIndex compositeIdentity;
     // (cuIdx, oldSym.v) → merged SymbolId. Covers func defs, global defs, AND
     // every extern import symbol.
     std::unordered_map<CuSymKey, SymbolId, CuSymKeyHash> symMerged;
@@ -227,7 +234,8 @@ public:
     // Clone `f` into `dst_`. Returns the merged MirFuncId.
     [[nodiscard]] MirFuncId clone(MirFuncId f, SymbolId mergedSymbol) {
         TypeId const sig = reinternType(srcInterner_, src_.funcSignature(f),
-                                        host_, typeRemap());
+                                        host_, typeRemap(),
+                                        plan_.compositeIdentity);
         // TF-C78 (D-CSUBSET-NOINLINE): carried across the cross-CU merge — the
         // merged module is what the optimizer then runs on, so a flag dropped
         // here would let a `noinline` function from CU A be inlined after link.
@@ -316,7 +324,8 @@ private:
     }
 
     [[nodiscard]] TypeId reType(TypeId t) {
-        return reinternType(srcInterner_, t, host_, typeRemap());
+        return reinternType(srcInterner_, t, host_, typeRemap(),
+                            plan_.compositeIdentity);
     }
 
     [[nodiscard]] MirBlockId mapBlock(MirBlockId oldB) {
@@ -608,6 +617,16 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     MergePlan plan;
     plan.typeRemap.resize(cus.size());
 
+    // ── (0) COMPOSITE IDENTITY PRE-PASS — before ANY reintern ────────────────
+    // Whether a forward-declared `struct T` may unify with a definition depends
+    // on CUs it does not itself contain, so the question cannot be answered
+    // while walking. Observing EVERY source interner first is what makes the
+    // merged type graph independent of the order the CUs are walked -- and
+    // order-independence is not a nicety here: the same operator ruling that
+    // requires byte-identical optimized output for any prefetch depth applies to
+    // a type graph that decides what the optimizer may inline.
+    for (auto const& cu : cus) plan.compositeIdentity.observe(*cu.interner);
+
     // ── (1)+(2) name → defining (cuIdx, MirFuncId, binding) + resolveCrossCuDefs.
     // A LinkedSymbolKey's cuId is the synthetic `cuIdx+1` (unique per CU, order-
     // stable); `cuIdxOf(key) == key.cuId.v - 1`. Only externally-visible
@@ -691,7 +710,23 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
 
     // (3a) one canonical merged id per externally-visible winner NAME. Use the
     // winner's natural value when it is a free CU0 value; otherwise mint fresh.
+    //
+    // ★★ IN SORTED NAME ORDER. `resolution.winners` is an `unordered_map`, and
+    // this loop MINTS SYMBOL IDS as it goes — so ranging over it directly makes
+    // the merged symbol numbering, and therefore the emitted symbol table, a
+    // function of the standard library's hash-table layout rather than of the
+    // input. Sorting the names first makes the numbering a pure function of the
+    // CU set, which is what lets two hosts (and two stdlib versions) agree on
+    // the artifact. Sibling of the `MirBuilder::finish` phi-pool flush ordering.
+    std::vector<std::string> winnerNames;
+    winnerNames.reserve(resolution.winners.size());
     for (auto const& [name, winKey] : resolution.winners) {
+        (void)winKey;
+        winnerNames.push_back(name);
+    }
+    std::sort(winnerNames.begin(), winnerNames.end());
+    for (std::string const& name : winnerNames) {
+        LinkedSymbolKey const& winKey = resolution.winners.at(name);
         SymbolId merged;
         if (cuIdxOf(winKey) == 0 && alloc.isFree(winKey.symbol.v)) {
             merged = alloc.claim(winKey.symbol.v);
@@ -899,7 +934,8 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                 continue;
 
             TypeId const ty = reinternType(*cus[ci].interner, m.globalType(g),
-                                           host, plan.typeRemap[ci]);
+                                           host, plan.typeRemap[ci],
+                                           plan.compositeIdentity);
             SymbolId const mergedSym = mergedSymbolOf(plan, ci, m.globalSymbol(g));
 
             std::uint32_t initLit = m.globalInitLiteralIndex(g);
@@ -1104,7 +1140,20 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // ── verify the merged module before returning (the engine's verify-after-
     // every-transform discipline). A non-verifying merge is a build break, never
     // a silent miscompile.
+    //
+    // ★★ THIS VERIFY IS THE SECOND WHOLE-PROGRAM `MirVerifier` RUN OF A BUILD,
+    // and until cycle P36 it was INVISIBLE: `mergeCuMirs` is called from the
+    // driver OUTSIDE any `PhaseTimers::Scope`, so its cost landed in the
+    // `--time` report's `[other]` row, which names nothing
+    // ([[D-PERF-MERGE-SIDE-WHOLE-PROGRAM-VERIFY-IS-UNATTRIBUTED]]). It is
+    // scoped as `CompilePhase::Verify` — the phase whose verb IS "the
+    // MirVerifier ran" — so the row now counts EVERY whole-module verify a
+    // build pays instead of only the optimizer's. ⓘ The `runs` column is what
+    // keeps the two distinguishable: it now reads (CUs + 1 optimizer verifies)
+    // + 1 merge verify.
     {
+        substrate::PhaseTimers::Scope const verifyScope{
+            substrate::CompilePhase::Verify};
         MirVerifier verifier{merged, &host.interner()};
         if (!verifier.verify(reporter)) {
             ParseDiagnostic d;

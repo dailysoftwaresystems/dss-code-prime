@@ -9,8 +9,8 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-25 — cycles **P14 … P34**. ★★★ **P34: THE REGISTRY SPLIT IN TWO, AND THE macOS LEG TURNED OUT TO BE MEASURING A TREE THAT EXISTS NOWHERE** — three carriage defects BORN CLOSED (a push that never deleted, agent worktrees shipped to the gate host, and a witness that could return another run's exit code), plus the serial-ctest fix REGRESSED by a script written four days after it closed. ⚠ RE-MEASURE the balance with `python scripts/check-anchor-balance/check-anchor-balance.py` rather than re-quoting any figure on this line. ★★★ **P32: THE FIRST NET-NEGATIVE CYCLE OF THIS RUN, AFTER THE OPERATOR SAID SO MID-CYCLE** — balance **1032 → 1023** (**closed 10, opened 1**, plus two rows filed BORN CLOSED, which correctly move neither tally); gate **1622/1622 (Windows x86_64)**; suite **1603 → 1622**. ⚠ the authority is `python scripts/check-anchor-balance/check-anchor-balance.py`; RE-MEASURE rather than re-quote this line. ★★★ **THE OPERATOR'S MID-CYCLE INSTRUCTION IS THE REASON AND IT IS NOW A STANDING ORDER** — verbatim: *“every time opens more anchors than closes, seems incapable of solving problems”*, said on seeing this orchestrator FILE `D-GATE-NO-CTEST-ENTRY-SEES-THE-MULTI-HOST-CARRIAGE-SCRIPTS` instead of fixing it, in the same cycle that had just caused the break it described. ⇒ **A NEW ROW IS A LAST RESORT, NOT A DELIVERABLE**; if it can be fixed inside owned paths without breaking the bar, FIX IT and record it inside a row already being closed; **“refused but not fixed” is NOT closed**. That row was taken by the orchestrator and closed the same day; the four lanes launched after it opened **ZERO** new rows between them while closing eight. ★★ **THE `dsscp` RENAME LANDED AND OVER-REACHED, AND THE OVER-REACH IS THE LESSON:** it rewrote THIRTEEN REPOSITORY CHECKOUT PATHS — `wsl-leg.sh`'s `SRC`/`DST`, `remote-leg.sh`'s `REMOTE_DIR`, `profile-compile-dispatch.sh`'s `RREPO` for all three legs, the sqlite harness's `SRC_DIR`, the citation inventory's skill-directory key — pointing the ENTIRE MULTI-HOST CARRIAGE at directories that exist on no host, **with ctest 1603/1603 GREEN**. Exactly one of the thirteen reddened anything, by accident. ⇒ the protect list enumerated five SPELLINGS and so could not discover a sixth CLASS; `carriage_paths_guard` now refuses that class offline on every leg. ★★ **AND TWO LANES OVERTURNED THE PREMISE OF THE ROW THEY WERE CLOSING** — the shipped-config row's *“3 checked, 6 unchecked”* split was counting COMMENTS (`in.bad()` after `buf << in.rdbuf()` is FALSE even when the streambuf THROWS, so 9 of 9 were unchecked), and the corpus row's named witness for a one-sided runner implementation **stays GREEN under one**. ★★★ **P31: THE CONFORMANCE LANDED, AND SIX OF THIS PROJECT'S OWN INSTRUMENTS WERE FOUND LYING** — eight lanes (A–H) in waves of four; gate **1603/1603 in 482.78 s (Windows x86_64, build+ctest chained) · 1603/1603 in 363.08 s (WSL x86_64 + qemu arm64, CLEAN build)**; balance **1023 → 1032** (closed 9 — ⚠ **FOUR of those are bookkeeping-only**, work that pre-dated the cycle, so the cycle's own credit is **5** — against **18** opened, and the guard's verdict is that it CREATED **13** more open rows than it closed); suite **1584 → 1603 tests**. ⚠ the authority is `python scripts/check-anchor-balance/check-anchor-balance.py`, which prints every one of these numbers on every run; RE-MEASURE rather than re-quote this line. ★★★ **THREE CORRECTIONS TO THE RED-ON-DISABLE PROOF STANDARD IN ONE CYCLE, EACH FAILING IN THE FLATTERING DIRECTION** — the check PASSES, so the lane believes it holds proof and stops looking: a PE image's md5 moved **between two builds of IDENTICAL sources** (a link timestamp) so it is not a compiled-in proof; a moved **OBJECT** md5 is not a reached-the-binary proof either, because the LINK can fail and ctest then runs the PREVIOUS binary; and **a run is void when ANY shared input moves under it, not only when a BUILD does** — one gate read **1102 passed / 501 failed with nothing building at any point**, and **1602/1603** on a quiesced re-run. ⇒ *the image moves when nothing changed, and the object moves when nothing shipped.* ★★ **THREE MORE WERE THE ORCHESTRATOR'S OWN:** it edited `.plans/**` under a running lane and flipped that lane's gate red→green (⇒ **ask what a file is an INPUT to, not which directory it lives in** — `.plans/**` is an input to five GUARDS, and a guard is a ctest entry), and its own *"103 misglyphed registry rows"* census was a keyword sieve mistaken for a verdict — ✔re-measured, the real number was **4**, because **a PARTIAL CLOSURE LEADS WITH THE PART THAT CLOSED**; and its own fold gate **exited 8 while its notification said 0**, because the invocation ended `…; echo "RUNGATE_EXIT=$?"` and the echo BECAME the terminal state — ⇒ **never append a command after `run-gate.sh`**. ★★★ **CONFORMANCE, CHOSEN BY AN IMPACT INSTRUMENT RATHER THAN BY INSPECTION** (`gcc -E` over ordinary TUs + a `/usr/include` census with a positive control per row): **`__extension__`** — 261 occurrences across 40 C headers — and ★★ **it is NOT a declaration specifier**, the shape this repository reaches for first, which would have accepted **four spellings no reference accepts** with every POSITIVE test still passing; plus **GNU statement expressions `({ … })`** — 59 across 15 headers, **7 sites writing the two together** — landing on a `HirKind::SeqExpr` whose own header comment already named them: **zero new HirKinds, zero MIR, zero LIR**. A real 1819-line `gcc -E -P` glibc TU now produces **zero** parse errors from either. ★★ **THE FLAKY TEST WAS US:** `ffi/test_c_header_parser` holds the live 478 KB `c.lang.json` open **76.6% of its wall time** because **no `loadShipped` entry point caches**, and what tears it is our OWN red-on-disable convention rewriting a shipped document in place — truncate hammer **156/156 red**, atomic `os.replace` **0/18**. See §0.0000000000000000000000000000000000. ★★★ **P30: THREE SILENT MISCOMPILES CLOSED, AND THE ENCODING TABLE LEARNS TO STATE A SEQUENCE INSTEAD OF ONE INSTRUCTION** — gate **1584/1584** in 461.72 s, balance **1022 → 1023** (closed 6, opened 7, one disclosed-pre-existing and exempt). See §0.000000000000000000000000000000000.
-**Branch:** `feature/c23-conformance-burndown-4` · **HEAD:** this commit (Cycle P32). ⚠ **Any `dss-code-prime` spelled as the BUILT COMMAND in a row or commit message older than 2026-08-24 is HISTORICAL, not stale** — the tool is named `dsscp` since that date, while the PROJECT and the REPOSITORY keep `dss-code-prime` (`project(…)`, the GitHub URLs, the funding and issue-template identity, `.claude/skills/dss-code-prime/`, and **every checkout path on every host**). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ **Likewise, any `c-subset` in a commit message or a row older than 2026-08-24 is HISTORICAL, not stale** — the C front end has been named `c` since that date, and the mapping is MECHANICAL — ✔MEASURED 2026-08-24 by applying it to every path-shaped mention in `.plans/**` + `.claude/**` and asking the filesystem: **834 of 862 resolve**, the 28-mention residue being examples deleted or renamed for reasons unrelated to this rename, so a miss is pre-existing staleness rather than a hole in the rule: `examples/c-subset/…` reads `examples/c/…`, `tests/corpus/c-subset/…` reads `tests/corpus/c/…`, `tests/corpus/diagnostics/c-subset/…` reads `tests/corpus/diagnostics/c/…`, `c-subset.lang.json` reads `c.lang.json`, and `--language c-subset` reads `--language c`. ⚠ `tsql-subset` is a DIFFERENT language and is spelled correctly — it is not part of this mapping. ★★ **BOTH `D-C-*` AND `D-CSUBSET-*` ANCHOR-ID PREFIXES DENOTE THE C LANGUAGE**: the 426 `D-CSUBSET-*` ids are FROZEN by operator ruling and are never to be renamed, so a grep for either prefix ALONE misses part of the language's rows.
+**Last updated:** 2026-08-26 — cycles **P14 … P36**. ★★★ **P36: THE GOAL CORPUS BUILDS AND RUNS AT RELEASE FOR THE FIRST TIME, AND THE THING IN THE WAY WAS ONE C TYPE COUNTED TWICE.** ✔MEASURED, Windows x86_64, 103-TU sqlite via `--project … --config=release --jobs 4`: **rc=1, 5 × `I_StoreValueTypeMismatch`, NO ARTIFACT → rc=0, ZERO errors, a 5,108,736-byte `speedtest1.exe` that RUNS** (`--size 3 --testset main`, every test executes, `PRAGMA integrity_check` passes, exit 0). ★★ **THE DEFECT: `reinternType` KEYED A HOST COMPOSITE ON ITS SOURCE DECLARATION SITE**, so `typedef struct Bitvec Bitvec;` in a header gave every TU its own incomplete `Bitvec` and the merge kept them all apart. Host identity is now a cross-CU STRUCTURAL identity (`CompositeIdentityIndex`), and a forward declaration RESOLVES to its tag's definition rather than being erased. ★★★ **FOUR ATTEMPTS, AND THE THREE FAILURES ARE WORTH MORE THAN THE FIX** — (1) a full recursive layout digest still forked `BtCursor`, because *the completeness of something you only POINT AT was leaking into your own identity*, this very defect one level down; (2) the obvious repair (tag-only behind a pointer) made two structs share a key while their fields still reinterned apart and `completeComposite` ABORTED ⇒ **the invariant everything since is built on: equal identity ⇒ every field reinterns to the same host type**; (3) the exact de Bruijn digest was CORRECT and took **952 s of CPU with no output** on sqlite's mutually recursive `sqlite3`/`Vdbe`/`Parse` cluster — a subtree that back-references an OUTER composite cannot be memoized ⇒ replaced by ordinary **iterative partition refinement**, which converges in **2 rounds over 14,663 nodes**; and (4) a bug in the memo key itself, which bit-packed a mode flag into bit 63 and then XOR-ed a constant whose bit 63 is also set. **Hash a key; never bit-pack one into a word whose width nobody re-checked.** ★★★ **AND THE LAST FORK WAS NOT IN THE MERGE AT ALL: A PER-CU AST NODE ID INSIDE A TYPE'S NAME.** ✔The index counts its own failures, and that count is what found it — **98 tags FORKED, EVERY ONE WITH A SINGLE LOCAL LAYOUT SIGNATURE** (`Parse`, `Table`, `Select`, `Index`, `KeyInfo` …), which cannot be a layout difference. An anonymous member is bound as `<anon:RULE:NODEID>` and that name reaches the interned TYPE, so two CUs including one header give one anonymous `union` two names and **every named struct that reaches it inherits the split**. The spelling had THREE inline readers and no owner; it has one now (`core/types/anon_member_name.hpp`). **98 → 0.** ★ **THE VERIFIER'S TYPE-MISMATCH MESSAGES NOW NAME THE TYPE, NOT JUST THE ID** — *"typed 5167 (kind 27) … pointee 6074 (kind 27)"* said *"two pointers, different numbers"* and stopped; it now reads `Ptr<Struct 'Bitvec'>` vs `Ptr<Struct 'Bitvec' incomplete>`, **and that sentence is what identified defect (1)**. The id stays — it is the only thing that distinguishes two forks of one spelling. ⚠⚠ **P36 RAN ACROSS TWO SESSIONS AND THE INTERRUPTION COST THE REPORTS, NOT THE WORK.** Every one of nine lanes' CODE is in the tree and gated. Lanes J, P and S wrote their rows to FILES and those applied verbatim; lanes **G, K, L, N, Q and R reported by citing a scratchpad PATH**, and their row text, red-on-disable transcripts and mutant md5s went with the session. The fold RE-DERIVED their rows by measuring the tree — the staticlib member names and the object-input link re-proved by RUNNING the shipped binary, the summary sections by reading the ten shipped format documents — but **a passing test is not proof that the test can fail**, so six rows close on the fix being present and exercised, say so in as many words, and owe their falsifiability arm. ⚠ **AND A STALE TEST HAD TO BE INVERTED:** `AsmDataSection.Int128GlobalFailsLoud` asserted a refusal a lane had since implemented — **a test that asserts a refusal is a claim about the product, and inverting the product without inverting the test leaves a gate that contradicts the compiler.** ⚠ **A TEST SOURCE CARRYING FOUR RAW NUL BYTES** made `grep` call it binary, which blinded every text-scanning guard and made `anchor_registry_guard` report the sentence *"Binary file … matches"* AS AN ANCHOR ID. Fixed; the loud half was the smaller half. ⚠ RE-MEASURE the balance with `python scripts/check-anchor-balance/check-anchor-balance.py` rather than re-quoting any figure on this line.
+**Branch:** `feature/c23-conformance-burndown-4` · **HEAD:** the P36 commit — re-derive it with `git log --oneline -1` rather than reading a hash here: the public-repo bot rebases and squash-merges, so a written hash is UNSTABLE. ⚠ **Any `dss-code-prime` spelled as the BUILT COMMAND in a row or commit message older than 2026-08-24 is HISTORICAL, not stale** — the tool is named `dsscp` since that date, while the PROJECT and the REPOSITORY keep `dss-code-prime` (`project(…)`, the GitHub URLs, the funding and issue-template identity, `.claude/skills/dss-code-prime/`, and **every checkout path on every host**). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ **Likewise, any `c-subset` in a commit message or a row older than 2026-08-24 is HISTORICAL, not stale** — the C front end has been named `c` since that date, and the mapping is MECHANICAL — ✔MEASURED 2026-08-24 by applying it to every path-shaped mention in `.plans/**` + `.claude/**` and asking the filesystem: **834 of 862 resolve**, the 28-mention residue being examples deleted or renamed for reasons unrelated to this rename, so a miss is pre-existing staleness rather than a hole in the rule: `examples/c-subset/…` reads `examples/c/…`, `tests/corpus/c-subset/…` reads `tests/corpus/c/…`, `tests/corpus/diagnostics/c-subset/…` reads `tests/corpus/diagnostics/c/…`, `c-subset.lang.json` reads `c.lang.json`, and `--language c-subset` reads `--language c`. ⚠ `tsql-subset` is a DIFFERENT language and is spelled correctly — it is not part of this mapping. ★★ **BOTH `D-C-*` AND `D-CSUBSET-*` ANCHOR-ID PREFIXES DENOTE THE C LANGUAGE**: the 426 `D-CSUBSET-*` ids are FROZEN by operator ruling and are never to be renamed, so a grep for either prefix ALONE misses part of the language's rows.
 
 ---
 
@@ -672,6 +672,671 @@ second pattern beside the one P23 built and pinned.**
   same search over the sqlite real-example tree returns **0**. No corpus example exercises `"w"`.
 
 ---
+
+## 0.000000000000000000000000000000000000000 ★★★ CYCLE P36 — THE GOAL CORPUS BUILDS AND RUNS AT RELEASE, AND THE THING IN THE WAY WAS ONE C TYPE COUNTED TWICE
+
+> This cycle ran across TWO sessions. The first launched nine lanes and was
+> interrupted; the second folded them. Read §"WHAT THE INTERRUPTION COST" before
+> trusting any lane attribution below — the code all landed, the *reports* did not.
+
+### ★★★ THE HEADLINE — sqlite COMPILES AND RUNS AT `--config=release`, WITH `Inlining` IN
+
+✔MEASURED at the fold, Windows x86_64, release `dsscp`, 103-TU sqlite via
+`--project … speedtest1.dss-project.json --config=release --jobs 4`:
+
+| | before | after |
+|---|---|---|
+| exit | **1** | **0** |
+| `error[…]` | **5 × `I_StoreValueTypeMismatch`** | **0** |
+| artifact | **none** | **5,108,736 B `speedtest1.exe`** |
+
+★★ **AND IT RUNS.** `speedtest1 --size 3 --testset main` on this host: every test
+executes, `PRAGMA integrity_check` passes, **exit 0**. That is the round trip —
+103 translation units compiled at release with the inliner on, linked, executed —
+and it is the first time this corpus has produced a running artifact at release.
+
+⚠ **THE GATE AND THE CORPUS ARE STILL TWO DIFFERENT MEASUREMENTS AND ARE STATED
+SEPARATELY.** `tests/harness/test_sqlite_harness_legs.cpp` — the only sqlite-named
+`ctest` entry — asserts the **leg resolver**, not the build. A green `ctest` says
+nothing about whether sqlite compiles, which is exactly why P36 spent a session
+believing a green suite while the goal corpus was red.
+
+### ★★★ THE DEFECT — HOST IDENTITY WAS THE DECLARATION SITE, SO ONE C TYPE FORKED PER CU
+
+`reinternType` keyed a host composite on `(srcId.arenaTag << 32) | srcId.v`,
+documented as *"distinct source composites stay distinct"* — true, and it also
+keeps a type distinct from ITSELF. sqlite declares `typedef struct Bitvec Bitvec;`
+in a header and defines it only in `bitvec.c`, so every TU handling a `Bitvec*`
+contributed its OWN incomplete `Bitvec`. The verifier's new Store rule then
+reported 5 errors whose two sides were one C type spelled two ways —
+`TOTAL mismatching stores=8 · structurally-identical=8 · genuinely-different=0`.
+
+★ **THE RULE THIS RESTORES IS THE ONE THE HEADER ALREADY DECLARED:** *"the host's
+hash-consing can canonicalize structurally-identical types from different CUs to
+one TypeId."* Every non-composite kind already obeyed it. Composites were the
+exception only because a composite may CONTAIN A CYCLE, so its host id must be
+minted before its fields are known — and the decl-site key stood in for an
+identity nobody had computed. It is computable, from the source side, before any
+minting.
+
+★★★ **FOUR ATTEMPTS, AND EVERY ONE OF THE THREE FAILURES IS WORTH MORE THAN THE
+FIX.** They are recorded here because each looked correct and each was caught by
+a MEASUREMENT rather than by review.
+
+1. **Full recursive layout digest** → `BtCursor` still forked. A TU that has seen
+   `struct Btree { … }` and one that has only seen `struct Btree;` give the
+   ENCLOSING struct different digests. ⇒ **the completeness of something you only
+   POINT AT was leaking into your own identity** — this very defect, one level down.
+2. **Tag-only behind a pointer** (the obvious repair) → `dss::TypeLattice fatal:
+   completeComposite: composite re-completed with different fields`. Two enclosing
+   structs shared a key while their pointer fields still reinterned apart.
+   ⇒ **THE INVARIANT, and everything since is built on it: equal identity ⇒ every
+   field reinterns to the same host type.** Erasing information the reintern still
+   has breaks it; RESOLVING instead (an incomplete composite is replaced by its
+   tag's definition, by one shared `resolveDefinition` both halves call) loses
+   nothing.
+3. **Exact recursive digest with de Bruijn backreferences** → correct, and **952 s
+   of CPU with no output**, killed by PID. A subtree that back-references an OUTER
+   composite cannot be memoized, so inside a mutually recursive cluster nothing is
+   cacheable and the walk re-expands once per path. sqlite's
+   `sqlite3`/`Vdbe`/`Parse`/`Expr` cluster is exactly that shape.
+   ⇒ replaced by **iterative partition refinement** — `h(0) = local`,
+   `h(k+1)[n] = mix(local[n], h(k)[refs…])`, stop when a round adds no class.
+   Ordinary, standard, and cycles are just edges. **Same corpus: converges in 2
+   rounds over 14,663 nodes.**
+4. ⚠ **AND A BUG IN THE MEMO ITSELF, WHICH IS THE ONE TO FEAR:** the cache key
+   bit-packed a mode flag into bit 63 and XOR-ed a golden-ratio constant whose bit
+   63 is also set, so one mode's lookup could return the other's entry. Silent, and
+   only on the second lookup. **Hash a key, never bit-pack one into a word whose
+   width nobody re-checked.**
+
+### ★★★ AND THE LAST ONE WAS NOT IN THE MERGE AT ALL — A PER-CU AST NODE ID INSIDE A TYPE'S NAME
+
+With the refinement in place the corpus still emitted 2 errors, both
+`Ptr<Struct 'BtCursor'>` against `Ptr<Struct 'BtCursor'>` — same tag, both
+COMPLETE. ✔The instrument that found it is a count the index now keeps of its own
+failures: **98 tags FORKED, every one of them with a SINGLE local layout
+signature** — `Parse`, `Table`, `Select`, `Index`, `KeyInfo` and 93 others. One
+local signature and many identities cannot be a layout difference, so identity was
+leaking in from below.
+
+★★ **IT WAS THE NAME.** An anonymous member is bound as `<anon:RULE:NODEID>`,
+where `NODEID` is a per-CU AST node index — and that name reaches the interned
+TYPE. Two CUs including the same header therefore give one anonymous `union` two
+names, and **every named struct that reaches one inherits the split.** The spelling
+had THREE inline readers and no owner; it has one now
+(`core/types/anon_member_name.hpp`), which keeps the RULE (`structSpec` and
+`unionSpec` overlay their fields differently) and drops the node id. **98 → 0.**
+
+⚠ **THE NAME IS PART OF THE HOST KEY, SO BOTH HALVES TAKE IT OR NEITHER DOES.**
+Normalising it for the identity but not for `forwardComposite(kind, name, key)`
+gave two anonymous composites ONE key and TWO host types, and their shared parent
+aborted on the conflicting re-completion — with the type graph otherwise perfectly
+unified. The same class of mistake as attempt 2, one call site over.
+
+### ★★ THE DIAGNOSTIC THAT PAID FOR ITSELF INSIDE THE CYCLE THAT WROTE IT
+
+`I_StoreValueTypeMismatch` and `I_CallSignatureMismatch` named their types by raw
+interner id and `TypeKind` ordinal: *"value typed 5167 (kind 27) into an address
+whose pointee is 6074 (kind 27)"*. Kind 27 is `Ptr` on both sides and a pointer has
+no vocabulary name, so the message said *"two pointers, different numbers"* and
+stopped — and reading it took a throwaway instrument that then died with the
+session. `describeType` now spells the type beside the id (**the id stays** — it is
+the only thing that distinguishes two forks of one spelling), and it marks an
+INCOMPLETE composite, which is the load-bearing half. The next run said
+`Ptr<Struct 'Bitvec'>` vs `Ptr<Struct 'Bitvec' incomplete>`, and that sentence is
+what identified defect 1 above. ★ **A diagnostic whose reader has to build a tool
+is not a diagnostic.**
+
+### ⚠⚠ WHAT THE INTERRUPTION COST — THE CODE LANDED, THE REPORTS DID NOT
+
+Nine lanes ran in session one. **Every lane's CODE is in the tree and gated.**
+Lanes J, P and S wrote their registry rows to FILES, and those applied verbatim.
+Lanes G, K, L, N, Q and R reported by CITING A SCRATCHPAD PATH, and those paths
+held working files, not deliverables — so their row text, their red-on-disable
+transcripts and their mutant md5s are gone.
+
+★ This is [[D-CYCLE-A-LANE-DELIVERABLE-LEFT-IN-THE-SCRATCHPAD-IS-INVISIBLE-TO-THE-FOLD]]
+at full scale, and the row is widened with it. **The one-line test stands: if the
+orchestrator would have to open a file to fold your work, the work is not reported
+yet.**
+
+**What the fold did instead, and what it could not do.** Every row it closed for a
+lost lane was RE-DERIVED BY MEASURING THE TREE — the staticlib member names and the
+object-input link were re-proved by RUNNING the shipped binary, the summary
+sections by reading the ten shipped format documents, the growth budget by
+re-reading the trace. What could NOT be re-derived is the falsifiability evidence:
+**a passing test is not proof that the test can fail**, so those rows close on the
+fix being present and exercised, say so in as many words, and owe their
+red-on-disable arm to whichever cycle next touches those files.
+
+⚠ **AND ONE STALE TEST HAD TO BE INVERTED.** `AsmDataSection.Int128GlobalFailsLoud`
+asserted a refusal that a lane had since implemented, so the baseline gate was RED
+on a test contradicting the shipped binary. **A test that asserts a refusal is a
+claim about the product; inverting the product without inverting the test leaves a
+gate that disagrees with the compiler.** Replaced by a positive test asserting the
+SIXTEEN BYTES, in three cases with three distinct failure modes.
+
+### THE GATE
+
+✔ALL FOUR LEGS GREEN, each on a tree that was NOT moving under it. ⚠ The Windows
+number was taken TWICE and only the second is quoted: the first ran while
+`.plans/**` was still being edited, and `.plans/**` is the SUBJECT of five
+guards, so that run measured a tree that no longer existed
+([[D-CYCLE-THE-ORCHESTRATOR-EDITED-PLANS-UNDER-A-RUNNING-LANE-AND-FLIPPED-ITS-GATE]],
+self-inflicted, caught before it was quoted).
+
+| leg | result |
+|---|---|
+| Windows x86_64 `ctest` (baseline, before the fold's own work) | **1668 / 1671** — 2 plan guards (the held row batch) + 1 stale test |
+| **Windows x86_64 `ctest` (frozen tree)** | **1671 / 1671**, 0 failed, 551.6 s |
+| **WSL x86_64 + qemu arm64** | **1653 / 1653**, 0 failed, 252.4 s (guards `-LE repo-guard`: the root host ran them) |
+| **macOS arm64 (Apple Silicon)** | **1671 / 1671**, 0 failed — configure 10 s, build 181 s, ctest 682 s |
+| **arm64 VPS (native aarch64)** | **1653 / 1653**, 0 failed |
+| **103-TU sqlite, `--config=release`** | **rc=0, 0 errors, 5,108,736 B in 15.1 s — and the artifact RUNS (exit 0, `PRAGMA integrity_check` passes)** |
+
+⚠ **A CARRIAGE DEFECT MEASURED WHILE THE LEGS RAN, AND NOT YET FIXED:** the macOS
+push shipped **`.kilo/` — 61 MB, 3,671 files** including a `node_modules` tree.
+Git IGNORES it (via `.git/info/exclude` plus `.kilo/.gitignore`), but the carriage
+excludes are a HAND-MAINTAINED ENUMERATION and their `node_modules` entry is
+ANCHORED (`./node_modules`), so `.kilo/node_modules` sails straight through.
+★ **The general form is the row worth writing: the transport re-derives, badly, a
+question `git` already answers exactly.** Excluding what `git status --ignored`
+reports would make *"a gate host holds the repo and nothing else"* true by
+construction instead of by enumeration — and an enumeration cannot discover the
+next directory some tool drops in the root. ⓘ It cost transfer time and gate-host
+disk, not correctness: no leg reddened. **Deliberately NOT fixed between a green
+gate and the commit** — `scripts/**` is a ctest subject, and editing one there
+would have voided the four leg results this table reports.
+
+### ★★★ NEXT — in order
+
+1. **The remaining legs**: WSL x86_64 + qemu arm64 (**`QEMU_LD_PREFIX=/usr/aarch64-linux-gnu`
+   or ~450 examples false-red at 255`) + macOS + the arm64 VPS. Push to each
+   carriage first. ⚠ A gate host holds the repo and nothing else.
+2. **The red-on-disable arms owed for the lost lanes' rows** — named in each row.
+   These are the falsifiability half of six rows that closed on presence and
+   execution alone.
+3. **[[D-OPT11-LAZY-IMPORT-EDGE]]** is still OPEN and is this cycle's only
+   surviving opener besides Lane S's. ⚠ Its option A ("reuse the fixpoint's own
+   max") is CONTAMINATED — every figure derived from the old `max` is an artifact
+   of a runaway process.
+4. **The four re-verdict rows the balance gate keeps flagging.** ⚠ ✔MEASURED at
+   this fold: the gate's *"opener discharged"* heuristic is NOT the same predicate
+   as *"trigger fired"*. `D-FULLC-STDBIT-BIG-ENDIAN-NATIVE`'s trigger is *a
+   big-endian target lands*, which has not happened, and
+   `D-FULLC-STDBIT-ADDRESSABLE-FN`'s is *a program takes `&stdc_*`*. Three of the
+   four are the guard being right about the opener and wrong about the gate; the
+   honest fix is to annotate each row, not to flip a status.
+5. **README correction still owed** from session one: the *"the answer is the pool"*
+   claim was refuted, a `-flto` arm is wanted, `5.4×` → `5.5×`. ⚠ **NOT DONE, and
+   deliberately not guessed:** the refuting measurement was in a lost lane report.
+   Re-measure before editing.
+6. **The interner-level arc** behind the merge fix: `sameRepresentation` still
+   compares a composite's operands by raw TypeId, so representation neutrality does
+   not survive one level of indirection. 1–2 cycles, with this cycle's measurement
+   as its witness. The `instType(cid).v != instType(actual).v` guard in
+   `inlining.cpp` is named as a consumer that gets to shrink.
+7. **A MEASURED `.sh`/`.ps1` PARITY GAP IN `macos-leg`, recorded rather than filed.**
+   ✔MEASURED at this fold by reading both siblings: `macos-leg.sh` accepts
+   `--guards`, `--mode`, `--tree` and `--build-type`; `macos-leg.ps1` accepts none
+   of the four (`-Src`, `-Filter`, `-Jobs`, `-NoPush`, `-Dst`, `-ResetTo` only).
+   The `.sh` header dates those flags to P35, so they landed in one sibling.
+   ⓘ **`--prune` is NOT part of the gap** — it is not a user flag at all; both
+   siblings pass `-Prune` to the carriage unconditionally, which is the P34
+   ruling met. ⚠ It blocked nothing here (a plain full leg needs none of the
+   four), which is why it is a note and not a row — but a Windows-side caller
+   wanting `--mode build` today has no way to ask for it.
+8. **Two worktrees deliberately KEPT**, with uncommitted work nobody has
+   adjudicated: `C:/Source/DailySoftware/dss-lane-r` (136 dirty files) and
+   `dss-perf-probe` (4, including a `src/perf_sampler.cpp` that exists nowhere
+   else). Five others were removed after verifying their work is in HEAD or in the
+   shared tree. ⛔ The three `.claude/worktrees/agent-*` trees belong to other
+   sessions and must not be touched.
+
+---
+
+## 0.00000000000000000000000000000000000000 ★★★ CYCLE P35 — COMPILE TIME, AND THE LAST HOST WHERE DSS LOST DREW LEVEL BEFORE THE CYCLE ENDED
+
+**Operator instruction, verbatim:** *"let's fix compile DSS time then measure agains our references"*.
+
+### ★★★ THE HEADLINE, AND IT REVERSES WHAT THIS PROJECT BELIEVED
+
+✔MEASURED with a NEW instrument (`scripts/compile-bench/`), 20 runs after 3 warm-ups, whole task
+source→executable, each compiler on its own command line. ⚠ **THE WINDOWS ROWS ARE `min`, NOT MEDIAN,
+AND THAT IS THE INSTRUMENT'S OWN RULE RATHER THAN A CHOICE THAT FLATTERS**: its caveat 8 refuses any
+before/after difference smaller than the `spread` column, this host's spread is 44–46 ms, and the delta
+being claimed is 35.4 ms. By median the improvement is UNPROVEN; by `min` — the run that got the most
+machine — the two distributions do not overlap at all. The other two hosts' rows are medians on quiet
+hosts and are labelled as such; ★ **do not divide a number from one of these rows by a number from
+another reading.** Lane E independently read the same pre-fix binary at 184 ms where this instrument read
+138.2 ms, which is exactly how far a cross-session ratio can be wrong.
+
+| host | dsscp `tiny` | best reference | verdict |
+|---|---|---|---|
+| **macOS arm64** (post-fix) | **25.2 ms** | Apple clang 21 — 31.5 ms | **DSS 1.25× FASTER** |
+| **WSL x86_64** (PRE-fix binary) | **41.7 ms** | clang 18.1.3 — 188.1 ms · gcc 13.3.0 — 327.1 ms | **DSS 4.5× FASTER** |
+| **Windows x86_64** (mid-cycle, lanes A/B/D only) | **128.9 ms** | gcc 13.2.0 — 90.7 ms | DSS 1.42× SLOWER |
+| **Windows x86_64** (FINAL, lane E folded) | **93.5 ms** | gcc 13.2.0 — 90.9 ms | **DSS 1.03× — LEVEL** |
+
+★★★ **THE FIRST READING OF THIS SAID "WINDOWS IS ~5× OFF ITS POSIX SIBLINGS" AND BLAMED THE HOST.
+THAT WAS WRONG, AND IT WAS WRONG IN THE MOST EXPENSIVE DIRECTION — a host is the one thing nobody can
+fix, so a wrong host attribution retires a question instead of answering it.** ✔THE CONTROL, taken only
+because the operator asked whether the comparison was fair: same host, same source, same binary, **only
+the target format changing** — `pe64-x86_64-windows` **3 CUs / 158 ms**, `elf64-x86_64-linux` **1 CU /
+63 ms**, `macho64-arm64-darwin` **1 CU / 64 ms**. The two extra CUs are **pe64-ONLY** — `runtime/platform/src/dirent.c` and `unistd.c`, DSS's own POSIX implementation half, bound to the format by a config `realization` map and not by any engine branch — and cost **95 ms
+of a 158 ms compile (60%)**. Cross-compiling the same file to ELF *on Windows* is 63 ms against WSL's
+41.7 ms ⇒ the genuine Windows-HOST penalty is **~1.5×**, and ⚠ even that is not a floor, because the WSL
+half of the pair is a PRE-fix binary. **Most of what looked like a host problem was DSS rebuilding the
+Windows runtime half on every invocation.**
+★ THE LESSON, and it is the same one twice in two cycles: **an instrument that reports a DIFFERENCE does
+not report its CAUSE.** Two hosts differ in host AND in realized-CU count; naming the host required
+holding the other variable still, and nobody had. ⚠ THE SPREAD COLUMN (0.9–2.6 ms on macOS, 32–47 ms on Windows) IS STILL A REAL HOST SIGNAL — Windows is
+genuinely noisier — but it is NOT the bulk of the gap, and reading it as though it were is what produced
+the wrong first verdict.
+
+⚠ [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]] measured a ~1.2× residual and stays OPEN —
+that figure was taken on a **103-TU build, which amortizes a per-invocation floor away**. On a SMALL
+compile the same-machine gap was read as ~5×. ⚠ **THAT FIGURE IS RETIRED — it descends from the host
+attribution corrected above, and the number that replaced it is 93.5 ms on Windows against 41.7 ms on
+WSL.** ⚠ Even that pair is not yet a real comparison, because the WSL half is a PRE-fix binary and no
+post-fix WSL reading has been taken. Both rows measure different things; the row should be re-verdicted
+against a matched pair, not against either of these.
+
+### ★★★ WHY WINDOWS COMPILES MORE TRANSLATION UNITS, AND WHY THAT IS NOT THE BUG
+
+⚠ **THE FIRST WRITE-UP OF THIS CYCLE CALLED THEM "the two extra CUs" AND LEFT IT THERE, WHICH INVITES
+EXACTLY ONE WRONG READING — that they are waste to be deleted.** The operator supplied the framing
+unprompted, 2026-08-25: *"windows compiles more TU than posix because we do have a posix C file own
+implementation that mimics the posix implementation so windows have the same interface (which is
+correct) … That's why this cache will do the trick for real big projects"*.
+
+✔VERIFIED IN THE TREE. `src/dss-config/runtime/` holds **exactly two files** — `platform/src/dirent.c`
+(181 lines) and `platform/src/unistd.c` (139 lines). Each is bound to the `pe` object format by one
+line in its own descriptor:
+
+```
+shippedLibs/dirent.json:  "realization": { "pe": { "source": "runtime/platform/src/dirent.c" } }
+shippedLibs/unistd.json:  "realization": { "pe": { "source": "runtime/platform/src/unistd.c" } }
+```
+
+★ **THAT MAP IS THE WHOLE MECHANISM, AND IT IS AGNOSTIC BY CONSTRUCTION.** `library` says which IMAGE a
+symbol is imported from; `realization` says WHETHER it is imported at all. On `elf`/`macho` the map
+carries no key, the import default stands, and the driver adds nothing — **1 CU**. On `pe` the driver
+adds the named file as an ordinary extra translation unit compiled FOR THE TARGET on ANY host —
+**3 CUs**. There is no `if (format == pe)` anywhere in the engine; the difference is a config document.
+
+★★ **AND THE UNITS ARE THE CONSERVATIVE ANSWER, NOT THE EXPEDIENT ONE.** Windows exports no POSIX
+directory API from ucrtbase OR kernel32, and the nearest-looking substitutes are traps the tree already
+documents: ucrtbase exports `_sleep` which takes MILLISECONDS where POSIX `sleep` takes SECONDS, so a
+`linkName` onto it would link clean, load clean, and sleep 1/1000th of the requested time. gcc's literal
+answer here is "link libmingwex" — which DSS cannot take without breaking
+[[D-HARNESS-CROSS-HOST-ANY-TARGET]] and re-adopting the third-party runtime the pe→UCRT migration ran to
+eliminate. So DSS ships the body, and the body is checked by the compiler: each unit `#include`s the
+header its descriptor publishes, so a signature that drifts STOPS COMPILING.
+
+★★★ **THE CONSEQUENCE FOR THE CACHE, WHICH IS WHY THE OPERATOR RAISED IT.** This is a FIXED cost — two
+units, whatever the project's size — but it is fixed **PER INVOCATION**, not per project. ✔DEDUCED FROM
+MEASURED DATA, and the arithmetic is decisive rather than suggestive: the runtime half costs **95 ms**
+while the measured **per-TU slope is 8.5 ms** at `-j6`, so it CANNOT be inside the slope — it is inside
+the 125 ms floor, compiled once per invocation however many TUs that invocation carries. ⚠ Say "deduced"
+and not "measured": no counter was read for these two units the way `load-config.runs` was read for
+config. 🧠INFERRED and NOT yet measured at all: a project driven one-TU-per-invocation, which is what every
+`make`-style build does, pays that floor **N times** — 100 files ⇒ 200 redundant runtime-unit compiles,
+order **9.5 s** of pure repetition. A
+content-addressed object cache keyed on (target × format × config × toolchain stamp) collapses all of it
+to one, permanently and across future builds. **That is the case for wiring the cache, and it is
+strongest exactly where the operator said it would be: real projects.**
+
+⚠ **DO NOT QUOTE 95 ms AS THE CACHE'S EXPECTED SAVING — IT IS AN UPPER BOUND, AND THE ERROR WOULD BE IN
+THE FLATTERING DIRECTION.** That figure is the pe64-minus-elf64 delta on one host, and pe64 also LINKS
+three objects where elf64 links one. A cache removes the COMPILE of the two units; it does not remove
+their link, their descriptor resolution, or the archive read that replaces the compile. **The realized
+saving is 95 ms MINUS whatever of that delta is link — and nobody has split those two yet.** The split
+is a one-command measurement (cold cache vs warm, same target, artifact probed) and it belongs in the
+row that wires the cache, not in a forecast.
+
+### ★★★ THE FINDING THE OPERATOR'S QUESTION PRODUCED — A CACHE THAT EXISTS, PASSES ITS TESTS, AND IS WIRED TO NOTHING
+
+The operator asked whether gcc was reusing objects while DSS was not. ✔BOTH DIRECTIONS MEASURED, and the
+answer is that the comparison is unfair **to DSS**:
+
+- **gcc and clang are not cached.** Windows `gcc` is the real 1.7 MB binary (a `ccache` IS on PATH and
+  nothing routes gcc through it); WSL `/usr/bin/gcc` → `gcc-13` and `/usr/bin/clang` → `llvm-18`, with
+  `/usr/lib/ccache` NOT on PATH, and WSL ccache reported **0 hits out of 14 cacheable calls** all session.
+- **DSS is not being flattered either — it is being PENALISED.** gcc links a PREBUILT libc and never
+  compiles it; DSS compiles two shipped runtime source units from source on every single invocation. That
+  work is inside DSS's 138 ms and absent from gcc's 95 ms.
+
+★★★ **AND `src/program/runtime_object_cache.{hpp,cpp}` EXISTS TO PREVENT EXACTLY THAT, IS FULLY
+IMPLEMENTED, HAS ITS OWN ~800-LINE TEST FILE, AND HAS NO PRODUCTION CALLER.** ✔MEASURED three ways:
+every exported function — `computeRuntimeObjectKey`, `storeRuntimeObject`, `lookupRuntimeObject`,
+`resolveRuntimeCacheRoots`, `runtimeKeyDocumentPath`, `buildStampPathSegment`,
+`runtimeCacheBuildStampSegment` — has **ZERO** call sites outside its own implementation file
+(`resolveArchiveSiblingFormat` shares the file, has 4 callers, and is unrelated); `compile_pipeline.cpp`
+INCLUDES the header and calls nothing from it; and setting `DSS_RUNTIME_CACHE_DIR` to an empty directory
+wrote **0 entries** with cold and "warm" timings indistinguishable.
+
+★ **The operator named the fix before the diagnosis was finished:** *"we just compile the prebuilt items
+(hermetic cost) once, so big for projects it will be almost invisible"* — which is precisely the design
+already sitting in that file, content-addressed and build-stamp-keyed. It is a **wiring** job, not a
+design job.
+
+### THE FOUR LANES — every row BORN CLOSED, zero opened
+
+**A — [[D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS]]** (production).
+P34's lane-SEAL memo folded forward, EXTENDED to `TargetSchema` and `ObjectFormatSchema`, plus three
+new `--time` phases. ✔`test_semantic_analyzer_c` **70.13 s → 15.35 s (4.6×)**, `test_hir_lowering_c`
+**36.56 s → 12.86 s (2.8×)**. Measured by an INTERLEAVED A/B against a one-token mutant, because this
+host drifts ±20% over tens of minutes and two readings taken apart would have credited the drift to
+the fix.
+
+**B — [[D-DRIVER-SHIPPED-SOURCE-RESOLUTION-COMPILES-EVERY-SHIPPED-GRAMMAR]]** (production). Compiling
+one `.c` file fully CONSTRUCTED the grammar of every shipped language — T-SQL, Toy, both asm dialects
+— **twice**, to read one array from each. A SAX reader that aborts when the `language` block closes
+replaced it: 6 grammar constructions → 1.
+
+**C — [[D-HARNESS-NO-INSTRUMENT-COMPARES-DSSCP-COMPILE-TIME-AGAINST-THE-REFERENCE-COMPILERS]]**
+(harness). The instrument above. ★ Its subject LADDER is the deliverable, not the numbers: a fixed
+per-invocation FLOOR and a per-TU SLOPE produce the same figure on a single-file benchmark and call
+for DIFFERENT fixes, so no single-subject measurement could have told the operator which to buy.
+
+**D — [[D-PERF-SIMPLIFYCFG-ADDRESS-TAKEN-QUERY-RESCANS-THE-WHOLE-FUNCTION]]** (production). A
+`--config=release` compile spent **92% of its `optimize` phase in a pass reporting `mutated=0`**.
+`Mir::isBlockAddressTaken` is DERIVED — it rescans every instruction of the function per call — and
+SimplifyCfg called it once per block before any cheap gate. ✔SimplifyCfg **215 ms → 8 ms**, `optimize`
+270 → 61 ms, and the emitted artifact is **BYTE-IDENTICAL over all 630 `examples/c` subjects**.
+
+### ★★ WHAT THE FIXES BOUGHT, AND WHERE THEY DID NOT
+
+✔MEASURED on Windows, RELEASE, quiet host, median of 20:
+
+```
+release arm            BEFORE     AFTER      gcc      ratio then -> now
+tiny   (1 line)        171.6      138.2      95.1     1.79x -> 1.45x
+hello  (3 headers)     195.6      141.6     106.1     1.83x -> 1.33x
+mid    (396 lines)     187.8      148.3     103.5     1.82x -> 1.43x
+large  (4224 lines)    579.5      312.6     116.0     4.97x -> 2.69x
+floor / per-TU @-j6   155.5/17.2 125.1/8.5  57.4/50.3
+```
+
+★ **DSS's PER-TU COST IS NOW 5.9× BETTER THAN gcc's; the entire deficit is the 68 ms of floor.**
+
+⚠ **AND THE CONFIG FIX BOUGHT MUCH LESS IN RELEASE THAN IN DEBUG — say so rather than quoting the
+flattering number.** ✔Debug showed −19% on the floor; release shows `build-config` at **15 ms**, not
+the ~100 ms Debug spends, because release parses config ~7× faster to begin with. A cycle that
+measured only its Debug lane trees would have over-claimed by roughly 5×.
+
+### ★★★ WHAT `[other]` IS NOW, AND WHY THAT IS THE REAL DELIVERABLE
+
+Before this cycle a one-line Windows RELEASE compile was 125 ms of `[other]` — wall time inside no
+phase at all, and therefore unattributable. It is now **88 ms, with config split out and NAMED**:
+
+```
+locate-config   2 ms / 10 runs      the precedence walk (deliberately NOT memoised: its
+                                    answer depends on cwd and the environment)
+load-config     6 ms /  7 runs      read + digest + memo lookup — all a HIT costs
+build-config   15 ms /  3 runs      the work a hit skips; its `runs` IS the miss count
+[other]        88 ms                still unattributed
+```
+
+⚠ ✔MEASURED and it rules out the obvious suspect: `load-config.runs` is **6 at 1 TU and 6 at 17 TUs**
+(per-PROCESS) while `[other]` still grows **~+8.9 ms per TU**. **So config loading is NOT the per-CU
+residue, and the next hunt must start somewhere else** — 🧠INFERRED candidates, none measured: the
+artifact write, the driver's own CLI/teardown work, and NTFS+AV per-file cost. `--version` is ~7 ms,
+so pre-`main` DLL load is already excluded.
+
+### THE CARRIAGE — three harness rows, all BORN CLOSED, all faced rather than filed
+
+- [[D-SCRIPT-WSL-LEG-RSYNCS-AGENT-WORKTREES-ONTO-THE-GATE-HOST]] — the P34 "a gate host holds the repo
+  and nothing else" ruling reached two carriages out of three. ✔MEASURED before the fix: **9,661
+  worktree files out of 34,831 — 28% of the tree under test was somebody's uncommitted lane.**
+- [[D-SCRIPT-WSL-LEG-HAS-NO-BUILD-ONLY-MODE-AND-AN-UNKNOWN-MODE-RAN-A-FULL-GATE]] and its macOS twin
+  [[D-SCRIPT-MACOS-LEG-HAS-NO-BUILD-ONLY-MODE-SO-NO-LEG-CAN-BE-BENCHMARKED]] — neither POSIX carriage
+  could produce a RELEASE driver, which is why macOS had **never been timed**. ★ The non-cosmetic half:
+  **a new terminal state needs a new witness** — the macOS driver authenticates a run by grepping for
+  `REMOTE_CTEST_RC[<token>]`, so a mode that never runs ctest would have had a successful build refused
+  as UNKNOWN. It emits `REMOTE_BUILD_RC[<token>]` and the driver picks the key by mode.
+
+### ★★★ LANE E — THE CACHE THAT EXISTED, PASSED ITS TESTS, AND WAS WIRED TO NOTHING
+
+[[D-RUNTIME-OBJECT-CACHE-IS-WIRED-TO-NOTHING]] (production, BORN CLOSED). Launched off the operator's own
+diagnosis — *"we just compile the prebuilt items (hermetic cost) once, so big for projects it will be almost
+invisible"* — which named the fix before this cycle had finished the diagnosis, because the design was
+already sitting in the tree.
+
+★★★ **THE LANE REFUTED ITS BRIEF ON THE FIRST READING, AND THAT IS THE CONTROL LOOP WORKING.** The brief
+said the realized runtime units reached the LINK and needed hooking to the cache. ✔They did not:
+`buildShippedSourceCus` compiled them into ordinary `CompilationUnit`s and APPENDED them to `cus`, so the
+whole-program MIR merge swallowed the demanded subset. There was no `--resolve-library` seam to wire, and
+the job was not a hookup but a change to **how DSS's runtime half enters the image**.
+
+**THE SHAPE, and one property dictated all of it:** per target, each realized unit is attributed to its
+declaring descriptor(s), the archive-writing sibling is resolved through the production
+`resolveArchiveSiblingFormat`, the key is computed, the cache is consulted. A HIT yields the cached `.a`; a
+MISS runs a nested default `Program` build into a staging area and stores it. ★★★ **The archive route is
+taken UNCONDITIONALLY, because a HIT and a MISS must emit the SAME IMAGE** — merging CUs on a miss and
+pulling members on a hit would make a cold and a warm build emit different code from identical inputs, so a
+green test could go red purely by being run twice. **A cache whose hit rate changes the artifact is not a
+cache.**
+
+⚠ **STATED RATHER THAN LEFT TO BE FOUND:** there is now no cross-module MIR inlining between user code and
+`opendir`'s body, and member selection is by SYMBOL REFERENCE (the armap worklist) rather than by "did this
+build resolve that descriptor". The second is strictly finer; the first is a real loss of optimization
+scope, accepted for the hit/miss equality above. ★ **Flagged for operator veto** — it is a deliberate
+trade, not an oversight.
+
+**TWO DEFECTS ITS OWN NEW RED-ON-DISABLE FOUND IN ITS OWN WORK**, which is the shape of a lane testing
+itself honestly: (i) runtime archives handed to a STATIC-LIBRARY output were fat-merged whole, so a one-CU
+`-staticlib` emitted a three-member `.lib`; (ii) a runtime unit that failed to compile exited 1 **and still
+wrote the artifact** — an image missing a runtime body links clean and dies at run time, i.e. the exact
+failure the mechanism exists to prevent, reintroduced one tier down.
+
+**MEASURED PRIZE** (medians of 12 INTERLEAVED iterations, output dir emptied before every run and the
+artifact probed after): one-line C **184 → 131.5 ms (−28.5%)**; a 4224-line TU **375 → 326.5 ms (−12.9%)**.
+★ The saving is **FLAT at ~48–52 ms across a 1-line and a 4224-line subject** — the signature of a removed
+FIXED cost rather than of noise. The operator's payoff case, **20 SEPARATE invocations**: **3544 → 2516 ms
+(−29.0%)**, and even COLD 2650 ms, because the single miss amortises inside the first build.
+
+⚠ **A COST THE LANE INTRODUCED, RECORDED WITH ITS NUMBER RATHER THAN NETTED OUT OF THE HEADLINE:**
+`build-config` goes 11 ms / 3 runs → 25 ms / 29 runs on the warm arm, because `resolveArchiveSiblingFormat`
+loads all 24 shipped object-format documents on every invocation to PROVE the sibling is unique. It cannot
+be skipped — the sibling is a key term — and it eats ~16 ms of the ~52 ms gross. A persistent format index
+is the next lever.
+
+### ★★★ THE FOLD CAUGHT A DEFECT TWO OF THE THREE GATE HOSTS CANNOT SEE
+
+[[D-CONFIG-A-LANGUAGE-IS-LOOKED-UP-BY-ITS-DECLARED-NAME-NOT-ITS-DOCUMENT-STEM]] (production, BORN CLOSED).
+
+`src/dss-config/sources/c.lang.json` declares `language.name = "C"`. The file the config tree is INDEXED
+by is `c.lang.json`. Lane E's nested runtime build passed the DECLARED name as its `--language` argument,
+so it resolved `sources/C.lang.json`.
+
+```
+Windows  (NTFS,  case-insensitive)   1656 / 1656   GREEN
+macOS    (APFS,  case-insensitive)   1656 / 1656   GREEN
+WSL      (ext4,  case-SENSITIVE)     1111 / 1638   527 FAILED
+arm64VPS (ext4,  case-SENSITIVE)     1111 / 1638   527 FAILED
+```
+
+★★★ **TWO OF THIS PROJECT'S THREE GATE HOSTS ARE STRUCTURALLY INCAPABLE OF OBSERVING THIS DEFECT CLASS,
+AND SO IS `fs::exists`.** A case-only divergence is invisible to every question asked of a
+case-insensitive filesystem. ⇒ **the pin compares STRINGS and asks the filesystem nothing** — a
+`std::string` comparison is case-sensitive on every host there is, which is the only reason the witness
+means the same thing on all four.
+
+⚠ **AND THE TWO LINUX HOSTS AGREED TO THE TEST — 527 of 1638, twice, independently.** That is what turned
+"a leg is red" into "the tree is wrong": a single red leg is a host until a second host reproduces it.
+
+★★ **THE PIN FOUND A SECOND SITE THE FIX HAD MISSED, AND THE ASYMMETRY IS THE REASON.** With the
+`--language` argument corrected, the key still read `doc=language:sources/C.lang.json` from a different
+call site. It was harmless in substance — its digest was right, and a duplicate `unit-language` term
+carried the correct spelling — but it is the same defect wearing a smaller consequence. ⓘ It surfaced ONLY
+because the pin asserts the **absence of the wrong spelling anywhere in the key** rather than the
+**presence of the right one in the term under repair**; the presence-only form would have passed and the
+second site would have shipped.
+
+★ **THE FIX IS THE CLASS, NOT THE TWO INSTANCES.** `GrammarSchema::configName()` now returns the
+`.lang.json` stem, derived from the document's FILENAME rather than from the entry point — `loadShipped`
+knows the stem, `loadFromFile` does not go through it, and both share one memo entry, so deriving it in
+`loadShipped` would make the answer depend on which call populated the memo first. It is EMPTY for an
+inline grammar and the caller **refuses rather than falling back to `name()`**: that substitution is how
+the defect arose, so it is the one thing the fix must not offer.
+
+### ⚠ AND THE ORCHESTRATOR REPEATED A TRAP THIS FILE ALREADY DOCUMENTS, VERBATIM
+
+All three leg invocations were written as `… > log 2>&1; echo "LEG_RC=$?"`, so **the echo became the
+terminal state and every leg reported exit 0** — including the arm64 VPS run that had just lost 527
+tests. ✔This is the P31 finding word for word (*"never append a command after `run-gate.sh`"*), reached
+by a different route: not after `run-gate.sh` this time, but after a background invocation whose exit
+code the harness reports.
+
+★ **It cost nothing only because the logs were read instead of the exit codes** — the leg scripts
+themselves were correct throughout and printed `[X] remote-leg: arm64-vps leg failed (rc=8)` plainly.
+⇒ the rule generalizes: **never append anything after a command whose exit status is the measurement**,
+and a notification's exit code is worth less than the log it points at.
+
+### ★★★ THE END-OF-CYCLE BENCHMARK — THREE HOSTS, AND ONE CLAIM THAT ONLY THREE HOSTS COULD SETTLE
+
+**Operator instruction, verbatim:** *"compare in this host against gcc and msvc the sqlite's speedtest1, in
+linux/macos also the sqlite's speedtest1 but gcc and clang compile/execute time and update readme"*, then
+*"we already have the benchmark inside here real-examples\c\sqlite, just a matter to adapt it"* — which was
+correct, and is why nothing new was written.
+
+✔MEASURED — `test/speedtest1.c` over the same **103 full-source TUs**, cold builds (fresh object dir per
+repeat), median of 3; runs median of 5:
+
+```
+host                     arm            -j1      -j4      run      1->4 scaling
+Windows 11 x86_64 (32c)  dsscp         64.54    36.16    3.485     1.78x
+  upstream 6f1110c       gcc 13.2.0    26.71     7.38    2.472     3.62x
+                         MSVC          13.74     4.50    3.094     3.05x
+Linux x86_64 WSL2 (32c)  dsscp         40.40    22.02    3.086     1.83x
+  upstream 93f6407070    gcc 13.3.0    17.65     4.94    2.177     3.57x
+                         clang 18.1.3  14.73     4.04    2.160     3.65x
+macOS arm64 (10c)        dsscp         36.63    17.94    1.396     2.04x
+  upstream 55bf04a530    Apple clang   10.69     2.96    0.784     3.61x
+```
+
+⚠ **THREE DIFFERENT UPSTREAM REVISIONS AND ONE HOST WITH A THIRD OF THE CORES ⇒ DO NOT READ ACROSS THE
+TABLES.** Within a host every arm compiled the same source on the same machine; between hosts nothing is
+claimed, and the README says so twice.
+
+★★★ **THE DELIVERABLE IS NOT THE NUMBERS, IT IS THE CLAIM THEY SETTLE.**
+[[D-PERF-CU-POOL-SCALES-HALF-AS-WELL-AS-SEPARATE-PROCESSES]] was a one-host observation, and one host
+cannot separate *"our pool scales badly"* from *"this host schedules badly"*. ✔It now reproduces on
+**three operating systems, four toolchains and two ISAs**: dsscp 1.78–2.04× where every reference is
+3.05–3.65×. **The answer is the pool.** By Amdahl that is roughly a third of a full-source release build
+on a serial path, and it is now the largest addressable item in DSS's compile-time story — far larger
+than anything this cycle touched.
+
+⚠ **THIS CYCLE'S OWN WINS DO NOT APPEAR HERE, AND THAT IS THE CORRECT RESULT RATHER THAN A DISAPPOINTMENT.**
+The floor fell 128.9 → 93.5 ms (27% of a one-file compile) and moved these numbers by **less than their
+run-to-run spread**, because a 103-TU build pays a fixed floor ONCE. ✔The control says the hosts were
+comparable: gcc's Windows run time reads **2.472 s** against the README's **2.473 s** from 2026-08-21.
+★ **Compile time has TWO problems — a per-invocation floor and per-CU throughput — and each needs its own
+instrument. `compile-bench` sees the first; this sees the second.**
+
+### ⚠ THE BENCHMARK COULD NOT HAVE ANSWERED THE QUESTION AS IT STOOD — THREE DEFECTS, ALL BORN CLOSED
+
+1. [[D-HARNESS-SPEEDTEST1-BENCH-MEASURES-ONLY-THE-FIRST-REFERENCE-COMPILER-IT-FINDS]] — the reference was
+   `command -v gcc || command -v clang`, so on a host carrying both, gcc always won the `||` and **the
+   clang arm could never appear under any host configuration**. The operator asked for clang; the tool
+   was structurally unable to produce it.
+2. [[D-HARNESS-SPEEDTEST1-BENCH-ASKS-make-FOR-A-TARGET-SPELLED-THE-POSIX-WAY]] — `sqlite3d` where upstream
+   declares `sqlite3d$(T.exe)`. On Windows that matched no rule and make answered `Nothing to be done`
+   **with exit status 0 and an empty recipe**. ★ A recurrence of
+   [[D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING]] one layer up.
+3. ★★ **AND THE macOS PROBE CAUGHT THE SHARPEST ONE BEFORE IT COULD BE PUBLISHED.** `/usr/bin/gcc` and
+   `/usr/bin/clang` are DISTINCT FILES that both report `Apple clang version 21.0.0` — so the resolved-path
+   dedupe passed both, and because candidates are tried `gcc` first, **the README would have gained a row
+   reading "gcc 21.0.0", a version gcc has never had, over a measurement of Apple clang.** ⇒ dedupe on the
+   VERSION LINE, and take the LABEL from what the compiler says it is rather than from what we typed:
+   `command -v gcc` answers WHERE a name resolves, never WHAT lives there. Same principle as (2), which is
+   why they are one edit apart in the same file.
+
+### ⚠ FOUR TRAPS THIS CYCLE WALKED INTO, ALL OF THEM ALREADY WRITTEN DOWN
+
+1. **A quoted heredoc ate a backslash AGAIN** — `\n` inside a C string literal became a real newline
+   and the file did not compile. Fourth relapse. ⇒ content with a backslash goes through the Write
+   tool, never a heredoc.
+2. **`wsl.exe -e bash /tmp/x.sh` from Git Bash SILENTLY DID NOTHING AND EXITED 0** — MSYS rewrote the
+   argument to `C:/Users/.../Temp/x.sh`. ⇒ use `-lc '<literal starting with a word>'`, and note that
+   `/tmp` in WSL does not survive a distro restart; put the script in `$HOME`.
+3. **A registry row was inserted at end-of-FILE and landed in the two-column ALLOWLIST table**, where
+   the renderer silently drops the trailing two cells. Caught by `anchor-registry`'s cell-width check.
+   ⇒ the insertion point is the last row of the **table whose header has four columns**, found by
+   locating that header — never "the last line in the file that looks like a row".
+4. **A hand sanity-check of the WSL numbers read `0.00 s` for a compile that had FAILED** — it ran
+   `dsscp` from `/tmp`, where config discovery cannot resolve, and the reading was one step from being
+   repeated as "35× faster than gcc". ★ Lane C's instrument does not have this hole: it empties the
+   run directory before every run and probes for the artifact after. **The tool was more careful than
+   the person checking it.**
+
+### ★ THE ORCHESTRATOR'S OWN BRIEFS WERE WRONG TWICE, AND BOTH WERE CAUGHT BY A LANE
+
+- It told all four lanes a registry row has **six** pipe-delimited cells. ✔It has **four** — histogram
+  over every real row: production {4: 1313}, harness {4: 572}. Lane C measured the header instead of
+  trusting the brief and said so.
+- It briefed lane A to design a config cache **that already existed**, finished and measured, in the
+  P34 lane-SEAL worktree — and the design it briefed had a correctness hole SEAL had already closed
+  (`languageReferences` means a host document's digest says nothing about its dependency). ⇒ **Step 0
+  means reading the handoff to the END, not the first screen of it.**
+
+### THE PAUSE GATE P34 LEFT, DISCHARGED BY MEASUREMENT
+
+P34 deferred the memo for an operator ruling: three tests obtain "two schemas" by loading one document
+twice, which the memo collapses. ✔Lane A measured the predicate FALSE — all 15 `schemaId()` sites in
+`src/` are a dedup, a map key or an ownership test, and every one becomes MORE correct when duplicates
+collapse; no emitter reads a schema id, so it cannot reach artifact bytes. **The only four observers
+anywhere were tests, and all four were STRENGTHENED rather than relaxed** — two now load under two
+distinct `sourceLabel`s (a key term) and keep their assertions verbatim, the death arm GAINING an
+`ASSERT_NE` it never had so it cannot go vacuously green; two changed subject to two DIFFERENT
+documents, the property the id must actually carry and one neither old form exercised.
+★ Flagged for operator VETO rather than treated as settled — per the §B-predicate rule, a lane may
+discharge a gate by measuring its predicate false **provided the measurement is recorded and the cycle
+report says so.**
+
+### ★★★ NEXT — in order, and item 1 changed underneath this block when lane E landed
+
+⚠ **THIS BLOCK WAS WRITTEN BEFORE LANE E AND ITS FIRST ITEM SAID WINDOWS WAS "the ONLY host where DSS
+loses" WITH AN 88 ms DEFICIT. THAT IS NO LONGER TRUE** — the small-compile ratio is **1.03×** and the
+multi-TU ratios are **0.47× / 0.23×**. Corrected rather than left standing, because the stale form would
+have sent the next cycle hunting a deficit that no longer exists.
+
+1. **ATTRIBUTE WHAT IS LEFT OF `[other]`, BUT AS A THROUGHPUT QUESTION, NOT A DEFICIT.** ✔MEASURED that
+   it is NOT config (split out and named this cycle) and NOT pre-`main` DLL load (`--version` is ~7 ms,
+   and `--time` starts inside `main`). ★ The one place a reference is still clearly ahead is the
+   **`large` RELEASE arm — dsscp 282.9 ms vs gcc -O2 115.0 ms (2.46×)** on a 4224-line switch-dense TU,
+   and note dsscp's own DEFAULT arm runs that subject in 221.9 ms, so **DSS's release pipeline is paying
+   61 ms for that file and needs to show what it buys.** That is a concrete, reproducible subject —
+   prefer it over a general hunt. The method is the one that just worked: **extend phase coverage over
+   the driver's own non-pipeline work** — CLI parse, artifact write, teardown — until `[other]` is
+   genuinely unaccounted rather than a lump. ⚠ **Instrument first, patch never-on-suspicion**; this cycle
+   produced four refuted hypotheses (mine: "quadratic in successors"; mine: "stat-validated cache"; the
+   tree's: "config load is I/O-dominated"; and the brief I gave lane E: "the realized runtime units reach
+   the link") and every one died on a direct measurement.
+2. **Re-verdict [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]] against the small-compile number.**
+   Its ~1.2× residual was taken on a 103-TU build that amortizes a per-invocation floor away, so it is
+   answering a different question and should say which. ⚠ **DO NOT CARRY THE "~5×" FIGURE AN EARLIER
+   DRAFT OF THIS BLOCK USED** — it descends from the host attribution this cycle refuted. The honest
+   Windows-vs-WSL same-source gap is now **93.5 ms vs 41.7 ms**, and ⚠ **even that is not a real number
+   yet, because the WSL half is a PRE-fix binary and no post-fix WSL reading has been taken.** Take that
+   reading before re-verdicting anything.
+3. **[[D-PERF-CU-POOL-SCALES-HALF-AS-WELL-AS-SEPARATE-PROCESSES]] is now one step from attributable.**
+   Its stated closing work is *"attribute the serial ~36%"* and its stated method is *"instrument first"*.
+   ✔This cycle removed config from the suspect list; ⚠ `[other]` still grows **~+8.9 ms per TU** and
+   nothing names it. That per-CU residue and this row are plausibly the same defect — 🧠INFERRED, and it
+   is exactly the kind of guess item 1's instrument would settle.
+4. **The `loadFromText` half of the config memo, DELIBERATELY NOT DONE.** ✔Its own cost is ~5 ms once per
+   distinct document per process, and doing it breaks THREE more test sites that obtain "two schemas" by
+   loading identical bytes twice — `TargetSchemaContentDigest.SameTextTwiceYieldsTheSameDigest`,
+   `ObjectFormatSchemaContentDigest.SameTextTwiceYieldsTheSameDigest`, and the ~54-call-site mutant
+   battery in `tests/test_support/mutate_target_schema.hpp`. It wants its own cycle and its own gate, not
+   a drive-by inside a 400-line change.
+5. **`Mir::isBlockAddressTaken` is still O(function) per call** (`src/mir/mir.cpp`). ✔SimplifyCfg was its
+   only caller in `src/`, so the compiler-wide cost is retired — but **a future caller re-acquires the
+   quadratic**, and the guard against that is this sentence rather than any test.
 
 ## 0.0000000000000000000000000000000000000 ★★★ CYCLE P34 — FOUR LANES, THREE ROWS CLOSED PLUS THREE BORN CLOSED, ZERO OPENED, AND THE REGISTRY SPLIT IN TWO
 

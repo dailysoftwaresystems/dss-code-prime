@@ -34,15 +34,28 @@
 #include "program/git_acquire.hpp"          // SystemGitRunner — the default git seam
 #include "program/input_resolver.hpp"
 #include "program/project_sources.hpp"  // D-AP2-SOURCES-GLOB + AP6 M4: sources[] → files
+// D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the shipped runtime's
+// content-addressed object cache — the key, the two roots, and the archive
+// sibling lookup the runtime units are compiled against.
+#include "program/runtime_object_cache.hpp"
 #include "program/target_spec.hpp"
 
+// The SHALLOW read of a language document's `language.fileExtensions` — see
+// `LanguageBlockExtensionReader`. `src/program/CMakeLists.txt` already carries
+// the PRIVATE `nlohmann_json::nlohmann_json` edge and keeps its own honest
+// include list by `grep -rn '^#include <nlohmann' src/program/`; this file is
+// the second entry that instrument reports.
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
+#include <atomic>  // the staging directory's uniqueness counter
 #include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <latch>
@@ -227,6 +240,15 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 }
 
 // Called ONCE per artifact, and ONLY after the write path reported success.
+// ★★★ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: TRUE ONLY INSIDE THE NESTED
+// BUILD THAT MATERIALISES A SHIPPED RUNTIME ARCHIVE. Declared up here because
+// its two readers sit at opposite ends of this file — `compileOneTarget`'s
+// artifact report, immediately below, and `resolveShippedRuntimeArchives`, which
+// owns it. The full argument for why it exists (without it the nested build
+// resolves its own runtime and recurses forever) is on
+// `ShippedRuntimeBuildGuard`, which is the ONLY thing that may write it.
+extern thread_local bool gCompilingShippedRuntimeUnit;
+
 void reportArtifactWritten(std::string const& targetSpec,
                            fs::path const&    outPath) {
     // Lexical only. `absolute` needs the cwd; `lexically_normal` folds the
@@ -626,14 +648,18 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // backstop that also covers a root build with no `dependsOn` at all.
     //
     // ⓘ `grammar.name()` is the language's OWN declared name (`AsmX86_64Att`),
-    // not the document stem the operator typed (`asm-x86_64-att`), and that is
-    // deliberate rather than a compromise: it is the identity THIS function
-    // actually holds, and it is the same string the driver already uses as the
-    // language identity in `CuBuildKey::languageName`. Re-deriving the
-    // document stem here would mean restating a resolution
-    // `resolveGrammarForTarget` owns — a second derivation that can disagree
-    // with the first. The message carries the actionable half either way: both
-    // declared ISA values, and where each is declared.
+    // not the document stem the operator typed (`asm-x86_64-att`), and here
+    // that is deliberate: this value is PROSE IN A DIAGNOSTIC and nothing else
+    // — it is compared against no path, no `--language` argument and no cache
+    // key, so the identity this function actually holds is the right one to
+    // print. The message carries the actionable half either way: both declared
+    // ISA values, and where each is declared.
+    //
+    // ⚠ NOT AN ARGUMENT FOR USING `name()` ANYWHERE ELSE. `CuBuildKey::
+    // languageName` used to cite this site as precedent and was corrected in
+    // cycle P36: a KEY needs an identity that is unique by construction, which
+    // the declared name is not. The rule is the USE, not the call site — a
+    // name that will be printed, versus a name that will be resolved.
     if (!crossValidateLanguageTarget(grammar, grammar.name(), **targetR,
                                      targetSpecStr, /*subject=*/{}, reporter)) {
         return std::nullopt;
@@ -732,7 +758,29 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // paths is OS-agnostic and uniformly also catches NTFS ADS. This is a NO-OP
     // for the CLI path — there `artifactName` is nullopt ⇒ the name is the source
     // STEM (always a bare filename) ⇒ always a direct child ⇒ never fires.
-    if (outPath.lexically_normal().parent_path() != outDir.lexically_normal()) {
+    //
+    // ⚠ THE "NEVER FIRES ON THE CLI PATH" CLAIM ABOVE WAS FALSE, AND THE
+    // COUNTEREXAMPLE IS ONE CHARACTER LONG. ✔MEASURED on the shipped CLI:
+    // `--output .` with a bare source stem was REFUSED —
+    //   "artifact name 'a' resolves outside the output directory '.'"
+    // — because the two sides of the comparison were normalized DIFFERENTLY.
+    // `("." / "a.o").lexically_normal()` is `a.o`, whose `parent_path()` is the
+    // EMPTY path, while `fs::path{"."}.lexically_normal()` is `.` — and `"" !=
+    // "."`, so a perfectly contained artifact read as an escape. The containment
+    // rule was right; only the basis it compared against was.
+    //
+    // ★ THE FIX IS TO DERIVE THE BASIS THROUGH THE SAME CONSTRUCTION THE
+    // ARTIFACT PATH TAKES, rather than to normalize `outDir` on its own and hope
+    // the two spellings agree. Appending a bare name and taking the parent puts
+    // both sides through the identical `operator/` + `lexically_normal()`
+    // pipeline, so they cannot disagree about how a relative, `.`-rooted or
+    // trailing-separator directory spells itself. Every escape vector the block
+    // above names still fires: a bare ".." normalizes the parent away, and a
+    // differing root-name ("D:app") makes `operator/` REPLACE `outDir` so the
+    // parents differ by root.
+    auto const containmentBasis =
+        (outDir / "dss-containment-probe").lexically_normal().parent_path();
+    if (outPath.lexically_normal().parent_path() != containmentBasis) {
         emitDriver(reporter, DiagnosticCode::D_ArtifactNameEscapesOutputDir,
                    "artifact name '" + artifactName.value_or(sourceStem)
                    + "' resolves outside the output directory '"
@@ -756,9 +804,20 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // a route that returned a path without reporting (or reported without
     // returning) would need to bypass this lambda, which is the same bypass the
     // note above already forbids.
+    // ⓘ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the REPORT is suppressed —
+    // and only the report — for the nested build that materialises a shipped
+    // runtime archive. `dsscp: artifact …` announces what the OPERATOR'S build
+    // produced; a runtime archive is an internal cache entry they never named,
+    // and printing it would make an ordinary `hello.c` claim to have written
+    // two extra artifacts on the first (cold) run and none afterwards. The
+    // RETURN VALUE is untouched, so `Program::artifactPaths()` still answers
+    // where the archive landed — which is how the cache finds the bytes to
+    // store. The `wrote` predicate remains the single owner of both facts.
     auto const reported = [&](bool wrote) -> std::optional<std::filesystem::path> {
         if (!wrote) return std::nullopt;
-        reportArtifactWritten(targetSpecStr, outPath);
+        if (!gCompilingShippedRuntimeUnit) {
+            reportArtifactWritten(targetSpecStr, outPath);
+        }
         return outPath;
     };
 
@@ -778,13 +837,42 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // merged into the image and records no import at all. The partition keeps
     // the whole spec on the dynamic side and takes only the PATH for archives,
     // so nothing is silently dropped where it would have had an effect.
+    // ── D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION: the THIRD arm
+    // of the same dispatch ────
+    //
+    // A relocatable OBJECT named on `--resolve-library` is neither a dynamic
+    // library nor an archive, and before this arm it took the dynamic path and
+    // died on `F_SectionNotFound` -- "no `.dynsym` section found" -- a message
+    // that blames a missing section when the real fact is that the dispatcher
+    // had no arm for the file's actual shape. ✔MEASURED on the shipped CLI
+    // before the arm landed.
+    //
+    // ★ THE ORDER OF THE THREE PROBES IS NOT ARBITRARY. `ar` first, because an
+    // archive's global magic is unambiguous and its members are objects (a
+    // relocatable probe must never see the container). Then the object probe,
+    // which is asked OF THE FORMAT. Dynamic last, as the residual -- keeping the
+    // pre-existing rule that an unreadable path stays dynamic so its eager
+    // open-probe fails loud rather than being silently diverted.
+    //
+    // The whole spec rides to the dynamic side; the object and archive sides
+    // take only the PATH, because a merged input records no runtime import for a
+    // STATED import name to name (D-FFI-DECLARED-IMPORT-NAME). Nothing is
+    // dropped where it would have had an effect.
     std::vector<std::filesystem::path> staticArchives;
     CompileOptions perCuOpts = compileOpts;
     {
         std::vector<ResolveLibrarySpec> dynamicLibs;
         for (auto const& lib : compileOpts.resolveLibraries) {
-            if (isArArchiveFile(lib.path)) staticArchives.push_back(lib.path);
-            else                           dynamicLibs.push_back(lib);
+            if (isArArchiveFile(lib.path)) {
+                staticArchives.push_back(lib.path);
+            } else if (isRelocatableObjectFile(lib.path, **formatR)) {
+                // Joins the SAME list a `--compile`-named object lands in --
+                // one channel, so there is one definition of what an object
+                // input means and no second engine to keep in step.
+                perCuOpts.objectInputs.push_back(lib.path);
+            } else {
+                dynamicLibs.push_back(lib);
+            }
         }
         perCuOpts.resolveLibraries = std::move(dynamicLibs);
     }
@@ -843,9 +931,19 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // code through the optimizer, which is the exact miscompile the facet
     // exists to prevent. The switch has no `default:`, so a new enumerator is a
     // COMPILE error here.
+    // ⚠ D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE: `!cus.empty()` GUARDS THE WHOLE
+    // DISPATCH, because a pipeline ENTRY TIER is a property of a SOURCE
+    // LANGUAGE and an all-object link has no source. Without the guard an
+    // `--compile a.o` under a target whose `defaultAssemblyLanguage` declares
+    // `{"rule": "root", "tier": "encode"}` — which is every target, since no
+    // `--language` is needed to link objects — reached the `Encode` arm with
+    // ZERO CUs and was refused as "a multi-CU standalone-assembly build",
+    // naming a build the operator never asked for. The grammar is still
+    // resolved and still cross-validated against the target above; it simply
+    // has nothing to say about which tier to enter when nothing is parsed.
     if (auto const rootTier =
             grammar.pipelineEntry().tierForRule(grammar.rootCursor().rule());
-        rootTier.has_value()) {
+        !cus.empty() && rootTier.has_value()) {
         switch (*rootTier) {
         case PipelineTier::Hir:
             break;   // the ordinary path below
@@ -884,6 +982,13 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             // now has an effect on both halves.
             return reported(linkAndWriteWithStaticArchives(
                 std::move(*mod),
+                // D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION: an
+                // assembly unit may name
+                // pre-assembled objects exactly as a C unit may — the `encode`
+                // tier reaches the linker through this same composition, which
+                // is why the parameter is threaded here rather than defaulted
+                // away on the route least likely to be exercised.
+                std::span<std::filesystem::path const>{perCuOpts.objectInputs},
                 std::span<std::filesystem::path const>{staticArchives},
                 // D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY: the
                 // DYNAMIC half, so a pulled member's extern can rebind to a
@@ -1019,6 +1124,51 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         std::vector<std::string>     memberNames;
         members.reserve(cuMirs.size());
         memberNames.reserve(cuMirs.size());
+        // ── D-STATICLIB-MEMBER-NAME-DERIVES-FROM-THE-FIRST-SOURCE ──────────
+        //
+        // ★★ A MEMBER IS NAMED AFTER THE SOURCE THAT PRODUCED IT, AND UNTIL
+        // NOW NONE OF THEM WAS. Every CU-derived member took the DRIVER'S
+        // `sourceStem` — `fs::path{sourceFiles.front()}.stem()`, the FIRST file
+        // of the whole command — plus its index, so ✔MEASURED before this
+        // change: `--compile u1.c u2.c --target …-staticlib` emitted `u1_0.obj`
+        // and `u1_1.obj`, and `u2.c`'s member was named after `u1`. The armap
+        // indexes members BY POSITION, so selection was never wrong; what was
+        // wrong is everything a HUMAN reads — an `ar t` listing, and every
+        // member-read refusal, which names the member and so pointed at a file
+        // that did not produce it. A diagnostic that misdirects is worse than
+        // one that says nothing.
+        //
+        // ★ THE NAME COMES FROM THE CU, NOT FROM A STEM LIST THREADED BESIDE
+        // IT. `CompilationUnit::primarySourceName()` answers from the unit's
+        // own first tree; a parallel `std::vector<std::string>` would be a
+        // second owner of that fact, and an index-parallel side list is exactly
+        // what desynchronizes without reddening anything. See the accessor.
+        //
+        // ⓘ The FALLBACK is the old behaviour and is not dead: a CU with no
+        // trees (or a hand-built one with no source buffer) can name nothing,
+        // and `sourceStem` is still the best available answer there.
+        //
+        // ⓘ UNIQUENESS is now earned rather than assumed. The old `_<i>`
+        // suffix made every multi-CU name distinct by construction; real stems
+        // do not (`a/u.c` and `b/u.c` share one), so the suffix is applied ONLY
+        // where a name would otherwise repeat — a two-source archive of
+        // DIFFERENT stems now reads `u1.obj` / `u2.obj`, and one of the SAME
+        // stem reads `u.obj` / `u_1.obj`. Applied to the CU-derived names
+        // alone: an extracted archive member and a `--compile`d object input
+        // carry the name their INPUT gave them, and renaming those would
+        // misdirect in the other direction.
+        auto const uniqueMemberName = [&memberNames](std::string base,
+                                                     std::string const& ext) {
+            auto taken = [&memberNames](std::string const& n) {
+                for (auto const& m : memberNames) if (m == n) return true;
+                return false;
+            };
+            if (!taken(base + ext)) return base + ext;
+            for (std::size_t n = 1;; ++n) {
+                std::string cand = base + "_" + std::to_string(n) + ext;
+                if (!taken(cand)) return cand;
+            }
+        };
         for (std::size_t i = 0; i < cuMirs.size(); ++i) {
             // P10: a static-archive member is the FINAL module of its own
             // artifact (nothing downstream merges it — the foreign linker
@@ -1039,14 +1189,15 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                             (*formatR)->kind(), reporter);
             if (!mod) return std::nullopt;  // back-half tier failure already reported
             members.push_back(std::move(*mod));
-            // Member file name: distinct + valid `ar` name. The armap
-            // (symbol → member index) drives a linker's member selection, so
-            // the name is cosmetic; a lone CU takes `<stem><ext>`, multiple
-            // CUs disambiguate by index.
-            memberNames.push_back(
-                cuMirs.size() == 1
-                    ? std::string{sourceStem} + memberExt
-                    : std::string{sourceStem} + "_" + std::to_string(i) + memberExt);
+            // Member file name: THIS CU's own source stem (see the block above),
+            // uniquified only where two sources share one stem.
+            std::string_view const own =
+                i < cus.size() ? cus[i].primarySourceName() : std::string_view{};
+            std::string stem = own.empty()
+                ? std::string{sourceStem}
+                : fs::path{own}.stem().string();
+            if (stem.empty()) stem = std::string{sourceStem};
+            memberNames.push_back(uniqueMemberName(std::move(stem), memberExt));
         }
         // ── D-FF1-STATICLIB-FAT-ARCHIVE: merge input static archives ──
         // When this static-library build is also handed INPUT `--resolve-library`
@@ -1073,10 +1224,233 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 memberNames.push_back(std::move(extracted->names[i]));
             }
         }
+        // ── D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION:
+        // pre-assembled OBJECT inputs become
+        //    MEMBERS of this library ─────────────────────────────────────────
+        //
+        // ⚠ THIS ARM EXISTS BECAUSE ITS ABSENCE WAS A SILENT DROP. `objectInputs`
+        // is consumed by `linkAndWriteWithStaticArchives`, and a `container:
+        // archive` build never reaches that composition — it routes here. So an
+        // object named on a static-library build would have been accepted,
+        // ignored, and the library shipped without it: rc 0, no diagnostic, a
+        // member the operator asked for simply absent. That is the exact shape
+        // the fat-archive arm above was written to avoid, and it is the reason
+        // an object input has to be answered on EVERY route that produces an
+        // artifact rather than only on the one it was first needed for.
+        //
+        // Packaged, never merged: an archive bundles objects, so each object
+        // input becomes its own member under its own file name, exactly as an
+        // extracted archive member does. CU-derived members lead, then the input
+        // archives' members, then these.
+        if (!perCuOpts.objectInputs.empty()) {
+            auto objects = readObjectInputModules(
+                std::span<std::filesystem::path const>{perCuOpts.objectInputs},
+                **targetR, **formatR, reporter);
+            if (!objects) return std::nullopt;  // fail-loud already reported
+            members.reserve(members.size() + objects->size());
+            memberNames.reserve(memberNames.size() + objects->size());
+            for (std::size_t i = 0; i < objects->size(); ++i) {
+                members.push_back(std::move((*objects)[i]));
+                memberNames.push_back(
+                    perCuOpts.objectInputs[i].filename().string());
+            }
+        }
         return reported(linkAndWriteStaticArchive(members, memberNames,
                                                   **targetR, **formatR, outPath,
                                                   reporter, imageRequest));
     }
+
+    // ── D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE: THE ALL-OBJECT LINK ─────────
+    //
+    // ★★ NO CU AT ALL, WHICH IS A LEGITIMATE BUILD AND NOT AN ERROR. `dsscp
+    // --compile a.o b.o --target …-exec` is `cc a.o b.o` — the operator gathered
+    // only pre-assembled objects, so nothing is parsed, nothing is lowered, and
+    // the whole job is the LINK. Every arm below this one starts from a lowered
+    // CU module and has nothing to start from here: the `cuMirs.size() == 1`
+    // arm does not fire, and the N>1 whole-program merge would fold ZERO
+    // modules into one and lower the empty result.
+    //
+    // ★ THE FIRST OBJECT IS ELECTED CLIENT, THE REST STAY OBJECT INPUTS. The
+    // link composition below is `[client, objects…, pulled…]`, and it needs a
+    // client to seed the archive pull with; with no CU there is no natural one,
+    // so the first object takes the role. That is a NAMING of one of the
+    // inputs, never a promotion: `linkAndWriteWithStaticArchives` merges the
+    // client and the object inputs by the same `mergeModules` that binds a
+    // sibling CU's reference, so which object holds the seat cannot change what
+    // the image contains. ⓘ It is READ HERE and the REST are passed as PATHS —
+    // one read per object, never two.
+    //
+    // ⓘ The STATIC-ARCHIVE route above already answered this case correctly on
+    // its own (zero CU-derived members, the objects packaged as members), which
+    // is why this arm is below it rather than in front of it.
+    if (cuMirs.empty()) {
+        // Fail loud rather than write an empty image. Unreachable through the
+        // shipped driver (`compileFiles`/`compileUnits` refuse an empty file
+        // list, and a gathered file that is not an object stays a source), so
+        // this is the net under a future gathering route, not a live arm.
+        if (perCuOpts.objectInputs.empty()) {
+            emitDriver(reporter, DiagnosticCode::D_EmptyInput,
+                       "nothing to compile or link for target '" + targetSpecStr
+                       + "': the build produced no compilation unit and named "
+                         "no pre-assembled object input.");
+            return std::nullopt;
+        }
+        std::span<std::filesystem::path const> const objectPaths{
+            perCuOpts.objectInputs};
+
+        // ── WHICH OBJECT HOLDS THE PROGRAM ENTRY, AND WHY IT MUST BE ASKED BY
+        //    NAME ───────────────────────────────────────────────────────────
+        //
+        // ★★★ A RELOCATABLE OBJECT CANNOT RECORD `userEntrySymbol`, AND THAT IS
+        // A FACT ABOUT THE FORMAT RATHER THAN A GAP IN THE READER. That field
+        // is a per-CU `SymbolId` — an arena-local integer minted by the compile
+        // that produced the module — and no object format has a place to put
+        // one. So a module read back from an object arrives with it unset,
+        // ✔MEASURED: before this arm `--compile u1.obj u2.obj --target
+        // …-exec` reached the entry trampoline with two functions, no
+        // `userEntrySymbol` and an empty format `entryPoint`, and failed loud
+        // with `K_SymbolUndefined`. Every ordinary build sidesteps this because
+        // its client is a CU the pipeline stamped.
+        //
+        // ★★ THE NAME IS THE FORMAT-LEVEL IDENTITY, and it is the one the merge
+        // ALREADY uses — `ModuleSymbol::name` is the cross-module match key
+        // precisely because `SymbolId` is not portable across units. Resolving
+        // the entry the same way is reuse, not a parallel mechanism.
+        //
+        // ★ THE CANDIDATE SET IS THE DECLARED INTERSECTION, not a `"main"`
+        // literal: the LANGUAGE's `entryFunctions` rows supply the names, the
+        // FORMAT's `entryVerbs` set says which of those verbs it can realize,
+        // and the format's own C decoration spells the on-binary form. That is
+        // the same two-owner intersection `entry_shape.hpp` documents and the
+        // same `applyCMangling` the merge keys on (`_main` on Mach-O, identity
+        // on ELF/PE) — so `wmain` is a candidate on a Windows image and on
+        // nothing else, with no format identity tested anywhere here.
+        //
+        // ⚠ NAME ONLY, NEVER THE SIGNATURE. The CU route intersects the
+        // signature too (`collectEntryCandidates` reads each SemanticModel);
+        // an object carries no prototype, so that half is simply not knowable
+        // here. The name+verb intersection is what the format itself can see.
+        std::vector<std::string> entryNames;
+        {
+            CSymbolDecorationScheme const scheme =
+                (*formatR)->cSymbolDecoration().scheme;
+            for (auto const& decl : grammar.semantics().declarations) {
+                for (auto const& row : decl.entryFunctions) {
+                    if (!(*formatR)->realizesEntryVerb(row.verb)) continue;
+                    std::string mangled =
+                        dss::ffi::applyCMangling(row.name, scheme);
+                    if (std::find(entryNames.begin(), entryNames.end(), mangled)
+                        == entryNames.end()) {
+                        entryNames.push_back(std::move(mangled));
+                    }
+                }
+            }
+        }
+        // Does this module DEFINE one of the candidates as a function? A
+        // `ModuleSymbol` row alone is not enough — the readers mint one for
+        // data and for section symbols too — so the row's `SymbolId` has to
+        // name an actual `AssembledFunction`, which is what the trampoline will
+        // call.
+        auto definedEntryOf =
+            [&entryNames](AssembledModule const& m) -> std::optional<SymbolId> {
+            for (auto const& ms : m.symbols) {
+                if (std::find(entryNames.begin(), entryNames.end(), ms.name)
+                    == entryNames.end()) continue;
+                for (auto const& fn : m.functions) {
+                    if (fn.symbol.v == ms.symbol.v) return ms.symbol;
+                }
+            }
+            return std::nullopt;
+        };
+
+        // ★ THE CLIENT IS THE OBJECT THAT DEFINES THE ENTRY, and the election
+        // is what makes the choice mean something. `linkAndWriteWithStaticArchives`
+        // composes `[client, objects…, pulled…]` and the client is the module
+        // whose `userEntrySymbol` survives the merge, so electing the FIRST
+        // object unconditionally would have made `--compile helper.o main.o`
+        // and `--compile main.o helper.o` two different programs.
+        //
+        // ⓘ ONE READ PER OBJECT. The probe stops at the winner and keeps its
+        // module, so the common case (`main.o` named first) reads one object
+        // here and the rest exactly once more inside the link. Object 0 is
+        // retained on the way past so the no-entry fallback costs no re-read.
+        std::optional<AssembledModule> client;
+        std::optional<AssembledModule> firstObject;
+        std::optional<SymbolId>        entrySymbol;
+        std::size_t                    clientIndex = 0;
+        for (std::size_t oi = 0; oi < objectPaths.size(); ++oi) {
+            auto one = readObjectInputModules(objectPaths.subspan(oi, 1),
+                                              **targetR, **formatR, reporter);
+            if (!one) return std::nullopt;  // fail-loud already reported
+            if (auto sym = definedEntryOf((*one)[0])) {
+                entrySymbol = sym;
+                clientIndex = oi;
+                client      = std::move((*one)[0]);
+                break;
+            }
+            if (oi == 0) firstObject = std::move((*one)[0]);
+        }
+        if (!client) {
+            // ★ NO OBJECT DEFINES AN ENTRY THE FORMAT CAN REALIZE — and when
+            // the language DID name some, that is a refusal this arm owes the
+            // operator IN ITS OWN WORDS. Falling through would reach the
+            // trampoline, whose message talks about a synthesized `sym_<id>`
+            // convention and a SymbolId encoded in the format's `entryPoint`
+            // — true of the mechanism, and about nothing the operator can act
+            // on: they named objects, and none of them has a `main`. gcc,
+            // clang and MSVC all refuse the same link naming the same fact, so
+            // this is the union's answer and not an invented strictness.
+            //
+            // ⓘ GATED ON A NON-EMPTY CANDIDATE SET. With no `--language` the
+            // resolved grammar is the target's assembly dialect, which
+            // declares no entry rows at all — there is then no claim to make
+            // about a missing `main`, and the trampoline's own single-function
+            // fallback stays the answer, unchanged.
+            if (!entryNames.empty() && (*formatR)->isImageFlavor()) {
+                std::string names;
+                for (auto const& n : entryNames) {
+                    if (!names.empty()) names += ", ";
+                    names += '\'' + n + '\'';
+                }
+                std::string objs;
+                for (auto const& p : objectPaths) {
+                    if (!objs.empty()) objs += ", ";
+                    objs += p.generic_string();
+                }
+                emitDriver(reporter, DiagnosticCode::K_SymbolUndefined,
+                           "no program entry: none of the object inputs ("
+                           + objs + ") defines a function named "
+                           + names + " — the entry name(s) language '"
+                           + std::string{grammar.configName()}
+                           + "' declares that format '"
+                           + std::string{(*formatR)->name()}
+                           + "' can enter through. An object records no entry "
+                             "of its own, so the link has nothing to call.");
+                return std::nullopt;
+            }
+            // The FIRST object is elected and left unstamped, which preserves
+            // the trampoline's own single-function fallback and, for anything
+            // else, its existing loud refusal — this arm neither invents an
+            // entry nor swallows the refusal.
+            client      = std::move(firstObject);
+            clientIndex = 0;
+        }
+        if (entrySymbol.has_value()) client->userEntrySymbol = entrySymbol;
+
+        // Everything except the elected client, IN THE OPERATOR'S ORDER.
+        std::vector<std::filesystem::path> remaining;
+        remaining.reserve(objectPaths.size() - 1);
+        for (std::size_t oi = 0; oi < objectPaths.size(); ++oi) {
+            if (oi != clientIndex) remaining.push_back(objectPaths[oi]);
+        }
+        return reported(linkAndWriteWithStaticArchives(
+            std::move(*client),
+            std::span<std::filesystem::path const>{remaining},
+            std::span<std::filesystem::path const>{staticArchives},
+            std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
+            **targetR, **formatR, outPath, reporter, imageRequest));
+    }
+
     // N==1 (the CU5 multi-file-single-CU case): lower the sole CU + link it. UNCHANGED
     // from cycle 24 in its LOWERING — routing N==1 through the merge would re-intern
     // CU0's types into a fresh host (a no-op for correctness, but extra work + a
@@ -1109,7 +1483,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // half rides along so a pulled member's extern can rebind to a library
         // the operator named (`perCuOpts` — archives already partitioned out).
         return reported(linkAndWriteWithStaticArchives(
-            std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
+            std::move(*mod),
+            std::span<std::filesystem::path const>{perCuOpts.objectInputs},
+            std::span<std::filesystem::path const>{staticArchives},
             std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
             **targetR, **formatR, outPath, reporter, imageRequest));
     }
@@ -1494,7 +1870,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // all three must answer — a route that kept the old argument list would
     // silently keep the gap for whichever builds happen to take it.
     return reported(linkAndWriteWithStaticArchives(
-        std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
+        std::move(*mod),
+        std::span<std::filesystem::path const>{perCuOpts.objectInputs},
+        std::span<std::filesystem::path const>{staticArchives},
         std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
         **targetR, **formatR, outPath, reporter, imageRequest));
 }
@@ -1575,6 +1953,28 @@ struct CuBuildKey {
     // target when the caller named one; the TARGET's own
     // `defaultAssemblyLanguage` when it did not — so `dss --compile hello.s
     // --target x86_64:… --target arm64:…` parses ONE file under TWO grammars.
+    //
+    // ⚠⚠ THE **CONFIG** NAME (`GrammarSchema::configName()`, the `.lang.json`
+    // stem), NOT `name()`. This member decides whether two targets SHARE ONE CU
+    // BUILD, so two grammars that compare equal here are handed the same parsed
+    // source. The stem is unique BY CONSTRUCTION — two documents in one
+    // `sources/` directory cannot share a filename — whereas `language.name` is
+    // a declared field under no uniqueness rule at all: two documents declaring
+    // the same name would silently MERGE two builds, and a `.s` parsed under one
+    // dialect would be compiled for the other CPU. That is the same silent
+    // miscompile TF-C74 widened this key to prevent, reachable through a
+    // one-word config edit. ✔MEASURED 2026-08-25 that the swap changes NO
+    // grouping on today's corpus: both columns are injective over the six
+    // shipped documents, so "same declared name" and "same stem" partition them
+    // identically — pinned, so it cannot quietly stop being true, by
+    // `ShippedCorpusStemsAndDeclaredNames*` in `tests/core/test_grammar_schema`.
+    //
+    // ⓘ AND THE ONE WAY THE TWO CAN STILL DISAGREE ERRS SAFELY. On a
+    // case-insensitive host, two targets declaring the SAME document under two
+    // spellings (`asm-x86_64-att` / `Asm-X86_64-Att`) resolve to one file but
+    // two stems, so this key SPLITS what `name()` would have merged: one extra
+    // identical CU build, never a shared one. Over-splitting costs time;
+    // over-merging hands one target another's parsed source.
     //
     // ⚠⚠ POPULATED UNCONDITIONALLY — READ THE NEXT SENTENCE BEFORE MOVING IT.
     // Every OTHER member of this key is populated only `if (ppEnabled)`,
@@ -1724,15 +2124,193 @@ struct CuBuildKey {
 // the caller, every input's extension has to be checked against it, and that
 // check needs the paths (see `resolveGrammarForTarget`).
 
+// ══ D-DRIVER-SHIPPED-SOURCE-RESOLUTION-COMPILES-EVERY-SHIPPED-GRAMMAR ════════
+//
+// ★★★ THE QUESTION IS ONE FIELD WIDE, SO THE READ IS ONE FIELD WIDE.
+// `resolveShippedSourceGrammar` asks every shipped language document a single
+// yes/no question — "does your `language.fileExtensions` contain this
+// extension?" — and it used to answer it by CONSTRUCTING each document's entire
+// grammar: tokens, shapes, FIRST/FOLLOW, ambiguity analysis, semantics and HIR
+// lowering, for every shipped language, on the way to compiling one `.c` file.
+//
+// ✔MEASURED at 5085664a (Windows x86_64, Debug), compiling
+// `int main(void){return 0;}` for pe64: THIRTEEN `GrammarSchema::loadShipped`
+// calls, 2,068,338 bytes of JSON, 211 ms inside `buildSchemaFromJsonText` — of
+// which exactly ONE construction was ever used to parse anything. The whole
+// corpus was built TWICE because the resolver runs once per realized shipped
+// unit and this build realizes two. The file READ across all thirteen was 1 ms
+// and path discovery 2 ms, so the cost was never I/O: it was five grammars
+// nobody asked for, built twice, thrown away.
+//
+// ⚠ A CACHE IS NOT THE FIX AND DOES NOT SUBSTITUTE FOR IT. Memoizing a load
+// makes the SECOND pointless construction cheap; the first one still happens,
+// in every process, for every shipped language. The two compose — this seam
+// stops asking, a loader memo makes any remaining ask cheap — and neither makes
+// the other redundant. ✔MEASURED in this build tree WITH the document memo
+// present: `--time` reports `build-config` runs 9 -> 3 and `load-config` runs
+// 18 -> 7 across this change alone.
+
+// ── THE ONE FIELD, READ WITHOUT BUILDING A GRAMMAR ───────────────────────────
+//
+// ★★ WHY A SHALLOW READ IS FAITHFUL AND NOT AN APPROXIMATION. In
+// `buildSchemaFromJsonText`, `GrammarSchemaData::fileExtensions` is filled from
+// the HOST document's own `language` block, and it is filled UPSTREAM of the
+// `languageReferences` merge — which folds only `shapes`, `semantics`,
+// `hirLowering` and `pipelineEntry` from a referenced document. No referenced
+// document can add, remove or rewrite an extension, and no later pass touches
+// the vector. So the array in the file IS the answer a constructed schema would
+// have given.
+//
+// ★ A SAX READER, NOT A DOM PARSE, AND THE DIFFERENCE IS THE POINT: it ABORTS
+// the instant the `language` block closes, so it reads the first few hundred
+// bytes of a 510 KB document instead of lexing all of it and building a DOM to
+// throw away. `language` is the first or second key of every shipped document;
+// one that buries it deeper still gets the RIGHT answer, just later.
+//
+// AGNOSTIC: the two strings below are SCHEMA VOCABULARY — the block and field
+// names `grammar_schema_json.cpp` reads — never a language NAME. No language
+// name is spelled anywhere in this file.
+constexpr std::string_view kLanguageBlockKey  = "language";
+constexpr std::string_view kFileExtensionsKey = "fileExtensions";
+
+class LanguageBlockExtensionReader {
+  public:
+    using number_integer_t  = nlohmann::json::number_integer_t;
+    using number_unsigned_t = nlohmann::json::number_unsigned_t;
+    using number_float_t    = nlohmann::json::number_float_t;
+    using string_t          = nlohmann::json::string_t;
+    using binary_t          = nlohmann::json::binary_t;
+
+    [[nodiscard]] std::vector<std::string> const& extensions() const noexcept {
+        return extensions_;
+    }
+
+    bool null()                             { return true; }
+    bool boolean(bool)                      { return true; }
+    bool number_integer(number_integer_t)   { return true; }
+    bool number_unsigned(number_unsigned_t) { return true; }
+    bool number_float(number_float_t, string_t const&) { return true; }
+    bool binary(binary_t&)                  { return true; }
+
+    // Only DIRECT string elements of the array are taken, which is exactly what
+    // the full loader does (`if (ext.is_string())`) — a nested array or an
+    // object inside `fileExtensions` contributes nothing on either path.
+    bool string(string_t& value) {
+        if (collecting_ && depth_ == collectDepth_) extensions_.push_back(value);
+        return true;
+    }
+
+    bool key(string_t& k) { lastKey_ = k; return true; }
+
+    bool start_object(std::size_t) {
+        ++depth_;
+        if (depth_ == 2 && lastKey_ == kLanguageBlockKey) inLanguage_ = true;
+        lastKey_.clear();
+        return true;
+    }
+
+    // ★ THE ABORT. Returning false from any SAX callback stops the parse where
+    // it stands; nlohmann reports that by returning false from `sax_parse`,
+    // which is indistinguishable from a parse error at the call site and does
+    // not need to be distinguished — see `declaredFileExtensionsOf`.
+    bool end_object() {
+        if (depth_ == 2 && inLanguage_) return false;
+        --depth_;
+        lastKey_.clear();
+        return true;
+    }
+
+    bool start_array(std::size_t) {
+        ++depth_;
+        if (!collecting_ && inLanguage_ && depth_ == 3
+            && lastKey_ == kFileExtensionsKey) {
+            collecting_   = true;
+            collectDepth_ = depth_;
+        }
+        lastKey_.clear();
+        return true;
+    }
+
+    bool end_array() {
+        if (collecting_ && depth_ == collectDepth_) collecting_ = false;
+        --depth_;
+        lastKey_.clear();
+        return true;
+    }
+
+    bool parse_error(std::size_t, std::string const&,
+                     nlohmann::detail::exception const&) {
+        return false;
+    }
+
+  private:
+    std::vector<std::string> extensions_;
+    std::string              lastKey_;
+    int                      depth_        = 0;
+    int                      collectDepth_ = 0;
+    bool                     inLanguage_   = false;
+    bool                     collecting_   = false;
+};
+
+// `doc`'s own `language.fileExtensions`, ASCII-lowercased, or an empty vector.
+//
+// ⚠ DIAGNOSTIC-FREE, exactly like `readShippedSourcesForFormat`, and for the
+// same reason: a document's HEALTH is the loader's own business, and this reads
+// documents it has no intention of loading. A file that is missing, unreadable
+// or malformed BEFORE its `language` block simply declares nothing here — which
+// is the same answer the old code reached by loading it and discarding the
+// failure, so a broken sibling document never became a claimant then and does
+// not now.
+[[nodiscard]] std::vector<std::string> declaredFileExtensionsOf(fs::path const& doc) {
+    std::ifstream in{doc, std::ios::binary};
+    if (!in) return {};
+    LanguageBlockExtensionReader reader;
+    // The return value is DELIBERATELY ignored: `false` means either "we aborted
+    // on purpose at the end of the `language` block" (the fast path, every
+    // well-formed document) or "the document is malformed". Both are answered by
+    // what the reader collected before stopping.
+    (void)nlohmann::json::sax_parse(in, &reader, nlohmann::json::input_format_t::json,
+                                    /*strict=*/false);
+    std::vector<std::string> out;
+    out.reserve(reader.extensions().size());
+    for (auto const& e : reader.extensions()) out.push_back(asciiLowerCopy(e));
+    return out;
+}
+
+// The per-invocation memo for the shipped-source units' extension⇒language
+// resolution. TWO fields, and they answer different questions:
+//
+//   * `claimantsByExtension` — WHICH language documents declare each extension.
+//     Read off the documents ONCE per invocation (the whole `sources/` corpus
+//     in one directory walk), because it is a property of the config tree, not
+//     of the file being resolved. Every additional realized unit is then a map
+//     lookup.
+//   * `grammarByName` — the grammars actually CONSTRUCTED, i.e. only the ones a
+//     realized unit is genuinely compiled under. This is the field the old
+//     signature had; it was written to after every load and never read before
+//     one, so it memoized nothing.
+//
+// `indexedDir` is the tree the index was read from, not a bool: an empty path
+// means "not built", and a DIFFERENT path rebuilds. Assuming discovery is
+// stable within one invocation would be an unstated assumption, and this is
+// cheaper than the assumption.
+struct ShippedSourceLanguageCache {
+    std::map<std::string, std::vector<std::string>>             claimantsByExtension;
+    std::map<std::string, std::shared_ptr<GrammarSchema const>> grammarByName;
+    fs::path                                                    indexedDir;
+};
+
 // Which shipped LANGUAGE claims `path`'s extension — the extension⇒language
 // resolution the shipped-source units need, and the ONE place it lives.
 //
 // ★ THIS IS WHY THERE IS NO LANGUAGE SEGMENT IN THE RUNTIME TREE AND NO UNIT
-// MANIFEST. `sources/c.lang.json` declares `"fileExtensions": [".c",
-// ".h"]`, and `.c` is claimed by that language ALONE; restating "these files are
-// C" in a path segment or a JSON key would be a second owner of a fact the
-// language configs already hold, free to drift from them the moment either side
-// is edited.
+// MANIFEST. A language document declares its own `"fileExtensions"`, and `.c`
+// is claimed by exactly one shipped language; restating "these files are C" in
+// a path segment or a JSON key would be a second owner of a fact the language
+// configs already hold, free to drift from them the moment either side is
+// edited. The same rule is why the index above is read from the DOCUMENTS on
+// every run and never written to a side file: a generated index is a second
+// owner too, and this repository treats staleness as a defect class.
 //
 // ⚠ ZERO claimants and TWO claimants both fail LOUD, and the second is not
 // hypothetical: `.s`/`.S` is claimed by BOTH shipped asm dialects, so a
@@ -1743,15 +2321,58 @@ struct CuBuildKey {
 // here. Refusing is correct today; building the arch axis now would be the
 // speculative structure the bar rules out.
 //
+// ⚠ ONE BEHAVIOUR MOVED, DELIBERATELY. "Health is the loader's own business"
+// still holds for every document this resolution does NOT choose — they are no
+// longer constructed at all, so their health cannot affect anything. It no
+// longer holds for the ONE document it DOES choose: a sole claimant that fails
+// to load now fails LOUD with the loader's own reason. The old code dropped it
+// silently and then reported "no shipped language claims the extension '.c'",
+// which is not what happened — the same misattribution class as reporting an
+// I/O failure as a missing file, and this file already refuses that one a few
+// hundred lines below.
+//
 // AGNOSTIC: no language NAME is compared against a literal — the config
 // directory supplies the candidates and the match is set membership over
 // config-declared strings.
-[[nodiscard]] std::shared_ptr<GrammarSchema const> resolveShippedSourceGrammar(
-    std::filesystem::path const& path,
-    std::map<std::string, std::shared_ptr<GrammarSchema const>>& cache,
-    DiagnosticReporter&          rep) {
-    std::string ext = path.extension().generic_string();
-    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+// ★★★ BOTH HALVES ARE RETURNED, AND THE SECOND ONE IS THE BUG FIX.
+// A language has TWO names: the one its document DECLARES (`language.name`,
+// "C") and the one the config tree is INDEXED BY (the file stem, "c"). They are
+// not required to agree and today they do not.
+//
+// ⚠⚠ AND THEY DIVERGE BY MORE THAN CASE — reading this as a case problem
+// understates the class by half. ✔MEASURED over the shipped corpus 2026-08-25:
+// of the six language documents five are nameable (the sixth, `asm`, is
+// embedded-only), and of those five, `c`→"C" and `toy`→"Toy" differ only in
+// case while `asm-arm64-gas`→"AsmArm64Gas", `asm-x86_64-att`→"AsmX86_64Att" and
+// `tsql-subset`→"TsqlSubset" differ STRUCTURALLY — the stem's hyphens are
+// absent from the declared name. Passing the declared name where a stem was
+// meant fails on EVERY host for those three: `sources/AsmArm64Gas.lang.json`
+// does not exist on NTFS either.
+//
+// ⚠ THIS RESOLVER USED TO RETURN ONLY THE GRAMMAR, so its caller had to recover
+// a name — and the only name reachable from a `GrammarSchema` is the DECLARED
+// one. The nested runtime build was therefore invoked as `--language C` and
+// looked up `sources/C.lang.json`. That is the CASE-ONLY pair, which is why it
+// reached production at all: the same file on NTFS, NO FILE on ext4. The
+// Windows gate was 1656/1656 green while the WSL leg lost 527 tests to
+// `error[C_InvalidLanguageName]`. A host-blind failure would have been caught
+// by the first gate that ran.
+// ⇒ the stem this function ALREADY derived and ALREADY loaded by is now part of
+//   its answer, so no caller can re-derive it wrongly.
+struct ShippedSourceLanguage {
+    // The name the CONFIG TREE knows this language by — the `.lang.json` stem.
+    // This is what `--language` takes and what a document path is built from.
+    std::string                          configName;
+    std::shared_ptr<GrammarSchema const> grammar;
+
+    [[nodiscard]] explicit operator bool() const { return grammar != nullptr; }
+};
+
+[[nodiscard]] ShippedSourceLanguage resolveShippedSourceGrammar(
+    fs::path const&             path,
+    ShippedSourceLanguageCache& cache,
+    DiagnosticReporter&         rep) {
+    std::string const ext = asciiLowerCopy(path.extension().generic_string());
 
     auto const sourcesDir = findShippedConfigDir("sources");
     if (!sourcesDir) {
@@ -1759,29 +2380,72 @@ struct CuBuildKey {
                    "shipped-source realization: the shipped language directory "
                    "(src/dss-config/sources) could not be located, so '"
                    + path.generic_string() + "' has no front end to compile it");
-        return nullptr;
+        return {};
     }
-    std::vector<std::string> claimants;
-    std::error_code          ec;
-    for (std::filesystem::directory_iterator it{*sourcesDir, ec}, end; it != end;
-         it.increment(ec)) {
-        if (ec) break;
-        if (!it->is_regular_file(ec)) continue;
-        std::string const leaf = it->path().filename().generic_string();
-        auto const        dot  = leaf.find(".lang.json");
-        if (dot == std::string::npos) continue;
-        std::string const name = leaf.substr(0, dot);
-        auto              g    = GrammarSchema::loadShipped(name);
-        if (!g.has_value()) continue;   // health is the loader's own business
-        for (auto const& e : (*g)->fileExtensions()) {
-            std::string lowered = e;
-            for (auto& c : lowered)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (lowered == ext) { claimants.push_back(name); break; }
+
+    if (cache.indexedDir != *sourcesDir) {
+        cache.claimantsByExtension.clear();
+        std::error_code ec;
+        for (fs::directory_iterator it{*sourcesDir, ec}, end; it != end;
+             it.increment(ec)) {
+            if (ec) break;
+            if (!it->is_regular_file(ec)) continue;
+            std::string const leaf = it->path().filename().generic_string();
+            auto const        dot  = leaf.find(".lang.json");
+            if (dot == std::string::npos) continue;
+            std::string const name = leaf.substr(0, dot);
+            for (auto const& declared : declaredFileExtensionsOf(it->path())) {
+                auto& claimants = cache.claimantsByExtension[declared];
+                // A document that declares one extension twice is ONE claimant.
+                if (std::find(claimants.begin(), claimants.end(), name)
+                    == claimants.end())
+                    claimants.push_back(name);
+            }
         }
-        cache.emplace(name, *g);
+        // Sorted so the claimant set is a property of the CORPUS and not of the
+        // host filesystem's iteration order (sorted on NTFS, hash-ordered on
+        // ext4).
+        for (auto& entry : cache.claimantsByExtension)
+            std::sort(entry.second.begin(), entry.second.end());
+        cache.indexedDir = *sourcesDir;
     }
-    if (claimants.size() == 1) return cache.at(claimants.front());
+
+    static std::vector<std::string> const kNoClaimants;
+    auto const  found = cache.claimantsByExtension.find(ext);
+    auto const& claimants =
+        found == cache.claimantsByExtension.end() ? kNoClaimants : found->second;
+
+    if (claimants.size() == 1) {
+        std::string const& name = claimants.front();
+        auto               got  = cache.grammarByName.find(name);
+        if (got == cache.grammarByName.end()) {
+            auto loaded = GrammarSchema::loadShipped(name);
+            if (!loaded.has_value()) {
+                forwardConfigDiagnostics(loaded.error(), rep);
+                emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                           "shipped-source realization: shipped language '" + name
+                           + "' is the only one that claims the extension '" + ext
+                           + "' of '" + path.generic_string()
+                           + "', but it could not be loaded — the reason is in the "
+                             "configuration diagnostic(s) above (config: "
+                             "src/dss-config/sources/" + name + ".lang.json)");
+                // Not memoized: a load failure is fatal for this run anyway, and
+                // caching it would make a future retry-after-fix answer from a
+                // stale miss — the rule `resolveGrammarForTarget` already states.
+                return {};
+            }
+            // ⓘ `loadDiagnostics()` are NOT forwarded on success here, and that
+            // is the same one-emission-per-document-per-run rule
+            // `resolveGrammarForTarget` documents: it forwards them for every
+            // language a TARGET resolves, and a shipped unit compiled under that
+            // language would otherwise report each warning a second time.
+            got = cache.grammarByName.emplace(name, *loaded).first;
+        }
+        // `name` is the STEM the index was built from and the grammar was loaded
+        // by — never `got->second->name()`, which is the declared name.
+        return {name, got->second};
+    }
+
     emitDriver(rep, DiagnosticCode::D_UnknownFileExtension,
                claimants.empty()
                    ? "shipped-source realization: no shipped language claims the "
@@ -1792,21 +2456,11 @@ struct CuBuildKey {
                          + "' of '" + path.generic_string()
                          + "', so the extension alone cannot name one — refusing "
                            "rather than guessing which front end owns this file");
-    return nullptr;
+    return {};
 }
 
-// Did this CU produce any ERROR at the tiers a CU BUILD covers (the driver's own
-// reporter + each parsed Tree's)? Used ONLY to attribute a failure to the shipped
-// unit that caused it — the diagnostics themselves are drained by the caller
-// exactly as they are for a user CU, so nothing is double-reported.
-[[nodiscard]] bool cuBuildHadErrors(CompilationUnit const& cu) {
-    if (cu.driverDiagnostics().errorCount() > 0) return true;
-    for (auto const& tree : cu.trees())
-        if (tree.diagnostics().errorCount() > 0) return true;
-    return false;
-}
-
-// ══ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — THE SHIPPED SOURCE UNITS ════
+// ══ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — THE SHIPPED RUNTIME, ════════
+//    COMPILED ONCE AND THEN READ OUT OF A CONTENT-ADDRESSED CACHE ════════════
 //
 // DSS SHIPS THE SOURCE. A descriptor's per-format `realization` map may state
 // that a symbol's body is PROVIDED by a file the compiler ships rather than
@@ -1814,117 +2468,437 @@ struct CuBuildKey {
 // exports because Windows has no POSIX directory API. This is the seam that
 // turns that declaration into a build-graph edge.
 //
-// ★★★ IT IS AN ORDINARY EXTRA TRANSLATION UNIT, AND THAT IS THE WHOLE DESIGN.
-// The shipped file is compiled FOR THE TARGET, by the same front end, into the
-// same whole-program MIR merge that a plain `cc a.c b.c` already produces; the
-// linker resolves the reference against the body exactly as it resolves any
-// sibling-CU definition. Nothing here is a new binding rule, a new lowering, or
-// a new link path — which is why it works cross, on every host, without a
-// single host-keyed line. (★MEASURED before this landed: a two-CU program
-// compiled from a Windows host for pe64 and RAN (exit 42); from a Linux host it
-// produced pe64, elf64-aarch64 and macho64-arm64 artifacts, and the aarch64 one
-// RAN under qemu, exit 42. The premise the mechanism rests on is not assumed.)
+// ★★★ THE UNIT USED TO BE AN EXTRA TRANSLATION UNIT OF EVERY BUILD, AND THAT IS
+// WHAT THIS SECTION REPLACES. ✔MEASURED 2026-08-25 on this host, Release, one
+// `int main(void){return 0;}`, the SAME binary and source with only `--target`
+// changing: pe64 took 190 ms against 79 ms for elf64 and macho64, and the whole
+// difference is the two units `realization.pe` names — PREPROCESSED AND PARSED
+// on every single invocation (`preprocess`/`parse` `runs` = 3 on pe64, 1
+// elsewhere) and then, for any program that does not reach them, DISCARDED. For
+// scale, gcc 13.2.0 compiles the same file in 95.1 ms on this host and never
+// compiles libc at all: it links a PREBUILT one. `runtime_object_cache.hpp` is
+// DSS's equivalent of that prebuilt libc, and this is where it is wired.
 //
-// ★ THE ENGINE NEVER BRANCHES ON FORMAT. `readShippedSourcesForFormat` is a map
-// lookup keyed by the active format's declared NAME; there is no `if (format ==
-// "pe")` on this path. A build for a format no descriptor realizes from source
-// gets an EMPTY list and is byte-identical to the pre-ruling driver.
+// ★★★ HIT AND MISS MUST PRODUCE THE SAME IMAGE, AND THAT IS THE PROPERTY THE
+// WHOLE SHAPE IS CHOSEN FOR. The route below is taken UNCONDITIONALLY: the
+// runtime reaches the link as a STATIC ARCHIVE whether the archive was found in
+// the cache or built one line earlier. The alternative — merge the units as CUs
+// on a miss, pull archive members on a hit — would make a cold build and a warm
+// build emit DIFFERENT code from identical inputs, so a green test could go red
+// purely by being run twice. A cache whose hit rate changes the artifact is not
+// a cache.
 //
-// ★ THE RUNTIME CU IS HERMETIC. It is built with the SYSTEM descriptor dirs and
-// the target/format predefines — and deliberately WITHOUT the user's `-I` dirs
-// and `--define`s. DSS's runtime must mean the same thing in every program that
-// links it; a user `-DNDEBUG` or a stray `-I` that shadowed a shipped header
-// would silently re-compile someone else's runtime into their binary. The same
-// choice keeps the other half of R4 true by construction: the shipped source
-// tree is never added to any include-search root, so a file there can never
-// shadow the descriptor a unit exists to consume.
+// ⚠ WHAT THIS CHANGES ABOUT THE EMITTED CODE, STATED RATHER THAN LEFT TO BE
+// DISCOVERED. The units are no longer folded into the whole-program MIR merge
+// alongside the user's CUs; they are lowered against the format's ARCHIVE
+// SIBLING and pulled back at link time by `pullStaticArchiveMembers`. So there
+// is no cross-module MIR inlining between a user function and `opendir`'s body,
+// and member selection is now by SYMBOL REFERENCE (the armap worklist) rather
+// than by "did this build resolve that descriptor". Symbol-level selection is
+// strictly the finer of the two, and it is the mechanism the cache header
+// already named: *COMPILE-ALWAYS IS NOT LINK-ALWAYS* — what is COMPILED is a
+// pure function of (target, config), what is LINKED stays demand-driven.
 //
-// ⚠ TRANSITIVE, CYCLE-SAFE. A shipped unit may itself include a header whose
-// descriptor realizes from source, so the walk is a WORK LIST over resolved
-// paths with a visited set — not a single pass. No unit does this today; the
-// walk is three lines and the alternative is an unhandled case.
-[[nodiscard]] std::vector<CompilationUnit> buildShippedSourceCus(
-    std::span<CompilationUnit const>            seedCus,
-    CuBuildKey const&                           key,
-    std::span<PredefinedMacroDef const>         targetPredefines,
-    std::span<PredefinedMacroDef const>         formatPredefines,
-    std::map<std::string, std::shared_ptr<GrammarSchema const>>& grammarCache,
-    DiagnosticReporter&                         rep) {
-    std::vector<CompilationUnit> out;
-    if (!key.format.has_value()) return out;   // no format ⇒ no realization to read
-    std::string const formatKey{objectFormatKindName(*key.format)};
+// ★ THE ENGINE NEVER BRANCHES ON FORMAT. `allShippedSourcesForFormat` is a map
+// lookup keyed by the active format's declared KIND NAME; there is no
+// `if (format == "pe")` on this path. A build for a format no descriptor
+// realizes from source gets an EMPTY list and never resolves an archive
+// sibling, a cache root or a key.
+//
+// ★ THE RUNTIME COMPILE IS HERMETIC. The nested build below is a DEFAULT
+// `Program` carrying only the build configuration — deliberately WITHOUT the
+// user's `-I` dirs, `--define`s, optimizer overrides and `--resolve-library`
+// list. DSS's runtime must mean the same thing in every program that links it;
+// a user `-DNDEBUG` or a stray `-I` that shadowed a shipped header would
+// silently compile someone else's runtime into their binary. It is also what
+// makes the cache key HONEST: the key covers (compiler, target, format,
+// sibling, config, unit bytes, descriptor bytes, loaded config documents), so
+// anything else that could change the output must not be able to reach it.
 
-    // ★★★ EVERY UNIT THIS FORMAT REALIZES, NOT ONLY THE ONES THIS BUILD
-    // INCLUDED. Compiling on demand would make the runtime object set depend on
-    // which headers a program happened to `#include`, and an object set that
-    // varies by that cannot be cached, packaged or shipped. Always-compile makes
-    // it a PURE FUNCTION OF (target, config) — which is also why `seedCus` is
-    // still scanned below: a unit may itself pull in another unit, and that edge
-    // is a property of the SOURCE, not of the corpus.
+// ★★★ THE RE-ENTRANCY GUARD, AND IT IS LOAD-BEARING RATHER THAN DEFENSIVE.
+// The runtime archive is produced by a NESTED `Program` build aimed at the
+// archive-writing SIBLING of this format — and the sibling has the SAME format
+// KIND, so `allShippedSourcesForFormat` answers that nested build with the very
+// same unit list. Without this flag the nested build would resolve its own
+// runtime archives, which would nest again, forever. With it, the nested build
+// compiles exactly ONE translation unit into exactly ONE archive member, which
+// is also what makes the stored artifact the single-member archive
+// `runtime_object_cache.hpp` documents.
+//
+// ⓘ `thread_local`, not global: the per-CU pool builds CUs concurrently, and a
+// shared flag would let one thread's nested build silence another thread's
+// legitimate resolution. It is set and cleared by `ShippedRuntimeBuildGuard`
+// below, never by hand — an early `return` or a thrown exception between the
+// two would otherwise leave the driver permanently unable to see its runtime.
+//
+// ⓘ Forward-declared beside `reportArtifactWritten`, whose suppression arm is
+// its second reader. The DEFINITION is here, with the flag it belongs to.
+thread_local bool gCompilingShippedRuntimeUnit = false;
+
+struct ShippedRuntimeBuildGuard {
+    ShippedRuntimeBuildGuard() { gCompilingShippedRuntimeUnit = true; }
+    ~ShippedRuntimeBuildGuard() { gCompilingShippedRuntimeUnit = false; }
+    ShippedRuntimeBuildGuard(ShippedRuntimeBuildGuard const&)            = delete;
+    ShippedRuntimeBuildGuard& operator=(ShippedRuntimeBuildGuard const&) = delete;
+};
+
+// One realized shipped runtime unit and EVERY descriptor that declares it.
+struct ShippedRuntimeClaim {
+    std::string              source;       // config-root-relative
+    std::vector<std::string> descriptors;  // config-root-relative, ≥1
+};
+
+// ★★★ THE DECLARING DESCRIPTORS ARE PART OF THE CACHE KEY, SO THEY MUST BE
+// ATTRIBUTED RATHER THAN ASSUMED. The unit `#include`s its descriptor's
+// declarations, so editing `struct dirent`'s layout must move the key or a
+// build links an archive compiled against the OLD layout — links clean, returns
+// silently wrong bytes, the `environ` copy-relocation class. `ffi` exposes the
+// unit list (`allShippedSourcesForFormat`) and the per-descriptor read
+// (`readShippedSourcesForFormat`) but no attribution between them, so the pairing
+// is composed here from those two exported readers.
+//
+// ⓘ THE SECOND WALK IS NOT A SECOND READ. `cachedDescriptorJson` memoizes each
+// descriptor's parsed JSON per thread, so this pass costs one directory
+// iteration and a map lookup per file — the parse was already paid by
+// `allShippedSourcesForFormat`.
+//
+// ⚠ A UNIT WITH NO ATTRIBUTED DESCRIPTOR IS A REFUSAL. It means the corpus
+// reader that produced the unit and the walk that attributes it disagree, and
+// the key would then be computed without the term the mechanism exists for.
+// `computeRuntimeObjectKey` refuses an empty set for the same reason; this
+// refusal fires FIRST because it can name the walk.
+[[nodiscard]] std::vector<ShippedRuntimeClaim>
+attributeShippedRuntimeUnits(fs::path const&     configRoot,
+                             fs::path const&     descriptorDir,
+                             std::string const&  formatKey,
+                             DiagnosticReporter& rep) {
+    std::vector<ShippedRuntimeClaim> claims;
+    auto const sources =
+        dss::ffi::allShippedSourcesForFormat(descriptorDir, formatKey);
+    if (sources.empty()) return claims;   // this format realizes nothing
+
+    std::map<std::string, std::vector<std::string>> declarers;
+    std::error_code ec;
+    fs::recursive_directory_iterator it{descriptorDir, ec};
+    if (ec) {
+        emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
+                   "shipped-source realization: the descriptor corpus at '"
+                   + descriptorDir.generic_string()
+                   + "' could not be walked (" + ec.message()
+                   + "), so the descriptor(s) declaring each shipped runtime "
+                     "unit cannot be identified — and the runtime object "
+                     "cache keys on their CONTENT (the unit includes their "
+                     "declarations). Refusing rather than keying without them.");
+        return claims;
+    }
+    for (fs::recursive_directory_iterator const end;
+         it != end;
+         it.increment(ec)) {
+        if (ec) break;
+        std::error_code typeEc;
+        if (!it->is_regular_file(typeEc) || typeEc) continue;
+        if (asciiLowerCopy(it->path().extension().generic_string()) != ".json")
+            continue;
+        auto const declared =
+            dss::ffi::readShippedSourcesForFormat(it->path(), formatKey);
+        if (declared.empty()) continue;
+        std::error_code relEc;
+        fs::path const rel = fs::relative(it->path(), configRoot, relEc);
+        // A descriptor outside the config root cannot be spelled
+        // config-root-relatively, and the key document's whole point is that it
+        // is portable between an installed tree and a source tree — so the
+        // absolute spelling is used and it is the ROOT that differs, which the
+        // key would then refuse to find. Recording the absolute path is the
+        // honest answer; `computeRuntimeObjectKey` resolves it against the root
+        // and reports the miss where it is real.
+        std::string const spelling =
+            (relEc || rel.empty()) ? it->path().generic_string()
+                                   : rel.generic_string();
+        for (auto const& source : declared)
+            declarers[source].push_back(spelling);
+    }
+
+    claims.reserve(sources.size());
+    for (auto const& source : sources) {
+        auto const found = declarers.find(source);
+        if (found == declarers.end() || found->second.empty()) {
+            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                       "shipped-source realization: object format '" + formatKey
+                       + "' realizes '" + source
+                       + "', but no descriptor under '"
+                       + descriptorDir.generic_string()
+                       + "' was found to declare it. The corpus reader and the "
+                         "descriptor walk disagree, so the runtime object "
+                         "cache key would omit the declaring descriptor's "
+                         "content — an edit to those declarations would then be "
+                         "served a stale archive. Refusing.");
+            continue;
+        }
+        claims.push_back(ShippedRuntimeClaim{source, found->second});
+    }
+    return claims;
+}
+
+// Read a whole file as bytes. Binary on every host — the cache stores exactly
+// what the writer produced, and a text-mode CR translation would make the
+// stored artifact host-dependent under a key that says it is not.
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
+readWholeBinaryFile(fs::path const& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return std::nullopt;
+    std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
+                                    std::istreambuf_iterator<char>()};
+    if (in.bad()) return std::nullopt;
+    return bytes;
+}
+
+// ── THE STAGING AREA ────────────────────────────────────────────────────────
+//
+// A cache MISS compiles the unit somewhere before it can be stored, because
+// `storeRuntimeObject` takes BYTES and owns its own write-temp-then-rename (the
+// sidecar-first ordering is a crash-safety property, so the store cannot be
+// handed a directory to compile into). This is that somewhere.
+//
+// ★ IT IS ALSO THE FALLBACK THE BUILD LINKS WHEN THE STORE CANNOT WRITE. That
+// is what keeps the cache an OPTIMIZATION rather than a correctness dependency:
+// an unwritable cache root costs a note and a recompile next time, never a
+// failed build. The bytes are right either way — they were just produced.
+class RuntimeArchiveStaging {
+public:
+    // EMPTY until first use. A build that hits in the cache for every unit —
+    // the steady state — never creates a directory at all.
+    [[nodiscard]] fs::path const& dir() {
+        if (!dir_.empty()) return dir_;
+        std::error_code    ec;
+        fs::path const     base = fs::temp_directory_path(ec);
+        if (ec) return dir_;   // still empty ⇒ the caller reports the failure
+        static std::atomic<unsigned> counter{0u};
+        for (unsigned attempt = 0; attempt < 64u; ++attempt) {
+            fs::path candidate =
+                base / std::format("dsscp-runtime-{:016x}-{}",
+                                   static_cast<std::uint64_t>(
+                                       std::chrono::steady_clock::now()
+                                           .time_since_epoch().count()),
+                                   counter.fetch_add(1u));
+            std::error_code mkEc;
+            // `create_directory` (not `create_directories`) returns FALSE for a
+            // path that already existed, which is exactly the uniqueness probe
+            // this loop needs — `create_directories` would happily adopt
+            // somebody else's directory and two builds would share a staging
+            // area.
+            if (fs::create_directory(candidate, mkEc) && !mkEc) {
+                dir_ = std::move(candidate);
+                return dir_;
+            }
+        }
+        return dir_;   // empty
+    }
+
+    ~RuntimeArchiveStaging() {
+        if (dir_.empty()) return;
+        std::error_code ec;
+        fs::remove_all(dir_, ec);   // best-effort: a leaked temp dir is not a
+                                    // build failure, and on Windows a file the
+                                    // linker still has open cannot be unlinked.
+    }
+
+    RuntimeArchiveStaging()                                        = default;
+    RuntimeArchiveStaging(RuntimeArchiveStaging const&)            = delete;
+    RuntimeArchiveStaging& operator=(RuntimeArchiveStaging const&) = delete;
+
+private:
+    fs::path dir_;
+};
+
+// ★★ THE OPERATIONAL NOTE CHANNEL — `std::cerr`, beside `dsscp: artifact …`,
+// and NOT a `D_*` diagnostic. A cache that could not be written is a statement
+// about this MACHINE (an unwritable root, a full disk, a scrubbed environment),
+// not about the program being compiled: it has no source position, no buffer
+// and no band, and routing it through the diagnostic reporter would let
+// `--warnings-as-errors` turn a full disk into a compile error. It is still
+// LOUD — `runtime_object_cache.hpp`'s standing rule is that a mechanism which
+// silently does nothing is worse than one that fails, and every later build
+// re-emitting this line is the intended behaviour, not noise to be suppressed.
+void reportRuntimeCacheNote(std::string_view text) {
+    std::cerr << "dsscp: note: " << text << '\n';
+}
+
+// Append the documents a loaded schema is a function of: the document itself,
+// plus every OTHER document its loader folded in (`languageReferences` and
+// friends). Asked of the LOADER, never hand-listed — the header's rule, and the
+// first hand-written list in this mechanism's history was already wrong.
+void appendSchemaDocuments(
+    std::vector<dss::runtime::LoadedConfigDocument>& out,
+    std::string_view                                 label,
+    std::string                                      path,
+    std::string_view                                 digest,
+    std::span<detail::ConfigDocumentDependency const> referenced,
+    fs::path const&                                  configRoot) {
+    out.push_back(dss::runtime::LoadedConfigDocument{
+        std::string{label}, std::move(path), std::string{digest}});
+    for (auto const& dep : referenced) {
+        std::error_code relEc;
+        fs::path const  rel = fs::relative(fs::path{dep.path}, configRoot, relEc);
+        out.push_back(dss::runtime::LoadedConfigDocument{
+            std::string{label} + "-ref",
+            (relEc || rel.empty()) ? dep.path : rel.generic_string(),
+            dep.digest});
+    }
+}
+
+// ══ THE ONE SEAM ═════════════════════════════════════════════════════════════
+//
+// Every shipped runtime archive this (target, format, config) needs, as paths a
+// static link can pull members from. Cached entries are returned as they lie;
+// misses are compiled, stored, and returned from the staging area.
+//
+// Returns an EMPTY vector for every build that realizes nothing — which is
+// every target of every format kind no descriptor declares a `realization` for,
+// and is byte-identical to the pre-cache driver.
+[[nodiscard]] std::vector<fs::path> resolveShippedRuntimeArchives(
+    std::string const&          targetSpec,
+    TargetSchema const&         target,
+    ObjectFormatSchema const&   buildFormat,
+    ObjectFormatKind            formatKind,
+    GrammarSchema const&        buildGrammar,
+    ShippedSourceLanguageCache& grammarCache,
+    CompileConfig               config,
+    RuntimeArchiveStaging&      staging,
+    DiagnosticReporter&         rep) {
+    std::vector<fs::path> archives;
+    // The nested build is aimed at THIS format's archive sibling, which shares
+    // its KIND — so without this it would resolve the same unit list and nest
+    // forever. See `gCompilingShippedRuntimeUnit`.
+    if (gCompilingShippedRuntimeUnit) return archives;
+
     auto const descriptorDir = findShippedConfigDir("shippedLibs");
+    if (!descriptorDir) return archives;   // no corpus ⇒ nothing realized
 
-    // ★★ TWO SETS, AND THE DISTINCTION IS THE RULING'S: COMPILE-ALWAYS IS NOT
-    // LINK-ALWAYS.
-    //
-    // `pending` is everything this FORMAT realizes from source, read off the
-    // CORPUS — every such unit is COMPILED on every build of this (target,
-    // config), whether or not this program includes its header. On-demand
-    // COMPILATION would make the runtime object set depend on which headers
-    // somebody happened to `#include`, and a set that varies by that cannot be
-    // cached, packaged or shipped; always-compile makes it a PURE FUNCTION OF
-    // (target, config). It also means a runtime unit that stops compiling is
-    // caught by EVERY build of that target, not only by the one program that
-    // still uses it.
-    //
-    // `demanded` is the subset this program actually reached — the units named
-    // by descriptors its own CUs resolved, transitively. Only those are RETURNED
-    // into the build graph, so a `hello.c` on pe64 carries no directory-walking
-    // code it never calls. (★MEASURED before the split existed: it did —
-    // `hello.exe` carried `_wfindfirst64i32`, `_wfindnext64i32`, `_findclose` and
-    // `MultiByteToWideChar`.)
-    std::vector<std::string>        pending;
-    std::unordered_set<std::string> seen;
-    std::unordered_set<std::string> demanded;
-    if (descriptorDir)
-        for (auto&& rel : dss::ffi::allShippedSourcesForFormat(*descriptorDir,
-                                                               formatKey))
-            if (seen.insert(rel).second) pending.push_back(std::move(rel));
-    // A unit reached from a CU this build parsed is DEMANDED. Seeded from the
-    // user's CUs and re-run over each runtime CU, because a unit may itself
-    // include a header whose descriptor realizes from source — that edge is a
-    // property of the SOURCE, not of the corpus, so it can only be learned by
-    // parsing. Cycle-safe by `seen`.
-    auto harvest = [&](std::span<CompilationUnit const> cus, bool markDemanded) {
-        for (auto const& cu : cus)
-            for (auto const& ref : cu.shippedLibDescriptors())
-                for (auto&& rel : dss::ffi::readShippedSourcesForFormat(ref.path,
-                                                                        formatKey)) {
-                    if (markDemanded) demanded.insert(rel);
-                    if (seen.insert(rel).second) pending.push_back(std::move(rel));
-                }
-    };
-    harvest(seedCus, /*markDemanded=*/true);
+    // `findShippedConfigDir` returns `<configRoot>/<sub>`, so the root is its
+    // parent. Derived rather than re-walked: two walks could answer with two
+    // different trees on a host that has more than one checkout, which is the
+    // D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE shape.
+    fs::path const    configRoot = descriptorDir->parent_path();
+    std::string const formatKey{objectFormatKindName(formatKind)};
 
-    while (!pending.empty()) {
-        std::string const rel = std::move(pending.back());
-        pending.pop_back();
-        auto const resolved = dss::ffi::resolveShippedSource(rel);
+    auto const claims = attributeShippedRuntimeUnits(configRoot, *descriptorDir,
+                                                     formatKey, rep);
+    if (claims.empty()) return archives;
+
+    // ── THE ARCHIVE SIBLING: the format that WRITES the bytes ────────────────
+    // Reached through the production lookup, which scans every candidate and
+    // refuses on 0 or >1 rather than taking a first match — `directory_iterator`
+    // is sorted on NTFS and hash-ordered on ext4, so first-match would let the
+    // filesystem decide which format compiled the runtime.
+    auto const objectFormatsDir = findShippedConfigDir("object-formats");
+    if (!objectFormatsDir) {
+        emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                   "shipped-source realization: object format '" + formatKey
+                   + "' realizes " + std::to_string(claims.size())
+                   + " shipped runtime unit(s), but the shipped object-format "
+                     "directory (src/dss-config/object-formats) could not be "
+                     "located, so the archive-writing sibling that compiles "
+                     "them cannot be resolved.");
+        return archives;
+    }
+    auto const siblingName = dss::runtime::resolveArchiveSiblingFormat(
+        buildFormat, target, *objectFormatsDir,
+        dss::runtime::kRuntimeCacheSiblingRequester);
+    if (!siblingName.has_value()) {
+        emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed, siblingName.error());
+        return archives;
+    }
+    auto const siblingSchema = ObjectFormatSchema::loadShipped(*siblingName);
+    if (!siblingSchema.has_value()) {
+        emitObjectFormatSchemaLoadFailed(rep, siblingSchema.error(),
+                                         *siblingName);
+        return archives;
+    }
+
+    auto const parsedSpec = TargetSpec::parse(targetSpec);
+    if (!parsedSpec.has_value()) {
+        // Unreachable from the driver — every spec parsed in the pre-flight
+        // above — but stated rather than assumed: this function composes a NEW
+        // spec from the target half, and composing one out of an unparsed
+        // string is how a nested build silently aims somewhere else.
+        emitDriver(rep, DiagnosticCode::D_InvalidTargetSpec,
+                   "shipped-source realization: the target spec '" + targetSpec
+                   + "' does not parse, so the archive-sibling spec the runtime "
+                     "units compile under cannot be composed.");
+        return archives;
+    }
+    std::string const siblingSpec = parsedSpec->targetName + ":" + *siblingName;
+
+    // ── THE CONFIG DOCUMENTS THIS BUILD ALREADY LOADED ──────────────────────
+    // Asked of the loaders, which retain a digest of the bytes they read, so
+    // this term costs the hash alone and never a re-walk of src/dss-config
+    // (✔MEASURED at ~165 ms per invocation, I/O-dominated).
+    //
+    // ⓘ THE TARGET AND FORMAT ROWS PASS AN EMPTY DEPENDENCY SPAN BECAUSE
+    // NEITHER LOADER HAS ONE — ✔MEASURED 2026-08-25, `referencedDocuments()`
+    // exists on `GrammarSchema` alone, which is the only loader that folds other
+    // documents in (`languageReferences`). This is a statement about those
+    // loaders and not a decision taken here: the day a target or format document
+    // grows a reference, its loader grows the accessor, and the argument in
+    // `LoadedConfigDocument`'s docblock — *the set must be ASKED of the loaders,
+    // never hand-listed* — makes wiring it up the obvious edit. A hand-written
+    // list of what a target document might include would be the drift this whole
+    // term exists to avoid.
+    // ⚠ `configDocumentPath()`, NOT a path composed from `name()` — the stem the
+    // config tree is INDEXED by, never the name the document DECLARES. Three of
+    // the six shipped languages declare a name that is not a file stem at all
+    // (`asm-arm64-gas` → "AsmArm64Gas"), and one more differs only in case
+    // (`c` → "C") — that last is the pair a case-insensitive host cannot see.
+    // See `GrammarSchema::configName`.
+    //
+    // ⓘ THERE IS NO EMPTY-NAME REFUSAL HERE, AND ITS DELETION IS DELIBERATE
+    // (cycle P36). One stood here and could not fire: `buildGrammar` reaches
+    // this function only from `resolveGrammarForTarget`, whose every arm is
+    // `GrammarSchema::loadShipped` → `loadFromFile` → `loadFromText(text,
+    // "<…>/<stem>.lang.json")`, and ✔MEASURED over `src/` there is no
+    // production caller of `GrammarSchema::loadFromText` at all — only tests,
+    // which cannot reach this internal function. It also guarded the wrong
+    // thing: this term is the LABEL half of the key line
+    // `doc=<label>:<path>:<digest>`, so a wrong label cannot serve a stale
+    // object, while the refusal failed the whole build. The property it wanted
+    // now lives where it can be exercised — `configDocumentPath()` is total,
+    // and BOTH its arms are driven directly in `tests/core/test_grammar_schema`.
+    std::vector<dss::runtime::LoadedConfigDocument> baseDocuments;
+    appendSchemaDocuments(baseDocuments, "language",
+                          buildGrammar.configDocumentPath(),
+                          buildGrammar.contentDigest(),
+                          buildGrammar.referencedDocuments(), configRoot);
+    appendSchemaDocuments(baseDocuments, "target",
+                          "targets/" + parsedSpec->targetName + ".target.json",
+                          target.contentDigest(), {}, configRoot);
+    appendSchemaDocuments(baseDocuments, "format",
+                          "object-formats/" + std::string{buildFormat.name()}
+                              + ".format.json",
+                          buildFormat.contentDigest(), {}, configRoot);
+    appendSchemaDocuments(baseDocuments, "sibling-format",
+                          "object-formats/" + *siblingName + ".format.json",
+                          (*siblingSchema)->contentDigest(), {}, configRoot);
+
+    for (ShippedRuntimeClaim const& claim : claims) {
+        auto const resolved = dss::ffi::resolveShippedSource(claim.source);
         if (!resolved.resolved()) {
             // R1's descriptor-read-time refusal owns the diagnostic and has
-            // already fired by the time we get here (the semantic phase read the
-            // descriptor). This arm exists so a discovery failure cannot silently
-            // drop a body: it says so, in the driver's own voice.
+            // already fired by the time we get here. This arm exists so a
+            // discovery failure cannot silently drop a body: it says so, in the
+            // driver's own voice.
             // ★ THE CODE FOLLOWS THE FINDING, because `D_FileNotFound` is itself
-            // a claim. An I/O failure is not a missing file, and reporting one as
-            // the other is what sent a reader hunting for `unistd.c` while it sat
-            // in place (✔MEASURED 2026-08-25 under concurrent gate load).
+            // a claim. An I/O failure is not a missing file, and reporting one
+            // as the other is what sent a reader hunting for `unistd.c` while it
+            // sat in place (✔MEASURED 2026-08-25 under concurrent gate load).
             emitDriver(rep,
                        dss::ffi::diagnosticCodeForShippedSourceLookup(resolved),
                        "shipped-source realization: a descriptor this build "
-                       "resolved names '" + rel
+                       "resolved names '" + claim.source
                        + "' for object format '" + formatKey + "', but "
-                       + dss::ffi::describeShippedSourceLookup(resolved, rel)
-                       + " — the program would link against a symbol with no body");
+                       + dss::ffi::describeShippedSourceLookup(resolved,
+                                                               claim.source)
+                       + " — the program would link against a symbol with no "
+                         "body");
             continue;
         }
         // ★ THE LANGUAGE COMES FROM THE EXTENSION, through the SAME mechanism
@@ -1932,64 +2906,234 @@ struct CuBuildKey {
         // language, so no manifest, no path segment and no driver-side literal
         // states it a second time. An extension NO language claims, or one that
         // TWO claim (`.s`/`.S`, claimed by both asm dialects), fails LOUD rather
-        // than picking — that ambiguity is a real future fork for a hand-written
-        // assembly runtime unit, and it needs the ARCH rather than the language,
-        // so it is refused here instead of guessed.
-        auto const langGrammar =
-            resolveShippedSourceGrammar(resolved.path, grammarCache, rep);
-        if (!langGrammar) continue;
-
-        CompilationUnit cu = substrate::callOnLargeStack(
-            substrate::kDeepRecursionStackBytes, [&] {
-                UnitBuilder builder{langGrammar, DiagnosticBudget{rep.config()}};
-                applySystemDirs(builder, *langGrammar);
-                builder.setActiveFormat(*key.format);
-                builder.setHeaderNameMatching(key.headerNameMatching);
-                builder.setTargetPredefinedMacros(
-                    {targetPredefines.begin(), targetPredefines.end()});
-                builder.setFormatPredefinedMacros(
-                    {formatPredefines.begin(), formatPredefines.end()});
-                builder.addFile(resolved.path);
-                return std::move(builder).finish();
-            });
-        // ★★★ A RUNTIME UNIT THAT DOES NOT COMPILE FAILS THE BUILD *HERE*,
-        // NAMING THE UNIT, THE FORMAT AND THE TARGET — it is never skipped.
+        // than picking.
         //
-        // Skipping would produce a GREEN BUILD THAT DIES IN THE USER'S HANDS:
-        // [[D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD]] is OPEN, so an undefined EXEC
-        // symbol currently yields rc=0 at link and a runtime exit-127 rather than
-        // a link error. A silently-dropped runtime body would therefore ship as a
-        // successful build of a program that cannot run, which is the exact
-        // failure class this whole mechanism exists to close. The per-CU
-        // diagnostics are drained by the caller either way; this adds the sentence
-        // that says WHICH shipped unit was being compiled, because a parse error
-        // in a file the user never wrote is otherwise unattributable.
-        if (cuBuildHadErrors(cu)) {
-            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
-                       "shipped-source realization: the shipped runtime unit '"
-                       + rel + "' (declared by a shipped-lib descriptor's "
-                         "'realization." + formatKey + "') FAILED TO COMPILE for "
-                         "target '" + key.targetName + ":" + key.formatName
-                       + "'. The build stops here rather than continuing without "
-                         "its body — a missing runtime body links clean and dies "
-                         "at run time.");
+        // ⚠ RESOLVED ON THE HIT PATH TOO, AND THAT IS NOT WASTE. The grammar
+        // that compiles the unit is an INPUT to the archive, so its digest
+        // belongs in the key: skip it on a hit and an edit to `c.lang.json`
+        // would be served an archive built by the previous grammar whenever the
+        // user's own file is not also C. The loads are memoized in-process and
+        // the claim index is memoized in `grammarCache`, so the common case —
+        // a `.c` user file — costs a map lookup.
+        auto const unitGrammar =
+            resolveShippedSourceGrammar(resolved.path, grammarCache, rep);
+        if (!unitGrammar) continue;   // already diagnosed
+
+        dss::runtime::RuntimeObjectRequest request;
+        request.configRoot        = configRoot;
+        request.descriptorPaths   = claim.descriptors;
+        request.sourcePath        = claim.source;
+        request.targetSpec        = targetSpec;
+        request.buildFormatName   = std::string{buildFormat.name()};
+        request.siblingFormatName = *siblingName;
+        request.configName        = std::string{compileConfigName(config)};
+        request.loadedDocuments   = baseDocuments;
+        // ⚠ THE GRAMMAR ANSWERS FOR ITS OWN DOCUMENT PATH — never a second
+        // composition from `unitGrammar.configName` here and a third somewhere
+        // else. The path must be the one that EXISTS (`sources/c.lang.json`),
+        // and the declared name is "C". `resolveShippedSourceGrammar` loaded
+        // this grammar BY that stem, so the two agree by construction; asking
+        // the schema is what keeps them agreeing. See `ShippedSourceLanguage`.
+        appendSchemaDocuments(request.loadedDocuments, "unit-language",
+                              unitGrammar.grammar->configDocumentPath(),
+                              unitGrammar.grammar->contentDigest(),
+                              unitGrammar.grammar->referencedDocuments(),
+                              configRoot);
+
+        auto const key = dss::runtime::computeRuntimeObjectKey(request);
+        if (!key.has_value()) {
+            // NOT degraded to "compile it uncached". A key that cannot be
+            // computed means an INPUT could not be read or a loader reported a
+            // digest this mechanism does not recognise — the cache would be
+            // serving keys it cannot verify, and the same unreadable input is
+            // about to be handed to the front end anyway.
+            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed, key.error());
+            continue;
         }
-        // A DEMANDED unit's own includes are demanded too; a compiled-but-unused
-        // unit's are not, so scanning it must not drag its dependencies into the
-        // image.
-        bool const isDemanded = demanded.contains(rel);
-        harvest({&cu, 1}, /*markDemanded=*/isDemanded);
-        if (isDemanded) out.push_back(std::move(cu));
+
+        auto const hit = dss::runtime::lookupRuntimeObject(*key);
+        if (!hit.has_value()) {
+            // ⛔ AN UNVERIFIABLE ENTRY IS A REFUSAL, NOT A MISS, and this is the
+            // one place the wiring deliberately does NOT degrade. An artifact
+            // whose `.key` sidecar is absent, unreadable or different is an
+            // entry that cannot be shown to be this key's — the exact state the
+            // 16-character path index would otherwise make un-detectable — and
+            // treating it as a miss would restore the un-verified behaviour by
+            // the back door. The message names the file and the remedy.
+            //
+            // ⓘ `D_FileReadFailed` is the CLOSEST code the driver band carries,
+            // not an exact one: it fits "the sidecar could not be read" and is
+            // stretched over "it is absent" and "it differs". Nothing is lost to
+            // a READER — the message carries the path, the 16-character index,
+            // the full identity digest, the remedy and the anchor. What an exact
+            // code would buy is FILTERABILITY, and minting one is an enumerator
+            // in `core/types/parse_diagnostic.hpp`.
+            emitDriver(rep, DiagnosticCode::D_FileReadFailed, hit.error());
+            continue;
+        }
+        if (hit->has_value()) {
+            archives.push_back(**hit);
+            continue;
+        }
+
+        // ── A MISS: compile the unit into its own single-member archive ──────
+        fs::path const& stagingRoot = staging.dir();
+        if (stagingRoot.empty()) {
+            emitDriver(rep, DiagnosticCode::D_OutputDirCreateFailed,
+                       "shipped-source realization: no staging directory could "
+                       "be created under the system temporary directory, so "
+                       "the shipped runtime unit '" + claim.source
+                       + "' cannot be compiled for target '" + siblingSpec
+                       + "'. The build stops here rather than continuing "
+                         "without its body — a missing runtime body links clean "
+                         "and dies at run time.");
+            continue;
+        }
+        // A FRESH directory per unit. The artifact assertion below then means
+        // "THIS compile wrote it" rather than "a file with that name exists":
+        // a leftover from an earlier unit cannot stand in for one that was
+        // never produced.
+        fs::path const unitDir =
+            stagingRoot / fs::path{claim.source}.stem();
+        std::error_code mkEc;
+        fs::create_directories(unitDir, mkEc);
+        if (mkEc && !fs::is_directory(unitDir)) {
+            emitDriver(rep, DiagnosticCode::D_OutputDirCreateFailed,
+                       "shipped-source realization: could not create the "
+                       "staging directory '" + unitDir.generic_string()
+                       + "' for shipped runtime unit '" + claim.source
+                       + "': " + mkEc.message());
+            continue;
+        }
+
+        int rc = 1;
+        {
+            // ★ THE NESTED BUILD IS THE PRODUCTION WRITER, NOT A SECOND ONE.
+            // It is the same `Program` → `compileOneTarget` → static-archive
+            // arm every `--target …-staticlib` build takes, which is why the
+            // shipped-runtime compile GATE
+            // (`tests/program/test_shipped_runtime_compiles`) is a real control
+            // over this path: it drives the identical call for every declared
+            // unit × machine × config.
+            ShippedRuntimeBuildGuard const guard;
+            Program                        runtimeProgram;
+            runtimeProgram.setOutputDir(unitDir);
+            runtimeProgram.setCompileConfig(config);
+            // POLICY inherited (suppress / overrides / warnings-as-errors), CAP
+            // and DEDUP relaxed — the same split the per-target scratch
+            // reporter uses, and for the same reason: the run-wide limits are
+            // enforced once at the destination.
+            auto nestedCfg           = rep.config();
+            nestedCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
+            nestedCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
+            nestedCfg.dedupWindow    = 0;
+            DiagnosticReporter nested{nestedCfg};
+            // ⚠ `configName`, NOT `grammar->name()`. This string is a
+            // `--language` argument, so it must be the name the CONFIG TREE is
+            // indexed by. For C the declared name resolved
+            // `sources/C.lang.json` — the same file on a case-insensitive host
+            // and none at all on Linux — and for the three shipped languages
+            // whose declared name is not a stem at all (`AsmArm64Gas`,
+            // `AsmX86_64Att`, `TsqlSubset`) it resolves to nothing ANYWHERE.
+            // See `ShippedSourceLanguage`.
+            rc = runtimeProgram.compileFiles(
+                std::vector<std::string>{resolved.path.string()},
+                unitGrammar.configName,
+                std::vector<std::string>{siblingSpec}, nested);
+            // ★★★ A RUNTIME UNIT THAT DOES NOT COMPILE FAILS THE BUILD *HERE*,
+            // NAMING THE UNIT, THE FORMAT AND THE TARGET — it is never skipped.
+            // Skipping would produce a GREEN BUILD THAT DIES IN THE USER'S
+            // HANDS: [[D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD]] is OPEN, so an
+            // undefined EXEC symbol currently yields rc=0 at link and a runtime
+            // exit-127 rather than a link error.
+            if (rc != 0 || nested.hasErrors()) {
+                emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                           "shipped-source realization: the shipped runtime "
+                           "unit '" + claim.source
+                           + "' (declared by a shipped-lib descriptor's "
+                             "'realization." + formatKey + "') FAILED TO "
+                             "COMPILE for target '" + siblingSpec
+                           + "' (the archive-writing sibling of '"
+                           + std::string{buildFormat.name()}
+                           + "'). The build stops here rather than continuing "
+                             "without its body — a missing runtime body links "
+                             "clean and dies at run time. The reason is in the "
+                             "diagnostic(s) above.");
+                rc = 1;
+            }
+            if (rc == 0) {
+                // The producer answers where it wrote — never a second copy of
+                // the `<outputDir>/<stem><ext>` formula, which is exactly the
+                // drift `Program::artifactPaths()` exists to remove.
+                auto const& written = runtimeProgram.artifactPaths();
+                if (written.size() != 1u || !written.front().has_value()) {
+                    emitDriver(rep, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
+                               "internal: the shipped runtime unit '"
+                               + claim.source
+                               + "' compiled with rc=0 for '" + siblingSpec
+                               + "' but reported no artifact path — a success "
+                                 "that produced nothing.");
+                    rc = 1;
+                } else {
+                    archives.push_back(*written.front());
+                }
+            }
+        }
+        if (rc != 0) continue;
+
+        // ── STORE IT, AND A FAILURE TO STORE IS A NOTE ──────────────────────
+        // The archive the link will pull from is already on disk in the staging
+        // area and it is already in `archives`, so nothing below can change
+        // WHAT this build produces — only whether the NEXT build has to repeat
+        // the compile. That is what makes the cache an optimization: an
+        // unwritable root, a full disk or an environment with no HOME costs a
+        // line on stderr, never a build.
+        auto const bytes = readWholeBinaryFile(archives.back());
+        if (!bytes.has_value()) {
+            reportRuntimeCacheNote(
+                "the shipped runtime archive '" + archives.back().generic_string()
+                + "' could not be read back, so it was not added to the runtime "
+                  "object cache; this build links it from the staging area and "
+                  "the next build will compile it again.");
+            continue;
+        }
+        auto const stored = dss::runtime::storeRuntimeObject(
+            *key, std::span<std::uint8_t const>{bytes->data(), bytes->size()});
+        if (!stored.has_value()) {
+            reportRuntimeCacheNote(stored.error());
+            continue;
+        }
+        // ★ THE STORED COPY REPLACES THE STAGING COPY IN THE LINK INPUTS, so a
+        // hit and a miss link the same FILE and not merely the same bytes. The
+        // staging area is torn down at the end of the build; the cache entry is
+        // not, and pointing the link at the durable copy removes any question
+        // about which of the two the artifact was actually built from.
+        archives.back() = *stored;
     }
-    return out;
+    return archives;
 }
 
 int runCusToTargets(
+    // ★★ D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE: THE FIRST PARAMETER IS THE
+    // FILE LIST TO BUILD, AND IT IS A PARAMETER RATHER THAN A CAPTURE FOR ONE
+    // REASON. This closure used to be BOUND to `sourceFiles` by whichever
+    // entry point created it (`compileFiles` / `compileUnits`), so by the time
+    // this function could ask a FORMAT whether a gathered file is a
+    // pre-assembled object, the decision of what to parse had already been
+    // made and could not be revisited without a second list travelling beside
+    // the first. Passing the list makes THIS function the single owner of
+    // "which gathered files become compilation units" — which is where the
+    // partition below already lives — and removes the parallel-list shape
+    // entirely rather than threading one through.
     std::function<std::vector<CompilationUnit>(
         CuBuildKey const&, std::span<PredefinedMacroDef const>,
         std::span<PredefinedMacroDef const>,
-        std::shared_ptr<GrammarSchema const> const&)> buildCus,
+        std::shared_ptr<GrammarSchema const> const&,
+        std::span<std::string const>)> buildCus,
     std::shared_ptr<GrammarSchema const> const& explicitGrammar,
+    // ⚠ EVERY gathered file, sources AND objects. The partition below splits
+    // it; `sourceStem` is still derived from `front()` by the caller, which is
+    // right — an all-object `--compile a.o` names its image after `a`.
     std::vector<std::string> const&             sourceFiles,
     std::string const&                          sourceStem,
     std::vector<std::string> const&             targets,
@@ -2189,6 +3333,63 @@ int runCusToTargets(
         return 1;
     }
 
+    // ── D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE: PARTITION THE GATHERED FILES
+    //    INTO SOURCES AND PRE-ASSEMBLED OBJECTS, BEFORE ANY OF THEM IS PARSED ─
+    //
+    // ★★★ THE STANDING RULING IS THAT `--project`, `--directory` AND
+    // `--compile` ARE DIFFERENT WAYS TO GATHER THE FILES TO BE COMPILED AND
+    // NEVER DIFFERENT COMPILERS. A relocatable object was nameable on
+    // `--resolve-library` and on NO gathering route, which is precisely that
+    // asymmetry: ✔MEASURED on the shipped CLI before this pass, `--compile u1.c
+    // objs/u2.obj` produced a cascade of `P000E illegal character 0x01` from
+    // the TOKENIZER — the object had been handed to the front end — while
+    // `--compile u1.c --resolve-library objs/u2.obj` built an exe that RAN and
+    // returned 42.
+    //
+    // ★★ IT LIVES HERE, AND THAT IS WHY IT SERVES ALL THREE ROUTES AT ONCE.
+    // Every gathering route funnels into this function: the CLI's
+    // `compileFiles`/`compileUnits`, a `.dss-project.json` build (whose
+    // expanded+deduped source list reaches the same two entries), and
+    // `compileDirectory`. Partitioning at ANY of the entry points would have
+    // been one route learning a trick the others do not know — a second engine,
+    // which is the thing the ruling forbids. There is one partition and every
+    // route is behind it.
+    //
+    // ★ ASKED OF THE FORMAT, BY MAGIC BYTES, NEVER BY EXTENSION. The predicate
+    // is `isRelocatableObjectFile(path, format)` — the SAME third arm the
+    // `--resolve-library` dispatch already uses, reused rather than
+    // reimplemented, so `.o` / `.obj` / `.lo` / no extension at all are decided
+    // by what the file IS. It reads a 64-byte header prefix and never the file.
+    //
+    // ⚠ THE UNION OVER THIS BUILD'S FORMATS, NOT ONE FORMAT'S ANSWER. A build
+    // may name several targets and a file can be an object for one format and
+    // noise to another (an ELF `.o` under an additional `pe64` target). The CU
+    // set is SHARED across targets — `CuBuildKey` groups the builds — so the
+    // partition has to produce ONE answer for the whole run. Taking the union
+    // is the fail-loud choice: the disagreeing target routes the file to
+    // `readObjectInputModules`, which refuses it BY NAME as an object it cannot
+    // read, instead of the tokenizer reporting `illegal character 0x7f` about a
+    // file that was never text. The other direction — intersection — would send
+    // a real object back to the front end, which is the defect this closes.
+    //
+    // ⓘ A file that is an object for NO format in this build stays a SOURCE and
+    // reaches the front end exactly as before, so a build that names no object
+    // is byte-identical: `objectInputsFromSources` is empty and
+    // `sourcesToBuild` is `sourceFiles` itself.
+    std::vector<std::string>           sourcesToBuild;
+    std::vector<std::filesystem::path> objectInputsFromSources;
+    {
+        for (auto const& file : sourceFiles) {
+            fs::path const path{file};
+            bool isObject = false;
+            for (auto const& [_, format] : formatByName) {
+                if (isRelocatableObjectFile(path, *format)) { isObject = true; break; }
+            }
+            if (isObject) objectInputsFromSources.push_back(path);
+            else          sourcesToBuild.push_back(file);
+        }
+    }
+
     // ── D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET (a'): resolve every target's
     //    SOURCE LANGUAGE before a single CU is built ─────────────────────────
     //
@@ -2218,8 +3419,13 @@ int runCusToTargets(
             // the same discipline the target/format pre-flight above follows.
             // `nullptr` keeps the vector index-parallel; the drain below is
             // what stops us using it.
+            // D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE: the SOURCES, not every
+            // gathered file. This resolver reads the list's EXTENSIONS to pick
+            // a dialect, and a pre-assembled object has no source language to
+            // contribute — asking it for one is how an all-object link would
+            // have been refused for naming a file no grammar claims.
             grammarPerTarget.push_back(resolveGrammarForTarget(
-                explicitGrammar, targetSchema, sourceFiles, grammarByName, rep));
+                explicitGrammar, targetSchema, sourcesToBuild, grammarByName, rep));
         }
     }
     if (rep.hasErrors()) {
@@ -2311,10 +3517,15 @@ int runCusToTargets(
     // language still share one build, so a `.s` for two formats of ONE CPU is
     // still built once.
     std::map<CuBuildKey, std::vector<CompilationUnit>> cuByKey;
-    // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: memoizes `loadShipped` for the
-    // shipped-source units' extension->language resolution across keys, so a
-    // 5-target build reads the language corpus once rather than five times.
-    std::map<std::string, std::shared_ptr<GrammarSchema const>> shippedSourceGrammars;
+    // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: carries the shipped-source
+    // units' extension->language resolution across keys, so a 5-target build
+    // reads the language corpus ONCE rather than five times.
+    // D-DRIVER-SHIPPED-SOURCE-RESOLUTION-COMPILES-EVERY-SHIPPED-GRAMMAR: it
+    // used to be the grammar map ALONE, written after every load and never read
+    // before one, so it memoized nothing at all — every realized unit re-built
+    // every shipped grammar. It now carries the claim INDEX too, which is the
+    // half that stops the loads happening.
+    ShippedSourceLanguageCache shippedSourceGrammars;
     std::vector<CuBuildKey> keyPerTarget;
     keyPerTarget.reserve(targets.size());
     for (std::size_t ti = 0; ti < targets.size(); ++ti) {
@@ -2323,9 +3534,10 @@ int runCusToTargets(
         std::span<PredefinedMacroDef const> targetPredefines;
         std::span<PredefinedMacroDef const> formatPredefines;
         // ★★ KEYED UNCONDITIONALLY — see `CuBuildKey::languageName` for why
-        // this must NOT join the `ppEnabled` block below.
+        // this must NOT join the `ppEnabled` block below, and for why the
+        // CONFIG NAME is the identity rather than the declared one.
         auto const& resolvedGrammar = grammarPerTarget[ti];
-        key.languageName = std::string{resolvedGrammar->name()};
+        key.languageName = std::string{resolvedGrammar->configName()};
         bool const ppEnabled = resolvedGrammar->preprocess().enabled;
         if (ppEnabled) {
             key.format = formatKindOfSpec(spec);
@@ -2347,23 +3559,21 @@ int runCusToTargets(
         }
         keyPerTarget.push_back(key);
         if (cuByKey.find(key) == cuByKey.end()) {
-            std::vector<CompilationUnit> cus =
-                buildCus(key, targetPredefines, formatPredefines, resolvedGrammar);
-            // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: DSS's own runtime units,
-            // appended for THIS key. Placed here rather than in either caller's
-            // `buildCus` because this is the ONE seam every route funnels through
-            // — the CLI, `--project`, `--directory`, `compileFiles` and
-            // `compileUnits` all reach it ⇒ so a capability cannot land on one
-            // route and silently miss its sibling.
-            //
-            // ★ APPENDED, NEVER PREPENDED: the artifact NAME is the caller's
-            // `sourceFiles.front()` stem, so a runtime unit at the head would
-            // rename the user's binary.
-            for (auto& extra : buildShippedSourceCus(cus, key, targetPredefines,
-                                                     formatPredefines,
-                                                     shippedSourceGrammars, rep))
-                cus.push_back(std::move(extra));
-            cuByKey.emplace(key, std::move(cus));
+            // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: DSS's own runtime
+            // units NO LONGER JOIN THIS SET. They used to be appended here as
+            // extra translation units of every build, which meant preprocessing
+            // and parsing them on EVERY invocation and then discarding them for
+            // every program that did not reach them — ✔MEASURED at 111 ms of a
+            // 190 ms pe64 compile of `int main(void){return 0;}`. They are now
+            // resolved per TARGET, below, as cached static archives; see
+            // `resolveShippedRuntimeArchives`.
+            cuByKey.emplace(key, buildCus(key, targetPredefines,
+                                          formatPredefines, resolvedGrammar,
+                                          // D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE:
+                                          // the SOURCES, never every gathered
+                                          // file — the objects are already out.
+                                          std::span<std::string const>{
+                                              sourcesToBuild}));
         }
     }
 
@@ -2405,6 +3615,23 @@ int runCusToTargets(
     }
 
     int exitCode = 0;
+    // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: where a cache MISS compiles
+    // its archive before it can be stored, and where the build links it from
+    // when the store cannot write. Declared HERE so its lifetime covers every
+    // target's link — a staging area torn down between the compile and the pull
+    // would take the archive with it. Creates nothing until a miss.
+    RuntimeArchiveStaging runtimeStaging;
+    // Memoized on the SPEC STRING, which is what the cache key's `target=` term
+    // carries verbatim — not on `CuBuildKey`, whose target/format halves are
+    // populated only when the language preprocesses. Two targets naming one
+    // spec resolve their archives once.
+    // ⚠ `nullopt` = THIS SPEC'S RUNTIME COULD NOT BE RESOLVED, and it is a
+    // distinct state from "resolved to nothing" (an empty vector, which is every
+    // format that realizes no unit). It is memoized because two targets naming
+    // one spec must reach the SAME verdict: re-running the resolver for the
+    // second would emit the refusal twice and, worse, could answer differently.
+    std::map<std::string, std::optional<std::vector<fs::path>>>
+        runtimeArchivesBySpec;
     // AP6: sized ONCE, here — every entry starts disengaged, so a target whose
     // build fails leaves `nullopt` rather than a stale or invented path, and the
     // vector stays index-parallel to `targets` for the ones that succeeded.
@@ -2430,6 +3657,118 @@ int runCusToTargets(
         // in the pass above. Identical to `resolveLibraries` when no additions
         // were supplied, which is every caller outside AP6.
         compileOpts.resolveLibraries = resolveLibsPerTarget[i];
+        // D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE: the objects the partition
+        // took out of the gathered file list, on the SAME channel a
+        // `--resolve-library`-named object lands in — `compileOneTarget`'s own
+        // partition APPENDS to this vector, so an operator may spell some
+        // objects one way and some the other and the link sees one list. The
+        // gathered ones lead, because they are the ones the operator named as
+        // INPUTS and the first of them is what an all-object link elects as its
+        // client module.
+        compileOpts.objectInputs     = objectInputsFromSources;
+
+        // ── D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: THIS TARGET'S SHIPPED
+        //    RUNTIME, AS CACHED STATIC ARCHIVES ────────────────────────────
+        //
+        // Resolved HERE rather than in the CU-build loop above because a cache
+        // HIT must not require a front end at all: the whole saving is in not
+        // preprocessing and parsing a unit whose object already exists.
+        //
+        // ⚠ A FAILURE HERE FAILS THIS TARGET. `scratch` is the per-target
+        // reporter and `scratch.hasErrors()` already decides the exit code
+        // below, so a unit that cannot be resolved, keyed, verified or compiled
+        // stops the build exactly where the old in-graph CU build did.
+        // ⓘ `formatByName`/`targetByName` are keyed off the SAME parse the
+        // pre-flight used, and every surviving spec is in both.
+        {
+            auto const it = runtimeArchivesBySpec.find(spec);
+            if (it == runtimeArchivesBySpec.end()) {
+                std::vector<fs::path> resolvedArchives;
+                auto const parsedForRuntime = TargetSpec::parse(spec);
+                // ★ THE VERDICT IS THE ERROR COUNT ACROSS THE CALL, NOT A
+                // RETURN VALUE. The resolver reports per UNIT and keeps going,
+                // so a corpus with two broken units names both instead of
+                // stopping at the first — the same all-reasons-in-one-run
+                // discipline the target/format pre-flight follows. Reading
+                // `scratch` before and after is what turns those per-unit
+                // reports into one per-target verdict.
+                std::size_t const errorsBefore = scratch.errorCount();
+                // A language with no preprocess pass has no active format on
+                // its CU key; the realization map is FORMAT-keyed, so such a
+                // build realizes nothing — exactly as it did before the cache.
+                if (parsedForRuntime.has_value()
+                    && keyPerTarget[i].format.has_value()) {
+                    resolvedArchives = resolveShippedRuntimeArchives(
+                        spec, *targetByName.at(parsedForRuntime->targetName),
+                        *formatByName.at(parsedForRuntime->formatName),
+                        *keyPerTarget[i].format, *grammarPerTarget[i],
+                        shippedSourceGrammars, config, runtimeStaging, scratch);
+                }
+                if (scratch.errorCount() != errorsBefore) {
+                    runtimeArchivesBySpec.emplace(spec, std::nullopt);
+                } else {
+                    runtimeArchivesBySpec.emplace(spec,
+                                                  std::move(resolvedArchives));
+                }
+            }
+        }
+        // ★★★ A RUNTIME THAT COULD NOT BE RESOLVED STOPS THIS TARGET *BEFORE*
+        // ANYTHING IS WRITTEN, and that ordering is the whole point rather than
+        // tidiness. ✔MEASURED before this arm existed: breaking `dirent.c` in a
+        // staged tree produced the correct refusal, exit code 1 — AND a
+        // `hello.exe` on disk plus a `dsscp: artifact …` line announcing it. A
+        // build that failed must not leave a working-looking binary behind: the
+        // image would be missing a runtime body, and with
+        // [[D-LINK-EXEC-UNDEFINED-SYMBOL-FAIL-LOUD]] still OPEN it would link
+        // clean and die at run time — which is the exact failure this whole
+        // mechanism exists to prevent, reintroduced one tier further down.
+        //
+        // ⓘ `artifactsOut[i]` is left DISENGAGED (it was never assigned), so a
+        // consumer reading this build's artifacts sees "this target produced
+        // nothing" rather than a path to a file that must not be linked.
+        if (!runtimeArchivesBySpec.at(spec).has_value()) {
+            mergeWithTargetContext(scratch, spec, rep);
+            exitCode = 1;
+            continue;
+        }
+        // ★★★ COMPILE-ALWAYS IS NOT LINK-ALWAYS, AND THIS IS THE LINK HALF.
+        // The resolution above ran for EVERY build of a format that realizes
+        // units — that is the ruling, and it is what keeps a broken runtime unit
+        // caught by every build of its target rather than by the one program
+        // that still uses it. What reaches an ARTIFACT is a separate question,
+        // and a STATIC ARCHIVE answers it differently from an image:
+        //
+        // ⚠ A LIBRARY BUILD CARRIES EVERY MEMBER OF EVERY INPUT ARCHIVE, never
+        // the referenced subset — `extractStaticArchiveMembers`, deliberately,
+        // because dropping an unreferenced member would silently ship an
+        // incomplete library. ✔MEASURED: handing the runtime archives to a
+        // library build turned a one-CU `-staticlib` into a THREE-member `.lib`
+        // and a fat archive built from it into a SIX-member one. Nothing is
+        // lost by withholding them: a relocatable artifact's whole contract is
+        // that it DEFERS "who owns this name" to a later link
+        // (`allowsUndefinedImports()`), and that later link is an IMAGE build —
+        // which supplies the runtime right here.
+        // ⚠ READ OFF THE FORMAT'S DECLARED `container`, never off its name or
+        // kind: the same predicate the driver's own static-archive arm is
+        // dispatched on.
+        //
+        // ★★ APPENDED AFTER THE OPERATOR'S OWN `--resolve-library` ARCHIVES,
+        // BECAUSE THE OPERATOR OUTRANKS THE PLATFORM DEFAULT. That is the same
+        // precedence `resolveOperatorNamedLibraryImports` already encodes on the
+        // rebinding side, reused rather than re-decided: an operator who
+        // statically links their own `opendir` gets theirs, and a build that
+        // names none gets DSS's shipped body. Order is load-bearing — the armap
+        // is FIRST-WINS across archives in list order.
+        // ⓘ They ride the SAME `--resolve-library` channel and are therefore
+        // dispatched by MAGIC BYTES like every other input: the archive goes to
+        // the static merge, and the demand-driven member pull is what keeps a
+        // `hello.c` free of directory-walking code it never calls.
+        if (!formatByName.at(TargetSpec::parse(spec)->formatName)
+                 ->isStaticArchive()) {
+            for (auto const& archive : *runtimeArchivesBySpec.at(spec))
+                compileOpts.resolveLibraries.push_back(
+                    ResolveLibrarySpec{archive});
+        }
         // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the grammar THIS target's
         // CU was parsed under — never the invocation's, which no longer
         // exists as a single value.
@@ -3419,8 +4758,18 @@ int Program::compileFiles(
                         // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the grammar
                         // THIS key resolved to. Never the enclosing
                         // `grammar` — that is null on the ask-the-target path.
-                        std::shared_ptr<GrammarSchema const> const& keyGrammar)
+                        std::shared_ptr<GrammarSchema const> const& keyGrammar,
+                        // D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE: the files
+                        // `runCusToTargets` decided are SOURCES. Not the
+                        // enclosing `sourceFiles` — that list may also name
+                        // pre-assembled objects, which have no front end.
+                        std::span<std::string const> sources)
         -> std::vector<CompilationUnit> {
+        // ⓘ Every source turned out to be an object ⇒ this build has no
+        // translation unit at all, and an empty CU vector is the honest answer.
+        // Returning a CU built from ZERO files would mint an empty unit the
+        // link then has to recognise as nothing.
+        if (sources.empty()) return {};
         auto cu = substrate::callOnLargeStack(
             substrate::kDeepRecursionStackBytes, [&] {
                 // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the
@@ -3445,7 +4794,7 @@ int Program::compileFiles(
                     {formatPredefines.begin(), formatPredefines.end()});
                 builder.setUserDefines(userDefines());  // c105: --define
                 applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
-                for (auto const& path : sourceFiles) {
+                for (auto const& path : sources) {
                     builder.addFile(fs::path{path});
                 }
                 return std::move(builder).finish();
@@ -3559,22 +4908,30 @@ int Program::compileUnits(
     // (`driverDiagnostics()` and each `Tree`'s own). `runCusToTargets` then
     // drains those by walking the same index order. So diagnostic ORDER and
     // COUNT are a pure function of CU index, and CU index is a pure function of
-    // `sourceFiles` — neither can observe the schedule.
+    // the `sources` span — neither can observe the schedule.
     //
-    // ⚠ WHAT IS *NOT* PARALLELIZED HERE, AND WHY. `buildShippedSourceCus`
-    // (called by `runCusToTargets` right after this) walks a DISCOVERY work
-    // list: which runtime unit is reached depends on what the previously-parsed
-    // units included. Its iteration order is part of its result, so it stays
-    // serial until it has a shape that does not conflate discovery with
-    // traversal — refusing to parallelize it is not an oversight.
+    // ⚠ WHAT IS *NOT* PARALLELIZED HERE, AND WHY. DSS's own shipped runtime
+    // units are not in this batch at all — `runCusToTargets` resolves them
+    // per TARGET as cached static archives (`resolveShippedRuntimeArchives`),
+    // and that path stays SERIAL: it is dominated by two `stat`s and a digest
+    // per unit on the steady-state HIT, and its MISS arm runs a whole nested
+    // `Program` build whose own per-CU pool would then be nested inside this
+    // one. Refusing to parallelize it is not an oversight.
     auto buildCus = [&](CuBuildKey const&                   key,
                         std::span<PredefinedMacroDef const> targetPredefines,
                         std::span<PredefinedMacroDef const> formatPredefines,
                         // D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: this key's
                         // resolved grammar (see the `compileFiles` twin).
-                        std::shared_ptr<GrammarSchema const> const& keyGrammar)
+                        std::shared_ptr<GrammarSchema const> const& keyGrammar,
+                        // D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE: see the
+                        // `compileFiles` twin. ONE CU PER SOURCE — so the CU
+                        // index is a pure function of THIS span, and every
+                        // downstream index-parallel claim (the diagnostic
+                        // drain's order, `cuMirs[i]` ↔ `cus[i]`) is stated
+                        // against the list that actually produced the units.
+                        std::span<std::string const> sources)
         -> std::vector<CompilationUnit> {
-        std::size_t const n = sourceFiles.size();
+        std::size_t const n = sources.size();
         // Resolved ONCE for the whole batch rather than once per file: the
         // answer is fixed for this key, and it is a filesystem walk (see
         // `resolveSystemDirs`).
@@ -3610,7 +4967,7 @@ int Program::compileUnits(
                         {formatPredefines.begin(), formatPredefines.end()});
                     builder.setUserDefines(userDefines());  // c105: --define
                     applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
-                    builder.addFile(fs::path{sourceFiles[i]});
+                    builder.addFile(fs::path{sources[i]});
                     return std::move(builder).finish();
                 });
         };
@@ -3669,7 +5026,7 @@ int Program::compileUnits(
             if (!slots[i].has_value()) {
                 emitDriver(rep, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
                            "internal: the front-end build of translation unit '"
-                           + sourceFiles[i]
+                           + std::string{sources[i]}
                            + "' produced no compilation unit — its build job "
                              "terminated abnormally (the executor logs the "
                              "throw). The build stops rather than linking a "
@@ -3795,11 +5152,31 @@ int Program::compileDirectory(
         return 1;
     }
 
-    // Delegate to compileFiles — same CU + per-target loop shape.
-    // Pass the reporter config through so `--warnings-as-errors`
-    // + `--suppress=<code>` apply uniformly across the directory
-    // scan AND the per-tier IR drains.
-    return compileFiles(sourceFiles, languageName, targets, reporterConfig);
+    // ★★★ ROUTE THROUGH THE SHARED PREDICATE, EXACTLY AS `--compile` AND
+    // `--project` DO. A directory scan is a way of GATHERING files; it is not a
+    // different compilation model, and the mode must not decide the translation
+    // -unit semantics.
+    //
+    // ⚠ THIS CALLED `compileFiles` UNCONDITIONALLY, WHICH IS THE UNITY-BUILD
+    // PATH — the one the dispatcher's own comment calls "deliberately NOT a CLI
+    // surface", on the stated grounds that no language's file model
+    // concatenates translation units. So `--directory` reached a surface the
+    // code says no CLI should reach, and every C file after the first was
+    // dropped. ✔MEASURED 2026-08-25 on a 257-source directory: **exit 0, zero
+    // diagnostics, an artifact written, and `nm` finds NONE of the 256
+    // functions in it** — a wrong image reported as success, which is the one
+    // failure mode this project refuses outright. With three files it instead
+    // fails at link with `undefined symbol`, so the damage is loud or silent
+    // depending only on whether the dropped code happened to be referenced.
+    //
+    // ★ AND THE COMMENT ON `routesToMultiUnit` NAMED THE CAUSE BEFORE THE BUG
+    // EXISTED: it calls itself "the single source of truth for the threshold,
+    // shared with `compileProject` so the two dispatch sites never drift."
+    // There are THREE dispatch sites. The one that did not use it is the one
+    // that drifted.
+    return routesToMultiUnit(sourceFiles.size())
+        ? compileUnits(sourceFiles, languageName, targets, reporterConfig)
+        : compileFiles(sourceFiles, languageName, targets, reporterConfig);
 }
 
 } // namespace dss

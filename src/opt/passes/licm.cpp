@@ -6,6 +6,7 @@
 #include "mir/mir_opcode.hpp"
 #include "opt/analysis/mir_alias.hpp"
 #include "opt/analysis/mir_memory_clobbers.hpp"
+#include "opt/passes/mir_id_remap.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -151,9 +153,17 @@ public:
     // `domScratch` = the pass-wide reusable dominator scratch
     // (D-OPT-DOMTREE-SCRATCH-REUSE) — byte-identical dom trees without the
     // per-function whole-module allocation storm.
+    // `moduleSelfLoops` = the pass-wide self-looping-block index and
+    // `candidateBuf` = the pass-wide scratch behind the SCOPED back-edge sweep
+    // ([[D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN]]). Both are owned by
+    // `runLicm` and threaded in rather than rebuilt here: the index is a MODULE
+    // property (one sweep per pass call, not one per function) and the buffer
+    // exists so the per-function candidate list reuses its storage.
     void analyze(MirFuncId fn, DiagnosticReporter& reporter,
                  std::vector<std::vector<MirBlockId>> const& preds,
-                 MirMemoryClobbers const& clobbers, MirDomScratch& domScratch);
+                 MirMemoryClobbers const& clobbers, MirDomScratch& domScratch,
+                 std::span<std::uint32_t const> moduleSelfLoops,
+                 std::vector<std::uint32_t>& candidateBuf);
 
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
@@ -176,8 +186,8 @@ public:
     void onBlockBeforeTerminator(
         MirBlockId oldB, MirBlockId newB,
         MirBuilder& dst,
-        std::unordered_map<std::uint32_t, MirInstId>& rewrite,
-        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) override {
+        MirInstRemap& rewrite,
+        MirBlockRemap const& /*blockMap*/) override {
         (void)newB;
         auto it = hoistPlan_.find(oldB);
         if (it == hoistPlan_.end()) return;
@@ -192,8 +202,8 @@ public:
             std::vector<MirInstId> newOps;
             newOps.reserve(oldOps.size());
             for (MirInstId const o : oldOps) {
-                auto rit = rewrite.find(o.v);
-                if (rit == rewrite.end()) {
+                MirInstId const* const mapped = rewrite.find(o.v);
+                if (mapped == nullptr) {
                     std::fprintf(stderr,
                         "dss::opt::passes::Licm fatal: hoisting old "
                         "inst v=%u from loop body but operand v=%u "
@@ -203,13 +213,13 @@ public:
                         oldX.v, o.v);
                     std::abort();
                 }
-                newOps.push_back(rit->second);
+                newOps.push_back(*mapped);
             }
             MirInstId const newId = dst.addInst(op, newOps,
                                                 src_.instType(oldX),
                                                 src_.instPayload(oldX),
                                                 src_.instFlags(oldX));
-            rewrite.emplace(oldX.v, newId);
+            rewrite.put(oldX.v, newId);
             ++instructionsHoisted_;
         }
     }
@@ -262,7 +272,9 @@ public:
 void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter,
                          std::vector<std::vector<MirBlockId>> const& preds,
                          MirMemoryClobbers const& clobbers,
-                         MirDomScratch& domScratch) {
+                         MirDomScratch& domScratch,
+                         std::span<std::uint32_t const> moduleSelfLoops,
+                         std::vector<std::uint32_t>& candidateBuf) {
     resetPerFunction();
     MirBlockId const entry = src_.funcEntry(fn);
     auto const rpo = mirReversePostOrder(src_, entry);
@@ -278,7 +290,26 @@ void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter,
     auto const& dom = computeMirDomTree(src_, entry, rpo, preds, domScratch);
     auto const tDom1 = trace ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point{};
-    auto const loops = mirNaturalLoops(src_, dom, preds);
+    // ★★ THE BACK-EDGE SOURCE SWEEP IS SCOPED TO THIS FUNCTION
+    // ([[D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN]]). `dom` is a ONE-FUNCTION
+    // tree, so the whole-module overload swept every block of the module for
+    // every function — O(functions × module blocks), quadratic in module size,
+    // and it was ALL of LICM's cost on a merged program module. ✔MEASURED
+    // 2026-08-25 (cycle P36), release dsscp over the 103-TU full-source sqlite
+    // corpus at `--jobs 1`: `loops=2,239 ms` of each 2,552 ms LICM call, four
+    // calls per whole-program pipeline = 8.98 s of a 79.3 s build (11.3%), all
+    // of it on the SERIAL side of the -j1→-j4 scaling.
+    //
+    // `mirBackEdgeCandidates` supplies exactly the superset the scoped
+    // overload's completeness clause names (`rpo ∪ this function's range ∪ the
+    // module's self-looping blocks`), so the forest is BYTE-IDENTICAL to the
+    // whole-module sweep's — including the pseudo-loops the sweep manufactures
+    // for FOREIGN self-looping blocks, which LICM must keep seeing until
+    // [[D-MIR-STRUCTCF-DERIVATION-REACHES-PAST-THE-FUNCTION]] is taken
+    // deliberately. This is a cost change, never a behaviour change.
+    mirBackEdgeCandidates(src_, fn, rpo, moduleSelfLoops, candidateBuf);
+    auto const loops = mirNaturalLoops(
+        src_, dom, preds, std::span<std::uint32_t const>{candidateBuf});
     if (trace) {
         auto const tLoops1 = std::chrono::steady_clock::now();
         traceDomNs += static_cast<std::uint64_t>(
@@ -606,6 +637,14 @@ LicmResult runLicm(Mir& mir, TypeInterner const& interner,
     auto const preds = mirBuildPredecessors(mir);
     MirMemoryClobbers const clobbers{mir, preds};
     MirDomScratch domScratch;   // one per pass call (D-OPT-DOMTREE-SCRATCH-REUSE)
+    // The module's self-looping-block index: a MODULE property, so it is swept
+    // ONCE per pass call and every function reuses it, exactly as
+    // `rederiveStructCfMarkers` does. `candidateBuf` is the per-function
+    // candidate list's storage, reused rather than reallocated
+    // ([[D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN]]).
+    std::vector<std::uint32_t> moduleSelfLoops;
+    mirModuleSelfLoopBlocks(mir, moduleSelfLoops);
+    std::vector<std::uint32_t> candidateBuf;
     long long const setupMs = trace
         ? std::chrono::duration_cast<std::chrono::milliseconds>(now() - tSetup)
               .count()
@@ -614,7 +653,9 @@ LicmResult runLicm(Mir& mir, TypeInterner const& interner,
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
         auto const tA = trace ? now() : std::chrono::steady_clock::time_point{};
-        policy.analyze(f, reporter, preds, clobbers, domScratch);
+        policy.analyze(f, reporter, preds, clobbers, domScratch,
+                       std::span<std::uint32_t const>{moduleSelfLoops},
+                       candidateBuf);
         if (trace) {
             auto const tR = now();
             analyzeNs += static_cast<std::uint64_t>(

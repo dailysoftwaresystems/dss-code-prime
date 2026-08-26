@@ -89,6 +89,24 @@
       "flags": 0,
       "addrAlign": 0,
       "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-CARRIES-NO-SUMMARY-OR-MIR-SECTION. The per-module LINK-TIME-OPTIMIZATION SUMMARY. Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA (0x00000040) | IMAGE_SCN_MEM_DISCARDABLE (0x02000000) = 33554496. That pair is PE's spelling of non-ALLOC, and it is spelled as two facts rather than one: the section HAS file content, and the linker must DISCARD it rather than map it. IMAGE_SCN_MEM_READ is deliberately ABSENT -- a section with no memory-access characteristic is not placed in the image, which is what keeps a summary-carrying object linkable by link.exe/lld into a byte-identical program. \u26a0 THE NAME IS SEVEN CHARACTERS ON PURPOSE: a COFF section header's Name field is EIGHT bytes, and a longer name has to be spilled into the string table as `/nnnn` -- a second encoding this writer does not need to reach for. PAIRED with the `.dssmir` row below; the SPLIT is the whole economy (see the summary/MIR note in section_kind.hpp).",
+      "kind": "lto-summary",
+      "name": ".dsssum",
+      "type": 33554496,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-CARRIES-NO-SUMMARY-OR-MIR-SECTION. The module's serialized MIR body -- the LARGE half of the pair. Same Characteristics as the summary row above and for the same reasons; the two differ in PAYLOAD, never in wire treatment. Seven characters, for the same eight-byte Name field.",
+      "kind": "lto-ir",
+      "name": ".dssmir",
+      "type": 33554496,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0
     }
   ],
 

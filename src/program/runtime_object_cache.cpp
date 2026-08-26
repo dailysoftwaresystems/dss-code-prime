@@ -80,7 +80,12 @@ namespace fs = std::filesystem;
 // The key document's first line. A VERSION is part of it on purpose: the day a
 // term is added or reordered, every previously-written artifact must become
 // unreachable rather than merely stale, and bumping this line is what does it.
-constexpr std::string_view kKeyDocumentHeader = "dss-runtime-object-cache-key/1";
+// ⓘ `/2` since 2026-08-25: the single `descriptor=`/`descriptor-sha256=` pair
+// became a SORTED RUN of pairs, one per declaring descriptor. A `/1` document
+// and a `/2` document over a one-descriptor unit would otherwise be byte-
+// identical, so every `/1` artifact would stay addressable under a scheme whose
+// term list had changed — the exact reachability this line exists to end.
+constexpr std::string_view kKeyDocumentHeader = "dss-runtime-object-cache-key/2";
 
 // Cited by every refusal below so a user landing on one message can find the
 // ruling that produced this whole mechanism.
@@ -473,16 +478,30 @@ private:
 
 [[nodiscard]] std::string unwritableMissRefusal(RuntimeObjectKey const& key,
                                                 std::string_view reason) {
+    // ⚠ THE WORDING SAYS WHAT **THE STORE** COULD NOT DO, NOT WHAT THE BUILD
+    // WILL DO — it used to say *"so this build cannot proceed"*, written when
+    // this function had no production caller and the author could assume the
+    // caller would treat it as fatal. It now has one, and it does NOT stop the
+    // build: the archive is already compiled and correct, and the driver links
+    // it out of its staging area, so a message claiming the build has stopped
+    // would be a diagnostic contradicted by the very run that printed it.
+    //
+    // ★ THE "REFUSAL, NOT A FALLBACK" ARGUMENT IS UNCHANGED AND IS SATISFIED,
+    // which is why it stays. What it forbids is a SILENT degradation — success
+    // reported while every later build recompiles the same unit, the cost
+    // permanent and invisible. This function is the loud half of that bargain;
+    // the caller's obligation is to SAY SO, and `reportRuntimeCacheNote` in
+    // `program.cpp` prints this text verbatim on every affected build.
     return std::format(
-        "runtime object cache: a cache MISS could not be WRITTEN, so this build "
-        "cannot proceed. {}. Roots considered, in precedence order: {}. This is "
-        "a REFUSAL and not a fallback, deliberately: compiling the runtime unit "
-        "and discarding it would report success while every later build "
-        "recompiled the same unit, so the cost would be permanent and "
-        "invisible — a mechanism that silently does nothing is worse than one "
-        "that fails. REMEDY: set {} to a writable directory; it is the explicit "
-        "override, it wins over every platform default, and it is what CI and "
-        "hermetic builds are expected to use. Anchored: {}.",
+        "runtime object cache: a cache MISS could not be WRITTEN, so the "
+        "compiled runtime archive was NOT added to the cache and every later "
+        "build will compile it again. {}. Roots considered, in precedence "
+        "order: {}. This is a REFUSAL by the store and never a silent fallback: "
+        "a mechanism that silently does nothing is worse than one that fails, "
+        "so it is reported on every affected build until it is fixed. REMEDY: "
+        "set {} to a writable directory; it is the explicit override, it wins "
+        "over every platform default, and it is what CI and hermetic builds are "
+        "expected to use. Anchored: {}.",
         reason, key.rootTrail, kOverrideVariable, kAnchor);
 }
 
@@ -985,11 +1004,42 @@ computeRuntimeObjectKey(RuntimeObjectRequest const& request) {
     if (!unitContents.has_value()) {
         return std::unexpected(unitContents.error());
     }
-    auto const descriptorContents =
-        readWholeFile(request.configRoot / request.descriptorPath,
-                      "shipped-header descriptor");
-    if (!descriptorContents.has_value()) {
-        return std::unexpected(descriptorContents.error());
+    // ★★★ AN EMPTY DESCRIPTOR SET IS A REFUSAL AND NOT A KEY WITH ONE FEWER
+    // TERM. A realized unit exists only because a descriptor's
+    // `realization.<fmt>.source` named it, so "no declaring descriptor" is the
+    // caller's attribution disagreeing with the corpus reader that produced the
+    // unit — two owners of one fact, drifted. Keying anyway would drop the term
+    // the whole mechanism exists for, and drop it SILENTLY.
+    if (request.descriptorPaths.empty()) {
+        return std::unexpected(std::format(
+            "runtime object cache: the request for shipped runtime unit '{}' "
+            "names NO declaring shipped-header descriptor. A realized unit is "
+            "named by at least one descriptor's 'realization.<format>.source', "
+            "so an empty set means the caller's attribution and the corpus "
+            "reader disagree — and a key computed without the descriptor term "
+            "would serve an artifact compiled against declarations that have "
+            "since moved. Refusing. Anchored: {}.",
+            request.sourcePath, kAnchor));
+    }
+    // ★ SORTED AND DEDUPLICATED, so the key is a function of the SET. The
+    // caller's order is whatever its corpus walk happened to produce (sorted on
+    // NTFS, hash-ordered on ext4 — the same filesystem-decides-the-answer trap
+    // `resolveArchiveSiblingFormat` refuses), and one descriptor listed twice is
+    // ONE input.
+    std::vector<std::string> descriptorPaths = request.descriptorPaths;
+    std::sort(descriptorPaths.begin(), descriptorPaths.end());
+    descriptorPaths.erase(
+        std::unique(descriptorPaths.begin(), descriptorPaths.end()),
+        descriptorPaths.end());
+    std::vector<std::string> descriptorDigests;
+    descriptorDigests.reserve(descriptorPaths.size());
+    for (std::string const& descriptorPath : descriptorPaths) {
+        auto const contents = readWholeFile(request.configRoot / descriptorPath,
+                                            "shipped-header descriptor");
+        if (!contents.has_value()) {
+            return std::unexpected(contents.error());
+        }
+        descriptorDigests.push_back(dss::crypto::sha256Hex(*contents));
     }
 
     // ── STEP 3: the document ────────────────────────────────────────────────
@@ -1019,8 +1069,14 @@ computeRuntimeObjectKey(RuntimeObjectRequest const& request) {
     field("config=", request.configName);
     field("unit=", request.sourcePath);
     field("unit-sha256=", dss::crypto::sha256Hex(*unitContents));
-    field("descriptor=", request.descriptorPath);
-    field("descriptor-sha256=", dss::crypto::sha256Hex(*descriptorContents));
+    // ⓘ PATH AND DIGEST STAY ADJACENT, one pair per descriptor, in the sorted
+    // order above. Emitting all the paths and then all the digests would let a
+    // reader diffing two documents pair a path with the wrong digest, and would
+    // let two descriptors that swapped both fields produce the same document.
+    for (std::size_t i = 0; i < descriptorPaths.size(); ++i) {
+        field("descriptor=", descriptorPaths[i]);
+        field("descriptor-sha256=", descriptorDigests[i]);
+    }
 
     // ★ SORTED BY (label, path). The loaders report their documents in
     // whatever order resolution happened to reach them — which is a function

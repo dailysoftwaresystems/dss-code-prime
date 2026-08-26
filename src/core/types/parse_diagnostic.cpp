@@ -1,6 +1,9 @@
 #include "core/types/parse_diagnostic.hpp"
 
+#include <array>
+#include <cstdint>
 #include <format>
+#include <string_view>
 
 namespace dss {
 
@@ -112,6 +115,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::P_MaxSpeculationDepth:      return "P_MaxSpeculationDepth";
         case DiagnosticCode::P_UncommittedCheckpoint:    return "P_UncommittedCheckpoint";
         case DiagnosticCode::P_BacktrackFailed:          return "P_BacktrackFailed";
+        case DiagnosticCode::P_DiagnosticsElided:        return "P_DiagnosticsElided";
         case DiagnosticCode::C_MissingField:             return "C_MissingField";
         case DiagnosticCode::C_UnknownShape:             return "C_UnknownShape";
         case DiagnosticCode::C_UnknownToken:             return "C_UnknownToken";
@@ -342,6 +346,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_VlaStackRestorePairing:   return "I_VlaStackRestorePairing";
         case DiagnosticCode::I_AtomicAccessNotLowered:   return "I_AtomicAccessNotLowered";
         case DiagnosticCode::I_CallSignatureMismatch:    return "I_CallSignatureMismatch";
+        case DiagnosticCode::I_StoreValueTypeMismatch:   return "I_StoreValueTypeMismatch";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";
@@ -549,96 +554,138 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::X_OptReturnFalseWithoutDiagnostic:
             return "X_OptReturnFalseWithoutDiagnostic";
         case DiagnosticCode::X_InlineMalformedCallSite:      return "X_InlineMalformedCallSite";
+        case DiagnosticCode::X_OptFixpointTruncated:         return "X_OptFixpointTruncated";
     }
-    return "Unknown";
+    // Not a `default:` arm — the switch above deliberately has none, so
+    // `-Werror=switch` forces an arm for every enumerator and this line is
+    // reachable ONLY for a 16-bit value that is not an enumerator at all.
+    // That is what makes it the project's exact allocation oracle rather than
+    // a fallback: see `kUnallocatedDiagnosticCodeName` in the header.
+    return kUnallocatedDiagnosticCodeName;
+}
+
+namespace {
+
+// One row per HIGH NIBBLE of the `DiagnosticCode` space. Sixteen rows, always,
+// addressed BY INDEX (`kNibbleFamilies[v >> 12]`) rather than searched.
+struct NibbleFamily {
+    char             letter;        // kUnallocatedFamilyLetter iff unallocated
+    bool             stripsNibble;  // render the low 12 bits only
+    std::string_view owner;         // what the family is; documentation as data
+};
+
+// ★★★ D-DIAG-CODE-PREFIX-DEFAULT-IS-SILENT — WHY THIS IS A TABLE AND NOT A
+// LADDER, AND WHY THE TABLE HAS SIXTEEN ROWS RATHER THAN ELEVEN.
+//
+// This function used to be an else-if ladder over the eleven ALLOCATED
+// nibbles, seeded with `char letter = 'P'`. That seed was the defect. `'P'` is
+// correct for exactly two nibbles (0x0 and 0x9, the parser's own ranges) and
+// it was ALSO the answer for "I do not recognise this family" — so a family
+// allocated in the header but not here rendered a PLAUSIBLE WRONG CODE rather
+// than failing. That is not hypothetical: the whole X_* optimizer family
+// shipped at 0x2xxx with no arm here and printed `P2002` for
+// `X_PipelineVersionMismatch` — the parser's letter, the family nibble left
+// un-stripped — for its entire life, and nothing noticed, because a
+// wrong-but-well-formed diagnostic code passes every eye and every green
+// suite. ✔MEASURED at the time: `grep -rInE 'P200[1-8]'` over src/ tests/
+// examples/ real-examples/ docs/ .plans/ returned ZERO hits, so the rendering
+// was not merely wrong, it was untested — no golden file had even recorded the
+// wrong answer.
+//
+// ★ THE FIX IS STRUCTURAL, NOT A BETTER DEFAULT. Sixteen rows indexed by
+// `v >> 12` means **there is no default arm to get wrong**: every possible
+// high nibble already has a row, so "unhandled" is not a reachable state. A
+// new family cannot half-land, because the row it needs already exists and
+// says `kUnallocatedFamilyLetter` until someone fills it in.
+//
+// ★★ AND THE SECOND DUPLICATE IS GONE TOO. The old code carried the allocated
+// set TWICE — once in the letter ladder and once in a `hasNibbleMarker`
+// boolean OR-chain that decided nibble-stripping. Two hand-maintained copies
+// of one fact, in one function, is the same drift hazard one scale down;
+// `stripsNibble` is now a field of the single row.
+//
+// ⚠ WHAT THIS TABLE DOES NOT DO: it does not abort on an unallocated family.
+// `hir_text.cpp`'s `@diag(code N)` handler deliberately renders a code it has
+// already refused as unallocated, to show the operator what it would have
+// looked like. Aborting would turn that refusal into a crash on a `.dsshir`
+// input. The fail-loud obligation is met by `kUnallocatedFamilyLetter` (`?`),
+// which no reader and no `[A-Z][0-9A-F]{4}` scraper can mistake for a code —
+// plus the TOTALITY TEST in tests/core/test_parse_diagnostic.cpp
+// (`EveryAllocatedCodeRendersUnderARealFamilyLetter`), which walks all 65536
+// values, asks `diagnosticCodeName` whether each is allocated, and fails if any
+// allocated code renders under `?`. That test is what makes half-landing a
+// family a RED rather than a silent `P2002`; it is derived from the enum, not
+// from a hand-listed sample, so it covers the NEXT family automatically.
+//
+// CROSS-PLAN AUTHORITY: plan 00 §0.3 carries the same allocation. Claiming a
+// family means updating plan 00 §0.3 and THIS table. ⓘ The third mirror —
+// `NIBBLE_LETTER` in scripts/corpus-census/corpus-census.py, which had drifted
+// identically and was mis-attributing every X_* diagnostic to the parser in the
+// very instrument whose job is to attribute failures to a tier — no longer
+// hand-copies these rows; it parses them out of this table.
+//
+// ⚠ 0x5xxx IS CLAIMED TWICE IN PLAN 00 §0.3 (`O0xxx` RESERVED for the object
+// format / linker, and `F0xxx` for the FFI reader). Only `F` was ever rendered
+// and only `F_*` codes were ever allocated there, so this table records the
+// SHIPPED truth rather than the plan's ambiguity. That conflict is
+// D-DIAG-0X5XXX-NIBBLE-CLAIMED-BY-TWO-FAMILIES and is not resolved here.
+constexpr std::array<NibbleFamily, 16> kNibbleFamilies{{
+    /* 0x0 */ {'P', false, "parser"},
+    /* 0x1 */ {'A', true,  "assembler (plan 13 AS1, allocated 2026-05-29)"},
+    /* 0x2 */ {'X', true,  "optimizer pass engine + pass internals (plan 22 PR1)"},
+    /* 0x3 */ {kUnallocatedFamilyLetter, false,
+               "UNALLOCATED - the sole free nibble; post-v1 candidates "
+               "(JVM IL / .NET IL / shader-stage validators) draw from here"},
+    /* 0x4 */ {'R', true,  "register allocator"},
+    /* 0x5 */ {'F', true,  "FFI binary-reader + C-header-parser (plan 11 s2.6)"},
+    /* 0x6 */ {kUnallocatedFamilyLetter, false,
+               "RESERVED for the WAT/WASM verifier (plan 18) - reserved is NOT "
+               "allocated: no code may render here until a row claims a letter"},
+    /* 0x7 */ {kUnallocatedFamilyLetter, false,
+               "RESERVED for the SPIR-V verifier (plan 17) - reserved is NOT "
+               "allocated: no code may render here until a row claims a letter"},
+    /* 0x8 */ {'K', true,  "linker (plan 14 LK4)"},
+    /* 0x9 */ {'P', false, "parser, internal-invariant range (renders P9xxx)"},
+    /* 0xA */ {'I', true,  "MIR verifier / IR-gen mid-level"},
+    /* 0xB */ {'L', true,  "LIR lowering + verifier"},
+    /* 0xC */ {'C', true,  "config"},
+    /* 0xD */ {'D', true,  "driver / compilation-unit"},
+    /* 0xE */ {'S', true,  "semantic analysis"},
+    /* 0xF */ {'H', true,  "HIR verifier / lowering"},
+}};
+
+// Structural completeness, at COMPILE TIME. The table is addressed by index, so
+// the only way it can be wrong is by being the wrong SHAPE — and that is
+// exactly what these catch. A row deleted or added reds the first; a row whose
+// `stripsNibble` contradicts the parser's two un-stripped ranges reds the
+// second. Neither can be satisfied by a plausible-looking wrong value.
+static_assert(kNibbleFamilies.size() == 16,
+              "kNibbleFamilies must carry one row per high nibble: the table is "
+              "addressed by `v >> 12`, so a missing row is an out-of-bounds "
+              "read and an extra row is unreachable");
+static_assert(!kNibbleFamilies[0x0].stripsNibble
+                  && !kNibbleFamilies[0x9].stripsNibble,
+              "the parser's 0x0xxx and 0x9xxx ranges render their FULL value "
+              "(P0001, P9000); stripping either would collide them");
+
+} // namespace
+
+char diagnosticFamilyLetter(DiagnosticCode c) noexcept {
+    return kNibbleFamilies[static_cast<std::uint16_t>(c) >> 12].letter;
+}
+
+bool diagnosticCodeIsAllocated(DiagnosticCode c) noexcept {
+    return diagnosticCodeName(c) != kUnallocatedDiagnosticCodeName;
 }
 
 std::string diagnosticCodePrefix(DiagnosticCode c) {
-    // The numeric value carries the phase letter in its high nibble.
-    // CROSS-PLAN AUTHORITY: this table mirrors plan 00 §0.3 — the two
-    // sources MUST stay in lockstep. When adding a new family, update
-    // BOTH in the same PR.
-    //   0x0xxx → P0xxx     (parse)
-    //   0x1xxx → A0xxx     (assembler — plan 13 AS1; allocated 2026-05-29)
-    //   0x2xxx → X0xxx     (optimizer pass engine + pass internals — plan 22
-    //                       PR1; renderer arm landed 2026-08-04, TF-C118)
-    //   0x4xxx → R0xxx     (register allocator)
-    //   0x5xxx → O0xxx     RESERVED — object format / linker (plan 14;
-    //                       holding the slot so plan-14 doesn't accidentally
-    //                       land on 0xCxxx (which is C_*) or 0xDxxx (D_*))
-    //   0x5xxx → F0xxx     (FFI binary-reader + C-header-parser; plan 11 §2.6 — allocated 2026-06-01)
-    //   0x6xxx → W0xxx     RESERVED — WAT/WASM verifier (plan 18; allocated 2026-05-29)
-    //   0x7xxx → V0xxx     RESERVED — SPIR-V verifier  (plan 17; allocated 2026-05-29)
-    //   0x9xxx → P9xxx     (parse, internal-invariant range)
-    //   0xCxxx → C0xxx     (config)
-    //   0xDxxx → D0xxx     (driver / compilation-unit)
-    //   0xAxxx → I0xxx     (MIR verifier / IR-gen mid-level)
-    //   0xBxxx → L0xxx     (LIR lowering + verifier)
-    //   0x8xxx → K0xxx     (linker — plan 14 LK4)
-    //   0xExxx → S0xxx     (semantic analysis)
-    //   0xFxxx → H0xxx     (HIR verifier / lowering)
-    // Free for future families: 0x3xxx ONLY (the sole unclaimed nibble —
-    // 0x6xxx/0x7xxx are RESERVED-not-free per the rows above, and 0x2xxx
-    // is now the optimizer X_* family). Post-v1 candidates (JVM IL /
-    // .NET IL / future shader-stage validators) draw from 0x3xxx.
-    //
-    // D-DIAG-OPT-FAMILY-NIBBLE-CLAIMED-IN-HEADER-BUT-NOT-IN-RENDERER.
-    // WHY THE 0x2xxx ARM BELOW EXISTS AS A SEPARATE NOTE (TF-C118): plan 00
-    // §0.3's allocation discipline says to claim a new family "here AND in
-    // parse_diagnostic.cpp's switch in the same PR". For the X_* family only
-    // the HEADER half landed — the enumerators went in at 0x2xxx while this
-    // renderer kept no 0x2000u arm, so every optimizer diagnostic rendered
-    // under the PARSER's default letter with the family nibble left in the
-    // number (X_PipelineVersionMismatch printed "P2002", not "X0002"). This
-    // is exactly the half-landed claim that rule exists to prevent; the
-    // band-wide test pin in tests/core/test_parse_diagnostic.cpp
-    // (PrefixOptimizerBandRendersAsXWithNibbleStripped) now covers all
-    // eight codes so a future family cannot half-land the same way.
-    //
-    // ★ THERE IS A THIRD MIRROR, and it had drifted identically: the census
-    // instrument scripts/corpus-census/corpus-census.py hand-copies this
-    // nibble→letter table into `NIBBLE_LETTER` and was also missing 0x2000
-    // (fixed in the same cycle). Claiming a family means updating plan 00
-    // §0.3, THIS function, and that dict.
     // Render as the 4-digit hex grouping the user actually sees.
-    const auto v          = static_cast<std::uint16_t>(c);
-    const std::uint16_t nibble = v & 0xF000u;
-    char letter = 'P';
-    if (nibble == 0x1000u) {
-        letter = 'A';
-    } else if (nibble == 0x2000u) {
-        letter = 'X';
-    } else if (nibble == 0x4000u) {
-        letter = 'R';
-    } else if (nibble == 0x5000u) {
-        letter = 'F';
-    } else if (nibble == 0x8000u) {
-        letter = 'K';
-    } else if (nibble == 0xA000u) {
-        letter = 'I';
-    } else if (nibble == 0xB000u) {
-        letter = 'L';
-    } else if (nibble == 0xC000u) {
-        letter = 'C';
-    } else if (nibble == 0xD000u) {
-        letter = 'D';
-    } else if (nibble == 0xE000u) {
-        letter = 'S';
-    } else if (nibble == 0xF000u) {
-        letter = 'H';
-    }
-    // Strip the high nibble for the numeric portion when it's a phase
-    // marker (A/X/K/R/C/D/S/H/I/L). The 9xxx range stays 9xxx so
-    // P_BuilderInvariant prints as "P9000".
-    const bool hasNibbleMarker = (nibble == 0x1000u || nibble == 0x2000u
-                                  || nibble == 0x4000u
-                                  || nibble == 0x5000u
-                                  || nibble == 0x8000u
-                                  || nibble == 0xA000u || nibble == 0xB000u
-                                  || nibble == 0xC000u || nibble == 0xD000u
-                                  || nibble == 0xE000u || nibble == 0xF000u);
-    const std::uint16_t lo = hasNibbleMarker ? (v & 0x0FFFu) : v;
-    return std::format("{}{:04X}", letter, lo);
+    const auto v = static_cast<std::uint16_t>(c);
+    NibbleFamily const& fam = kNibbleFamilies[v >> 12];
+    // An UNALLOCATED family keeps its whole value (`?3000`, not `?0000`) so the
+    // operator can see WHICH nibble was rendered without a real family.
+    const std::uint16_t lo = fam.stripsNibble ? (v & 0x0FFFu) : v;
+    return std::format("{}{:04X}", fam.letter, lo);
 }
 
 } // namespace dss

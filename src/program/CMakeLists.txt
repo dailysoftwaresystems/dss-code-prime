@@ -69,9 +69,21 @@ endif()
 # reads and writes `.dss-deps/dss-lock.json` and `#include <nlohmann/json.hpp>`
 # directly.
 #
-# PRIVATE, and the honest include list is ONE file — `grep -rn
+# PRIVATE, and the honest include list is TWO files — `grep -rn
 # '^#include <nlohmann' src/program/` is the whole instrument, exactly as
-# src/core/CMakeLists.txt keeps its own list honest. `dependency_lockfile.hpp`
+# src/core/CMakeLists.txt keeps its own list honest:
+#   * `dependency_lockfile.cpp` — reads/writes `.dss-deps/dss-lock.json` (AP6);
+#   * `program.cpp` — `declaredFileExtensionsOf` reads a shipped language
+#     document's own `language.fileExtensions` through a SAX handler that
+#     ABORTS the parse the moment that block closes, so the extension question
+#     costs a few hundred bytes instead of constructing a whole grammar
+#     ([[D-DRIVER-SHIPPED-SOURCE-RESOLUTION-COMPILES-EVERY-SHIPPED-GRAMMAR]],
+#     cycle P35). No CMake change was needed — this PRIVATE edge already existed.
+# ⚠ THIS COUNT SAID "ONE FILE" UNTIL 2026-08-25 AND WAS WRONG THE MOMENT THE
+# SECOND INCLUDE LANDED. A note that states a number is a note that goes stale
+# silently: nothing here fails when the count drifts, which is exactly why the
+# instrument is spelled out beside it — run the grep, do not trust the sentence.
+# `dependency_lockfile.hpp`
 # is a public header and deliberately names NO JSON type: the document shape is
 # an implementation detail of the .cpp, so no consumer of the lockfile inherits
 # the dependency (contrast the sanctioned `_json.hpp` shape in `core`, which is

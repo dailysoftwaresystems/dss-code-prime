@@ -2947,3 +2947,69 @@ TEST(Tokenizer, PopAtNewlineModeAutoPopsAtEofWithoutNewline) {
     EXPECT_TRUE(result.diags.empty())
         << "a popAtNewline mode at EOF closes silently — not unterminated";
 }
+// ═══ Longest-match probe index ════════════════════════════════════════════
+//
+// D-PERF-TOK-LONGEST-MATCH-PROBES-EVERY-DECLARED-LENGTH-AT-EVERY-POSITION.
+// The scan no longer walks every length from `maxLexemeLength` down to 1; it
+// walks only the lengths `GrammarSchema::lexemeLengthsForLeadByte` declares
+// for the byte under the cursor. These pin the two ends of that row on the
+// SHIPPED `c` grammar, because the row's ends are where a filter goes wrong:
+// the longest entry is what a truncating index drops, and a byte with no
+// entries at all is the case that used to cost a full sweep of misses.
+// The index itself is pinned exhaustively in
+// `tests/core/test_grammar_schema.cpp` (`GrammarSchemaProbeIndex.*`).
+
+TEST(Tokenizer, ProbeIndexStillReachesTheLongestDeclaredLexeme) {
+    // `__builtin_types_compatible_p` IS `maxLexemeLength` for the shipped `c`
+    // grammar — 28 bytes, and the reason the unindexed scan probed 28 lengths
+    // at every single token position. It is also the only key in the `_` row
+    // at that length, so an index that truncated the row (or that stopped at
+    // the 15-byte small-string boundary the old per-probe `std::string`
+    // crossed) would lex it as a plain identifier: a WRONG PARSE, not a parse
+    // error, which is exactly the failure this pin exists to catch.
+    auto h      = loadC("__builtin_types_compatible_p");
+    auto result = lex(h);
+    ASSERT_GE(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].span.length(), 28u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
+    EXPECT_TRUE(result.tokens[0].schemaKind.valid())
+        << "the longest declared lexeme resolved to no schema kind — the "
+           "probe index is not reaching the end of its row";
+    EXPECT_EQ(h.schema->maxLexemeLength(), result.tokens[0].span.length())
+        << "this pin is only meaningful while this lexeme IS the longest one";
+}
+
+TEST(Tokenizer, ProbeIndexLeavesAnUndeclaredLeadByteToTheIllegalCharPath) {
+    // `@` starts no declared key, so its row is empty and the scan does zero
+    // lookups — where it used to do `maxLexemeLength` guaranteed misses. The
+    // OUTCOME must be unchanged: one Error token, one P_IllegalChar, and
+    // tokenization continues.
+    ASSERT_TRUE(dss::test_support::shippedSchemaOrThrow("c")
+                    ->lexemeLengthsForLeadByte('@').empty())
+        << "this pin assumes `@` is outside C's lexical alphabet";
+
+    auto h      = loadC("a@b");
+    auto result = lex(h);
+    ASSERT_EQ(result.diags.size(), 1u);
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_IllegalChar);
+    ASSERT_GE(result.tokens.size(), 3u);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "a");
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "@");
+    EXPECT_EQ(textOf(*h.src, result.tokens[2]), "b");
+}
+
+// ★ THE OTHER HALF OF THE FIX, PINNED AT COMPILE TIME. The lexeme tables are
+// queried with the probe's `std::string_view` rather than a `std::string`
+// built from it, which is what stops a probe past the 15-byte small-string
+// threshold calling malloc. That property has NO runtime behaviour to assert
+// — the output is byte-identical either way, deliberately — so the pin is the
+// transparency itself: revert either the hasher or the comparator and this
+// stops compiling. A `find(string_view)` call would NOT catch it, because a
+// non-transparent map accepts one too, by silently constructing the
+// `std::string` this exists to remove.
+static_assert(requires { typename dss::detail::LexemeTable::hasher::is_transparent; },
+              "the lexeme table's hasher must stay transparent, or every "
+              "longest-match probe materialises a std::string again");
+static_assert(requires { typename dss::detail::LexemeTable::key_equal::is_transparent; },
+              "the lexeme table's comparator must stay transparent, or "
+              "heterogeneous find() silently converts to std::string again");

@@ -180,15 +180,39 @@ TEST(TargetSchema, LoadShippedReportsNotFoundForUnknownName) {
     EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_InvalidTargetName));
 }
 
-TEST(TargetSchema, EachLoadMintsDistinctSchemaId) {
-    auto a = TargetSchema::loadShipped("x86_64");
-    auto b = TargetSchema::loadShipped("x86_64");
-    ASSERT_TRUE(a.has_value()) << "x86_64 must be a shipped target";
-    ASSERT_TRUE(b.has_value());
-    EXPECT_NE((*a)->id(), (*b)->id())
-        << "two independent loads must produce distinct TargetSchemaIds — "
-           "otherwise the substrate cross-check between Lir::targetId and "
-           "the schema reference would silently alias unrelated builders";
+// ⚠ RE-AIMED 2026-08-25 (cycle P35, lane A). It was
+// `EachLoadMintsDistinctSchemaId`, and it loaded `x86_64` TWICE. The
+// content-addressed memo
+// (D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS)
+// makes two loads of ONE document one build and therefore ONE id, so the old
+// subject is now false BY DESIGN.
+//
+// ★ THIS IS A STRENGTHENING, NOT A WEAKENING, AND THE OLD TEST'S OWN COMMENT
+// SAYS SO. Its stated stake was that colliding ids would "silently alias
+// UNRELATED builders" through the `Lir::targetId` cross-check — but two loads of
+// `x86_64` are not unrelated, they are the same description byte for byte, so
+// the old arm never once exercised that hazard. Two DIFFERENT target documents
+// do, and that is what it now loads: had `x86_64` and `arm64` collided on one
+// id, the previous form would have stayed green.
+// ★★ The second half states the memo's own property in the same place, so a
+// future reader does not re-derive the deleted expectation from the name.
+TEST(TargetSchema, DistinctTargetDocumentsMintDistinctSchemaIds) {
+    auto x86 = TargetSchema::loadShipped("x86_64");
+    auto arm = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(x86.has_value()) << "x86_64 must be a shipped target";
+    ASSERT_TRUE(arm.has_value()) << "arm64 must be a shipped target";
+    EXPECT_NE((*x86)->id(), (*arm)->id())
+        << "two DIFFERENT target descriptions share one TargetSchemaId — the "
+           "substrate cross-check between Lir::targetId and the schema "
+           "reference would silently alias unrelated builders";
+
+    auto again = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(x86->get(), again->get())
+        << "two loads of ONE unchanged document must share the memoized schema";
+    EXPECT_EQ((*x86)->id(), (*again)->id())
+        << "one build means one id — a second id here would mean the document "
+           "was rebuilt";
 }
 
 TEST(TargetSchema, LoadFromTextDefaultsSourceLabel) {

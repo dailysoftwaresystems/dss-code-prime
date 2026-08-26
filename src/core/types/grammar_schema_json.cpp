@@ -1,5 +1,6 @@
 #include "core/types/grammar_schema_json.hpp"
 
+#include "core/crypto/sha256.hpp"                 // crypto::sha256Hex — the referenced-document ledger's digest
 #include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
@@ -3094,7 +3095,8 @@ struct LanguageReferenceBinding {
 void mergeLanguageReferences(
         json& doc, std::string_view hostLabel, Collector& coll,
         std::vector<LanguageReferenceBinding>& outRefs,
-        std::unordered_map<std::string, std::string>& outShapeOrigin) {
+        std::unordered_map<std::string, std::string>& outShapeOrigin,
+        std::vector<ConfigDocumentDependency>& outDependencies) {
 
     if (!doc.contains("languageReferences")) return;
     json const& lrs = doc.at("languageReferences");
@@ -3195,6 +3197,19 @@ void mergeLanguageReferences(
             continue;
         }
         std::string text = *std::move(readText);
+        // ── THE REFERENCED-DOCUMENT LEDGER ──────────────────────────────
+        // Recorded HERE, from the bytes this build actually merged, rather
+        // than re-read later from the path: a second read could see a
+        // DIFFERENT file and would record a digest this schema was never built
+        // from. The ledger's whole job is to say what went in, so it is taken
+        // at the moment the bytes go in.
+        // ⚠ Recorded BEFORE the parse and before every validation below, so a
+        // document that is merged only PARTIALLY — the arms below `continue`
+        // on a malformed fragment — still names its contributor. A load that
+        // reached this line read that file, and a consumer keying on this
+        // schema must know it.
+        outDependencies.push_back(
+            ConfigDocumentDependency{resolved->string(), crypto::sha256Hex(text)});
         json refDoc;
         try {
             refDoc = json::parse(text);
@@ -4453,7 +4468,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     }();
     std::vector<LanguageReferenceBinding> languageRefs;
     mergeLanguageReferences(doc, hostLabel, coll, languageRefs,
-                            data.shapeOriginDoc);
+                            data.shapeOriginDoc, data.referencedDocuments);
 
     // D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER: fill this
     // document's inline-asm TEMPLATE lexer mode from the language-declared role

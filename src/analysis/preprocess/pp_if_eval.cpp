@@ -134,17 +134,17 @@ public:
     IceParser(std::vector<Token> toks, GrammarSchema const& schema,
               SourceBuffer const& synth, SourceBuffer const& scratch,
               LiteralKinds const& lits, DiagnosticReporter& rep,
-              BufferId diagBufferId)
+              BufferId diagBufferId, std::string_view productTail)
         : toks_(std::move(toks)),
           schema_(schema),
           synth_(synth),
           scratch_(scratch),
-          // FC15b: diagnostics attribute to the ORIGINAL prefix synth buffer
-          // (`diagBufferId`), even when real tokens are sliced against a COMBINED
-          // (prefix + product) buffer whose id differs. A real token's span is a
-          // valid PREFIX offset, so it positions correctly under either id; using
-          // the prefix id keeps the diagnostic on the buffer `preprocess()`
-          // remaps (the combined buffer is local + unregistered).
+          productTail_(productTail),
+          // FC15b: diagnostics attribute to the prefix synth buffer
+          // (`diagBufferId`). A real token's span is either a valid PREFIX offset
+          // or a PRODUCT offset past the prefix's end; the prefix id keeps the
+          // diagnostic on the buffer `preprocess()` remaps, which is the only
+          // registered one (the product tail is not a buffer at all).
           diagBufferId_(diagBufferId),
           lits_(lits),
           rep_(rep),
@@ -215,6 +215,12 @@ private:
     GrammarSchema const&          schema_;
     SourceBuffer const&           synth_;
     SourceBuffer const&           scratch_;
+    // FC15b: the expander's accumulated `#`/`##`/predefined PRODUCT bytes, which
+    // conceptually sit immediately AFTER `synth_`'s bytes. Borrowed, never copied
+    // — see `textOf` and, at the call site, the note anchored
+    // D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION.
+    // Empty for a language with no products.
+    std::string_view              productTail_;
     BufferId                      diagBufferId_{};
     LiteralKinds const&           lits_;
     DiagnosticReporter&           rep_;
@@ -234,10 +240,29 @@ private:
     [[nodiscard]] Token const& peek() const { return toks_[pos_]; }
     void advance() { ++pos_; }
 
+    // ★ THE ONE SLICING RULE, AND IT IS `MacroExpander::text`'s RULE. A synthetic
+    // `defined`-result token slices the scratch buffer. Every REAL token slices
+    // the PREFIX (`synth_`) when its span starts inside it, and the PRODUCT TAIL
+    // when it starts at-or-past the prefix's end (FC15a's A2 layout: a product
+    // token's span is `[prefixLen + productOffset, …)`). Sharing the rule rather
+    // than materializing `prefix + tail` as one buffer is what removed a
+    // whole-TU copy from every `#if` — see the call site's
+    // D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION note.
+    // The `e <= productTail_.size()` bound mirrors the expander's own defensive
+    // arm: a malformed product span returns EMPTY rather than reading out of
+    // range (an empty spelling then fails loud in `decodeInteger`, never a
+    // silent wrong value).
     [[nodiscard]] std::string_view textOf(Token const& t) const {
-        // A synthetic `defined`-result token slices against the scratch buffer;
-        // every real operand token slices against the synth buffer.
         if (has(t.flags, NodeFlags::Synthetic)) return scratch_.slice(t.span);
+        const ByteOffset prefixLen = static_cast<ByteOffset>(synth_.text().size());
+        if (t.span.start() >= prefixLen) {
+            const ByteOffset s = t.span.start() - prefixLen;
+            const ByteOffset e = t.span.end() - prefixLen;
+            if (e <= productTail_.size() && s <= e) {
+                return productTail_.substr(s, e - s);
+            }
+            return {};
+        }
         return synth_.slice(t.span);
     }
 
@@ -1089,21 +1114,36 @@ evaluateIfExpression(std::span<Token const> operandTokens,
 
     // FC15b: a predefined / `#` / `##` PRODUCT materialized during the expansion
     // above carries a span in the synth buffer's product TAIL (`[prefixLen + ..)`)
-    // -- bytes NOT present in the prefix-only `synth`. Assemble a COMBINED buffer
-    // `synth.text() + productText()` so the ICE parser can slice such a real token
-    // (e.g. `__STDC_VERSION__` -> `202311L`). A prefix span is byte-identical in
-    // the combined buffer (it is a strict prefix), so the operand's own tokens
-    // resolve unchanged. With no products the tail is empty -> combined == prefix.
+    // -- bytes NOT present in the prefix-only `synth`. The ICE parser must be able
+    // to slice such a real token (e.g. `__STDC_VERSION__` -> `202311L`).
+    //
+    // ★★★ D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION. This
+    // used to assemble a COMBINED buffer per evaluation -- `std::string
+    // combined{synth.text()}; combined.append(tail);` then a `SourceBuffer` around
+    // it -- i.e. it COPIED THE ENTIRE TRANSLATION UNIT, twice, once for every
+    // `#if`/`#elif` line evaluated after the TU's first `#`/`##`/predefined
+    // product. ✔MEASURED 2026-08-25 on the 103-TU sqlite full-source corpus
+    // (`--project … --config=release --jobs 1`): 13,242 evaluations copied
+    // 12,424 MB and cost 10.05 s -- 10.0 s of the 13.3 s `preprocess-expand`
+    // phase, on a build whose ENTIRE preprocessor cost 47 s. The cost is
+    // QUADRATIC in the shape that matters: a bigger TU makes each copy bigger AND
+    // gives it more `#if` lines to be copied at.
+    //
+    // ★ THE FIX IS NOT A CACHE OF THE COMBINED BUFFER -- it is to stop
+    // materializing a concatenation nothing needs. A token's bytes already have
+    // exactly one well-defined home, and `MacroExpander::text` (the expander's own
+    // slicer) has always known the rule: a span at-or-past `prefixLen` is a
+    // PRODUCT and slices the product tail at `start - prefixLen`; every other span
+    // slices the prefix. `IceParser::textOf` now applies that SAME rule, so the
+    // two slicers cannot drift -- and the per-`#if` copy is gone entirely.
+    //
+    // ⓘ `prefixLen` is not a new parameter because it is not new information:
+    // `synth` IS the prefix buffer (`preprocess()` builds it from `synthText`
+    // BEFORE appending `productText()`, and hands the same byte count to
+    // `MacroExpander` as its `prefixLen`), so `synth.text().size()` IS that
+    // length. Deriving it here rather than threading a second spelling of the
+    // same number is what keeps the two from disagreeing.
     std::string_view const tail = productText ? productText() : std::string_view{};
-    std::shared_ptr<SourceBuffer> combinedHolder;
-    SourceBuffer const* realSlice = &synth;
-    if (!tail.empty()) {
-        std::string combined{synth.text()};
-        combined.append(tail);
-        combinedHolder =
-            SourceBuffer::fromString(std::move(combined), std::string{synth.name()});
-        realSlice = combinedHolder.get();
-    }
 
     // ── Steps 3 + 4: drop trivia, then parse + fold (a surviving identifier ->
     // 0 happens inside the parser's primary). ──
@@ -1113,8 +1153,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         if (!isTriviaTok(t)) nonTrivia.push_back(t);
     }
 
-    IceParser parser{std::move(nonTrivia), schema, *realSlice, *scratchBuf, lits,
-                     rep, synth.id()};
+    IceParser parser{std::move(nonTrivia), schema, synth,    *scratchBuf, lits,
+                     rep,                  synth.id(), tail};
     return parser.evaluate();
 }
 

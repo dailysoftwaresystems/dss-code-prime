@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <format>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -86,6 +87,43 @@ constexpr WeakDefinitionDialect kPeWeakDialects[] = {
     WeakDefinitionDialect::Comdat,
 };
 
+// ── `IMAGE_FILE_HEADER` geometry the BYTE PROBE reads (PE/COFF §3.3) ──────
+//
+// The two fields that decide "COFF object of THIS format", and nothing else.
+// A COFF object begins AT this header — there is no DOS stub and no `PE\0\0`
+// signature ahead of it — so these offsets are file offsets, not RVAs.
+constexpr std::size_t kFhMachineOff    = 0;   // u16 Machine
+constexpr std::size_t kFhOptHdrSizeOff = 16;  // u16 SizeOfOptionalHeader
+
+// `IMAGE_FILE_MACHINE_UNKNOWN`. Not a machine a shipped format declares — it
+// is what an unvalidated, hand-built `PeIdentity` leaves behind, and the probe
+// treats it as "recognizes nothing" (see the fail-closed note on the method).
+constexpr std::uint16_t kPeMachineUnknown = 0;
+
+// Bounds-checked little-endian half-word read.
+//
+// ★ LOCAL, NOT `ffi/binary_readers/reader_common.hpp`'s `readU16`: `ffi`
+// depends UP on `link` (`ffi/ingest.hpp`, `ffi/abi/abi_catalog.hpp` and
+// `ffi/mangling/c_mangle.hpp` all include `link/object_format_schema.hpp`), so
+// a `link` -> `ffi` include closes a dependency CYCLE — the call
+// `coff_object_reader.cpp` already records at its own `kFileHeaderSz` block.
+// And that helper indexes `b[off]` UNCHECKED, which is correct for a reader
+// that has validated its buffer and wrong for a `noexcept` predicate handed an
+// arbitrary file.
+//
+// No byte-order parameter, unlike the ELF probe's reader: every field of a
+// COFF header is little-endian by the PE/COFF specification, on every machine
+// Windows has ever shipped — the format carries no encoding byte to consult.
+[[nodiscard]] constexpr std::optional<std::uint16_t>
+peProbeReadU16(std::span<std::uint8_t const> b, std::size_t off) noexcept {
+    // A SUBTRACTION on the size, never `off + 2 > b.size()`, so it stays
+    // correct for an `off` near `SIZE_MAX` that a future caller could compute.
+    if (b.size() < 2u || off > b.size() - 2u) return std::nullopt;
+    return static_cast<std::uint16_t>(
+        static_cast<std::uint16_t>(b[off + 0])
+        | static_cast<std::uint16_t>(b[off + 1] << 8));
+}
+
 class PeBackend final : public ObjectFormatBackend {
 public:
     [[nodiscard]] std::string_view configName() const noexcept override {
@@ -129,6 +167,74 @@ public:
             detail::ObjectFormatData const& d) const noexcept override {
         return d.pe.objectType == PeObjectType::Obj;
     }
+
+    // ★★★ THE BYTE PROBE, AND THE ONE ARM WHERE THE SCHEMA'S OWN DECLARATION
+    // IS LOAD-BEARING RATHER THAN CORROBORATING.
+    //
+    // A COFF OBJECT HAS NO MAGIC NUMBER. ELF opens with `0x7F 'E' 'L' 'F'`
+    // and Mach-O with `0xFEEDFACF`; a `.obj` opens with its
+    // `IMAGE_FILE_HEADER`, whose first field is a 16-bit machine code. There
+    // is no signature anywhere in the file — the `MZ` stub and the `PE\0\0`
+    // signature belong to IMAGES (`.exe`/`.dll`) and are exactly what a
+    // relocatable object does NOT carry. So "is this a COFF object?" is
+    // UNDECIDABLE in general: any 20 bytes whose first half-word happens to
+    // be a plausible machine and whose 17th and 18th are zero would pass, and
+    // that describes plenty of files that are not COFF at all.
+    //
+    // "Is this a COFF object FOR THIS FORMAT?" is decidable, and it is the
+    // only question this predicate is actually asked. `pe.cpp`'s `.obj`
+    // writer emits `Machine` verbatim out of `pe.machine`, so requiring the
+    // file's machine to equal the DECLARED one turns an open-ended guess into
+    // a closed structural test against a value this schema published. That is
+    // why this arm keys on the schema and the ELF/Mach-O arms do not need to:
+    // they have a magic and this one does not.
+    //
+    // The other two conditions complete the shape:
+    //   * `MZ` REJECTED FIRST. A DOS stub means a PE IMAGE — a link OUTPUT,
+    //     not a relocatable input — and its `e_lfanew`-reachable COFF header
+    //     sits at some later offset, so the fields read below would be DOS
+    //     stub bytes. Rejecting on the stub is both the right answer and the
+    //     reason the reads afterwards are meaningful.
+    //   * `SizeOfOptionalHeader == 0`. An object has no optional header; an
+    //     image always has one. This is the same discriminator
+    //     `pe::readRelocatableObject` fails loud on, stated as acceptance.
+    //
+    // ⓘ EXACTLY WHEN THE `MZ` ARM CHANGES THE ANSWER — said out loud, because
+    // a guard nothing can reach asserts nothing. `'M','Z'` occupies the same
+    // two bytes as `Machine`, so a stub reads as machine 0x5A4D: for every
+    // other declared machine the arm is SUBSUMED by the equality below, and
+    // for 0x5A4D it is the only thing standing between this predicate and
+    // "every PE image on the system is a relocatable object". 0x5A4D is not a
+    // defined `IMAGE_FILE_MACHINE_*` value, but it IS a reachable
+    // declaration: `readIdentity` range-checks `pe.machine` to `[0, 0xFFFF]`
+    // and `validateIdentity` requires only that it be non-zero, so a
+    // `.format.json` saying `"machine": 23117` loads. The test named
+    // `PeImageIsRejectedOnItsDosStubWhenTheStubReadsAsTheDeclaredMachine`
+    // (suite `RelocatableObjectProbe`, in
+    // tests/link/test_relocatable_object_probe.cpp) builds that schema and
+    // goes red the moment the arm is deleted.
+    //
+    // ⚠ FAIL-CLOSED ON A SCHEMA THAT DECLARED NO MACHINE, EXPLICITLY. Unlike
+    // the ELF arm — where a zero `fileClass` can never match a real file — a
+    // zero machine (`IMAGE_FILE_MACHINE_UNKNOWN`) WOULD match a run of zero
+    // bytes, so 20 zeros handed to an unvalidated hand-built schema would
+    // read as a COFF object. The guard below is what stops that; it is not
+    // defensive decoration.
+    [[nodiscard]] bool looksLikeRelocatableObject(
+            detail::ObjectFormatData const& d,
+            std::span<std::uint8_t const>   bytes) const noexcept override {
+        if (bytes.size() >= 2u && bytes[0] == 'M' && bytes[1] == 'Z') {
+            return false;
+        }
+        if (d.pe.machine == kPeMachineUnknown) return false;
+
+        auto const machine = peProbeReadU16(bytes, kFhMachineOff);
+        if (!machine.has_value() || *machine != d.pe.machine) return false;
+
+        auto const optHeaderSize = peProbeReadU16(bytes, kFhOptHdrSizeOff);
+        return optHeaderSize.has_value() && *optHeaderSize == 0u;
+    }
+
     [[nodiscard]] bool sectionsCarrySegmentNames() const noexcept override {
         return false;
     }

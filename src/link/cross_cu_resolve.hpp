@@ -1,9 +1,11 @@
 #pragma once
 
 #include "core/export.hpp"
-#include "core/types/symbol_attrs.hpp"  // SymbolBinding
+#include "core/types/symbol_attrs.hpp"  // SymbolBinding, DuplicateMatch
 #include "link/symbol_kind.hpp"         // LinkedSymbolKey
 
+#include <cstddef>
+#include <cstdint>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -47,6 +49,52 @@ struct CrossCuDef {
     std::string     name;
     SymbolBinding   binding = SymbolBinding::Global;
     LinkedSymbolKey key{};
+    // ── WHAT THIS WEAK DEFINITION PROMISES ABOUT ITS DUPLICATES ───────────
+    //    D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED
+    //
+    // Two of COFF's COMDAT selections carry a duty the linker is SPECIFIED to
+    // discharge: SAME_SIZE (3) requires every definition of the name to have
+    // the same byte length, EXACT_MATCH (4) requires them to be byte-identical,
+    // and either way a violation is a multiply-defined-symbol ERROR. Before
+    // this, all three of ANY / SAME_SIZE / EXACT_MATCH were folded lowest-key
+    // with no comparison at all, so DSS silently accepted exactly the input the
+    // format tells it to reject.
+    //
+    // ★ THE VERIFICATION LIVES HERE, WITH THE POLICY, RATHER THAN IN THE
+    // LINKER. This kernel is already the single source of truth for "which
+    // definition wins"; "…and under what conditions the losers were allowed to
+    // exist" is the same question's other half, and splitting them would leave
+    // the MIR merge folding weak duplicates by a rule the linker had privately
+    // strengthened. It stays PURE and diagnostic-free: a violation is RECORDED
+    // as data (`duplicateMismatches`) exactly as a two-strong collision is, and
+    // the caller owns the wording.
+    //
+    // ⚠ `body` IS A NON-OWNING VIEW and the caller guarantees it outlives the
+    // call. That is the one concession this struct makes to the tier above it,
+    // and it is deliberately a `span<const byte>` rather than an
+    // `AssembledFunction` or an `AssembledData`: the kernel still depends on no
+    // module type, no target, no object format, and no source language.
+    //
+    // ★★ `bodySize` IS SEPARATE FROM `body.size()` AND THAT IS NOT REDUNDANCY —
+    // it is the ZERO-FILL case, and getting it wrong is a silent hole rather
+    // than a loud one. A `.bss` definition occupies `reservedSize` bytes in its
+    // section and stores NONE of them (`AssembledData::sizeInSection` is the
+    // producer-side statement of exactly this). Comparing `body.size()` would
+    // compare 0 against 0 for two zero-fill definitions of DIFFERENT declared
+    // sizes and report that a SAME_SIZE promise was kept. So:
+    //   * `bodySize` is the size the definition OCCUPIES — always meaningful;
+    //   * `body` is the STORAGE, empty for a zero-fill definition, and
+    //     otherwise `body.size() == bodySize`.
+    // A zero-fill definition's content is implicitly all-zero, which is what
+    // lets EXACT_MATCH compare a zero-fill against a file-backed run of zeros
+    // and get the right answer rather than refusing to look.
+    //
+    // Both default to "nothing declared", which is why `Any` (the default duty)
+    // skips the comparison entirely and the pre-existing behaviour is preserved
+    // bit for bit for every producer that sets neither.
+    DuplicateMatch                 duplicateMatch = DuplicateMatch::Any;
+    std::size_t                    bodySize = 0;
+    std::span<std::uint8_t const>  body{};
 };
 
 // One two-strong collision event. `name` is the colliding cross-CU name; `existing` is
@@ -61,6 +109,29 @@ struct CrossCuConflict {
     LinkedSymbolKey incoming{};
 };
 
+// One BROKEN DUPLICATE-MATCH PROMISE — the anchor, whole on its own line:
+//   D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED
+// Recorded when two definitions of `name` are folded and the
+// governing duty (`required`, the STRICTER of the pair's two — see
+// `stricterDuplicateMatch`) is not satisfied by their bodies. `existing` /
+// `incoming` are the same winner-so-far / duplicate pair `CrossCuConflict`
+// carries, and `existingSize` / `incomingSize` are their body lengths, so the
+// caller can name both members AND state the numbers without re-deriving them.
+//
+// ⚠ `required` is reported rather than inferred by the caller BECAUSE THE
+// DUTY MAY COME FROM EITHER MEMBER. A definition that promises nothing folded
+// against one that promises EXACT_MATCH is governed by EXACT_MATCH, so a
+// diagnostic that read the duty off `incoming` alone would name the wrong
+// selection roughly half the time.
+struct CrossCuDuplicateMismatch {
+    std::string     name;
+    LinkedSymbolKey existing{};
+    LinkedSymbolKey incoming{};
+    DuplicateMatch  required = DuplicateMatch::Any;
+    std::size_t     existingSize = 0;
+    std::size_t     incomingSize = 0;
+};
+
 // The resolution outcome. `winners[name]` is the winning definition's compound key for
 // every externally-visible name (a strong def shadows weak; among all-weak the
 // lexicographically-lowest `(cuId, SymbolId)` wins; among multiple strongs the lowest
@@ -71,6 +142,10 @@ struct CrossCuConflict {
 struct CrossCuResolution {
     std::unordered_map<std::string, LinkedSymbolKey> winners;
     std::vector<CrossCuConflict>                     conflicts;
+    // Every folded weak pair whose duplicate-match promise was BROKEN. Empty
+    // for every link in which no producer declared a duty (the overwhelmingly
+    // common case, and the pre-existing behaviour bit for bit).
+    std::vector<CrossCuDuplicateMismatch>            duplicateMismatches;
 };
 
 // Resolve the winning definition per name. ORDER-INDEPENDENT: permuting `defs` yields

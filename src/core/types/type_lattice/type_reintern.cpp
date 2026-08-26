@@ -1,11 +1,16 @@
 #include "core/types/type_lattice/type_reintern.hpp"
 
+#include "core/types/anon_member_name.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <span>
 #include <string>
 #include <string_view>
@@ -14,6 +19,37 @@
 namespace dss {
 
 namespace {
+
+// ── The mixer ───────────────────────────────────────────────────────────────
+// FNV-1a. Every value that reaches a composite's identity goes through one of
+// these two, so the encoding has ONE owner and a new channel cannot be added in
+// a second spelling.
+constexpr std::uint64_t kFnvOffset = 1469598103934665603ULL;
+constexpr std::uint64_t kFnvPrime  = 1099511628211ULL;
+
+void mix(std::uint64_t& h, std::string_view s) {
+    for (char c : s) {
+        h ^= static_cast<std::uint64_t>(static_cast<unsigned char>(c));
+        h *= kFnvPrime;
+    }
+    h ^= 0xFFu;   // field separator: `("ab","c")` must not digest as `("a","bc")`
+    h *= kFnvPrime;
+}
+
+void mix(std::uint64_t& h, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        h ^= (v >> (i * 8)) & 0xFFu;
+        h *= kFnvPrime;
+    }
+}
+
+// The (kind, tag) key of the ambiguity table. Length-prefixed so that it is
+// injective: a separator-joined encoding would fold `("S", "x")` into `("S:x",
+// "")`, the same non-injectivity `ffiImportKey` in mir_merge.cpp guards against.
+[[nodiscard]] std::string tagKey(TypeKind kind, std::string_view name) {
+    return std::format("{}:{}:{}", static_cast<std::uint32_t>(kind),
+                       name.size(), name);
+}
 
 // ── The abort-message name — ONE OWNER, in the header ───────────────────────
 //
@@ -46,8 +82,348 @@ namespace {
 
 } // namespace
 
+// ── The ACYCLIC half of a composite's identity ──────────────────────────────
+//
+// `spine_` describes a field's type down to, but NOT through, the composites it
+// reaches: every composite becomes a placeholder plus an entry in `refs`. That
+// split is what makes the whole thing computable — the walk below cannot cycle,
+// because a cycle in a C type graph must pass through a composite, and this walk
+// stops at every composite. All the cycles end up in `refs`, where the fixed
+// point in `finalize_` handles them as ordinary edges.
+void CompositeIdentityIndex::spine_(TypeInterner const& src, TypeId id,
+                                    std::uint64_t& h,
+                                    std::vector<std::uint32_t>& refs) {
+    if (!id.valid()) { mix(h, std::string_view{"!"}); return; }
+    // RAW kind, never the transparent `kind()`: a `volatile T` must not describe
+    // as a plain `T`, or the cross-CU merge silently drops the qualifier
+    // (c27, D-CSUBSET-VOLATILE-POINTEE).
+    TypeKind const kind = src.get(id).kind;
+    mix(h, static_cast<std::uint64_t>(kind));
+
+    if (kind == TypeKind::Struct || kind == TypeKind::Union) {
+        mix(h, std::string_view{"<composite>"});
+        refs.push_back(nodeFor_(src, id));
+        return;
+    }
+    if (kind == TypeKind::VolatileQual) {
+        mix(h, static_cast<std::uint64_t>(src.qualifierBits(id)));
+        spine_(src, src.stripVolatile(id), h, refs);
+        return;
+    }
+    // Every other kind is hash-consed by (kind, name, extensionKind, scalars,
+    // operands) in the host, so the signature spells the same tuple.
+    mix(h, src.name(id));
+    mix(h, static_cast<std::uint64_t>(src.get(id).extensionKind.v));
+    if (kind == TypeKind::FnSig) {
+        mix(h, static_cast<std::uint64_t>(src.fnIsVariadic(id) ? 1 : 0));
+    }
+    std::span<std::int64_t const> scalars = src.scalars(id);
+    mix(h, static_cast<std::uint64_t>(scalars.size()));
+    for (std::int64_t s : scalars) mix(h, static_cast<std::uint64_t>(s));
+    std::span<TypeId const> ops = src.operands(id);
+    mix(h, static_cast<std::uint64_t>(ops.size()));
+    for (TypeId op : ops) spine_(src, op, h, refs);
+}
+
+// ★ EVERY CHANNEL `reinternType` CARRIES ACROSS MUST BE HERE, and the argument
+// is one line: this signature is a claim that two composites will reintern to
+// interchangeable host types, so anything the reintern preserves and this omits
+// is a layout difference that would be merged away. Hence the same accessor list
+// the composite arm of `reinternType` uses — packed, explicit field offsets,
+// member alignas, whole-composite alignas, bit-field widths. ⓘ Adding a channel
+// to `completeComposite` without adding it here reopens exactly the silent
+// ABI-merge class `D-CSUBSET-PACKED` and `D-CSUBSET-COMPOSITE-ALIGNED` are about.
+void CompositeIdentityIndex::localSignature_(TypeInterner const& src, TypeId id,
+                                             std::uint64_t& h,
+                                             std::vector<std::uint32_t>& refs) {
+    TypeKind const kind = src.get(id).kind;
+    h = kFnvOffset;
+    mix(h, static_cast<std::uint64_t>(kind));
+    // ⚠ THE NAME GOES IN WITHOUT ITS DECL SITE. An anonymous member is named
+    // `<anon:RULE:NODEID>` and that NODEID is a per-CU AST index, so mixing it
+    // raw makes every anonymous composite unique to its CU -- and every named
+    // struct that reaches one inherits the split. ✔MEASURED on 103-TU sqlite
+    // before this line existed: **98 tags forked, each with a SINGLE local
+    // layout signature**, `Parse` / `Table` / `Select` / `Index` among them.
+    // See `core/types/anon_member_name.hpp` for the whole argument.
+    mix(h, anonNameWithoutDeclSite(src.name(id)));
+    mix(h, static_cast<std::uint64_t>(src.isPacked(id) ? 1 : 0));
+    mix(h, static_cast<std::uint64_t>(src.explicitCompositeAlign(id)));
+    std::span<TypeId const>       fields = src.operands(id);
+    std::span<std::int64_t const> widths = src.scalars(id);
+    bool const hasOffsets = src.hasExplicitOffsets(id);
+    bool const hasAligns  = src.hasExplicitAligns(id);
+    mix(h, static_cast<std::uint64_t>(fields.size()));
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        spine_(src, fields[i], h, refs);
+        mix(h, i < widths.size() ? static_cast<std::uint64_t>(widths[i]) : 0ULL);
+        if (hasOffsets) mix(h, src.explicitFieldOffset(id, i).value_or(0));
+        if (hasAligns)
+            mix(h, static_cast<std::uint64_t>(src.explicitFieldAlign(id, i)));
+    }
+}
+
+std::uint32_t CompositeIdentityIndex::nodeFor_(TypeInterner const& src,
+                                               TypeId id) {
+    std::uint64_t const nk = (static_cast<std::uint64_t>(src.owner().v) << 32)
+                             | static_cast<std::uint64_t>(id.v);
+    auto const [it, fresh] =
+        nodeOf_.try_emplace(nk, static_cast<std::uint32_t>(nodes_.size()));
+    if (fresh) {
+        nodes_.push_back(Node{});
+        Node& n = nodes_.back();
+        n.owner = &src;
+        n.id    = id.v;
+        n.alias = it->second;
+    }
+    return it->second;
+}
+
+// ── observe: one node per composite, plus the tag table ─────────────────────
+void CompositeIdentityIndex::observe(TypeInterner const& src) {
+    if (finalized_) {
+        std::fputs("dss::CompositeIdentityIndex fatal: observe() after keyFor() "
+                   "- the identities are a fixed point over the whole observed "
+                   "graph, so a late arrival would silently change answers that "
+                   "have already been handed out.\n", stderr);
+        std::abort();
+    }
+    // A LINEAR arena walk, not a walk from the reintern roots. Deliberate: the
+    // roots are scattered (function signatures, global types, per-instruction
+    // types) and a root list that drifts would silently stop observing part of
+    // the CU -- "observed less than it should have" degrades into exactly the
+    // forking this class removes, with nothing red anywhere. Types the merge
+    // never reaches only ever ADD ambiguity, which is the safe direction.
+    for (std::uint32_t v = 1; v <= src.size(); ++v) {
+        TypeId const   id   = TypeId{v, src.owner().v};
+        TypeKind const kind = src.get(id).kind;
+        if (kind != TypeKind::Struct && kind != TypeKind::Union) continue;
+
+        std::uint32_t const self = nodeFor_(src, id);
+        if (nodes_[self].filled) continue;   // observed twice: harmless
+        nodes_[self].filled = true;
+        if (src.isIncompleteComposite(id)) continue;   // aliased in finalize_
+
+        std::uint64_t              local = 0;
+        std::vector<std::uint32_t> refs;
+        localSignature_(src, id, local, refs);
+        // ⚠ `nodeFor_` may have REALLOCATED `nodes_` while walking the fields,
+        // so the reference is taken AFTER the walk, never before it. A `Node&`
+        // held across `localSignature_` is a dangling reference the moment a
+        // field mentions an unseen composite -- which is the common case.
+        nodes_[self].local = local;
+        nodes_[self].refs  = std::move(refs);
+
+        std::string_view const name = anonNameWithoutDeclSite(src.name(id));
+        if (name.empty() || isSyntheticAnonymousName(name)) continue;   // no user tag
+        // ★ AMBIGUITY IS TESTED ON THE **LOCAL** SIGNATURE, WHICH IS ACYCLIC AND
+        // COMPLETENESS-INSENSITIVE, and that is the whole reason `local` and
+        // `refs` are split. "Does this tag have one layout?" must be answerable
+        // BEFORE the fixed point exists, and it must not be confused by a
+        // neighbour's completeness -- a TU that has seen `struct Btree { ... }`
+        // and one that has only seen `struct Btree;` describe the SAME
+        // `struct BtCursor`, and a completeness-sensitive test would call those
+        // two definitions different and mark the tag ambiguous. ✔That is not a
+        // hypothetical: it is what kept sqlite's `BtCursor` forked through the
+        // first attempt at this fix.
+        auto const [it, fresh] = canonical_.try_emplace(
+            tagKey(kind, name), TagEntry{nodes_[self].local, &src, v, self, false});
+        if (!fresh && it->second.localDigest != nodes_[self].local)
+            it->second.ambiguous = true;
+    }
+}
+
+bool CompositeIdentityIndex::resolveDefinition(TypeInterner const& src,
+                                               TypeId srcId,
+                                               TypeInterner const*& defIn,
+                                               TypeId& defId) const {
+    // The SAME normalization `observe` keyed on. Two spellings of one lookup is
+    // how the tag table and its readers drift apart, and this file has already
+    // paid once for exactly that (the identity and the reintern disagreeing).
+    std::string_view const name = anonNameWithoutDeclSite(src.name(srcId));
+    if (name.empty() || isSyntheticAnonymousName(name)) return false;
+    auto const it = canonical_.find(tagKey(src.get(srcId).kind, name));
+    if (it == canonical_.end() || it->second.ambiguous
+        || it->second.owner == nullptr) {
+        return false;
+    }
+    defIn = it->second.owner;
+    defId = TypeId{it->second.defId, it->second.owner->owner().v};
+    return true;
+}
+
+// ── THE FIXED POINT ─────────────────────────────────────────────────────────
+//
+// ⚠⚠ THE OBVIOUS ALGORITHM DOES NOT TERMINATE ON REAL CODE, AND THIS ONE EXISTS
+// BECAUSE THAT WAS MEASURED RATHER THAN FEARED. A recursive digest that walks
+// through composites and cuts cycles with a de Bruijn backreference cannot
+// memoize any subtree that back-references an OUTER composite -- so inside a
+// mutually recursive cluster nothing is cacheable and the walk re-expands once
+// per path. ✔MEASURED on the 103-TU sqlite corpus, whose
+// `sqlite3`/`Vdbe`/`Parse`/`Expr` cluster is exactly that shape: **952 s of CPU,
+// 1.2 GB resident, no output**, killed by PID. The same corpus finishes in
+// seconds here.
+//
+// ★ THE ALGORITHM IS ORDINARY AND THAT IS THE POINT: iterative partition
+// refinement, the standard way to decide equivalence of recursive types.
+// `h(0) = local`, then `h(k+1)[n] = mix(local[n], h(k)[refs...])`. Two
+// composites keep the same hash only while nothing within k levels tells them
+// apart, so the partition REFINES monotonically and stops when a round adds no
+// new class. Cycles need no special handling at all -- they are just edges.
+//
+// ⓘ ORDER-INDEPENDENT BY CONSTRUCTION, which the merge requires: a hash is
+// built from local signatures and neighbours' hashes, never from a node INDEX,
+// so observing the CUs in a different order gives the same values.
+//
+// ⚠ THE ROUND BOUND IS A BACKSTOP, NOT THE TERMINATION CONDITION. Refinement
+// converges in at most `nodes` rounds; the cap is `nodes + 2`, so hitting it is
+// impossible for a sound graph, and `refinementRounds()` is exposed so a test
+// can assert convergence rather than assume it. A bound that BOUND would mean
+// two distinct types share a key -- caught loudly by `completeComposite`, never
+// silently.
+void CompositeIdentityIndex::finalize_() const {
+    finalized_ = true;
+    auto& nodes  = const_cast<std::vector<Node>&>(nodes_);
+    auto& opaque = const_cast<std::unordered_map<std::string, std::uint32_t>&>(
+        opaqueNode_);
+
+    // (1) ALIAS every forward declaration onto what it actually denotes.
+    std::size_t const observed = nodes.size();
+    for (std::uint32_t i = 0; i < observed; ++i) {
+        Node& n = nodes[i];
+        if (n.owner == nullptr) continue;                 // synthetic
+        TypeId const id{n.id, n.owner->owner().v};
+        if (!n.owner->isIncompleteComposite(id)) continue;
+        TypeInterner const* di = nullptr;
+        TypeId              dd{};
+        if (resolveDefinition(*n.owner, id, di, dd)) {
+            auto const it = nodeOf_.find(
+                (static_cast<std::uint64_t>(di->owner().v) << 32)
+                | static_cast<std::uint64_t>(dd.v));
+            if (it != nodeOf_.end()) { n.alias = it->second; continue; }
+        }
+        // No definition anywhere, or definitions that disagree. Every forward
+        // declaration of the tag still collapses onto ONE shared opaque node --
+        // strictly better than one per declaring CU, and it cannot unify with a
+        // definition it is not entitled to.
+        std::string const key = tagKey(n.owner->get(id).kind,
+                                       anonNameWithoutDeclSite(n.owner->name(id)));
+        auto const [oit, fresh] =
+            opaque.try_emplace(key, static_cast<std::uint32_t>(nodes.size()));
+        if (fresh) {
+            std::uint64_t lh = kFnvOffset;
+            mix(lh, std::string_view{"opaque-composite"});
+            mix(lh, key);
+            Node syn;
+            syn.local = lh;
+            syn.alias = static_cast<std::uint32_t>(nodes.size());
+            nodes.push_back(std::move(syn));
+        }
+        nodes[i].alias = oit->second;
+    }
+    // An alias never points at another alias: only INCOMPLETE nodes are aliased,
+    // and a resolution always lands on a COMPLETE one (or on a synthetic node,
+    // which is its own alias).
+
+    // (2) REFINE.
+    std::vector<std::uint64_t> h(nodes.size());
+    for (std::size_t i = 0; i < nodes.size(); ++i) h[i] = nodes[i].local;
+    std::vector<std::uint64_t> next(nodes.size());
+    std::size_t const bound = nodes.size() + 2;
+    std::size_t distinct =
+        std::unordered_set<std::uint64_t>(h.begin(), h.end()).size();
+    std::size_t r = 0;
+    for (; r < bound; ++r) {
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+            std::uint64_t x = kFnvOffset;
+            mix(x, nodes[i].local);
+            for (std::uint32_t ref : nodes[i].refs) mix(x, h[nodes[ref].alias]);
+            next[i] = x;
+        }
+        h.swap(next);
+        std::size_t const d =
+            std::unordered_set<std::uint64_t>(h.begin(), h.end()).size();
+        if (d == distinct) { ++r; break; }   // a round that adds no class: done
+        distinct = d;
+    }
+    rounds_ = r;
+    hash_   = std::move(h);
+
+    // ── (3) HOW MANY TAGS THIS MERGE COULD NOT UNIFY ────────────────────────
+    //
+    // ★ THIS COUNT IS THE INSTRUMENT THAT FOUND THE LAST TWO DEFECTS IN THIS
+    // FILE, AND IT IS KEPT AS A FACT RATHER THAN AS A PRINTF FOR EXACTLY THAT
+    // REASON. A `stderr` dump behind an environment variable is a tool that dies
+    // with the session that wrote it — this project has measured that twice — so
+    // the quantity is COMPUTED and EXPOSED, and a test can assert it instead of
+    // a human re-deriving it.
+    //
+    // A tag is FORKED when its complete definitions do not all end with one
+    // identity. ✔MEASURED on the 103-TU sqlite corpus: **98 forked, every one of
+    // them with a SINGLE local layout signature** — which is what said the split
+    // could not be a real layout difference and had to be identity leaking in
+    // from somewhere. It was: `<anon:RULE:NODEID>`, a per-CU AST node index
+    // inside a TYPE's name. After that fix, **0**.
+    // ⓘ A non-zero count is NOT by itself a defect: two `.c` files may legally
+    // define a private `struct Node` differently, and those SHOULD fork. It is a
+    // number to look at when a merge behaves as if one C type were two.
+    std::unordered_map<std::string, std::unordered_set<std::uint64_t>> byTag;
+    for (auto const& n : nodes) {
+        if (n.owner == nullptr) continue;
+        TypeId const id{n.id, n.owner->owner().v};
+        if (n.owner->isIncompleteComposite(id)) continue;
+        std::string_view const nm = anonNameWithoutDeclSite(n.owner->name(id));
+        if (nm.empty() || isSyntheticAnonymousName(nm)) continue;
+        byTag[tagKey(n.owner->get(id).kind, nm)].insert(hash_[n.alias]);
+    }
+    forkedTags_ = 0;
+    for (auto const& [k, s] : byTag) {
+        (void)k;
+        if (s.size() > 1) ++forkedTags_;
+    }
+}
+
+std::uint32_t CompositeIdentityIndex::nodeIndex_(TypeInterner const& src,
+                                                 TypeId id) const {
+    auto const it = nodeOf_.find(
+        (static_cast<std::uint64_t>(src.owner().v) << 32)
+        | static_cast<std::uint64_t>(id.v));
+    if (it == nodeOf_.end()) {
+        // The composite was never observed. That is a CALLER contract breach --
+        // every source interner the merge reinterns from must be observed first
+        // -- and guessing a key here is how one C type forks again, silently.
+        std::fputs("dss::CompositeIdentityIndex fatal: keyFor() on a composite "
+                   "from an interner that was never observe()d - every source of "
+                   "the merge must be observed before the first reintern.\n",
+                   stderr);
+        std::abort();
+    }
+    return it->second;
+}
+
+std::uint64_t CompositeIdentityIndex::keyFor(TypeInterner const& src,
+                                             TypeId srcId) const {
+    // ⚠ ONE CALL, NO SPECIAL CASES, AND THAT IS THE POINT. An earlier draft
+    // branched here -- own digest for a definition, canonical digest for a
+    // forward declaration -- and that branch is where the identity rule and the
+    // reintern drifted apart, which `completeComposite` reported by ABORTING
+    // (*"composite re-completed with different fields"*) rather than by giving a
+    // wrong answer. The alias edge performs the substitution ONCE, in the graph,
+    // so there is no second rule left to disagree with the first.
+    if (!finalized_) finalize_();
+    return hash_[nodes_[nodeIndex_(src, srcId)].alias];
+}
+
 TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
                     std::unordered_map<std::uint32_t, TypeId>& remap) {
+    CompositeIdentityIndex scratch;
+    scratch.observe(src);
+    return reinternType(src, srcId, dstHost, remap, scratch);
+}
+
+TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
+                    std::unordered_map<std::uint32_t, TypeId>& remap,
+                    CompositeIdentityIndex const& index) {
     // Sentinel / invalid → identity. InvalidType carries no CU provenance, so it
     // is meaningful (as "no type") against any lattice.
     if (!srcId.valid()) return InvalidType;
@@ -74,7 +450,7 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
     // round-trip, a silent loss-of-atomicity miscompile.
     if (kind == TypeKind::VolatileQual) {
         TypeId const inner  = reinternType(src, src.stripVolatile(srcId),
-                                           dstHost, remap);
+                                           dstHost, remap, index);
         TypeId const result = dst.qualified(inner, src.qualifierBits(srcId));
         remap.emplace(srcId.v, result);
         return result;
@@ -87,14 +463,32 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
     // forever on that edge. So FORWARD-MINT the host composite, INSERT it into the
     // memo BEFORE recursing the fields, THEN re-intern the fields and complete it —
     // the self-ref field's recursion hits the memo and resolves to the placeholder.
-    // Host identity is keyed per SOURCE composite (its CU tag + index) so distinct
-    // source composites stay distinct and the same source composite is stable.
+    //
+    // ★ HOST IDENTITY IS THE COMPOSITE'S STRUCTURE, NOT ITS DECLARATION SITE
+    // (D-MIR-MERGE-COMPOSITE-HOST-IDENTITY-IS-THE-DECLARATION-SITE). This used to
+    // be `(srcId.arenaTag << 32) | srcId.v`, documented as "distinct source
+    // composites stay distinct" -- true, and it also kept ONE C type apart from
+    // ITSELF once per CU that mentioned it, because a CU that only ever sees
+    // `typedef struct Bitvec Bitvec;` contributes its own incomplete `Bitvec`.
+    // ✔MEASURED on 103-TU sqlite: that fork is what made the release build emit
+    // 5 x `I_StoreValueTypeMismatch` and produce no artifact, both sides of every
+    // store being one C type spelled two ways. `CompositeIdentityIndex::keyFor`
+    // computes the identity from the SOURCE side -- available before the mint the
+    // cycle forces -- and same-tag/different-layout composites still get
+    // different keys, so nothing C keeps apart is merged. See the header.
     if (kind == TypeKind::Struct || kind == TypeKind::Union) {
-        std::uint64_t const declSiteKey =
-            (static_cast<std::uint64_t>(srcId.arenaTag) << 32)
-            | static_cast<std::uint64_t>(srcId.v);
-        TypeId const fwd =
-            dst.forwardComposite(kind, src.name(srcId), declSiteKey);
+        std::uint64_t const declSiteKey = index.keyFor(src, srcId);
+        // ⚠ THE NAME IS PART OF THE HOST KEY, SO IT MUST BE THE SAME NAME THE
+        // IDENTITY WAS COMPUTED FROM. `forwardComposite` keys on
+        // (kind, name, declSiteKey); passing the RAW `<anon:RULE:NODEID>` here
+        // while the identity used the decl-site-independent form gives two
+        // anonymous composites ONE key and TWO host types, and their shared
+        // parent then completes twice with different fields -- which
+        // `completeComposite` reports by ABORTING. ✔MEASURED on 103-TU sqlite:
+        // exactly that abort, with the type graph otherwise perfectly unified
+        // (`forked-tags=0`). The two halves take the same name or neither does.
+        TypeId const fwd = dst.forwardComposite(
+            kind, anonNameWithoutDeclSite(src.name(srcId)), declSiteKey);
         remap.emplace(srcId.v, fwd);   // BEFORE recursion → breaks the cycle
         // An INCOMPLETE source composite (forward-declared, never defined) stays
         // incomplete in the host: re-intern nothing, leave the placeholder.
@@ -104,7 +498,7 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         std::vector<TypeId> fields;
         fields.reserve(srcFields.size());
         for (TypeId f : srcFields)
-            fields.push_back(reinternType(src, f, dstHost, remap));
+            fields.push_back(reinternType(src, f, dstHost, remap, index));
         // Decode the (width+1)/0 scalar form back to the kNotBitfield/width form
         // completeComposite re-encodes (round-trip identity for a bitfield-free
         // composite, whose scalars are empty → no per-field widths).
@@ -175,7 +569,8 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
     // host already holds the children when we build the parent.
     std::vector<TypeId> ops;
     ops.reserve(srcOps.size());
-    for (TypeId op : srcOps) ops.push_back(reinternType(src, op, dstHost, remap));
+    for (TypeId op : srcOps)
+        ops.push_back(reinternType(src, op, dstHost, remap, index));
 
     TypeId result{};
     switch (kind) {

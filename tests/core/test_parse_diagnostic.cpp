@@ -283,6 +283,7 @@ TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::X_UnknownPassId),          "X0001");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::X_PipelineVersionMismatch), "X0002");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::X_InlineMalformedCallSite), "X0008");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::X_OptFixpointTruncated),    "X0009");
 }
 
 // D-DIAG-OPT-FAMILY-NIBBLE-CLAIMED-IN-HEADER-BUT-NOT-IN-RENDERER.
@@ -334,6 +335,11 @@ TEST(DiagnosticCode, PrefixOptimizerBandRendersAsXWithNibbleStripped) {
         DiagnosticCode::X_OptReturnFalseWithoutDiagnostic,
         DiagnosticCode::X_OptPassSkipped,
         DiagnosticCode::X_InlineMalformedCallSite,
+        // P36 (Lane R, D-OPT-INLINING-FIXPOINT-TRUNCATES-BEFORE-CONVERGING).
+        // ★ The NINTH code this test's own comment predicted, and it arrived
+        // from a lane that had never read this file — which is the only way to
+        // find out whether the guarantee actually holds for an outsider.
+        DiagnosticCode::X_OptFixpointTruncated,
     };
 
     int named = 0;
@@ -347,14 +353,18 @@ TEST(DiagnosticCode, PrefixOptimizerBandRendersAsXWithNibbleStripped) {
     // Non-vacuity: a COUNTER incremented in the loop, not sizeof the array —
     // the latter is a compile-time tautology that stays green even if the loop
     // never executes.
-    EXPECT_EQ(named, 8);
+    EXPECT_EQ(named, 9);
 
     // (2) Discovery scan of the entire band — catches any X_* code that exists
     // but is missing from the list above.
     int discovered = 0;
     for (std::uint32_t v = 0x2000u; v <= 0x2FFFu; ++v) {
         const auto code = static_cast<DiagnosticCode>(static_cast<std::uint16_t>(v));
-        if (diagnosticCodeName(code) == std::string_view{"Unknown"}) {
+        // P36: was a hand-spelled `std::string_view{"Unknown"}` — a THIRD copy
+        // of the allocation oracle, in a test whose whole subject is a table
+        // that drifted from its copies. `dss::kUnallocatedDiagnosticCodeName`
+        // is now the one spelling (D-DIAG-CODE-PREFIX-DEFAULT-IS-SILENT).
+        if (!dss::diagnosticCodeIsAllocated(code)) {
             continue;  // unallocated slot in the band
         }
         expectRendersAsX(code);
@@ -365,6 +375,83 @@ TEST(DiagnosticCode, PrefixOptimizerBandRendersAsXWithNibbleStripped) {
     // answering) must not pass as clean.
     EXPECT_GE(discovered, named)
         << "band scan discovered fewer codes than are explicitly listed";
+}
+
+// ★★★ D-DIAG-CODE-PREFIX-DEFAULT-IS-SILENT — THE TOTALITY PIN.
+//
+// The band pin above protects 0x2xxx. This protects EVERY nibble, including the
+// ones that do not exist yet, which is the half the X_* defect actually needed:
+// a band-specific test cannot fail for a family nobody has written a test for,
+// and "nobody wrote a test for it" is the precise condition under which a family
+// half-lands.
+//
+// The scan is possible because `DiagnosticCode` has a fixed underlying type, so
+// every 16-bit value is a valid enum value, and `diagnosticCodeName` — a
+// `default:`-less switch kept total by `-Werror=switch` — answers exactly which
+// of them are allocated. That makes the ALLOCATED SET derivable rather than
+// hand-listed, so this test covers the next family automatically.
+TEST(DiagnosticCode, EveryAllocatedCodeRendersUnderARealFamilyLetter) {
+    int allocated = 0;
+    for (std::uint32_t v = 0; v <= 0xFFFFu; ++v) {
+        const auto code = static_cast<DiagnosticCode>(static_cast<std::uint16_t>(v));
+        if (!dss::diagnosticCodeIsAllocated(code)) continue;
+        ++allocated;
+
+        const std::string rendered = diagnosticCodePrefix(code);
+        ASSERT_FALSE(rendered.empty()) << diagnosticCodeName(code);
+
+        // (a) THE DEFECT ITSELF: an allocated code must never render under the
+        //     unallocated marker. This is what would have caught `X_*` — every
+        //     one of those eight codes was allocated and rendered 'P'.
+        EXPECT_NE(rendered.front(), dss::kUnallocatedFamilyLetter)
+            << diagnosticCodeName(code) << " (0x" << std::format("{:04X}", v)
+            << ") is ALLOCATED but its family nibble has no row in "
+               "kNibbleFamilies — add one rather than letting it render '?'";
+
+        // (b) The renderer and the family table cannot disagree: whatever
+        //     letter the table gives for this nibble is the letter that is
+        //     printed. Without this, a future edit could fix one and not the
+        //     other and (a) would still pass.
+        EXPECT_EQ(rendered.front(), dss::diagnosticFamilyLetter(code))
+            << diagnosticCodeName(code);
+    }
+    // Non-vacuity FLOOR, not equality: a scan that discovered nothing (e.g. if
+    // `diagnosticCodeName` stopped answering) must not pass as clean, but a new
+    // code must not fail this test either. 397 allocated as of P36.
+    EXPECT_GE(allocated, 390)
+        << "allocation scan collapsed — it found " << allocated
+        << " codes, which is fewer than the tree is known to carry";
+}
+
+// The other half of the same property, and the reason the renderer does NOT
+// abort on an unallocated family: it must stay TOTAL, because `hir_text.cpp`
+// deliberately renders a code it has already refused as unallocated in order to
+// show the operator what it would have looked like. So the fail-loud obligation
+// is discharged by making the RENDERING unmistakable rather than by dying.
+TEST(DiagnosticCode, UnallocatedFamilyNibbleRendersUnmistakably) {
+    // 0x3xxx is the sole FREE nibble; 0x6xxx/0x7xxx are RESERVED but likewise
+    // carry no letter. None of the three has an allocated code — asserted here
+    // so this test tells the truth about its own premise rather than assuming
+    // it, and so that ALLOCATING one of them fails HERE with a name.
+    for (const std::uint16_t nibble : {std::uint16_t{0x3000u},
+                                       std::uint16_t{0x6000u},
+                                       std::uint16_t{0x7000u}}) {
+        const auto probe = static_cast<DiagnosticCode>(
+            static_cast<std::uint16_t>(nibble | 0x0123u));
+        ASSERT_FALSE(dss::diagnosticCodeIsAllocated(probe))
+            << "0x" << std::format("{:04X}", nibble)
+            << " gained an allocated code; give it a row in kNibbleFamilies "
+               "and move this probe to a nibble that is still free";
+
+        const std::string rendered = diagnosticCodePrefix(probe);
+        // Unmistakable means two things, and both matter:
+        //  * the leading character is NOT a letter, so no reader and no
+        //    `[A-Z][0-9A-F]{4}` scraper can take it for a diagnostic code;
+        //  * the FULL 16-bit value survives, so the operator can see WHICH
+        //    nibble rendered without a family. `?3123`, never `?0123`.
+        EXPECT_EQ(rendered.front(), dss::kUnallocatedFamilyLetter) << rendered;
+        EXPECT_EQ(rendered, std::format("?{:04X}", nibble | 0x0123u));
+    }
 }
 
 TEST(DiagnosticSeverity, NameMapping) {

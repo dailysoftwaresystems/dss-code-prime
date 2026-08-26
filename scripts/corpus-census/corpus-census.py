@@ -167,7 +167,26 @@ DEFAULT_TARGETS = [
 ]
 
 ISOLATION_PROFILE = "staticlib"
-PER_CODE_CAP = 50   # DiagnosticReporter::Config::maxPerCode
+
+# ★★★ `PER_CODE_CAP = 50` IS GONE (D-DIAG-MAXPERCODE-SILENT-COALESCE, P36).
+#
+# It was a hand-copy of `DiagnosticReporter::Config::maxPerCode`, used to detect
+# a saturated count by asking `n == PER_CODE_CAP`. TWO things were wrong with
+# that, and the second is the one that mattered:
+#   * it was a MIRROR -- move the C++ default and this instrument silently
+#     re-labels floors as totals;
+#   * it was a ROUND-NUMBER SNIFF WITH NO FALSE-NEGATIVE BOUND. A code capped at
+#     50 out of 51 is indistinguishable from one that genuinely occurred 50
+#     times, so the detector could not tell a floor from a total in the one case
+#     where it matters most.
+# The compiler now says so IN BAND: `P_DiagnosticsElided` (renders `P9007`) is
+# emitted once per elided code carrying the code, the cap and the counts. Floor
+# detection is therefore EXACT and needs no knowledge of the cap's value.
+ELISION_MARKER_CODE = "P9007"   # dss::DiagnosticCode::P_DiagnosticsElided
+
+# The marker names the code it abbreviates in its rendered spelling, e.g.
+# `S0006 (S_UnknownTypeName) diagnostics were ELIDED ...`.
+ELIDED_CODE_RE = re.compile(r"^([A-Z?][0-9A-F]{4})\s*\(")
 
 # Windows spells the compiler `dsscp.exe`. Used ONLY when auto-
 # discovering the binary; an explicit `--dss-bin` / `DSS_BIN` is taken verbatim.
@@ -285,10 +304,53 @@ HEX_CODE_RE = re.compile(r"^[A-Z][0-9A-F]{4}$")
 # been censused as `P2001`..`P2008`, i.e. attributed to the PARSER, in the very
 # tool whose job is to attribute failures to a tier. Adding a family means
 # updating THREE places, not two: the header, `diagnosticCodePrefix`, and here.
-NIBBLE_LETTER = {0x1000: "A", 0x2000: "X", 0x4000: "R", 0x5000: "F",
-                 0x8000: "K",
-                 0xA000: "I", 0xB000: "L", 0xC000: "C", 0xD000: "D",
-                 0xE000: "S", 0xF000: "H"}
+# ★★★ THE MIRROR IS RETIRED (D-DIAG-CODE-PREFIX-DEFAULT-IS-SILENT, P36).
+#
+# This dict used to be hand-copied from `diagnosticCodePrefix`, and it had
+# drifted identically: `0x2000: "X"` was missing here for exactly as long as it
+# was missing there, so every optimizer diagnostic was censused as
+# `P2001..P2008` -- attributed to the PARSER, in the instrument whose entire job
+# is attributing failures to a tier. A hand-copy of a table cannot be kept
+# honest by asking people to remember; it has to be READ.
+#
+# It is now parsed out of the compiler's own `kNibbleFamilies` table, which is
+# the idiom this file already uses for the enum itself (`read_code_name_table`
+# reads `parse_diagnostic.hpp` rather than duplicating it, on the stated ground
+# that anything asking a human to keep a second list in sync has the failure
+# mode it exists to catch).
+UNALLOCATED_FAMILY_LETTER = "?"   # must match dss::kUnallocatedFamilyLetter
+
+# `/* 0xE */ {'S', true,  "semantic analysis"},`
+_NIBBLE_ROW_RE = re.compile(
+    r"/\*\s*0x([0-9A-Fa-f])\s*\*/\s*\{\s*"
+    r"(?:'(.)'|kUnallocatedFamilyLetter)\s*,\s*(true|false)\s*,")
+
+
+def read_nibble_families(source: Path) -> dict[int, tuple[str, bool]]:
+    """high-nibble -> (letter, strips_nibble), read from parse_diagnostic.cpp.
+
+    ⚠ FAILS LOUD ON AN EMPTY OR SHORT PARSE. A census that silently read zero
+    families would fall back to guessing for every code -- the same class of
+    defect as a scan reporting a clean tree it never actually read."""
+    if not source.is_file():
+        die(f"cannot read the diagnostic family table: {source} does not exist")
+    rows: dict[int, tuple[str, bool]] = {}
+    for m in _NIBBLE_ROW_RE.finditer(source.read_text(encoding="utf-8",
+                                                      errors="replace")):
+        nib = int(m.group(1), 16)
+        letter = m.group(2) if m.group(2) else UNALLOCATED_FAMILY_LETTER
+        rows[nib] = (letter, m.group(3) == "true")
+    if len(rows) != 16:
+        die(f"{source}: parsed {len(rows)} of 16 diagnostic family nibbles from "
+            f"`kNibbleFamilies`. That table is addressed by index and has one "
+            f"row per high nibble, so anything but 16 means this parser has "
+            f"drifted from the table it reads -- fix the parser rather than "
+            f"letting the census guess a family letter.")
+    return rows
+
+
+NIBBLE_FAMILIES = read_nibble_families(
+    REPO_ROOT / "src" / "core" / "types" / "parse_diagnostic.cpp")
 
 
 def die(msg: str) -> "NoReturn":                       # noqa: F821
@@ -316,9 +378,15 @@ def git(*args: str) -> str:
 
 
 def canonical_code(value: int) -> str:
-    nib = value & 0xF000
-    letter = NIBBLE_LETTER.get(nib, "P")
-    lo = (value & 0x0FFF) if nib in NIBBLE_LETTER else value
+    # ⚠ NO `"P"` FALLBACK. The old `.get(nib, "P")` was row 1's defect in
+    # Python: an unlisted nibble rendered under the PARSER's letter AND skipped
+    # the nibble strip, so a family this instrument had not been told about was
+    # not merely unlabelled -- it was labelled as somebody else's. The table is
+    # now total over all 16 nibbles, so the lookup cannot miss; an unallocated
+    # family renders `?` exactly as the compiler renders it, which no reader and
+    # no `[A-Z][0-9A-F]{4}` scraper can mistake for a real code.
+    letter, strips = NIBBLE_FAMILIES[(value & 0xF000) >> 12]
+    lo = (value & 0x0FFF) if strips else value
     return f"{letter}{lo:04X}"
 
 
@@ -587,13 +655,21 @@ def run_dss(dss_bin: Path, manifest: Path, out_dir: Path, config: str | None,
 
 
 def scan_log(path: Path, name_to_code: dict[str, str]):
-    """-> (Counter(code), {code: severity}, {code: Counter(msg)}, set(unresolved))"""
+    """-> (Counter(code), {code: severity}, {code: Counter(msg)}, set(unresolved),
+           {elided_code: marker_text})
+
+    ★ THE FIFTH RETURN IS THE FLOOR ORACLE (D-DIAG-MAXPERCODE-SILENT-COALESCE).
+    Every `P_DiagnosticsElided` marker in this log names, in band, a code whose
+    surviving count is a FLOOR rather than a total. That replaces the old
+    `n == PER_CODE_CAP` round-number sniff, which could not tell 50-of-51 from a
+    genuine 50 and went stale the moment the C++ default moved."""
     counts: collections.Counter = collections.Counter()
     sev: dict[str, str] = {}
     msgs: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     unresolved: set[str] = set()
+    elided: dict[str, str] = {}
     if not path.is_file():
-        return counts, sev, msgs, unresolved
+        return counts, sev, msgs, unresolved, elided
     # `encoding` pinned (not the host locale): a diagnostic carrying a non-ASCII
     # byte must decode the SAME WAY on every leg, or the two platforms disagree
     # about a message they both received.
@@ -608,11 +684,20 @@ def scan_log(path: Path, name_to_code: dict[str, str]):
             code = name_to_code[raw]
         else:
             code, _ = raw, unresolved.add(raw)
+        # The elision marker is NOT a census row about the corpus -- it is a
+        # statement ABOUT the other rows. Recorded as the floor oracle and not
+        # counted as a diagnostic, or the instrument would report the compiler's
+        # own bookkeeping as a corpus finding.
+        if code in (ELISION_MARKER_CODE, "P_DiagnosticsElided"):
+            m2 = ELIDED_CODE_RE.match(msg.strip())
+            if m2:
+                elided[m2.group(1)] = msg.strip()[:200]
+            continue
         counts[code] += 1
         sev[code] = severity
         # `got X` is the generic renderer's prefix; keep the payload readable.
         msgs[code][msg.strip()[:140]] += 1
-    return counts, sev, msgs, unresolved
+    return counts, sev, msgs, unresolved, elided
 
 
 # ── one target leg ───────────────────────────────────────────────────────────
@@ -648,7 +733,9 @@ class Leg:
         self.whole_msgs: dict[str, collections.Counter] = \
             collections.defaultdict(collections.Counter)
         self.unresolved: set[str] = set()
-        self.saturated: list[tuple[str, str, int]] = []
+        # (src, code, shown_count, marker_text) -- the marker text travels so
+        # the report can quote the compiler rather than paraphrase it.
+        self.saturated: list[tuple[str, str, int, str]] = []
         self.clean: list[str] = []
         self.silent_fail: list[tuple[str, int]] = []
         self.noisy_ok: list[str] = []
@@ -733,16 +820,21 @@ class Leg:
         # Latch coverage while the scratch tree still exists (see `attempted`).
         self._attempted = len(list((self.dir / "logs").glob("*.log")))
         for slot, src in self.slots:
-            counts, sev, msgs, unk = scan_log(
+            counts, sev, msgs, unk, elided = scan_log(
                 self.dir / "logs" / f"{slot}.log", name_to_code)
             self.unresolved |= unk
+            # EXACT, and stated by the compiler rather than inferred from the
+            # shape of a number: every code the TU emitted an elision marker for
+            # has a count that is a floor. A code can now be reported as a floor
+            # at ANY value, including one, which the round-number sniff could
+            # never do.
+            for code, marker in elided.items():
+                self.saturated.append((src, code, counts.get(code, 0), marker))
             for code, n in counts.items():
                 self.per_code[code] += n
                 self.per_code_sev[code] = sev[code]
                 self.per_code_tus[code].add(src)
                 self.per_code_msgs[code].update(msgs[code])
-                if n == PER_CODE_CAP:
-                    self.saturated.append((src, code, n))
             rc = self.rc.get(slot)
             if not counts:
                 self.clean.append(src)
@@ -759,11 +851,20 @@ class Leg:
         # isolation manifest drops what its format cannot carry. Saying "the
         # whole-project leg still measures it" is worth nothing if the report
         # then declines to say WHAT it measured.
-        wc, wsev, wmsgs, wunk = scan_log(self.dir / "whole.log", name_to_code)
+        wc, wsev, wmsgs, wunk, welided = scan_log(self.dir / "whole.log",
+                                                  name_to_code)
         self.whole_counts = wc
         self.whole_sev = wsev
         self.whole_msgs = wmsgs
         self.unresolved |= wunk
+        # The whole-project leg's floors count too. Its elisions used to be
+        # invisible for a second reason on top of the silence: this leg's counts
+        # never went through the `n == PER_CODE_CAP` sniff at all, so a
+        # saturated whole-project code was reported as a total with nothing
+        # anywhere saying otherwise.
+        for code, marker in welided.items():
+            self.saturated.append(("<whole-project>", code,
+                                   wc.get(code, 0), marker))
 
     # coverage
     @property
@@ -896,11 +997,14 @@ def write_report(out: "list[str]", legs: list[Leg], meta: dict,
                 w(f"        {n}")
             w("")
         if leg.saturated:
-            w("  -- ** PER-CODE CAP SATURATION — THESE COUNTS ARE FLOORS --")
-            w(f"     DiagnosticReporter coalesces SILENTLY past maxPerCode="
-              f"{PER_CODE_CAP} (src/core/types/diagnostic_reporter.cpp:215).")
-            for src, code, n in leg.saturated:
-                w(f"        {code:<8} {n}  {src}")
+            w("  -- ** ELIDED COUNTS — THESE ARE FLOORS, NOT TOTALS --")
+            w("     Reported by the COMPILER, in band, not inferred from the")
+            w("     shape of a number: each row below is a `P_DiagnosticsElided`")
+            w("     marker naming a code whose surviving count is short by the")
+            w("     amount the marker states. Raise it with --max-per-code=N.")
+            for src, code, n, marker in leg.saturated:
+                w(f"        {code:<8} shown {n:<5} {src}")
+                w(f"                 {marker}")
             w("")
         w(f"  -- PER-CODE CENSUS (isolated per-TU runs, all {leg.in_manifest} TUs) --")
         w(f"     {'code':<10} {'severity':<9} {'count':>6}  {'TUs':>5}  distinct msgs")

@@ -3755,10 +3755,22 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
     //   * the fpr `move` row (those copies ARE fmov, not the GPR
     //     ORR-alias mov against a D hwEncoding);
     //   * the fpr `store`/`load` rows: AAPCS64 declares d8-d15
-    //     callee-saved + the regalloc allocates callee-saved FIRST,
-    //     so the FPR vregs land in d-regs the prologue must FSTUR-
-    //     spill and the epilogue FLDUR-reload (the exact shape that
-    //     surfaced movsd_store on ms_x64).
+    //     callee-saved, and the FAdd result MUST SURVIVE A CALL, so
+    //     it cannot live in a caller-saved d-reg — the prologue must
+    //     FSTUR-spill a d8-d15 and the epilogue FLDUR-reload it (the
+    //     exact shape that surfaced movsd_store on ms_x64).
+    //
+    // ★★★ THE CALL REPLACED AN ALLOCATOR ACCIDENT (plan 22 OPT8,
+    // 2026-08-26). This fixture had no call and leaned on the
+    // allocator handing out the callee-saved partition FIRST, so the
+    // FSTUR/FLDUR clauses were pinning a leaf function preserving a
+    // register it had no reason to touch. OPT8 taught the allocator
+    // to prefer caller-saved for a range that never crosses a call,
+    // the spill vanished, and these two clauses went red while the
+    // FADD/FCVTZS/FMOV clauses — the instruction-SELECTION subject
+    // this test is named for — never moved. The call makes the
+    // preservation an ABI requirement, so a future allocator cannot
+    // dissolve it again.
     // RED-on-disable lever: strip the arm64 registerClassOps fpr row
     // → classOpHandle fails loud (L_RequiredLirOpcodeMissing, "no
     // 'move' operation for register class 'fpr'") at the arg copy
@@ -3776,8 +3788,16 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
     MirInstId const b = mb.addArg(1, f64);
     MirInstId const addOps[] = {a, b};
     MirInstId const s = mb.addInst(MirOpcode::FAdd, addOps, f64);
-    MirInstId const cvtOps[] = {s};
-    MirInstId const r = mb.addInst(MirOpcode::FPToSI, cvtOps, i32);
+    // The call `s` must survive. Its result is consumed too, so the
+    // call cannot be judged dead and removed.
+    TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
+    MirInstId const callee = mb.addGlobalAddr(SymbolId{2}, ptrT);
+    MirInstId const callOps[] = {callee};
+    MirInstId const t = mb.addInst(MirOpcode::Call, callOps, i32);
+    MirInstId const cvtOps[] = {s};   // `s` is READ AFTER the call
+    MirInstId const c = mb.addInst(MirOpcode::FPToSI, cvtOps, i32);
+    MirInstId const sumOps[] = {c, t};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sumOps, i32);
     mb.addReturn(r);
     Mir mir = std::move(mb).finish();
 

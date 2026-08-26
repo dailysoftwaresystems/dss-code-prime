@@ -431,6 +431,11 @@ struct DefSym {
     // keeps `mod.symbols` in symbol-table order, which is the order every
     // existing round-trip pin reads it in.
     bool moduleSymbolAlreadyPushed = false;
+    // D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED: what this definition
+    // promises about the copies it may be folded against, decoded from the
+    // COMDAT Selection byte in (5.5). `Any` for every non-COMDAT symbol and for
+    // IMAGE_COMDAT_SELECT_ANY, which is the pre-existing behaviour verbatim.
+    DuplicateMatch duplicateMatch = DuplicateMatch::Any;
 };
 
 // A reconstructed [start, start+len) byte range within one section, plus the
@@ -869,7 +874,28 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // enumeration -- every kind-resolved COMDAT section maps to a binding or
     // FAILS LOUD; a selection is never silently defaulted (a wrong default
     // silently mis-dedups).
-    std::unordered_map<std::uint16_t, SymbolBinding> comdatBindingBySection;
+    //
+    // ★★ AND THE BINDING IS ONLY HALF OF WHAT THE SELECTION BYTE SAYS --
+    // D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED. ANY(2), SAME_SIZE(3)
+    // and EXACT_MATCH(4) all lift to Weak, but the last two additionally
+    // PROMISE something about the copies -- equal LENGTH, or equal BYTES -- and
+    // the format specifies a violation as "a multiply defined symbol error".
+    // Folding all three lowest-key with no comparison meant DSS silently
+    // accepted exactly the input the format tells it to reject. The duty
+    // travels with the binding, as `DuplicateMatch`, and the cross-CU fold
+    // discharges it (`link/cross_cu_resolve.cpp`).
+    //
+    // ⚠ ONE MAP CARRYING A PAIR, NOT TWO PARALLEL MAPS. The binding and the
+    // duty are read off the SAME aux byte at the SAME moment and are consumed
+    // at the same site; two maps keyed on the same ordinal is the shape that
+    // acquires an entry in one and not the other, and the failure would be a
+    // COMDAT lifted to Weak with its promise silently downgraded to `Any` --
+    // i.e. this exact defect, reintroduced by bookkeeping.
+    struct ComdatPolicy {
+        SymbolBinding  binding;
+        DuplicateMatch duty;
+    };
+    std::unordered_map<std::uint16_t, ComdatPolicy> comdatBindingBySection;
     for (std::uint16_t si = 0; si < numSections; ++si) {
         Section const& sec = sections[si];
         if ((sec.chars & kScnLnkComdat) == 0u) continue;  // not a COMDAT section
@@ -921,16 +947,43 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // symbol STRONG (Global) so the existing all-strong merge fires
                 // K_SymbolRedefinedAcrossUnits on a duplicate -- which IS the
                 // NODUPLICATES contract.
-                comdatBindingBySection.emplace(ordinal, SymbolBinding::Global);
+                comdatBindingBySection.emplace(
+                    ordinal,
+                    ComdatPolicy{SymbolBinding::Global, DuplicateMatch::Any});
                 break;
             case kComdatSelAny:
+                // ANY: duplicates are legal and the copies need not agree about
+                // anything at all -- "any section that defines the same COMDAT
+                // symbol can be linked; the rest are removed". Lift to WEAK so
+                // the existing all-weak merge dedup keeps one body + drops the
+                // shadow (ZERO merge change), and promise NOTHING.
+                //
+                // ★ THIS ARM IS CORRECT AS IT STANDS AND THE FIX MUST NOT
+                // WIDEN INTO IT. Attaching a size or byte comparison here would
+                // start REFUSING the one selection the format says may differ
+                // freely -- which is the encoding DSS's OWN writer emits for
+                // every weak definition (D-LK-OBJECT-WEAK-DEF-RELOCATABLE), so
+                // it would refuse DSS's own output.
+                comdatBindingBySection.emplace(
+                    ordinal,
+                    ComdatPolicy{SymbolBinding::Weak, DuplicateMatch::Any});
+                break;
             case kComdatSelSameSize:
+                // SAME_SIZE: duplicates are legal ONLY IF every definition has
+                // the same size; otherwise the format requires a multiply-
+                // defined-symbol error. Same WEAK lift, plus the duty.
+                comdatBindingBySection.emplace(
+                    ordinal,
+                    ComdatPolicy{SymbolBinding::Weak,
+                                 DuplicateMatch::SameSize});
+                break;
             case kComdatSelExactMatch:
-                // ANY / SAME_SIZE / EXACT_MATCH: duplicates are legal; the
-                // linker keeps one and drops the rest. Lift to WEAK so the
-                // existing all-weak merge dedup keeps one body + drops the
-                // shadow (ZERO merge change).
-                comdatBindingBySection.emplace(ordinal, SymbolBinding::Weak);
+                // EXACT_MATCH: duplicates are legal ONLY IF the definitions
+                // match exactly -- the strictest of the three, and the reason
+                // the duty is an ordered scale rather than a flag.
+                comdatBindingBySection.emplace(
+                    ordinal, ComdatPolicy{SymbolBinding::Weak,
+                                          DuplicateMatch::ExactContent});
                 break;
             default:
                 // LARGEST(6) / ASSOCIATIVE(5) / 0 / unknown -> FAIL LOUD.
@@ -1215,14 +1268,20 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // a COMDAT section lifts the binding per its Selection policy (Weak
             // for ANY/SAME_SIZE/EXACT_MATCH so the all-weak dedup folds
             // duplicates; Global for NODUPLICATES / a non-COMDAT section).
-            SymbolBinding extBinding = SymbolBinding::Global;
+            // D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED: the duty rides
+            // out with the binding, on the SAME lookup, so a COMDAT can never
+            // arrive Weak with its promise lost on the way.
+            SymbolBinding  extBinding = SymbolBinding::Global;
+            DuplicateMatch extDuty    = DuplicateMatch::Any;
             if (auto it = comdatBindingBySection.find(s.sectNum);
                 it != comdatBindingBySection.end()) {
-                extBinding = it->second;
+                extBinding = it->second.binding;
+                extDuty    = it->second.duty;
             }
             defsBySection[s.sectNum].push_back(
                 DefSym{i, s.value, s.name, extBinding,
-                       SymbolVisibility::Default});
+                       SymbolVisibility::Default,
+                       /*moduleSymbolAlreadyPushed=*/false, extDuty});
         } else if (role == CoffSymbolRole::Static && declaresFunction(s)) {
             // A FILE-LOCAL (`static`) FUNCTION -- an atom BOUNDARY, exactly like
             // an external one. D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM:
@@ -1391,7 +1450,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // `mod.symbols` (see `DefSym::moduleSymbolAlreadyPushed`).
         if (!d.name.empty() && !d.moduleSymbolAlreadyPushed) {
             mod.symbols.push_back(ModuleSymbol{SymbolId{d.symIdx}, d.name,
-                                               d.binding, d.visibility});
+                                               d.binding, d.visibility,
+                                               d.duplicateMatch});
         }
     };
 

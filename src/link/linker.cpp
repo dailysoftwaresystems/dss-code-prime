@@ -276,15 +276,67 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
     // The key is (cuId, SymbolId, name); both leading fields are decimal digits, so
     // the two separators delimit unambiguously and an arbitrary trailing name cannot
     // forge a different triple's key.
+    //
+    // ★ AND ONE BODY VIEW PER DEFINITION —
+    //   D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED
+    // Two COMDAT selections promise that every copy of a weak
+    // definition has the same LENGTH (SAME_SIZE) or the same BYTES
+    // (EXACT_MATCH), and the kernel can only discharge a promise about bytes if
+    // it is handed the bytes. `modules` is a span the caller owns for the whole
+    // of this function, so a non-owning view into `fn.bytes` / `d.bytes` is
+    // safe and copies nothing — a link of a large archive would otherwise
+    // duplicate every COMDAT body just to compare a handful of them.
+    //
+    // ⚠ FUNCTIONS AND DATA ITEMS BOTH, because a COMDAT is a SECTION and MSVC
+    // puts `__declspec(selectany)` DATA in one just as readily as an inline
+    // function body. Indexing only `functions` would have made the data half of
+    // the promise silently unverifiable while reporting success.
+    //
+    // ⚠ THE SIZE IS `sizeInSection()`, NOT `bytes.size()`. A ZERO-FILL item
+    // (`.bss` / `.tbss`) holds its extent in `reservedSize` and stores no bytes
+    // at all, so keying the comparison on `bytes.size()` would compare 0 with 0
+    // and pronounce two `.bss` COMDATs of DIFFERENT declared sizes a match --
+    // this defect, reintroduced in the one shape nobody looks at. The producer
+    // already publishes the right answer; this reads it rather than
+    // reconstructing it.
+    struct DefBody {
+        std::size_t                   size = 0;
+        std::span<std::uint8_t const> bytes{};
+    };
+    auto bodyOfSymbol = [](AssembledModule const& m)
+        -> std::unordered_map<SymbolId, DefBody> {
+        std::unordered_map<SymbolId, DefBody> byId;
+        for (auto const& fn : m.functions) {
+            if (fn.symbol == SymbolId{}) continue;
+            byId.emplace(fn.symbol,
+                         DefBody{fn.bytes.size(),
+                                 std::span<std::uint8_t const>{fn.bytes}});
+        }
+        for (auto const& d : m.dataItems) {
+            // An anonymous item carries no ModuleSymbol row, so it can never be
+            // one of the definitions being folded.
+            if (d.symbol == SymbolId{}) continue;
+            byId.emplace(d.symbol,
+                         DefBody{static_cast<std::size_t>(d.sizeInSection()),
+                                 std::span<std::uint8_t const>{d.bytes}});
+        }
+        return byId;
+    };
+
     std::vector<CrossCuDef>         defs;
     std::unordered_set<std::string> seenDefs;
     for (auto const& m : modules) {
+        auto const bodies = bodyOfSymbol(m);
         for (auto const& s : m.symbols) {
             if (!seenDefs.insert(std::format("{}:{}:{}", m.cuId.v, s.symbol.v, s.name))
                      .second) {
                 continue;   // the same definition, described twice
             }
-            defs.push_back(CrossCuDef{s.name, s.binding, LinkedSymbolKey{m.cuId, s.symbol}});
+            auto const    bit  = bodies.find(s.symbol);
+            DefBody const body = bit == bodies.end() ? DefBody{} : bit->second;
+            defs.push_back(CrossCuDef{
+                s.name, s.binding, LinkedSymbolKey{m.cuId, s.symbol},
+                s.duplicateMatch, body.size, body.bytes});
         }
     }
     CrossCuResolution const resolution = resolveCrossCuDefs(defs);
@@ -296,6 +348,34 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
                std::to_string(c.existing.cuId.v) + " and CU #" +
                std::to_string(c.incoming.cuId.v) + ") — a strong symbol may be "
                "defined only once across the linked image.");
+    }
+    // ── A BROKEN DUPLICATE-MATCH PROMISE IS A MULTIPLY-DEFINED SYMBOL ──────
+    //    D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED
+    //
+    // ★ THE CODE IS `K_SymbolRedefinedAcrossUnits` DELIBERATELY, not a new one.
+    // The PE/COFF specification's own words for a SAME_SIZE / EXACT_MATCH
+    // violation are "a multiply defined symbol error is issued" — this IS that
+    // error, reached by a different route, and giving it a private code would
+    // split one diagnosable condition across two vocabularies for no gain to
+    // the reader. The MESSAGE is what distinguishes them, and it names the
+    // selection that was promised so the reader knows which rule was broken.
+    for (auto const& m : resolution.duplicateMismatches) {
+        report(reporter, DiagnosticCode::K_SymbolRedefinedAcrossUnits,
+               DiagnosticSeverity::Error,
+               std::format(
+                   "symbol \"{}\" is defined in CU #{} and CU #{} as duplicates "
+                   "whose duplicate-resolution policy '{}' PROMISES they match, "
+                   "and they do not: {} bytes versus {} bytes{}. That policy is "
+                   "a promise the linker is required to VERIFY — keeping one "
+                   "copy anyway would silently pick a body the program was "
+                   "never told it might get.",
+                   m.name, m.existing.cuId.v, m.incoming.cuId.v,
+                   duplicateMatchName(m.required), m.existingSize,
+                   m.incomingSize,
+                   (m.required == DuplicateMatch::ExactContent
+                    && m.existingSize == m.incomingSize)
+                       ? " (same length, differing content)"
+                       : ""));
     }
     // (2) Reference resolution — an extern import whose name is DEFINED in a sibling CU
     // binds to that definition (the definition shadows the extern declaration). Record

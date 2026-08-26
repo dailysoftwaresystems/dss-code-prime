@@ -130,6 +130,46 @@ deriveStructCfMarkers(Mir const& mir, MirFuncId f,
                       std::vector<MirBlockId> const& rpo,
                       MirDomTree const& dom);
 
+// ── THE SUBSTRATE BUNDLE FOR A CALLER THAT DERIVES EVERY FUNCTION ───────────
+//
+// The two O(module) establishments the overload above pays PER CALL — the
+// self-loop index and the post-dominator buffers — hoisted into one object the
+// caller owns for the whole sweep. The module-wide applier below has always
+// hoisted them; this bundle is what lets a caller that is NOT the applier do
+// the same.
+//
+// ✔MEASURED 2026-08-25 (cycle P36) — why it exists: `MirVerifier::checkDomination`
+// derives markers for EVERY function through the per-call overload, so one
+// whole-program verify paid `moduleFuncCount` self-loop scans and
+// `moduleFuncCount` fresh eight-buffer post-dominator allocations. The optimizer
+// runs that verify once per module and the cross-CU merge runs it again, so a
+// 103-TU sqlite build paid it TWICE over an 86,411-block module
+// ([[D-PERF-VERIFIER-REESTABLISHES-MODULE-SUBSTRATES-PER-FUNCTION]]). Same
+// defect the module-wide applier already fixed; the verifier just could not
+// reach the fix.
+//
+// Contract, the `MirDomScratch` / `MirPostDomScratch` pattern: one bundle per
+// (sweep × module). It binds to the first module it sees ({module id,
+// blockCount}); a later call with a DIFFERENT module fails loud rather than
+// serving an index built from other blocks.
+struct MirStructCfScratch {
+    std::uint32_t moduleIdV  = 0;
+    std::uint32_t blockCount = 0;   // 0 = not yet bound to a module
+    std::vector<std::uint32_t> moduleSelfLoops;  // filled once, at bind time
+    std::vector<std::uint32_t> candidates;       // per-function, storage reused
+    MirPostDomScratch          postDom;
+};
+
+// Scratch-backed derivation — BYTE-IDENTICAL to the per-call overload above
+// (same `deriveInto` body, same inputs; the bundle only changes where the two
+// module substrates come from), O(function) per call after the first.
+[[nodiscard]] DSS_EXPORT std::vector<StructCfMarker>
+deriveStructCfMarkers(Mir const& mir, MirFuncId f,
+                      std::vector<std::vector<MirBlockId>> const& preds,
+                      std::vector<MirBlockId> const& rpo,
+                      MirDomTree const& dom,
+                      MirStructCfScratch& scratch);
+
 // The applier: stamp every block of `f` with its derived marker
 // (unreachable blocks of `f` stamp `Linear` — the derivation's value
 // for them). Producers call this after `MirBuilder::finish()`.

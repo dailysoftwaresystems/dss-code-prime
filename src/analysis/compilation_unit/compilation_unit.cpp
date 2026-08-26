@@ -199,6 +199,21 @@ std::string CompilationUnit::compositeSourceLanguage() const {
     return out.empty() ? std::string{schema().name()} : out;
 }
 
+// D-STATICLIB-MEMBER-NAME-DERIVES-FROM-THE-FIRST-SOURCE — see the header for
+// why this is DERIVED from the trees rather than threaded alongside them.
+// `sourceShared()` can legitimately be null on a hand-built test tree
+// (`BufferRegistry::add` throws on one, and the driver's own drain guards for
+// it), so the empty answer covers "no trees" and "a tree with no buffer" alike
+// — both mean the same thing to a caller: this unit cannot name its source.
+std::string_view CompilationUnit::primarySourceName() const noexcept {
+    if (trees_.empty()) return {};
+    // `sourceShared()` and not `source()`: the latter DEREFERENCES and requires
+    // non-null. The buffer outlives the temporary `shared_ptr` because the Tree
+    // holds its own reference for the CU's lifetime, so the view stays valid.
+    std::shared_ptr<SourceBuffer> const src = trees_.front().sourceShared();
+    return src ? src->name() : std::string_view{};
+}
+
 GrammarSchema const& CompilationUnit::schema() const noexcept {
     // Mirrors Tree::schema (tree.cpp): a moved-from CU has a null schema_
     // (the shared_ptr was moved out). Dereferencing it is UB; abort loudly

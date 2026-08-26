@@ -6,7 +6,12 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"
+// For `kDefaultInlineCallerGrowthPercent` — the pipeline-tier vocabulary,
+// which is where the inline cost-model defaults live alongside
+// `kDefaultInlineThreshold`. Split across two headers they would drift.
+#include "opt/optimizer.hpp"
 #include "opt/analysis/call_graph_scc.hpp"
+#include "opt/passes/mir_id_remap.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <cstdint>
@@ -153,10 +158,43 @@ resolveDirectCallee(Mir const& mir, ModuleAnalysis const& a,
     return it->second;
 }
 
-// The §2.9 legality gate. Returns the callee function id IFF the call
-// at `callId` in `caller` is legal to inline under this cycle's LOCKED
-// scope; nullopt = conservatively REFUSE (leave the call as-is).
-[[nodiscard]] std::optional<MirFuncId>
+// Total instruction count of a function, across all blocks. The SAME
+// counting rule the legality gate's rule-6 size bound applies to a callee
+// (every instruction in every block counts), so the per-callee threshold and
+// the per-caller growth budget are denominated in one unit — a budget in a
+// different unit from the threshold it floors at would be nonsense.
+[[nodiscard]] std::uint32_t funcInstCount(Mir const& mir, MirFuncId f) {
+    std::uint32_t n = 0;
+    std::uint32_t const nb = mir.funcBlockCount(f);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        n += mir.blockInstCount(mir.funcBlockAt(f, bi));
+    }
+    return n;
+}
+
+// What the §2.9 gate returns when it ADMITS a call site. The callee's
+// instruction count rides along because the gate has just counted it: the
+// per-caller growth budget needs exactly that number, and recomputing it
+// would walk every callee body a second time on a module where that walk is
+// already the pass's inner loop.
+struct GateAdmission {
+    MirFuncId     callee;
+    std::uint32_t calleeInsts;
+};
+
+// The §2.9 legality gate. Returns the callee function id (plus its size)
+// IFF the call at `callId` in `caller` is legal to inline under this cycle's
+// LOCKED scope; nullopt = conservatively REFUSE (leave the call as-is).
+//
+// ⚠ THIS GATE ANSWERS "IS THIS SPLICE LEGAL AND INDIVIDUALLY PROFITABLE",
+// AND NOTHING ELSE. The per-caller CUMULATIVE growth budget is deliberately
+// NOT here: it is a property of the CALLER's history across the whole
+// `optimize()` call, not of this call site, and the gate is invoked once per
+// site with no memory between sites. Spending a budget from inside a
+// predicate that the plan builder may call more than once per site is how a
+// budget silently double-charges. The budget lives in `buildInlinePlan`,
+// which visits each site exactly once.
+[[nodiscard]] std::optional<GateAdmission>
 inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
                    MirFuncId caller, MirInstId callId,
                    std::uint32_t inlineThreshold) {
@@ -493,7 +531,7 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     if (instCount > inlineThreshold && !mir.funcAlwaysInline(callee)) {
         return std::nullopt;
     }
-    return callee;
+    return GateAdmission{callee, instCount};
 }
 
 // ── shared splice helpers (free functions; consumed by BOTH the
@@ -523,14 +561,41 @@ mapCalleeOperand(Mir const& src, MirInstId calleeOp,
     return it->second;
 }
 
+// ── The caller-side rewrite map has TWO spellings, and both reach the two
+// helpers below ──
+//
+// `MirFunctionRebuilder` owns a `MirInstRemap` (the dense per-function vector),
+// which is what `InliningPolicy`'s hook receives. `MultiBlockInliner` is a
+// SEPARATE hand-rolled rebuild driver whose `rewrite_` is still a
+// `std::unordered_map` — deliberately, because it also keys CALLEE ids from a
+// DIFFERENT function's arena range, which a range-checked remap must refuse.
+// The two shared helpers are therefore templated over the map, and this pair of
+// overloads is the only thing that differs — the ABSENT spelling. Both answer
+// with a POINTER (`nullptr` = absent), which is `MirIdRemap::find`'s own
+// signature, so the `unordered_map` arm keeps ITS exact absent set too: an entry
+// that happens to hold an invalid id is still FOUND there, exactly as it was
+// before this conversion.
+[[nodiscard]] inline MirInstId const*
+lookupCallerRewrite(std::unordered_map<std::uint32_t, MirInstId> const& rewrite,
+                    std::uint32_t oldV) {
+    auto const it = rewrite.find(oldV);
+    return it == rewrite.end() ? nullptr : &it->second;
+}
+
+[[nodiscard]] inline MirInstId const*
+lookupCallerRewrite(MirInstRemap const& rewrite, std::uint32_t oldV) {
+    return rewrite.find(oldV);
+}
+
 // Map one of the CALLER Call's own operands (callee address or an
 // actual argument) to its caller-NEW value via the rewrite map.
+template <class RewriteMap>
 [[nodiscard]] MirInstId
 mapCallerOperand(MirInstId callerOp,
-                 std::unordered_map<std::uint32_t, MirInstId> const& rewrite,
+                 RewriteMap const& rewrite,
                  MirInstId oldCall) {
-    auto const it = rewrite.find(callerOp.v);
-    if (it == rewrite.end()) {
+    MirInstId const* const mapped = lookupCallerRewrite(rewrite, callerOp.v);
+    if (mapped == nullptr) {
         std::fprintf(stderr,
             "dss::opt::passes::Inlining fatal: caller Call v=%u "
             "operand v=%u has no rewrite entry during splice — "
@@ -539,16 +604,17 @@ mapCallerOperand(MirInstId callerOp,
             oldCall.v, callerOp.v);
         std::abort();
     }
-    return it->second;
+    return *mapped;
 }
 
 // Compute the Call's actual arguments as caller-NEW values. Call
 // operands are [calleeGlobalAddr, arg0, arg1, ...]; operand[0] (the
 // callee GlobalAddr) is intentionally dropped — inlining removes the
 // indirect-through-address call entirely.
+template <class RewriteMap>
 [[nodiscard]] std::vector<MirInstId>
 mapActualArgs(Mir const& src, MirInstId oldCall,
-              std::unordered_map<std::uint32_t, MirInstId> const& rewrite) {
+              RewriteMap const& rewrite) {
     auto const callOps = src.instOperands(oldCall);
     std::vector<MirInstId> actualArgs;
     actualArgs.reserve(callOps.size() > 0 ? callOps.size() - 1 : 0);
@@ -652,9 +718,11 @@ constexpr std::string_view kPassName = "Inlining";
 // (and its tests + the Weak-inline pin) byte-for-byte.
 class InliningPolicy final : public MirRebuildPolicy {
 public:
-    InliningPolicy(Mir const& src, ModuleAnalysis const& analysis,
-                   std::uint32_t inlineThreshold) noexcept
-        : src_(src), analysis_(analysis), inlineThreshold_(inlineThreshold) {}
+    // ⓘ No `inlineThreshold` any more: the policy stopped deciding WHICH
+    // sites to splice when `buildInlinePlan` became the single plan builder,
+    // and a cost bound it no longer consults would be a field that lies.
+    InliningPolicy(Mir const& src, ModuleAnalysis const& analysis) noexcept
+        : src_(src), analysis_(analysis) {}
 
     [[nodiscard]] std::string_view passName() const noexcept override {
         return kPassName;
@@ -665,26 +733,22 @@ public:
     }
     [[nodiscard]] bool malformed() const noexcept { return malformed_; }
 
-    // Compute the per-function single-block-leaf inline plan: callId →
-    // callee. Only callees with exactly one block are admitted here;
-    // multi-block targets are handled by `MultiBlockInliner`.
-    void analyze(MirFuncId caller) {
-        plan_.clear();
-        std::uint32_t const nb = src_.funcBlockCount(caller);
-        for (std::uint32_t bi = 0; bi < nb; ++bi) {
-            MirBlockId const b = src_.funcBlockAt(caller, bi);
-            std::uint32_t const ni = src_.blockInstCount(b);
-            for (std::uint32_t ii = 0; ii < ni; ++ii) {
-                MirInstId const id = src_.blockInstAt(b, ii);
-                if (src_.instOpcode(id) != MirOpcode::Call) continue;
-                auto const callee =
-                    inlineLegalityGate(src_, analysis_, caller, id,
-                                       inlineThreshold_);
-                if (!callee.has_value()) continue;
-                if (src_.funcBlockCount(*callee) != 1) continue;  // multi-block path
-                plan_.emplace(id.v, *callee);
-            }
-        }
+    // Install the per-function inline plan (callId → callee) that
+    // `buildInlinePlan` produced for this caller.
+    //
+    // ★ THE POLICY NO LONGER BUILDS ITS OWN PLAN, AND THAT IS THE POINT. It
+    // used to re-run the legality gate over every call site in the caller,
+    // duplicating the walk `buildInlinePlan` had just done. Harmless while the
+    // gate was a pure predicate; incorrect the moment a CUMULATIVE growth
+    // budget rides on it, because the second walk would charge the same
+    // splices to the same caller twice. One walk, one charge, one plan.
+    //
+    // The plan handed here is already filtered to what this route can splice
+    // (`buildInlinePlan(..., singleBlockOnly=true, ...)`), so the policy does
+    // no filtering of its own — nothing here silently drops a target the
+    // budget was charged for.
+    void setPlan(std::unordered_map<std::uint32_t, MirFuncId> plan) {
+        plan_ = std::move(plan);
     }
 
     [[nodiscard]] std::vector<MirBlockId>
@@ -705,7 +769,7 @@ public:
     [[nodiscard]] std::optional<MirInstId>
     tryRewrite(MirOpcode op, MirInstId oldId,
                MirBuilder& dst,
-               std::unordered_map<std::uint32_t, MirInstId> const& rewrite) override {
+               MirInstRemap const& rewrite) override {
         if (op != MirOpcode::Call) return std::nullopt;
         auto const it = plan_.find(oldId.v);
         if (it == plan_.end()) return std::nullopt;  // not selected → verbatim Call
@@ -723,7 +787,7 @@ private:
     // the caller's CURRENTLY-OPEN block via `dst`.
     [[nodiscard]] MirInstId
     spliceCallee(MirFuncId callee, MirInstId oldCall, MirBuilder& dst,
-                 std::unordered_map<std::uint32_t, MirInstId> const& rewrite) {
+                 MirInstRemap const& rewrite) {
         std::vector<MirInstId> const actualArgs =
             mapActualArgs(src_, oldCall, rewrite);
 
@@ -778,7 +842,6 @@ private:
 
     Mir const&            src_;
     ModuleAnalysis const& analysis_;
-    std::uint32_t         inlineThreshold_;  // COST MODEL size bound
     // Per-function inline plan: caller Call old-id .v → callee MirFuncId.
     std::unordered_map<std::uint32_t, MirFuncId> plan_;
     std::size_t callsInlined_ = 0;
@@ -860,6 +923,19 @@ public:
     [[nodiscard]] bool malformed() const noexcept { return malformed_; }
 
     void rebuildFunction(MirFuncId caller) {
+        // ★ THE SECOND REBUILD DRIVER. This pass does NOT go through
+        // `MirFunctionRebuilder`, so the shared rebuild-time accumulator it
+        // owns would report Inlining's multi-block path as ZERO rebuild time.
+        // `optRebuildScope` is the same RAII the shared rebuilder uses; without
+        // it the analyze:rebuild ratio for the ONE whole-module pass reads as
+        // pure analysis, which is exactly backwards.
+        auto const rebuildT0 = optRebuildTraceEnabled()
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        struct Acc {
+            std::chrono::steady_clock::time_point t0;
+            ~Acc() { if (optRebuildTraceEnabled()) optRebuildNsAdd(t0); }
+        } const rebuildAcc_{rebuildT0};
         // TF-C78 (D-CSUBSET-NOINLINE): the inliner's OWN rebuild must carry the
         // flag too. A `noinline` function is still a CALLER (it may inline other
         // functions INTO itself — the attribute constrains splicing it OUT, not
@@ -1559,13 +1635,54 @@ private:
 // True iff `caller`'s inline plan contains at least one MULTI-BLOCK
 // callee — the signal to route this function through the multi-block
 // rebuild rather than the cycle-1 `tryRewrite` path.
+// ★★★ THE ONE PLACE A CALLER'S INLINE PLAN IS BUILT, AND THE ONE PLACE THE
+// GROWTH BUDGET IS SPENT.
+//
+// ⚠ IT REPLACED TWO PLAN BUILDERS, AND THE MERGE IS WHY THE BUDGET IS
+// CORRECT. Before this, `planHasMultiBlock` built a plan AND
+// `InliningPolicy::analyze` built the same plan again for the single-block
+// route — the gate ran TWICE over every call site in most functions. That was
+// harmless while the gate was a pure predicate. A budget spent inside a
+// predicate called twice charges twice, so the second builder had to go
+// rather than be taught to skip; `InliningPolicy` now RECEIVES a plan.
+//
+// `singleBlockOnly` is the computed-goto / SEH host route, where only
+// single-block callees are ever spliced. Such a host must not merely have its
+// multi-block targets dropped downstream — it must never CHARGE for them,
+// or a computed-goto function would spend its budget on splices that never
+// happen. Admission and charging are therefore the same decision here.
+//
+// Returns whether the plan contains a MULTI-BLOCK target (the routing signal).
 [[nodiscard]] bool
-planHasMultiBlock(Mir const& src, ModuleAnalysis const& analysis,
-                  MirFuncId caller,
-                  std::unordered_map<std::uint32_t, MirFuncId>& planOut,
-                  std::uint32_t inlineThreshold) {
+buildInlinePlan(Mir const& src, ModuleAnalysis const& analysis,
+                MirFuncId caller,
+                std::unordered_map<std::uint32_t, MirFuncId>& planOut,
+                std::uint32_t inlineThreshold,
+                std::uint32_t callerGrowthPercent,
+                InlineGrowthLedger& ledger,
+                bool singleBlockOnly,
+                std::size_t& budgetedOut) {
     planOut.clear();
     bool anyMulti = false;
+
+    // The caller's ceiling. `original` is fixed for this whole `optimize()`
+    // call by the ledger; `allowance` is a percentage of it, floored at one
+    // maximal legal callee so a small wrapper can still absorb the helper the
+    // per-callee threshold says is inlinable. 64-bit arithmetic throughout:
+    // `original * percent` overflows uint32 at a percent the loader accepts.
+    std::uint32_t const currentInsts = funcInstCount(src, caller);
+    std::uint64_t const original =
+        ledger.originalInsts(src.funcSymbol(caller), currentInsts);
+    std::uint64_t const allowance =
+        std::max(original * static_cast<std::uint64_t>(callerGrowthPercent) / 100u,
+                 static_cast<std::uint64_t>(inlineThreshold));
+    std::uint64_t const ceiling = original + allowance;
+    // Already over ceiling (a previous iteration spent it, or the function
+    // GREW for another reason — another pass may legitimately have enlarged
+    // it). `projected` is unsigned, so start from the real size and let the
+    // comparison below refuse everything rather than underflowing a remaining.
+    std::uint64_t projected = currentInsts;
+
     std::uint32_t const nb = src.funcBlockCount(caller);
     for (std::uint32_t bi = 0; bi < nb; ++bi) {
         MirBlockId const b = src.funcBlockAt(caller, bi);
@@ -1573,11 +1690,26 @@ planHasMultiBlock(Mir const& src, ModuleAnalysis const& analysis,
         for (std::uint32_t ii = 0; ii < ni; ++ii) {
             MirInstId const id = src.blockInstAt(b, ii);
             if (src.instOpcode(id) != MirOpcode::Call) continue;
-            auto const callee =
+            auto const adm =
                 inlineLegalityGate(src, analysis, caller, id, inlineThreshold);
-            if (!callee.has_value()) continue;
-            planOut.emplace(id.v, *callee);
-            if (src.funcBlockCount(*callee) != 1) anyMulti = true;
+            if (!adm.has_value()) continue;
+            bool const multi = src.funcBlockCount(adm->callee) != 1;
+            if (singleBlockOnly && multi) continue;  // never spliced ⇒ never charged
+
+            // TF-C81: `always_inline` waives the budget exactly as it waives
+            // the per-callee threshold — the attribute overrides profitability
+            // vetoes, and a cumulative growth bound is one. It is still
+            // CHARGED, so it reduces what ordinary sites in this caller may
+            // take. Charged but never refused.
+            if (!src.funcAlwaysInline(adm->callee)
+                && projected + adm->calleeInsts > ceiling) {
+                ++budgetedOut;
+                continue;
+            }
+            projected += adm->calleeInsts;
+
+            planOut.emplace(id.v, adm->callee);
+            if (multi) anyMulti = true;
         }
     }
     return anyMulti;
@@ -1585,9 +1717,24 @@ planHasMultiBlock(Mir const& src, ModuleAnalysis const& analysis,
 
 } // namespace
 
+InliningResult runInlining(Mir& mir, TypeInterner const& interner,
+                           DiagnosticReporter& reporter,
+                           std::uint32_t inlineThreshold,
+                           bool maintainMarkers) {
+    // The single-invocation entry point: a ledger that lives exactly as long
+    // as this one call, so "original size" == "size at pass entry". See the
+    // header for why a PIPELINE must never come through here.
+    InlineGrowthLedger oneShot;
+    return runInlining(mir, interner, reporter, inlineThreshold,
+                       kDefaultInlineCallerGrowthPercent, oneShot,
+                       maintainMarkers);
+}
+
 InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
                            DiagnosticReporter& reporter,
                            std::uint32_t inlineThreshold,
+                           std::uint32_t callerGrowthPercent,
+                           InlineGrowthLedger& ledger,
                            bool maintainMarkers) {
     InliningResult result{};
     MirBuilder builder;
@@ -1599,10 +1746,11 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
     }
 
     ModuleAnalysis const analysis = analyzeModule(mir);
-    InliningPolicy policy{mir, analysis, inlineThreshold};
+    InliningPolicy policy{mir, analysis};
 
-    std::size_t callsInlined = 0;
-    bool        malformed    = false;
+    std::size_t callsInlined  = 0;
+    std::size_t callsBudgeted = 0;
+    bool        malformed     = false;
 
     // Per-function routing: a function whose inline plan is empty or
     // contains ONLY single-block-leaf targets goes through the cycle-1
@@ -1622,14 +1770,19 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
         // c115 SEH: a SEH-containing host routes the same way — the rebuild
         // path carries the SehTryBegin/SehFilterReturn clone arms the
         // MultiBlockInliner's caller-host emit lacks (D-WIN64-SEH-FUNCLETS).
-        if (!functionHasComputedGoto(mir, f) && !functionHasSeh(mir, f)
-            && planHasMultiBlock(mir, analysis, f, plan, inlineThreshold)) {
+        bool const singleBlockOnly =
+            functionHasComputedGoto(mir, f) || functionHasSeh(mir, f);
+        bool const anyMulti =
+            buildInlinePlan(mir, analysis, f, plan, inlineThreshold,
+                            callerGrowthPercent, ledger, singleBlockOnly,
+                            callsBudgeted);
+        if (!singleBlockOnly && anyMulti) {
             MultiBlockInliner mb{mir, builder, plan};
             mb.rebuildFunction(f);
             callsInlined += mb.callsInlined();
             malformed = malformed || mb.malformed();
         } else {
-            policy.analyze(f);
+            policy.setPlan(std::move(plan));
             MirFunctionRebuilder rb{mir, builder, policy};
             rb.rebuildFunction(f);
         }
@@ -1653,13 +1806,23 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
         return result;
     }
 
-    result.callsInlined = callsInlined;
+    result.callsInlined  = callsInlined;
+    result.callsBudgeted = callsBudgeted;
     // A/B instrument (P10 D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE): the per-stage
     // inlining count the split decision pre-registers on. Same env gate as
     // the engine's per-pass trace so the two compose in one log.
+    //
+    // `callsBudgeted` joins it because the two numbers are only meaningful
+    // together: `callsInlined` alone cannot distinguish "the fixpoint has
+    // converged, there is nothing left to inline" from "the growth budget is
+    // holding back work" — and those call for opposite responses.
+    // ⚠ APPENDED, never inserted: the existing field keeps its position so
+    // the P10 A/B parsers and `scratchpad/p36/*/probe.py` keep matching.
     if (std::getenv("DSS_OPT_TRACE") != nullptr) {
-        std::fprintf(stderr, "opt: pass=Inlining callsInlined=%u\n",
-                     static_cast<unsigned>(callsInlined));
+        std::fprintf(stderr,
+                     "opt: pass=Inlining callsInlined=%u callsBudgeted=%u\n",
+                     static_cast<unsigned>(callsInlined),
+                     static_cast<unsigned>(callsBudgeted));
         std::fflush(stderr);
     }
     mir = std::move(builder).finish();

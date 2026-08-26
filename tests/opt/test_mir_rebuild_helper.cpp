@@ -20,6 +20,7 @@
 #include "mir/mir_cfg.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/passes/mir_id_remap.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <gtest/gtest.h>
@@ -523,9 +524,8 @@ public:
     }
     void onBlockBegin(MirBlockId /*oldB*/, MirBlockId /*newB*/,
                       MirBuilder& dst,
-                      std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
-                      std::unordered_map<std::uint32_t, MirBlockId> const&
-                          /*blockMap*/) override {
+                      MirInstRemap& /*rewrite*/,
+                      MirBlockRemap const& /*blockMap*/) override {
         ++onBlockBeginCalls;
         MirLiteralValue v;
         v.value = std::int64_t{999};
@@ -1017,8 +1017,7 @@ public:
     }
     [[nodiscard]] bool acceptPhiIncoming(
         MirPhiIncoming const& /*inc*/, MirBlockId /*oldPhiBlock*/,
-        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/)
-        override {
+        MirBlockRemap const& /*blockMap*/) override {
         return false;
     }
 };

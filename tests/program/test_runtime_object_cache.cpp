@@ -123,6 +123,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>   // std::reverse — the declaring-descriptor ORDER control
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -215,7 +216,7 @@ makeRequest(fs::path const&  configRoot,
             std::string_view targetSpec = "arm64:elf64-aarch64-linux-exec") {
     RuntimeObjectRequest request;
     request.configRoot        = configRoot;
-    request.descriptorPath    = std::string{kDescriptorPath};
+    request.descriptorPaths   = {std::string{kDescriptorPath}};
     request.sourcePath        = std::string{kSourcePath};
     request.targetSpec        = std::string{targetSpec};
     request.buildFormatName   = "elf64-aarch64-linux-exec";
@@ -569,7 +570,7 @@ TEST(RuntimeObjectCacheKey, DocumentHasTheExactLineShapeAndOrder) {
     }
 
     ASSERT_EQ(lines.size(), 12u) << key->document;
-    EXPECT_EQ(lines[0], "dss-runtime-object-cache-key/1");
+    EXPECT_EQ(lines[0], "dss-runtime-object-cache-key/2");
 
     // ⓘ `compiler=` is the ONE term this test cannot pin to a literal: its
     // value is a build-time stamp macro compiled into the library, and the
@@ -750,6 +751,105 @@ TEST(RuntimeObjectCacheKey, OneByteDescriptorChangeAtEqualLengthMovesTheKey) {
            "is still reachable in BOTH roots.";
 }
 
+// ═══ EVERY TERM, ONE ROW EACH — THE TOO-COARSE-KEY DETECTOR ═════════════════
+//
+// ★★★ THIS IS THE CASE THAT REDS WHEN A TERM IS DROPPED, AND THAT IS THE ONLY
+// REASON IT IS TABLE-DRIVEN. The other key cases each pin one input they had a
+// specific argument about; this one asserts the WHOLE list, so deleting any
+// `field(...)` line from `computeRuntimeObjectKey` — or "simplifying" the
+// loaded-document loop, or dropping the sort — turns exactly one row red and
+// names it. A key that is too COARSE is not a slow build: it is a stale archive
+// served under a key that says it is current, which links clean and returns
+// wrong bytes.
+//
+// ⚠ EACH ROW MUTATES EXACTLY ONE THING, and every row is paired with the
+// `OutOfScopeDocumentChangeLeavesTheKeyUnmoved` control below — without that
+// control a key that hashed the entire config root would pass every row here
+// and hit never.
+//
+// ⓘ `relativePath` is asserted alongside `digest` because reachability is the
+// property, not distinguishability: the 16-character path index is a prefix of
+// the identity, so a moved digest must move the FILENAME too or the stale
+// artifact stays exactly where the next lookup will find it.
+TEST(RuntimeObjectCacheKey, EveryKeyTermMovesTheKeyAndTheArtifactPath) {
+    struct Row {
+        char const* term;
+        // Mutates the request in place, or the staged tree behind it, or both.
+        void (*mutate)(RuntimeObjectRequest&, fs::path const&);
+    };
+    constexpr Row kRows[] = {
+        {"target", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.targetSpec = "x86_64:elf64-x86_64-linux-exec";
+         }},
+        {"format", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.buildFormatName = "elf64-aarch64-linux-pie";
+         }},
+        {"sibling", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.siblingFormatName = "elf64-x86_64-linux-staticlib";
+         }},
+        {"config", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.configName = "release";
+         }},
+        {"unit path", [](RuntimeObjectRequest& r, fs::path const& root) {
+             constexpr std::string_view kOther = "runtime/platform/src/other.c";
+             writeFile(root / kOther, kUnitText);
+             r.sourcePath = std::string{kOther};
+         }},
+        {"unit bytes", [](RuntimeObjectRequest&, fs::path const& root) {
+             writeFile(root / kSourcePath,
+                       std::string{kUnitText} + "int extra(void){return 1;}\n");
+         }},
+        {"descriptor bytes", [](RuntimeObjectRequest&, fs::path const& root) {
+             writeFile(root / kDescriptorPath, kDescriptorV2);
+         }},
+        {"loaded document digest", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.loadedDocuments[0].digest = std::string(64u, 'b');
+         }},
+        {"loaded document path", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.loadedDocuments[0].path = "sources/somewhere-else.lang.json";
+         }},
+        {"loaded document label", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.loadedDocuments[0].label = "unit-language";
+         }},
+        {"loaded document count", [](RuntimeObjectRequest& r, fs::path const&) {
+             r.loadedDocuments.push_back(
+                 {"sibling-format",
+                  "object-formats/elf64-aarch64-linux-staticlib.format.json",
+                  std::string(64u, 'c')});
+         }},
+    };
+
+    for (Row const& row : kRows) {
+        // A FRESH staged root per row: a mutation that rewrote a file would
+        // otherwise leak into the next row's baseline and make its "moved"
+        // assertion pass for the wrong reason.
+        ScratchDir scratch{Location::Temp, "roc-key-terms"};
+        ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1))
+            << "term: " << row.term;
+
+        auto const before = computeRuntimeObjectKey(makeRequest(scratch.path()));
+        ASSERT_TRUE(before.has_value()) << row.term << ": " << before.error();
+
+        auto mutated = makeRequest(scratch.path());
+        row.mutate(mutated, scratch.path());
+        auto const after = computeRuntimeObjectKey(mutated);
+        ASSERT_TRUE(after.has_value()) << row.term << ": " << after.error();
+
+        EXPECT_NE(before->digest, after->digest)
+            << "changing the '" << row.term
+            << "' term did NOT move the cache key. The key is too COARSE: a "
+               "build with this input changed would be served the artifact "
+               "compiled with the OLD one, which links clean and returns wrong "
+               "bytes.\n  before: " << before->document
+            << "\n  after:  " << after->document;
+        EXPECT_NE(before->relativePath.generic_string(),
+                  after->relativePath.generic_string())
+            << "changing the '" << row.term
+            << "' term moved the key but NOT the artifact path, so the stale "
+               "artifact is still exactly where the next lookup reads.";
+    }
+}
+
 TEST(RuntimeObjectCacheKey, OutOfScopeDocumentChangeLeavesTheKeyUnmoved) {
     // THE CONTROL THAT PROVES THE KEY IS SCOPED. A key that hashed the whole
     // config root would pass every invalidation case in this file and fail
@@ -825,6 +925,93 @@ TEST(RuntimeObjectCacheKey, MalformedLoadedDocumentDigestRefuses) {
         ASSERT_FALSE(key.has_value());
         EXPECT_TRUE(contains(key.error(), "MALFORMED")) << key.error();
     }
+}
+
+// ── THE SECOND DECLARING DESCRIPTOR ─────────────────────────────────────────
+//
+// `realization.<fmt>.source` is a per-DESCRIPTOR declaration, so a unit may be
+// named by more than one. ✔MEASURED 2026-08-25 the shipped corpus names exactly
+// one per unit — which is precisely the state in which a singular term looks
+// correct forever while a second declaration would silently fall outside the
+// key. These three cases are what make the plural term a measurement.
+TEST(RuntimeObjectCacheKey, ASecondDeclaringDescriptorMovesTheKey) {
+    ScratchDir scratch{Location::Temp, "roc-key-descr2"};
+    ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
+    // The second declarer is a REAL file with its own bytes — a path alone
+    // would be satisfied by a key that hashed paths and not content.
+    constexpr std::string_view kSecondPath = "shippedLibs/probe-two.json";
+    ASSERT_NO_FATAL_FAILURE(
+        writeFile(scratch.path() / kSecondPath, kDescriptorV2));
+
+    auto const one = computeRuntimeObjectKey(makeRequest(scratch.path()));
+    ASSERT_TRUE(one.has_value()) << one.error();
+
+    auto twoRequest = makeRequest(scratch.path());
+    twoRequest.descriptorPaths.emplace_back(kSecondPath);
+    auto const two = computeRuntimeObjectKey(twoRequest);
+    ASSERT_TRUE(two.has_value()) << two.error();
+
+    EXPECT_NE(one->digest, two->digest)
+        << "a SECOND declaring descriptor did not move the key — its bytes are "
+           "outside the key, so editing it would serve an archive compiled "
+           "against the old declarations.";
+    EXPECT_NE(one->relativePath.generic_string(),
+              two->relativePath.generic_string());
+
+    // ★ AND THE ORDER THE CALLER HAPPENED TO WALK IN MUST NOT MATTER — the key
+    // is a function of the SET. `directory_iterator` is sorted on NTFS and
+    // hash-ordered on ext4, so an order-sensitive key would make the SAME
+    // corpus miss on one filesystem and hit on the other.
+    auto reversed = twoRequest;
+    std::reverse(reversed.descriptorPaths.begin(),
+                 reversed.descriptorPaths.end());
+    auto const swapped = computeRuntimeObjectKey(reversed);
+    ASSERT_TRUE(swapped.has_value()) << swapped.error();
+    EXPECT_EQ(two->document, swapped->document)
+        << "the declaring-descriptor order changed the key document.";
+}
+
+TEST(RuntimeObjectCacheKey, EditingTheSecondDeclaringDescriptorMovesTheKey) {
+    ScratchDir scratch{Location::Temp, "roc-key-descr2edit"};
+    ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
+    constexpr std::string_view kSecondPath = "shippedLibs/probe-two.json";
+    ASSERT_NO_FATAL_FAILURE(
+        writeFile(scratch.path() / kSecondPath, kDescriptorV1));
+
+    auto request = makeRequest(scratch.path());
+    request.descriptorPaths.emplace_back(kSecondPath);
+    auto const before = computeRuntimeObjectKey(request);
+    ASSERT_TRUE(before.has_value()) << before.error();
+
+    // Equal length, one differing byte — the mutation a size- or mtime-based
+    // key would wave through. The FIRST descriptor is left untouched, so only
+    // the second can account for a moved key.
+    ASSERT_EQ(kDescriptorV1.size(), kDescriptorV2.size());
+    ASSERT_NO_FATAL_FAILURE(
+        writeFile(scratch.path() / kSecondPath, kDescriptorV2));
+    EXPECT_EQ(readFile(scratch.path() / kDescriptorPath), kDescriptorV1)
+        << "the first descriptor was disturbed, so this case no longer "
+           "attributes the moved key to the second.";
+
+    auto const after = computeRuntimeObjectKey(request);
+    ASSERT_TRUE(after.has_value()) << after.error();
+    EXPECT_NE(before->digest, after->digest)
+        << "editing the SECOND declaring descriptor did not move the key.";
+}
+
+TEST(RuntimeObjectCacheKey, NoDeclaringDescriptorRefusesRatherThanDroppingTheTerm) {
+    ScratchDir scratch{Location::Temp, "roc-key-descr0"};
+    ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
+
+    auto request = makeRequest(scratch.path());
+    request.descriptorPaths.clear();
+    auto const key = computeRuntimeObjectKey(request);
+    ASSERT_FALSE(key.has_value())
+        << "a request naming NO declaring descriptor produced a key anyway — "
+           "the term the whole mechanism exists for was dropped silently.";
+    EXPECT_TRUE(contains(key.error(), "runtime/platform/src/unit.c"))
+        << key.error();
+    EXPECT_TRUE(contains(key.error(), "NO declaring")) << key.error();
 }
 
 TEST(RuntimeObjectCacheKey, MissingUnitOrDescriptorRefuses) {

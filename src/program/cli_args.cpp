@@ -142,6 +142,7 @@ std::string_view cliArgsErrorName(CliArgsError e) noexcept {
         case CliArgsError::InvalidStackReserve:  return "InvalidStackReserve";
         case CliArgsError::InvalidResolveLibrary: return "InvalidResolveLibrary";
         case CliArgsError::InvalidMaxDiagnostics: return "InvalidMaxDiagnostics";
+        case CliArgsError::InvalidMaxPerCode:     return "InvalidMaxPerCode";
     }
     return "Unknown";
 }
@@ -861,6 +862,38 @@ parseCliArgs(int argc, char* argv[]) {
             }
         }
         {
+            // `--max-per-code <count>` / `--max-per-code=<count>` — the
+            // PER-CODE cap (`DiagnosticReporter::Config::maxPerCode`).
+            // D-DIAG-MAXPERCODE-SILENT-COALESCE.
+            //
+            // Shape is the `--max-diagnostics` arm above, verbatim and
+            // deliberately: one `valueFlag` covering both spellings,
+            // `from_chars` on an UNSIGNED type so a leading '-' is rejected as
+            // invalid_argument with no separate branch, `ec` covering
+            // non-numeric AND result_out_of_range (a count above SIZE_MAX must
+            // not wrap into a small cap), and `p != end` covering trailing junk
+            // so `100x` cannot silently become 100. Zero is accepted here too
+            // — see the `CliArgs::maxPerCode` docblock.
+            auto m = valueFlag(a, i, "--max-per-code");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                std::string const& v = **m;
+                std::size_t n = 0;
+                auto const [p, ec] = std::from_chars(
+                    v.data(), v.data() + v.size(), n);
+                if (ec != std::errc{} || p != v.data() + v.size()) {
+                    return std::unexpected(make_error(
+                        CliArgsError::InvalidMaxPerCode,
+                        std::string{"--max-per-code: '"} + v
+                        + "' is not a non-negative integer diagnostic count "
+                          "(e.g. --max-per-code 500; 0 is legal and means "
+                          "elide every one, just count them per code)"));
+                }
+                out.maxPerCode = n;
+                continue;
+            }
+        }
+        {
             auto m = valueFlag(a, i, "--suppress");
             if (!m) return std::unexpected(m.error());
             if (m->has_value()) {
@@ -1005,6 +1038,7 @@ parseCliArgs(int argc, char* argv[]) {
             offenders += flag;
         };
         if (out.maxDiagnostics.has_value()) note("--max-diagnostics");
+        if (out.maxPerCode.has_value())     note("--max-per-code");
         if (!out.suppress.empty())          note("--suppress");
         if (out.warningsAsErrors)           note("--warnings-as-errors");
         if (!offenders.empty()) {
@@ -1047,6 +1081,9 @@ parseCliArgs(int argc, char* argv[]) {
          // --max-diagnostics without a mode flag would silently discard the
          // requested cap (no compile, so no reporter is ever built from it).
          || out.maxDiagnostics.has_value()
+         // --max-per-code without a mode flag would silently discard the
+         // requested cap for exactly the same reason.
+         || out.maxPerCode.has_value()
          || out.config != CompileConfig::Debug
          || out.directoryMode != InputResolver::Mode::Recursive;
         if (hasOptions) {
@@ -1143,6 +1180,11 @@ DiagnosticReporter::Config buildReporterConfig(CliArgs const& args) {
     // source of truth this flag was added to eliminate.
     if (args.maxDiagnostics.has_value()) {
         cfg.maxDiagnostics = *args.maxDiagnostics;
+    }
+    // Same write-only-when-asked discipline, same reason
+    // (D-DIAG-MAXPERCODE-SILENT-COALESCE).
+    if (args.maxPerCode.has_value()) {
+        cfg.maxPerCode = *args.maxPerCode;
     }
     return cfg;
 }

@@ -5,6 +5,7 @@
 #include "mir/mir_cfg.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/passes/mir_id_remap.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <cstdint>
@@ -341,8 +342,8 @@ public:
 
     [[nodiscard]] bool acceptPhiIncoming(
         MirPhiIncoming const& inc, MirBlockId /*oldPhiBlock*/,
-        std::unordered_map<std::uint32_t, MirBlockId> const& blockMap) override {
-        return blockMap.count(inc.pred.v) != 0;
+        MirBlockRemap const& blockMap) override {
+        return blockMap.contains(inc.pred.v);
     }
 
     // (No `recordTerminatorInRewrite` override — the hook is gone. This policy

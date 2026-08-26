@@ -86,6 +86,95 @@ symbolVisibilityFromName(std::string_view s) noexcept {
     return kSymbolVisibilityTable.fromName(s);
 }
 
+// ── WHAT A WEAK DEFINITION PROMISES ABOUT ITS DUPLICATES ──────────────────
+//    D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED
+//
+// `SymbolBinding::Weak` says "several translation units may define this; the
+// linker keeps one". It does NOT say how much the copies are required to have
+// in common, and for two of COFF's COMDAT selections that difference is the
+// entire contract: their selection byte is a PROMISE the linker is specified to
+// VERIFY, and issue a multiply-defined-symbol error when it is broken.
+//
+// ★★ THIS IS A SEPARATE AXIS FROM BINDING, NOT A THIRD BINDING. Making it
+// `SymbolBinding::WeakSameSize` would have forced every `== SymbolBinding::Weak`
+// test in the tree (the writers' dialect gates, the DCE preserve rule, the
+// merge's own strong-shadows-weak arm) to enumerate a widening set of
+// enumerators, and each site that forgot one would silently reclassify a weak
+// definition as strong. The duty rides ALONGSIDE the binding and is read only
+// by the code that folds duplicates.
+//
+// ★ FORMAT-BLIND ON PURPOSE. Nothing here is COFF: the COFF reader is simply
+// the first producer that has a duty to declare, because COMDAT is where the
+// spelling exists today. ELF's section groups (`GRP_COMDAT`) and Mach-O's
+// coalesced sections express the same idea and would map onto the same three
+// answers, so a second producer needs no new vocabulary — which is exactly what
+// stops a `Coff*` enum from appearing beside this one.
+//
+// `Any` is the DEFAULT and it is the honest default: it is what a weak
+// definition minted by DSS's own front end promises (nothing beyond "keep one"),
+// and it is what IMAGE_COMDAT_SELECT_ANY promises. A producer that knows more
+// says more.
+enum class DuplicateMatch : std::uint8_t {
+    Any          = 0,  // keep any one copy; the copies need not agree at all
+    SameSize     = 1,  // every copy must have the SAME BYTE LENGTH
+    ExactContent = 2,  // every copy must have identical BYTES
+};
+
+inline constexpr EnumNameTable<DuplicateMatch, 3> kDuplicateMatchTable{{{
+    { DuplicateMatch::Any,          "any"           },
+    { DuplicateMatch::SameSize,     "same-size"     },
+    { DuplicateMatch::ExactContent, "exact-content" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kDuplicateMatchTable);
+
+[[nodiscard]] constexpr std::string_view
+duplicateMatchName(DuplicateMatch m) noexcept {
+    return kDuplicateMatchTable.name(m);
+}
+[[nodiscard]] constexpr std::optional<DuplicateMatch>
+duplicateMatchFromName(std::string_view s) noexcept {
+    return kDuplicateMatchTable.fromName(s);
+}
+
+// When two definitions of one name are folded, the duty that governs is the
+// STRICTER of the two. ★ THAT IS A DELIBERATE CHOICE AND IT IS THE SAFE ONE:
+// it can only ever refuse input the format also refuses, never accept input the
+// format rejects. It also means a producer that declares nothing (`Any`) cannot
+// dilute a sibling's promise, which is the failure mode a "first one wins" or a
+// "they must agree" rule would each have in one direction.
+//
+// ⚠ NOT the same question as "do the two definitions declare the SAME
+// selection". COFF's linker treats a selection-byte disagreement between
+// duplicates as its own error; DSS does not model that today and this function
+// is not it — widening it into that would start refusing inputs on a rule this
+// row never measured.
+[[nodiscard]] constexpr DuplicateMatch
+stricterDuplicateMatch(DuplicateMatch a, DuplicateMatch b) noexcept {
+    // The enumerators are ordered by strictness, and the ONE static_assert
+    // below is what keeps that true: reordering them silently inverts this
+    // function, and nothing else in the tree would notice.
+    return (static_cast<std::uint8_t>(a) >= static_cast<std::uint8_t>(b)) ? a : b;
+}
+
+static_assert(static_cast<std::uint8_t>(DuplicateMatch::Any)
+              < static_cast<std::uint8_t>(DuplicateMatch::SameSize)
+           && static_cast<std::uint8_t>(DuplicateMatch::SameSize)
+              < static_cast<std::uint8_t>(DuplicateMatch::ExactContent),
+              "DuplicateMatch enumerators must stay ordered by increasing "
+              "strictness -- stricterDuplicateMatch() compares them numerically");
+static_assert(stricterDuplicateMatch(DuplicateMatch::Any,
+                                     DuplicateMatch::SameSize)
+              == DuplicateMatch::SameSize);
+static_assert(stricterDuplicateMatch(DuplicateMatch::ExactContent,
+                                     DuplicateMatch::SameSize)
+              == DuplicateMatch::ExactContent);
+static_assert(stricterDuplicateMatch(DuplicateMatch::Any, DuplicateMatch::Any)
+              == DuplicateMatch::Any);
+
 // D-OPT1-SYMBOL-BINDING-VISIBILITY-THREAD invariant: a symbol whose
 // `binding == Global` AND `visibility != Hidden` AND `visibility !=
 // Internal` is externally observable — every later image (the linker,

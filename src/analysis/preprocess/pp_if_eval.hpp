@@ -91,10 +91,18 @@ using PpHasEmbed =
 // (`__STDC_VERSION__` &c.) or a `#`/`##` product expanded inside a `#if`
 // controlling expression materializes a token whose span points into the synth
 // buffer's product TAIL (`[prefixLen + ..)`), which is NOT yet appended to the
-// prefix-only `synth` buffer at #if-eval time. This provider returns that tail
-// so the evaluator can assemble a COMBINED (prefix + product) buffer the ICE
-// parser slices every real token against. Returns an empty view when the
-// language produces no products (then the combined buffer == the prefix).
+// prefix-only `synth` buffer at #if-eval time. This provider returns that tail,
+// which the ICE parser slices a product-span token out of DIRECTLY — the tail is
+// BORROWED for the duration of the call, never copied, so the bytes it names
+// must outlive `evaluateIfExpression` and must not be appended to during it
+// (both callers own the storage and stop appending before the tail is taken).
+// Returns an empty view when the language produces no products.
+//
+// ★ IT USED TO SAY "so the evaluator can assemble a COMBINED (prefix + product)
+// buffer", and it did — copying the WHOLE translation unit on every `#if` after
+// the TU's first product. See the
+// D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION note in
+// `evaluateIfExpression` for the measurement that removed it.
 using PpProductText = std::function<std::string_view()>;
 
 // Evaluate the `#if`/`#elif` operand tokens to a compile-time integer.

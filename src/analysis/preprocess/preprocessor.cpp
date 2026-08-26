@@ -22,6 +22,7 @@
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <optional>
 #include <set>
@@ -37,6 +38,7 @@
 namespace fs = std::filesystem;
 
 namespace dss {
+
 
 namespace {
 
@@ -768,6 +770,126 @@ detectIncludeOnceMechanism(std::shared_ptr<SourceBuffer> const&        buf,
                          : IncludeOnceMechanism::None;
 }
 
+// ── The per-FILE pre-scan memo ───────────────────────────────────────────────
+//
+// ★★★ D-PERF-PP-EVERY-INCLUDE-RE-READS-AND-RE-TOKENIZES-THE-SAME-HEADER.
+// `SynthBuilder::build` opens, phase-2-splices, wraps in a `SourceBuffer` and
+// FULLY TOKENIZES its file on EVERY occurrence of an `#include` naming it — per
+// translation unit, and again for every TU in the project. Nothing about those
+// four steps depends on where the include sits or on what macros are in scope:
+// they are a pure function of the file's BYTES. Only the directive WALK that
+// follows is state-dependent, and that walk is cheap.
+//
+// ✔MEASURED 2026-08-25 on the 103-TU sqlite full-source corpus (`--project …
+// --config=release --jobs 1`): 1,364 include opens read 109.2 MB and the
+// pre-scan tokenized 118.7 MB into 13.2M pp-tokens — 10.2 s of the 16.1 s
+// `preprocess-splice` phase — for a distinct header set a small fraction of
+// that size. `sqliteInt.h` alone is re-read and re-tokenized once per TU.
+//
+// So this memo holds, per distinct file, exactly the four pure results:
+// the loaded buffer, the continuation-spliced text, its line map, and its
+// pp-token vector. It is a MEMO of a pure function, not a cache with a policy:
+// there is no eviction, no staleness window, and no way for a hit and a miss to
+// disagree — a hit returns the same object the miss would have built.
+//
+// ⚠ THE KEY IS (identity, size, last-write-time), NOT the path alone. A file
+// edited mid-compile MISSES and is re-read rather than silently served stale
+// bytes — the fail-loud direction, and it costs two `stat`s against an 80 KB
+// read plus a tokenize.
+// ⚠ THE ENTRY IS IMMUTABLE ONCE PUBLISHED and handed out as a `shared_ptr<const
+// …>`, because the driver preprocesses translation units on a THREAD POOL: a
+// reader must never see a half-built entry, and an entry must outlive the
+// builder that took it (a `PPToken::text` is a view into `scanBuf`'s bytes, and
+// a `LineMapSegment::origin` is a `shared_ptr` the CU keeps). Building happens
+// OUTSIDE the lock, so two threads racing on a cold header both do the work and
+// the first to publish wins — duplicated work on a cold miss, never a stall.
+// ⚠ ONE BUFFER PER DISTINCT FILE, deliberately: the memoized `LineMapSegment`s
+// carry `origin` pointers into `source`, so re-using the tokens REQUIRES
+// re-using the buffer they were mapped against. Sharing one immutable
+// `SourceBuffer` across CUs is also strictly better for the diagnostic
+// registry, which used to hold one duplicate per TU of every header.
+struct PreScannedFile {
+    std::shared_ptr<SourceBuffer> source;    // the file's own bytes
+    std::string                   spliced;   // phase-2 continuation splice of them
+    LineMap                       localMap;  // spliced -> `source` segments
+    std::shared_ptr<SourceBuffer> scanBuf;   // `spliced` as a buffer (owns token text)
+    std::vector<PPToken>          toks;      // the ONE tokenize of `spliced`
+};
+
+// The memo's identity key. `core::PathIdentity` answers "same file" across
+// spellings; size + mtime answer "same bytes".
+struct PreScanKey {
+    core::PathIdentity      path;
+    std::uintmax_t          size = 0;
+    std::int64_t            mtime = 0;
+    bool operator==(PreScanKey const& o) const noexcept {
+        return path == o.path && size == o.size && mtime == o.mtime;
+    }
+};
+struct PreScanKeyHash {
+    std::size_t operator()(PreScanKey const& k) const noexcept {
+        std::size_t h = std::hash<core::PathIdentity>{}(k.path);
+        h ^= std::hash<std::uintmax_t>{}(k.size) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<std::int64_t>{}(k.mtime) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+// Process-lifetime storage. A driver process compiles one invocation and exits,
+// so the memo's size is bounded by that invocation's distinct include set.
+// `tests` that need isolation do not exist for this: an entry can only ever be
+// re-served for a file whose identity, size and mtime all still match.
+std::mutex& preScanMemoMutex() {
+    static std::mutex m;
+    return m;
+}
+std::unordered_map<PreScanKey, std::shared_ptr<PreScannedFile const>,
+                   PreScanKeyHash>&
+preScanMemo() {
+    static std::unordered_map<PreScanKey, std::shared_ptr<PreScannedFile const>,
+                              PreScanKeyHash> m;
+    return m;
+}
+
+// Look the file up, or read + splice + tokenize it and publish the result.
+// Returns null EXACTLY when `SourceBuffer::fromFile` would have — the callers'
+// unreadable-include diagnostics are unchanged.
+[[nodiscard]] std::shared_ptr<PreScannedFile const>
+preScanIncludeFile(fs::path const& path,
+                   std::shared_ptr<GrammarSchema const> const& schema) {
+    std::error_code ec;
+    PreScanKey key{core::PathIdentity::of(path), 0, 0};
+    const auto sz = fs::file_size(path, ec);
+    if (!ec) key.size = sz;
+    const auto wt = fs::last_write_time(path, ec);
+    if (!ec) key.mtime = wt.time_since_epoch().count();
+    {
+        std::lock_guard<std::mutex> lk{preScanMemoMutex()};
+        auto it = preScanMemo().find(key);
+        if (it != preScanMemo().end()) return it->second;
+    }
+    auto buf = SourceBuffer::fromFile(path);
+    if (!buf) return nullptr;   // caller emits the unreadable-include diagnostic
+    auto built = std::make_shared<PreScannedFile>();
+    built->source = std::move(buf);
+    appendWithContinuationSplice(built->source->text(), built->source, 0,
+                                 built->spliced, built->localMap);
+    built->scanBuf = SourceBuffer::fromString(
+        built->spliced, std::string{built->source->name()});
+    // The pre-scan's tokenizer diagnostics are DISCARDED here exactly as they
+    // were at the old per-occurrence call site: this pass only INSPECTS the
+    // header, and the authoritative pass re-tokenizes the same bytes and owns
+    // every diagnostic about them. Memoizing therefore drops nothing.
+    DiagnosticReporter scratch;
+    built->toks = tokenizeToPP(built->scanBuf, schema, scratch);
+    std::shared_ptr<PreScannedFile const> frozen = std::move(built);
+    std::lock_guard<std::mutex> lk{preScanMemoMutex()};
+    // First publisher wins; a racing loser discards its (identical) copy and
+    // serves the published one, so every consumer of one file sees ONE entry.
+    auto [it, inserted] = preScanMemo().emplace(key, frozen);
+    return it->second;
+}
+
 // Recursive synth-text builder. Tokenizes a file to FIND quote includes,
 // splices the recursively-preprocessed header text in place of each quote
 // include directive, and copies everything else (including angle includes)
@@ -1314,8 +1436,10 @@ struct SynthBuilder {
     // TF-C60 (c′, the FC15b product-tail pattern): re-tokenize a shared macro's
     // replacement TEXT into the per-evaluation product string, minting tokens
     // whose spans point at `[bufLen + productBase, …)` — exactly where
-    // `evaluateIfExpression` slices them from, since it assembles
-    // `combined = synth.text() + productText()` (pp_if_eval). Token KINDS come
+    // `evaluateIfExpression` slices them from: its `IceParser::textOf` reads a
+    // span at-or-past `synth.text().size()` out of `productText()` and every
+    // other span out of the buffer itself, which is the rule `sbTextOf` just
+    // above spells for this pass (pp_if_eval). Token KINDS come
     // from the real tokenizer, so nothing is ever re-lexed across a
     // substitution boundary (no glue hazard, no `<a/b.h>` byte corruption).
     std::vector<Token> sbMintProduct(std::string_view spelling,
@@ -1415,9 +1539,12 @@ struct SynthBuilder {
 
         // TF-C60 (c′): the per-EVALUATION product string. Substituted macro
         // replacements are minted here; `productCb` hands it to
-        // `evaluateIfExpression`, which slices product-region spans from
-        // `synth.text() + productText()`. Owned per call — it must outlive the
-        // whole evaluation (the ICE slices after the expand callback returns).
+        // `evaluateIfExpression`, which reads a product-region span straight out
+        // of it (no concatenated buffer is built — see that function's
+        // D-PERF-PP-IF-REMATERIALIZES-THE-WHOLE-SYNTH-BUFFER-PER-EVALUATION
+        // note). Owned per call — it must outlive the whole evaluation, and now
+        // strictly so: the ICE BORROWS these bytes rather than copying them, and
+        // it slices after the expand callback returns.
         std::string sbProduct;
         // FIX-3 completion (post-expansion arm): an object-like macro can EXPAND
         // TO a function-like macro's NAME (`#define Z ENABLED(1)`), which the
@@ -1630,8 +1757,17 @@ struct SynthBuilder {
         return false;   // unreachable — every IncludeOnceMechanism handled above
     }
 
+    // `pre` is the SHARED per-file pre-scan (see `preScanIncludeFile`): the
+    // file's buffer, its continuation-spliced text, that text's line map, and
+    // its ONE tokenize. Every INCLUDE arm passes it, so a header spliced into
+    // fifty translation units is read and tokenized ONCE. The ROOT passes
+    // nothing and builds its own, because a main file is unique per TU AND
+    // because only the root carries the non-emitted `preScanDefinePrefix`, which
+    // is a property of the INVOCATION rather than of the file — memoizing a
+    // buffer that contains it would key file bytes on command-line state.
     void build(std::shared_ptr<SourceBuffer> const& source,
-               std::string& out, LineMap& map) {
+               std::string& out, LineMap& map,
+               std::shared_ptr<PreScannedFile const> const& pre = nullptr) {
         // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the `"` / `>` byte constants that
         // used to sit here are GONE. Both include arms below used to re-consume
         // the closing delimiter BYTE because it belonged to no token; the closer
@@ -1693,16 +1829,36 @@ struct SynthBuilder {
         // per TU, then the #undef holds for the rest, children included). The
         // prefix's second historical role — providing sliceable SPANS for seeded
         // replacement values — is obsolete: SbMacro now stores replacement TEXT.
-        std::string spliced = (depth == 0) ? preScanDefinePrefix : std::string{};
-        std::size_t const prefixLen = spliced.size();
-        LineMap     localMap;
-        appendWithContinuationSplice(source->text(), source, 0, spliced,
-                                     localMap);
-
-        auto scanBuf =
-            SourceBuffer::fromString(spliced, std::string{source->name()});
+        // ── The four pure per-file results, from the memo when this is an
+        // INCLUDE (`pre`), built here when it is the ROOT. Held by const
+        // reference either way, so everything below reads one shape: the memo
+        // entry is immutable and shared across threads, and nothing in this
+        // function has ever written to any of the four
+        // (D-PERF-PP-EVERY-INCLUDE-RE-READS-AND-RE-TOKENIZES-THE-SAME-HEADER).
+        std::string                   ownSpliced;
+        LineMap                       ownMap;
+        std::shared_ptr<SourceBuffer> ownScanBuf;
+        std::vector<PPToken>          ownToks;
+        std::size_t                   prefixLen = 0;
+        // THROWAWAY: every diagnostic this pre-scan raises — the tokenizer's and
+        // the conditional handlers' below — is discarded here and re-raised by
+        // the AUTHORITATIVE pass over the same bytes. Function-scoped because the
+        // conditional-directive walk further down reports into it too.
         DiagnosticReporter scratch;
-        auto toks = tokenizeToPP(scanBuf, schema, scratch);
+        if (!pre) {
+            ownSpliced = (depth == 0) ? preScanDefinePrefix : std::string{};
+            prefixLen  = ownSpliced.size();
+            appendWithContinuationSplice(source->text(), source, 0, ownSpliced,
+                                         ownMap);
+            ownScanBuf = SourceBuffer::fromString(ownSpliced,
+                                                  std::string{source->name()});
+            ownToks = tokenizeToPP(ownScanBuf, schema, scratch);
+        }
+        std::string const&  spliced  = pre ? pre->spliced  : ownSpliced;
+        LineMap const&      localMap = pre ? pre->localMap : ownMap;
+        std::shared_ptr<SourceBuffer> const& scanBuf =
+            pre ? pre->scanBuf : ownScanBuf;
+        std::vector<PPToken> const& toks = pre ? pre->toks : ownToks;
 
         const auto hashKind =
             schema->schemaTokens().find(cfg().directiveIntroToken);
@@ -2108,13 +2264,18 @@ struct SynthBuilder {
                     // because the re-entry decision reads the header's own text.
                     // Order-independent in practice: a header already ON the stack
                     // was readable when it was pushed.
-                    auto headerBuf = SourceBuffer::fromFile(angleRes.path);
-                    if (!headerBuf) {
+                    // The load now goes through the shared per-file pre-scan, so
+                    // the read + splice + tokenize happen once per FILE rather
+                    // than once per OCCURRENCE; a null return means exactly what
+                    // a null `SourceBuffer::fromFile` meant.
+                    auto headerPre = preScanIncludeFile(angleRes.path, schema);
+                    if (!headerPre) {
                         emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                                BufferId{}, SourceSpan::empty(0),
                                std::string{"system include unreadable: "} + angleName);
                         continue;
                     }
+                    auto const& headerBuf = headerPre->source;
                     if (std::find(includeStack.begin(), includeStack.end(), canon)
                             != includeStack.end()
                         && !permitReentry(headerBuf, angleName)) {
@@ -2127,7 +2288,7 @@ struct SynthBuilder {
                                        rep, depth + 1, includeStack, fatal,
                                        preScanDefinePrefix, effectivePredefines,
                                        resolvedDescriptorsOut, localMacros};
-                    child.build(headerBuf, out, map);
+                    child.build(headerBuf, out, map, headerPre);
                     includeStack.pop_back();
                     out.push_back(newline);
                     copiedUpTo = dirEnd;   // DROP the directive — content is inlined
@@ -2290,8 +2451,11 @@ struct SynthBuilder {
             }
             auto const canon = core::PathIdentity::of(*resolved);
             // TF-C87: loaded BEFORE the stack test (the re-entry decision reads
-            // the header's own text) — see the angle arm's note.
-            auto headerBuf = SourceBuffer::fromFile(*resolved);
+            // the header's own text) — see the angle arm's note. Routed through
+            // the shared per-file pre-scan for the same reason it is there.
+            auto headerPre = preScanIncludeFile(*resolved, schema);
+            std::shared_ptr<SourceBuffer> const headerBuf =
+                headerPre ? headerPre->source : nullptr;
             if (!headerBuf) {
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                        BufferId{}, SourceSpan::empty(0),
@@ -2319,7 +2483,7 @@ struct SynthBuilder {
                                depth + 1, includeStack, fatal, preScanDefinePrefix,
                                effectivePredefines, resolvedDescriptorsOut,
                                localMacros};
-            child.build(headerBuf, out, map);
+            child.build(headerBuf, out, map, headerPre);
             includeStack.pop_back();
 
             out.push_back(newline);

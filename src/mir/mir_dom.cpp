@@ -742,6 +742,63 @@ mirNaturalLoops(Mir const& mir,
     });
 }
 
+void mirModuleSelfLoopBlocks(Mir const& mir, std::vector<std::uint32_t>& out) {
+    out.clear();
+    std::uint32_t const bc = static_cast<std::uint32_t>(mir.blockCount());
+    for (std::uint32_t i = 1; i < bc; ++i) {
+        MirBlockId const b{i, mir.id().v};
+        for (MirBlockId const s : mir.blockSuccessors(b)) {
+            if (s.valid() && s.v == i) { out.push_back(i); break; }
+        }
+    }
+}
+
+void mirBackEdgeCandidates(Mir const& mir, MirFuncId f,
+                           std::vector<MirBlockId> const& rpo,
+                           std::span<std::uint32_t const> moduleSelfLoops,
+                           std::vector<std::uint32_t>& out) {
+    out.clear();
+    std::uint32_t const bc = static_cast<std::uint32_t>(mir.blockCount());
+    std::uint32_t const nb = mir.funcBlockCount(f);
+    if (nb == 0) {
+        std::fprintf(stderr,
+            "dss::mirBackEdgeCandidates fatal: func #%u has no blocks — a "
+            "candidate set is only defined for a function with an entry "
+            "(D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN).\n", f.v);
+        std::abort();
+    }
+    std::uint32_t const first = mir.funcBlockAt(f, 0).v;
+    // A function's blocks are CONTIGUOUS in the block arena (`funcBlockAt` is
+    // `blockStart + i`). The whole range enumeration below rests on that, so
+    // assert it rather than assume it — a future non-contiguous layout would
+    // otherwise silently narrow the sweep.
+    if (mir.funcBlockAt(f, nb - 1).v != first + nb - 1) {
+        std::fprintf(stderr,
+            "dss::mirBackEdgeCandidates fatal: func #%u blocks are not "
+            "contiguous (first=%u, last=%u, count=%u) — the back-edge "
+            "candidate sweep assumes a contiguous block range.\n",
+            f.v, first, mir.funcBlockAt(f, nb - 1).v, nb);
+        std::abort();
+    }
+    std::uint32_t const lastEx = first + nb;
+    out.reserve(static_cast<std::size_t>(nb) + moduleSelfLoops.size());
+    for (std::uint32_t s = (first < 1u ? 1u : first); s < lastEx; ++s) {
+        if (s < bc) out.push_back(s);
+    }
+    std::size_t const inRange = out.size();
+    auto addOutside = [&](std::uint32_t s) {
+        if (s < 1u || s >= bc) return;               // the sweep is [1, bc)
+        if (s >= first && s < lastEx) return;        // already enumerated
+        out.push_back(s);
+    };
+    for (MirBlockId const b : rpo) addOutside(b.v);
+    for (std::uint32_t const s : moduleSelfLoops) addOutside(s);
+    if (out.size() != inRange) {   // the common case appends nothing
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+    }
+}
+
 std::vector<MirBlockId>
 mirIteratedDominanceFrontier(
     std::vector<MirBlockId> const& defBlocks,

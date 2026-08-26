@@ -6,6 +6,7 @@
 #include "mir/mir_literal_pool.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/passes/mir_id_remap.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <chrono>
@@ -124,8 +125,8 @@ public:
     // MirRebuildPolicy::onBlockBegin (D-OPT-MIR-REBUILDER-ONBLOCKBEGIN-HOOK).
     void onBlockBegin(MirBlockId oldB, MirBlockId /*newB*/,
                       MirBuilder& dst,
-                      std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
-                      std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) override {
+                      MirInstRemap& /*rewrite*/,
+                      MirBlockRemap const& /*blockMap*/) override {
         // Materialize one zero `Const` per element type the rename walk found needs
         // an undef-as-zero incoming (D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF). Emitted
         // in the ENTRY block, which dominates every edge → the Const is a valid
@@ -176,7 +177,7 @@ public:
 
     [[nodiscard]] std::optional<MirInstId>
     tryRewrite(MirOpcode op, MirInstId oldId, MirBuilder& /*dst*/,
-               std::unordered_map<std::uint32_t, MirInstId> const& rewrite) override {
+               MirInstRemap const& rewrite) override {
         if (op != MirOpcode::Load) return std::nullopt;
         auto const ops = src_.instOperands(oldId);
         if (ops.size() != 1 || !promoted_.count(ops[0].v)) return std::nullopt;
@@ -198,8 +199,8 @@ public:
     // and emits `dst.addPhiIncoming(newPhi, {newValue, newPred})`.
     void finalizePhiIncomings(
         MirBuilder& dst,
-        std::unordered_map<std::uint32_t, MirBlockId> const& blockMap,
-        std::unordered_map<std::uint32_t, MirInstId> const& rewrite) {
+        MirBlockRemap const& blockMap,
+        MirInstRemap const& rewrite) {
         for (auto const& [markerV, incomings] : phiIncomings_) {
             auto const phiIt = phiNewIdByMarker_.find(markerV);
             if (phiIt == phiNewIdByMarker_.end()) {
@@ -211,8 +212,8 @@ public:
             }
             MirInstId const newPhi = phiIt->second;
             for (PendingIncoming const& inc : incomings) {
-                auto const blkIt = blockMap.find(inc.predOld.v);
-                if (blkIt == blockMap.end()) {
+                MirBlockId const* const predNew = blockMap.find(inc.predOld.v);
+                if (predNew == nullptr) {
                     std::fprintf(stderr,
                         "dss::opt::passes::Mem2Reg fatal: phi incoming "
                         "predOld v=%u not in rebuild blockMap.\n",
@@ -220,7 +221,7 @@ public:
                     std::abort();
                 }
                 MirInstId const newVal = resolveToNewId(inc.value, rewrite);
-                dst.addPhiIncoming(newPhi, MirPhiIncoming{newVal, blkIt->second});
+                dst.addPhiIncoming(newPhi, MirPhiIncoming{newVal, *predNew});
             }
         }
     }
@@ -254,7 +255,7 @@ public:
 private:
     [[nodiscard]] MirInstId resolveToNewId(
         ReachingValue rv,
-        std::unordered_map<std::uint32_t, MirInstId> const& rewrite) const {
+        MirInstRemap const& rewrite) const {
         if (rv.kind == ReachingValue::Kind::Phi) {
             auto const it = phiNewIdByMarker_.find(rv.value);
             if (it == phiNewIdByMarker_.end()) {
@@ -282,15 +283,15 @@ private:
         }
         // OldInst — must be in the rebuild's rewrite map by now (the
         // value-producer was emitted earlier in scan order).
-        auto const it = rewrite.find(rv.value);
-        if (it == rewrite.end()) {
+        MirInstId const* const mapped = rewrite.find(rv.value);
+        if (mapped == nullptr) {
             std::fprintf(stderr,
                 "dss::opt::passes::Mem2Reg fatal: ReachingValue::OldInst "
                 "v=%u has no rewrite entry — scan-order violation.\n",
                 rv.value);
             std::abort();
         }
-        return it->second;
+        return *mapped;
     }
 
     void renameWalkIterative(

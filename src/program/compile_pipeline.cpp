@@ -32,6 +32,7 @@
 #include "lir/lir_2addr_legalize.hpp"
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_liveness.hpp"
+#include "lir/lir_peephole.hpp"
 #include "lir/lir_regalloc.hpp"
 #include "lir/lir_rewrite.hpp"
 #include "lir/lir_verifier.hpp"           // LirVerifier — the LIR tier's own invariant checks
@@ -1211,6 +1212,28 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // identified by which stage first reports.
     checkLoopCarriedSpills(legal.lir, target, "post-legalize");
 
+    // 8b. LIR PEEPHOLE (plan 22 OPT8) -- delete the register-to-register
+    //     copies the allocator left redundant. See `lir_peephole.hpp` for
+    //     why it runs HERE and not after callconv: callconv mints ZERO
+    //     additional identity copies (MEASURED 5575 at both stages over
+    //     `examples/c/**`) and its `perFuncCfi` is keyed BY `LirInstId`,
+    //     so a rebuild downstream of it would renumber every CFI row's
+    //     subject -- an unwind table that loads clean and walks into the
+    //     wrong frame.
+    auto const peepEntry = reporter.errorCount();
+    auto peeped = runLirPeephole(legal.lir, target, reporter);
+    if (!peeped.ok() || !tierClean(reporter, peepEntry)) {
+        return std::nullopt;
+    }
+    // Paired rebuild check -- the same side-structure census every other
+    // rebuilding pass is held to, plus the post-regalloc rules (this pass
+    // is the only one that DELETES, so it is the only one that can orphan
+    // a pool entry).
+    if (!verifyLirRebuild(legal.lir, peeped.lir, "lir-peephole", reporter)
+        || !verifyLirPostRegalloc(peeped.lir, target, reporter)) {
+        return std::nullopt;
+    }
+
     // 9. Calling-convention materialization (prologue/epilogue,
     //    frame_load/frame_store; `arg` virtual-op rewrite is the
     //    ML7 cycle 2 gap — anchored D-LK10-2 for caller awareness).
@@ -1239,7 +1262,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             LirFuncLocalAlignment{a.funcSymbol, a.maxLocalAlignBytes,
                                   a.perAllocaAlignBytes});
     }
-    auto cc = materializeCallingConvention(legal.lir, target, alloc, reporter,
+    auto cc = materializeCallingConvention(peeped.lir, target, alloc, reporter,
                                            sehFuncletParents,
                                            funcLocalAligns);
     if (!cc.ok() || !tierClean(reporter, ccEntry)) {
@@ -1250,7 +1273,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // same reason: callconv materializes the frame ops and the arg/return
     // moves, so it is the pass with the most opportunities to mint a register
     // operand, and after `assemble()` there is no LIR left to check.
-    if (!verifyLirRebuild(legal.lir, cc.lir, "callconv", reporter)
+    if (!verifyLirRebuild(peeped.lir, cc.lir, "callconv", reporter)
         || !verifyLirPostRegalloc(cc.lir, target, reporter)) {
         return std::nullopt;
     }
@@ -2455,6 +2478,27 @@ bool isArArchiveFile(std::filesystem::path const& path) {
     return true;
 }
 
+bool isRelocatableObjectFile(std::filesystem::path const& path,
+                             ObjectFormatSchema const&    format) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
+
+    // A HEADER PREFIX, never the file. Every field the backends inspect lives in
+    // the first few dozen bytes (the ELF `e_type` at 16, the Mach-O `filetype`
+    // at 12, the COFF `SizeOfOptionalHeader` at 16), so 64 bytes covers all
+    // three with margin -- and this predicate runs over every path the operator
+    // named, including large dynamic libraries it will answer `false` for.
+    // ⚠ A SHORT READ IS NOT AN ERROR HERE: a file smaller than the prefix is
+    // simply passed to the backend as the short span it is, and the backends'
+    // bounds checks answer `false`. Rejecting the short read instead would make
+    // a genuinely tiny object unclassifiable.
+    std::uint8_t buf[64] = {};
+    in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
+    auto const got = static_cast<std::size_t>(in.gcount());
+    return format.looksLikeRelocatableObject(
+        std::span<std::uint8_t const>{buf, got});
+}
+
 // ── D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT ────
 //
 // THE FORMAT AN ARCHIVE MEMBER **IS**, WHICH IS NOT THE FORMAT THE LINK IS
@@ -2649,7 +2693,7 @@ readArchiveMemberModule(std::span<std::uint8_t const> memberBytes,
 }
 
 std::optional<std::vector<AssembledModule>>
-pullStaticArchiveMembers(AssembledModule const&                 clientModule,
+pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                          std::span<std::filesystem::path const> archivePaths,
                          std::span<ResolveLibrarySpec const>    dynamicLibraries,
                          TargetSchema const&                    target,
@@ -2698,21 +2742,35 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
         }
     }
 
-    // Names already satisfied by a DEFINITION (client, then each pulled member).
-    // A worklist name that is already defined is never pulled again. Only
-    // externally-visible definitions can satisfy a cross-module reference (the
-    // same filter the c163 armap writer applies), so Local defs are excluded.
+    // Names already satisfied by a DEFINITION (every client module, then each
+    // pulled member). A worklist name that is already defined is never pulled
+    // again. Only externally-visible definitions can satisfy a cross-module
+    // reference (the same filter the c163 armap writer applies), so Local defs
+    // are excluded.
+    // ⚠ EVERY module in `clientModules`, not merely the compiled one -- see the
+    // header's plural note
+    // (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION). A
+    // pre-assembled
+    // object input that DEFINES a name must suppress the pull of an archive
+    // member defining it too, or the link merges two definitions of one symbol.
     std::unordered_set<std::string> definedNames;
-    for (auto const& ms : clientModule.symbols) {
-        if (!ms.name.empty() && isExternallyVisible(ms.binding, ms.visibility)) {
-            definedNames.insert(ms.name);
+    for (auto const& clientModule : clientModules) {
+        for (auto const& ms : clientModule.symbols) {
+            if (!ms.name.empty()
+                && isExternallyVisible(ms.binding, ms.visibility)) {
+                definedNames.insert(ms.name);
+            }
         }
     }
 
-    // Worklist: the client's unresolved extern names (the references to satisfy).
+    // Worklist: every client module's unresolved extern names (the references to
+    // satisfy). An object input's externs belong here for the same reason the
+    // compiled client's do -- they are references the archives may resolve.
     std::vector<std::string> worklist;
-    for (auto const& ext : clientModule.externImports) {
-        if (!ext.mangledName.empty()) worklist.push_back(ext.mangledName);
+    for (auto const& clientModule : clientModules) {
+        for (auto const& ext : clientModule.externImports) {
+            if (!ext.mangledName.empty()) worklist.push_back(ext.mangledName);
+        }
     }
 
     // The member format, resolved at most ONCE for the whole pull (see
@@ -3008,7 +3066,58 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
     return out;
 }
 
+// D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION -- the EAGER half of
+// the link's input set. See
+// the header docblock for why "eager" is the whole distinction from an archive.
+std::optional<std::vector<AssembledModule>>
+readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
+                       TargetSchema const&                    target,
+                       ObjectFormatSchema const&              linkFormat,
+                       DiagnosticReporter&                    reporter) {
+    std::vector<AssembledModule> objects;
+    if (objectPaths.empty()) return objects;   // valid no-op: no object inputs
+    objects.reserve(objectPaths.size());
+
+    // Resolved at most ONCE for the whole input set, exactly as both archive
+    // paths do it: the member format is a function of the LINK's format and
+    // target, which no input varies, so per-file resolution would re-scan the
+    // object-format tree for every object named.
+    ArchiveMemberFormat memberFormat;
+    for (auto const& objectPath : objectPaths) {
+        std::ifstream in(objectPath, std::ios::binary);
+        if (!in) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_FileOpenFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "object input: failed to open '{}' for reading. It was named as "
+                "a link input, so it cannot be skipped -- an omitted object "
+                "would link into a smaller image that may still run "
+                "(D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION).",
+                objectPath.generic_string());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
+                                        std::istreambuf_iterator<char>()};
+
+        // THE SAME CHOKEPOINT AN ARCHIVE MEMBER TAKES. A bare object file is a
+        // member of a one-member container: the bytes are the whole file rather
+        // than a subspan, and nothing else about reading it differs. Funnelling
+        // here is what makes a newly-supported object format light up for object
+        // inputs and archive members together, by construction.
+        auto object_mod = readArchiveMemberModule(
+            std::span<std::uint8_t const>{bytes.data(), bytes.size()}, target,
+            linkFormat, memberFormat, objectPath,
+            objectPath.filename().string(), reporter);
+        if (!object_mod) return std::nullopt;   // read fail-loud already reported
+        objects.push_back(std::move(*object_mod));
+    }
+    return objects;
+}
+
 bool linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
+                                    std::span<std::filesystem::path const> objectInputs,
                                     std::span<std::filesystem::path const> staticArchives,
                                     std::span<ResolveLibrarySpec const>    dynamicLibraries,
                                     TargetSchema const&                    target,
@@ -3016,24 +3125,33 @@ bool linkAndWriteWithStaticArchives(AssembledModule                        clien
                                     std::filesystem::path const&           outPath,
                                     DiagnosticReporter&                    reporter,
                                     ImageRequest const&                    request) {
-    if (staticArchives.empty()) {
+    if (objectInputs.empty() && staticArchives.empty()) {
         return linkAndWrite(std::span<AssembledModule const>{&clientModule, 1},
                             target, format, outPath, reporter, request);
     }
-    auto pulled = pullStaticArchiveMembers(clientModule, staticArchives,
-                                           dynamicLibraries, target, format,
-                                           reporter);
+
+    // EAGER FIRST -- see the header's ordering note. The objects join the seed
+    // the lazy archive pull resolves against, so an archive member an object
+    // input needs is pulled rather than silently left behind.
+    auto objects = readObjectInputModules(objectInputs, target, format, reporter);
+    if (!objects) return false;   // read fail-loud already reported
+
+    std::vector<AssembledModule> combined;
+    combined.reserve(1 + objects->size());
+    combined.push_back(std::move(clientModule));
+    for (auto& object_mod : *objects) combined.push_back(std::move(object_mod));
+
+    auto pulled = pullStaticArchiveMembers(
+        std::span<AssembledModule const>{combined.data(), combined.size()},
+        staticArchives, dynamicLibraries, target, format, reporter);
     if (!pulled) return false;   // pull fail-loud already reported
 
-    // Link the COMBINED span [client, pulled...]. >1 element triggers the c154
-    // cross-CU merge in `linker::link`, whose `mergeModules` binds each archive
-    // reference to the pulled member's definition (stripping the extern import)
-    // exactly as it resolves a sibling-CU reference. When nothing was pulled
-    // (the archives defined nothing referenced) the span is the client alone --
-    // the single-CU path, unchanged.
-    std::vector<AssembledModule> combined;
-    combined.reserve(1 + pulled->size());
-    combined.push_back(std::move(clientModule));
+    // Link the COMBINED span [client, objects..., pulled...]. >1 element triggers
+    // the c154 cross-CU merge in `linker::link`, whose `mergeModules` binds each
+    // cross-module reference to its definition (stripping the extern import)
+    // exactly as it resolves a sibling-CU reference. With no objects and nothing
+    // pulled the span is the client alone -- the single-CU path, unchanged.
+    combined.reserve(combined.size() + pulled->size());
     for (auto& member_mod : *pulled) combined.push_back(std::move(member_mod));
     return linkAndWrite(std::span<AssembledModule const>{combined.data(), combined.size()},
                         target, format, outPath, reporter, request);

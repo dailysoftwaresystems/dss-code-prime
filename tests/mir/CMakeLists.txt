@@ -25,6 +25,15 @@ dss_add_test(NAME mir/test_mir_lowering_extern SOURCES test_mir_lowering_extern.
 # Cycle 25 Stage B — cross-module MIR merge (mergeCuMirs) tested in isolation.
 dss_add_test(NAME mir/test_mir_merge SOURCES test_mir_merge.cpp)
 
+# OPT11 (plan 22 §0.2) — the cross-CU SUMMARY INDEX that replaces the monolithic
+# whole-program merge above. TWO binaries, because they test opposite sides of
+# one contract and must be able to fail independently: the first pins that MIR
+# projects onto a summary correctly, the second pins what the global pass
+# decides GIVEN summaries. Deriving the second's inputs from real MIR would hide
+# an index bug behind an emitter bug.
+dss_add_test(NAME mir/test_mir_summary   SOURCES test_mir_summary.cpp)
+dss_add_test(NAME mir/test_summary_index SOURCES test_summary_index.cpp)
+
 # D-MIR-OVERLAP-STRUCT-ZERO-INIT — brace-init of a struct whose members SHARE
 # BYTES (a c107 explicit-offset overlay). Hand-built HIR, because explicit offsets
 # cannot be spelled in C source — they arrive only from a shipped descriptor.

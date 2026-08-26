@@ -174,7 +174,11 @@ combineBinaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& opti
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
     }
-    if (!asInt64(*a.value).has_value() || !asInt64(*b.value).has_value()) {
+    // `asIntBits` -- see the twin guard in const_eval.cpp
+    // (D-HIR-CONSTEVAL-UNSIGNED-WRAPAROUND-NOT-MODULAR). "Is this an integer
+    // operand" is the question here; "does it fit in a signed int64" is not.
+    if (!detail::asIntBits(*a.value).has_value()
+        || !detail::asIntBits(*b.value).has_value()) {
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
     }
     ConstEvalFailure why = ConstEvalFailure::None;
@@ -734,6 +738,27 @@ evalNode(NodeId                              expr,
             return ok(std::move(v));
         }
         if (tgt->isInteger) {
+            // ── THE CAST'S CORE IS ITS DECLARED WIDTH, NOT A GENERIC 64 ─────
+            // D-HIR-CONSTEVAL-UNSIGNED-WRAPAROUND-NOT-MODULAR. Both arms below
+            // used to stamp `I64`/`U64` on EVERY integer cast result whatever
+            // `intBits` said, while `narrowIntToBits` correctly reduced the
+            // VALUE to the declared width. Value and label disagreed, and once
+            // the usual arithmetic conversions started reading the label, the
+            // disagreement became a wrong answer: `(unsigned int)0 - 1u` would
+            // compute its common type as 64-bit and wrap to
+            // 0xffffffffffffffff instead of 0xffffffff.
+            //
+            // ★ THIS IS ROW D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE'S
+            // DEFECT CLASS EXACTLY, one tier up: a result typed from a generic
+            // KIND instead of from the DECLARED type. It stayed invisible for
+            // the same reason -- the widths whose kind and declared type
+            // coincide (I64/U64) worked, so every 64-bit probe passed.
+            // `intKindFromWidth` is the interner-free spelling of the declared
+            // width, and is the same verb `packBitIntResult` already uses.
+            auto const castCore = [&] {
+                return detail::intKindFromWidth(
+                    static_cast<std::uint32_t>(tgt->intBits), tgt->intSigned);
+            };
             if (auto const* a = asAddress(*inner.value)) {
                 // address → integer: legal ONLY for a NULL-base address (a pure
                 // compile-time offset). A symbol-based address is a relocation,
@@ -742,19 +767,24 @@ evalNode(NodeId                              expr,
                     return fail(ConstEvalFailure::NotAConstantExpression, expr);
                 }
                 HirLiteralValue v;
-                v.core  = tgt->intSigned ? TypeKind::I64 : TypeKind::U64;
+                v.core  = castCore();
                 std::int64_t const nv = narrowIntToBits(a->byteOffset, tgt->intBits,
                                                         tgt->intSigned);
                 if (tgt->intSigned) v.value = nv;
                 else                v.value = static_cast<std::uint64_t>(nv);
                 return ok(std::move(v));
             }
-            auto const iv = asInt64(*inner.value);
+            // `asIntBits`: a cast READS its operand's bits and re-labels
+            // them at the declared width -- `(unsigned long long)-1` and
+            // `(long long)0xffffffffffffffffull` are both well-defined C
+            // (6.3.1.3p2), so refusing the operand for not fitting a SIGNED
+            // int64 refused legal conversions.
+            auto const iv = detail::asIntBits(*inner.value);
             if (!iv.has_value()) {
                 return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
             }
             HirLiteralValue v;
-            v.core  = tgt->intSigned ? TypeKind::I64 : TypeKind::U64;
+            v.core  = castCore();
             std::int64_t const nv = narrowIntToBits(*iv, tgt->intBits, tgt->intSigned);
             if (tgt->intSigned) v.value = nv;
             else                v.value = static_cast<std::uint64_t>(nv);

@@ -2357,3 +2357,78 @@ TEST(LirRegAlloc, EarlyClobberTwoAddressResultAvoidsOperandZeroToo) {
     EXPECT_NE(*eR, *eB)
         << "an EARLY-CLOBBER 2-address result aliases operand[1]";
 }
+
+// ── OPT8 (plan 22): THE PARTITION PREFERENCE ────────────────────────────
+//
+// A range that does NOT cross a call prefers a CALLER-saved register. Both
+// partitions were always legal for such a range; the order is what changed,
+// and it changed because a callee-saved register obliges the function to
+// save and restore it (✔MEASURED 3352 prologue saves = 5.1% of the emitted
+// `examples/c/**` instruction stream before the change, 735 after).
+//
+// ★★★ THE ENVELOPE PIN IS THE SIBLING TEST, NOT THIS ONE.
+// `CrossCallRangesLandInCalleeSavedOrSpill` above is what makes this change
+// safe: it asserts the rule this preference must never bend — a range that
+// DOES cross a call is still callee-saved-or-spilled. Read the two together;
+// this one alone could be satisfied by an allocator that had simply stopped
+// honouring the ABI.
+TEST(LirRegAlloc, NonCrossCallRangesPreferCallerSavedRegisters) {
+    // A LEAF function: no call anywhere, so no range can cross one, so every
+    // assigned range is free to take the cheap partition.
+    auto lowered = lowerCToLir(
+        "int f(int a, int b, int c) {\n"
+        "    int x = a * b;\n"
+        "    int y = x + c;\n"
+        "    return y ^ (x - c);\n"
+        "}\n");
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter rep;
+    LirAllocation const out =
+        allocateRegisters(lowered.lir.lir, *lowered.target, lv,
+                          /*ccIndex=*/0, rep);
+    ASSERT_TRUE(out.ok());
+    ASSERT_FALSE(out.perFunc.empty());
+
+    auto const& sch = *lowered.target;
+    auto const* cc  = sch.callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    std::unordered_set<std::uint16_t> callerSaved, calleeSaved;
+    for (auto const& n : cc->callerSaved)
+        if (auto o = sch.registerByName(n); o.has_value()) callerSaved.insert(*o);
+    for (auto const& n : cc->calleeSaved)
+        if (auto o = sch.registerByName(n); o.has_value()) calleeSaved.insert(*o);
+    ASSERT_FALSE(callerSaved.empty());
+    ASSERT_FALSE(calleeSaved.empty());
+
+    // The leaf function is the one with no `call`.
+    auto const callOp = sch.opcodeByMnemonic("call");
+    ASSERT_TRUE(callOp.has_value());
+    Lir const& lir = lowered.lir.lir;
+    std::size_t inCaller = 0, inCallee = 0;
+    for (std::uint32_t i = 0; i < out.perFunc.size(); ++i) {
+        LirFuncId const fn = lir.funcAt(i);
+        bool hasCall = false;
+        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn) && !hasCall; ++bi) {
+            LirBlockId const b = lir.funcBlockAt(fn, bi);
+            for (std::uint32_t k = 0; k < lir.blockInstCount(b); ++k)
+                if (lir.instOpcode(lir.blockInstAt(b, k)) == *callOp) {
+                    hasCall = true; break;
+                }
+        }
+        if (hasCall) continue;
+        for (auto const& a : out.perFunc[i].assignments) {
+            if (!a.vreg.valid() || a.isSpilled()) continue;
+            auto const ord = static_cast<std::uint16_t>(a.physReg().id);
+            if (callerSaved.count(ord) != 0)      ++inCaller;
+            else if (calleeSaved.count(ord) != 0) ++inCallee;
+        }
+    }
+    EXPECT_GT(inCaller, 0u)
+        << "a leaf function's ranges never reached the caller-saved partition "
+           "— the OPT8 preference is not being applied";
+    EXPECT_EQ(inCallee, 0u)
+        << "a leaf function took " << inCallee << " CALLEE-saved register(s) "
+           "while caller-saved ones were free. Each one costs a prologue save "
+           "and an epilogue restore that the function does not need.";
+}

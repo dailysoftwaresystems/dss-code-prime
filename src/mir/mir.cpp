@@ -4,9 +4,11 @@
 #include "core/types/arg_payload.hpp"
 #include "core/types/target_schema.hpp"   // TargetRegClass (the piece's result-register pool)
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -1327,12 +1329,38 @@ Mir MirBuilder::finish() && {
     // Flush pending phi incomings into the phi pool, patching each phi's operand
     // range. Each phi gets a contiguous slice regardless of the order incomings
     // were added in.
-    for (auto& [phiV, incomings] : pendingPhi_) {
-        MirInstId const phiId{phiV, moduleId_.v};
-        detail::MirInst& inst = instArena_.at(phiId);
-        inst.operandStart = static_cast<std::uint32_t>(phiPool_.size());
-        inst.operandCount = static_cast<std::uint32_t>(incomings.size());
-        for (MirPhiIncoming inc : incomings) phiPool_.push_back(inc);
+    //
+    // ★★ IN ASCENDING PHI-SLOT ORDER, and that is a CORRECTNESS-OF-THE-BUILD
+    // property, not tidiness. `pendingPhi_` is an `unordered_map`, so ranging
+    // over it directly hands `phiPool_` a layout chosen by the hash table —
+    // i.e. by the standard-library implementation and the bucket count. Two
+    // hosts building the SAME module then produce different `operandStart`
+    // values and a different pool image.
+    //
+    // ⓘ WHY NOTHING HAS EVER OBSERVED IT: every consumer reads incomings
+    // through `phiIncomings(id)`, which follows the per-phi range, so the
+    // ORDER OF THE RANGES has no reader. That makes this a latent defect
+    // rather than a live bug today — but it stops being latent the moment
+    // anything hashes, caches, or diffs the pool image, which is exactly what
+    // OPT11's per-TU cache keys do (plan 22 §0.2). Ascending slot order is
+    // free, is a total order on a dense contiguous integer range, and matches
+    // the arena order every other MIR structure already uses.
+    {
+        std::vector<std::uint32_t> phiSlots;
+        phiSlots.reserve(pendingPhi_.size());
+        for (auto const& [phiV, incomings] : pendingPhi_) {
+            (void)incomings;
+            phiSlots.push_back(phiV);
+        }
+        std::sort(phiSlots.begin(), phiSlots.end());
+        for (std::uint32_t const phiV : phiSlots) {
+            std::vector<MirPhiIncoming> const& incomings = pendingPhi_.at(phiV);
+            MirInstId const phiId{phiV, moduleId_.v};
+            detail::MirInst& inst = instArena_.at(phiId);
+            inst.operandStart = static_cast<std::uint32_t>(phiPool_.size());
+            inst.operandCount = static_cast<std::uint32_t>(incomings.size());
+            for (MirPhiIncoming inc : incomings) phiPool_.push_back(inc);
+        }
     }
 
     // Freeze-boundary sweep: every pooled reference must name a real, defined

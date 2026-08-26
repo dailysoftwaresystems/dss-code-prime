@@ -178,6 +178,18 @@ public:
         return false;
     }
 
+    // SPIR-V ships no relocatable-object READER, so there is no shape for
+    // this backend to recognize and no bytes it could hand a linker — the
+    // strict answer, exactly as above. (A SPIR-V module DOES have a magic —
+    // `0x07230203` — and the day a reader lands, THAT is the change that
+    // earns a real check here; claiming recognition first would route a file
+    // to a reader that does not exist.)
+    [[nodiscard]] bool looksLikeRelocatableObject(
+            detail::ObjectFormatData const&,
+            std::span<std::uint8_t const>) const noexcept override {
+        return false;
+    }
+
     // ⚠ BEHAVIOUR WIDENED HERE, DELIBERATELY, AND SAID OUT LOUD. The rule this
     // feeds used to be `if (kind == Elf || kind == Pe)` — an ENUMERATION, which
     // by construction said nothing about WASM or SPIR-V, so a hand-built

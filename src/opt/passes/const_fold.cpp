@@ -8,6 +8,7 @@
 #include "hir/hir_op.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/passes/mir_id_remap.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <cstddef>
@@ -176,7 +177,7 @@ public:
 
     [[nodiscard]] std::optional<MirInstId>
     tryRewrite(MirOpcode op, MirInstId oldId, MirBuilder& dst,
-               std::unordered_map<std::uint32_t, MirInstId> const& /*rewrite*/) override {
+               MirInstRemap const& /*rewrite*/) override {
         auto folded = tryFold(op, oldId);
         if (!folded.has_value()) return std::nullopt;
         MirInstId const newId = dst.addConst(toMirLiteral(*folded),

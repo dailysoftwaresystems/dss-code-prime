@@ -3203,7 +3203,7 @@ struct DSS_EXPORT TargetLoweringStep {
     std::uint16_t  resultTempSlot = 0;           // when hasResult && !definesResult
     std::string    resultName;                   // declared spelling (diagnostics)
     TargetRegClass resultClass   = TargetRegClass::None;
-    std::uint8_t   widthBits     = 0;            // 0 / 8 / 16 / 32 / 64
+    std::uint8_t   widthBits     = 0;            // 0 / 8 / 16 / 32 / 64 / 128
     std::vector<TargetLoweringOperand> operands;
 };
 

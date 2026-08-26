@@ -12,10 +12,13 @@ dss_add_test(NAME opt/test_simplify_cfg    SOURCES test_simplify_cfg.cpp)
 dss_add_test(NAME opt/test_prune_unreachable SOURCES test_prune_unreachable.cpp)
 dss_add_test(NAME opt/test_licm            SOURCES test_licm.cpp)
 dss_add_test(NAME opt/test_inlining        SOURCES test_inlining.cpp)
+dss_add_test(NAME opt/test_inline_growth_budget
+             SOURCES test_inline_growth_budget.cpp)
 dss_add_test(NAME opt/test_compile_options SOURCES test_compile_options.cpp)
 dss_add_test(NAME opt/test_mir_alias       SOURCES test_mir_alias.cpp)
 dss_add_test(NAME opt/test_mir_memory_clobbers SOURCES test_mir_memory_clobbers.cpp)
 dss_add_test(NAME opt/test_call_graph_scc  SOURCES test_call_graph_scc.cpp)
+dss_add_test(NAME opt/test_mir_id_remap    SOURCES test_mir_id_remap.cpp)
 dss_add_test(NAME opt/test_mir_rebuild_helper SOURCES test_mir_rebuild_helper.cpp)
 
 # Inline-asm P5 (plan 29 §4.4): the MIR asm descriptor survives EACH of the

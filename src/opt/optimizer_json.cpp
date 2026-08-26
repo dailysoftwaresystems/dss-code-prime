@@ -36,7 +36,9 @@
 //         | {"fixpoint": {"max":  N, "passes": [element,...]}}
 //       "maxIterations": <1..32>,           — FLAT spelling only; refused
 //                                              beside structural nodes
-//       "inlineThreshold": <1..100000>, "verifyEveryPass": <bool> } }
+//       "inlineThreshold": <1..100000>,
+//       "inlineCallerGrowthPercent": <0..100000>,
+//       "verifyEveryPass": <bool> } }
 //
 // FLAT documents stay valid (all-string `passes` + optional top-level
 // `maxIterations` desugar to one top-level fixpoint). Every document
@@ -365,6 +367,38 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
         }
     }
 
+    // PER-CALLER CUMULATIVE GROWTH BUDGET (P36 Lane R). Optional. Default =
+    // `kDefaultInlineCallerGrowthPercent`. Same parse shape as
+    // `inlineThreshold` with ONE deliberate difference: the lower bound is
+    // 0, NOT 1. `inlineThreshold: 0` is rejected because it silently refuses
+    // every inline; `inlineCallerGrowthPercent: 0` refuses nothing on its
+    // own — the allowance floors at `inlineThreshold` instructions — so 0 is
+    // a real posture ("grow each caller by at most one maximal callee"), not
+    // a trap. Out of [0, kMaxInlineCallerGrowthPercent], or a non-integer →
+    // X_PipelineMalformed via `emitMalformed`.
+    std::uint32_t inlineCallerGrowthPercent = kDefaultInlineCallerGrowthPercent;
+    if (pipe.contains("inlineCallerGrowthPercent")) {
+        if (!pipe.at("inlineCallerGrowthPercent").is_number_integer()) {
+            emitMalformed(coll,
+                          std::string{sourceLabel}
+                              + "/pipeline/inlineCallerGrowthPercent",
+                          "must be an integer");
+        } else {
+            auto const v =
+                pipe.at("inlineCallerGrowthPercent").get<std::int64_t>();
+            if (v < 0
+                || v > static_cast<std::int64_t>(kMaxInlineCallerGrowthPercent)) {
+                emitMalformed(coll,
+                    std::string{sourceLabel}
+                        + "/pipeline/inlineCallerGrowthPercent",
+                    std::format("must be in [0, {}] (got {})",
+                                kMaxInlineCallerGrowthPercent, v));
+            } else {
+                inlineCallerGrowthPercent = static_cast<std::uint32_t>(v);
+            }
+        }
+    }
+
     // Verify frequency (D-OPT1-VERIFY-FREQUENCY-CONFIG). Optional bool; default
     // true = verify after EVERY pass (the developer posture: LLVM `-verify-each`
     // / GCC `--enable-checking=yes` — pinpoints the offending pass). false =
@@ -384,7 +418,7 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     rejectUnknownKeys(coll, pipe, std::string{sourceLabel} + "/pipeline",
                       "the 'pipeline' block",
                       {"name", "passes", "maxIterations", "inlineThreshold",
-                       "verifyEveryPass"});
+                       "inlineCallerGrowthPercent", "verifyEveryPass"});
 
     // ★ ONE SPELLING PER DOCUMENT (P10 ruling): a document using ANY
     // structural node (repeat/fixpoint) REFUSES top-level
@@ -452,6 +486,7 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
     out.name             = std::move(name);
     out.schedule         = std::move(root);
     out.inlineThreshold  = inlineThreshold;
+    out.inlineCallerGrowthPercent = inlineCallerGrowthPercent;
     out.verifyEveryPass  = verifyEveryPass;
     if (doc.contains("unitPipeline")) {
         out.unitPipelineName = doc.at("unitPipeline").get<std::string>();

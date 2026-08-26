@@ -116,6 +116,9 @@ std::atomic<std::size_t> gLiveScopes{0};
 
 std::string_view compilePhaseName(CompilePhase p) noexcept {
     switch (p) {
+        case CompilePhase::LocateConfig:   return "locate-config";
+        case CompilePhase::LoadConfig:     return "load-config";
+        case CompilePhase::BuildConfig:    return "build-config";
         case CompilePhase::Preprocess:     return "preprocess";
         case CompilePhase::PreprocessSplice:   return "preprocess-splice";
         case CompilePhase::PreprocessTokenize: return "preprocess-tokenize";

@@ -35,6 +35,7 @@
 #include <array>
 #include <cstdint>
 #include <ios>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -600,36 +601,118 @@ TEST(LirCallconv, NonLeafAarch64FramePrologueEpilogueByteExact) {
     auto const& fBytes = mod.functions[fIdx].bytes;
     auto const& gBytes = mod.functions[gIdx].bytes;
 
-    // EXACT non-leaf PROLOGUE — 4 insts / 16 bytes, each decoded from the ARM ARM
-    // (little-endian):
-    //   sub  sp, sp, #0x20     d10083ff   (SUB imm: 0xD1000000|(32<<10)|(31<<5)|31)
-    //   stur x28, [sp]         f80003fc   (STUR : 0xF8000000|(0<<12)|(31<<5)|28)
-    //   stur x29, [sp, #8]     f80083fd   (        |(8<<12)|...|29)
-    //   stur x30, [sp, #16]    f80103fe   (the LINK-REGISTER spill: |(16<<12)|...|30)
-    static constexpr std::array<std::uint8_t, 16> kProlog{
-        0xff, 0x83, 0x00, 0xd1,  0xfc, 0x03, 0x00, 0xf8,
-        0xfd, 0x83, 0x00, 0xf8,  0xfe, 0x03, 0x01, 0xf8};
-    // EXACT non-leaf EPILOGUE — 5 insts / 20 bytes:
-    //   ldur x28, [sp]         f84003fc   (LDUR : 0xF8400000|...)
-    //   ldur x29, [sp, #8]     f84083fd
-    //   ldur x30, [sp, #16]    f84103fe   (the LINK-REGISTER reload, before ret)
-    //   add  sp, sp, #0x20     910083ff   (ADD imm: 0x91000000|(32<<10)|(31<<5)|31)
-    //   ret                    d65f03c0   (RET X30: 0xD65F0000|(30<<5))
-    static constexpr std::array<std::uint8_t, 20> kEpilog{
-        0xfc, 0x03, 0x40, 0xf8,  0xfd, 0x83, 0x40, 0xf8,
-        0xfe, 0x03, 0x41, 0xf8,  0xff, 0x83, 0x00, 0x91,
+    // *** LAYER 1 -- THE STRUCTURAL CLAIM, INDEPENDENT OF EVERY BYTE BELOW
+    // (plan 22 OPT8, 2026-08-26). Until now the ENTIRE assertion of this test
+    // was two byte-array compares, so any change to the frame -- including one
+    // that made the frame BETTER -- reddened it with no way to tell whether the
+    // x30 discipline it exists for had actually broken. OPT8's allocator
+    // preference did exactly that: the frame shrank because f stopped taking
+    // callee-saved registers it never needed, the arrays diverged, and the x30
+    // spill was never in question.
+    //
+    // So the load-bearing claim is stated FIRST and structurally, and it is
+    // offset-INDEPENDENT in both of its forms: the FrameLayout must record the
+    // link register among the saved registers, and the emitted words must
+    // contain a STUR of x30 through sp at SOME displacement (the imm9 field is
+    // masked out). The byte arrays below are then a REDUNDANCY check on the
+    // exact composition -- valuable, because 2b07e3b was byte-green per
+    // instruction and still SIGSEGV'd, but no longer the only thing asserted.
+    auto const* ccDesc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(ccDesc, nullptr);
+    ASSERT_TRUE(ccDesc->linkRegister.has_value())
+        << "aapcs64 must declare a link register (x30)";
+    std::uint16_t const lrOrd = ccDesc->linkRegister->ordinal;
+    EXPECT_TRUE(savedRegsContain(cc.perFunc[fIdx], lrOrd))
+        << "non-leaf AAPCS64 frame must record x30 among its saved registers -- "
+           "without the spill the epilogue `ret` returns to a bl-clobbered LR "
+           "(SIGSEGV). This is the claim the byte arrays only corroborate.";
+    EXPECT_FALSE(savedRegsContain(cc.perFunc[gIdx], lrOrd))
+        << "leaf AAPCS64 frame must NOT record x30 -- no call clobbers it";
+
+    // The same claim at the BYTE tier, offset-independent: STUR/LDUR are
+    // 0xF8[0|4]00000 | (imm9 << 12) | (Rn << 5) | Rt, so masking bits 12..20
+    // (0xFFE00FFF) leaves `stur x30,[sp]` = 0xF80003FE and `ldur x30,[sp]` =
+    // 0xF84003FE whatever the displacement. `stur x28,[sp]` masks to
+    // 0xF80003FC, so the mask discriminates the REGISTER, which is the point.
+    auto wordsOfBytes = [](std::vector<std::uint8_t> const& v) {
+        std::vector<std::uint32_t> w;
+        w.reserve(v.size() / 4);
+        for (std::size_t k = 0; k + 3 < v.size(); k += 4) {
+            w.push_back(static_cast<std::uint32_t>(v[k])
+                      | (static_cast<std::uint32_t>(v[k + 1]) << 8)
+                      | (static_cast<std::uint32_t>(v[k + 2]) << 16)
+                      | (static_cast<std::uint32_t>(v[k + 3]) << 24));
+        }
+        return w;
+    };
+    constexpr std::uint32_t kUnscaledImm9Mask = 0xFFE00FFFu;
+    constexpr std::uint32_t kSturX30SpAnyOff  = 0xF80003FEu;
+    constexpr std::uint32_t kLdurX30SpAnyOff  = 0xF84003FEu;
+    auto const fWords = wordsOfBytes(fBytes);
+    auto const gWords = wordsOfBytes(gBytes);
+    auto hasMasked = [&](std::vector<std::uint32_t> const& w, std::uint32_t base) {
+        for (auto const x : w) if ((x & kUnscaledImm9Mask) == base) return true;
+        return false;
+    };
+    EXPECT_TRUE(hasMasked(fWords, kSturX30SpAnyOff))
+        << "non-leaf prologue must STUR x30 through sp at SOME displacement";
+    EXPECT_TRUE(hasMasked(fWords, kLdurX30SpAnyOff))
+        << "non-leaf epilogue must LDUR x30 back before `ret`";
+    EXPECT_FALSE(hasMasked(gWords, kSturX30SpAnyOff))
+        << "leaf function must never spill x30 at any displacement";
+
+    // *** LAYER 2 -- the byte-exact composition (the redundancy check).
+    // On a divergence, DUMP both so the array can be re-derived from evidence
+    // rather than guessed; a re-derivation is only honest if the thing it is
+    // derived from is visible in the failure output.
+    auto hexOf = [](std::vector<std::uint8_t> const& v, std::size_t n, bool tail) {
+        std::string s;
+        std::size_t const c = std::min(n, v.size());
+        for (std::size_t k = 0; k < c; ++k) {
+            auto const byte = tail ? v[v.size() - c + k] : v[k];
+            s += std::format("0x{:02x}, ", static_cast<unsigned>(byte));
+        }
+        return s;
+    };
+
+    // EXACT non-leaf PROLOGUE -- 2 insts / 8 bytes, each decoded from the ARM
+    // ARM (little-endian) and cross-checked against the bytes the failure dump
+    // above prints, so the array is DERIVED rather than copied:
+    //   sub  sp, sp, #0x10   d10043ff  (SUB imm: 0xD1000000|(16<<10)|(31<<5)|31)
+    //   stur x30, [sp]       f80003fe  (STUR: 0xF8000000|(0<<12)|(31<<5)|30)
+    //
+    // *** THE FRAME IS 0x10 AND THAT IS ITSELF A CHECK. A non-leaf frame that
+    // holds ONLY the link register needs one 8-byte slot, rounded to AAPCS64's
+    // 16-byte stack alignment. Before plan 22 OPT8 this array was 4 insts /
+    // 16 bytes with a 0x20 frame, because the allocator handed f the
+    // CALLEE-SAVED x28 and x29 for values that never crossed a call and then
+    // had to preserve both. Those two saves were pure waste, and the array
+    // encoded the waste as a requirement.
+    static constexpr std::array<std::uint8_t, 8> kProlog{
+        0xff, 0x43, 0x00, 0xd1,  0xfe, 0x03, 0x00, 0xf8};
+    // EXACT non-leaf EPILOGUE -- 3 insts / 12 bytes:
+    //   ldur x30, [sp]       f84003fe  (LDUR: 0xF8400000|(0<<12)|(31<<5)|30)
+    //   add  sp, sp, #0x10   910043ff  (ADD imm: 0x91000000|(16<<10)|(31<<5)|31)
+    //   ret                  d65f03c0  (RET X30: 0xD65F0000|(30<<5))
+    // The x30 reload comes BEFORE `ret`, which is the ordering the composed
+    // frame exists to get right (2b07e3b was byte-green per instruction and
+    // still SIGSEGV'd).
+    static constexpr std::array<std::uint8_t, 12> kEpilog{
+        0xfe, 0x03, 0x40, 0xf8,  0xff, 0x43, 0x00, 0x91,
         0xc0, 0x03, 0x5f, 0xd6};
     ASSERT_GE(fBytes.size(), kProlog.size() + kEpilog.size());
     EXPECT_TRUE(std::equal(kProlog.begin(), kProlog.end(), fBytes.begin()))
-        << "non-leaf AAPCS64 prologue must byte-match exactly — incl. "
-           "`stur x30,[sp,#16]` (f80103fe) at offset 12; without the link-register "
-           "spill the frame shrinks to 0x10 and these bytes diverge (red-on-disable)";
+        << "non-leaf AAPCS64 prologue must byte-match exactly -- incl. "
+           "`stur x30,[sp]` at offset 4, whose PRESENCE is already asserted "
+           "offset-independently above; this pins the COMPOSITION."
+        << " | actual head: " << hexOf(fBytes, kProlog.size(), false);
     EXPECT_TRUE(std::equal(kEpilog.rbegin(), kEpilog.rend(), fBytes.rbegin()))
-        << "non-leaf AAPCS64 epilogue must byte-match exactly — incl. "
-           "`ldur x30,[sp,#16]` (f84103fe) reloaded BEFORE `ret`, so the return "
-           "targets the caller, not the bl-clobbered x30";
+        << "non-leaf AAPCS64 epilogue must byte-match exactly -- incl. "
+           "`ldur x30` reloaded BEFORE `ret`, so the return targets the caller "
+           "and not the bl-clobbered x30."
+        << " | actual tail: " << hexOf(fBytes, kEpilog.size(), true);
 
-    // Leaf control: g saves x28/x29 (the x*2 scratch) but must contain NO
+    // Leaf control: g must contain NO
     // `stur x30,[sp,#16]` anywhere — no `bl` clobbers x30 in a leaf. Proves the pin
     // discriminates the x30 spill specifically, not "matches any prologue". (This
     // byte check is offset-specific to #16; the offset-INDEPENDENT "x30 ∉ savedRegs"
@@ -733,19 +816,36 @@ TEST(LirCallconv, Aarch64FrameBeyond16MiBPrologueMaterializesIntoX16) {
 // chokepoint swap (keep unscaled `load`) → the count drops to 0 here AND the
 // module fails to assemble (A_ImmediateOperandOutOfRange on the high-param load).
 TEST(LirCallconv, Aarch64HighStackParamUsesScaledImm12FrameLoad) {
-    // f takes 40 fixed int params; AAPCS64 passes the first 8 in x0..x7 and the
-    // rest (p08..p39) on the incoming stack. The body reads p08, p20, p39 — the
-    // last lands at offset totalFrameSize + (39-8)*8 = frame + 248, well past
-    // imm9 — but the body holds at most one param live at a time (no spill, no
-    // scratch exhaustion). Each high-param read is an incoming-stack-arg
-    // frame_load routed through the chokepoint.
+    // f takes EIGHTY fixed int params; AAPCS64 passes the first 8 in x0..x7 and
+    // the rest on the incoming stack, at `[sp + totalFrameSize + (i-8)*8]`. The
+    // body reads p08, p40 and p79, and holds at most one param live at a time
+    // (no spill, no scratch exhaustion -- host-compiler-independent).
+    //
+    // *** THE PARAMETER COUNT CARRIES THE PIN, NOT THE FRAME SIZE (plan 22 OPT8,
+    // 2026-08-26). p79 sits at `frame + (79-8)*8 = frame + 568`, and 568 ALONE
+    // is already past the unscaled imm9 reach of +/-256, so the scaled imm12
+    // form is REQUIRED for any frame size at all, including zero.
+    //
+    // This fixture used to declare FORTY params, putting p39 at `frame + 248`:
+    // beyond imm9 only because `totalFrameSize` was large, and it was large only
+    // because the allocator handed out CALLEE-SAVED registers first and every
+    // one of them bought a prologue save slot. When OPT8 taught the allocator to
+    // prefer caller-saved for a range that never crosses a call the frame shrank,
+    // 248 fitted in imm9, the `load_u` count went to 0 and this test went red --
+    // while the chokepoint it is named for was untouched. The subject is now the
+    // DISPLACEMENT itself, which is what the anchor is about.
     auto bundle = lowerThroughRewrite(
         "int f(int p00,int p01,int p02,int p03,int p04,int p05,int p06,int p07,\n"
         "      int p08,int p09,int p10,int p11,int p12,int p13,int p14,int p15,\n"
         "      int p16,int p17,int p18,int p19,int p20,int p21,int p22,int p23,\n"
         "      int p24,int p25,int p26,int p27,int p28,int p29,int p30,int p31,\n"
-        "      int p32,int p33,int p34,int p35,int p36,int p37,int p38,int p39) {\n"
-        "  return p08 + p20 + p39;\n"
+        "      int p32,int p33,int p34,int p35,int p36,int p37,int p38,int p39,\n"
+        "      int p40,int p41,int p42,int p43,int p44,int p45,int p46,int p47,\n"
+        "      int p48,int p49,int p50,int p51,int p52,int p53,int p54,int p55,\n"
+        "      int p56,int p57,int p58,int p59,int p60,int p61,int p62,int p63,\n"
+        "      int p64,int p65,int p66,int p67,int p68,int p69,int p70,int p71,\n"
+        "      int p72,int p73,int p74,int p75,int p76,int p77,int p78,int p79) {\n"
+        "  return p08 + p40 + p79;\n"
         "}\n",
         /*ccIndex=*/0, /*targetName=*/"arm64");
     ASSERT_TRUE(bundle.lowered.lir.ok);
@@ -765,9 +865,10 @@ TEST(LirCallconv, Aarch64HighStackParamUsesScaledImm12FrameLoad) {
         << "arm64 must declare load_u (D-ASM-AARCH64-LARGE-FRAME-IMM12)";
     std::uint32_t const nLoadU = countOpcodeInModule(cc.lir, *loadU);
     EXPECT_GT(nLoadU, 0u)
-        << "a 40-param AAPCS64 callee must emit at least one load_u (a high "
-           "incoming-stack-arg read beyond imm9, routed through the emitFrameLoad "
-           "chokepoint) — 0 means the chokepoint swap regressed (red-on-disable)";
+        << "an 80-param AAPCS64 callee must emit at least one load_u: p79 sits at "
+           "frame + 568, past the unscaled imm9 reach for ANY frame size, and its "
+           "read is routed through the emitFrameLoad chokepoint. 0 means the "
+           "chokepoint swap regressed (red-on-disable).";
 
     // The module must still assemble clean (the scaled load encodes, not fail-loud).
     std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);

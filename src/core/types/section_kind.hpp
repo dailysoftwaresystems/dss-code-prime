@@ -125,9 +125,48 @@ enum class SectionKind : std::uint8_t {
     // format writer encodes its own table from that, so a producer reaching for
     // this kind would be spelling a format's table by hand.
     Unwind     = 16, // per-function unwind metadata (linker-consumed)
+    // D-LK-OBJECT-CARRIES-NO-SUMMARY-OR-MIR-SECTION: THE LINK-TIME-OPTIMIZATION
+    // PAIR, and the taxonomy's FOURTH species. The fifteen storage/table kinds
+    // answer "what do these bytes become in the image" and `Unwind` answers
+    // "what do they describe about other sections". These answer neither: they
+    // are the COMPILER'S OWN INPUT, carried through the object so a LATER whole-
+    // program pass can read it. Nothing in the image corresponds to them, and
+    // the loader never sees them — every format's row below is declared
+    // non-ALLOC (ELF: no SHF_ALLOC; PE: IMAGE_SCN_MEM_DISCARDABLE and no
+    // MEM_READ; Mach-O: S_ATTR_DEBUG, the same "do not load this" instruction
+    // the `__compact_unwind` row already carries).
+    //
+    // ★★★ WHY TWO KINDS AND NOT ONE SECTION, WHICH IS THE WHOLE ECONOMY. The
+    // summary is a small per-module DIGEST — which symbols this unit defines,
+    // which it references, what each one costs — and the MIR is the module's
+    // whole body. A global pass reads EVERY summary to decide what to import,
+    // and it must do that WITHOUT PAGING IN ONE BYTE OF MIR; then it reads the
+    // MIR of the few modules it chose. One combined section makes that
+    // impossible: the digest could not be read without the body behind it. The
+    // split IS the ThinLTO economy, and it is the reason this is a pair.
+    //
+    // ⚠ NOT THE `SectionEncoding` AXIS, and the difference from `Unwind` is
+    // exactly what that axis is for. `__compact_unwind` and `__eh_frame` are ONE
+    // role in TWO WIRE ENCODINGS — a consumer picks either and learns the same
+    // facts. Summary and IR are two DIFFERENT PAYLOADS: no decoding of the MIR
+    // yields the summary cheaply, which is the entire point. Two roles.
+    //
+    // ⚠ NOT `Debug` EITHER, for the reason the `Unwind` note above already
+    // states in its own case: "strip the debug sections" must not mean "throw
+    // away the link-time optimizer's input". They share the non-loaded wire
+    // attribute on some formats; they are not the same species.
+    //
+    // ⓘ `Lto*` AND NOT `Dss*`. The ROLE is the industry's — LLVM carries
+    // `.llvmbc`, GCC `.gnu.lto_*` — while the SPELLING is per-format vocabulary
+    // (`.dss.summary` / `.dss.mir`, `.dsssum` / `.dssmir`, `__DSS,__summary` /
+    // `__DSS,__mir`), which is where DSS's own identity belongs. Naming the
+    // universal kind after this compiler's IR would put a product name in the
+    // format-blind vocabulary every tier speaks.
+    LtoSummary = 17, // per-module link-time-optimization summary index
+    LtoIr      = 18, // the module's serialized IR body, for a link-time pass
 };
 
-inline constexpr EnumNameTable<SectionKind, 17> kSectionKindTable{{{
+inline constexpr EnumNameTable<SectionKind, 19> kSectionKindTable{{{
     { SectionKind::Text,       "text"       },
     { SectionKind::Rodata,     "rodata"     },
     { SectionKind::Data,       "data"       },
@@ -145,6 +184,8 @@ inline constexpr EnumNameTable<SectionKind, 17> kSectionKindTable{{{
     { SectionKind::ThreadVars, "tvars"      },
     { SectionKind::RelRoConst, "relro"      },
     { SectionKind::Unwind,     "unwind"     },
+    { SectionKind::LtoSummary, "lto-summary" },
+    { SectionKind::LtoIr,      "lto-ir"      },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -298,7 +339,7 @@ struct SectionKindEncoding {
 // Narrow subset of `SectionKind` that a producer can legitimately
 // emit via `AssembledData`. Closes D-LK4-RODATA-SECTION-NARROW.
 //
-// Of the 17 `SectionKind` values, 11 are NOT producer-emittable
+// Of the 19 `SectionKind` values, 13 are NOT producer-emittable
 // (`Text` = executable code; `Symtab`/`Strtab`/`ShStrtab` = symbol
 // + name tables; `RelocTable` = relocation entries; `Dynamic` =
 // dynamic linking metadata; `Note` = vendor notes; `Debug` =
@@ -306,8 +347,10 @@ struct SectionKindEncoding {
 // by the WRITER and never by a producer; `Unwind` = per-function
 // unwind metadata, which arrives on the READ side from a foreign
 // object and which DSS's own producers state as `CfiFunction`
-// instead; `Custom` = format-specific
-// anything). A producer constructing
+// instead; `LtoSummary`/`LtoIr` = the link-time-optimization pair,
+// which the SUMMARY-INDEX writer emits as whole sections rather than
+// as `AssembledData` items a producer places; `Custom` =
+// format-specific anything). A producer constructing
 // `AssembledData{symbol, SectionKind::Symtab, ...}` is semantically
 // nonsense — the assembler doesn't emit symbol tables; the linker
 // walker synthesizes them.
@@ -319,10 +362,11 @@ struct SectionKindEncoding {
 // species of defect as the projection count below, arriving through a
 // comment instead of through a template argument. Both are now pinned
 // by the `static_assert` beside `kDataSectionKindNames`, which fails
-// the build if the 6/11 split ever moves — and it EARNED that keep on
-// 2026-08-24, when `Unwind` landed: the assert went red on the same
-// compile that added the enumerator, which is what dragged this prose
-// forward with it instead of letting it rot a third time.
+// the build if the 6/13 split ever moves — and it EARNED that keep
+// TWICE: on 2026-08-24 when `Unwind` landed, and again on 2026-08-26
+// when the `LtoSummary`/`LtoIr` pair did, the assert going red on the
+// same compile that added the enumerators, which is what dragged this
+// prose forward with it instead of letting it rot again.
 //
 // The SIX valid producer-emittable kinds:
 //   * `Rodata` — read-only initialised data (string literals,
@@ -343,7 +387,7 @@ struct SectionKindEncoding {
 // `toSectionKind()` conversion is total — every `DataSectionKind`
 // value maps to its corresponding `SectionKind`. The reverse
 // direction is partial: `dataSectionKindOf()` returns nullopt for
-// the 10 walker-synthesized kinds.
+// the 13 non-producer-emittable kinds.
 enum class DataSectionKind : std::uint8_t {
     Rodata     = static_cast<std::uint8_t>(SectionKind::Rodata),
     Data       = static_cast<std::uint8_t>(SectionKind::Data),
@@ -469,6 +513,21 @@ static_assert(!sectionKindCarriesLinkableBody(SectionKind::Unwind));
 static_assert(!sectionKindCarriesLinkableBody(SectionKind::Debug));
 static_assert(!sectionKindCarriesLinkableBody(SectionKind::Symtab));
 static_assert(!sectionKindCarriesLinkableBody(SectionKind::ThreadVars));
+// D-LK-OBJECT-CARRIES-NO-SUMMARY-OR-MIR-SECTION: neither LTO row holds body
+// bytes a defined symbol names. A summary/IR section is the COMPILER'S input,
+// so a symbol found inside one must never start an atom — the reader would
+// then mint a body the image has to place, which is the exact failure the
+// `Unwind` row's note above records for `__compact_unwind`'s `ltmp1` label.
+static_assert(!sectionKindCarriesLinkableBody(SectionKind::LtoSummary));
+static_assert(!sectionKindCarriesLinkableBody(SectionKind::LtoIr));
+static_assert(!isDataSectionKind(SectionKind::LtoSummary));
+static_assert(!isDataSectionKind(SectionKind::LtoIr));
+// The two spellings resolve, and they resolve to DIFFERENT kinds — the pair is
+// the whole point, so a table row that accidentally spelled both the same way
+// would silently collapse the summary and the body into one.
+static_assert(sectionKindFromName("lto-summary") == SectionKind::LtoSummary);
+static_assert(sectionKindFromName("lto-ir")      == SectionKind::LtoIr);
+static_assert(SectionKind::LtoSummary != SectionKind::LtoIr);
 
 // The spellings a data-section declaration may use — `kSectionKindTable`
 // narrowed to the data subrange. What a loader's "the closed set is …" half
@@ -495,17 +554,18 @@ static_assert(!sectionKindCarriesLinkableBody(SectionKind::ThreadVars));
 //
 // ⓘ THE SENTINEL SHAPE ONE VOCABULARY OVER: `kSelectableObjectFormatKindNames`
 // in `core/types/object_format_kind.hpp` is the same pair where the rejected
-// set is a single sentinel row. Here it is a SUBRANGE of eleven, which is why
-// the constant is `11` and not the `1` every sibling site carries — it is
+// set is a single sentinel row. Here it is a SUBRANGE of thirteen, which is why
+// the constant is `13` and not the `1` every sibling site carries — it is
 // derived from THIS table, never copied from a neighbour.
 inline constexpr auto kDataSectionKindNames =
     namesWhere<6>(kSectionKindTable, isDataSectionKind);
 static_assert(kSectionKindTable.rows.size()
-                  == kDataSectionKindNames.size() + 11,
-              "kSectionKindTable must have exactly ELEVEN rows that are NOT "
-              "producer-emittable (the walker-synthesized kinds plus the "
-              "linker-consumed `Unwind` metadata kind, for all of which "
-              "`dataSectionKindOf` returns nullopt) — a twelfth leaves "
+                  == kDataSectionKindNames.size() + 13,
+              "kSectionKindTable must have exactly THIRTEEN rows that are NOT "
+              "producer-emittable (the walker-synthesized kinds, the "
+              "linker-consumed `Unwind` metadata kind, and the "
+              "`LtoSummary`/`LtoIr` link-time-optimization pair, for all of "
+              "which `dataSectionKindOf` returns nullopt) — a fourteenth leaves "
               "`namesWhere`'s literal count matching while every 'the closed "
               "set is …' message silently stops describing the split "
               "`isDataSectionKind` actually enforces. If the new kind IS "

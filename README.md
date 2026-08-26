@@ -42,21 +42,42 @@ DSS Code Prime already compiles and runs **real, unmodified, production software
   | `--config=release` | **38.0 s** | 16.6 s | 6,904,848 B |
 
   The figure is the compiler's own `--time` report, not a wrapper's stopwatch. The release build turns **4m08s of attributed CPU into 31.1 s of phase wall — 8.0× parallel** (the front-half CU stage runs 103 jobs at 30.2× concurrency). ⚠ **Quote both rows or neither:** the optimizer is the difference between them, and a debug-pipeline number presented as "SQLite compiles in 23 seconds" would be the release-only omission this project has been bitten by before. ⚠ The staged upstream tree these figures ran against carries **no recorded revision id**, so they are a this-host, this-day measurement and not a benchmark you can reproduce against a different checkout.
-- **Benchmarked head-to-head against GCC and MSVC, on SQLite's own benchmark, and we are behind.** The subject is `test/speedtest1.c` — SQLite's own performance program — linked against the same **103 full-source translation units**, *not* the amalgamation. (Upstream ships no full-source recipe for it: both `main.mk` and `Makefile.msc` build `speedtest1` from `sqlite3.c`. So the TU list is derived from the full-source `sqlite3d` recipe and has its one artifact TU substituted.) Native Windows 11 host, 32 logical CPUs, all three compilers on the same machine against the same source tree, cold builds (fresh object directory per repeat), median of 3; run times median of 5 after an uncounted warm-up, monotonic clock:
+- **Benchmarked head-to-head against GCC, Clang and MSVC on THREE hosts, on SQLite's own benchmark, and we are behind on compile time.** The subject is `test/speedtest1.c` — SQLite's own performance program — linked against the same **103 full-source translation units**, *not* the amalgamation. (Upstream ships no full-source recipe for it: both `main.mk` and `Makefile.msc` build `speedtest1` from `sqlite3.c`. So the TU list is derived from the full-source `sqlite3d` recipe and has its one artifact TU substituted.) On each host every compiler builds the same source on the same machine; builds are **cold** — a fresh object directory per repeat — median of 3, run times median of 5 after an uncounted warm-up, monotonic clock.
 
-  | compiler | optimization | build −j1 | build −j4 | `speedtest1 --size 25` | parallelism |
+  **Windows 11 / x86_64, 32 logical CPUs — upstream `6f1110c`**
+
+  | compiler | optimization | build −j1 | build −j4 | `speedtest1 --size 25` | 1→4 scaling |
   |---|---|---|---|---|---|
-  | **DSS Code Prime** | `--config=release` | 66.56 s | **34.81 s** | 3.473 s | in-process CU thread pool (`--jobs N`) |
-  | gcc 13.2.0 (MinGW-W64) | `-O2` | 26.41 s | **7.12 s** | 2.473 s | 4 × `gcc -c` processes + link |
-  | MSVC `cl.exe` (VS 2026) | `/O2` | 13.26 s | **4.31 s** | 2.976 s | 4 × `cl /c` processes + link |
+  | **DSS Code Prime** | `--config=release` | 64.54 s | **36.16 s** | 3.485 s | 1.78× |
+  | gcc 13.2.0 (MinGW-W64) | `-O2` | 26.71 s | **7.38 s** | 2.472 s | 3.62× |
+  | MSVC `cl.exe` | `/O2` | 13.74 s | **4.50 s** | 3.094 s | 3.05× |
 
-  **Read this as the gap it is.** At `-j4` DSS takes **4.9× gcc's** and **8.1× MSVC's** compile time, and its output runs **1.40× slower than gcc's** and **1.17× slower than MSVC's**. We publish it because a compiler that only reports the axes it wins is not a measurement, it is marketing.
+  **Linux / x86_64 (WSL2), 32 logical CPUs — upstream `93f6407070`**
 
-  ⚠ **The parallel mechanism is deliberately not equalized, and the sharpest number is the one that exposes.** DSS compiles every CU inside *one* process on a worker-thread pool; the references are four separate processes. Going 1 → 4 workers, DSS scales **1.91×** where gcc scales **3.71×** and MSVC **3.08×** — by Amdahl that puts roughly **a third of a full-source release build on a serial path**, which is a specific, addressable target rather than a vague "it is slower" (`D-PERF-CU-POOL-SCALES-HALF-AS-WELL-AS-SEPARATE-PROCESSES`).
+  | compiler | optimization | build −j1 | build −j4 | `speedtest1 --size 25` | 1→4 scaling |
+  |---|---|---|---|---|---|
+  | **DSS Code Prime** | `--config=release` | 40.40 s | **22.02 s** | 3.086 s | 1.83× |
+  | gcc 13.3.0 | `-O2` | 17.65 s | **4.94 s** | 2.177 s | 3.57× |
+  | clang 18.1.3 | `-O2` | 14.73 s | **4.04 s** | 2.160 s | 3.65× |
 
-  ✅ **What the benchmark also proves is correctness.** It runs `speedtest1 --verify`, whose hash upstream describes as being there "to verify that compilation is not miscompiled" — and **all three binaries produced the same hash**. Arms whose output disagrees are refused outright rather than reported side by side, because three programs computing different things do not have comparable times.
+  **macOS / arm64, 10 logical CPUs — upstream `55bf04a530`**
 
-  Reproduce it: [`real-examples/c/sqlite/benchmark-speedtest1.ps1`](real-examples/c/sqlite/benchmark-speedtest1.sh) (`.sh` twin for POSIX hosts; both share one derivation and one measurement core). ⚠ These figures are this-host and this-day, against upstream SQLite `6f1110c` — a compile-time number quoted without its host, its TU count and its upstream revision is not comparable to anything.
+  | compiler | optimization | build −j1 | build −j4 | `speedtest1 --size 25` | 1→4 scaling |
+  |---|---|---|---|---|---|
+  | **DSS Code Prime** | `--config=release` | 36.63 s | **17.94 s** | 1.396 s | 2.04× |
+  | Apple clang 21.0.0 | `-O2` | 10.69 s | **2.96 s** | 0.784 s | 3.61× |
+
+  **Read this as the gap it is.** At `-j4` DSS takes **4.9× gcc's** and **8.0× MSVC's** compile time on Windows, **4.5× gcc's** and **5.4× clang's** on Linux, and **6.1× Apple clang's** on macOS. Its output runs **1.13×–1.78×** slower than the references depending on host and vendor — closest to MSVC, furthest from Apple clang. We publish it because a compiler that only reports the axes it wins is not a measurement, it is marketing.
+
+  ⚠ **Three tables, three upstream revisions, and one of the hosts has a third of the cores — so do not read across them.** The checkouts are at `6f1110c`, `93f6407070` and `55bf04a530`, and the Mac has 10 logical CPUs against 32. Within a table every arm compiled the same source on the same machine; between tables, nothing is being claimed. A compile-time number quoted without its host, its TU count and its upstream revision is not comparable to anything.
+
+  ⚠ **The parallel mechanism is deliberately not equalized, and the sharpest number is the one that exposes.** DSS compiles every CU inside *one* process on a worker-thread pool; the references are N separate processes. ★ **Going 1 → 4 workers DSS scales 1.78×–2.04× where every reference scales 3.05×–3.65× — on three operating systems, four toolchains and two ISAs.** One host could not tell "our pool scales badly" apart from "this host schedules badly"; three can, and the answer is the pool. By Amdahl that puts roughly **a third of a full-source release build on a serial path** — a specific, addressable target rather than a vague "it is slower" (`D-PERF-CU-POOL-SCALES-HALF-AS-WELL-AS-SEPARATE-PROCESSES`).
+
+  ⚠ **A per-invocation improvement will not show up here, and that is the point of measuring a real build.** DSS's fixed startup cost fell by **35 ms** during this work — **27% of a one-file compile**, 128.9 → 93.5 ms against an unmoving gcc control — and moved these numbers by less than their run-to-run spread, because a 103-TU build pays a fixed floor once. **Compile time has two different problems and this benchmark only sees the second one.**
+
+  ✅ **What the benchmark also proves is correctness.** It runs `speedtest1 --verify`, whose hash upstream describes as being there "to verify that compilation is not miscompiled" — and the harness compares every arm's *normalized* output, hash included, refusing the whole run (`R6`, exit 1) if two arms disagree. **All three hosts exited 0 with every arm reporting a time, so no arm's output differed from its host's references.** That refusal is the load-bearing part: three programs computing different things do not have comparable times, so a disagreeing arm is never reported side by side with a caveat.
+
+  Reproduce it: [`real-examples/c/sqlite/benchmark-speedtest1.sh`](real-examples/c/sqlite/benchmark-speedtest1.sh) (`.ps1` twin for Windows; both share one derivation and one measurement core). ⓘ The reference set is discovered, not hardcoded: every C compiler found becomes its own arm, and one that is absent is **printed as absent with the probe that failed** rather than dropped — a benchmark that quietly omits a compiler reads exactly like one where that compiler was slow. Two names resolving to one binary are measured once and labelled by what the compiler reports itself to be, which is why the macOS row reads *Apple clang* and not *gcc*.
 - **The whole pipeline is in-tree and complete**: tokenizer → parser → semantic analysis → three-tier IR (HIR → MIR → LIR) → register allocation → **its own assembler** (x86_64 + arm64 byte encoding with a round-trip oracle) → **its own linker** (ELF / PE / Mach-O, static and dynamic).
 
 | Capability | Status |

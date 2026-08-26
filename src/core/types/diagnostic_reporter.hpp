@@ -108,6 +108,36 @@ public:
 
     [[nodiscard]] Config const& config() const noexcept { return cfg_; }
 
+    // ★★★ D-DIAG-MAXPERCODE-SILENT-COALESCE, LIMB (C): THE FLOOR MUST BE
+    // MACHINE-READABLE, NOT ONLY HUMAN-READABLE.
+    //
+    // The arc's failure was never that a human missed a marker. It was that a
+    // SCRIPT counted `50` and reported `50`. `scripts/corpus-census` hard-coded
+    // `PER_CODE_CAP = 50` as a hand-copy of this class's default and asked "is
+    // this number suspiciously round?" — a detection method with no
+    // false-negative bound, and a mirror that silently mis-labels floors as
+    // totals the moment the default moves.
+    //
+    // So the elision is exposed as DATA as well as prose. A consumer can now
+    // ask "was any figure in this run a floor?" and get a yes/no, without
+    // regex-sniffing for round numbers and without knowing what the cap is.
+    struct ElisionLedger {
+        std::size_t coalesced   = 0;   // dropped by the per-code cap
+        std::size_t deduped     = 0;   // dropped by the recent-duplicate window
+        std::size_t markerIndex = 0;   // index into all()
+
+        [[nodiscard]] constexpr std::size_t total() const noexcept {
+            return coalesced + deduped;
+        }
+    };
+
+    // What this reporter elided for `code` — zeroes when nothing was elided.
+    [[nodiscard]] ElisionLedger elisionFor(DiagnosticCode code) const noexcept;
+
+    // True iff ANY code's reported count in this reporter is a FLOOR rather
+    // than a total. The one question a census actually wants answered.
+    [[nodiscard]] bool anyCountIsAFloor() const noexcept { return !elided_.empty(); }
+
     // Opaque restore token used exclusively by TreeBuilder::Checkpoint.
     // `recent_` is a sliding window with pop_front, so size-only capture
     // would lose front entries to speculative pushes; truncateTo would
@@ -128,6 +158,14 @@ public:
         // the end and the next cap drop would write out of bounds.
         std::size_t                                       droppedByCap    = 0;
         std::size_t                                       capMarkerIndex  = 0;
+        // The per-code elision ledger travels for EXACTLY the reason
+        // `capMarkerIndex` does: each row holds an index INTO `all_`, which
+        // `truncateTo` shrinks. Restoring the counts without the indices — or
+        // the indices without the counts — would leave a marker index pointing
+        // past the end, and the next elision on that code would rewrite a
+        // diagnostic that is not its marker, or run off the vector. Whole-map
+        // capture is the only sound shape here, same as `recent`.
+        std::unordered_map<DiagnosticCode, ElisionLedger> elided;
     };
     [[nodiscard]] Snapshot snapshotForRollback() const;
     void                   truncateTo(Snapshot const& snap);
@@ -286,6 +324,31 @@ private:
     // instead of leaving the number to be recovered later (it cannot be:
     // once a diagnostic is dropped there is nothing left to count).
     void noteCapDrop_();
+
+    // ★★★ D-DIAG-MAXPERCODE-SILENT-COALESCE — THE PER-CODE ELISION LEDGER.
+    //
+    // The global cap got a marker; the two gates that actually fire in an
+    // ordinary build did not. `noteElision_` gives them one, and gives BOTH of
+    // them the SAME one — deliberately, because they are the same fact from a
+    // reader's point of view ("N diagnostics of this kind exist that you are
+    // not being shown") and two markers for one code would reproduce exactly
+    // the noise the gates exist to suppress.
+    //
+    // Minted ONCE per code, then rewritten in place as the counts grow —
+    // `noteCapDrop_`'s shape, for `noteCapDrop_`'s reason: `all()` is readable
+    // at any moment and must never be observed carrying a stale number.
+    enum class ElisionKind { PerCodeCap, DedupWindow };
+    void noteElision_(ParseDiagnostic const& d, ElisionKind kind);
+
+    // Rewrite one code's marker prose from its current ledger row. Split out
+    // so minting and updating cannot compose the sentence differently — the
+    // second-source-of-truth failure this whole area exists to remove.
+    void rewriteElisionMarker_(DiagnosticCode code);
+
+    // Absent from the map == nothing elided for that code, which is the
+    // overwhelmingly common case, so a build that never saturates pays one
+    // empty-map probe per elision-free report and nothing else.
+    std::unordered_map<DiagnosticCode, ElisionLedger> elided_;
 
     Config                                  cfg_{};
     std::vector<ParseDiagnostic>            all_;

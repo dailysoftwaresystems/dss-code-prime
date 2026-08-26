@@ -3056,3 +3056,332 @@ TEST(CoffObjectReader, ANamedUndefExternStillReadsGreenAsAnImport) {
         << "the named UNDEF record is still an extern import -- the refusal is "
            "about the MISSING NAME, not about UNDEF records";
 }
+
+// ── SAME_SIZE(3) / EXACT_MATCH(4): THE TWO SELECTIONS THAT CARRY A DUTY ─────
+//    D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED
+//
+// ✔MEASURED BEFORE THIS BLOCK EXISTED: `grep 'SameSize\|ExactMatch'` over this
+// file returned ZERO hits, and the reader routed selections 3 and 4 into the
+// SAME switch arm as ANY(2) -- one fall-through, no size compare, no byte
+// compare anywhere in the tree. So the two selections whose ENTIRE contract is
+// "duplicates must match, else error" were exactly the two with no coverage,
+// and DSS accepted, silently, precisely the input the format tells it to
+// reject.
+//
+// The pins come in two halves and BOTH are needed:
+//   * the READER decodes the selection byte into a universal duty
+//     (`ModuleSymbol::duplicateMatch`) -- pinned here, per selection, because a
+//     narrowing typo in the switch would otherwise fall to the `default:`
+//     fail-loud arm and reject a legal object with nothing to notice;
+//   * the FOLD discharges the duty -- pinned end-to-end below through
+//     `linker::link`, and directly against the shared kernel in
+//     `tests/link/test_cross_cu_resolve.cpp`.
+//
+// RED ON DISABLE (reader half): collapse `case kComdatSelSameSize:` /
+// `case kComdatSelExactMatch:` back into the `kComdatSelAny` arm in
+// `coff_object_reader.cpp`. The duty degrades to `Any`, the mismatch is no
+// longer detected, and `MismatchedSameSizeComdatDuplicatesFailLoud` /
+// `MismatchedExactMatchComdatDuplicatesFailLoud` below go RED.
+
+namespace {
+
+// The two selection bytes this file had no constant for until now. Deliberately
+// spelled beside the existing four rather than inline: a literal `3` passed as
+// `auxSelection` reads as an ordinal, not as a policy.
+constexpr std::uint8_t kSelSameSize = 3, kSelExactMatch = 4;
+
+// The reconstructed ModuleSymbol row of a defined symbol (by name). `bindingOf`
+// above answers only about the binding; the COMDAT duty rides on the SAME row
+// and a test that could not read it would be asserting the lift while leaving
+// the promise -- the actual subject -- unobserved.
+[[nodiscard]] ModuleSymbol const*
+symbolNamed(AssembledModule const& m, std::string const& name) {
+    for (auto const& s : m.symbols) if (s.name == name) return &s;
+    return nullptr;
+}
+
+// One synthetic archive member: a COMDAT `.data` datum `shared_w` carrying
+// `wbytes` under `selection`, plus a distinct Global function so the two
+// members are not otherwise identical modules.
+[[nodiscard]] std::vector<std::uint8_t>
+comdatMember(std::string const& fn, std::uint8_t retImm, std::uint8_t selection,
+             std::vector<std::uint8_t> const& wbytes) {
+    std::vector<std::uint8_t> const body = {0xB8, retImm, 0x00, 0x00, 0x00, 0xC3};
+    return buildCoff(
+        {BSec{".data", kScnData | kScnLnkComdat, wbytes, {}},
+         BSec{".text$mn", kScnText, body, {}}},
+        {BSym{".data", 0, 1, 0, kClassStatic, selection},
+         BSym{"shared_w", 0, 1, 0, kClassExternal, std::nullopt},
+         BSym{fn, 0, 2, kDtypeFunction, kClassExternal, std::nullopt}});
+}
+
+// Read the two members back and merge them. Returns the link reporter so the
+// caller can assert on the diagnostics; asserts the READS themselves succeeded,
+// because a refused read would vacate every claim about the merge.
+struct MergedPair {
+    bool                       readsOk = false;
+    std::optional<SymbolBinding> bindingA;
+    std::optional<SymbolBinding> bindingB;
+    std::string                messages;
+    bool                       sawRedefinition = false;
+};
+
+[[nodiscard]] MergedPair
+mergeTwoComdatMembers(std::vector<std::uint8_t> const& objA,
+                      std::vector<std::uint8_t> const& objB,
+                      TargetSchema const& target,
+                      ObjectFormatSchema const& format) {
+    MergedPair out;
+    DiagnosticReporter repA, repB;
+    auto modA = pe::readRelocatableObject(objA, target, format, repA,
+                                          CompilationUnitId{1});
+    auto modB = pe::readRelocatableObject(objB, target, format, repB,
+                                          CompilationUnitId{2});
+    if (!modA.has_value() || !modB.has_value()) return out;
+    out.readsOk  = true;
+    out.bindingA = bindingOf(*modA, "shared_w");
+    out.bindingB = bindingOf(*modB, "shared_w");
+
+    std::array<AssembledModule, 2> const mods{*modA, *modB};
+    DiagnosticReporter linkRep;
+    (void)linker::link(std::span<AssembledModule const>{mods.data(), mods.size()},
+                       target, format, linkRep);
+    out.sawRedefinition =
+        sawCode(linkRep, DiagnosticCode::K_SymbolRedefinedAcrossUnits);
+    for (auto const& d : linkRep.all()) {
+        out.messages += d.actual;
+        out.messages += '\n';
+    }
+    return out;
+}
+
+} // namespace
+
+// -- Reader half: selection 3 lifts to Weak AND records the SAME_SIZE duty ----
+TEST(CoffForeignObject, DataComdatSameSizeLiftsWeak) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    std::vector<std::uint8_t> const wbytes = {42, 0, 0, 0};
+    auto const obj = buildCoff(
+        {BSec{".data", kScnData | kScnLnkComdat, wbytes, {}}},
+        {BSym{".data", 0, 1, 0, kClassStatic, kSelSameSize},
+         BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}});
+
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value())
+        << "SAME_SIZE(3) is a LEGAL selection and must not reach the fail-loud "
+           "default arm; errs=" << rep.errorCount();
+    EXPECT_EQ(bindingOf(*got, "W").value_or(SymbolBinding::Global),
+              SymbolBinding::Weak);
+    auto const* sym = symbolNamed(*got, "W");
+    ASSERT_NE(sym, nullptr);
+    EXPECT_EQ(sym->duplicateMatch, DuplicateMatch::SameSize)
+        << "the Selection byte is a PROMISE the linker must verify; lifting to "
+           "Weak while discarding WHICH promise was made is the defect "
+           "(D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED)";
+}
+
+// -- Reader half: selection 4 lifts to Weak AND records the EXACT_MATCH duty --
+TEST(CoffForeignObject, DataComdatExactMatchLiftsWeak) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    std::vector<std::uint8_t> const wbytes = {42, 0, 0, 0};
+    auto const obj = buildCoff(
+        {BSec{".data", kScnData | kScnLnkComdat, wbytes, {}}},
+        {BSym{".data", 0, 1, 0, kClassStatic, kSelExactMatch},
+         BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}});
+
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value())
+        << "EXACT_MATCH(4) is a LEGAL selection; errs=" << rep.errorCount();
+    EXPECT_EQ(bindingOf(*got, "W").value_or(SymbolBinding::Global),
+              SymbolBinding::Weak);
+    auto const* sym = symbolNamed(*got, "W");
+    ASSERT_NE(sym, nullptr);
+    EXPECT_EQ(sym->duplicateMatch, DuplicateMatch::ExactContent);
+}
+
+// -- ANY keeps promising nothing. The fix must NOT widen into the arm that was
+//    already correct: ANY is the encoding DSS's OWN writer emits for every weak
+//    definition, so comparing it would refuse DSS's own output.
+TEST(CoffForeignObject, DataComdatAnyRecordsNoDuplicatePromise) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}}},
+        {BSym{".data", 0, 1, 0, kClassStatic, kSelAny},
+         BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value());
+    auto const* sym = symbolNamed(*got, "W");
+    ASSERT_NE(sym, nullptr);
+    EXPECT_EQ(sym->duplicateMatch, DuplicateMatch::Any);
+}
+
+// -- NODUPLICATES stays Global and promises nothing: a duplicate is an error by
+//    a DIFFERENT rule (the all-strong merge), and giving it a duty as well
+//    would double-report the same condition.
+TEST(CoffForeignObject, ComdatNoDuplicatesRecordsNoDuplicatePromise) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = buildCoff(
+        {BSec{".data", kScnData | kScnLnkComdat, {42, 0, 0, 0}, {}}},
+        {BSym{".data", 0, 1, 0, kClassStatic, kSelNoDup},
+         BSym{"W", 0, 1, 0, kClassExternal, std::nullopt}});
+    DiagnosticReporter rep;
+    auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value());
+    auto const* sym = symbolNamed(*got, "W");
+    ASSERT_NE(sym, nullptr);
+    EXPECT_EQ(bindingOf(*got, "W").value_or(SymbolBinding::Weak),
+              SymbolBinding::Global);
+    EXPECT_EQ(sym->duplicateMatch, DuplicateMatch::Any);
+}
+
+// -- END TO END: a SAME_SIZE pair whose sizes AGREE folds silently -----------
+//
+// The control for the refusal below. Without it, that refusal could be caused
+// by anything at all about a two-member SAME_SIZE link.
+TEST(CoffForeignObject, MatchingSameSizeComdatDuplicatesFoldSilently) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // Same LENGTH, deliberately DIFFERENT bytes -- SAME_SIZE promises the size
+    // and nothing else, so this pair is legal and must link.
+    auto const objA = comdatMember("alpha", 20, kSelSameSize, {1, 0, 0, 0});
+    auto const objB = comdatMember("beta", 22, kSelSameSize, {2, 0, 0, 0});
+
+    auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                           *loaded.format);
+    ASSERT_TRUE(got.readsOk);
+    EXPECT_EQ(got.bindingA.value_or(SymbolBinding::Global), SymbolBinding::Weak);
+    EXPECT_EQ(got.bindingB.value_or(SymbolBinding::Global), SymbolBinding::Weak);
+    EXPECT_FALSE(got.sawRedefinition)
+        << "equal-length SAME_SIZE duplicates satisfy their promise and must "
+           "fold: " << got.messages;
+}
+
+// -- END TO END: a SAME_SIZE pair whose sizes DIFFER must FAIL LOUD ----------
+TEST(CoffForeignObject, MismatchedSameSizeComdatDuplicatesFailLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const objA = comdatMember("alpha", 20, kSelSameSize, {1, 0, 0, 0});
+    auto const objB = comdatMember("beta", 22, kSelSameSize, {2, 0});
+
+    auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                           *loaded.format);
+    ASSERT_TRUE(got.readsOk)
+        << "both members are individually well-formed; the violation is a "
+           "property of the PAIR and must surface at the merge, not the read";
+    EXPECT_TRUE(got.sawRedefinition)
+        << "two IMAGE_COMDAT_SELECT_SAME_SIZE definitions of `shared_w` with 4 "
+           "and 2 bytes broke the promise their selection byte made, and DSS "
+           "kept one anyway. The format specifies this as a multiply defined "
+           "symbol error (D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED). "
+           "Diagnostics were: " << got.messages;
+    EXPECT_NE(got.messages.find("same-size"), std::string::npos)
+        << "the diagnostic must name WHICH promise was broken, otherwise the "
+           "reader cannot tell it from an ordinary two-strong collision: "
+        << got.messages;
+    EXPECT_NE(got.messages.find("shared_w"), std::string::npos);
+}
+
+// -- END TO END: EXACT_MATCH catches the case SAME_SIZE cannot --------------
+//
+// Same LENGTH, different BYTES: legal under SAME_SIZE (pinned above), an error
+// under EXACT_MATCH. The two tests together prove the scale has two real steps
+// rather than one check wearing two names.
+TEST(CoffForeignObject, MismatchedExactMatchComdatDuplicatesFailLoud) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const objA = comdatMember("alpha", 20, kSelExactMatch, {1, 0, 0, 0});
+    auto const objB = comdatMember("beta", 22, kSelExactMatch, {2, 0, 0, 0});
+
+    auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                           *loaded.format);
+    ASSERT_TRUE(got.readsOk);
+    EXPECT_TRUE(got.sawRedefinition)
+        << "two IMAGE_COMDAT_SELECT_EXACT_MATCH definitions of `shared_w` with "
+           "the SAME length and DIFFERENT bytes broke their promise; only a "
+           "content compare can see this one: " << got.messages;
+    EXPECT_NE(got.messages.find("exact-content"), std::string::npos)
+        << got.messages;
+    EXPECT_NE(got.messages.find("same length, differing content"),
+              std::string::npos)
+        << "the diagnostic must say WHY equal sizes were not enough: "
+        << got.messages;
+}
+
+TEST(CoffForeignObject, MatchingExactMatchComdatDuplicatesFoldSilently) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const objA = comdatMember("alpha", 20, kSelExactMatch, {7, 0, 0, 0});
+    auto const objB = comdatMember("beta", 22, kSelExactMatch, {7, 0, 0, 0});
+
+    auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                           *loaded.format);
+    ASSERT_TRUE(got.readsOk);
+    EXPECT_FALSE(got.sawRedefinition)
+        << "byte-identical EXACT_MATCH duplicates satisfy their promise: "
+        << got.messages;
+}
+
+// -- ANY duplicates that differ in EVERY way still fold ---------------------
+//
+// The guard against the fix widening. `CrossObjectComdatAnyDedupsInMerge` above
+// already links two ANY members, but their bodies are IDENTICAL, so it would
+// stay green even if ANY had been given an EXACT_MATCH duty by mistake. This
+// one differs in both size and content.
+TEST(CoffForeignObject, AnyComdatDuplicatesThatDifferEntirelyStillFold) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto const objA = comdatMember("alpha", 20, kSelAny, {1, 0, 0, 0});
+    auto const objB = comdatMember("beta", 22, kSelAny, {2, 0});
+
+    auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                           *loaded.format);
+    ASSERT_TRUE(got.readsOk);
+    EXPECT_FALSE(got.sawRedefinition)
+        << "IMAGE_COMDAT_SELECT_ANY promises NOTHING about its duplicates; a "
+           "verification widened into this arm would refuse DSS's own weak "
+           "definitions, which are emitted as ANY: " << got.messages;
+}
+
+// -- A MIXED pair: one member ANY, the other EXACT_MATCH --------------------
+//
+// The stricter duty governs, so the ANY member does not license the mismatch.
+// Both orders are exercised because "whichever member declared it" is exactly
+// the half an implementation gets right by accident.
+TEST(CoffForeignObject, AMixedSelectionPairIsGovernedByTheStricterPromise) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    {
+        auto const objA = comdatMember("alpha", 20, kSelAny, {1, 0, 0, 0});
+        auto const objB = comdatMember("beta", 22, kSelExactMatch, {2, 0, 0, 0});
+        auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                               *loaded.format);
+        ASSERT_TRUE(got.readsOk);
+        EXPECT_TRUE(got.sawRedefinition)
+            << "the ANY member must not dilute the EXACT_MATCH member: "
+            << got.messages;
+    }
+    {
+        auto const objA = comdatMember("alpha", 20, kSelExactMatch, {1, 0, 0, 0});
+        auto const objB = comdatMember("beta", 22, kSelAny, {2, 0, 0, 0});
+        auto const got = mergeTwoComdatMembers(objA, objB, *loaded.target,
+                                               *loaded.format);
+        ASSERT_TRUE(got.readsOk);
+        EXPECT_TRUE(got.sawRedefinition)
+            << "the promise must be read off BOTH members: " << got.messages;
+    }
+}

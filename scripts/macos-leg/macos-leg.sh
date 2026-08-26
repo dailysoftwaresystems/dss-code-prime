@@ -101,6 +101,20 @@
 #                                                       #   the root host already did)
 #   scripts/macos-leg/macos-leg.sh --no-push            # reuse what is already on the Mac
 #   scripts/macos-leg/macos-leg.sh --reset-to <commit>  # DESTRUCTIVE: reset the remote checkout first
+#   scripts/macos-leg/macos-leg.sh --mode build         # clean build and STOP -- no ctest
+#   scripts/macos-leg/macos-leg.sh --tree <name> --build-type <T>   # build/<name>, default build/dbg + Debug
+#
+# ⚠ `--mode`, `--tree` and `--build-type` ARRIVED IN P35 AND `--help` DENIED THEIR
+# EXISTENCE UNTIL P36. `--help` prints the contiguous comment block at the top of this
+# file and stops at the first non-comment line, so the rationale written beside those
+# flags DOWN IN THE ARGUMENT LOOP was unreachable from the interface -- the same class
+# of drift that the `sed -n '2,40p'` note below records, arriving by a different route.
+# A flag the tool accepts and its own `--help` does not mention is a flag nobody will
+# type.
+#
+# ⚠ A FLAG THE SELECTED MODE NEVER READS IS REFUSED, NOT IGNORED: `-R` and `--guards`
+# under `--mode build` (which runs no ctest) exit non-zero and say so, and a `-j` that
+# is not a positive integer is refused rather than silently replaced by the default.
 set -uo pipefail
 
 SRC="$(pwd)"
@@ -114,23 +128,42 @@ LEG_RUN="$$-$(date +%s)"
 LEG_OUT="${TMPDIR:-/tmp}/macos-leg-${LEG_RUN}.out"
 DST="${DSS_MACOS_LEG_DIR:-~/src/dss-code-prime}"
 RESET_TO=""
+# Defaults chosen so every pre-existing invocation behaves EXACTLY as before.
+MODE="full"
+TREE="dbg"
+BUILD_TYPE="Debug"
 CARRIAGE="scripts/ssh-macos/ssh-macos.sh"
 
 die() { printf '\n[X] macos-leg: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n=== %s ===\n' "$*"; }
 
+# Which flags the CALLER actually typed, as opposed to which ones hold a default or
+# an inherited environment value. The refusals below can only be honest about "this
+# mode never reads that" if they can tell a supplied value from an inherited one --
+# `--guards` in particular, whose default is `$DSS_LEG_GUARDS`.
+GAVE_FILTER=0; GAVE_GUARDS=0
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --src)     SRC="${2:?--src needs a value}"; shift 2 ;;
-        -R)        FILTER="${2:?-R needs a value}"; shift 2 ;;
+        -R)        FILTER="${2:?-R needs a value}"; GAVE_FILTER=1; shift 2 ;;
         -j)        JOBS="${2:?-j needs a value}"; shift 2 ;;
-        --guards)  GUARDS=1; shift ;;
+        --guards)  GUARDS=1; GAVE_GUARDS=1; shift ;;
         --no-push) DO_PUSH=0; shift ;;
         # DESTRUCTIVE, and therefore never a default: `git reset --hard` on the remote
         # checkout before the push. Tracked files return to <commit>; untracked ones do
         # NOT, and the count is reported below.
         --reset-to) RESET_TO="${2:?--reset-to needs a commit}"; shift 2 ;;
         --dst)     DST="${2:?--dst needs a value}"; shift 2 ;;
+        # `build` mode: clean configure + build, then STOP. It exists so a BENCHMARK
+        # can get a RELEASE driver onto this host without paying for a suite -- and
+        # because the reading it then takes is only valid on a QUIET host, so running
+        # tests in the same invocation would corrupt the measurement the build was for.
+        # Defaults leave `full` byte-for-byte as it was: build/dbg, Debug.
+        # D-SCRIPT-MACOS-LEG-HAS-NO-BUILD-ONLY-MODE-SO-NO-LEG-CAN-BE-BENCHMARKED
+        --mode)       MODE="${2:?--mode needs a value}"; shift 2 ;;
+        --tree)       TREE="${2:?--tree needs a value}"; shift 2 ;;
+        --build-type) BUILD_TYPE="${2:?--build-type needs a value}"; shift 2 ;;
         # ⚠ This printed a FIXED LINE RANGE (`sed -n '2,40p'`) and the usage block had
         # already drifted below it, so `--help` showed the rationale and NOT the usage.
         # The contiguous comment block cannot drift out of date the way a range does.
@@ -140,6 +173,51 @@ while [ $# -gt 0 ]; do
         *) die "unknown argument '$1' (try --help)" ;;
     esac
 done
+
+# An unknown MODE is a REFUSAL for the same reason an unknown FLAG is, and the
+# argument loop above already says so in a comment. A closed set is only closed
+# where something checks it.
+case "$MODE" in
+    full|build) ;;
+    *) die "unknown --mode '$MODE' (expected: full, build)" ;;
+esac
+
+# ── A KNOWN FLAG THE SELECTED MODE NEVER READS IS ALSO A REFUSAL ────────────
+# ★★★ SAME ARGUMENT THE ARGUMENT LOOP ALREADY MAKES ABOUT THE UNKNOWN FLAG:
+# "silently ignoring one is how a leg runs a different thing than the operator asked
+# for and still reports green." A KNOWN flag this mode never reads is the identical
+# failure wearing a legal name, and it is the wider hole -- nothing is unknown, so
+# nothing was ever going to refuse it.
+# ✔MEASURED 2026-08-25 (cycle P36) by RUNNING the pre-edit file: `--mode build -R
+# 'harness/.*'` was accepted without a word and went straight on to the carriage, and
+# `--mode build --guards` did the same. Neither could have taken effect: `LEG_FILTER`
+# and `LEG_GUARDS` are read ONLY by the `CTEST_ARGS` block, which the build mode
+# returns before reaching. A `-R` is typed precisely to narrow a run, so swallowing it
+# is the one response that must never be silent.
+# ★ `--guards` is checked on the FLAG and not on `$GUARDS`, because `$GUARDS` also
+# carries `$DSS_LEG_GUARDS` -- a standing environment switch that means "run them
+# wherever they run" and must not turn an unrelated build into a refusal.
+if [ "$MODE" = "build" ] && [ "$GAVE_FILTER" = "1" ]; then
+    die "--mode build never reads '-R' (this mode runs no ctest, so there is nothing for a filter to scope). Refused rather than ignored: a flag that is silently dropped is how a leg runs a different thing than the operator asked for and still reports green."
+fi
+if [ "$MODE" = "build" ] && [ "$GAVE_GUARDS" = "1" ]; then
+    die "--mode build never reads '--guards' (the repo guards are ctest entries and this mode runs no ctest). Refused rather than ignored: a flag that is silently dropped is how a leg runs a different thing than the operator asked for and still reports green."
+fi
+
+# ── AND A `-j` THAT IS NOT A JOB COUNT IS A REFUSAL, NOT A SHRUG ────────────
+# ★★ THE COERCION EXISTS AND IT IS ON THE WRONG SIDE OF THE WIRE. The remote body
+# maps `''|0|*[!0-9]*` to the default, which is the RIGHT answer for a value that was
+# never sent and the WRONG one for a value the operator typed. ✔MEASURED on the
+# pre-edit file: `-j four` was accepted without a word and went on to the carriage,
+# where the remote `case` would have replaced it with the default and said nothing.
+# A leg that quietly picks its own parallelism answers a different question than the
+# one asked, and the timings are what a `-j` is usually typed for.
+# ★ Validated HERE, where the value is typed. The remote fallback stays as it is,
+# because it now only has to cover "nothing arrived".
+case "${JOBS:-}" in
+    '') ;;
+    0|*[!0-9]*) die "-j '$JOBS' is not a positive job count. Refused rather than silently replaced by the remote default." ;;
+esac
 
 [ -f "$CARRIAGE" ] || die "carriage not found at $CARRIAGE (run from the repo root)"
 
@@ -169,14 +247,65 @@ if [ "$DO_PUSH" = "1" ]; then
 fi
 
 say "remote clean configure + build + ctest"
-# The remote half goes over STDIN. ✔MEASURED 2026-08-25 that stdin survives byte-exact
-# to this host (1000 random bytes, identical md5) -- the 2026-08-18 note claiming the
-# login profile eats stdin is expired. A remote script fed this way never has to be
+# The remote half goes over STDIN. A remote script fed this way never has to be
 # quoted into a `-c` string, which is the trap that once turned a variable into
 # `rsync -a --delete / /`.
+#
+# ⚠⚠ THIS COMMENT PREVIOUSLY CLAIMED THE OPPOSITE OF THE TRUTH AND THE CLAIM CITED A
+# MEASUREMENT, WHICH IS WHY IT SURVIVED. It read: "✔MEASURED 2026-08-25 that stdin
+# survives byte-exact to this host (1000 random bytes, identical md5) -- the
+# 2026-08-18 note claiming the login profile eats stdin is expired." The 2026-08-18
+# note was RIGHT and this line retired it on the strength of an experiment that did
+# not test the thing that breaks: 1000 random bytes measured DATA crossing the wire,
+# while what actually crosses here is A SHELL READING ITS SCRIPT FROM STDIN, and the
+# consumer was never the login profile at all.
+#
+# ✔MEASURED 2026-08-25 (cycle P36, lane B): `ssh-macos.sh` resolved the `.local` name
+# by shelling out to `powershell.exe` INSIDE A COMMAND SUBSTITUTION, which inherits
+# this pipeline's stdin and DRANK THE REMOTE BODY before `ssh` ever ran. Same host,
+# same payload, only the resolution path changing:
+#     hostname form : printf '12345678\n' | ssh-macos.sh "wc -c"  ->  0
+#     IP form       : DSS_MACOS_HOST=<ip> ...                     ->  9
+# So `bash -s` received ZERO BYTES and EVERY macOS leg taken through the `.local`
+# name ended in "no witness came back ... UNKNOWN". Fail-closed, so no false green
+# was ever produced -- but a leg that cannot run is not a leg that passed.
+# ⇒ FIXED at the source: the resolver helpers in `ssh-macos.sh` now read `</dev/null`.
+# ★ THE LESSON WORTH KEEPING: a "✔MEASURED" tag is only as good as the question the
+# experiment asked. Retiring a warning needs an experiment that reproduces the
+# WARNED-ABOUT shape, not merely an adjacent one that happens to pass.
 REMOTE_BODY=$(cat <<'REMOTE_EOF'
 set -uo pipefail
-cd "$LEG" || { echo "[X] remote: $LEG missing"; exit 1; }
+
+# ★★★ EVERY TERMINAL STATE EMITS A WITNESS, NOT JUST THE TWO SUCCESSFUL ONES.
+# ⚠ SEVEN of this body's exits emitted no witness at all -- a missing checkout, an
+# unmakeable log directory, a held lock, a missing cmake, a missing ninja, a failed
+# configure and a failed build -- so every one of them reached the operator as the SAME
+# sentence, "no witness came back, this run's real status is UNKNOWN", while the real
+# diagnosis sat further up a several-hundred-line transcript. (The wipe check below
+# would have been an eighth; it is new in this commit and was born on this channel.)
+# ✔MEASURED 2026-08-25 (cycle P36) on the real host, one arm of the seven: a `--dst`
+# that does not exist there reported "no REMOTE_BUILD_RC witness came back ... UNKNOWN"
+# before and "macOS build leg FAILED (rc=1)" after, with `[X] remote: /tmp/… missing`
+# visible in both transcripts and read by neither verdict.
+# ★ The verdict was never WRONG -- the driver refuses either way, which is the half
+# that matters -- but the CAUSE was always misnamed, and a refusal's only job is to be
+# acted on.
+# ★★ IT IS ALSO THIS FILE'S OWN STATED RULE, applied to the states it had not reached:
+# see the `build`-mode block below -- "a watcher must observe EVERY terminal state on
+# the channel it polls". Eight of them were invisible on that channel.
+# ⓘ THE KEY IS MODE-CHOSEN, exactly as the driver's poll is: a `build` run can never
+# produce a REMOTE_CTEST_RC, so a failure that emitted one would be unmatchable and
+# would land back on the anonymous refusal this block exists to end.
+WITNESS_KEY=REMOTE_CTEST_RC
+if [ "${LEG_MODE:-full}" = "build" ]; then WITNESS_KEY=REMOTE_BUILD_RC; fi
+remote_fail() {   # <rc> <what went wrong>
+    _rf_rc="$1"; shift
+    echo "[X] remote: $*"
+    echo "$WITNESS_KEY[$LEG_RUN]=$_rf_rc"
+    exit "$_rf_rc"
+}
+
+cd "$LEG" || remote_fail 1 "$LEG missing"
 
 # ★★★ HOLD THE MACHINE AWAKE FOR EXACTLY AS LONG AS THIS LEG LIVES.
 # ⚠ ✔MEASURED 2026-08-25 (cycle P34) from `pmset -g log` DURING a running leg: this
@@ -211,27 +340,34 @@ fi
 # previous names sat in the checkout ROOT as untracked files, where `--reset-to` counts
 # them as staleness -- a leg's own logs should not look like a dirty tree.
 LOGDIR="build/macos-leg/$LEG_RUN"
-mkdir -p "$LOGDIR" || { echo "[X] remote: cannot create $LOGDIR"; exit 1; }
+mkdir -p "$LOGDIR" || remote_fail 1 "cannot create $LOGDIR"
 echo "logs  : $LEG/$LOGDIR"
 
 # ★★ MUTUAL EXCLUSION ON THE BUILD TREE. Two legs sharing one build/dbg do not merely
 # run slowly -- the second one's `rm -rf` deletes the tree the first is testing, and
 # NEITHER verdict is attributable afterwards. Refuse; never destroy.
+# ⚠ THE REFUSAL USED TO NAME `build/dbg` UNCONDITIONALLY, AND SINCE THE `build` MODE
+# LANDED THAT IS OFTEN THE WRONG TREE. The lock is ONE lock over the whole `build/`
+# directory (deliberately: it is coarser than the trees it protects, and coarse is the
+# safe direction for a refusal), but a message that names a directory neither leg is
+# touching sends the reader to the wrong place -- and a refusal's only job is to be
+# acted on. It names the ACTUAL trees now, both the owner's and this run's, which is
+# why the lock records one.
+TREEDIR="build/$LEG_TREE"
 LOCK="build/.macos-leg.lock"
 if [ -e "$LOCK" ]; then
     _owner=$(sed -n 's/^pid=//p' "$LOCK" | head -1)
     if [ -n "$_owner" ] && kill -0 "$_owner" 2>/dev/null; then
-        echo "[X] remote: another macOS leg owns $LEG/build/dbg"
-        echo "    owner pid=$_owner run=$(sed -n 's/^run=//p' "$LOCK" | head -1)"
-        echo "    Refusing -- starting here would rm -rf build/dbg underneath a live ctest."
-        exit 4
+        echo "[X] remote: another macOS leg owns $LEG/build"
+        echo "    owner pid=$_owner run=$(sed -n 's/^run=//p' "$LOCK" | head -1) mode=$(sed -n 's/^mode=//p' "$LOCK" | head -1) tree=$(sed -n 's/^tree=//p' "$LOCK" | head -1)"
+        remote_fail 4 "refusing to start -- that would rm -rf $LEG/$TREEDIR underneath a live leg"
     fi
     # A leg killed mid-run must not wedge the carriage forever: the owner is gone, so
     # the lock describes nothing. Say so rather than silently reclaiming it.
     echo "! stale lock (pid ${_owner:-?} is gone) -- taking it"
     rm -f "$LOCK"
 fi
-printf 'pid=%s\nrun=%s\n' "$$" "$LEG_RUN" > "$LOCK"
+printf 'pid=%s\nrun=%s\nmode=%s\ntree=%s\n' "$$" "$LEG_RUN" "${LEG_MODE:-full}" "$TREEDIR" > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT INT TERM
 
 # Absolute paths: `command -v` is unreliable over non-interactive ssh here.
@@ -239,8 +375,8 @@ CMAKE=""
 for c in /opt/homebrew/bin/cmake /usr/local/bin/cmake; do [ -x "$c" ] && CMAKE="$c" && break; done
 NINJA=""
 for n in /opt/homebrew/bin/ninja /usr/local/bin/ninja; do [ -x "$n" ] && NINJA="$n" && break; done
-[ -n "$CMAKE" ] || { echo "[X] remote: no cmake found on the filesystem"; exit 1; }
-[ -n "$NINJA" ] || { echo "[X] remote: no ninja found on the filesystem"; exit 1; }
+[ -n "$CMAKE" ] || remote_fail 1 "no cmake found on the filesystem"
+[ -n "$NINJA" ] || remote_fail 1 "no ninja found on the filesystem"
 echo "cmake : $CMAKE ($("$CMAKE" --version | head -1))"
 echo "ninja : $NINJA ($("$NINJA" --version))"
 echo "cc    : $(/usr/bin/cc --version | head -1)"
@@ -276,21 +412,47 @@ fi
 _t=$(date +%s)
 _phase() { echo "PHASE $1 $(( $(date +%s) - _t ))s"; _t=$(date +%s); }
 
-rm -rf build/dbg
+# (TREEDIR is set above, beside the lock that names it)
+rm -rf "$TREEDIR"
+# ★★ AND THE WIPE IS CHECKED, BECAUSE "CLEAN" IS THE ONLY THING THIS BUILD PROMISES.
+# `set -e` is deliberately off here, so a `rm -rf` that failed fell straight through to
+# a configure over the SURVIVING tree, and the leg then ran an INCREMENTAL build under
+# a heading that says clean -- the preserved-mtime class this file's header spends a
+# paragraph refusing to hope around. The postcondition is the DIRECTORY, not the rc.
+if [ -e "$TREEDIR" ]; then
+    remote_fail 1 "could not remove $TREEDIR, so this build would be INCREMENTAL under a heading that says CLEAN"
+fi
 # shellcheck disable=SC2086
-"$CMAKE" -S . -B build/dbg -G Ninja \
-    -DCMAKE_BUILD_TYPE=Debug \
+"$CMAKE" -S . -B "$TREEDIR" -G Ninja \
+    -DCMAKE_BUILD_TYPE="$LEG_BUILD_TYPE" \
     -DCMAKE_MAKE_PROGRAM="$NINJA" $CACHE_ARGS > "$LOGDIR/configure.log" 2>&1
 rc=$?
-if [ $rc -ne 0 ]; then echo "[X] remote configure rc=$rc"; tail -25 "$LOGDIR/configure.log"; exit 1; fi
-echo "configure OK"; _phase configure
+if [ $rc -ne 0 ]; then tail -25 "$LOGDIR/configure.log"; remote_fail "$rc" "configure failed (rc=$rc, log $LOGDIR/configure.log)"; fi
+echo "configure OK ($TREEDIR, $LEG_BUILD_TYPE)"; _phase configure
 
-"$CMAKE" --build build/dbg --parallel "$JOBS" > "$LOGDIR/build.log" 2>&1
+"$CMAKE" --build "$TREEDIR" --parallel "$JOBS" > "$LOGDIR/build.log" 2>&1
 rc=$?
-if [ $rc -ne 0 ]; then echo "[X] remote build rc=$rc"; grep -iE 'error' "$LOGDIR/build.log" | head -25; exit 1; fi
+if [ $rc -ne 0 ]; then grep -iE 'error' "$LOGDIR/build.log" | head -25; remote_fail "$rc" "build failed (rc=$rc, log $LOGDIR/build.log)"; fi
 echo "build OK: $(tail -1 "$LOGDIR/build.log")"; _phase build
 
-CTEST_ARGS="--test-dir build/dbg --output-on-failure -j $JOBS"
+# ── build mode: STOP HERE, and emit its OWN witness ─────────────────────────
+# ★★ A DIFFERENT TERMINAL STATE NEEDS A DIFFERENT WITNESS. The driver polls for
+# `REMOTE_CTEST_RC[<run>]`; a mode that never runs ctest would never emit one, and
+# the driver would correctly refuse a run that actually succeeded. So this mode
+# emits `REMOTE_BUILD_RC[<run>]` and the driver picks the name by mode -- the
+# standing rule that a watcher must observe every terminal state on the channel it
+# polls, applied to a channel that just grew a second state.
+if [ "${LEG_MODE:-full}" = "build" ]; then
+    if [ ! -x "$TREEDIR/bin/dss/dsscp" ]; then
+        remote_fail 1 "build reported success but produced no driver at $TREEDIR/bin/dss/dsscp"
+    fi
+    ls -la "$TREEDIR/bin/dss/dsscp"
+    echo "no tests were run in this mode, and it does not claim otherwise"
+    echo "REMOTE_BUILD_RC[$LEG_RUN]=0"
+    exit 0
+fi
+
+CTEST_ARGS="--test-dir $TREEDIR --output-on-failure -j $JOBS"
 [ -n "${LEG_FILTER:-}" ] && CTEST_ARGS="$CTEST_ARGS -R ${LEG_FILTER}"
 # ★★ THE REPO GUARDS ARE SKIPPED HERE, by operator ruling: this is an INDIRECT leg. They
 # check the SOURCE TREE, the tree is byte-identical to the root host's, and on macOS they
@@ -316,15 +478,23 @@ REMOTE_EOF
 # the whole reason the witness exists.
 # `LEG` is emitted UNQUOTED so a leading `~` still expands on the remote side, exactly
 # as `ssh-macos --push` requires and for the same reason.
-printf 'LEG=%s\nLEG_FILTER=%s\nLEG_RUN=%s\nLEG_JOBS=%s\nLEG_GUARDS=%s\n%s\n' \
-    "$DST" "'$FILTER'" "'$LEG_RUN'" "'$JOBS'" "'$GUARDS'" "$REMOTE_BODY" \
+printf 'LEG=%s\nLEG_FILTER=%s\nLEG_RUN=%s\nLEG_JOBS=%s\nLEG_GUARDS=%s\nLEG_MODE=%s\nLEG_TREE=%s\nLEG_BUILD_TYPE=%s\n%s\n' \
+    "$DST" "'$FILTER'" "'$LEG_RUN'" "'$JOBS'" "'$GUARDS'" \
+    "'$MODE'" "'$TREE'" "'$BUILD_TYPE'" "$REMOTE_BODY" \
   | bash "$CARRIAGE" 'bash -s' 2>&1 | tee "$LEG_OUT"
 # ⚠ The pipeline's status is `tee`'s, NEVER the leg's. ✔MEASURED at the P33 fold: piping
 # a gate through `tail` reported rc=0 while ctest had failed rc=8. The witness below is
 # the authority, exactly as `scripts/run-gate` emits one for the same reason.
-WITNESS=$(grep -oE "REMOTE_CTEST_RC\[$LEG_RUN\]=[0-9]+" "$LEG_OUT" | tail -1)
-[ -n "$WITNESS" ] || die "no REMOTE_CTEST_RC[$LEG_RUN] witness came back -- this run's real status is UNKNOWN, which is not a pass (log: $LEG_OUT)"
+# ★ The witness NAME is chosen by mode, because the two modes have different
+# terminal states and a watcher must observe the one its run can actually reach.
+if [ "$MODE" = "build" ]; then WITNESS_KEY="REMOTE_BUILD_RC"; else WITNESS_KEY="REMOTE_CTEST_RC"; fi
+WITNESS=$(grep -oE "$WITNESS_KEY\[$LEG_RUN\]=[0-9]+" "$LEG_OUT" | tail -1)
+[ -n "$WITNESS" ] || die "no $WITNESS_KEY[$LEG_RUN] witness came back -- this run's real status is UNKNOWN, which is not a pass (log: $LEG_OUT)"
 RC=${WITNESS##*=}
 grep -E '^PHASE ' "$LEG_OUT"
-if [ "$RC" != "0" ]; then die "macOS ctest leg FAILED (rc=$RC, log $LEG_OUT)"; fi
-say "macOS leg OK (run $LEG_RUN)"
+if [ "$RC" != "0" ]; then die "macOS $MODE leg FAILED (rc=$RC, log $LEG_OUT)"; fi
+if [ "$MODE" = "build" ]; then
+    say "macOS build OK (run $LEG_RUN, build/$TREE, $BUILD_TYPE) -- no tests were run"
+else
+    say "macOS leg OK (run $LEG_RUN)"
+fi

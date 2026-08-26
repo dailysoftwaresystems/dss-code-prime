@@ -1877,6 +1877,29 @@ public:
         return d_.backend != nullptr && d_.backend->isImageFlavor(d_);
     }
 
+    // Do these RAW BYTES look like a relocatable object file THIS format
+    // could have written? The public face of the backends'
+    // `looksLikeRelocatableObject()`: a caller holding a file named as a
+    // compile input asks it, and routes a `true` to the LINKER instead of to
+    // the tokenizer, which reports an object's first magic byte as `illegal
+    // character 0x7f` as though the author had typed it.
+    //
+    // ★ ABOUT THE INPUT, NOT ABOUT THIS SCHEMA'S OWN FLAVOR — see the
+    // interface comment on `ObjectFormatBackend::looksLikeRelocatableObject`.
+    // An image-flavored schema still recognizes the relocatable objects of
+    // its own family, which is the whole case that matters: the driver holds
+    // the format it is PRODUCING while it classifies the inputs.
+    //
+    // Null backend ⇒ false, the fail-closed shape of `isImageFlavor()`
+    // directly above: a document that resolved to no backend recognizes
+    // nothing, so the file falls through to the ordinary unknown-input path
+    // rather than to a linker that has no format to read it with.
+    [[nodiscard]] bool looksLikeRelocatableObject(
+            std::span<std::uint8_t const> bytes) const noexcept {
+        return d_.backend != nullptr
+            && d_.backend->looksLikeRelocatableObject(d_, bytes);
+    }
+
     // Cross-format EXEC-flavor predicate. True iff the schema
     // describes a PROGRAM the OS starts — the four arms are ELF
     // ET_EXEC, ELF ET_DYN carrying the full PIE entry cluster, PE

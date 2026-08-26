@@ -100,6 +100,19 @@ fs::path writeSrc(fs::path const& dir, std::string_view name,
     return p;
 }
 
+// The one-module seed span
+// (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION).
+// `pullStaticArchive-
+// Members` seeds its defined-name set and its worklist from a SPAN of client
+// modules, because a link that also names pre-assembled OBJECT inputs has more
+// than one module in it before any member is pulled. Every pin in this file
+// predates object inputs and seeds with exactly one module, so it says so here
+// rather than spelling the span at fifteen call sites.
+[[nodiscard]] std::span<AssembledModule const>
+oneModule(AssembledModule const& m) {
+    return std::span<AssembledModule const>{&m, 1};
+}
+
 // The RELOCATABLE ELF format (ET_REL) -- what an `ar` member is. The EXEC format
 // -- what `main` links to. Both x86_64 ELF; the member is written ET_REL and
 // read back during the exec link.
@@ -432,7 +445,7 @@ TEST(StaticLink, PullResolvesReferenceAndMergeStripsImport) {
     // Pull the archive members that satisfy main's externs.
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
-    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target,
+    auto pulled = pullStaticArchiveMembers(oneModule(*mainMod), archives, kNoDynamicLibraries, *s.target,
                                            *s.exec, pullRep);
     ASSERT_TRUE(pulled) << "pull failed; errs=" << pullRep.errorCount();
     ASSERT_EQ(pulled->size(), 1u) << "exactly the one member defining dss_lib_answer";
@@ -506,7 +519,7 @@ TEST(StaticLink, LazyPullSkipsUnreferencedMember) {
 
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
-    auto pulled = pullStaticArchiveMembers(*clientMod, archives, kNoDynamicLibraries, *s.target,
+    auto pulled = pullStaticArchiveMembers(oneModule(*clientMod), archives, kNoDynamicLibraries, *s.target,
                                            *s.exec, pullRep);
     ASSERT_TRUE(pulled) << "pull failed; errs=" << pullRep.errorCount();
 
@@ -726,7 +739,7 @@ TEST(StaticLink, MachOPullResolvesReferenceAndMergeStripsImport) {
 
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
-    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target, *s.exec, pullRep);
+    auto pulled = pullStaticArchiveMembers(oneModule(*mainMod), archives, kNoDynamicLibraries, *s.target, *s.exec, pullRep);
     ASSERT_TRUE(pulled) << "macho pull failed; errs=" << pullRep.errorCount();
     ASSERT_EQ(pulled->size(), 1u) << "exactly the one member defining dss_lib_answer";
     EXPECT_TRUE(std::any_of((*pulled)[0].symbols.begin(), (*pulled)[0].symbols.end(),
@@ -838,7 +851,7 @@ TEST(StaticLink, CoffPullResolvesReferenceAndMergeStripsImport) {
 
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
-    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target, *s.exec, pullRep);
+    auto pulled = pullStaticArchiveMembers(oneModule(*mainMod), archives, kNoDynamicLibraries, *s.target, *s.exec, pullRep);
     ASSERT_TRUE(pulled) << "coff pull failed; errs=" << pullRep.errorCount();
     ASSERT_EQ(pulled->size(), 1u) << "exactly the one member defining dss_lib_answer";
     EXPECT_TRUE(std::any_of((*pulled)[0].symbols.begin(), (*pulled)[0].symbols.end(),
@@ -1589,7 +1602,7 @@ TEST(ArchiveMemberObjectFormat,
 
     std::vector<fs::path> const archives{archivePath};
     DiagnosticReporter pullRep;
-    auto pulled = pullStaticArchiveMembers(*clientMod, archives, kNoDynamicLibraries, *s.target,
+    auto pulled = pullStaticArchiveMembers(oneModule(*clientMod), archives, kNoDynamicLibraries, *s.target,
                                            *s.exec, pullRep);
     ASSERT_TRUE(pulled.has_value())
         << "the pull was handed the IMAGE format and read the member with it; "
@@ -1669,7 +1682,7 @@ TEST(ArchiveMemberObjectFormat,
 
     std::vector<fs::path> const archives{archivePath};
     DiagnosticReporter pullRep;
-    auto pulled = pullStaticArchiveMembers(*clientMod, archives, kNoDynamicLibraries, *s.target,
+    auto pulled = pullStaticArchiveMembers(oneModule(*clientMod), archives, kNoDynamicLibraries, *s.target,
                                            *s.exec, pullRep);
     ASSERT_TRUE(pulled.has_value())
         << "macho64-x86_64 pull refused; errs=" << pullRep.errorCount();
@@ -1730,7 +1743,7 @@ TEST(ArchiveMemberObjectFormat,
     {
         ScopedEnv env("DSS_CONFIG_ROOT",
                       (scratch.path() / "cfgroot").string());
-        pulled = pullStaticArchiveMembers(*clientMod, archives, kNoDynamicLibraries, *s.target,
+        pulled = pullStaticArchiveMembers(oneModule(*clientMod), archives, kNoDynamicLibraries, *s.target,
                                           *s.exec, pullRep);
     }
     ASSERT_FALSE(pulled.has_value())
@@ -1889,7 +1902,7 @@ void expectArchiveMemberRebindsLibraryImport(Schemas const& s,
 
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
-    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target,
+    auto pulled = pullStaticArchiveMembers(oneModule(*mainMod), archives, kNoDynamicLibraries, *s.target,
                                            *s.exec, pullRep);
     ASSERT_TRUE(pulled) << familyLabel << ": pull failed; errs="
                         << pullRep.errorCount();
@@ -2025,7 +2038,7 @@ TEST(ArchiveMemberLibraryImport, CoffMemberBindsARowCarryingAPlatformLinkName) {
 
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
-    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target,
+    auto pulled = pullStaticArchiveMembers(oneModule(*mainMod), archives, kNoDynamicLibraries, *s.target,
                                            *s.exec, pullRep);
     ASSERT_TRUE(pulled) << "pull failed; errs=" << pullRep.errorCount();
     ASSERT_EQ(pulled->size(), 1u);
@@ -2076,7 +2089,7 @@ void expectGenuinelyUndefinedStillFailsLoud(Schemas const& s,
 
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
-    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target,
+    auto pulled = pullStaticArchiveMembers(oneModule(*mainMod), archives, kNoDynamicLibraries, *s.target,
                                            *s.exec, pullRep);
     ASSERT_TRUE(pulled) << familyLabel;
     ASSERT_EQ(pulled->size(), 1u) << familyLabel;
@@ -2185,7 +2198,7 @@ TEST(ArchiveMemberLibraryImport, CoffSynthesizeRecipeRowIsNeverBound) {
 
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archivePath};
-    auto pulled = pullStaticArchiveMembers(*mainMod, archives, kNoDynamicLibraries, *s.target,
+    auto pulled = pullStaticArchiveMembers(oneModule(*mainMod), archives, kNoDynamicLibraries, *s.target,
                                            *s.exec, pullRep);
     ASSERT_TRUE(pulled) << "pull failed; errs=" << pullRep.errorCount();
     ASSERT_EQ(pulled->size(), 1u);
@@ -2296,7 +2309,7 @@ void expectArchiveMemberBindsAnOperatorNamedLibrary(
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
     auto pulled = pullStaticArchiveMembers(
-        *mainMod, archives,
+        oneModule(*mainMod), archives,
         std::span<ResolveLibrarySpec const>{dynamicLibs}, *s.target, *s.exec,
         pullRep);
     ASSERT_TRUE(pulled) << familyLabel << ": pull failed; errs="
@@ -2424,7 +2437,7 @@ void expectOperatorNamedLibraryOutranksThePlatformCorpus(
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
     auto pulled = pullStaticArchiveMembers(
-        *mainMod, archives,
+        oneModule(*mainMod), archives,
         std::span<ResolveLibrarySpec const>{dynamicLibs}, *s.target, *s.exec,
         pullRep);
     ASSERT_TRUE(pulled) << familyLabel << ": pull failed; errs="
@@ -2496,7 +2509,7 @@ TEST(ArchiveMemberResolveLibraryImport, GenuinelyUndefinedSymbolStillFailsLoud) 
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
     auto pulled = pullStaticArchiveMembers(
-        *mainMod, archives,
+        oneModule(*mainMod), archives,
         std::span<ResolveLibrarySpec const>{dynamicLibs}, *s.target, *s.exec,
         pullRep);
     ASSERT_TRUE(pulled) << "pull failed; errs=" << pullRep.errorCount();
@@ -2574,7 +2587,7 @@ TEST(ArchiveMemberResolveLibraryImport, WrongFormatNamedBinaryRefusesThePull) {
     DiagnosticReporter pullRep;
     std::vector<fs::path> const archives{archive};
     auto pulled = pullStaticArchiveMembers(
-        *mainMod, archives,
+        oneModule(*mainMod), archives,
         std::span<ResolveLibrarySpec const>{dynamicLibs}, *elf.target,
         *elf.exec, pullRep);
     EXPECT_FALSE(pulled.has_value())
@@ -2678,4 +2691,543 @@ TEST(StaticLink, PeArchiveMemberBindsAnOperatorNamedLibraryThroughTheDriver) {
            "through an archive member whose import was re-bound at pull time to "
            "the operator-named dynsrc.dll";
 #endif  // _WIN32
+}
+
+// ═══ D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION — PRE-ASSEMBLED
+// OBJECT INPUTS ══════════════
+//
+// The separate-compilation half: DSS compiles `.c` -> `.o` per TU and then links
+// pre-assembled objects that carry NO MIR. The emit half already shipped (name a
+// relocatable format and the driver writes one object); what did not was the
+// INGEST half — DSS could not read back the object it had just written.
+//
+// ✔MEASURED on the shipped CLI before this landed: `--resolve-library <bare .o>`
+// died with `F_SectionNotFound` — "ELF64 reader: no `.dynsym` section found" —
+// because the magic-byte dispatcher had exactly two arms (`ar` archive, dynamic
+// library) and a relocatable fell through to the DYNAMIC reader. The message
+// blamed a missing section when the real fact was a missing arm.
+//
+// ★★ WHY THESE PINS ASSERT A RUNTIME ANSWER AND NOT `rc == 0`. The
+// characteristic failure of a separate-compilation driver is a silently
+// INCOMPLETE link: an object quietly omitted yields a smaller image that still
+// links and still runs. `rc == 0` cannot see it. Exit 42 can, because the answer
+// is reachable only if every object actually reached the merge.
+namespace {
+
+// Compile ONE source to ONE relocatable object with the shipped driver — the
+// operator's separate-compilation step, not a test-only shortcut. Returns the
+// emitted object's path, or an empty path on failure (the caller asserts).
+[[nodiscard]] fs::path buildObject(fs::path const&  dir,
+                                   std::string_view srcName,
+                                   std::string_view srcText,
+                                   std::string_view relocTargetSpec) {
+    auto const src = writeSrc(dir, srcName, srcText);
+    Program p;
+    p.setOutputDir(dir);
+    DiagnosticReporter rep;
+    int const rc =
+        p.compileFiles(std::vector<std::string>{src.string()}, "c",
+                       std::vector<std::string>{std::string{relocTargetSpec}},
+                       rep);
+    if (rc != 0) return {};
+    // The artifact extension is the FORMAT's business (`outputExtension`), so
+    // both shipped spellings are accepted rather than one being assumed here.
+    auto const stem = fs::path{std::string{srcName}}.stem().string();
+    for (char const* ext : {".o", ".obj"}) {
+        auto const cand = dir / (stem + ext);
+        if (fs::exists(cand)) return cand;
+    }
+    return {};
+}
+
+// A function body large enough that its presence or absence in an image cannot
+// be absorbed by section/file alignment — the discriminator the eager-vs-lazy
+// pin below rests on. Pure integer work, no rodata: a relocatable `.obj` schema
+// declaring rodata support is a config error, so a big const array would not be
+// portable across the two object formats this file exercises.
+[[nodiscard]] std::string bulkFunctionSrc(char const* name, int statements) {
+    std::string s = "int ";
+    s += name;
+    s += "(int x){\n";
+    for (int i = 0; i < statements; ++i) {
+        s += "  x = x * 3 + " + std::to_string(i) + ";\n";
+    }
+    s += "  return x;\n}\n";
+    return s;
+}
+
+}  // namespace
+
+// PIN 1 — TWO object inputs, one of them referenced only BY THE OTHER.
+//
+// `main.c` calls `f1`; `o1.o` defines `f1` and calls `f2`; `o2.o` defines `f2`.
+// So `o2.o` is reachable ONLY through a reference that lives inside another
+// OBJECT INPUT, never inside the compiled client. That is the case a driver gets
+// wrong when it seeds the link from the client module alone — the reason
+// `pullStaticArchiveMembers` takes a SPAN of client modules and the reason the
+// objects are read BEFORE the archive pull rather than after it.
+TEST(ObjectInput, CoffTwoObjectInputsExitFortyTwo) {
+    ScratchDir scratch{Location::InsideRepo, "object-input"};
+    auto const dir = scratch.path();
+
+    auto const o1 = buildObject(dir, "o1.c",
+                                "int f2(void);\n"
+                                "int f1(void){ return f2() + 2; }\n",
+                                "x86_64:pe64-x86_64-windows");
+    ASSERT_FALSE(o1.empty()) << "the driver must emit o1's relocatable object";
+    auto const o2 = buildObject(dir, "o2.c", "int f2(void){ return 40; }\n",
+                                "x86_64:pe64-x86_64-windows");
+    ASSERT_FALSE(o2.empty()) << "the driver must emit o2's relocatable object";
+
+    auto const mainSrc = writeSrc(dir, "main.c",
+                                  "extern int f1(void);\n"
+                                  "int main(void){ return f1(); }\n");
+    Program p;
+    p.setOutputDir(dir);
+    p.setResolveLibraries(std::vector<fs::path>{o1, o2});
+    DiagnosticReporter rep;
+    int const rc = p.compileFiles(
+        std::vector<std::string>{mainSrc.string()}, "c",
+        std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
+    ASSERT_EQ(rc, 0) << "linking two pre-assembled objects must succeed; errs="
+                     << rep.errorCount();
+    auto const mainExe = dir / "main.exe";
+    ASSERT_TRUE(fs::exists(mainExe)) << "the driver must emit main.exe";
+
+#if defined(_WIN32)
+    auto const r = runBinary(mainExe);
+    ASSERT_TRUE(r.spawned) << "main.exe must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE acceptance criterion: 42 = f1() (from o1.o) + f2() (from o2.o), "
+           "both pre-assembled objects carrying no MIR, merged into main.exe. A "
+           "silently dropped object cannot reach this answer.";
+#endif  // _WIN32
+}
+
+// PIN 2 — EAGER, and the discriminator is the SAME SOURCE in two containers.
+//
+// Nothing in `main` references `dss_unused_bulk`. As an OBJECT INPUT it must be
+// merged anyway (`ld a.o b.o` links `b.o` whether or not anything refers to it —
+// the operator naming the file IS the reference). As an ARCHIVE MEMBER it must
+// NOT be pulled (that is what makes a static library a library, and it is
+// already pinned by `LazyPullSkipsUnreferencedMember`). One source, one format,
+// two containers, two documented behaviours — so the image built through the
+// object route is strictly LARGER, by a function body deliberately sized far
+// beyond any alignment granularity.
+//
+// ⚠ THIS IS THE SILENT-DROP GUARD. Pin 1 would still pass if object inputs were
+// pulled lazily, because everything in it is referenced. Only an UNREFERENCED
+// object separates "merged eagerly" from "quietly omitted", and an omission is
+// invisible to `rc` and to any runtime answer.
+TEST(ObjectInput, CoffUnreferencedObjectInputIsMergedEagerlyUnlikeArchiveMember) {
+    Schemas const s = loadCoffSchemas();
+    ASSERT_TRUE(s.grammar);
+    auto const bulk = bulkFunctionSrc("dss_unused_bulk", 1500);
+    constexpr std::string_view kSelfContainedMain =
+        "int main(void){ return 42; }\n";
+
+    // ROUTE A — the bulk object named as an OBJECT INPUT.
+    ScratchDir scratchObj{Location::InsideRepo, "object-input-eager"};
+    auto const dirObj = scratchObj.path();
+    auto const bulkObj =
+        buildObject(dirObj, "bulk.c", bulk, "x86_64:pe64-x86_64-windows");
+    ASSERT_FALSE(bulkObj.empty()) << "the driver must emit bulk's object";
+    auto const mainObjSrc = writeSrc(dirObj, "main.c", kSelfContainedMain);
+    {
+        Program p;
+        p.setOutputDir(dirObj);
+        p.setResolveLibraries(std::vector<fs::path>{bulkObj});
+        DiagnosticReporter rep;
+        ASSERT_EQ(p.compileFiles(
+                      std::vector<std::string>{mainObjSrc.string()}, "c",
+                      std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"},
+                      rep),
+                  0)
+            << "the object-input link must succeed; errs=" << rep.errorCount();
+    }
+    auto const objExe = dirObj / "main.exe";
+    ASSERT_TRUE(fs::exists(objExe));
+
+    // ROUTE B — THE SAME SOURCE, bundled as an archive member instead.
+    ScratchDir scratchAr{Location::InsideRepo, "object-input-lazy"};
+    auto const dirAr = scratchAr.path();
+    auto const archive =
+        buildArchive(dirAr, "libbulk.a", {{bulk, "bulk.o"}}, s);
+    ASSERT_FALSE(archive.empty()) << "the driver must emit libbulk.a";
+    auto const mainArSrc = writeSrc(dirAr, "main.c", kSelfContainedMain);
+    {
+        Program p;
+        p.setOutputDir(dirAr);
+        p.setResolveLibraries(std::vector<fs::path>{archive});
+        DiagnosticReporter rep;
+        ASSERT_EQ(p.compileFiles(
+                      std::vector<std::string>{mainArSrc.string()}, "c",
+                      std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"},
+                      rep),
+                  0)
+            << "the archive link must succeed; errs=" << rep.errorCount();
+    }
+    auto const arExe = dirAr / "main.exe";
+    ASSERT_TRUE(fs::exists(arExe));
+
+    auto const objSize = static_cast<std::uintmax_t>(fs::file_size(objExe));
+    auto const arSize  = static_cast<std::uintmax_t>(fs::file_size(arExe));
+    EXPECT_GT(objSize, arSize)
+        << "an OBJECT INPUT is merged eagerly and an unpulled archive member is "
+           "not, so the object route's image must carry dss_unused_bulk's body: "
+           "object=" << objSize << " archive=" << arSize;
+
+#if defined(_WIN32)
+    // Both images must still RUN — an eager merge that corrupted the image
+    // would show up here and not in the size comparison above.
+    auto const rObj = runBinary(objExe);
+    ASSERT_TRUE(rObj.spawned) << rObj.diagnostic;
+    EXPECT_EQ(rObj.exitCode, 42u);
+    auto const rAr = runBinary(arExe);
+    ASSERT_TRUE(rAr.spawned) << rAr.diagnostic;
+    EXPECT_EQ(rAr.exitCode, 42u);
+#endif  // _WIN32
+}
+
+// PIN 3 — THE SAME CAPABILITY IN THE OTHER SHIPPED OBJECT FAMILY.
+//
+// Pins 1 and 2 are COFF because that is what the Windows leg can RUN. Coverage
+// is as wide as the SHAPES a suite names, never as the count that passes, and
+// ELF and COFF reach `readObjectInputModules` through DIFFERENT reader arms of
+// the `ObjectFormatKind` chokepoint — so a green COFF pin says nothing about
+// ELF. The BUILD half runs on every host (cross-compilation); the RUN half is
+// gated to an x86_64 Linux host exactly as its static-link sibling above is.
+TEST(ObjectInput, ElfTwoObjectInputsExitFortyTwo) {
+    ScratchDir scratch{Location::InsideRepo, "object-input-elf"};
+    auto const dir = scratch.path();
+
+    auto const o1 = buildObject(dir, "eo1.c",
+                                "int ef2(void);\n"
+                                "int ef1(void){ return ef2() + 2; }\n",
+                                "x86_64:elf64-x86_64-linux");
+    ASSERT_FALSE(o1.empty()) << "the driver must emit eo1's relocatable object";
+    auto const o2 = buildObject(dir, "eo2.c", "int ef2(void){ return 40; }\n",
+                                "x86_64:elf64-x86_64-linux");
+    ASSERT_FALSE(o2.empty()) << "the driver must emit eo2's relocatable object";
+
+    auto const mainSrc = writeSrc(dir, "main.c",
+                                  "extern int ef1(void);\n"
+                                  "int main(void){ return ef1(); }\n");
+    Program p;
+    p.setOutputDir(dir);
+    p.setResolveLibraries(std::vector<fs::path>{o1, o2});
+    DiagnosticReporter rep;
+    int const rc = p.compileFiles(
+        std::vector<std::string>{mainSrc.string()}, "c",
+        std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"}, rep);
+    ASSERT_EQ(rc, 0) << "linking two pre-assembled ELF objects must succeed; errs="
+                     << rep.errorCount();
+    auto const mainPath = dir / "main";
+    ASSERT_TRUE(fs::exists(mainPath)) << "the driver must emit the ELF exec";
+
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__))
+    auto const r = runBinary(mainPath);
+    ASSERT_TRUE(r.spawned) << "main must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE acceptance criterion: 42 = ef1() (from eo1.o) + ef2() (from "
+           "eo2.o), where ef2 is referenced ONLY from inside another object "
+           "input — the seed case a client-module-only pull gets wrong.";
+#endif  // __linux__ && x86_64
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE — an object is an INPUT on the same
+// route sources arrive on, and a link may consist of objects alone.
+//
+// ★★★ WHY THIS IS NOT COSMETIC. The standing ruling is that `--project`,
+// `--directory` and `--compile` are different ways to GATHER THE FILES TO BE
+// COMPILED and never different compilers. A relocatable object was nameable on
+// `--resolve-library` and on NO gathering route, so ✔MEASURED on the shipped
+// CLI before this arm: `--compile u1.c objs/u2.obj` produced a cascade of
+// `P000E illegal character 0x01` FROM THE TOKENIZER — the object was handed to
+// the front end — while the same two files through `--resolve-library` built an
+// exe that RAN and returned 42. One asymmetry, two answers.
+//
+// ⓘ Every case below pins the RUNTIME ANSWER, never `rc == 0`: an object that
+// is accepted, ignored and silently dropped returns 0 just as loudly as one
+// that was linked.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// PIN 1 — a SOURCE and an OBJECT gathered by the same flag.
+//
+// `cf2` is defined ONLY in the pre-assembled object and referenced ONLY from the
+// source, so 42 is unreachable unless the partition sent the object to the
+// linker AND the source to the front end, from ONE file list.
+TEST(ObjectInputCompileSurface, CoffSourceAndObjectGatheredTogetherExitFortyTwo) {
+    ScratchDir scratch{Location::InsideRepo, "object-input-compile"};
+    auto const dir = scratch.path();
+
+    auto const o2 = buildObject(dir, "co2.c", "int cf2(void){ return 42; }\n",
+                                "x86_64:pe64-x86_64-windows");
+    ASSERT_FALSE(o2.empty()) << "the driver must emit co2's relocatable object";
+
+    auto const mainSrc = writeSrc(dir, "cmain.c",
+                                  "int cf2(void);\n"
+                                  "int main(void){ return cf2(); }\n");
+    Program p;
+    p.setOutputDir(dir);
+    DiagnosticReporter rep;
+    // BOTH files on the COMPILE list. The object never reaches a grammar.
+    int const rc = p.compileUnits(
+        std::vector<std::string>{mainSrc.string(), o2.string()}, "c",
+        std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
+    ASSERT_EQ(rc, 0) << "a source and an object named on one compile must link; "
+                        "errs=" << rep.errorCount();
+    auto const mainExe = dir / "cmain.exe";
+    ASSERT_TRUE(fs::exists(mainExe)) << "the driver must emit cmain.exe";
+
+#if defined(_WIN32)
+    auto const r = runBinary(mainExe);
+    ASSERT_TRUE(r.spawned) << "cmain.exe must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE acceptance criterion: 42 comes from a function defined ONLY in "
+           "the pre-assembled object, reached from a source in the SAME "
+           "compile list.";
+#endif  // _WIN32
+}
+
+// PIN 2 — the ALL-OBJECT LINK. No compilation unit exists at all.
+//
+// ⚠ The arm every other route depends on not existing: with zero CUs the
+// `cuMirs.size() == 1` arm does not fire and the N>1 whole-program merge would
+// fold ZERO modules into one and lower the empty result.
+TEST(ObjectInputCompileSurface, CoffAllObjectLinkExitsFortyTwo) {
+    ScratchDir scratch{Location::InsideRepo, "object-input-allobj"};
+    auto const dir = scratch.path();
+
+    auto const o1 = buildObject(dir, "ao1.c",
+                                "int af2(void);\n"
+                                "int main(void){ return af2(); }\n",
+                                "x86_64:pe64-x86_64-windows");
+    ASSERT_FALSE(o1.empty()) << "the driver must emit ao1's object";
+    auto const o2 = buildObject(dir, "ao2.c", "int af2(void){ return 42; }\n",
+                                "x86_64:pe64-x86_64-windows");
+    ASSERT_FALSE(o2.empty()) << "the driver must emit ao2's object";
+
+    Program p;
+    p.setOutputDir(dir);
+    DiagnosticReporter rep;
+    int const rc = p.compileUnits(
+        std::vector<std::string>{o1.string(), o2.string()}, "c",
+        std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
+    ASSERT_EQ(rc, 0) << "an all-object link must succeed; errs="
+                     << rep.errorCount();
+    auto const exe = dir / "ao1.exe";
+    ASSERT_TRUE(fs::exists(exe))
+        << "the image is named after the first gathered file, object or not";
+
+#if defined(_WIN32)
+    auto const r = runBinary(exe);
+    ASSERT_TRUE(r.spawned) << "ao1.exe must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE acceptance criterion: `cc a.o b.o` — nothing was parsed, "
+           "nothing lowered, and the whole job was the link.";
+#endif  // _WIN32
+}
+
+// PIN 3 — THE ELECTION DISCRIMINATOR, and the one pin the other two cannot
+// substitute for.
+//
+// The link composition is `[client, objects…, pulled…]` and only the CLIENT's
+// `userEntrySymbol` survives the merge. A relocatable object cannot record one
+// — it is a per-CU arena id and no object format has a place for it — so the
+// driver resolves the entry BY NAME (the language's declared entry rows, mangled
+// by the format, filtered by the verbs the format realizes) and elects the
+// object that DEFINES it. Electing the first object unconditionally would make
+// this test and PIN 2 two different programs from the same two files.
+TEST(ObjectInputCompileSurface, CoffAllObjectLinkElectsTheEntryObjectNotTheFirst) {
+    ScratchDir scratch{Location::InsideRepo, "object-input-elect"};
+    auto const dir = scratch.path();
+
+    auto const helper = buildObject(dir, "eo_helper.c",
+                                    "int ef2(void){ return 42; }\n",
+                                    "x86_64:pe64-x86_64-windows");
+    ASSERT_FALSE(helper.empty());
+    auto const entry = buildObject(dir, "eo_entry.c",
+                                   "int ef2(void);\n"
+                                   "int main(void){ return ef2(); }\n",
+                                   "x86_64:pe64-x86_64-windows");
+    ASSERT_FALSE(entry.empty());
+
+    Program p;
+    p.setOutputDir(dir);
+    DiagnosticReporter rep;
+    // HELPER FIRST — the entry-defining object is named SECOND.
+    int const rc = p.compileUnits(
+        std::vector<std::string>{helper.string(), entry.string()}, "c",
+        std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
+    ASSERT_EQ(rc, 0) << "the entry may be defined by any named object; errs="
+                     << rep.errorCount();
+    auto const exe = dir / "eo_helper.exe";
+    ASSERT_TRUE(fs::exists(exe));
+
+#if defined(_WIN32)
+    auto const r = runBinary(exe);
+    ASSERT_TRUE(r.spawned) << "eo_helper.exe must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE acceptance criterion: the program entry was found in the "
+           "SECOND object. A first-object-wins election links a program with "
+           "no entry and cannot reach this answer.";
+#endif  // _WIN32
+}
+
+// PIN 4 — AND IT REFUSES IN THE ARM'S OWN WORDS WHEN THERE IS NO ENTRY.
+//
+// ⚠ Falling through here reaches the entry trampoline, whose message talks
+// about a synthesized `sym_<id>` convention and a SymbolId encoded in the
+// format's `entryPoint` — true of the mechanism and about nothing the operator
+// can act on. gcc, clang and MSVC all refuse the same link naming the same
+// fact, so this is the reference union's answer rather than invented strictness.
+TEST(ObjectInputCompileSurface, AllObjectLinkWithNoEntryFailsLoud) {
+    ScratchDir scratch{Location::InsideRepo, "object-input-noentry"};
+    auto const dir = scratch.path();
+
+    auto const helper = buildObject(dir, "no_entry.c",
+                                    "int nf2(void){ return 42; }\n",
+                                    "x86_64:pe64-x86_64-windows");
+    ASSERT_FALSE(helper.empty());
+
+    Program p;
+    p.setOutputDir(dir);
+    DiagnosticReporter rep;
+    int const rc = p.compileUnits(
+        std::vector<std::string>{helper.string()}, "c",
+        std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
+    EXPECT_NE(rc, 0)
+        << "an image with no entry must be refused, not silently given the "
+           "first function it happens to contain as its entry point";
+    EXPECT_GT(rep.errorCount(), 0u) << "the refusal must be diagnosed, not silent";
+    EXPECT_FALSE(fs::exists(dir / "no_entry.exe"))
+        << "a refused link must leave no working-looking binary behind";
+}
+
+// PIN 5 — the ELF twin of PIN 2. The partition asks the FORMAT, so a second
+// object family exercising it is what separates "the driver learned one
+// format's magic" from "the driver asks whichever format it is building for".
+TEST(ObjectInputCompileSurface, ElfAllObjectLinkExitsFortyTwo) {
+    ScratchDir scratch{Location::InsideRepo, "object-input-allobj-elf"};
+    auto const dir = scratch.path();
+
+    auto const o1 = buildObject(dir, "eao1.c",
+                                "int eaf2(void);\n"
+                                "int main(void){ return eaf2(); }\n",
+                                "x86_64:elf64-x86_64-linux");
+    ASSERT_FALSE(o1.empty()) << "the driver must emit eao1's ELF object";
+    auto const o2 = buildObject(dir, "eao2.c", "int eaf2(void){ return 42; }\n",
+                                "x86_64:elf64-x86_64-linux");
+    ASSERT_FALSE(o2.empty()) << "the driver must emit eao2's ELF object";
+
+    Program p;
+    p.setOutputDir(dir);
+    DiagnosticReporter rep;
+    int const rc = p.compileUnits(
+        std::vector<std::string>{o1.string(), o2.string()}, "c",
+        std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"}, rep);
+    ASSERT_EQ(rc, 0) << "an all-object ELF link must succeed; errs="
+                     << rep.errorCount();
+    auto const exe = dir / "eao1";
+    ASSERT_TRUE(fs::exists(exe)) << "the driver must emit the ELF exec";
+
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__))
+    auto const r = runBinary(exe);
+    ASSERT_TRUE(r.spawned) << "eao1 must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE acceptance criterion: an all-object link on the second shipped "
+           "object family.";
+#endif  // __linux__ && x86_64
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// D-STATICLIB-MEMBER-NAME-DERIVES-FROM-THE-FIRST-SOURCE — a member is named
+// after the source that produced IT.
+//
+// ✔MEASURED before the fix: `--compile u1.c u2.c --target …-staticlib` emitted
+// members `u1_0.obj` AND `u1_1.obj` — both from the FIRST source's stem plus an
+// index, so `u2.c`'s member was named after `u1`. Selection was never wrong
+// (the armap indexes by position); what was wrong is every `ar t` listing and
+// every member-read refusal, each naming a file that did not produce the member.
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST(StaticArchiveMemberNames, EachMemberIsNamedAfterItsOwnSource) {
+    ScratchDir scratch{Location::InsideRepo, "staticlib-member-names"};
+    auto const dir = scratch.path();
+    auto const s1 = writeSrc(dir, "mn1.c", "int mn_f1(void){ return 1; }\n");
+    auto const s2 = writeSrc(dir, "mn2.c", "int mn_f2(void){ return 2; }\n");
+
+    Program p;
+    p.setOutputDir(dir);
+    DiagnosticReporter rep;
+    int const rc = p.compileUnits(
+        std::vector<std::string>{s1.string(), s2.string()}, "c",
+        std::vector<std::string>{"x86_64:elf64-x86_64-linux-staticlib"}, rep);
+    ASSERT_EQ(rc, 0) << "two-CU staticlib build must succeed; errs="
+                     << rep.errorCount();
+
+    auto const archivePath = dir / "mn1.a";
+    ASSERT_TRUE(fs::exists(archivePath));
+    auto const bytes = readFileBytes(archivePath);
+    DiagnosticReporter rrep;
+    auto arch = ffi::readArArchive(bytes, archivePath.string(), rrep);
+    ASSERT_TRUE(arch.has_value()) << arch.error().detail;
+    ASSERT_EQ(arch->members.size(), 2u) << "two CUs -> two members";
+
+    std::vector<std::string> names;
+    for (auto const& m : arch->members) names.push_back(m.name);
+    EXPECT_EQ(names[0], "mn1.o");
+    EXPECT_EQ(names[1], "mn2.o")
+        << "the SECOND member is named after the SECOND source. Before the fix "
+           "this read `mn1_1.o` — a name that points a member-read refusal at a "
+           "file which did not produce the member.";
+    for (auto const& n : names) {
+        EXPECT_EQ(n.find("mn1_"), std::string::npos)
+            << "member '" << n
+            << "' still carries the first-source stem plus an index";
+    }
+}
+
+// ⓘ THE UNIQUIFIER, WHICH THE OLD `_<i>` SUFFIX MADE UNNECESSARY AND THE NEW
+// NAMES DO NOT. Two sources in different directories legitimately share a stem;
+// two identically-named members in one archive would be exactly the misdirection
+// this row is about, one level down. The suffix is applied only where a name
+// would otherwise repeat, so the ordinary case reads `<stem>.o` and the
+// collision case is still distinguishable.
+TEST(StaticArchiveMemberNames, TwoSourcesSharingAStemAreDisambiguated) {
+    ScratchDir scratch{Location::InsideRepo, "staticlib-member-collide"};
+    auto const dir = scratch.path();
+    fs::create_directories(dir / "a");
+    fs::create_directories(dir / "b");
+    auto const s1 = writeSrc(dir / "a", "dup.c", "int dup_a(void){ return 1; }\n");
+    auto const s2 = writeSrc(dir / "b", "dup.c", "int dup_b(void){ return 2; }\n");
+
+    Program p;
+    p.setOutputDir(dir);
+    DiagnosticReporter rep;
+    int const rc = p.compileUnits(
+        std::vector<std::string>{s1.string(), s2.string()}, "c",
+        std::vector<std::string>{"x86_64:elf64-x86_64-linux-staticlib"}, rep);
+    ASSERT_EQ(rc, 0) << "same-stem two-CU staticlib build must succeed; errs="
+                     << rep.errorCount();
+
+    auto const archivePath = dir / "dup.a";
+    ASSERT_TRUE(fs::exists(archivePath));
+    auto const bytes = readFileBytes(archivePath);
+    DiagnosticReporter rrep;
+    auto arch = ffi::readArArchive(bytes, archivePath.string(), rrep);
+    ASSERT_TRUE(arch.has_value()) << arch.error().detail;
+    ASSERT_EQ(arch->members.size(), 2u);
+    EXPECT_NE(arch->members[0].name, arch->members[1].name)
+        << "two members of one archive must not share a file name";
+    EXPECT_EQ(arch->members[0].name, "dup.o");
+    EXPECT_EQ(arch->members[1].name, "dup_1.o");
 }

@@ -413,6 +413,14 @@ struct DSS_EXPORT ModuleSymbol {
     std::string      name;                               // declared identifier — the cross-CU match key
     SymbolBinding    binding    = SymbolBinding::Global; // Local: module-private; Global/Weak: enter the global table
     SymbolVisibility visibility = SymbolVisibility::Default;
+    // D-LK-COFF-COMDAT-SAME-SIZE-EXACT-MATCH-UNCHECKED: what this WEAK
+    // definition promises about the copies it will be folded against. Read ONLY
+    // when `binding == Weak` and only by the cross-CU fold; `Any` (the default)
+    // is the pre-existing behaviour verbatim, so every producer that does not
+    // set it is unchanged. Producers that DO know: the COFF object reader, from
+    // the COMDAT Selection byte. See `core/types/symbol_attrs.hpp` for why this
+    // is a second axis rather than two more `SymbolBinding` enumerators.
+    DuplicateMatch   duplicateMatch = DuplicateMatch::Any;
 };
 
 struct DSS_EXPORT AssembledModule {

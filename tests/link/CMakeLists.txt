@@ -273,6 +273,19 @@ dss_add_test(NAME link/test_object_format_backend_registry
 target_link_libraries(dss_link_test_object_format_backend_registry
                       PRIVATE nlohmann_json::nlohmann_json)
 
+# `looksLikeRelocatableObject()` — the backends' raw-bytes probe, the answer a
+# driver routes a compile input on: a `.o` named as an input is tokenized as C
+# source today and dies at `illegal character 0x7f`. Unlike its four sibling
+# predicates this one reads a FILE — arbitrary, possibly truncated, possibly a
+# near-miss — under `noexcept`, so the truncation cases are the contract and
+# not politeness. Two cases hand it a DESYNCED header (one encoding declared,
+# the type word spelled in the other): on a little-endian host they are the
+# only ones that can tell a correct lens from a lucky one, and DSS has a live
+# big-endian s390x leg. No json link — the fixtures are byte patterns built
+# from the SHIPPED schemas' own declared values via `loadShipped`.
+dss_add_test(NAME link/test_relocatable_object_probe
+             SOURCES test_relocatable_object_probe.cpp)
+
 # UCRT-P4 (D-FFI-PE-CRT-UCRT-MIGRATION): the `runtimeLibraries` ROLE TABLE's
 # red-on-disable levers + the migration's mechanical exit criterion. Both levers are
 # the C4 shape -- change CONFIG, recompile no C++, observe different EMITTED BYTES.
@@ -413,3 +426,15 @@ dss_add_test(NAME link/test_merged_foreign_unwind
              SOURCES test_merged_foreign_unwind.cpp)
 target_link_libraries(dss_link_test_merged_foreign_unwind
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LK-OBJECT-CARRIES-NO-SUMMARY-OR-MIR-SECTION -- the `.dss.summary` / `.dss.mir`
+# pair every LINK-INPUT format declares. Pins the VOCABULARY (declared, on the
+# derived population, per-format spelling, NON-ALLOC in each format's own idiom)
+# and the SPLIT itself: two sections, because the global pass must read every
+# summary WITHOUT paging in one byte of MIR. Population is DERIVED from the
+# documents (not an image + declares a `text` row), so a relocatable format
+# added tomorrow is measured the day it lands. No json link -- every fact is
+# read through `ObjectFormatSchema::loadShipped`, which also proves the ten
+# edited documents still load.
+dss_add_test(NAME link/test_lto_summary_ir_sections
+             SOURCES test_lto_summary_ir_sections.cpp)

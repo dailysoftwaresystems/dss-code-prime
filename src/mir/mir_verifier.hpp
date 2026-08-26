@@ -142,6 +142,13 @@ private:
     // that rule's own comment defers ("when the first non-cst_to_hir producer
     // arrives"). Emits I_CallSignatureMismatch. Interner-gated.
     //
+    // P36 (D-MIR-VERIFIER-CALLSITE-RESULT-TYPE-UNCHECKED): it now also checks
+    // the Call's RESULT against the callee's declared return, with explicit
+    // arms for no-result/`void`, a by-value-class return's ABI piece 0, and a
+    // scalar return. That check runs BEFORE the physical-vs-semantic operand
+    // gate below, because the gate bails on a by-value-class return and would
+    // otherwise silence exactly the struct-return shape the result rule is for.
+    //
     // ⚠ THE RULE'S OWN LIMITS — it covers strictly less than "the call is
     // wired correctly", and must not be read as covering more:
     //   * TYPE-BLIND TRANSPOSITION. Two operands whose declared parameter
@@ -181,6 +188,26 @@ private:
     // initialization is not itself atomic). Interner-gated (needs
     // isAtomicQualified); skipped when `interner_ == nullptr`.
     void checkAtomicAccessLowered(DiagnosticReporter& reporter) const;
+
+    // P36 (D-MIR-VERIFIER-STORE-CALLARG-TYPE-BLIND): the MEMORY-WRITE seam. A
+    // `Store`/`AtomicStore`'s VALUE must have the type of the slot it lands in —
+    // the pointee of its address operand — under the ONE value↔slot
+    // compatibility notion (`sameSlotType` in the .cpp) that the two call rules
+    // also use. Until this rule, `checkAtomicAccessLowered` walked every Store
+    // and read ONLY the pointee's atomic qualification, so a wrong `TypeId` on a
+    // stored value passed SILENTLY: that is how
+    // D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE hid — its `return` form
+    // was diagnosed (`I_TerminatorTypeMismatch`) while the store-shaped form
+    // carried the SAME wrong TypeId with no diagnostic at all. Emits
+    // I_StoreValueTypeMismatch. Interner-gated.
+    //
+    // ⚠ THE ONE NARROWING, stated because a rule tuned to its own output
+    // asserts nothing: a `ptr<void>` pointee makes NO type claim (it is MIR's
+    // spelling for "an address whose pointee is unknown"), so a store through
+    // one is not judged. That is the `void*` arm of `sameSlotType` read one
+    // level down, and it lives at the seam rather than in the notion because it
+    // is a fact about what a `void` pointee MEANS.
+    void checkStoreValueTypes(DiagnosticReporter& reporter) const;
 
     Mir const&          mir_;
     TypeInterner const* interner_;

@@ -245,6 +245,39 @@ struct DSS_EXPORT CliArgs {
     // are uncappable by construction on every CLI path.
     std::optional<std::size_t>    maxDiagnostics;
 
+    // `--max-per-code <count>` / `--max-per-code=<count>`: the PER-CODE cap —
+    // `DiagnosticReporter::Config::maxPerCode`. Beyond this many of ONE code,
+    // the reporter coalesces and records the elision in a `P_DiagnosticsElided`
+    // marker (D-DIAG-MAXPERCODE-SILENT-COALESCE).
+    //
+    // ★★ WHY THIS FLAG HAD TO EXIST BEFORE THE MARKER COULD BE HONEST. The
+    // marker's remedy sentence names the way to see what was hidden. Until this
+    // flag, the ONLY way to raise the per-code cap was to edit C++ and rebuild
+    // — so a marker that told an operator "raise the cap" would have been
+    // naming a remedy they could not perform, which is the defect
+    // `--max-diagnostics` was added to fix one axis over. A notice whose remedy
+    // is unreachable is barely better than silence.
+    //
+    // ★★ AND IT IS THE AXIS THAT ACTUALLY BINDS. ✔MEASURED: `report()` checks
+    // `maxPerCode` BEFORE `maxDiagnostics`, so an ordinary tier is bounded at
+    // (distinct codes x maxPerCode) and NEVER approaches the global cap — 1400
+    // illegal characters reach stderr as 100 diagnostics, 1400 malformed
+    // declarations as 53, 1400 `#warning` directives as 50. An operator raising
+    // only `--max-diagnostics` therefore changes nothing about what they see;
+    // this is the flag that does.
+    //
+    // ★ std::optional for the same reason as `maxDiagnostics`: absent means "do
+    // not write the field", so `DiagnosticReporter::Config`'s in-class
+    // initializer stays the single source of truth for the default.
+    //
+    // ★ ZERO IS LEGAL, on the identical argument: the gate is
+    // `counts >= cfg_.maxPerCode` on unsigned operands, so at 0 the first
+    // report of every code is elided and counted into that code's marker —
+    // "show me none of them, just tell me how many of each there were". It
+    // cannot silence a `Guaranteed` or unsuppressable diagnostic, which bypass
+    // all four volume gates at every value.
+    std::optional<std::size_t>    maxPerCode;
+
     // `--time` prints the compilation's wall-clock duration to stderr after the
     // compile finishes (any compile-producing mode). Diagnostic-neutral, off by
     // default; `--time` with no mode flag is a hard NoModeSelected error.
@@ -349,6 +382,20 @@ enum class CliArgsError : std::uint8_t {
                                 // the two share only the word "diagnostic",
                                 // and the remediation differs completely
                                 // ("write a number" vs "spell the code name").
+    InvalidMaxPerCode   = 17,   // D-DIAG-MAXPERCODE-SILENT-COALESCE:
+                                // --max-per-code with a non-numeric value,
+                                // trailing junk, or a count that overflows
+                                // std::size_t. ZERO IS NOT AN ERROR, for the
+                                // same reason it is not for --max-diagnostics:
+                                // `report()`'s gate is an unsigned `>=`, so 0
+                                // is a value the library already defines
+                                // ("elide every one, but count them"), and a
+                                // parser that rejected it would be a narrower,
+                                // disagreeing second source of truth.
+                                // Its OWN enumerator rather than reusing
+                                // InvalidMaxDiagnostics: they name DIFFERENT
+                                // axes (global vs per-code), and an operator
+                                // who mistypes one must be told which.
 };
 
 [[nodiscard]] DSS_EXPORT std::string_view

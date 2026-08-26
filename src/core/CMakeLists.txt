@@ -24,6 +24,9 @@ add_library(core OBJECT
     types/header_case_diagnostic.cpp
     types/include_path_resolve.cpp
     types/glob_match.cpp
+    # The content-addressed memo every schema family loads through
+    # (D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS).
+    types/config_document_memo.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
     types/predefined_macro_json.cpp

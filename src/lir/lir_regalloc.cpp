@@ -154,8 +154,15 @@ buildFreeLists(TargetSchema const&            schema,
     // read (SILENT miscompile — e.g. x86_64 SysV's last caller-saved
     // GPR is r9 = the 6th integer arg register). Reserve K caller-saved
     // NON-ARG (and non-sret) registers, scanning from the caller-saved
-    // END (the allocator's last-choice partition — tryAllocate prefers
-    // callee-saved) and SKIPPING any arg/sret ordinal. cc-config-driven
+    // END and SKIPPING any arg/sret ordinal.
+    //
+    // ⓘ THE RESERVE IS UNAFFECTED BY THE OPT8 PARTITION PREFERENCE, and
+    // the reason is the ORDER OF OPERATIONS rather than an argument about
+    // pressure: these K registers are held back BEFORE the free lists are
+    // built, so they are never in circulation for `tryAllocate` to prefer
+    // in the first place. (The comment here used to describe caller-saved
+    // as "the allocator's last-choice partition"; a non-call-crossing
+    // range now prefers it — see `tryAllocate`'s docblock.) cc-config-driven
     // (argGprs/argFprs/indirectResultRegister); no register names, no
     // arch identity. x86_64 SysV non-arg caller-saved GPRs = {rax, r10,
     // r11} = 3 ≥ K (K ≤ the max non-call same-class virtual reg
@@ -591,22 +598,58 @@ struct AllocPick {
     bool          isCalleeSaved;
 };
 
+// ── THE PARTITION PREFERENCE (plan 22 OPT8) ─────────────────────────────
+//
+// ★★★ A RANGE THAT DOES NOT CROSS A CALL PREFERS A **CALLER-SAVED**
+// REGISTER, AND THE ORDER USED TO BE THE OTHER WAY ROUND.
+//
+// The ABI envelope is unchanged and is the part that must not move: a range
+// that DOES cross a call may only be assigned a callee-saved register,
+// because the callee is free to destroy every caller-saved one. That clause
+// is still the first thing this function checks.
+//
+// What changed is the preference for the ranges the envelope does NOT
+// constrain. A callee-saved register is not free: the function that uses one
+// must SAVE it in its prologue and RESTORE it in its epilogue, which is two
+// memory instructions plus (for the first one in a frameless function) the
+// `sub rsp` / `add rsp` pair that makes somewhere to put it. A caller-saved
+// register costs nothing at all to a range that never crosses a call.
+// Handing out the expensive partition first therefore bought a leaf function
+// a prologue it did not need, AND consumed the very registers that the
+// call-crossing ranges are the only legitimate consumers of — so it made
+// spills more likely at the same time.
+//
+// ✔MEASURED on the emitted `examples/c/**` artifacts before this change
+// (2026-08-25, 561 ELF64/x86_64 release artifacts): 3352 callee-saved
+// prologue SAVES, each with its epilogue restore — 6704 instructions, 5.1%
+// of the whole emitted stream — and 20.5% of all instructions touch the
+// stack. The `int main(void){return 42;}` shape emitted SEVEN instructions
+// (`sub rsp` / save r15 / `mov $42,r15` / `mov r15,rax` / restore r15 /
+// `add rsp` / `ret`) where the references emit two.
+//
+// ⚠ THE ENVELOPE IS WHAT MAKES THIS SAFE, NOT THE MEASUREMENT. Nothing
+// below widens what a cross-call range may be given; the caller-saved arm is
+// reachable only when `crossesCall` is false, exactly as before. A
+// non-cross-call range was ALREADY allowed both partitions — this only
+// changes which it is offered first.
 [[nodiscard]] std::optional<AllocPick>
 tryAllocate(FreeListsByClass& free, LirRegClass cls, bool crossesCall) {
     auto& bucket = free[static_cast<std::size_t>(cls)];
+    if (!crossesCall) {
+        if (auto r = popReg(bucket.callerSaved); r.has_value()) {
+            return AllocPick{*r, false};
+        }
+    }
     if (auto r = popReg(bucket.calleeSaved); r.has_value()) {
         return AllocPick{*r, true};
-    }
-    if (crossesCall) return std::nullopt;
-    if (auto r = popReg(bucket.callerSaved); r.has_value()) {
-        return AllocPick{*r, false};
     }
     return std::nullopt;
 }
 
 // Pop a free register, SKIPPING any ordinal in `excluded`. Matches
-// the `tryAllocate` policy (callee-saved first, then caller-saved
-// unless crossesCall) but removes the picked entry only when it's
+// the `tryAllocate` policy exactly (a call-crossing range takes only
+// callee-saved; any other range prefers caller-saved and falls back to
+// callee-saved) but removes the picked entry only when it's
 // admissible. Excluded entries stay in the bucket (will be returned
 // to circulation when an unfettered call site asks for them).
 //
@@ -645,12 +688,17 @@ tryAllocateExcluding(FreeListsByClass& free,
         return std::nullopt;
     };
     auto& bucket = free[static_cast<std::size_t>(cls)];
+    // Same partition preference as `tryAllocate` — see its docblock. The two
+    // must agree, because which one runs is decided by whether the range
+    // happens to have an exclusion set, which is not a property a register
+    // choice may depend on.
+    if (!crossesCall) {
+        if (auto r = popFiltered(bucket.callerSaved); r.has_value()) {
+            return AllocPick{*r, false};
+        }
+    }
     if (auto r = popFiltered(bucket.calleeSaved); r.has_value()) {
         return AllocPick{*r, true};
-    }
-    if (crossesCall) return std::nullopt;
-    if (auto r = popFiltered(bucket.callerSaved); r.has_value()) {
-        return AllocPick{*r, false};
     }
     return std::nullopt;
 }

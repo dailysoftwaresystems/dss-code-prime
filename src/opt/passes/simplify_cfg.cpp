@@ -5,6 +5,7 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"
+#include "opt/passes/mir_id_remap.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 #include "opt/passes/path_compress.hpp"
 
@@ -45,6 +46,9 @@ public:
     [[nodiscard]] std::size_t blocksMerged() const noexcept {
         return blocksMerged_;
     }
+    [[nodiscard]] std::uint64_t analysisInstScans() const noexcept {
+        return analysisInstScans_;
+    }
 
     // `preds` = `mirBuildPredecessors(mir)` for the SAME module, computed ONCE
     // by runSimplifyCfg and threaded in (invariant across every function in one
@@ -52,6 +56,42 @@ public:
     // D-OPT-CSE-ANALYSIS-HOIST). analyze only VALUE-READS `preds[B.v]` for the
     // merge-candidate single-predecessor check.
     void analyze(MirFuncId fn, std::vector<std::vector<MirBlockId>> const& preds);
+
+    // ── D-PERF-SIMPLIFYCFG-ADDRESS-TAKEN-QUERY-RESCANS-THE-WHOLE-FUNCTION ──
+    //
+    // ONE sweep of `fn`'s instructions that answers, for every block of `fn`,
+    // BOTH structural questions this analysis asks: is the block the target of
+    // a `BlockAddress`, and does the block contain a `Phi`. Called once per
+    // function, from `analyze`.
+    //
+    // ★ WHY THIS EXISTS AND WHAT IT REPLACES. `Mir::isBlockAddressTaken(b)` is
+    // DERIVED, not stored — it answers by scanning every instruction of `b`'s
+    // owning function looking for a `BlockAddress` whose payload is `b`. That
+    // derivation is the right design at the Mir tier (it cannot go stale across
+    // a rebuild, and it needs no side-table), and it is fine for the one-off
+    // codegen query it was written for. It is NOT fine as a per-block predicate:
+    // the trampoline loop asked it once for every block, so the loop cost
+    // Θ(blocks × instructions). ✔MEASURED on `examples/c/switch_wide_bound`
+    // (one 4201-arm switch): 4214 calls, 66 ms, in a pass whose TOTAL was 70 ms
+    // and whose reported mutation count was ZERO. Scaling the same shape
+    // confirmed the exponent rather than assuming it — 600/1200/2400/4201 arms
+    // cost 1/5/19/56 ms per run, i.e. ~4× per doubling.
+    //
+    // ★ THE ANSWER IS IDENTICAL, BY CONSTRUCTION, NOT BY LUCK. The sweep walks
+    // `funcBlockCount`/`funcBlockAt` — the SAME block set `isBlockAddressTaken`
+    // walks, which is the whole function INCLUDING blocks unreachable from
+    // entry, not the RPO subset this analysis otherwise iterates. Restricting it
+    // to RPO would silently answer "not address-taken" for a block whose only
+    // `&&label` sits in an unreachable region, and that answer would elide a
+    // block an `IndirectBr` can still reach. The source module is immutable for
+    // the whole pass (the rebuild writes a SEPARATE builder), so one sweep and N
+    // rescans observe the same MIR.
+    //
+    // ★ THE PHI QUESTION RIDES ALONG rather than getting its own loop: it was
+    // already two separate O(block) scans (the trampoline gate's `hasAnyPhi` and
+    // the merge gate's inline loop), it needs exactly the same walk, and a
+    // second walk would be a second thing to keep in step with this one.
+    void gatherStructuralFacts(MirFuncId fn);
 
     // D-OPT-SIMPLIFYCFG-EMPTY-SELF-LOOP-REDIRECT-CYCLE — THE ACYCLICITY
     // CHOKEPOINT for `jumpThreadMap_`. Called by `analyze` between the
@@ -156,7 +196,7 @@ public:
     //     starves a surviving phi to zero incomings.
     [[nodiscard]] bool acceptPhiIncoming(
         MirPhiIncoming const& inc, MirBlockId oldPhiBlock,
-        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) override {
+        MirBlockRemap const& /*blockMap*/) override {
         if (abandonedPhiEdges_.find(edgeKey_(inc.pred.v, oldPhiBlock.v))
             != abandonedPhiEdges_.end()) {
             return false;  // (1) dead EDGE
@@ -169,16 +209,16 @@ public:
 
     [[nodiscard]] std::optional<MirInstId>
     tryRewriteTerminator(MirOpcode op, MirInstId oldId, MirBuilder& dst,
-                         std::unordered_map<std::uint32_t, MirInstId> const& /*rewrite*/,
-                         std::unordered_map<std::uint32_t, MirBlockId> const& blockMap) override {
+                         MirInstRemap const& /*rewrite*/,
+                         MirBlockRemap const& blockMap) override {
         if (op != MirOpcode::CondBr) return std::nullopt;
         auto it = foldedBranches_.find(oldId);
         if (it == foldedBranches_.end()) return std::nullopt;
         // `it->second` is the OLD-id of the target block (already
         // path-compressed through `jumpThreadMap_` at analysis time).
         // Resolve to NEW via blockMap.
-        auto const blkIt = blockMap.find(it->second.v);
-        if (blkIt == blockMap.end()) {
+        MirBlockId const* const blkNew = blockMap.find(it->second.v);
+        if (blkNew == nullptr) {
             std::fprintf(stderr,
                 "dss::opt::passes::SimplifyCfg fatal: branch-fold target "
                 "block v=%u for terminator v=%u not in blockMap — "
@@ -188,7 +228,7 @@ public:
             std::abort();
         }
         ++branchesFolded_;
-        return dst.addBr(blkIt->second);
+        return dst.addBr(*blkNew);
     }
 
     void resetPerFunction() {
@@ -198,6 +238,12 @@ public:
         absorbedToHead_.clear();
         abandonedPhiEdges_.clear();
         postFoldReachable_.clear();
+        // The two structural memos are per-function state on exactly the same
+        // terms as everything above — a memo left over from the PREVIOUS
+        // function would answer with another function's block slots, which is
+        // the drift this single reset point exists to make impossible.
+        addressTakenTargets_.clear();
+        blocksWithPhi_.clear();
     }
 
     // (No `recordTerminatorInRewrite` override — the hook is gone.) This policy
@@ -256,6 +302,24 @@ private:
     // (their own elision is owned by `absorbedToHead_` / `jumpThreadMap_`;
     // this set is purely the post-fold reachability fact).
     std::unordered_set<MirBlockId> postFoldReachable_;
+    // D-PERF-SIMPLIFYCFG-ADDRESS-TAKEN-QUERY-RESCANS-THE-WHOLE-FUNCTION.
+    // Both memos are keyed by BLOCK SLOT and are filled by `gatherStructuralFacts`
+    // for the function currently under analysis; see that function's doc for why
+    // they replace the per-block `Mir::isBlockAddressTaken` / `hasAnyPhi` rescans
+    // and why the answers are identical rather than merely close.
+    //   * `addressTakenTargets_` = the payloads of every `BlockAddress` in the
+    //     function, i.e. exactly the blocks `Mir::isBlockAddressTaken` answers
+    //     true for.
+    //   * `blocksWithPhi_` = the blocks holding at least one `Phi`.
+    std::unordered_set<std::uint32_t> addressTakenTargets_;
+    std::unordered_set<std::uint32_t> blocksWithPhi_;
+
+    [[nodiscard]] bool isAddressTaken_(MirBlockId b) const noexcept {
+        return addressTakenTargets_.count(b.v) != 0;
+    }
+    [[nodiscard]] bool hasAnyPhi_(MirBlockId b) const noexcept {
+        return blocksWithPhi_.count(b.v) != 0;
+    }
 
     [[nodiscard]] static std::uint64_t edgeKey_(std::uint32_t pred,
                                                 std::uint32_t owner) noexcept {
@@ -265,6 +329,12 @@ private:
     std::size_t branchesFolded_     = 0;
     std::size_t blocksJumpThreaded_ = 0;
     std::size_t blocksMerged_       = 0;
+    // Instructions read by `gatherStructuralFacts`, summed over every analyzed
+    // function — the pass's own statement of its analysis complexity. Lives
+    // across functions (a per-invocation total, like the three counters above),
+    // so it is deliberately NOT reset by `resetPerFunction`. Surfaced on
+    // `SimplifyCfgResult::analysisInstScans`; see that field for the pin.
+    std::uint64_t analysisInstScans_ = 0;
 };
 
 // ── D-OPT-SIMPLIFYCFG-EMPTY-SELF-LOOP-REDIRECT-CYCLE ────────────────────────
@@ -399,12 +469,42 @@ void SimplifyCfgPolicy::breakJumpThreadCycles(std::vector<MirBlockId> const& rpo
     }
 }
 
+void SimplifyCfgPolicy::gatherStructuralFacts(MirFuncId fn) {
+    std::uint32_t const nb = src_.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b  = src_.funcBlockAt(fn, bi);
+        std::uint32_t const ni = src_.blockInstCount(b);
+        analysisInstScans_ += ni;
+        for (std::uint32_t ii = 0; ii < ni; ++ii) {
+            MirInstId const inst = src_.blockInstAt(b, ii);
+            switch (src_.instOpcode(inst)) {
+            case MirOpcode::BlockAddress:
+                // The TYPED payload reader, never a hand-decoded `instPayload`
+                // — it aborts on a wrong-opcode id, so this cannot silently
+                // start recording some other opcode's payload as a block slot.
+                addressTakenTargets_.insert(src_.blockAddressTarget(inst).v);
+                break;
+            case MirOpcode::Phi:
+                blocksWithPhi_.insert(b.v);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+}
+
 void SimplifyCfgPolicy::analyze(MirFuncId fn,
                                 std::vector<std::vector<MirBlockId>> const& preds) {
     resetPerFunction();
     MirBlockId const entry = src_.funcEntry(fn);
     auto const rpo = mirReversePostOrder(src_, entry);
     if (rpo.empty()) return;
+
+    // D-PERF-SIMPLIFYCFG-ADDRESS-TAKEN-QUERY-RESCANS-THE-WHOLE-FUNCTION: the
+    // ONE structural sweep every gate below reads from. It must run before the
+    // first gate and after `resetPerFunction`, and there is exactly one caller.
+    gatherStructuralFacts(fn);
 
     // c115 SEH (D-WIN64-SEH-FUNCLETS): blocks that are DIRECT SUCCESSORS of a
     // SEH terminator (SehTryBegin's [tryEntry, filterEntry], SehFilterReturn's
@@ -432,15 +532,6 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn,
     //   - The Br's target S has no Phi nodes (conservative — avoids
     //     phi-incoming-from-B fan-out which requires reflowing every
     //     incoming through B's full predecessor set).
-    auto hasAnyPhi = [&](MirBlockId b) {
-        std::uint32_t const n = src_.blockInstCount(b);
-        for (std::uint32_t i = 0; i < n; ++i) {
-            if (src_.instOpcode(src_.blockInstAt(b, i)) == MirOpcode::Phi) {
-                return true;
-            }
-        }
-        return false;
-    };
     for (MirBlockId const b : rpo) {
         if (b.v == entry.v) continue;
         // D-CSUBSET-COMPUTED-GOTO (MF-B): never trampoline-REMOVE an ADDRESS-TAKEN
@@ -448,7 +539,10 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn,
         // may jump to it; eliding it would leave the synthetic block symbol's
         // offset pointing at deleted/moved code — a SILENT MISCOMPILE. Keep it
         // verbatim (the indirect edge keeps it reachable anyway).
-        if (src_.isBlockAddressTaken(b)) continue;
+        // The answer comes from `gatherStructuralFacts`' memo, not from
+        // `Mir::isBlockAddressTaken` — same set, one function sweep instead of
+        // one per block (D-PERF-SIMPLIFYCFG-ADDRESS-TAKEN-QUERY-RESCANS-THE-WHOLE-FUNCTION).
+        if (isAddressTaken_(b)) continue;
         // c115 SEH: a region-skeleton anchor is never elided (see above).
         if (sehSuccessors.count(b.v) != 0) continue;
         if (src_.blockInstCount(b) != 1) continue;
@@ -457,7 +551,7 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn,
         auto const succs = src_.blockSuccessors(b);
         if (succs.size() != 1) continue;  // defense — Br has exactly 1
         MirBlockId const tgt = succs[0];
-        if (hasAnyPhi(tgt)) continue;
+        if (hasAnyPhi_(tgt)) continue;
         // NOTE — there is deliberately NO `tgt.v == b.v` special case here.
         // A Br-to-self IS a redirect cycle, just the length-1 one, and it is
         // handled by `breakJumpThreadCycles` below together with every other
@@ -510,8 +604,10 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn,
         // its predecessor P. B's runtime address is live as data (an IndirectBr can
         // branch to it); folding B's body into P would move B's code, so the
         // synthetic block symbol's offset would no longer name B's first
-        // instruction — a SILENT MISCOMPILE.
-        if (src_.isBlockAddressTaken(B)) return false;
+        // instruction — a SILENT MISCOMPILE. Memo-answered, same as the
+        // trampoline gate above
+        // (D-PERF-SIMPLIFYCFG-ADDRESS-TAKEN-QUERY-RESCANS-THE-WHOLE-FUNCTION).
+        if (isAddressTaken_(B)) return false;
         // c115 SEH: a region-skeleton anchor is never absorbed (see above).
         if (sehSuccessors.count(B.v) != 0) return false;
         if (jumpThreadMap_.count(P) || jumpThreadMap_.count(B)) return false;
@@ -519,12 +615,9 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn,
         if (preds[B.v][0].v != P.v) return false;
         std::uint32_t const bCount = src_.blockInstCount(B);
         if (bCount <= 1) return false;  // empty/trampoline — handled elsewhere
-        // Phi gate.
-        for (std::uint32_t i = 0; i < bCount; ++i) {
-            if (src_.instOpcode(src_.blockInstAt(B, i)) == MirOpcode::Phi) {
-                return false;
-            }
-        }
+        // Phi gate — memo-answered, exactly the set the open-coded scan this
+        // replaced produced (D-PERF-SIMPLIFYCFG-ADDRESS-TAKEN-QUERY-RESCANS-THE-WHOLE-FUNCTION).
+        if (hasAnyPhi_(B)) return false;
         return true;
     };
     // Process pairs in RPO order, incrementally admitting them into
@@ -730,6 +823,7 @@ SimplifyCfgResult runSimplifyCfg(Mir& mir, TypeInterner const& /*interner*/,
     result.branchesFolded     = policy.branchesFolded();
     result.blocksJumpThreaded = policy.blocksJumpThreaded();
     result.blocksMerged       = policy.blocksMerged();
+    result.analysisInstScans  = policy.analysisInstScans();
     mir = std::move(builder).finish();
     // Canonical-marker stamping (D-OPT4-1): SimplifyCfg mutates the CFG
     // (fold/thread/merge), so every surviving block's structural role is

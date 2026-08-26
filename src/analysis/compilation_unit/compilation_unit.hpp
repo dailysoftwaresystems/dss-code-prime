@@ -157,6 +157,38 @@ public:
     // `sourceLanguage` tags — purely descriptive, never a dispatch key.
     [[nodiscard]] std::string                    compositeSourceLanguage() const;
 
+    // ★ THE NAME OF THE SOURCE THIS UNIT WAS BUILT FROM — the FIRST file the
+    // builder was handed, empty for a unit with no trees at all.
+    //
+    // D-STATICLIB-MEMBER-NAME-DERIVES-FROM-THE-FIRST-SOURCE. A static-archive
+    // build lowers each CU to its OWN member and has to NAME that member; it
+    // used to name every one of them after the DRIVER'S `sourceStem` (the first
+    // file of the whole command), so `--compile u1.c u2.c --target …-staticlib`
+    // emitted `u1_0.o` AND `u1_1.o` and every member-read refusal, every `ar t`
+    // listing, pointed at a file that did not produce the member.
+    //
+    // ★★ IT IS AN ACCESSOR AND NOT A LIST THE DRIVER THREADS ALONGSIDE `cus`.
+    // The unit ALREADY holds this fact — `trees_[0]`'s buffer carries the path
+    // `UnitBuilder::addFile` opened — so a per-CU stem vector passed in
+    // parallel would be a SECOND OWNER of it, kept in step by nothing but the
+    // discipline of every future caller. An index-parallel side list is exactly
+    // the shape that desynchronizes silently: the build stays green and the
+    // names simply stop matching. Deriving it from the trees cannot drift,
+    // because there is nothing to drift FROM.
+    //
+    // ⚠ THE FIRST TREE, NOT "THE" TREE. A CU may hold several (a CU5
+    // multi-file unit; a preprocess-enabled unit whose `#include`s the import
+    // resolver appended at `finish()`), and only the FIRST is the file the
+    // caller named — the resolver appends after every `addFile`. For a
+    // preprocessed tree the buffer is the SYNTHESIZED one, which carries the
+    // MAIN SOURCE'S OWN NAME (`preprocess()` builds it
+    // `SourceBuffer::fromString(synthText, mainSource->name())`), so this stays
+    // the operator's path rather than a `<synth>` label.
+    //
+    // ⓘ A `string_view` INTO THE BUFFER, whose lifetime is the CU's: the
+    // trees are frozen at `finish()` and each holds its source `shared_ptr`.
+    [[nodiscard]] std::string_view               primarySourceName() const noexcept;
+
     // Driver-level diagnostics (file-not-found, schema-load forwarding,
     // ...). Empty in CU1 — the first D_* codes land in CU2.
     [[nodiscard]] DiagnosticReporter const&      driverDiagnostics() const noexcept;

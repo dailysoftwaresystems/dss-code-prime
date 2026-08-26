@@ -495,3 +495,141 @@ TEST(DriverPerTargetCompilePositionRemap, AsmTierDiagnosticInsideAnIncludedHeade
 }
 
 }  // namespace
+
+// ═════════════════════════════════════════════════════════════════════════
+// D-DIAG-LINE-NUMBERS-ARE-POST-EXPANSION-WHILE-THE-FILE-NAME-IS-ORIGINAL
+// (P36, Lane S) — THE CUMULATIVE-SPLICE-DRIFT PIN.
+//
+// ★ WHY THIS EXISTS ALONGSIDE THE PINS ABOVE RATHER THAN INSTEAD OF THEM. That
+// row was closed by MEASUREMENT: its witness does not reproduce at HEAD,
+// because P28 (D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED) had already fixed
+// the mechanism six days after the row was filed. But every pin above uses a
+// ONE- OR TWO-LINE header, and the defect that row described is CUMULATIVE:
+// each `#include` spliced above a position shifts that position further, the
+// row's own text records that "early lines still align", and its witness was a
+// 39,578-line file reporting line 56,763. A fixture whose splice is two lines
+// deep cannot distinguish a correct remap from an absent one.
+//
+// So this pin supplies the missing dimension — a splice ~3,600 lines deep —
+// and asserts BOTH halves of the pair the row is named for: the line number
+// AND the file name, together, because the row's whole point is that each was
+// individually plausible while the pair was incoherent.
+// ═════════════════════════════════════════════════════════════════════════
+namespace {
+
+// N harmless declarations, so the splice is large enough for drift to be
+// unmistakable if it ever returns. Guarded so re-inclusion is a no-op.
+std::string bigHeader(int index, int lines) {
+    std::string s = "#ifndef BIG_" + std::to_string(index) + "_H\n#define BIG_"
+                  + std::to_string(index) + "_H\n";
+    for (int i = 0; i < lines; ++i) {
+        s += "int big" + std::to_string(index) + "_decl_" + std::to_string(i)
+           + "(void);\n";
+    }
+    s += "#endif\n";
+    return s;
+}
+
+} // namespace
+
+TEST(SemanticTierPositionRemap, SurvivesAThousandsOfLinesDeepSplice) {
+    auto const dir = makeCaseDir("semantic_deep_splice");
+    constexpr int kHeaders        = 3;
+    constexpr int kLinesPerHeader = 1200;
+    for (int h = 0; h < kHeaders; ++h) {
+        writeFile(dir / ("big" + std::to_string(h) + ".h"),
+                  bigHeader(h, kLinesPerHeader));
+    }
+    auto const main = dir / "main.c";
+    // Three big includes, a blank line, then the error on a KNOWN line.
+    writeFile(main,
+              "#include \"big0.h\"\n"      // 1
+              "#include \"big1.h\"\n"      // 2
+              "#include \"big2.h\"\n"      // 3
+              "\n"                          // 4
+              "int main(void) {\n"          // 5
+              "    return zzz_undeclared;\n" // 6  <-- THE ERROR
+              "}\n");                        // 7
+    constexpr int kUndeclaredLine   = 6;
+    constexpr int kUndeclaredColumn = 12;
+
+    UnitBuilder builder{cSubset(), DiagnosticBudget::libraryDefault()};
+    builder.addFile(main);
+    auto cu = std::make_shared<CompilationUnit const>(std::move(builder).finish());
+
+    auto const model = analyze(cu, DiagnosticBudget::libraryDefault());
+    auto const bufs  = driverRegistryFor(*cu);
+
+    auto const* d = firstWithCode(model.diagnostics().all(),
+                                  DiagnosticCode::S_UndeclaredIdentifier);
+    ASSERT_NE(d, nullptr) << "the fixture must produce S_UndeclaredIdentifier";
+
+    std::string const rendered = model.diagnostics().format(*d, bufs);
+
+    // (a) THE LINE. Under the defect this would be ~3,618 — the true line plus
+    //     everything spliced above it. Nothing about that number looks wrong
+    //     unless you count the lines in the file it names, which is exactly why
+    //     the defect survived: `main.c` has 7 lines, so a report of 3,618 is
+    //     past EOF and STILL renders a plausible-looking diagnostic.
+    EXPECT_TRUE(contains(rendered, positionOf("main.c", kUndeclaredLine,
+                                              kUndeclaredColumn)))
+        << "a position " << (kHeaders * (kLinesPerHeader + 3))
+        << "+ spliced lines deep must still resolve to the ORIGINAL line\n"
+        << rendered;
+
+    // (b) THE PAIR. The row is named for a line number in post-expansion
+    //     coordinates paired with the ORIGINAL file's name. Asserting the line
+    //     alone would pass if the name silently became the synth buffer's, so
+    //     both halves are pinned together.
+    EXPECT_TRUE(endsWith(bufferNameOf(bufs, d->buffer), "main.c"))
+        << "the coordinates are the main file's, so the NAME must be too";
+    EXPECT_FALSE(contains(rendered, "<unknown-buffer"))
+        << rendered;
+}
+
+TEST(SemanticTierPositionRemap, DeepSpliceStillNamesAnIncludedHeadersOwnLine) {
+    // The other half, and the DECISIVE arm for that row: an error INSIDE a
+    // header that itself sits thousands of spliced lines deep. Both the name
+    // and the line must be the HEADER's — a self-consistent pair, which the row
+    // says never happens once includes accumulate.
+    auto const dir = makeCaseDir("semantic_deep_splice_header");
+    constexpr int kHeaders        = 3;
+    constexpr int kLinesPerHeader = 1200;
+    for (int h = 0; h < kHeaders; ++h) {
+        writeFile(dir / ("big" + std::to_string(h) + ".h"),
+                  bigHeader(h, kLinesPerHeader));
+    }
+    writeFile(dir / "bad.h",
+              "#ifndef BAD_H\n#define BAD_H\n"
+              "static int hdrbad(void) { return qqq; }\n"   // line 3
+              "#endif\n");
+    auto const main = dir / "main.c";
+    writeFile(main,
+              "#include \"big0.h\"\n"
+              "#include \"big1.h\"\n"
+              "#include \"big2.h\"\n"
+              "#include \"bad.h\"\n"
+              "int main(void) { return hdrbad(); }\n");
+    constexpr int kUndeclaredLine   = 3;
+    constexpr int kUndeclaredColumn = 34;
+
+    UnitBuilder builder{cSubset(), DiagnosticBudget::libraryDefault()};
+    builder.addFile(main);
+    auto cu = std::make_shared<CompilationUnit const>(std::move(builder).finish());
+
+    auto const model = analyze(cu, DiagnosticBudget::libraryDefault());
+    auto const bufs  = driverRegistryFor(*cu);
+
+    auto const* d = firstWithCode(model.diagnostics().all(),
+                                  DiagnosticCode::S_UndeclaredIdentifier);
+    ASSERT_NE(d, nullptr) << "the fixture must produce S_UndeclaredIdentifier";
+
+    std::string const name = bufferNameOf(bufs, d->buffer);
+    EXPECT_TRUE(endsWith(name, "bad.h"))
+        << "got '" << name << "'";
+    std::string const rendered = model.diagnostics().format(*d, bufs);
+    EXPECT_TRUE(contains(rendered, positionOf("bad.h", kUndeclaredLine,
+                                              kUndeclaredColumn)))
+        << "the header's OWN line, not a synth offset, even 3,600 lines deep\n"
+        << rendered;
+}

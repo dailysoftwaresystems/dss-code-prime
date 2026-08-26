@@ -30,7 +30,9 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
+#include "opt/passes/mir_id_remap.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -39,6 +41,37 @@
 #include <vector>
 
 namespace dss::opt::passes {
+
+// ── The shared REBUILD-TIME accumulator (DSS_OPT_TRACE) ───────────────
+//
+// Every MIR-tier pass splits its per-function work the same way: a
+// READ-ONLY `analyze` over the source `Mir`, then a `rebuildFunction`
+// that appends into the pass's single `MirBuilder`. Only the second
+// half touches shared mutable state, so the analyze:rebuild RATIO is
+// the number that bounds how much of the optimizer can ever run in
+// parallel — and it was previously observable for exactly two passes
+// (Cse and Licm own bespoke sub-timers).
+//
+// ONE accumulator inside `rebuildFunction` makes the ratio observable
+// for ALL of them without eight more bespoke timers: the engine
+// (`opt::optimizer.cpp`'s `runLeaf`) zeroes it before a pass and reads
+// it after, printing `rebuild=Nms` on the existing per-pass trace line.
+// `thread_local` because the unit-stage pipeline runs inside the
+// driver's per-CU pool — a process-wide counter would interleave 4
+// CUs' rebuilds into one meaningless number.
+//
+// Zero-cost when the trace is off: `optRebuildTraceEnabled()` is a
+// function-local `static bool const` over one `getenv`, and the clock
+// read is guarded by it.
+// ⚠ `MirFunctionRebuilder` is NOT the only rebuild driver: `Inlining`'s
+// multi-block path hand-rolls its own 3-phase walk (`MultiBlockInliner`).
+// That driver calls `optRebuildNsAdd` directly, so the ONE whole-module
+// pass does not report as pure analysis.
+[[nodiscard]] DSS_EXPORT bool optRebuildTraceEnabled() noexcept;
+[[nodiscard]] DSS_EXPORT std::uint64_t optRebuildNsTake() noexcept;
+DSS_EXPORT void optRebuildNsAdd(std::chrono::steady_clock::time_point t0) noexcept;
+[[nodiscard]] DSS_EXPORT std::uint64_t optRebuildInstsTake() noexcept;
+DSS_EXPORT void optRebuildInstsAdd(std::uint64_t n) noexcept;
 
 // Shared "clone globals OR carve out on runtime-init" prelude used
 // by every MIR-tier rebuild pass (ConstFold, Dce, Mem2Reg, CopyProp).
@@ -179,8 +212,8 @@ public:
     virtual void onBlockBegin(
         MirBlockId /*oldB*/, MirBlockId /*newB*/,
         MirBuilder& /*dst*/,
-        std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
-        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) {}
+        MirInstRemap& /*rewrite*/,
+        MirBlockRemap const& /*blockMap*/) {}
 
     // Phase 2: pre-emit filter for non-Phi, non-terminator value-producing
     // insts. Returns false → skip this inst entirely (caller's counter
@@ -200,7 +233,7 @@ public:
     [[nodiscard]] virtual std::optional<MirInstId>
     tryRewrite(MirOpcode /*op*/, MirInstId /*oldId*/,
                MirBuilder& /*dst*/,
-               std::unordered_map<std::uint32_t, MirInstId> const& /*rewrite*/) {
+               MirInstRemap const& /*rewrite*/) {
         return std::nullopt;
     }
 
@@ -243,8 +276,8 @@ public:
     virtual void onBlockBeforeTerminator(
         MirBlockId /*oldB*/, MirBlockId /*newB*/,
         MirBuilder& /*dst*/,
-        std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
-        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) {}
+        MirInstRemap& /*rewrite*/,
+        MirBlockRemap const& /*blockMap*/) {}
 
     // Block-merge / absorb hook. If a policy returns `next` for
     // block `oldB`, the rebuilder treats `next`'s instructions as a
@@ -289,8 +322,8 @@ public:
     [[nodiscard]] virtual std::optional<MirInstId>
     tryRewriteTerminator(MirOpcode /*op*/, MirInstId /*oldId*/,
                          MirBuilder& /*dst*/,
-                         std::unordered_map<std::uint32_t, MirInstId> const& /*rewrite*/,
-                         std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) {
+                         MirInstRemap const& /*rewrite*/,
+                         MirBlockRemap const& /*blockMap*/) {
         return std::nullopt;
     }
 
@@ -305,7 +338,7 @@ public:
     // reachable, no edges removed).
     [[nodiscard]] virtual bool acceptPhiIncoming(
         MirPhiIncoming const& /*inc*/, MirBlockId /*oldPhiBlock*/,
-        std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) {
+        MirBlockRemap const& /*blockMap*/) {
         return true;
     }
 
@@ -470,9 +503,9 @@ public:
     // to any old-module instruction) can resolve old→new ids when
     // wiring up their own phi incomings. Read-only; the rebuilder
     // remains the sole writer of these maps during rebuild.
-    [[nodiscard]] std::unordered_map<std::uint32_t, MirInstId> const&
+    [[nodiscard]] MirInstRemap const&
     rewriteMap() const noexcept { return rewrite_; }
-    [[nodiscard]] std::unordered_map<std::uint32_t, MirBlockId> const&
+    [[nodiscard]] MirBlockRemap const&
     blockMap() const noexcept { return blockMap_; }
 
 private:
@@ -502,8 +535,8 @@ private:
     // excluded from optimization.
     MirRebuildPolicy* active_ = nullptr;
     MirIdentityRebuildPolicy identity_;
-    std::unordered_map<std::uint32_t, MirInstId>  rewrite_;
-    std::unordered_map<std::uint32_t, MirBlockId> blockMap_;
+    MirInstRemap  rewrite_;
+    MirBlockRemap blockMap_;
 };
 
 } // namespace dss::opt::passes

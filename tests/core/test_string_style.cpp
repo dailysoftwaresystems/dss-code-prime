@@ -551,10 +551,23 @@ TEST(StringStyleDeath, CrossSchemaStringStyleLookupAborts) {
       "tokens": { "+": [{ "kind": "PlusOp" }] },
       "shapes": { "root": { "sequence": [ "PlusOp" ] } }
     })JSON";
-    auto loadedA = GrammarSchema::loadFromText(kCfg);
-    auto loadedB = GrammarSchema::loadFromText(kCfg);
+    // ⚠ THE TWO LABELS ARE LOAD-BEARING AS OF 2026-08-25 (cycle P35), AND THIS
+    // IS THE ARM WHERE IT MATTERS MOST. The content-addressed memo
+    // (D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS)
+    // keys on (schema family, sourceLabel, digest), so under the DEFAULT label
+    // these two loads would be ONE schema — the lookup would be same-schema,
+    // legal, and would NOT abort, silently turning a fail-loud guard into a
+    // green test that pins nothing. Distinct labels give two genuinely
+    // different schemas, which is what "cross-schema" has always meant here.
+    // The subject and the expected abort message are unchanged.
+    auto loadedA = GrammarSchema::loadFromText(kCfg, "cross-schema-a");
+    auto loadedB = GrammarSchema::loadFromText(kCfg, "cross-schema-b");
     ASSERT_TRUE(loadedA.has_value());
     ASSERT_TRUE(loadedB.has_value());
+    ASSERT_NE(loadedA->get(), loadedB->get())
+        << "the two loads returned the SAME schema, so the lookup below is not "
+           "a CROSS-schema lookup at all and could not abort for the reason "
+           "this test exists to pin";
     LexemeMeaning fromA = (*loadedA)->lookupLexeme("+")[0];
     EXPECT_DEATH({ (void)(*loadedB)->stringStyle(fromA); },
                  "belongs to a different schema");

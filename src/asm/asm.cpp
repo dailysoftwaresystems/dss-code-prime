@@ -1542,15 +1542,84 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // `decodeScalarLiteralBits` returns nullopt for
         // these kinds too, so a `struct { __uint128_t x; }` global walls at the
         // aggregate-leaf recursion rather than slipping through this scalar path.
+        // ★ THE 16 BYTES ARE NOW EMITTED. This arm used to be a fail-loud
+        // DEFERRAL wall; it is a producer. What made the wall necessary was that
+        // `appendLE` takes a `std::uint64_t`, so a width-16 append computed
+        // `(value >> (j*8))` for j in [0,16) -- a shift of 64..120 bits, UB,
+        // which on both shipped host arches masks the count to 6 bits and
+        // REPEATS the low 8 bytes into the high 8. The fix is not a wider shift
+        // but a wider SOURCE: read the value as two little-endian 64-bit limbs
+        // and append each at its own width, so no shift ever exceeds 56.
+        //
+        // ⓘ THE TWO PAYLOAD ARMS ARE BOTH REAL AND NEITHER IMPLIES THE OTHER --
+        // this is the distinction the row recorded as the one a naive gate
+        // misses. `__uint128_t g = 5;` folds into a PLAIN `std::uint64_t` (the
+        // narrowest arm that holds it), while a value needing more than 64 bits
+        // folds into the `BitIntValue` pool arm carrying an I128/U128 core. A
+        // dispatch keyed on the VARIANT would silently miss the first; keying on
+        // the declared KIND `k`, as this arm does, catches both.
+        //
+        // ⓘ SIGN MATTERS FOR THE HIGH LIMB. A negative `__int128` folded into
+        // the int64 arm must fill its high limb with 1s, not zeros -- so the
+        // extension is taken from the VALUE's signedness, not assumed.
+        //
+        // ⚠ THE AGGREGATE LEAF STAYS WALLED, DELIBERATELY. `decodeScalarLiteralBits`
+        // still returns nullopt for these kinds, so `struct { __uint128_t x; }`
+        // fails LOUD at the aggregate-leaf recursion rather than slipping
+        // through: that chokepoint returns a `std::uint64_t` and structurally
+        // cannot carry 16 bytes. This mirrors the shipped F80 arm exactly (the
+        // sole F80 scalar-global producer, with F80 struct members walled the
+        // same way). A remaining site that is LOUD is a deferral; a remaining
+        // site that is SILENT would be the half-shipped multi-site contract this
+        // cycle exists to stop.
         if (k == TypeKind::I128 || k == TypeKind::U128) {
-            emit(DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} has "
-                             "a 128-bit integer initializer (TypeKind={}) — 128-bit "
-                             "integer DATA-globals are not yet emitted "
-                             "(D-CSUBSET-INT128-DATA-GLOBAL); the u64 literal-pool "
-                             "arm carries only the low 8 bytes, so emitting would "
-                             "write a wrong 16-byte image.",
-                             sym.v, static_cast<int>(k)));
+            std::uint64_t lo = 0;
+            std::uint64_t hi = 0;
+            if (auto const* bv = std::get_if<BitIntValue>(&v.value)) {
+                auto const& limbs = bv->limbs();
+                lo = limbs.size() > 0 ? limbs[0] : 0ull;
+                hi = limbs.size() > 1 ? limbs[1] : 0ull;
+                // A 1-limb payload declared 128 bits wide still needs its high
+                // limb materialized; `BitIntValue` keeps its limbs sign-clean, so
+                // the extension is the sign of the declared value.
+                if (limbs.size() < 2 && bv->isSigned()
+                    && (lo >> 63) != 0) hi = ~0ull;
+            } else if (auto const* uv = std::get_if<std::uint64_t>(&v.value)) {
+                lo = *uv;                       // zero-extends
+            } else if (auto const* iv = std::get_if<std::int64_t>(&v.value)) {
+                lo = static_cast<std::uint64_t>(*iv);
+                if (*iv < 0) hi = ~0ull;        // sign-extends
+            } else if (auto const* bo = std::get_if<bool>(&v.value)) {
+                lo = *bo ? 1ull : 0ull;
+            } else {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
+                                 "has a 128-bit integer type (TypeKind={}) but its "
+                                 "initializer is in no integer literal arm — refusing "
+                                 "rather than emitting a fabricated 16-byte image "
+                                 "(D-CSUBSET-INT128-DATA-GLOBAL).",
+                                 sym.v, static_cast<int>(k)));
+                continue;
+            }
+            std::size_t const before = d.bytes.size();
+            appendLE(d.bytes, lo, 8);
+            appendLE(d.bytes, hi, 8);
+            // The layout and the encoder must agree; a disagreement is a wrong
+            // image, so it fails loud rather than shipping a short/long record.
+            auto const w128 = scalarByteSize(k, dataModel);
+            if (!w128.has_value() || d.bytes.size() - before != *w128) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: 128-bit global "
+                                 "SymbolId={{ {} }} encoded to {} bytes but "
+                                 "scalarByteSize reserves {} — the 128-bit encoder "
+                                 "and the layout disagree.",
+                                 sym.v, d.bytes.size() - before,
+                                 w128.has_value() ? *w128 : 0));
+                continue;
+            }
+            d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
+                static_cast<std::uint32_t>(*w128)));
+            out.push_back(std::move(d));
             continue;
         }
         // C4b (I5, D-CSUBSET-BITINT-DATA-GLOBAL): a const-folded `_BitInt` value

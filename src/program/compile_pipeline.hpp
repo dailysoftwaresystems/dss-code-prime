@@ -463,6 +463,33 @@ struct CompileOptions {
     // three-level recorded-identity precedence (`src/ffi/ingest.hpp`). Empty
     // (the default) leaves that precedence exactly as it was.
     std::vector<ResolveLibrarySpec> resolveLibraries;
+
+    // ── PRE-ASSEMBLED OBJECT INPUTS
+    // (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION) ──────────
+    //
+    // Relocatable object files named as inputs to THIS build: compiled
+    // elsewhere (by an earlier DSS invocation or by a foreign toolchain),
+    // carrying no MIR, and merged into the image EAGERLY at link time. Empty
+    // (the default) ⇒ every build before this field is byte-identical, because
+    // `linkAndWriteWithStaticArchives` short-circuits to the untouched
+    // single-module `linkAndWrite` when this and `staticArchives` are both
+    // empty.
+    //
+    // ★ ONE CHANNEL, TWO SURFACES, AND THAT IS THE POINT. The operator can
+    // name an object as a compile INPUT or alongside the libraries to resolve
+    // against; both land here, so there is exactly one place that decides what
+    // an object input MEANS and no second engine to keep in step. This is the
+    // same shape the standing ruling states for the mode flags -- `--project`,
+    // `--directory` and `--compile` are different ways to determine WHAT gets
+    // compiled, never different compilers.
+    //
+    // ⚠ NOT a `ResolveLibrarySpec`: a spec may STATE a runtime import name, and
+    // an object input records no import at all (it is merged, exactly like a
+    // pulled archive member). Carrying the richer type here would accept a
+    // stated import name and silently drop it -- the partition in
+    // `compileOneTarget` takes only the PATH for the same reason it does for
+    // `ar` archives.
+    std::vector<std::filesystem::path> objectInputs;
 };
 
 // Resolve `CompileConfig` to a shipped pipeline name. Uses a
@@ -983,6 +1010,30 @@ linkAndWrite(std::span<AssembledModule const> modules,
 [[nodiscard]] DSS_EXPORT bool
 isArArchiveFile(std::filesystem::path const& path);
 
+// Does the file at `path` OPEN and begin with a RELOCATABLE OBJECT header that
+// `format` could itself have written? The third arm of the same magic-byte
+// dispatch `isArArchiveFile` opens
+// (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION): an object
+// routes to the EAGER merge, an `ar` archive to the LAZY pull, anything else to
+// the dynamic export reader.
+//
+// ★★ THE QUESTION IS ASKED OF THE FORMAT, NOT OF A TABLE OF MAGIC NUMBERS HERE,
+// and that is what keeps it agnostic AND decidable. `ObjectFormatSchema::looks-
+// LikeRelocatableObject` delegates to the backend that owns the shape --
+// the same interface `isImageFlavor()` already answers through, never a
+// parallel mechanism. It also makes the COFF case decidable at all: a COFF
+// object carries NO magic number, so "is this a COFF object" has no answer from
+// bytes alone, while "is this a COFF object FOR THIS FORMAT" does, because the
+// format document declares the machine to compare against.
+//
+// A path that cannot be opened/read returns false, for exactly the reason
+// `isArArchiveFile` does: it stays on the dynamic path whose eager open-probe
+// fails loud, so an unreadable path is never silently dropped. Only a HEADER
+// PREFIX is read -- the predicate never pays for the file.
+[[nodiscard]] DSS_EXPORT bool
+isRelocatableObjectFile(std::filesystem::path const& path,
+                        ObjectFormatSchema const&    format);
+
 // Pull the archive members that define `clientModule`'s (transitively)
 // unresolved externs, each parsed back into a mergeable `AssembledModule` via
 // the c164 ELF ET_REL reader (`elf::readRelocatableObject`). Two-pass LAZY-pull
@@ -1016,13 +1067,59 @@ isArArchiveFile(std::filesystem::path const& path);
 // `archivePaths` here: they are merged INTO the image and record no import at
 // all, and feeding one to the export reader is refused loud (correctly), which
 // would fail an otherwise good build. Empty is a valid no-op.
+// ── `clientModules` IS A SPAN, AND THE PLURAL IS A CORRECTNESS TERM
+// (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION)
+// ────────────────────────────────────────────
+// It seeds BOTH halves of the lazy pull: the already-DEFINED name set and the
+// UNRESOLVED worklist. It was one module while a link had exactly one
+// non-archive input; a link that also names pre-assembled OBJECT inputs has
+// several, and every one of them is a reference source. ⚠ Passing only the
+// compiled client and leaving an object input out of the seed does NOT fail --
+// it silently declines to pull the archive member that object needed, and the
+// link then fails downstream naming a symbol whose definition was sitting in an
+// archive the operator did name. Seed with EVERY module that is already in the
+// link.
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<AssembledModule>>
-pullStaticArchiveMembers(AssembledModule const&                 clientModule,
+pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                          std::span<std::filesystem::path const> archivePaths,
                          std::span<ResolveLibrarySpec const>    dynamicLibraries,
                          TargetSchema const&                    target,
                          ObjectFormatSchema const&              format,
                          DiagnosticReporter&                    reporter);
+
+// ── PRE-ASSEMBLED OBJECT INPUTS
+// (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION) ──────────────
+//
+// Read N relocatable OBJECT FILES named as link inputs into mergeable modules,
+// through the SAME per-format reader chokepoint an archive member takes
+// (`readArchiveMemberModule`) -- so an object format lights up here by
+// construction rather than by a second dispatch that can drift.
+//
+// ★★★ EAGER, AND THAT IS THE WHOLE DIFFERENCE FROM AN ARCHIVE. `ar` member
+// selection is LAZY by definition: a member nothing references is not pulled,
+// which is what makes a static library a library. An object named on the link
+// line is MANDATORY -- `ld a.o b.o` links `b.o` even when nothing in `a.o`
+// refers to it, because the operator naming a file IS the reference. Every real
+// toolchain draws the line exactly here, and collapsing the two would silently
+// drop an object whose only contents are, say, definitions consumed at run time.
+// ⇒ this reads ALL of `objectPaths`, in order, and returns `nullopt` (fail-loud)
+// on ANY open / read / format-mismatch failure. There is no arm in which an
+// object is skipped, which is the property that makes a silently INCOMPLETE
+// link unreachable rather than merely unlikely.
+//
+// `linkFormat` is what the link is PRODUCING; each object's own format is
+// resolved from it by the chokepoint (see
+// [[D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT]]), so
+// an object built for another machine is refused there by the reader's own
+// magic/relocation checks rather than mis-parsed here.
+//
+// An empty `objectPaths` yields an empty vector -- a valid no-op, and the arm
+// every pre-existing link takes.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<AssembledModule>>
+readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
+                       TargetSchema const&                    target,
+                       ObjectFormatSchema const&              linkFormat,
+                       DiagnosticReporter&                    reporter);
 
 // The members extracted from one-or-more input static archives (parallel):
 // `modules[i]` is a mergeable relocatable object, `names[i]` its `ar` file name.
@@ -1049,23 +1146,39 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
                             ObjectFormatSchema const&              format,
                             DiagnosticReporter&                    reporter);
 
-// Link `clientModule` against zero-or-more static `ar` archives, then write the
-// image to `outPath`. When `staticArchives` is empty this is exactly
-// `linkAndWrite({clientModule})` (byte-identical to the pre-c165 path). Otherwise
-// it pulls the referenced members (`pullStaticArchiveMembers`) and links the
-// COMBINED span `[clientModule, pulled...]` -- the N>1 `linker::link` path, whose
-// `mergeModules` binds each archive reference to the pulled member's definition
-// (stripping the extern import) exactly as it does a sibling-CU reference.
-// Returns true iff the pull, merge, link, and write all succeeded.
+// Link `clientModule` against zero-or-more pre-assembled OBJECT inputs and
+// zero-or-more static `ar` archives, then write the image to `outPath`. When
+// BOTH input lists are empty this is exactly `linkAndWrite({clientModule})`
+// (byte-identical to the pre-c165 path). Otherwise it reads every object input
+// (`readObjectInputModules`, EAGER), pulls the referenced archive members
+// (`pullStaticArchiveMembers`, LAZY) and links the COMBINED span
+// `[clientModule, objects..., pulled...]` -- the N>1 `linker::link` path, whose
+// `mergeModules` binds each cross-module reference to its definition (stripping
+// the extern import) exactly as it does a sibling-CU reference. Returns true iff
+// every read, the pull, the merge, the link and the write all succeeded.
+//
+// ── `objectInputs` (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION)
+// ───────────────────────────
+// ★★ THE ORDER OF THE TWO INPUT KINDS IS LOAD-BEARING, not stylistic. Objects
+// are read FIRST and then seed the archive pull together with `clientModule`,
+// because an object input's own unresolved externs are references an archive
+// may satisfy: reading objects after the pull -- or pulling with the client
+// alone as the seed -- would leave exactly those members unpulled and fail the
+// link naming a symbol the operator had already supplied. The reverse ordering
+// has no corresponding hazard: an archive member cannot introduce a reference
+// that only an object input satisfies without that object also being in the
+// seed, which it is.
 //
 // `dynamicLibraries` rides through to `pullStaticArchiveMembers` -- see its
 // contract above for why a pulled member's library binding has to be re-derived
-// and why this must be the DYNAMIC half of `--resolve-library`. It is NOT
-// defaulted: every route that produces an image has to answer the question, and
-// a default would let a new route silently inherit the gap this parameter
-// closes.
+// and why this must be the DYNAMIC half of `--resolve-library`. Neither it nor
+// `objectInputs` is defaulted: every route that produces an image has to answer
+// the question, and a default would let a new route silently inherit the gap
+// each parameter closes -- which for `objectInputs` is a silently INCOMPLETE
+// link, the characteristic failure of a separate-compilation driver.
 [[nodiscard]] DSS_EXPORT bool
 linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
+                               std::span<std::filesystem::path const> objectInputs,
                                std::span<std::filesystem::path const> staticArchives,
                                std::span<ResolveLibrarySpec const>    dynamicLibraries,
                                TargetSchema const&                    target,

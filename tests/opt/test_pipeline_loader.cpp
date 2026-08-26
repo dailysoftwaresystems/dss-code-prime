@@ -582,6 +582,95 @@ TEST(PipelineLoader, InlineThresholdInRange) {
     EXPECT_EQ(r->inlineThreshold, 7u);
 }
 
+// inlineCallerGrowthPercent bounds (P36 — the PER-CALLER CUMULATIVE growth
+// budget, the bound `inlineThreshold` was never able to be). Mirrors the
+// inlineThreshold quintet with ONE deliberate divergence, pinned below:
+// the lower bound is 0, NOT 1.
+TEST(PipelineLoader, InlineCallerGrowthPercentZeroIsLEGALNotATrap) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"],
+             "inlineCallerGrowthPercent": 0}})",
+        "growth-zero.json");
+    ASSERT_TRUE(r.has_value())
+        << "0 is REJECTED for inlineThreshold because it silently refuses "
+           "every inline. It must be ACCEPTED here: the allowance floors at "
+           "inlineThreshold instructions, so growth 0 still admits one "
+           "maximal legal callee per caller. It is a real posture, not a trap";
+    EXPECT_EQ(r->inlineCallerGrowthPercent, 0u);
+}
+
+TEST(PipelineLoader, InlineCallerGrowthPercentOverflowRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"],
+             "inlineCallerGrowthPercent": 100001}})",
+        "growth-overflow.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+}
+
+TEST(PipelineLoader, InlineCallerGrowthPercentNegativeRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"],
+             "inlineCallerGrowthPercent": -1}})",
+        "growth-negative.json");
+    ASSERT_FALSE(r.has_value())
+        << "the field is uint32 in the pipeline; a negative must be refused "
+           "at load rather than wrapping to an enormous allowance";
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+}
+
+TEST(PipelineLoader, InlineCallerGrowthPercentNonIntegerRejects) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"],
+             "inlineCallerGrowthPercent": "lots"}})",
+        "growth-string.json");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasCode(r.error(), DiagnosticCode::X_PipelineMalformed));
+}
+
+TEST(PipelineLoader, InlineCallerGrowthPercentDefaultsWhenAbsent) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"]}})",
+        "no-growth.json");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->inlineCallerGrowthPercent,
+              opt::kDefaultInlineCallerGrowthPercent);
+}
+
+TEST(PipelineLoader, InlineCallerGrowthPercentInRange) {
+    auto r = opt::loadPipelineFromText(
+        R"({"dssPipelineVersion": 1, "pipeline":
+            {"name": "x", "passes": ["Identity"],
+             "inlineCallerGrowthPercent": 42}})",
+        "growth-42.json");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->inlineCallerGrowthPercent, 42u);
+}
+
+// ★ THE SHIPPED VALUE IS A DECISION, AND A DECISION GETS A PIN. Without this
+// the release document could lose the key to a bad merge and every test above
+// would stay green while the compiler silently reverted to the programmatic
+// default. RED-on-disable: delete `inlineCallerGrowthPercent` from
+// `release.pipeline.json` and this fails.
+TEST(PipelineLoader, ShippedReleaseDeclaresItsGrowthBudget) {
+    auto r = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->inlineCallerGrowthPercent, 30u)
+        << "the shipped release growth budget is a MEASURED value, not the "
+           "programmatic default falling through — see the P36 sweep";
+    auto u = opt::loadShippedPipeline("release-unit");
+    ASSERT_TRUE(u.has_value());
+    EXPECT_EQ(u->inlineCallerGrowthPercent, 30u)
+        << "the unit stage carries the SAME budget: each optimize() call gets "
+           "its own ledger, so a per-stage divergence would be a silent "
+           "asymmetry in how much a program may grow before it is merged";
+}
+
 // SHIP pin (complementary to the exact-list ShippedReleaseLoadsAllPasses
 // above): the shipped `release.pipeline.json` CONTAINS `PassId::Inlining`
 // — a walk over the loaded tree, robust to future reordering. OPT7

@@ -119,3 +119,16 @@ dss_add_test(NAME lir/test_lir_apple_stack_arg_packing
 # outgoing-argument byte is written twice.
 dss_add_test(NAME lir/test_lir_outgoing_arg_cursor
              SOURCES test_lir_outgoing_arg_cursor.cpp)
+
+# OPT8 (plan 22) — the LIR peephole's redundant-copy rule. The load-bearing
+# pins are the NEGATIVES: `zext`/`sext`/`trunc`/`not`/`neg` whose result
+# register equals their only operand register are live computation, and on
+# x86-64 the first three encode to bytes a disassembler prints as `mov`. The
+# rule tests OPCODE IDENTITY against `registerClassOps[].move`, never a
+# mnemonic or a byte pattern; deleting the wrong one is a wrong answer that
+# every structural check in the pipeline still accepts.
+# Its 128-bit-width pins mutate the shipped x86_64 document in memory via
+# mutate_target_schema.hpp, which needs nlohmann_json.
+dss_add_test(NAME lir/test_lir_peephole
+             SOURCES test_lir_peephole.cpp)
+target_link_libraries(dss_lir_test_lir_peephole PRIVATE nlohmann_json::nlohmann_json)

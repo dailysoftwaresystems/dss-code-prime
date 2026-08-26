@@ -56,6 +56,7 @@
 #include "mir/mir.hpp"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace dss::opt::passes {
 
@@ -64,6 +65,32 @@ struct SimplifyCfgResult {
     std::size_t branchesFolded     = 0;
     std::size_t blocksJumpThreaded = 0;
     std::size_t blocksMerged       = 0;
+    // ── D-PERF-SIMPLIFYCFG-ADDRESS-TAKEN-QUERY-RESCANS-THE-WHOLE-FUNCTION ──
+    //
+    // THE ALGORITHMIC-SHAPE INSTRUMENT, and the reason it is on the RESULT
+    // rather than in a comment. This pass answers two purely STRUCTURAL
+    // questions about the source function — "is this block address-taken?"
+    // and "does this block contain a Phi?" — and it used to answer the first
+    // by calling `Mir::isBlockAddressTaken`, which RE-SCANS EVERY INSTRUCTION
+    // OF THE OWNING FUNCTION on every call, once per block. That is
+    // Θ(blocks × instructions): ✔MEASURED 66 ms of a 70 ms pass on a 4201-arm
+    // switch, with `mutated == 0` — the pass spent 94% of its life proving it
+    // had nothing to do. Both questions are now answered from a memo built by
+    // ONE sweep of the function.
+    //
+    // `analysisInstScans` counts the instructions THAT SWEEP reads, summed
+    // over every analyzed function. Its value is therefore exactly the
+    // instruction count of the functions analyzed — one visit each, never one
+    // visit per block per block. A test asserts that EQUALITY, because a wall-
+    // clock assertion is fragile (and `wall_clock_in_tests_guard` refuses one)
+    // while this number is deterministic and states the complexity directly.
+    //
+    // ⚠ THE BLINDNESS OF THIS INSTRUMENT, stated so no reader over-trusts it:
+    // it counts what THIS pass reads. Work done inside a `Mir` accessor the
+    // pass calls is invisible to it. That is precisely why the test asserts a
+    // LOWER bound too — a `0` here means the sweep is gone, which means the
+    // per-block rescan is back.
+    std::uint64_t analysisInstScans = 0;
 };
 
 // `maintainMarkers` (default true = the developer/test posture): re-stamp every

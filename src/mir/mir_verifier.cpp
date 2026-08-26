@@ -3,6 +3,7 @@
 #include "core/types/call_payload.hpp"   // TF-C112: hasIndirectResult (sret prepend)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/type_lattice/core_type.hpp"   // typeKindNameOrEmpty (describeType)
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"   // TF-C94: isWideInt (return ABI);
                                                      // TF-C112: isByValueClass /
@@ -14,6 +15,7 @@
 
 #include <format>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -67,6 +69,241 @@ void forEachBlock(Mir const& mir, Fn fn) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// THE ONE VALUE↔SLOT TYPE-COMPATIBILITY NOTION
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// P36 (D-MIR-VERIFIER-STORE-CALLARG-TYPE-BLIND +
+// D-MIR-VERIFIER-CALLSITE-RESULT-TYPE-UNCHECKED). MIR has THREE seams at which
+// a VALUE is placed into a DECLARED SLOT:
+//
+//   * a Call ARGUMENT into its declared parameter   (checkCallSignatures §5)
+//   * a Call RESULT into the callee's declared return (checkCallSignatures §2)
+//   * a Store VALUE into its address's pointee      (checkStoreValueTypes)
+//
+// They are ONE question and they must have ONE answer. The row that opened the
+// result half said so in as many words — "reuse the SAME compatibility notion
+// the operand half uses, never a second one, or the two halves will drift" —
+// so the notion lives HERE, in one function, with its reasons attached, and
+// every seam calls it. Before this cycle it existed only as a run of `continue`
+// arms inline in the argument loop, reachable by nothing else, which is exactly
+// why the other two seams shipped with NO type check at all.
+//
+// ⚠ A SEAM-SPECIFIC EXEMPTION IS NOT PART OF THIS NOTION AND MUST STAY AT ITS
+// SEAM. The F80 `ByValueStackArg` carrier is a fact about how hir_to_mir passes
+// an x87 `long double` ARGUMENT; struct-return piece 0 is a fact about how a
+// by-value-class RESULT is lowered. Neither is a statement about when two types
+// are compatible, and folding either in here would silently widen the other two
+// seams by the same amount.
+//
+// ★ THE NOTION IS DELIBERATELY TIGHT, because MIR is POST-conversion. Every
+// implicit conversion C admits was already materialized as an explicit
+// Cast/Bitcast by cst_to_hir's coerce arm — that is precisely what
+// `HirVerifier::checkCallArguments` enforces with its strict
+// `PointerConversionRules{}` (D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT). So a
+// value's type must EQUAL its slot's, modulo the four arms below and nothing
+// looser. In particular there is NO "all pointers are interchangeable" slack:
+// MIR does have one pointer representation, but admitting that would bless a
+// shim wiring a `FILE*` into a `char*` slot — the exact class these rules exist
+// for.
+// ── A SHORT TYPE SPELLING FOR A DIAGNOSTIC ──────────────────────────────────
+//
+// ⚠ AN INTERNER ID IS NOT EVIDENCE, AND THESE MESSAGES USED TO CARRY NOTHING
+// ELSE. ✔MEASURED (P36): the sqlite release build reported *"value typed 5167
+// (kind 27) into an address whose pointee is 6074 (kind 27)"* — kind 27 is
+// `Ptr` on both sides and a vocabulary name is empty for every pointer, so the
+// message said "two pointers, different ids" and stopped. What it was actually
+// looking at was `ptr<struct 'Bitvec'>` against `ptr<struct 'Bitvec' incomplete>`
+// — ONE C type the merge had forked — and reading that out of the ids took a
+// throwaway instrument that then died with the session that wrote it. A
+// diagnostic whose reader has to build a tool is not a diagnostic.
+//
+// ★ THE ID STAYS. It is the only thing that distinguishes two forks of one
+// spelling, which is precisely the defect class these messages keep finding;
+// dropping it for the prettier text would delete the evidence.
+//
+// ⓘ SHORT ON PURPOSE, and NOT `mir_text.cpp`'s `appendType`: that one expands a
+// composite's whole field list, which is right for a `.dssmir` dump and wrong
+// here — the reader wants the shape, and a `struct sqlite3` would bury the
+// message. `kDescribeMaxDepth` also makes it total on a cyclic type without a
+// visited set, since a self-referential composite is reached through a Ptr and
+// the depth cap cuts the walk before it can return to its own tag.
+constexpr int kDescribeMaxDepth = 3;
+
+[[nodiscard]] std::string describeType(TypeInterner const& in, TypeId t,
+                                       int depth = 0) {
+    if (!t.valid()) return "<invalid>";
+    if (depth > kDescribeMaxDepth) return "...";
+    // The RAW record kind, so a qualifier skin is visible rather than seen
+    // through: `ptr<T>` vs `ptr<volatile T>` is a real distinction here, and it
+    // is one `sameSlotType`'s ARM 4 exists to admit — a reader comparing two
+    // spellings must be able to see which arm applies.
+    TypeKind const k = in.get(t).kind;
+    switch (k) {
+        case TypeKind::Ptr:
+        case TypeKind::Ref:
+        case TypeKind::Nullable:
+        case TypeKind::Optional:
+        case TypeKind::Slice: {
+            auto const ops = in.operands(t);
+            std::string const inner =
+                ops.empty() ? std::string{"?"}
+                            : describeType(in, ops[0], depth + 1);
+            return std::format("{}<{}>", typeKindNameOrEmpty(k), inner);
+        }
+        case TypeKind::VolatileQual:
+            return std::format("qual<{}>",
+                               describeType(in, in.stripVolatile(t), depth + 1));
+        case TypeKind::Struct:
+        case TypeKind::Union: {
+            std::string const tag = in.name(t).empty()
+                ? std::string{"<anonymous>"}
+                : std::format("'{}'", in.name(t));
+            // ★ THE INCOMPLETENESS MARKER IS THE LOAD-BEARING HALF. A forward
+            // declaration and its definition are ONE C type that the merge can
+            // fork, and without this word the two spell identically — which is
+            // exactly the reading that made the original message useless.
+            return std::format("{} {}{}", typeKindNameOrEmpty(k), tag,
+                               in.isIncompleteComposite(t)
+                                   ? " incomplete" : "");
+        }
+        default: {
+            std::string const kn{typeKindNameOrEmpty(k)};
+            std::string const base =
+                kn.empty() ? std::format("kind#{}", static_cast<int>(k)) : kn;
+            std::string_view const vocab = in.vocabularyName(t);
+            return vocab.empty() ? base : std::format("{} '{}'", base, vocab);
+        }
+    }
+}
+
+[[nodiscard]] bool sameSlotType(TypeInterner const& in, TypeId value,
+                                TypeId slot) {
+    // Cascade suppression: an untyped side is a violation some OTHER rule owns
+    // (checkStructuralInvariants' result-type rule). Whole-verifier convention.
+    if (!value.valid() || !slot.valid()) return true;
+
+    // ── ARM 1: IDENTITY ──────────────────────────────────────────────────
+    if (value.v == slot.v) return true;
+
+    // ── ARM 2: SAME REPRESENTATION ───────────────────────────────────────
+    // Identity-distinct but bit-identical (D-LANG-TYPE-IDENTITY-VOCABULARY:
+    // `long` vs `long long` where the data model makes both I64). A
+    // same-representation conversion changes NO bits, so the tree deliberately
+    // RETAGS rather than emitting a Cast for it; rejecting it here would make
+    // the verifier contradict the lowering.
+    if (in.sameRepresentation(value, slot)) return true;
+
+    if (in.kind(value) != TypeKind::Ptr || in.kind(slot) != TypeKind::Ptr) {
+        return false;
+    }
+
+    // ── ARM 3: `void*` ON EITHER SIDE ────────────────────────────────────
+    // ★ MEASURED, not assumed. `ptr<void>` is MIR's canonical spelling for "an
+    // ADDRESS whose pointee is unknown or irrelevant" — it is the ABSENCE of a
+    // type claim, not a claim of `void`. Every va_list frame leaf
+    // (Va{Home,Overflow,RegSave}ArgAreaAddr) is emitted `ptr<void>` by
+    // hir_to_mir, and every synthesis pass spells an opaque OS/CRT handle
+    // (`FILE*`, `mtx_t*`, HANDLE, PINIT_ONCE_FN) `ptr<void>`. C agrees: `void*`
+    // converts to and from any object pointer with no cast at all (6.3.2.3p1).
+    //
+    // THE SHAPE THAT FORCED IT (MEASURED at TF-C112): for
+    // `int vsum(int, va_list)` (examples/c/va_list_param_forward) the BASELINE
+    // module passes `ap` as a `Load` typed with the declared `va_list`
+    // (= `ptr<i8>` under Win64) — an exact match. Running **Mem2Reg** promotes
+    // the slot and forwards the DEFINITION — the `VaHomeArgAreaAddr` leaf,
+    // typed `ptr<void>` — into the operand, ERASING the pointee with no
+    // retagging Cast, because such a retag changes no bits and materializing
+    // one would invent a runtime instruction. So pointee identity is NOT a MIR
+    // invariant after optimization, and a rule demanding it would demand
+    // something the tier does not provide.
+    //
+    // Scoped as tightly as the evidence allows: ONLY a `void*` on one side.
+    // `ptr<struct FILE>` into a `ptr<char>` slot is still REJECTED. Do NOT
+    // widen this to "all pointers are interchangeable" — that is the
+    // relaxation that would make these rules stop paying for themselves.
+    auto const isVoidPtr = [&](TypeId t) {
+        auto const o = in.operands(t);
+        return !o.empty() && o[0].valid() && in.kind(o[0]) == TypeKind::Void;
+    };
+    if (isVoidPtr(value) || isVoidPtr(slot)) return true;
+
+    // ── ARM 4: A QUALIFIER SKIN ONE LEVEL DOWN ───────────────────────────
+    // ★ MEASURED, not assumed. A qualifier skin (`volatile T` / `_Atomic T` —
+    // kind=VolatileQual carrying a QualBit mask) is by the interner's OWN
+    // construction a TRANSPARENT, REPRESENTATION-NEUTRAL wrapper:
+    // `kind()`/`operands()`/`scalars()` see straight through it, and
+    // `sameRepresentation`'s contract says in as many words that
+    // "`volatile long` and `long` compare equal here". But `sameRepresentation`
+    // compares a composite's OPERANDS by raw TypeId identity, so that
+    // neutrality does NOT survive one level of indirection: `ptr<T>` vs
+    // `ptr<volatile T>` compares the pointees as raw ids and reports UNEQUAL.
+    // This arm restores, for exactly one level, the neutrality the interner
+    // already declares.
+    //
+    // C requires it. `T*` → `volatile T*` is an IMPLICIT QUALIFICATION
+    // CONVERSION (C17 6.5.16.1p1), legal with no cast, so the tree correctly
+    // emits NO Cast for it — for the same reason it retags rather than Casts a
+    // `sameRepresentation` pair.
+    //
+    // THE SHAPE THAT FORCED IT (MEASURED at TF-C112): sqlite `src/func.c`
+    // declares `kahanBabuskaNeumaierInit/Step/StepInt64` as
+    // `(volatile SumCtx *, …)` and calls all three with a plain `SumCtx *p`.
+    // 11 call sites, 3 callees, one shape. The interner mints ONE `SumCtx`, and
+    // gcc 13.2.0 compiles the reduction at `-std=c17 -Wall -Wextra -pedantic`
+    // with rc=0 and ZERO diagnostics. It reproduces at `--config=debug`, so
+    // unlike the Mem2Reg pointee erasure this is NOT an optimizer artefact:
+    // pointee identity modulo qualifiers was never a property of the BASELINE
+    // lowering either, because C never required it.
+    //
+    // Scoped as tightly as the evidence allows, and deliberately NOT
+    // `sameRepresentation` on the pointees: this admits ONLY pointees that
+    // strip to the IDENTICAL interned TypeId. `ptr<long>` vs `ptr<long long>`
+    // stays REJECTED, and so does `ptr<struct FILE>` into `ptr<char>`. The arm
+    // cannot fire unless one side actually carries a skin: with neither
+    // qualified, `stripVolatile` is the identity and ARM 1 would already have
+    // matched.
+    //
+    // SYMMETRIC on purpose. Discarding a qualifier (`volatile T*` into a `T*`
+    // slot) is a C CONSTRAINT violation, not a representation error — it is the
+    // front end's to diagnose (the analyzer and HirVerifier's
+    // `PointerConversionRules`), and MIR must not encode one source language's
+    // qualifier rules or it stops being language-agnostic. See
+    // D-CSUBSET-QUALIFIER-DISCARD-AT-CALL-ARG-UNDIAGNOSED.
+    //
+    // ⚠ STATED, NOT OVERLOOKED: `stripVolatile` removes the WHOLE QualBit mask,
+    // so this also excuses `ptr<T>` against a `ptr<_Atomic T>` slot. That is
+    // sound HERE and only here: the value is an ADDRESS, and atomicity governs
+    // the ACCESSES — which `checkAtomicAccessLowered` guards independently (a
+    // plain Load/Store of an atomic-qualified type is its own violation,
+    // untouched by this arm). Using the interner's single documented strip
+    // chokepoint is also deliberate: a bespoke "volatile bit only" strip would
+    // mint a SECOND notion of qualifier identity beside
+    // `qualifierBits`/`stripVolatile`, and two notions drift.
+    auto const strippedPointee = [&](TypeId t) -> TypeId {
+        auto const o = in.operands(t);
+        if (o.size() != 1 || !o[0].valid()) return TypeId{};
+        return in.stripVolatile(o[0]);
+    };
+    TypeId const uv = strippedPointee(value);
+    TypeId const us = strippedPointee(slot);
+    if (uv.valid() && us.valid() && uv == us) return true;
+
+    return false;
+}
+
+// The register/`sret` PIECE kinds an ABI-lowered by-value-class value is
+// legitimately carried in. FC7 C1c established this exact set for the multi-
+// operand `Return` (checkTypeInvariants); the Call RESULT half reuses it rather
+// than minting a second list, because both are asking the identical question —
+// "is this a register piece of a lowered aggregate?" — and two lists drift.
+// F128 is an AAPCS64 binary128 HFA piece (a Q-register); F80 is the x87
+// counterpart, defensive (x87 struct returns classify ByReference).
+[[nodiscard]] bool isAbiPieceKind(TypeKind k) {
+    return k == TypeKind::I64 || k == TypeKind::F64 || k == TypeKind::F32
+        || k == TypeKind::Ptr || k == TypeKind::F80 || k == TypeKind::F128;
+}
+
 } // namespace
 
 bool MirVerifier::verify(DiagnosticReporter& reporter) const {
@@ -84,6 +321,7 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     checkTypeInvariants(reporter);
     checkCallSignatures(reporter);
     checkAtomicAccessLowered(reporter);
+    checkStoreValueTypes(reporter);
     if (reporter.hitCap()) return false;
     return reporter.errorCount() == errorsBefore;
 }
@@ -506,6 +744,36 @@ void MirVerifier::checkVlaStackTeardown(DiagnosticReporter& reporter) const {
 
 void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
     auto preds = mirBuildPredecessors(mir_);
+    // ══ EVERY WHOLE-MODULE SUBSTRATE IS ESTABLISHED ONCE, OUTSIDE THE LOOP ═══
+    //
+    // ✔MEASURED 2026-08-25 (cycle P36), release dsscp over the 103-TU
+    // full-source sqlite corpus: a whole-program build runs this function TWICE
+    // over the merged 86,411-block / 4,030-function module — once for the
+    // optimizer's final verify and once inside `mergeCuMirs` — and each run was
+    // paying FIVE O(module) establishments PER FUNCTION
+    // ([[D-PERF-VERIFIER-REESTABLISHES-MODULE-SUBSTRATES-PER-FUNCTION]]):
+    //   1. a fresh six-buffer dominator computation   -> `MirDomScratch`
+    //   2. `indexInBlock`, sized to the module's INSTRUCTION count  -> hoisted
+    //   3. `layoutPos`, sized to the module's block count           -> hoisted
+    //   4. the self-loop index the marker derivation needs  -> `MirStructCfScratch`
+    //   5. a fresh eight-buffer post-dominator computation  -> `MirStructCfScratch`
+    // That is functions x O(module) — quadratic in module size, and the SAME
+    // defect [[D-OPT-DOMTREE-SCRATCH-REUSE]] / [[D-OPT-POSTDOM-SCRATCH-REUSE]] /
+    // [[D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN]] already removed from the marker
+    // applier. The verifier could not reach those fixes; now it does.
+    //
+    // ⚠ ANYTHING ADDED BELOW THAT IS O(module) PER FUNCTION PUTS IT BACK.
+    //
+    // (2) and (3) are hoisted with an EXPLICIT touched-slot reset rather than a
+    // re-fill: the fill loops below are the ONLY writers, so walking the same
+    // two loops on the way out restores exactly the fresh-vector default. A
+    // whole-vector `assign` would be the O(module)-per-function cost again.
+    MirDomScratch      domScratch;
+    MirStructCfScratch cfScratch;
+    std::vector<std::uint32_t> indexInBlock(mir_.instCount(),
+        static_cast<std::uint32_t>(-1));
+    std::vector<std::uint32_t> layoutPos(mir_.blockCount(),
+        static_cast<std::uint32_t>(-1));
     for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
         MirFuncId const f = mir_.funcAt(fi);
         if (mir_.funcBlockCount(f) == 0) continue;
@@ -516,7 +784,8 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
             continue;
         }
         auto rpo  = mirReversePostOrder(mir_, entry);
-        MirDomTree const domState = computeMirDomTree(mir_, entry, rpo, preds);
+        MirDomTree const& domState =
+            computeMirDomTree(mir_, entry, rpo, preds, domScratch);
         // Emit `I_VerifierFailure` for every block whose idom couldn't
         // be computed (intersect bailed). Without this signal the
         // caller would silently see an under-conservative idom and
@@ -529,23 +798,55 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
                 "likely has an idom cycle from direct-`Mir`-ctor construction)");
         }
         // Vector-indexed same-block-position map (replaces unordered_map
-        // for a tighter inner loop). Slot 0 unused.
-        std::vector<std::uint32_t> indexInBlock(mir_.instCount(),
-            static_cast<std::uint32_t>(-1));
+        // for a tighter inner loop). Slot 0 unused. Hoisted out of this loop
+        // (see the header note above) and reset at function EXIT; it enters
+        // every iteration all-(-1), exactly as the per-function vector did.
         for (MirBlockId const b : rpo) {
             std::uint32_t const n = mir_.blockInstCount(b);
             for (std::uint32_t i = 0; i < n; ++i) {
                 indexInBlock[mir_.blockInstAt(b, i).v] = i;
             }
         }
+        // The RAII reset for BOTH hoisted maps, so each iteration observes them
+        // exactly as it observed a freshly-allocated vector. It is a guard
+        // object and not a trailing loop because this body `continue`s.
+        //
+        // ⓘ HONEST SCOPE, since an over-claiming comment is worse than none: a
+        // leak is UNREACHABLE today. `indexInBlock[op.v]` is read only when
+        // `op`'s block IS the use block (∈ rpo, so filled this iteration), and
+        // `layoutPos` is read only behind `mirDominatesBlock(...) == Dominates`
+        // against a ONE-FUNCTION tree, which no foreign block can satisfy. The
+        // reset is what makes the hoist equivalent UNCONDITIONALLY rather than
+        // by that two-step argument — widen either read and the argument dies
+        // silently, whereas the reset does not. It is O(function), the same
+        // walk the fill just did.
+        struct ScratchReset {
+            std::vector<std::uint32_t>&    indexInBlock;
+            std::vector<std::uint32_t>&    layoutPos;
+            Mir const&                     mir;
+            std::vector<MirBlockId> const& rpo;
+            MirFuncId                      f;
+            ~ScratchReset() {
+                for (MirBlockId const b : rpo) {
+                    std::uint32_t const n = mir.blockInstCount(b);
+                    for (std::uint32_t i = 0; i < n; ++i) {
+                        indexInBlock[mir.blockInstAt(b, i).v] =
+                            static_cast<std::uint32_t>(-1);
+                    }
+                }
+                std::uint32_t const nb = mir.funcBlockCount(f);
+                for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                    layoutPos[mir.funcBlockAt(f, bi).v] =
+                        static_cast<std::uint32_t>(-1);
+                }
+            }
+        } const scratchReset{indexInBlock, layoutPos, mir_, rpo, f};
         // Block LAYOUT-position map (funcBlockAt order — the order the
         // MIR→LIR lowering + every MirFunctionRebuilder emits blocks).
         // Indexed by block .v; slot 0 unused. Drives the layout rule
         // below: a cross-block operand whose definition DOMINATES its use
         // (SSA-legal) must ALSO be laid out before it, or no linear
         // consumer can resolve it (D-OPT2 layout contract, I0010).
-        std::vector<std::uint32_t> layoutPos(mir_.blockCount(),
-            static_cast<std::uint32_t>(-1));
         {
             std::uint32_t const nBlocksF = mir_.funcBlockCount(f);
             for (std::uint32_t bi = 0; bi < nBlocksF; ++bi) {
@@ -584,7 +885,8 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
         // (one computation per function per verify; the post-dominator
         // tree is the only addition, built inside the derivation).
         {
-            auto const derived = deriveStructCfMarkers(mir_, f, preds, rpo, domState);
+            auto const derived =
+                deriveStructCfMarkers(mir_, f, preds, rpo, domState, cfScratch);
             for (MirBlockId const b : rpo) {
                 StructCfMarker const stored = mir_.blockMarker(b);
                 if (b.v >= derived.size()) continue;  // defensive — derived is blockCount-sized
@@ -1008,7 +1310,132 @@ void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {
         bool const   variadic = interner_->fnIsVariadic(sig);
         std::uint32_t const symV = mir_.globalAddrSymbol(callee).v;
 
-        // ── (2) THE PHYSICAL-vs-SEMANTIC GATE ────────────────────────────────
+        // ── (2) THE RESULT TYPE ──────────────────────────────────────────────
+        // P36 (D-MIR-VERIFIER-CALLSITE-RESULT-TYPE-UNCHECKED). TF-C112 landed
+        // the OPERAND half and recorded this as a deliberate scope boundary so
+        // the ✅ next door would not be over-read. Same defect class, same blind
+        // spot shape: a hand-built call in a synthesis pass could take a result
+        // of the wrong type and no tier objected.
+        //
+        // ⚠ IT RUNS BEFORE THE OPERAND GATE BELOW, AND THAT ORDER IS THE WHOLE
+        // POINT. The gate asks whether the PHYSICAL OPERAND LIST can be aligned
+        // with the semantic parameter list — a question about ARGUMENTS that
+        // says nothing about the result. Its very first clause bails on a
+        // by-value-class return, so placing the result check after it would
+        // silence precisely the struct-return shape the row asks for.
+        {
+            TypeId const res = mir_.instType(id);
+            // A `Void`-typed result is the same claim as NO result. MIR's
+            // opcode table makes Call `R::Optional` for exactly this reason
+            // ("produces a value iff the callee's return type is non-void —
+            // both a valid and an invalid result type are legitimate"), and
+            // both spellings of "no value" reach here.
+            bool const hasResult =
+                res.valid() && interner_->kind(res) != TypeKind::Void;
+            // ⚠ AN INVALID `retTy` IS THE ABSENCE OF A RETURN CLAIM, NOT A
+            // CLAIM OF `void` — the same distinction `ptr<void>` carries at a
+            // pointee, and the reason it is drawn here rather than folded into
+            // the void arm: a rule that reported on absence would be accusing
+            // on SILENCE. So when the signature declares no return type at all,
+            // no result check runs. `checkStructuralInvariants` owns malformed
+            // FnSigs; this rule judges only what a signature actually says.
+            bool const calleeIsVoid =
+                retTy.valid() && interner_->kind(retTy) == TypeKind::Void;
+            if (!retTy.valid()) {
+                // No claim to check against — see the note above.
+            } else if (!hasResult) {
+                // ── ARM A: NO RESULT — always legal, and deliberately so. ──
+                // Three distinct shipped shapes land here and none is a defect:
+                //   * a call whose value is DISCARDED (an expression statement);
+                //   * a call to a genuinely void callee;
+                //   * a ByReference/sret struct-returning call, which hir_to_mir
+                //     emits with `InvalidType` because the callee writes THROUGH
+                //     the hidden pointer and the MIR Call is valueless
+                //     (emitStructReturningCall's ByReference arm).
+                // The tier cannot distinguish the first from a lowering that
+                // LOST a needed result, so it must not guess. Stated rather
+                // than left implicit, because "no result is always fine" is a
+                // real coverage hole and the next reader is owed it.
+            } else if (calleeIsVoid) {
+                // ── ARM B: A RESULT FROM A VOID CALLEE ──
+                // Unambiguous: there is no value to take. This is the arm that
+                // catches a synthesis pass wiring a result off a `void` shim.
+                reportInst(reporter, DiagnosticCode::I_CallSignatureMismatch, id,
+                    std::format("call of symbol #{} (callee fnsig type {}) takes "
+                                "a RESULT of type {} (kind {}{}) but the "
+                                "signature declares a void return",
+                        symV, sig.v, res.v,
+                        static_cast<int>(interner_->kind(res)),
+                        interner_->vocabularyName(res).empty()
+                            ? std::string{}
+                            : std::format(" \"{}\"",
+                                          interner_->vocabularyName(res))));
+            } else if (isByValueClass(*interner_, retTy)) {
+                // ── ARM C: A BY-VALUE-CLASS RETURN — PIECE 0 ──
+                // An InRegisters struct/union/_Complex/wide-int return is
+                // lowered so that THE CALL'S OWN RESULT IS PIECE 0 (measured in
+                // emitStructReturningCall: `mir.addInst(Call, …, p0ty, …)`, with
+                // pieces 1..N-1 as `ReturnPiece` reads). Piece 0's type is
+                // chosen by the TARGET's ABI classifier, which MIR must not know
+                // — the agnosticism bar — so the honest check is the same one
+                // FC7 C1c already applies to the multi-operand `Return`: the
+                // result is either the aggregate VALUE itself (the const-fold /
+                // .dssir-text form) or a register PIECE. Reusing
+                // `isAbiPieceKind` rather than re-listing the kinds is the point
+                // — two lists of "what an ABI piece looks like" would drift.
+                //
+                // ⓘ HONEST LIMIT, stated because the arm is genuinely weak:
+                // this accepts ANY register-piece kind, so a WRONG piece type is
+                // invisible here. Narrowing it needs the ABI classification
+                // recorded ON the Call (a MIR-tier change), exactly as the
+                // operand gate below needs. It is still strictly more than the
+                // nothing that preceded it: a struct-returning call taking a
+                // `ptr<struct FILE>` or a `struct` of the wrong identity is now
+                // named.
+                if (!sameSlotType(*interner_, res, retTy)
+                    && !isAbiPieceKind(interner_->kind(res))) {
+                    reportInst(reporter, DiagnosticCode::I_CallSignatureMismatch,
+                        id,
+                        std::format("call of symbol #{} (callee fnsig type {}) "
+                                    "takes a RESULT of type {} (kind {}{}) but "
+                                    "the signature declares a by-value-class "
+                                    "return of type {} (kind {}{}) — the result "
+                                    "must be the aggregate value or ABI piece 0 "
+                                    "(FC7 C1c)",
+                            symV, sig.v, res.v,
+                            static_cast<int>(interner_->kind(res)),
+                            interner_->vocabularyName(res).empty()
+                                ? std::string{}
+                                : std::format(" \"{}\"",
+                                              interner_->vocabularyName(res)),
+                            retTy.v, static_cast<int>(interner_->kind(retTy)),
+                            interner_->vocabularyName(retTy).empty()
+                                ? std::string{}
+                                : std::format(" \"{}\"",
+                                              interner_->vocabularyName(retTy))));
+                }
+            } else if (!sameSlotType(*interner_, res, retTy)) {
+                // ── ARM D: A SCALAR RETURN — the full notion, nothing looser. ──
+                reportInst(reporter, DiagnosticCode::I_CallSignatureMismatch, id,
+                    std::format("call of symbol #{} (callee fnsig type {}) takes "
+                                "a RESULT of type {} (kind {}{}) but the "
+                                "signature declares a return type of {} "
+                                "(kind {}{})",
+                        symV, sig.v, res.v,
+                        static_cast<int>(interner_->kind(res)),
+                        interner_->vocabularyName(res).empty()
+                            ? std::string{}
+                            : std::format(" \"{}\"",
+                                          interner_->vocabularyName(res)),
+                        retTy.v, static_cast<int>(interner_->kind(retTy)),
+                        interner_->vocabularyName(retTy).empty()
+                            ? std::string{}
+                            : std::format(" \"{}\"",
+                                          interner_->vocabularyName(retTy))));
+            }
+        }
+
+        // ── (3) THE PHYSICAL-vs-SEMANTIC GATE ────────────────────────────────
         // A MIR Call's operand list is the ABI-LOWERED (physical) list, NOT the
         // FnSig's semantic parameter list. hir_to_mir has already expanded the
         // by-value-aggregate shapes, and the expansion factor is not derivable
@@ -1037,7 +1464,7 @@ void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {
             if (p.valid() && isMemoryResidentType(*interner_, p)) return;
         }
 
-        // ── (3) ARITY ────────────────────────────────────────────────────────
+        // ── (4) ARITY ────────────────────────────────────────────────────────
         // A VARIADIC callee's declared params are the FIXED prefix; positions at
         // and beyond `params.size()` are the vararg region, which the FnSig does
         // not type at all (C's default argument promotions + the platform vararg
@@ -1056,7 +1483,7 @@ void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {
             return;   // positions no longer correspond — do not cascade
         }
 
-        // ── (4) PER-POSITION TYPE ────────────────────────────────────────────
+        // ── (5) PER-POSITION TYPE ────────────────────────────────────────────
         for (std::size_t i = 0; i < params.size(); ++i) {
             TypeId const p = params[i];
             TypeId const a = mir_.instType(ops[i + 1]);
@@ -1073,167 +1500,148 @@ void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {
             // aggregate expansions gated above) — only this position's TYPE is
             // unjudgeable.
             if (interner_->kind(p) == TypeKind::F80) continue;
-            // THE COMPATIBILITY NOTION, and it is deliberately TIGHT: MIR is
-            // POST-conversion. Every implicit conversion C admits at a call site
-            // was already materialized as an explicit Cast/Bitcast node by
-            // cst_to_hir's coerce arm — that is precisely what
-            // `HirVerifier::checkCallArguments` enforces with its strict
-            // `PointerConversionRules{}` (D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT),
-            // and the FfiDescriptorIntPointeeArgRealizesAsPtrBitcast
-            // pin witnesses a Ptr→Ptr bitcast being emitted for exactly this
-            // reason. So a call operand's type must EQUAL its parameter's:
-            //   * identical TypeId, or
-            //   * `sameRepresentation` — identity-distinct but bit-identical
-            //     (D-LANG-TYPE-IDENTITY-VOCABULARY: `long` vs `long long` where
-            //     the data model makes both I64). A same-representation
-            //     conversion changes NO bits, so the tree deliberately RETAGS
-            //     rather than emitting a Cast for it; rejecting it here would
-            //     make the verifier contradict the lowering.
-            // Nothing looser. In particular there is NO "all pointers are
-            // interchangeable" slack: MIR does have one pointer representation,
-            // but admitting that would silently bless a shim wiring a `FILE*`
-            // into a `char*` slot — the exact class this rule exists for.
-            if (a.v == p.v) continue;
-            if (interner_->sameRepresentation(a, p)) continue;
-            // ★ THE ONE POINTER RELAXATION, and it is MEASURED, not assumed.
-            // `ptr<void>` is MIR's canonical spelling for "an ADDRESS whose
-            // pointee is unknown or irrelevant" — it is the ABSENCE of a type
-            // claim, not a claim of `void`. Every va_list frame leaf
-            // (Va{Home,Overflow,RegSave}ArgAreaAddr) is emitted `ptr<void>` by
-            // hir_to_mir, and every synthesis pass spells an opaque OS/CRT
-            // handle (`FILE*`, `mtx_t*`, HANDLE, PINIT_ONCE_FN) `ptr<void>`.
-            // C agrees: `void*` converts to and from any object pointer with
-            // no cast at all (6.3.2.3p1).
-            //
-            // MEASURED at TF-C112, and this is the shape that forced it: for
-            // `int vsum(int, va_list)` (examples/c/va_list_param_forward),
-            // the BASELINE module passes `ap` as a `Load` of the slot, typed
-            // with the declared `va_list` (= `ptr<i8>` under Win64) — an exact
-            // match. Running **Mem2Reg** (isolated: the diagnostic appears
-            // between `pass=Mem2Reg done mutated=1` and the next pass, and
-            // never after Identity/ConstFold) promotes the slot and forwards
-            // the DEFINITION — the `VaHomeArgAreaAddr` leaf, typed `ptr<void>`
-            // — into the call operand. The pointee type is ERASED, with no
-            // retagging Cast, because a `ptr<void>`→`ptr<i8>` retag changes no
-            // bits and materializing one would invent a runtime instruction
-            // (the same reasoning that made `sameRepresentation` a RETAG rather
-            // than a Cast). So pointee identity at a call operand is NOT a MIR
-            // invariant after optimization, and a rule that demanded it would
-            // be demanding something the tier does not provide.
-            //
-            // Scoped as tightly as the evidence allows: this admits ONLY a
-            // `void*` on one side. `ptr<struct FILE>` into a `ptr<char>`
-            // parameter — the class nearest the shim bug this rule exists for
-            // — is still REJECTED. Do NOT widen this to "all pointers are
-            // interchangeable": that is the relaxation that would make the
-            // rule stop paying for itself.
-            {
-                auto const isVoidPtr = [&](TypeId t) {
-                    if (interner_->kind(t) != TypeKind::Ptr) return false;
-                    auto const o = interner_->operands(t);
-                    return !o.empty() && o[0].valid()
-                        && interner_->kind(o[0]) == TypeKind::Void;
-                };
-                if (interner_->kind(a) == TypeKind::Ptr
-                    && interner_->kind(p) == TypeKind::Ptr
-                    && (isVoidPtr(a) || isVoidPtr(p))) {
-                    continue;
-                }
-            }
-            // ★ THE TYPE-QUALIFIER ARM, and it is MEASURED, not assumed.
-            // A qualifier skin (`volatile T` / `_Atomic T` — kind=VolatileQual
-            // carrying a QualBit mask) is by the interner's OWN construction a
-            // TRANSPARENT, REPRESENTATION-NEUTRAL wrapper: `kind()`/`operands()`/
-            // `scalars()` see straight through it, and `sameRepresentation`'s
-            // contract says in as many words that "`volatile long` and `long`
-            // compare equal here". But `sameRepresentation` compares a composite's
-            // OPERANDS by raw TypeId identity, so that neutrality does NOT survive
-            // one level of indirection: `ptr<T>` vs `ptr<volatile T>` compares the
-            // pointees #T and #volatile-T as raw ids and reports UNEQUAL. The
-            // relaxation below restores, for exactly one level, the neutrality the
-            // interner already declares.
-            //
-            // C requires it. `T*` → `volatile T*` at a call argument is an
-            // IMPLICIT QUALIFICATION CONVERSION (C17 6.5.16.1p1 — the pointed-to
-            // type on the left has all the qualifiers of the one on the right),
-            // legal with no cast at all. So the tree correctly emits NO Cast for
-            // it, for the same reason it retags rather than Casts a
-            // `sameRepresentation` pair: the conversion changes no bits and
-            // materializing an instruction for it would invent runtime work.
-            // Demanding a Cast here would make the verifier contradict the
-            // lowering — the very thing the `sameRepresentation` arm above exists
-            // to avoid.
-            //
-            // MEASURED at TF-C112, and this is the shape that forced it: sqlite
-            // `src/func.c` declares `kahanBabuskaNeumaierInit/Step/StepInt64` as
-            // `(volatile SumCtx *, …)` and calls all three from `sumStep` /
-            // `sumInverse` with a plain `SumCtx *p`. 11 call sites, 3 callees, one
-            // shape. The interner mints ONE `SumCtx` (there is no second interning
-            // — verified: `stripVolatile(paramPointee)` returns the argument
-            // pointee's OWN TypeId, bit for bit), and gcc 13.2.0 compiles the
-            // reduction at `-std=c17 -Wall -Wextra -pedantic` with rc=0 and ZERO
-            // diagnostics. It reproduces at `--config=debug` too, so unlike
-            // D-OPT-MEM2REG-ERASES-CALL-OPERAND-POINTEE this is NOT an optimizer
-            // artefact: pointee identity modulo qualifiers was never a property of
-            // the BASELINE lowering either, because C never required it.
-            //
-            // Scoped as tightly as the evidence allows, and deliberately NOT
-            // `sameRepresentation` on the pointees: this admits ONLY pointees that
-            // strip to the IDENTICAL interned TypeId. `ptr<long>` vs
-            // `ptr<long long>` (same representation, different type) stays
-            // REJECTED, and so does `ptr<struct FILE>` into a `ptr<char>` parameter
-            // — the shim-miswiring class this rule exists for. The arm cannot fire
-            // at all unless one side actually carries a skin: with neither
-            // qualified, `stripVolatile` is the identity and the pointer types
-            // would already have been equal at the `a.v == p.v` test above.
-            //
-            // SYMMETRIC on purpose. Discarding a qualifier (`volatile T*` into a
-            // `T*` parameter) is a C CONSTRAINT violation, not a representation
-            // error — it is the front end's to diagnose (the analyzer and
-            // HirVerifier's `PointerConversionRules`), and MIR must not encode one
-            // source language's qualifier rules or it stops being language-
-            // agnostic. See D-CSUBSET-QUALIFIER-DISCARD-AT-CALL-ARG-UNDIAGNOSED.
-            //
-            // ⚠ STATED, NOT OVERLOOKED: `stripVolatile` removes the WHOLE QualBit
-            // mask, so this also excuses `ptr<T>` against a `ptr<_Atomic T>`
-            // parameter. That is sound HERE and only here: a call operand is an
-            // ADDRESS, and atomicity governs the ACCESSES — which the callee makes
-            // under its own parameter declaration, and which `checkAtomicAccessLowered`
-            // guards independently (a plain Load/Store of an atomic-qualified type
-            // is its own violation, untouched by this arm). Using the interner's
-            // single documented strip chokepoint is also deliberate: a bespoke
-            // "volatile bit only" strip would mint a SECOND notion of qualifier
-            // identity beside `qualifierBits`/`stripVolatile`, and two notions
-            // drift.
-            {
-                auto const strippedPointee = [&](TypeId t) -> TypeId {
-                    auto const o = interner_->operands(t);
-                    if (o.size() != 1 || !o[0].valid()) return TypeId{};
-                    return interner_->stripVolatile(o[0]);
-                };
-                if (interner_->kind(a) == TypeKind::Ptr
-                    && interner_->kind(p) == TypeKind::Ptr) {
-                    TypeId const ua = strippedPointee(a);
-                    TypeId const up = strippedPointee(p);
-                    if (ua.valid() && up.valid() && ua == up) continue;
-                }
-            }
+            // ── THE COMPATIBILITY NOTION ─────────────────────────────────
+            // ONE notion, shared with the RESULT half above and with
+            // `checkStoreValueTypes` — see `sameSlotType` at the top of this
+            // file for every arm and the measurement behind it. It used to live
+            // here, inline, reachable by nothing else, which is exactly why the
+            // other two seams shipped with no type check at all.
+            if (sameSlotType(*interner_, a, p)) continue;
             reportInst(reporter, DiagnosticCode::I_CallSignatureMismatch, id,
                 std::format("call of symbol #{} (callee fnsig type {}): argument "
-                            "at POSITION {} (value #{}) has type {} (kind {}{}) "
+                            "at POSITION {} (value #{}) has type {} ({}) "
                             "but the signature declares parameter {} as type {} "
-                            "(kind {}{})",
+                            "({})",
                     symV, sig.v,
                     i, ops[i + 1].v,
-                    a.v, static_cast<int>(interner_->kind(a)),
-                    interner_->vocabularyName(a).empty()
-                        ? std::string{}
-                        : std::format(" \"{}\"", interner_->vocabularyName(a)),
-                    i, p.v, static_cast<int>(interner_->kind(p)),
-                    interner_->vocabularyName(p).empty()
-                        ? std::string{}
-                        : std::format(" \"{}\"", interner_->vocabularyName(p))));
+                    a.v, describeType(*interner_, a),
+                    i, p.v, describeType(*interner_, p)));
         }
+    });
+}
+
+void MirVerifier::checkStoreValueTypes(DiagnosticReporter& reporter) const {
+    // P36 (D-MIR-VERIFIER-STORE-CALLARG-TYPE-BLIND). The MEMORY-WRITE seam.
+    // Needs the interner to read the address's pointee; without one (a raw test
+    // fixture whose TypeIds are untagged stand-ins) the rule is skipped exactly
+    // like every other interner-gated check.
+    //
+    // ★ WHY THIS IS THE SAME DEFECT AS THE TWO CALL RULES, not a third one.
+    // `checkAtomicAccessLowered` already walks every Store — and reads ONLY the
+    // pointee's ATOMIC QUALIFICATION. Nothing anywhere compared the stored
+    // VALUE's type against the slot it lands in. So `MirVerifier` green meant
+    // "no terminator or operand-count violations", which is far narrower than
+    // the "MIR is well-typed" its name implies, and every tier above it read
+    // the name. D-CSUBSET-INT128-NARROWING-CAST-SITE-INCOMPLETE is the measured
+    // consequence: `return (u64)(r>>64);` was diagnosed loudly
+    // (I_TerminatorTypeMismatch) while the STORE-SHAPED and CALL-ARGUMENT forms
+    // carried the SAME wrong TypeId with no diagnostic at all — and a hand
+    // probe over the one working site read as proof of a contract that held at
+    // one site out of seven.
+    if (interner_ == nullptr) return;
+    forEachInst(mir_, [&](MirInstId id) {
+        MirOpcode const op = mir_.instOpcode(id);
+        // AtomicStore is included DELIBERATELY. It is the identical seam with
+        // the identical operand order ([value, ptr] — mir_opcode.hpp says so in
+        // as many words: "the plain-Store operand order, so the funnel is a
+        // drop-in for the Store emit"), so excluding it would leave a hole of
+        // exactly the shape this rule exists to close, and an unstated one.
+        if (op != MirOpcode::Store && op != MirOpcode::AtomicStore) return;
+        auto const ops = mir_.instOperands(id);
+        // Operand arity is checkStructuralInvariants' rule ([min,max] == [2,2]);
+        // do not double-report it here.
+        if (ops.size() != 2) return;
+        TypeId const valTy  = mir_.instType(ops[0]);
+        TypeId const addrTy = mir_.instType(ops[1]);
+        // Cascade suppression — the whole-verifier convention.
+        if (!valTy.valid() || !addrTy.valid()) return;
+        // A non-pointer address is either another rule's violation or a shape
+        // this rule cannot read a slot type out of. Either way it is not this
+        // rule's to accuse.
+        if (interner_->kind(addrTy) != TypeKind::Ptr) return;
+        auto const pointeeSpan = interner_->operands(addrTy);
+        if (pointeeSpan.size() != 1 || !pointeeSpan[0].valid()) return;
+        TypeId const pointee = pointeeSpan[0];
+
+        // ── THE ONE NARROWING, and it is the `void*` arm read one level down ──
+        // `ptr<void>` is MIR's canonical spelling for "an ADDRESS whose pointee
+        // is unknown or irrelevant" — the ABSENCE of a type claim, not a claim
+        // of `void`. A store THROUGH such an address therefore makes no claim
+        // this rule could contradict. `sameSlotType`'s ARM 3 already says this
+        // for a pointer-typed VALUE; it cannot say it here because the slot is
+        // the pointee itself and the value is typically a scalar, so neither
+        // side is a pointer and ARM 3 never runs. Stating it at the seam is the
+        // honest placement: it is a fact about what a `void` pointee MEANS, not
+        // about type compatibility.
+        // `kind()` sees through a qualifier skin, so `ptr<volatile void>` is
+        // covered without a strip.
+        if (interner_->kind(pointee) == TypeKind::Void) return;
+
+        if (sameSlotType(*interner_, valTy, pointee)) return;
+
+        // ── THE SECOND NARROWING: A TIER-DECLARED REPRESENTATION IDENTITY ────
+        // ⚠ THIS IS A NARROWING WITH A MEASURED REASON, NOT A RULE TUNED UNTIL
+        // THE CORPUS WENT GREEN — the distinction matters, so here is the
+        // evidence and the line it is drawn on.
+        //
+        // ✔MEASURED (P36, 15 corpus examples x 2 configs, 113 diagnostics): 16 of
+        // them are `store <i32> into ptr<enum "Color">` and
+        // `store <u8|i8|u64> into ptr<_BitInt(N)>`. Both come from the BIT-FIELD
+        // path, where hir_to_mir types the allocation-unit ADDRESS with the
+        // member's DECLARED type while `emitBitfieldInsert`/`emitBitfieldExtract`
+        // reassign the value's type to the CONTAINER on their first line
+        // (`bitIntReprType(enumReprType(fieldTy))`).
+        //
+        // ★ WHY THAT IS NOT AN ILL-TYPED STORE, WHILE THE OTHER TWO CLASSES THIS
+        // RULE FOUND ARE. An enum's underlying type IS the container: the
+        // interner stores it, and `core_type.hpp` says an Enum has "distinct
+        // nominal identity … but int-compatible at all arithmetic / cast sites".
+        // A memory slot is such a site. Width, signedness and every bit agree, so
+        // NOTHING a later consumer does can differ — which is exactly the test
+        // that FAILS for the two classes left rejected: `i64` vs `u64` agree on
+        // width and bits but NOT on signedness, and signedness changes what a
+        // later division, shift, comparison or widening does. That is the line,
+        // and it is a property of the types rather than of the corpus.
+        //
+        // ★★ IT READS THE MAPPING, IT DOES NOT RESTATE IT. The container comes
+        // from `scalars(enum)[0]` and `bitIntContainerKind` — the interner's own
+        // declarations, the SAME ones `enumReprType`/`bitIntReprType` read. There
+        // is no name, size or signedness table here; a language that declares a
+        // different underlying type gets a different answer with no edit, which is
+        // the agnosticism bar. A hardcoded "Enum ~ I32" would have been the break.
+        //
+        // ⓘ SEAM-SCOPED ON PURPOSE — it is deliberately NOT in `sameSlotType`.
+        // A memory slot is where REPRESENTATION governs (the object's storage). A
+        // call ARGUMENT is a value conversion the front end must materialize, and
+        // the corpus is green with the call seam rejecting this class today, so
+        // widening the shared notion would loosen two seams to fix one.
+        {
+            TypeKind const slotKind = interner_->kind(pointee);
+            TypeKind container      = TypeKind::Void;   // Void = "no declaration"
+            if (slotKind == TypeKind::Enum) {
+                auto const sc = interner_->scalars(pointee);
+                if (!sc.empty()) container = static_cast<TypeKind>(sc[0]);
+            } else if (slotKind == TypeKind::BitInt) {
+                // Returns Void for N>64 (the fail-loud sentinel); a multi-limb
+                // `_BitInt` has no single container and is left judged.
+                container = interner_->bitIntContainerKind(pointee);
+            }
+            if (container != TypeKind::Void
+                && interner_->kind(valTy) == container) {
+                return;
+            }
+        }
+
+        reportInst(reporter, DiagnosticCode::I_StoreValueTypeMismatch, id,
+            std::format("`{}` of value #{} typed {} ({}) into an address "
+                        "whose pointee is {} ({}) — a stored value must "
+                        "have its slot's type; MIR is POST-conversion, so a "
+                        "narrowing/widening/retagging conversion must already "
+                        "have been materialized as a Cast",
+                mnemonic(op),
+                ops[0].v,
+                valTy.v, describeType(*interner_, valTy),
+                pointee.v, describeType(*interner_, pointee)));
     });
 }
 

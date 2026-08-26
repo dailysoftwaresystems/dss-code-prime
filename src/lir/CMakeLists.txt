@@ -5,6 +5,7 @@ add_library(lir OBJECT
     lir_literal_pool.cpp
     lir_liveness.cpp
     lir_pass_util.cpp
+    lir_peephole.cpp
     lir_reg_constraints.cpp
     lir_regalloc.cpp
     lir_rewrite.cpp

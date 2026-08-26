@@ -35,6 +35,7 @@ using detail::isFloatValue;
 using detail::makeBoolLiteral;
 using detail::narrowToFloatWidth;
 using detail::toWideFloatOperand;
+using detail::asIntBits;
 using detail::valueFitsInIntTarget;
 using detail::wrapToIntTarget;
 
@@ -185,7 +186,14 @@ combineBinary(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     // `UnsupportedTypeKind` consistent with LogicalAnd/Or/Ternary;
     // applyBinaryInt's nullopt is reserved for "operator not yet
     // modelled" (UnsupportedOperator) and policy refusals.
-    if (!asInt64(*a.value).has_value() || !asInt64(*b.value).has_value()) {
+    // `asIntBits`, not `asInt64` — see
+    // D-HIR-CONSTEVAL-UNSIGNED-WRAPAROUND-NOT-MODULAR.
+    // This guard asks "is this an INTEGER operand", and an unsigned
+    // value above INT64_MAX is one. Asking `asInt64` made it answer "is this
+    // value representable as signed", which rejected every `u64` expression
+    // whose high bit is set before `applyBinaryInt` -- which now establishes
+    // the operation's domain -- ever saw it.
+    if (!asIntBits(*a.value).has_value() || !asIntBits(*b.value).has_value()) {
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
     }
     ConstEvalFailure why = ConstEvalFailure::None;
@@ -451,15 +459,47 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     }
     HirLiteralValue folded;
     folded.core = toK;
-    // Cast to unsigned target ≥64 bits with a negative source value:
+    // ── D-CE-NEGATIVE-WIDENED-TO-U64-NOT-CONSTFOLDABLE: THE GUARD THAT USED
+    // TO STAND HERE IS GONE, AND ITS OWN COMMENT NAMED THE CONDITION ────────
+    // It read: "Cast to unsigned target >=64 bits with a negative source value:
     // the int64 storage arm cannot reconcile signedness with downstream
-    // signed-arithmetic paths (`applyBinaryInt` reads via int64), so the
-    // engine refuses regardless of the `refuseOnOverflow` knob. Callers
-    // route through the runtime path which handles the bit-pattern wrap
-    // correctly. (When CE5 opens the uint64 arm for arithmetic, this
-    // restriction can lift.)
-    if (target->bits >= 64 && !target->isSigned && iv < 0) {
-        return fail(ConstEvalFailure::Overflow, expr);
+    // signed-arithmetic paths (`applyBinaryInt` reads via int64) ... (When CE5
+    // opens the uint64 arm for arithmetic, this restriction can lift.)" That
+    // stated lift-condition is now met: `applyBinaryInt` evaluates in the
+    // operation's own (width, signedness) domain and reads unsigned operands
+    // through `uint64_t`, so the int64 payload is an unambiguous BIT PATTERN
+    // and nothing downstream re-reads it as signed by accident.
+    //
+    // ★ IT WAS ALSO WRONG ON THE STANDARD'S OWN TERMS, WHICH IS WHY THIS IS A
+    // DELETION AND NOT A KNOB. C 6.3.1.3p2 makes integer -> unsigned conversion
+    // ALWAYS DEFINED (reduce modulo 2^N); there is no overflow to report, so
+    // `(unsigned long)(-1)` was a legal constant expression being refused. It
+    // now falls through to the shared `valueFitsInIntTarget` / `wrapToIntTarget`
+    // policy every other width already used -- which is why `(unsigned int)(-1)`
+    // MEASURED as working the whole time while `(unsigned long)(-1)` did not.
+    //
+    // ⚠ THE TWO FLOAT -> INT GUARDS OF THE SAME SHAPE ABOVE DELIBERATELY STAY.
+    // C 6.3.1.4p1 makes a float -> integer conversion UNDEFINED when the
+    // integral part is unrepresentable, so a negative double to an unsigned
+    // type has no defined value to fold. Refusing there is fail-loud; deleting
+    // it would invent an answer the standard does not give.
+    //
+    // ★★ AND `refuseOnOverflow` DOES NOT APPLY TO AN UNSIGNED TARGET AT ALL --
+    // THE KNOB WAS CONFLATING TWO DIFFERENT PARAGRAPHS OF 6.3.1.3.
+    //   p2 (target UNSIGNED): the value is reduced modulo 2^N. Always defined.
+    //                         There is no overflow, so there is nothing for a
+    //                         strict policy to refuse -- refusing would reject
+    //                         a legal constant expression.
+    //   p3 (target SIGNED):   an unrepresentable value is IMPLEMENTATION-DEFINED
+    //                         (or raises a signal). A strict verifier is right
+    //                         to refuse that, and it still does.
+    // Deleting the >=64-bit guard alone was not enough: `valueFitsInIntTarget`
+    // reports "no value change", which is FALSE for -1 -> 2^64-1, so the strict
+    // knob still turned a defined conversion into an Overflow. Keying the knob
+    // on the target's SIGNEDNESS is what makes the two paragraphs distinct.
+    if (!target->isSigned) {
+        folded.value = wrapToIntTarget(iv, *target);
+        return ok(std::move(folded));
     }
     if (valueFitsInIntTarget(iv, *target)) {
         folded.value = iv;

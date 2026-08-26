@@ -28,17 +28,316 @@
 | OPT4  | Pre-cond refactors (dom-tree + rebuilder) + Mem2Reg + SSA copy-prop | 🟩 **c1+c2+c3 DONE** | c3          | `256b970` + `2e89b83` + `f496aea` |
 | OPT5  | CSE / GVN + SimplifyCFG + pipeline fixed-point | 🟩 **c1+c2 DONE** | c2          | `ec7220b` + `96bb941` |
 | OPT5+ | **SimplifyCFG**† — branch-fold + jump-thread + block-merge + marker re-derivation (MIR; recurring) | 🟩 **c2+c3 DONE** (single-non-Linear-marker case; both-sides-non-Linear case anchored at `D-OPT4-1-NON-LINEAR-MARKER-MERGE` — **✅ CLOSED 2026-06-12 by the D15 cycle-B `rederiveStructCfMarkers` substrate: the gate's marker condition deleted, both-non-Linear merges admitted, markers re-derived canonically; D-OPT4-1 FULLY closed**) | c2+c3 | `96bb941` + `738413d` |
-| OPT6  | LICM (Loop-Invariant Code Motion) | 🟩 **c1 DONE + chained-invariants CLOSED 10j + preheader-skip Info diag 10l** (preheader insertion still deferred — trap-safe conservative-safe default RUNTIME-PINNED cycle 11 (`licm_trap_safe_hoist/`, regression-proven, retires the 10j HARD STOP); aggressive hoist-when-safe needs value-range OPT8+; preheader-insertion needs Phi-merge substrate, supervised cycle) | c1 + 10j + 10l | `164a1ca` + `35cc798` + `7629f5f` |
+| OPT6  | LICM (Loop-Invariant Code Motion) | 🟩 **c1 DONE + chained-invariants CLOSED 10j + preheader-skip Info diag 10l** (preheader insertion still deferred — trap-safe conservative-safe default RUNTIME-PINNED cycle 11 (`licm_trap_safe_hoist/`, regression-proven, retires the 10j HARD STOP); aggressive hoist-when-safe needs value-range **OPT13**; preheader-insertion needs Phi-merge substrate, supervised cycle) | c1 + 10j + 10l | `164a1ca` + `35cc798` + `7629f5f` |
 | OPT7  | Inlining                                   | 🟩 **cycles 1–6 done (the user-directed OPT7 sequence c3–c6 COMPLETE)** — single-block (c1) + multi-block-leaf (c2) splice + §2.9 legality gate; **cross-CU MIR merge LANDED (c25, `D-OPT7-CROSSCU-MIR-MERGE` ✅); cross-CU INLINING ✅ DONE (c26, `D-OPT7-1` ✅) — the optimizer now runs on the whole-program merged module → cross-CU calls inlined**; **+ general NON-LEAF inlining + SCC recursion safety (c27: lifted Call-leaf, new `call_graph_scc` Tarjan, recursive-SCC refusal — generalizes self→mutual recursion; non-leaf is correctness-preserving + opt-in)** **+ inline COST MODEL + SHIP-IN-RELEASE (c28: `OptPipeline.inlineThreshold` config-driven; `Inlining` now in `release.pipeline.json` — a real -O optimization)** **+ IntrinsicCall inlining relaxation (c29: the gate admits an IntrinsicCall-bearing callee; frame-sensitive gating deferred trigger-gated behind a fail-loud registry-empty tripwire)** | `opt/passes/inlining.cpp` + `opt/analysis/call_graph_scc.{hpp,cpp}` + `mir/merge/mir_merge.cpp` | `test_inlining` + `NonLeafCalleeIsInlined` + `MutualRecursiveCallIsNotInlined` + `IntrinsicCalleeIsInlined` + `MultiBlockIntrinsicCalleeIsInlined` + `VoidIntrinsicCalleeIsInlined` + `NoShippedConstructLowersToIntrinsic` + `test_call_graph_scc` + `CrossCuCallIsInlinedOnMergedModule` + `WeakCalleeSurvivingMergeIsRefusedByMergedOptimize` + `InlineCostModelRefusesLargeCallee` + `InlineThreshold*Rejects` + `ShippedReleaseContainsInlining` + `test_mir_merge` + `test_type_reintern` + `non_leaf_inline` + `multiblock_inline` + `weak_inline_crosscu` + the `cross_cu_call` Inlining arm |
-| OPT8  | LIR peephole + register coalescing         | ⏳ **planned (v1.x)** | —           | — |
+| OPT8  | LIR peephole + register coalescing         | 🟩 **LANDED 2026-08-26 (cycle P36)** — the peephole is WIRED at step 8b of `compile_pipeline.cpp` (not merely written), and the callee-saved-first allocation preference that voided its prologue pins was corrected with it; `lir/test_lir_peephole` is a registered `ctest` entry. ⚠ The register COALESCING half is the residue and keeps this row open at v1.x scope. — ⚠ **OPT8 IS EXACTLY THESE TWO THINGS AND NOTHING ELSE; see §0.4.** The label was used for three different scopes across this document and the other two now have their own ids: instruction scheduling is **OPT19**, and the value-range analysis several rows park on as "OPT8+" is **OPT13**. | P36 | — |
 | OPT9  | Vectorization (auto-SIMD)                  | ⏳ **planned (v2)**   | —           | — |
 | OPT10 | Autotuner (research frontier)              | ⏳ **planned (v2+)**  | —           | — |
+| OPT11 | **Cross-CU SUMMARY INDEX** (replaces the monolithic whole-program merge) | 🟩 **PHASE 1 LANDED 2026-08-26 (cycle P36); THE ARC IS OPEN** — operator-decided 2026-08-25, see §0.2. The per-object summary and MIR sections are DECLARED in all ten relocatable/staticlib format documents with a per-format non-ALLOC spelling, and the producer plus the index live in `src/mir/summary/` behind three registered `ctest` entries. ⚠ The remaining work is [[D-OPT11-LAZY-IMPORT-EDGE]], which is OPEN — and its option A (*"reuse the fixpoint's own max"*) is CONTAMINATED: every figure derived from the pre-P36 `max` is an artifact of a fixpoint that DIVERGED rather than converged late. | P36 | — |
+| OPT12–OPT22 | **The remaining distance to a first-class optimizer** — 11 items across the scalar, interprocedural, machine and feedback tiers | ⏳ **ROADMAP — operator-directed 2026-08-25 (P36); see §0.3** | — | — |
 
 **Mandatory for v1**: OPT1 ✅ + OPT2 ✅ + OPT3 ✅.
 **v1.x→v2 roadmap**: OPT4–OPT8.
 **Research arc**: OPT9 + OPT10.
 
 † **SimplifyCFG is a recurring cleanup, not a linear OPT-N step** — hence the `OPT5+` label rather than its own integer (renumbering LICM→Autotuner would churn name-stable pins for no gain). Implemented in **two cycles** (OPT5+ c2 — branch-fold + empty-block jump-thread + pipeline-level fixed-point loop, commit `96bb941`; OPT5+ c3 — general block-merge + single-non-Linear-marker re-derivation, commit `738413d`), carrying the load-bearing **StructCfMarker repair** (D-OPT4-1, §2.7 — re-derive marked regions post-transform so WASM/SPIR-V codegen stays intact; this is the DSS-specific constraint LLVM's SimplifyCFG doesn't have). The both-sides-non-Linear case (full CFG-shape-driven re-derivation) is anchored at `D-OPT4-1-NON-LINEAR-MARKER-MERGE` in §3.1 — **✅ CLOSED 2026-06-12 (D15 cycle B): `deriveStructCfMarkers` (dom + post-dom canonical derivation, `src/mir/mir_struct_markers.{hpp,cpp}`) replaced the incremental repair entirely — every producer re-derives, the verifier checks stored==derived equality, the merge gate's marker condition is gone; D-OPT4-1 is FULLY closed**. **Thereafter a recurring pipeline citizen**: listed multiple times in `*.pipeline.json` and run to fixed point interleaved with ConstFold + DCE — ConstFold turns `if (5 < 3)` → `if (false)`, SimplifyCFG deletes the dead arm, DCE removes the now-unreachable code, exposing more folding (the classic mutually-enabling cleanup cluster). See the §3 SimplifyCFG row + `D-OPT-FIXED-POINT-LOOP` (closed OPT5+ c2).
+
+## 0.2 ★★★ THE OPERATOR'S ARCHITECTURE RULING — SUMMARY INDEX + OPT8, AND **NO TRADE-OFF** (2026-08-25, cycle P36)
+
+> **Verbatim:** *"use /dss-cycle so we have the BEST inlining EVER. We know how our references do, so we
+> know what to do. We need the summary index + OPT8. No trade off will happen."*
+> Taken together with the same day's §B ruling on `D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION`:
+> *"Yes — build it, it IS the compile-time answer."*
+
+**THE DECISION.** DSS replaces the **monolithic whole-program MIR merge** — which runs on EVERY build today —
+with a **per-module SUMMARY INDEX**: a compact record of each TU's call graph and symbol/linkage facts, a cheap
+global pass over the summaries alone to decide what to import where, and then **every TU optimized IN PARALLEL,
+importing on demand only the functions chosen for inlining**. The whole-program *decision* is decoupled from the
+whole-program *transformation*. This is OPT11, and it composes with separate compilation (`.c` → `.o` per TU) so
+that per-TU results stay cacheable and rebuilds stay incremental.
+
+★★★ **"NO TRADE OFF" IS A REQUIREMENT ON THE DESIGN, NOT AN ASPIRATION.** Both clauses bind, and a design
+surrendering either one is refused:
+1. **Inlining quality at least as good as today's whole-program merge** — the "BEST inlining EVER" clause;
+2. **Parallel + incremental + cacheable** per-TU optimization — the reason the index exists at all.
+
+### Why — the measurements, and they invert the received story
+
+⚠ **THE PREMISE THIS PLAN CARRIED UNTIL TODAY WAS WRONG: THE REFERENCE COMPILERS DO NO CROSS-CU INLINING AT ALL.**
+✔MEASURED 2026-08-25, gcc 13.2.0, two TUs where one calls a small function in the other:
+
+```
+gcc -O2   (separate TUs)   ->  2 call instructions remain in use()   = NO cross-CU inlining
+gcc -O2 -flto              ->  0 call instructions                   = cross-CU inlining
+```
+
+`gcc -O2`, `clang -O2` and MSVC `/O2` — **the exact arms `README.md` benchmarks DSS against** — compile each TU
+separately. What the C ecosystem actually uses is **headers** (`static inline`, textually included by the
+preprocessor) and **amalgamation** (SQLite ships a 250k-line `sqlite3.c` precisely so a compiler can inline across
+"modules"). LTO is opt-in and off by default everywhere, because it is expensive:
+
+```
+103-TU full-source sqlite, same host, same -j4
+gcc -O2         compile 10.82s   link  0.11s   TOTAL 10.93s
+gcc -O2 -flto   compile  4.51s   link 26.42s   TOTAL 30.94s
+                                cross-CU inlining costs gcc 2.83x
+```
+
+★ **READ THE SHAPE, IT IS THE ENTIRE ARGUMENT FOR THE INDEX.** Under LTO gcc's per-TU compile gets *cheaper*
+(10.82 → 4.51 s — the real work is deferred) and the **link explodes to 26.42 s of SERIAL whole-program work**.
+That is the monolithic-LTO bottleneck, and DSS has the identical signature: ✔MEASURED (P36 lane D, 103-TU sqlite)
+the front-half CU pool at **3.96×**, the back-half at **3.96×**, and the merged-module `optimize` at **1.10× at
+`--jobs 4`**. **gcc has our exact problem; they simply only pay it when the user asks.** DSS pays it on every
+build, and is then benchmarked against arms that are not paying it at all.
+
+ⓘ For scale, and it is why this is not a catch-up exercise: post-P36 DSS at `-j4` is ~27.6 s against gcc `-flto`
+~30.9 s on the same sources and box. ⚠ **INDICATIVE ONLY — separate runs, different target formats (elf64 vs
+pe64), a loaded machine.** It must be re-measured same-run/same-target/quiet before it is published anywhere.
+
+### What this obligates elsewhere
+
+- ⚠ **`README.md` compares DSS against a mode that is not doing what DSS does.** The honest table needs an
+  `-flto` arm beside `-O2`, because only the LTO arm performs cross-CU inlining. Owned by the orchestrator.
+- ⚠ **The "the answer is the pool" claim is REFUTED and must be corrected wherever it is published.** The CU pool
+  achieves 3.96×; the serial fraction is the whole-program optimizer
+  (`D-PERF-PROGRAM-STAGE-OPTIMIZER-IS-SINGLE-THREADED`).
+- **OPT8 (LIR peephole + register coalescing) is scheduled alongside**, and is the right target for the OTHER
+  half of the gap: DSS already has *more* interprocedural scope than the references at `-O2`, and its emitted
+  sqlite still runs **1.13×–1.78×** slower. That deficit is per-function codegen quality — instruction selection,
+  register allocation, the pass set — **not** inlining scope.
+- **Determinism is the load-bearing risk.** Per-TU parallel optimization with on-demand imports must emit a
+  byte-identical artifact run to run: no iteration-order dependence, no address-ordered containers, no
+  first-finisher-wins. The corpus proof already in use (`examples/c/**` 630/630 + a stable artifact md5) is the
+  standard it must meet.
+
+## 0.3 ★★★ THE REMAINING DISTANCE TO A FIRST-CLASS OPTIMIZER (operator-directed, 2026-08-25, cycle P36)
+
+> **Verbatim:** *"so also adjust our optimizer plan so we have the BEST FIRST CLASS OPTIMIZER, add the
+> remaining items"*
+
+### What we actually have — measured, not recalled
+
+✔MEASURED 2026-08-25 by reading `src/opt/optimizer.hpp`'s `PassId` and `release.pipeline.json`, the engine
+knows **exactly nine passes**:
+
+```
+Identity · ConstFold · Dce · Mem2Reg · CopyProp · Cse · SimplifyCfg · Licm · Inlining
+```
+
+That is a sound classical **scalar** core and it is genuinely short of a production backend. ★★★ **AND THE
+MEASUREMENTS SAY THE DEFICIT IS REAL AND IS *NOT* IN INLINING SCOPE.** DSS merges whole-program MIR on every
+build while gcc/clang/MSVC at `-O2` do **no cross-CU inlining at all** (§0.2) — **we have MORE interprocedural
+reach than any reference and STILL emit slower code**:
+
+```
+DSS emitted sqlite, `speedtest1 --size 25`, vs each host's own reference
+  vs MSVC          1.13x   <- nearly parity
+  vs gcc / clang   1.41-1.43x
+  vs Apple clang   1.78x   <- the far end
+```
+
+⇒ The runtime gap is concentrated in the **scalar depth** and the **machine tier**, which is where every item
+below lives. ⚠ That is a diagnosis, not a promise: the list is a ROADMAP of anchored intent, not a schedule,
+and nothing here is scheduled until a cycle takes it.
+
+### The twelve items
+
+⚠ **STATUS DISCIPLINE:** every row is ⏳ and carries the tier it belongs to and what it depends on. A row's
+"why" is MEASURED where a number is given and INFERRED where it is not; the two are never mixed silently.
+
+| # | Item | Tier | Why — and how strong the claim is |
+|---|---|---|---|
+| OPT12 | **SROA** — scalar replacement of aggregates | MIR | `Mem2Reg` promotes a whole alloca or nothing; SROA splits a struct into its fields first so each becomes SSA. **INFERRED (high confidence): sqlite is struct-dominated**, so a whole-alloca-only promoter leaves most of its locals in memory. Likely the single largest scalar item. |
+| OPT13 | **SCCP** + value-range analysis | MIR | Sparse conditional constant propagation subsumes `ConstFold`+`Dce` interleaving and proves branch-reachability facts neither can. ★ **The plan ALREADY DEPENDS ON THIS:** OPT6's aggressive hoist-when-safe is recorded as needing "value-range OPT8+", and it has been waiting on an analysis nobody scheduled. |
+| OPT14 | **GVN-PRE** — partial redundancy elimination | MIR | `Cse` removes only FULL redundancy (available on every path). PRE removes expressions redundant on *some* paths — the classic loop-and-branch case ordinary C generates constantly. |
+| OPT15 | **Loop transforms** — unrolling + induction-variable simplification / strength reduction | MIR | `Licm` moves invariants OUT; nothing simplifies what stays IN. IV strength reduction and unrolling (with a cost model, heuristics-as-data per this plan's thesis) are the standard next step. |
+| OPT16 | **Memory optimizations** — dead-store elimination, load/store forwarding, memset/memcpy idiom recognition | MIR | The alias arc is CLOSED (§0 gate condition c), so the substrate exists and is unused for these. Idiom recognition matters disproportionately for a database engine's buffer code. |
+| OPT17 | **Tail-call optimization** (sibling calls) | MIR/LIR | Absent. Turns a self- or mutual-recursive tail call into a jump — also relieves OPT7's recursion refusal, which currently refuses ALL cycles. |
+| OPT18 | **Interprocedural analyses over the summary index** — IPCP, dead-argument elimination, attribute inference (`noalias`/`readonly`/`nounwind`), indirect-call promotion | IPA | ⛔ **BLOCKED ON OPT11.** ★ Once summaries exist, inlining stops being the ONLY interprocedural transform. Attribute inference is the highest-leverage of these because every scalar pass above gets stronger with it. Indirect-call promotion matters specifically for sqlite's `sqlite3_io_methods`-style function-pointer dispatch. |
+| OPT19 | **Instruction scheduling** (target pipeline model) | LIR | ✔MEASURED: **DSS has no scheduler at all.** Emitted code is in lowering order. On any out-of-order core this costs less than it once did, but it is a real, universally-present component of a production backend and it is wholly absent here. |
+| OPT20 | **Register allocation quality** — live-range splitting + rematerialization | LIR | ✔MEASURED: the sqlite build emits `R_SpilledDueToPressure` naming functions spilling **4, 10 and 13** vregs. **Spills are demonstrably happening on the corpus.** OPT8's coalescing is the first half of this; splitting and remat are the rest. |
+| OPT21 | **Block placement** — hot/cold splitting, fallthrough and I-cache layout | LIR | Nothing orders blocks for locality today. Cheap relative to its effect on branchy interpreter-shaped code, which is exactly what a SQL VM is. |
+| OPT22 | **PGO** — profile instrumentation + profile-guided decisions | feedback | Every inline, unroll and placement decision above is made from a STATIC estimate. The references get real branch and hotness data. ⓘ Distinct from OPT10's autotuner: OPT10 tunes the *heuristics*, PGO feeds the *program's own behaviour* into them. |
+
+| OPT23 | **Target cost model + machine model** — the heuristics-as-data foundation the machine tier is missing | LIR/config | ⛔ **THE REAL NEXT CYCLE AFTER OPT8 — operator ruling 2026-08-26, see §0.4.** ✔MEASURED 2026-08-26: `costModel` and `machineModel` appear in **ZERO** files under `src/` and `src/dss-config/` — this document's own architecture section describes both in the present tense and NEITHER EXISTS. ★ It is a foundation, not a pass: **OPT19 cannot be built at all without `machineModel`** (a list scheduler is ports + latencies or it is nothing), OPT20's splitting/remat needs spill costs to decide anything, and OPT15's unrolling needs a size/benefit estimate. Carries **canonical machine patterns** with it, since a pattern set without a cost to rank alternatives by is a rewrite table rather than an optimizer. ⓘ Not a blocker for OPT8 itself: ✔lane G's peephole R1 was checked and is unconditionally profitable (a schema identity test against `registerClassOps[].move`), so it needs no cost input — which is why the ruling schedules this AFTER lane G rather than pausing it. |
+
+### Sequencing, and why this order
+
+1. **OPT11 first** (in flight) — it is the substrate for OPT18 and it removes the serial merge that makes every
+   future whole-program pass expensive.
+2. **OPT8 next** (in flight) — the machine tier is where the measured runtime gap concentrates, and coalescing
+   is the cheapest real win there.
+3. **THEN OPT23 — AND THIS IS A SCHEDULED CYCLE, NOT A ROADMAP ENTRY** (operator ruling 2026-08-26, §0.4: *"make the next a REAL next cycle after OPT8 lane G, don't forget"*). The cost model + machine model land in the cycle that follows lane G's OPT8, before any further machine-tier work, because OPT19/OPT20/OPT15 each read them and none can be built honestly without them.
+4. **Then OPT12 / OPT13** — SROA and SCCP are the two scalar items that make every *later* pass stronger, and
+   OPT13 additionally discharges a dependency OPT6 has been carrying unscheduled.
+5. **OPT19–OPT21** are a coherent machine-tier arc and are best taken together with a runtime benchmark in the
+   loop, since none of them is provable except by measurement.
+6. **OPT22 last** — a profile is only worth collecting once the decisions it feeds exist.
+
+⚠ **THE BAR IS UNCHANGED AND APPLIES TO EVERY ROW.** Each pass is heuristics-as-data (this plan's load-bearing
+thesis — thresholds and pipeline order live in config, never as constants in the engine); each is
+source/target/format agnostic; each ships with a runnable corpus example carrying a `release` arm; and each
+gets a negative pin, because **an optimizer bug is a silent miscompile by construction**.
+★ And the neutrality test differs by tier: a pass that changes emitted code CANNOT be pinned by artifact md5
+equality — it is pinned by run-to-run determinism plus a passing corpus (`examples/c/**`), the standard
+established for the OPT11 arc in §0.2.
+
+## 0.4 ★★★ THE OPERATOR'S OPT8-SCOPE RULING — OPT8 IS TWO THINGS, AND OPT23 IS A REAL NEXT CYCLE (2026-08-26, cycle P36)
+
+The operator asked whether OPT8 was covering five items — peephole, coalescing, target cost model,
+canonical machine patterns, and groundwork for RA/scheduling. ✔MEASURED answer: **two of the five.**
+
+| item | where it lives | state as measured 2026-08-26 |
+|---|---|---|
+| peephole | **OPT8** | in flight, cycle P36 lane G |
+| register coalescing | **OPT8** | in flight, cycle P36 lane G |
+| target cost model | **OPT23** (new) | `costModel` in **ZERO** files under `src/` and `src/dss-config/` |
+| canonical machine patterns | **OPT23** (new) | absent |
+| groundwork for RA / scheduling | **OPT19** + **OPT20** | no scheduler file exists at all; coalescing is only the first half of OPT20 |
+
+★ **THE LABEL WAS OVERLOADED THREE WAYS IN THIS DOCUMENT**, which is why the question had no clean
+answer, and that was a real defect rather than a wording preference:
+
+1. the scope row said **peephole + coalescing** (this is the true OPT8, and it is what lane G is building);
+2. the architecture sections said **instruction scheduling** — `pass_schedule.cpp`, `pass_lir_schedule`,
+   and the dependency arrow `OPT7 (inlining) ─► OPT8 (scheduling)`;
+3. OPT6's deferred aggressive hoist was parked on **"value-range OPT8+"**, which is a third thing again.
+
+⇒ (2) is retargeted to **OPT19**, (3) to **OPT13**, and OPT8 now says out loud that it is exactly two
+things. ⓘ The cycle-11 historical records that use the old spelling are left AS WRITTEN — a plan must
+not edit its own history to tidy a label — and this table is the map for reading them.
+
+**THE RULING, verbatim:** *"Option 1, but make the next a REAL next cycle after OPT8 lane G, don't forget"*.
+
+So **OPT23 is scheduled, not shelved.** It is the cycle that follows lane G's OPT8, ahead of every other
+machine-tier item, and the sequencing list above says so in the place a future cycle will actually read.
+⚠ The failure this guards against is the one this plan has already suffered once: OPT6's aggressive hoist
+has been waiting on a value-range analysis **nobody ever scheduled**, recorded only as a dependency inside
+another row's prose. A dependency named in prose and absent from the sequence is a dependency that never
+happens.
+
+★ **WHY IT IS A FOUNDATION AND NOT JUST ANOTHER PASS:** OPT19 cannot be built at all without
+`machineModel` — a list scheduler is ports and latencies or it is nothing — and OPT20's live-range
+splitting and rematerialization have no basis for a decision without spill costs. This document's own
+architecture section already specifies both, in the present tense, for a `machineModel` that does not
+exist. OPT23 is building what this plan already claims to have.
+
+ⓘ **Why lane G was NOT paused for it**, which was the third option considered and rejected on a
+measurement: lane G's peephole rule R1 is redundant-copy elimination gated on a schema identity test
+against `registerClassOps[].move`, and deleting a register's full-width copy of itself is unconditionally
+profitable — there is no cost trade-off to get wrong. ✔It was checked before the decision rather than
+assumed. Later peephole rules and coalescing's spill decisions WILL want OPT23, which is exactly why it
+is next rather than eventual.
+
+## 0.5 ★★★ THE OPERATOR'S OPT11 IMPORT-EDGE RULING — THE LAZY EDGE, AND WHY IT IS NOT A PREFERENCE (2026-08-26, cycle P36)
+
+**RULING: the LAZY EDGE.** The per-TU optimizer calls `SummaryIndex::definitionOf` when its own gate
+wants a body it does not have. The two eager policies — **A** depth-bounded closure at K = the Inlining
+fixpoint's `max`, and **B** ThinLTO-style per-TU instruction-budget decay — are rejected. Both remain
+reachable in config; neither is the architecture.
+
+### Why A's one virtue is its worst property
+
+A's pitch was that it invents no constant — it reuses the Inlining fixpoint's own `max` from the release
+pipeline document. ⚠ But that `max` has just been MEASURED to be **truncating** (see
+[[D-OPT-INLINING-FIXPOINT-TRUNCATES-BEFORE-CONVERGING]]: splices 1643 → 646 → 225 → 408, identical across
+four independent runs, capped at 4 while the curve is still moving). **So A does not reuse a principled
+bound — it INHERITS A KNOWN ARTIFACT and promotes it from a pipeline cap to an ARCHITECTURAL import
+bound, where it is far harder to dislodge.** The finding is not context for the fork; it is the argument
+against A.
+
+### The categorical difference — A and B PREDICT; the lazy edge does not have to
+
+A bounds by structure, B bounds by cost, and **both are PREDICTIONS of what the optimizer will want,
+computed before it runs**. ★★★ And the prediction is made against **a call graph that does not exist
+yet**: any eager import set is computed on the PRE-optimization graph, while the entire reason the
+pipeline iterates is that each pass exposes call sites the previous one could not see. A callee first
+exposed mid-fixpoint by `ConstFold`/`CopyProp` is a splice the merged module makes today and an eager
+index would MISS — not a corner case, but **the mechanism the fixpoint exists for**. ⇒ The measured
+**225 → 408 rise is direct evidence that the wanted-callee set GROWS during the fixpoint**, so a closure
+taken before iteration 1 is blind to it BY CONSTRUCTION. A and B do not merely lose quality at the
+margin; they cannot see the thing being optimized for.
+
+### One fact, one owner
+
+Under A/B there are TWO authorities: `inlineLegalityGate` decides what may be inlined, and the import
+policy decides what is even AVAILABLE to consider. When they disagree the gate is **SILENTLY STARVED** —
+it never sees the candidate, so it never declines it, so nothing reports anything. **A quality loss with
+no diagnostic**, which is the failure class this project treats as worst. Under the lazy edge there is
+ONE authority: the import set is a CONSEQUENCE of the gate, derived rather than declared, and the two
+cannot drift because there is nothing to drift from. ★★ That is also what makes the remaining tunable
+honest — **prefetch depth affects LATENCY ONLY**, and a knob that cannot change the result is the only
+kind that belongs in config for this decision. It is the "no trade-off" property of §0.2 obtained **by
+construction rather than by tuning**.
+
+### ✔MEASURED 2026-08-26 — the cost objection to lazy EVAPORATES
+
+The operator required this measured before the fork could be priced, and it inverts the pricing:
+
+| claim | measurement |
+|---|---|
+| `.dss.mir` body encoding exists | **NO** — the only two occurrences in `src/` are COMMENTS describing the design |
+| `FunctionCloner` clones a SUBSET | **NO** — it exists only on the whole-module merge path (`mir_merge.cpp`, `mir.cpp`) |
+| the summary index is wired into the pipeline | **NO** — `SummaryIndex` / `buildModuleSummary` have **ZERO call sites outside `src/mir/summary/`** |
+| `mergeCuMirs` is still the only cross-CU path | **YES** |
+
+⇒ **Branch (i) holds: ALL THREE options need the transformation half.** `.dss.mir` encoding,
+`FunctionCloner` over a subset, and the per-TU parallel optimize driver are demanded by **OPT11's
+destination architecture**, not by the lazy policy sitting on top of it. **A does not "ship today"** —
+its default is a policy field on a struct nothing consults. The cheap-option framing was false, and A is
+the same work plus a worse bound. (Branch (ii) — "A ships without it, therefore A is not the per-TU
+architecture at all" — is REFUTED, not selected.)
+
+### Why this beats the policy LLVM actually ships, and why that is not arrogance
+
+B is ThinLTO's real policy. ★★★ **ThinLTO's eager import is forced by a build-system constraint DSS does
+not have:** the thin-link phase must fix each backend job's inputs UP FRONT so those jobs can be
+dispatched independently, potentially across machines and a distributed cache. **The budget is a
+compromise with that dispatch model, not a claim about optimization quality.** DSS optimizes in one
+process against a shared in-memory index, so it can take the design that constraint forced LLVM to give
+up. ⚠ **The consequence, named now so it is a known trade and not a later surprise:** if DSS ever wants
+distributed or cached per-TU builds, lazy fetch means a job's inputs are not known ahead of time. The
+door is not closed — **the fetch SET is recordable after the fact**, so a cache key can be computed
+post-hoc and a distributed mode could replay a recorded set — but that is future work, written down here
+rather than discovered later.
+
+### ★★ THE INVARIANT THAT MAKES "NO TRADE-OFF" TESTABLE INSTEAD OF ASSERTED
+
+> **THE OPTIMIZED OUTPUT MUST BE BYTE-IDENTICAL FOR ANY PREFETCH DEPTH.**
+
+Run the corpus at prefetch **0** and at prefetch **8**; assert the emitted artifacts match. If they
+differ, prefetch has **LEAKED INTO QUALITY** and the design's central property is broken — and that is
+exactly the failure mode that would otherwise be invisible, because both runs would be green and merely
+DIFFERENT. This is the red-on-disable of the whole design, it is cheap, and it is what separates
+"no trade-off by construction" from a claim about intent. ★ Pair it with the correctness anchor for the
+whole port: **prefetch 0 must produce the SAME output as today's merged module** for the cases the merged
+module handles.
+
+### Mechanics that must be right — reuse, do not invent
+
+- **THE INDEX IS FROZEN FOR THE DURATION OF A ROUND.** If one TU's optimization could mutate what another
+  reads, results become order-dependent under parallelism — and order-dependence in an optimizer is a
+  **nondeterministic build**, which is worse than a quality loss because it cannot be reproduced. Freeze,
+  then fan out.
+- **RECURSION / CYCLES: reuse the proven guard, do not mint a second one.** ✔`forEachDescriptorInClosure`
+  (`src/ffi/shipped_lib_descriptor.cpp`) is a single DFS keyed on the weakly-canonical descriptor path
+  (`descriptorPathKey`, the same key the semantic `readDescriptors` dedup and `cachedDescriptorJson`
+  use), with a visited set that admits a path AT MOST ONCE — so a cycle A→B→A stops at the second A and a
+  diamond's shared leaf is visited once. That is the pattern the on-demand fetch adopts.
+- **Bound the fetch by the SAME fixpoint `max` the gate uses**, so there is still one owner — and note
+  that this `max` is the number §0.5 above says is currently wrong. **Fix it where it lives; never
+  compensate for it here.**
+
+### Measure / invert — the standing order for the next OPT11 cycle
+
+1. ✔**DONE 2026-08-26** — the §4 re-pricing above. Branch (i).
+2. **Characterize the 3→4 rise with `max` raised, BEFORE this plan or any report quotes 2,922 again.**
+   If the curve converges at 6 or 8, both the bar AND A's inherited bound move.
+3. **If `SummaryIndex::definitionOf` cannot serve a body without materializing the whole module**, lazy's
+   per-fetch cost is not what it looks like — say so, because that turns the prefetch story from "latency
+   tuning" into something with a real floor.
+4. **If the corpus shows prefetch 0 and prefetch 8 differing on day one, STOP and report it.** That is the
+   design's own alarm, and it is more informative than any benchmark number.
 
 ### Cycle-by-cycle log
 
@@ -70,7 +369,7 @@ Cycle-by-cycle progress tracker. Each row = one landed cycle with its commit + c
 | OPT5+ c2 | **SimplifyCFG (branch-fold + jump-thread) + pipeline-level fixed-point loop** ✅ **CLOSED 2026-06-03** (commit `96bb941`). Branch-fold `CondBr(Const)`→`Br`; empty-block jump-thread; new `OptPipeline.maxIterations` engine reruns to convergence. **Closes `D-OPT-FIXED-POINT-LOOP` + `D-OPT1-PASS-RUN-MAX-ITER`**. NOT a linear OPT-N step — see the §0 `OPT5+` footnote. | OPT5 ✅ | `D-OPT-FIXED-POINT-LOOP` ✅ CLOSED, `D-OPT1-PASS-RUN-MAX-ITER` ✅ CLOSED |
 | OPT6 c1 | **LICM** ✅ **CLOSED 2026-06-03** (commits `164a1ca` + `93362f1`). Natural-loop detection via back-edges; hoist pure invariants to unique non-back-edge preheader. New `MirRebuildPolicy::onBlockBeforeTerminator` hook + `mirNaturalLoops` helper. **2nd-look CRITICAL bugs closed**: `D-OPT6-LICM-NESTED-LOOP-DEDUP` + `D-OPT6-LICM-GAVEUP-BODY-FILTER`. | OPT4/5 ✅ + loop-nest substrate | `D-OPT1-LICM-CONDITIONAL-PIN` ✅ runtime arm activated; `D-OPT-MIR-REBUILDER-ONBLOCKBEFORETERMINATOR-HOOK` ✅ CLOSED |
 | OPT5+ c3 | **General block-merge + StructCfMarker re-derivation (single-non-Linear case)** ✅ **CLOSED 2026-06-03** (commit `738413d`). Block-merge for `(P, B)` with single-pred-of-B + no-Phi + non-trampoline + ≤1 non-Linear marker per chain. New `MirRebuildPolicy::absorbSuccessor` hook + `mapOperand` operand-resolution helper. **Closes `D-OPT5-BLOCK-MERGE` + partial `D-OPT4-1`** (single-non-Linear); both-sides-non-Linear deferred at `D-OPT4-1-NON-LINEAR-MARKER-MERGE`. | OPT5+ c2 ✅ + OPT6 c1 ✅ | `D-OPT5-BLOCK-MERGE` ✅ CLOSED, `D-OPT4-1` ✅ partial, `D-OPT4-1-NON-LINEAR-MARKER-MERGE` deferred |
-| OPT6+ | **LICM remainder** (independent of OPT7 — parallelizable) | Trap-safe hoist conservative-safe default RUNTIME-PINNED (cycle 11, `licm_trap_safe_hoist/`, regression-proven); aggressive hoist-when-safe still deferred to value-range/OPT8+. Preheader-insertion needs Phi-merge substrate. NOT an OPT7 blocker. | OPT6 c1 ✅ + Arc A ✅ (10r `50a07ab`) | `D-OPT6-LICM-TRAP-SAFE-HOIST` (safe default pinned; aggressive needs value-range OPT8+), `D-OPT6-LICM-PREHEADER-INSERTION` |
+| OPT6+ | **LICM remainder** (independent of OPT7 — parallelizable) | Trap-safe hoist conservative-safe default RUNTIME-PINNED (cycle 11, `licm_trap_safe_hoist/`, regression-proven); aggressive hoist-when-safe still deferred to value-range/**OPT13**. Preheader-insertion needs Phi-merge substrate. NOT an OPT7 blocker. | OPT6 c1 ✅ + Arc A ✅ (10r `50a07ab`) | `D-OPT6-LICM-TRAP-SAFE-HOIST` (safe default pinned; aggressive needs value-range OPT8+), `D-OPT6-LICM-PREHEADER-INSERTION` |
 | **PRE-OPT7 CHAIN** ✅ **COMPLETE 2026-06-05 (P1✅ P2✅ P3✅ P4✅) → OPT7 OPENED (user §B, supervised)** (decided 2026-06-04 — full cross-CU Weak-pin scope) | OPT7's §2.9 inline-legality (never inline a `Weak` callee; keep address-taken / externally-visible out-of-line bodies) is a silent-miscompile seam → guardrail #2 needs a genuine negative pin. The Weak hazard ("strong replaces weak **at link time**") is inherently cross-CU, so the real pin needs the full cross-CU stack. Ordered P1→P4 below; together P3+P4 also unblock `D-OPT7-1` so OPT7 is cross-CU from the start. | — | see §3.1 |
 | P1 | **Front-end linkage specifiers** — c-subset `static`→`Local` + weak-decl→`Weak` (+ visibility); semantic analyzer attaches linkage to the user-function HIR node (today only FFI externs carry linkage; user funcs default `Global`). **Design-locked cycle 12** (most-complete: `static` + `__attribute__((weak/visibility))`); **BINDING SPECIFIERS LANDED cycle 13** (`static`→Local + `__attribute__((weak))`→Weak: source→HIR→MIR→DCE, regression-proven; visibility-string syntax deferred; unknown-specifier diagnostic ✅ CLOSED cycle 14 — §3.1). | OPT1 linkage substrate ✅ (`symbol_attrs.hpp`) | `D-CSUBSET-LINKAGE-SPECIFIERS` |
 | P2 | ✅ **CLOSED cycle 13.** **HIR→MIR linkage mapping** — map HIR `FfiLinkage`/`FfiVisibility` + P1 user-fn linkage → MIR `SymbolBinding`/`SymbolVisibility` at `lowerToMir`; pin `Common`/`Internal` edges. **Lands the single-CU `static`-DCE runtime pin.** Corrects §2.9's "pinned in OPT1" overstatement (mapping was stubbed to `Global+Default`). | P1 | `D-OPT7-LINKAGE-HIR-TO-MIR-MAPPING` |
@@ -127,7 +426,7 @@ src/opt/
 ├── lir/
 │   ├── pass_lir_peephole.cpp      # OPT5 — target-aware peephole (rewrite table over real opcodes)
 │   ├── pass_coalesce.cpp          # OPT5 — register coalescing (cut the 2addr/isel mov traffic)
-│   └── pass_schedule.cpp          # OPT8 — list scheduler over the per-target machine model
+│   └── pass_schedule.cpp          # OPT19 — list scheduler over the per-target machine model
 └── tune/
     └── autotuner.{hpp,cpp}        # OPT10 — corpus + search loop over cost-model/pipeline config (research)
 
@@ -288,7 +587,7 @@ New family **`X_` at `0x2xxx`** (claims a free nibble per [`00`](./00-compiler-i
 | OPT5 | LIR target-aware opts | `pass_lir_peephole` (rewrite table over real opcodes — cuts redundant movs / setup) + `pass_coalesce` (register coalescing — directly reduces the mov traffic from 2addr-legalize + naive isel) + address-mode folding. First consumer of the `costModel` facet. |
 | OPT6 | Loop optimization | `analysis/mir_loop_forest` (natural loops, marker-cross-checked) + `pass_licm`. Unrolling anchored separately (profitability from `costModel`). |
 | OPT7 | Inlining (interprocedural) | Call-graph construction + `pass_inline` with a **data-driven** profitability threshold (from `costModel`, not a C++ constant). **Inline legality gates on the §2.9 linkage attribute:** never inline a `Weak` callee; an externally-visible / address-taken callee keeps its out-of-line body (not DCE'd). Couples with [`11-ffi-plan`](./11-ffi-plan%20-%20tbd.md) for cross-CU visibility limits. **Pre-OPT7 chain (decided 2026-06-04, full cross-CU Weak-pin scope):** P1 front-end linkage specifiers → P2 HIR→MIR linkage mapping → P3 CU6 → P4 LK11 (weak-vs-strong resolution); P3+P4 unblock `D-OPT7-1` so OPT7 is cross-CU from the start. The genuine Weak negative pin is end-to-end 2-CU (strong replaces weak at link) — `D-OPT7-WEAK-INLINE-NEGATIVE-PIN`. See §0.1 Upcoming + §3.1. |
-| OPT8 | Instruction scheduling | `pass_lir_schedule` — list scheduler over the per-target `machineModel` (ports + latencies as JSON). Pure bucket-2: one scheduler, every target's numbers. |
+| OPT19 | Instruction scheduling | `pass_lir_schedule` — list scheduler over the per-target `machineModel` (ports + latencies as JSON). Pure bucket-2: one scheduler, every target's numbers. |
 | OPT9 | Vectorization (frontier) | SLP + loop vectorization. Legality via a dependence-analysis framework (universal); profitability via `costModel`. The deep end — explicitly research-grade. |
 | OPT10 | The autotuner (research arc) | Corpus + measurement loop (leveraging the round-trip oracle + self-host as ground truth) + search over `costModel`/`pipeline` config; optional learned cost model. Output = generated `.target.json` cost blocks. The "climb past frozen hand-tuning" endgame. |
 
@@ -456,7 +755,7 @@ Mirrors plan 12 §3.1 / plan 13 §3.1 / plan 14 §3.1. Every deferred item names
                           │                                       │
                           └───────────────┬───────────────────────┘
                                           ▼
-                              OPT6 (loops/LICM)  ─►  OPT7 (inlining)  ─►  OPT8 (scheduling)
+                              OPT6 (loops/LICM)  ─►  OPT7 (inlining)  ─►  OPT19 (scheduling)
                                           │
                                           ▼
                                      OPT9 (vectorization — frontier)

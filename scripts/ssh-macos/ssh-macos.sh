@@ -95,12 +95,32 @@ fi
 # diagnostic names the override rather than leaving it to be discovered.
 target=$DSS_MACOS_HOST
 if ! printf '%s' "$DSS_MACOS_HOST" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
-    resolved=$(getent hosts "$DSS_MACOS_HOST" 2>/dev/null | awk '{print $1; exit}')
-    [ -z "$resolved" ] && resolved=$(ping -c1 -W1 "$DSS_MACOS_HOST" 2>/dev/null \
+    # ★★★ EVERY RESOLVER BELOW READS FROM /dev/null, AND THAT REDIRECT IS THE WHOLE
+    # POINT OF THIS BLOCK RATHER THAN AN AFTERTHOUGHT.
+    #
+    # ⚠ D-SCRIPT-SSH-MACOS-RESOLVER-DRAINS-THE-CALLER-S-STDIN: a command substitution
+    # INHERITS this script's stdin. `macos-leg.sh` pipes its entire remote body into
+    # `ssh-macos.sh ... bash -s`, so a resolver that reads stdin CONSUMES THE SCRIPT
+    # IT WAS SUPPOSED TO SEND, and `bash -s` on the far side receives ZERO BYTES.
+    # ✔MEASURED 2026-08-25 (cycle P36, lane B), same host and payload, only the
+    # resolution path changing:
+    #     hostname form : printf '12345678\n' | ssh-macos.sh "wc -c"  ->  0
+    #     IP form       : DSS_MACOS_HOST=<ip> ...                     ->  9
+    # ⇒ EVERY macOS leg taken through the `.local` name ended in "no witness came
+    # back ... UNKNOWN". `--push` was immune only because it builds its own pipe.
+    #
+    # ★ IT IS FAIL-CLOSED — no false green was ever produced — and the witness
+    # discipline is what surfaced it. But a leg that cannot run is not a leg that
+    # passed, and this file's header previously asserted the OPPOSITE ("stdin
+    # survives byte-exact ... the 2026-08-18 note claiming the login profile eats
+    # stdin is expired"). That note was RIGHT; the measurement which overturned it
+    # tested DATA over stdin, not a shell READING A SCRIPT from it.
+    resolved=$(getent hosts "$DSS_MACOS_HOST" 2>/dev/null </dev/null | awk '{print $1; exit}')
+    [ -z "$resolved" ] && resolved=$(ping -c1 -W1 "$DSS_MACOS_HOST" 2>/dev/null </dev/null \
         | sed -n 's/.*(\([0-9.]\{7,15\}\)).*/\1/p' | head -1)
     # ★ avahi, when this is a Linux box that actually has an mDNS responder.
     if [ -z "$resolved" ] && command -v avahi-resolve-host-name >/dev/null 2>&1; then
-        resolved=$(avahi-resolve-host-name -4 "$DSS_MACOS_HOST" 2>/dev/null | awk '{print $2; exit}')
+        resolved=$(avahi-resolve-host-name -4 "$DSS_MACOS_HOST" 2>/dev/null </dev/null | awk '{print $2; exit}')
     fi
     # ★★★ DELEGATE TO THE WINDOWS RESOLVER — THE ONE THAT ACTUALLY SPEAKS mDNS HERE.
     # ✔MEASURED 2026-08-17: from Git Bash and WSL, `getent` and `ping` both fail on a
@@ -118,7 +138,7 @@ if ! printf '%s' "$DSS_MACOS_HOST" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; t
             command -v "$_psh" >/dev/null 2>&1 || continue
             resolved=$("$_psh" -NoProfile -NonInteractive -Command \
                 "try { [System.Net.Dns]::GetHostAddresses('$DSS_MACOS_HOST') | Where-Object { \$_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1 -ExpandProperty IPAddressToString } catch { }" \
-                2>/dev/null | tr -d '\r' | grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1)
+                2>/dev/null </dev/null | tr -d '\r' | grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1)
             [ -n "$resolved" ] && break
         done
         unset _psh

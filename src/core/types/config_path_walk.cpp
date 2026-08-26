@@ -1,5 +1,6 @@
 #include "core/types/config_path_walk.hpp"
 
+#include "core/substrate/phase_timers.hpp"        // the `locate-config` pipeline phase
 #include "core/types/predefined_macro_json.hpp"   // kBuildVersionText — the binary's own version
 
 #include <cstdlib>
@@ -371,6 +372,17 @@ installedConfigRootFrom(std::filesystem::path const& executableDir) {
 
 LoadResult<std::filesystem::path>
 findShippedConfig(ShippedConfigLocator const& loc) {
+    // ── `locate-config`, the precedence walk's own row in `--time` ──────────
+    // This is the ONE thing a shipped load pays that the content-addressed
+    // memo can never remove: the walk's answer depends on cwd and on
+    // `DSS_CONFIG_ROOT`, both of which a single process may change (the test
+    // harness does), so a resolved path is not a memoizable fact about a NAME.
+    // ✔MEASURED 2026-08-25: ~2 ms across the 13 grammar lookups of a one-line
+    // Debug C compile — small, and small is exactly the claim the row now
+    // carries evidence for instead of leaving it to `[other]`.
+    substrate::PhaseTimers::Scope const locateScope{
+        substrate::CompilePhase::LocateConfig};
+
     // Reject path-like names up front. `loadShipped` is the LOGICAL-
     // name resolver — only `csharp` / `x86_64` / `toy` / ... — never
     // arbitrary paths. Defending against `../` traversal here also

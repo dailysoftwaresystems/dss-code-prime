@@ -90,6 +90,39 @@ namespace dss::substrate {
 // The pipeline's phase seams, in pipeline order. Names (see
 // `compilePhaseName`) are the driver-report vocabulary.
 enum class CompilePhase : std::uint8_t {
+    // ── The config-document load seam ──────────────────────────────────────
+    //
+    // ★★★ THESE THREE EXIST BECAUSE `[other]` WAS HIDING THE SINGLE LARGEST
+    // ITEM IN A SHORT COMPILE. ✔MEASURED 2026-08-25 (cycle P35), Windows
+    // Debug, `int main(void){return 0;}`: 18 shipped-config loads of 8
+    // distinct documents cost ~311 ms of a ~571 ms process — 69% of the
+    // unattributed remainder and 54% of the whole compile — and NONE of it
+    // was inside any instrumented phase, so the report attributed it to
+    // nothing. They are PIPELINE VERBS (locate / load / build a document),
+    // never a language / target / object-format identity: one set of rows
+    // covers `.lang.json`, `.target.json` and `.format.json` alike, and the
+    // report cannot name which family it was reading.
+    //
+    // ⓘ THE SPLIT IS THREE-WAY BECAUSE THE NEXT QUESTION IS THREE-WAY. After
+    // the content-addressed memo
+    // (D-CONFIG-A-SCHEMA-DOCUMENT-IS-REBUILT-ONCE-PER-LOAD-INSIDE-ONE-PROCESS)
+    // removes the repeat builds, "what is config costing now" splits into
+    // three independently-actionable answers, and one lumped row could not
+    // tell them apart:
+    //   * `locate-config` — the precedence walk, paid per shipped-NAME lookup
+    //     and never memoized (it depends on cwd and on the environment, both
+    //     of which can change inside one process);
+    //   * `load-config`   — read the bytes, digest them, consult the memo and
+    //     re-validate its dependency ledger. Paid on EVERY load, hit or miss;
+    //     a memo HIT costs exactly this and nothing more;
+    //   * `build-config`  — the work a memo hit SKIPS: parse the JSON and
+    //     construct the schema. Its `runs` IS the miss count.
+    // Each row's `runs` also separates once-per-PROCESS work from per-CU
+    // work without any new instrument: a count that grows with the
+    // translation-unit count is per-CU, one that does not is per-process.
+    LocateConfig,      // resolve a shipped config NAME to a path (the precedence walk)
+    LoadConfig,        // read + digest one config document, and consult the memo
+    BuildConfig,       // parse it and construct the schema — the work a memo hit skips
     Preprocess,        // config-selected preprocessor — the RESIDUAL self-time after the
                        // three sub-phases below (define prologues, buffer freezes, repackage)
     PreprocessSplice,  // build the synth buffer: recursive concat of main + quote-#includes + line-map
