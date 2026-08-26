@@ -25,19 +25,44 @@
 //      shipped `D-OPT-CSE-LOAD-BACKEDGE-TAIL`
 //      (`D-OPT-CSE-CLOBBER-COVER-CHOKEPOINT`).
 //
-// WHY NOT a full LLVM MemorySSA (MemoryDef/MemoryUse/MemoryPhi + a
-// walk-past-non-aliasing-defs clobber walker): the walk-past cache must key on
-// (def, location) to be sound — a per-block cache that stops the backward walk
-// at an alias-tested-negative block UNDER-REPORTS (a nearer non-aliasing Store
-// masks a farther aliasing one → CSE admits a stale Load → silent miscompile;
-// the design-audit constructed the concrete case, pinned as the
-// FrontierStopsAtNonAliasingStore test). At this substrate's alias precision
-// (`mirMayAlias` is mostly Maybe) the walk-past rarely fires, so the full
-// machinery cannot pay for itself; the right cut is: cache the
-// loadPtr-INDEPENDENT part (reachability + the clobber ledger), recompute the
-// loadPtr-DEPENDENT part (the alias tests, bounded by ACTUAL clobber count).
-// If the alias oracle ever gains precision, the walk-past refinement is the
-// gated successor `D-OPT-MEMSSA-WALK-PAST-PRECISION`.
+// THE WALK-PAST LAYER (closes `D-OPT-MEMSSA-WALK-PAST-PRECISION`).
+//
+// The original cut cached only the loadPtr-INDEPENDENT part (reachability + the
+// clobber ledger) and re-ran every alias TEST per query, on the recorded
+// grounds that "at this substrate's alias precision (`mirMayAlias` is mostly
+// Maybe) the walk-past rarely fires, so the full machinery cannot pay for
+// itself". That premise is gone: `mir_escape.hpp` gives `mirMayAlias` a
+// PROVENANCE rule (3b), this index builds one `MirPointerEscape` per pass and
+// threads it into every probe, and a local array or struct against a parameter
+// — the pair that dominates real C and that no TYPE test can ever separate —
+// now answers `No`. So provably-non-aliasing defs are both COMMON and worth
+// skipping structurally, which is exactly what the anchor's resolution asks for:
+//
+//   "the (def,location)-keyed walk-past layer OVER the existing index —
+//    never a per-block stop cache."
+//
+// `verdicts_` is that layer, and the shape is load-bearing in both halves:
+//   * KEYED ON (def, location). A def whose verdict for THIS location is
+//     already known is passed over with no alias reasoning at all — the
+//     "structurally skip provably-non-aliasing defs" the anchor named — and
+//     because the key carries the location, the skip says nothing about any
+//     OTHER location.
+//   * NOT A PER-BLOCK WALK STOP. The REJECTED design stopped the backward walk
+//     at an alias-tested-negative BLOCK, which UNDER-REPORTS: a nearer
+//     non-aliasing Store masks a farther aliasing one → CSE admits a stale Load
+//     → silent miscompile (the design-audit's constructed case, pinned as
+//     `FrontierStopsAtNonAliasingStoreMustStillRefuse`). Nothing here stops a
+//     walk or truncates an enumeration: every query still visits every def it
+//     visited before, in the same order, and the cache only supplies the answer
+//     the unchanged predicate would have computed. That is why the memo cannot
+//     change a verdict, and the differential sweeps prove it did not.
+// The cache is a pure memo of `mirInstClobbersLoadPtr`, which is a pure
+// function of (mir, interner, loadPtr, inst, strictTbaa, charTypesAliasAll):
+// `mir` is frozen for this object's lifetime (`checkModule_`), the flags are
+// part of the key, and a mismatched `interner` fails loud. `aliasTestCount()` /
+// `aliasTestSkipCount()` are the instruments — the anchor's OTHER trigger was
+// "a profile shows the index's per-query alias-TEST count dominating a pass",
+// so that count is now a number the tests read rather than a claim.
 //
 // Scope/lifetime: ONE instance per pass invocation (runCse/runLicm), built
 // beside the pass's hoisted whole-module `preds` while the module is frozen
@@ -50,8 +75,10 @@
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
 #include "opt/analysis/mir_alias.hpp"
+#include "opt/analysis/mir_escape.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -82,7 +109,8 @@ public:
         : mir_(mir)
         , preds_(preds)
         , moduleIdV_(mir.id().v)
-        , blockCount_(static_cast<std::uint32_t>(mir.blockCount())) {
+        , blockCount_(static_cast<std::uint32_t>(mir.blockCount()))
+        , escape_(mir) {
         // Design-audit F2: the boolean-identity proof rests on Store being in
         // the `opcodeClobbersMemory` positive list (the builder's filter is
         // then EXACTLY the support of `mirInstClobbersLoadPtr` — everything
@@ -144,8 +172,8 @@ public:
         for (MirMemoryDef const& d : it->second) {   // ascending instIdxInBlock
             if (d.instIdxInBlock < lo) continue;
             if (d.instIdxInBlock >= hi) break;
-            if (mirInstClobbersLoadPtr(mir_, interner, loadPtr, d.inst,
-                                       strictTbaa, charTypesAliasAll)) {
+            if (defClobbers_(interner, loadPtr, d.inst,
+                             strictTbaa, charTypesAliasAll)) {
                 return true;
             }
         }
@@ -173,8 +201,8 @@ public:
             if (slot == canonicalBlock.v || slot == useBlock.v) continue;
             if (!fwd[slot] || !bwd[slot]) continue;
             for (MirMemoryDef const& d : blockClobbers_.at(slot)) {
-                if (mirInstClobbersLoadPtr(mir_, interner, loadPtr, d.inst,
-                                           strictTbaa, charTypesAliasAll)) {
+                if (defClobbers_(interner, loadPtr, d.inst,
+                                 strictTbaa, charTypesAliasAll)) {
                     return true;
                 }
             }
@@ -195,8 +223,8 @@ public:
             auto const it = blockClobbers_.find(b.v);
             if (it == blockClobbers_.end()) continue;
             for (MirMemoryDef const& d : it->second) {
-                if (mirInstClobbersLoadPtr(mir_, interner, loadPtr, d.inst,
-                                           strictTbaa, charTypesAliasAll)) {
+                if (defClobbers_(interner, loadPtr, d.inst,
+                                 strictTbaa, charTypesAliasAll)) {
                     return true;
                 }
             }
@@ -386,7 +414,89 @@ public:
         return false;
     }
 
+    // The pointer-provenance + escape analysis this index built for its module
+    // and threads into EVERY alias probe. Exposed because a differential test
+    // must hand the reference walkers in `mir_alias.hpp` the SAME object — an
+    // oracle reasoning at a different precision than the production query is
+    // not an oracle, it is a second bug.
+    [[nodiscard]] MirPointerEscape const& escape() const noexcept {
+        return escape_;
+    }
+
+    // ── Instruments ──────────────────────────────────────────────────
+    // `aliasTestCount` counts the times the UNCHANGED predicate actually ran;
+    // `aliasTestSkipCount` counts the times a (def, location) verdict was
+    // already known and the def was passed over. Their sum is the number of
+    // defs visited, i.e. exactly the work the pre-walk-past index did every
+    // time. A precision or cost claim about this index reads these; it does
+    // not re-argue from the shape of the code.
+    [[nodiscard]] std::size_t aliasTestCount() const noexcept {
+        return aliasTests_;
+    }
+    [[nodiscard]] std::size_t aliasTestSkipCount() const noexcept {
+        return aliasSkips_;
+    }
+
 private:
+    // ★ THE (def, location)-KEYED WALK-PAST LAYER. Every one of Q1/Q2/Q3's def
+    // visits funnels through here, so the memo is single-sited and no query can
+    // accidentally consult a different cache — or none.
+    //
+    // On a MISS the UNCHANGED `mirInstClobbersLoadPtr` runs and its answer is
+    // recorded; on a HIT the def is passed over with no alias reasoning. The
+    // memo is sound because that predicate is a pure function of its arguments
+    // and every argument is either frozen (`mir_`, and `interner` — checked) or
+    // part of the key (`loadPtr`, `def`, both flags).
+    [[nodiscard]] bool defClobbers_(TypeInterner const& interner,
+                                    MirInstId loadPtr, MirInstId def,
+                                    StrictTbaa strictTbaa,
+                                    bool charTypesAliasAll) const {
+        // The interner is NOT part of the key — it is a module-scoped object a
+        // pass holds for its whole run. Binding to the first one seen and
+        // refusing any other keeps the key honest without paying for a third
+        // key field; a consumer that genuinely needs two interners has a
+        // module-identity problem this must not paper over.
+        if (interner_ == nullptr) {
+            interner_ = &interner;
+        } else if (interner_ != &interner) {
+            std::fprintf(stderr,
+                "dss::opt::analysis::MirMemoryClobbers fatal: a second "
+                "TypeInterner reached the clobber index (built its (def, "
+                "location) verdict cache against another one) — the cache key "
+                "does not carry the interner, so two of them would silently "
+                "share verdicts.\n");
+            std::abort();
+        }
+        std::uint64_t const key =
+            (static_cast<std::uint64_t>(def.v) << 32) | loadPtr.v;
+        auto& table = verdicts_[flagSlot_(strictTbaa, charTypesAliasAll)];
+        auto const it = table.find(key);
+        if (it != table.end()) {
+            ++aliasSkips_;
+            return it->second != 0u;
+        }
+        ++aliasTests_;
+        bool const verdict = mirInstClobbersLoadPtr(
+            mir_, interner, loadPtr, def, strictTbaa, charTypesAliasAll,
+            &escape_);
+        // Bounded memory: past the cap the index simply stops memoizing and
+        // keeps answering exactly as before. A cache that can grow without
+        // bound is a different failure mode from the one it was built to fix.
+        if (table.size() < kMaxVerdictEntries) {
+            table.emplace(key, static_cast<std::uint8_t>(verdict ? 1u : 0u));
+        }
+        return verdict;
+    }
+
+    [[nodiscard]] static constexpr std::size_t
+    flagSlot_(StrictTbaa st, bool ca) noexcept {
+        return (st == StrictTbaa::Yes ? 2u : 0u) | (ca ? 1u : 0u);
+    }
+
+    // ~10 MB of verdicts at libstdc++ node sizes — far more than any real pass
+    // reaches, and a hard ceiling rather than a hope.
+    static constexpr std::size_t kMaxVerdictEntries = 1u << 18;
+
     // Design-audit F3: the optimizer mints a fresh MirModuleId per rebuild and
     // `mir = std::move(builder).finish()` reassigns the SAME variable this
     // object's reference binds — so a use-after-finish flips the id/blockCount
@@ -450,6 +560,12 @@ private:
     std::vector<std::vector<MirBlockId>> const& preds_;
     std::uint32_t const                         moduleIdV_;
     std::uint32_t const                         blockCount_;
+    MirPointerEscape                            escape_;
+    // The (def, location)-keyed walk-past layer, one table per flag pair.
+    mutable std::unordered_map<std::uint64_t, std::uint8_t> verdicts_[4];
+    mutable TypeInterner const*                 interner_   = nullptr;
+    mutable std::size_t                         aliasTests_ = 0;
+    mutable std::size_t                         aliasSkips_ = 0;
     std::unordered_map<std::uint32_t, std::vector<MirMemoryDef>> blockClobbers_;
     std::vector<std::uint32_t>                  clobberBearingBlocks_;  // sorted
     mutable std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> fwdMemo_;

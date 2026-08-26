@@ -158,6 +158,32 @@ leg_tree_restore() {
         "$_lt_repo" "$_lt_dirty" \
         "$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')" \
         "$(git rev-parse --short HEAD 2>/dev/null)"
+
+    # ★★ NAME THE BUILD ROOTS THIS RESTORE JUST ORPHANED.
+    # `clean -fd` (never `-fdx`) deliberately SPARES ignored paths, so `build/`
+    # survives and a leg skips a cold rebuild -- a good trade whose unstated cost
+    # is that a binary built from the SYNCED tree is now sitting over sources
+    # rolled back to $_lt_sha. Nothing is broken until somebody uses that binary,
+    # and then it fails somewhere far away wearing a diagnostic about the CONFIG.
+    # ✔MEASURED 2026-08-26 (D-BENCH-COMPILER-AND-CONFIG-MAY-COME-FROM-DIFFERENT-COMMITS):
+    # exactly this pairing cost a macOS benchmark leg its DSS arm, and the error
+    # named `/opcodes/10/encoding/variants/0/resultSlot` -- the config, which was
+    # innocent.
+    # ⚠ DELIBERATELY A DIAGNOSTIC AND NOT A DELETION. Removing the build roots
+    # would make every leg pay a cold rebuild to prevent a mistake only some legs
+    # can make, and the enforcing check belongs where the binary is USED (the
+    # benchmark's pre-flight now refuses a compiler that cannot compile for the
+    # target it is about to be measured on). What restore owes is VISIBILITY at
+    # the moment the state is created, not a silent tidy-up.
+    if [ "$_lt_dirty" != "0" ] && [ -d build ]; then
+        _lt_roots=$(find build -maxdepth 2 -name CMakeCache.txt -print 2>/dev/null \
+                    | sed 's|/CMakeCache.txt$||' | tr '\n' ' ')
+        if [ -n "$_lt_roots" ]; then
+            printf '! leg-tree: these build root(s) were built from the tree just discarded and now sit over %s: %s\n' \
+                "$(git rev-parse --short HEAD 2>/dev/null)" "$_lt_roots" >&2
+            printf '! leg-tree: they are KEPT on purpose (cold rebuilds are expensive); rebuild before trusting a binary from them.\n' >&2
+        fi
+    fi
 }
 
 # ── dispatch, so this file is BOTH inlineable and runnable ───────────────────

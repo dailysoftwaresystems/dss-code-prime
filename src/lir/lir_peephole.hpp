@@ -61,6 +61,44 @@
 // (`registers[].widthBytes * 8`). Both guards are target VOCABULARY; the
 // pass contains no target name, no mnemonic string and no width constant.
 //
+// ── RULE R2: FALLTHROUGH-BRANCH ELISION (D-OPT-JCC-FALLTHROUGH) ─────────
+//
+// A branch terminator materializes EVERY edge it owns as bytes. Both shipped
+// `jcc` rows encode operand[0] as the taken displacement AND operand[1] as a
+// TRAILING UNCONDITIONAL JUMP — x86 `0F 8x rel32; E9 rel32` (11 bytes), arm64
+// `B.cond` + `B` (8 bytes) — precisely so LIR block layout never has to
+// guarantee fallthrough order. When the fallthrough successor IS THE
+// NEXT-LAID-OUT BLOCK, that trailing jump is a jump to +0: correct, and pure
+// waste (5 bytes on x86_64, 4 on arm64, plus a fetch/decode slot).
+//
+// R2 drops the TRAILING BlockRef OPERAND — and NOTHING ELSE. The block keeps
+// BOTH successors, so the CFG is untouched: liveness, `simplifyCfg` and every
+// walk still see two edges. What shrinks is the ENCODER's input, which is the
+// channel that turns into bytes (`lir_verifier.cpp`'s Rule 1b explains why
+// those two channels exist and why neither may be deleted).
+//
+// ★★★ THE ELISION IS NOT ALLOWED TO BE THE PASS'S OWN IDEA. Whether a machine
+// has fallthrough semantics at all, and how the shorter form spells itself,
+// is target VOCABULARY. R2 therefore fires only where
+// `lir_pass_util::declaresFallthroughBranchForm` finds the target declaring
+// an encoding variant identical to the selected one MINUS its trailing
+// BlockRef guard entry. A target that declares no such variant gets no
+// elision and no diagnostic — the same fail-safe silence R1 keeps for a
+// register class with no declared move.
+//
+// ★★ AND THE DANGEROUS FAILURE HERE IS A SILENT ONE: an elided jump whose
+// successor is NOT the next-laid-out block falls into the WRONG BLOCK, with
+// no bad byte anywhere for a disassembler to notice. Three things stand
+// between R2 and that: (a) R2 reads the layout it is rebuilding, and rebuilds
+// block order 1:1; (b) `materializeCallingConvention`, the only pass
+// downstream, recreates blocks 1:1 in source order; and (c) the PIN —
+// `checkTerminatorBlockRefsMatchSuccessors` re-derives the layout question
+// on the FINAL module and reports `L_TerminatorSuccessorMismatch` if the
+// unnamed successor is not the next block. (c) is what makes (a) and (b)
+// checked rather than believed, and it is why Rule 1b now also runs from
+// `verifyLirPostRegalloc` — before this rule existed it ran only BEFORE the
+// peephole, which is the one place an elision cannot be observed.
+//
 // ── WHY *BEFORE* CALLCONV, WHICH IS NOT WHERE THIS PASS FIRST WENT ──────
 //
 // Redundant copies are minted by the ALLOCATOR — `rewriteWithAllocation`
@@ -111,10 +149,23 @@ struct DSS_EXPORT LirPeepholeResult {
     // `LirTwoAddrLegalizeResult::expectedFuncCount` — the parallel-index
     // discipline every LIR rebuild pass reports.
     std::size_t expectedFuncCount = 0;
-    // Instructions R1 deleted, module-wide. Reported as an Info note
-    // (`L_PeepholeSummary`) once per module when non-zero, and read by the
-    // pass's differential tests.
+    // Instructions R1 deleted, module-wide. Read by the pass's differential
+    // tests.
+    //
+    // ⚠ THIS COMMENT USED TO PROMISE AN `L_PeepholeSummary` INFO NOTE
+    // "once per module when non-zero". ✔MEASURED 2026-08-26: no such
+    // diagnostic code exists and nothing reports one — the counter's ONLY
+    // reader is `tests/lir/test_lir_peephole.cpp`. Corrected rather than
+    // implemented: a silent cleanup pass has nothing a user must act on, and
+    // a docblock that describes an output channel the code does not have is
+    // the exact shape of claim this project measures before repeating.
     std::size_t redundantCopiesRemoved = 0;
+    // D-OPT-JCC-FALLTHROUGH: trailing BlockRef operands R2 dropped because
+    // the successor they named was already the next-laid-out block. NOT an
+    // instruction count — no instruction is deleted, the branch simply stops
+    // materializing an edge that the layout already satisfies. Read by the
+    // pass's differential tests.
+    std::size_t fallthroughBranchesElided = 0;
     // False iff the rebuild left the module unusable (a terminator the
     // shared dispatch refused). Same HARD channel as the sibling passes.
     bool        rebuilt = false;

@@ -2010,12 +2010,12 @@
       }
     },
     {
-      "$comment": "D-AS3-BLOCK-REL-IMM19/26: conditional intra-function jump with mandatory fallthrough. 2-WORD macro: `B.cond <ifTrue>` (word 0) then `B <ifFalse>` (word 1) — the AArch64 analog of x86's `0F 8x rel32; E9 rel32` compound. word0 = B.cond base 0x54000000 (opcode bits 24..31 = 0b01010100, bit 4 = 0); the cond nibble (bits 0..3) comes from the inst's payload (TargetCondCode) via `condCodeFromPayload` + the schema's `condCodeEncoding` table; the 19-bit signed PC-relative offset (bits 5..23, scaled by 4) goes to the Imm19 slot → ifTrue block. word1 = B base 0x14000000 with the Imm26 slot → ifFalse (fallthrough) block. Both displacements resolve at assemble time (BlockRef operands, no relocation). operand[0]=ifTrue (taken when cond holds), operand[1]=ifFalse. A future optimizer elides word1 when ifFalse is the next-laid-out block (D-OPT-JCC-FALLTHROUGH). Mirrors the x86 jcc wiring + the lea multi-word fixedWords+wordIndex shape.",
+      "$comment": "D-AS3-BLOCK-REL-IMM19/26: conditional intra-function jump with mandatory fallthrough. 2-WORD macro: `B.cond <ifTrue>` (word 0) then `B <ifFalse>` (word 1) — the AArch64 analog of x86's `0F 8x rel32; E9 rel32` compound. word0 = B.cond base 0x54000000 (opcode bits 24..31 = 0b01010100, bit 4 = 0); the cond nibble (bits 0..3) comes from the inst's payload (TargetCondCode) via `condCodeFromPayload` + the schema's `condCodeEncoding` table; the 19-bit signed PC-relative offset (bits 5..23, scaled by 4) goes to the Imm19 slot → ifTrue block. word1 = B base 0x14000000 with the Imm26 slot → ifFalse (fallthrough) block. Both displacements resolve at assemble time (BlockRef operands, no relocation). operand[0]=ifTrue (taken when cond holds), operand[1]=ifFalse. D-OPT-JCC-FALLTHROUGH: the SECOND variant is the FALLTHROUGH FORM — word0 alone, 4 bytes instead of 8 — selected by OPERAND COUNT when `lir_peephole`'s rule R2 drops the trailing BlockRef operand because ifFalse IS the next-laid-out block, both successors staying on the block. `lir_verifier`'s Rule 1b refuses the shortened operand list wherever that unnamed successor is not the block laid out next. Mirrors the x86 jcc wiring + the lea multi-word fixedWords+wordIndex shape.",
       "mnemonic":      "jcc",
       "result":        "none",
       "terminatorKind": "cond-br",
       "hasSideEffects": true,
-      "minOperands":   2,
+      "minOperands":   1,
       "maxOperands":   2,
       "minSuccessors": 2,
       "maxSuccessors": 2,
@@ -2028,6 +2028,14 @@
             "wires":    [
               { "index": 0, "slotKind": "imm19", "wordIndex": 0 },
               { "index": 1, "slotKind": "imm26", "wordIndex": 1 }
+            ]
+          },
+          {
+            "$comment": "D-OPT-JCC-FALLTHROUGH: the FALLTHROUGH FORM. Word 0 alone — `B.cond <ifTrue>` (base 0x54000000 + the payload cond nibble, Imm19 → ifTrue) — WITHOUT the trailing `B <ifFalse>` word: 4 bytes instead of 8. Note `fixedWord` (singular) rather than `fixedWords`: a one-word macro is a one-word template, and the Imm19 wire drops its `wordIndex` with it. Selected when the instruction carries ONE BlockRef operand instead of two, which `lir_peephole`'s rule R2 produces by dropping the trailing operand once the ifFalse successor IS the next-laid-out block.",
+            "guard":    { "operandKinds": ["blockref"] },
+            "template": { "fixedWord": 1409286144, "condCodeFromPayload": true },
+            "wires":    [
+              { "index": 0, "slotKind": "imm19" }
             ]
           }
         ]

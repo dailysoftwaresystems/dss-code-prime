@@ -136,9 +136,40 @@ fi
 # ── config (override via environment) ────────────────────────────────────────
 # dsscp is ALWAYS used at its CURRENT branch — the harness never switches
 # or pulls our own repo. SQLite DOES clone-or-pull (external dependency).
-DSS_REPO_URL="${DSS_REPO_URL:-git@github.com:dailysoftwaresystems/dsscp.git}"
+# ⚠ THE REPOSITORY IS `dss-code-prime`; ONLY THE COMMAND IS `dsscp`. This line
+# read `dsscp.git` between the rename and 2026-08-26, which is a repo that does
+# not exist — so `DSS_ALLOW_FRESH_CLONE=1` on a host without $SRC_DIR cloned
+# nothing while every OTHER tier reported green, the same silent-miss shape as
+# the 13 checkout paths the rename over-reached on and `carriage_paths_guard`
+# now refuses. `SRC_DIR` on the next line always had it right; they disagreed.
+DSS_REPO_URL="${DSS_REPO_URL:-git@github.com:dailysoftwaresystems/dss-code-prime.git}"
 SQLITE_REPO_URL="${SQLITE_REPO_URL:-git@github.com:sqlite/sqlite.git}"
 SRC_DIR="${SRC_DIR:-$HOME/src/dss-code-prime}"
+# ★★ ABSENT-HOST FALLBACK, AND IT DOES NOT WEAKEN THE "deliberately NOT the default"
+# RULE STATED FURTHER DOWN BESIDE `SELF_REPO`. That rule is about AMBIGUITY —
+# deriving by default would silently change WHICH TREE gets built where two exist
+# (the WSL gate tree vs a `/mnt/c` one), and it is correct. It says nothing about a
+# host where the preferred default does not exist AT ALL, which is the only case
+# this clause fires in, so it cannot produce the surprise that rule guards against.
+# ✔MEASURED 2026-08-26: the arm64 VPS keeps its clone at `~/src/Github/dss-code-prime`
+# (the per-host locations are declared in `scripts/leg-tree/leg-tree.sh`), so
+# `$HOME/src/dss-code-prime` named nothing there and the benchmark leg died with
+# `no dsscp binary found ... Searched under /home/ubuntu/src/dss-code-prime/build/`
+# — a directory no host on this project has.
+# ★ THIS IS A TWIN-PARITY REPAIR, not a new idea: BOTH PowerShell siblings ALREADY
+# derive the repo from their own location (`build-and-test.ps1` `$RepoRoot`,
+# `benchmark-speedtest1.ps1` `$DssSrc`), so the `.sh` half was the one guessing.
+# Pairing by EXISTENCE is not pairing by BEHAVIOUR.
+# ⚠ MUST run BEFORE `OUT_DIR`, which is derived from `SRC_DIR` one line below: a
+# fallback applied after it would fix the source tree and leave the OUTPUT tree
+# inside the directory that does not exist.
+if [[ ! -d "$SRC_DIR" ]]; then
+  dss_self_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." 2>/dev/null && pwd)" || dss_self_repo=""
+  # Only a real checkout — a script copied out of the repo falls back to nothing
+  # and keeps the original diagnostic, rather than silently building somewhere odd.
+  if [[ -n "$dss_self_repo" && -e "$dss_self_repo/.git" ]]; then SRC_DIR="$dss_self_repo"; fi
+  unset dss_self_repo
+fi
 SQLITE_DIR="${SQLITE_DIR:-$HOME/src/sqlite}"
 OUT_DIR="${OUT_DIR:-$SRC_DIR/build/real-examples/c/sqlite}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
@@ -178,6 +209,10 @@ DSS_ALLOW_FRESH_CLONE="${DSS_ALLOW_FRESH_CLONE:-0}"
 # script copied out of the repo suggests nothing rather than something wrong.
 SELF_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." 2>/dev/null && pwd)" || SELF_REPO=""
 [[ -n "$SELF_REPO" && -e "$SELF_REPO/.git" ]] || SELF_REPO=""
+# ⓘ `SELF_REPO` is ALSO the absent-host fallback for `SRC_DIR` — applied up beside
+# the `SRC_DIR` default itself, because `OUT_DIR` is derived FROM `SRC_DIR` and a
+# fallback applied down here would leave `OUT_DIR` pointing into the tree that does
+# not exist. See the `dss_self_repo` note at that site.
 # The directory THIS driver ships in — home of its three siblings: the leg
 # catalogue (legs.json), the leg resolver (harness_legs.py) and the driver
 # self-test (test-confound-scope.sh). Resolved ONCE so every consumer below reads

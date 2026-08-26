@@ -11,6 +11,7 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "opt/analysis/mir_alias.hpp"
+#include "opt/analysis/mir_escape.hpp"
 
 #include <gtest/gtest.h>
 
@@ -768,4 +769,485 @@ TEST(MirAlias, RegionWalkTreatsAtomicFenceAsClobber) {
         fenced.mir, interner, fenced.loadPtr, fencedRegion))
         << "a standalone CPU fence (AtomicFence) must be an opaque clobber — "
            "Loads may not move across it (D-CSUBSET-ATOMIC-FENCE)";
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// D-OPT-MEMSSA-WALK-PAST-PRECISION — the PROVENANCE + ESCAPE substrate
+// (`opt/analysis/mir_escape.hpp`) and `mirMayAlias` Rule 3b.
+//
+// Rules 1..7 are opcode and TYPE tests. The pair that dominates real C — a
+// local array or struct versus a parameter — has IDENTICAL types, so no type
+// test can ever separate it; that is the precision ceiling this substrate
+// lifts and the reason the anchor's own trigger ("`mirMayAlias` gains real
+// precision (points-to / full TBAA / escape analysis)") now fires.
+//
+// Every test below carries its own negative pin, because a `No` verdict is the
+// one direction that can license a stale Load: the escape half is proven
+// load-bearing by an ESCAPING twin that must stay Maybe, and the provenance
+// half by an `Unknown`-origin twin that must stay Maybe.
+// ═════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// The canonical precision shape, built once and shared by the tests below.
+//
+//   void probe(int *p) {         // `param`  — External provenance
+//       int  keep[4];            // `slot`   — a local slot that NEVER escapes
+//       int  leak[4];            // `leaked` — a local slot passed to a callee
+//       sink(leak);              // the escape
+//       *p = 0;                  // a Store through the parameter
+//       keep[0] = 0;             // a Store through the non-escaping slot
+//       leak[0] = 0;             // a Store through the escaping slot
+//   }
+struct EscapeShape {
+    Mir       mir;
+    MirInstId param{};       // Arg 0, Ptr<I32>
+    MirInstId gepParam{};    // Gep(param, 0)
+    MirInstId slot{};        // Alloca — never escapes
+    MirInstId gepSlot{};     // Gep(slot, 0)
+    MirInstId castSlot{};    // Bitcast(gepSlot)
+    MirInstId leaked{};      // Alloca — escapes via a Call argument
+    MirInstId gepLeaked{};   // Gep(leaked, 0)
+    MirInstId storeParam{};
+    MirInstId storeSlot{};
+    MirInstId storeLeaked{};
+    MirInstId call{};
+};
+
+EscapeShape buildEscapeShape(TypeInterner& interner) {
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const params[] = {ptrI32};
+    TypeId const fnSig  = interner.fnSig(params, voidT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+
+    EscapeShape s{};
+    s.param  = mb.addArg(0, ptrI32);
+    s.slot   = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+    s.leaked = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(z, i32);
+
+    MirInstId const gp[] = {s.param, c0};
+    s.gepParam  = mb.addInst(MirOpcode::Gep, gp, ptrI32);
+    MirInstId const gs[] = {s.slot, c0};
+    s.gepSlot   = mb.addInst(MirOpcode::Gep, gs, ptrI32);
+    MirInstId const bc[] = {s.gepSlot};
+    s.castSlot  = mb.addInst(MirOpcode::Bitcast, bc, ptrI32);
+    MirInstId const gl[] = {s.leaked, c0};
+    s.gepLeaked = mb.addInst(MirOpcode::Gep, gl, ptrI32);
+
+    // THE escape: `leaked`'s address becomes a call argument.
+    MirInstId const callee = mb.addGlobalAddr(SymbolId{200}, fnSig);
+    MirInstId const callOps[] = {callee, s.gepLeaked};
+    s.call = mb.addInst(MirOpcode::Call, callOps, InvalidType);
+
+    MirInstId const st0[] = {c0, s.gepParam};
+    s.storeParam  = mb.addInst(MirOpcode::Store, st0, InvalidType);
+    MirInstId const st1[] = {c0, s.gepSlot};
+    s.storeSlot   = mb.addInst(MirOpcode::Store, st1, InvalidType);
+    MirInstId const st2[] = {c0, s.gepLeaked};
+    s.storeLeaked = mb.addInst(MirOpcode::Store, st2, InvalidType);
+    mb.addReturn();
+
+    s.mir = std::move(mb).finish();
+    return s;
+}
+
+} // namespace
+
+// Provenance survives address arithmetic and pointer re-typing — the whole
+// reason Rule 2 (which compares the raw `Alloca` ids) cannot see the shapes
+// real C presents. NEGATIVE PIN: a Gep off a PARAMETER must stay External, or
+// the walk would be reporting slot provenance for pointers that have none.
+TEST(MirEscape, OriginWalksThroughGepAndBitcastButNotThroughAParameter) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto s = buildEscapeShape(interner);
+    MirPointerEscape const esc{s.mir};
+
+    for (MirInstId const v : {s.slot, s.gepSlot, s.castSlot}) {
+        auto const o = esc.originOf(v);
+        EXPECT_EQ(o.kind, MirPointerOriginKind::Slot)
+            << "v=" << v.v << " is derived from a local slot by address "
+               "arithmetic / a Bitcast — provenance must survive both";
+        EXPECT_EQ(o.slot.v, s.slot.v)
+            << "v=" << v.v << " must name the SLOT it came from, not another";
+    }
+    EXPECT_EQ(esc.originOf(s.param).kind, MirPointerOriginKind::External);
+    EXPECT_EQ(esc.originOf(s.gepParam).kind, MirPointerOriginKind::External)
+        << "a Gep off a parameter carries the PARAMETER's provenance — "
+           "reporting Slot here would be an unsound No waiting to happen";
+    EXPECT_EQ(esc.originOf(s.gepLeaked).kind, MirPointerOriginKind::Slot);
+    EXPECT_EQ(esc.originOf(s.gepLeaked).slot.v, s.leaked.v);
+}
+
+// The escape half itself: dereference and address arithmetic CONTAIN a slot
+// address; handing it to a callee publishes it. Both polarities in one shape,
+// so a table edit that makes every use escaping (or none) reds this test.
+TEST(MirEscape, LoadStoreAndGepContainASlotWhileACallArgumentPublishesIt) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto s = buildEscapeShape(interner);
+    MirPointerEscape const esc{s.mir};
+
+    EXPECT_FALSE(esc.slotEscapes(s.slot))
+        << "`keep` is only Gep'd, Bitcast and stored THROUGH — its address "
+           "never leaves the activation";
+    EXPECT_TRUE(esc.slotEscapes(s.leaked))
+        << "`leak`'s address is a Call argument — the callee can keep it";
+    EXPECT_EQ(esc.slotCount(), 2u);
+    EXPECT_EQ(esc.escapingSlotCount(), 1u)
+        << "exactly one of the two slots escapes — if BOTH or NEITHER do, the "
+           "shape stopped discriminating and every verdict below is vacuous";
+    EXPECT_EQ(esc.frameObservingFunctionCount(), 0u);
+}
+
+// ★ THE PRECISION WIN, and the anchor's trigger made concrete: a Store through
+// a PARAMETER cannot clobber a Load from a NON-ESCAPED local slot, at
+// IDENTICAL pointee types where every type rule answers Maybe.
+// RED-ON-DISABLE: delete Rule 3b from `mirMayAlias` (or the `provablyDisjoint`
+// arm behind it) and the first EXPECT flips No -> Maybe.
+TEST(MirAlias, Rule3b_NonEscapingSlotVersusAParameterIsNo) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto s = buildEscapeShape(interner);
+    MirPointerEscape const esc{s.mir};
+
+    for (StrictTbaa const st : {StrictTbaa::No, StrictTbaa::Yes}) {
+        for (bool const ca : {false, true}) {
+            EXPECT_EQ(mirMayAlias(s.mir, interner, s.gepSlot, s.gepParam,
+                                  st, ca, &esc),
+                      MirAliasResult::No)
+                << "a non-escaped local slot and a parameter can never overlap";
+            // NEGATIVE PIN 1 — the substrate is OPT-IN and sound when omitted.
+            EXPECT_EQ(mirMayAlias(s.mir, interner, s.gepSlot, s.gepParam, st, ca),
+                      MirAliasResult::Maybe)
+                << "without the escape analysis the SAME pair must fall to the "
+                   "type rules' Maybe — a No here would mean Rule 3b leaked "
+                   "into the default path";
+            // NEGATIVE PIN 2 — the ESCAPE test is load-bearing, not decoration.
+            EXPECT_EQ(mirMayAlias(s.mir, interner, s.gepLeaked, s.gepParam,
+                                  st, ca, &esc),
+                      MirAliasResult::Maybe)
+                << "`leak` ESCAPED into a callee, so the parameter may well "
+                   "name it — Rule 3b must NOT fire";
+        }
+    }
+    // The clobber predicate is the surface consumers actually use.
+    EXPECT_FALSE(mirInstClobbersLoadPtr(s.mir, interner, s.gepSlot,
+                                        s.storeParam, StrictTbaa::No, true, &esc));
+    EXPECT_TRUE(mirInstClobbersLoadPtr(s.mir, interner, s.gepSlot, s.storeParam));
+    EXPECT_TRUE(mirInstClobbersLoadPtr(s.mir, interner, s.gepLeaked,
+                                       s.storeParam, StrictTbaa::No, true, &esc));
+    // An opaque clobber stays opaque at ANY provenance precision — Rule 3b is
+    // reached only through the Store arm of the predicate.
+    EXPECT_TRUE(mirInstClobbersLoadPtr(s.mir, interner, s.gepSlot, s.call,
+                                       StrictTbaa::No, true, &esc))
+        << "a Call is an opaque memory clobber; provenance never excuses it";
+}
+
+// Arm (i): two DIFFERENT slots reached through address arithmetic. This is
+// Rule 2 generalized — Rule 2 compares raw `Alloca` ids and sees only two
+// `Gep`s here. NEGATIVE PIN: the SAME slot through two different derivations
+// must NOT be disjoint (that pair genuinely may overlap).
+TEST(MirAlias, Rule3b_DistinctSlotsThroughGepsAreDisjointButOneSlotIsNot) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto s = buildEscapeShape(interner);
+    MirPointerEscape const esc{s.mir};
+
+    EXPECT_EQ(mirMayAlias(s.mir, interner, s.gepSlot, s.gepLeaked,
+                          StrictTbaa::No, true, &esc),
+              MirAliasResult::No)
+        << "two different local slots are two different objects even when one "
+           "of them escapes — arm (i) does not read the escape bit";
+    EXPECT_EQ(mirMayAlias(s.mir, interner, s.gepSlot, s.gepLeaked),
+              MirAliasResult::Maybe)
+        << "Rule 2 cannot see through the Geps; only Rule 3b can";
+    EXPECT_FALSE(esc.provablyDisjoint(s.gepSlot, s.castSlot))
+        << "gepSlot and castSlot name the SAME slot — claiming disjointness "
+           "here would license a stale Load";
+    EXPECT_FALSE(esc.provablyDisjoint(s.gepSlot, s.gepSlot))
+        << "a pointer is never disjoint from itself";
+}
+
+// A Phi that MERGES slot provenance with a parameter is the lattice's top, and
+// top must never yield a No. Also pins the second half: the merged value
+// leaving the activation escapes the slot that fed it, so the slot's OWN
+// pointers stop being separable from the parameter too.
+TEST(MirAlias, Rule3b_PhiMergingASlotAndAParameterIsUnknownAndEscapesTheSlot) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const boolT  = interner.primitive(TypeKind::Bool);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const params[] = {ptrI32, boolT};
+    TypeId const fnSig  = interner.fnSig(params, voidT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const armA  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const armB  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join  = mb.createBlock(StructCfMarker::ExitBlock);
+    mb.beginBlock(entry);
+    MirInstId const param = mb.addArg(0, ptrI32);
+    MirInstId const cond  = mb.addArg(1, boolT);
+    MirInstId const slot  = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+    (void)mb.addCondBr(cond, armA, armB);
+    mb.beginBlock(armA);
+    (void)mb.addBr(join);
+    mb.beginBlock(armB);
+    (void)mb.addBr(join);
+    mb.beginBlock(join);
+    MirPhiIncoming const incs[] = {{slot, armA}, {param, armB}};
+    MirInstId const merged = mb.addPhi(ptrI32, incs);
+    // The merged pointer LEAVES: it becomes a call argument.
+    MirInstId const callee = mb.addGlobalAddr(SymbolId{200}, fnSig);
+    MirInstId const callOps[] = {callee, merged};
+    (void)mb.addInst(MirOpcode::Call, callOps, InvalidType);
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+
+    MirPointerEscape const esc{mir};
+    EXPECT_EQ(esc.originOf(merged).kind, MirPointerOriginKind::Unknown)
+        << "Slot join External is the lattice's TOP — a Phi that may carry "
+           "either must not be reported as either";
+    EXPECT_EQ(mirMayAlias(mir, interner, merged, param,
+                          StrictTbaa::No, true, &esc),
+              MirAliasResult::Maybe)
+        << "an Unknown origin can never produce a No";
+    EXPECT_TRUE(esc.slotEscapes(slot))
+        << "the merged pointer left the activation and it MAY be the slot's "
+           "address — the slot must be treated as escaped";
+    EXPECT_EQ(mirMayAlias(mir, interner, slot, param,
+                          StrictTbaa::No, true, &esc),
+              MirAliasResult::Maybe)
+        << "once the slot escapes, the parameter may name it";
+}
+
+// The frame-observing hatch. An assembly template can read the frame pointer
+// and compute ANY slot address with no SSA edge to observe, so a function
+// containing one keeps exactly the pre-Rule-3b precision. NEGATIVE PIN: the
+// identical shape WITHOUT the template separates the pair.
+TEST(MirEscape, AnInlineAsmTemplateEscapesEverySlotInItsFunction) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const params[] = {ptrI32};
+    TypeId const fnSig  = interner.fnSig(params, voidT, CallConv::CcSysV);
+
+    struct Shape { Mir mir; MirInstId param, slot; };
+    auto build = [&](bool withAsm) {
+        MirBuilder mb;
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(entry);
+        MirInstId const param = mb.addArg(0, ptrI32);
+        MirInstId const slot  = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+        if (withAsm) {
+            MirAsmDescriptor d;
+            d.templateText = "nop";
+            (void)mb.addInlineAsm(std::move(d), {}, InvalidType);
+        }
+        mb.addReturn();
+        return Shape{std::move(mb).finish(), param, slot};
+    };
+
+    Shape clean = build(false);
+    MirPointerEscape const escClean{clean.mir};
+    EXPECT_FALSE(escClean.slotEscapes(clean.slot));
+    EXPECT_EQ(escClean.frameObservingFunctionCount(), 0u);
+    EXPECT_EQ(mirMayAlias(clean.mir, interner, clean.slot, clean.param,
+                          StrictTbaa::No, true, &escClean),
+              MirAliasResult::No)
+        << "the control arm must separate the pair, or the asm arm below "
+           "proves nothing";
+
+    Shape asmed = build(true);
+    MirPointerEscape const escAsm{asmed.mir};
+    EXPECT_TRUE(escAsm.slotEscapes(asmed.slot))
+        << "an opaque template may read the frame pointer and name any slot";
+    EXPECT_EQ(escAsm.frameObservingFunctionCount(), 1u);
+    EXPECT_EQ(mirMayAlias(asmed.mir, interner, asmed.slot, asmed.param,
+                          StrictTbaa::No, true, &escAsm),
+              MirAliasResult::Maybe)
+        << "a frame-observing function returns to exactly today's precision";
+}
+
+// Rule 3b sits AFTER Rule 3's pointer-ness screen, so a caller exploring
+// alias-ness on a NON-pointer SSA value still gets Maybe rather than a No
+// derived from a value that does not name storage at all.
+TEST(MirAlias, Rule3b_DoesNotFireBehindRule3sPointernessScreen) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const fnSig  = interner.fnSig({}, voidT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+    MirLiteralValue z; z.value = std::int64_t{7}; z.core = TypeKind::I32;
+    MirInstId const scalar = mb.addConst(z, i32);   // NOT pointer-typed
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+
+    MirPointerEscape const esc{mir};
+    EXPECT_FALSE(esc.slotEscapes(slot));
+    EXPECT_EQ(mirMayAlias(mir, interner, slot, scalar,
+                          StrictTbaa::No, true, &esc),
+              MirAliasResult::Maybe)
+        << "Rule 3 screens non-pointer operands FIRST; Rule 3b must not "
+           "answer a question about a value that names no storage";
+}
+
+// ── Completeness of the two classification tables, CHECKED not argued ──
+//
+// Both tables are whitelists whose DEFAULT arm is the conservative answer, so
+// an opcode added to the enum without touching mir_escape.hpp loses precision
+// and can never gain an unsound No. These sweeps assert exactly that shape
+// over the WHOLE `MirOpcode` enum, so the property is a test result rather
+// than a promise in a comment.
+TEST(MirEscape, EveryUseOutsideTheWhitelistIsClassifiedEscapes) {
+    std::size_t nonEscaping = 0;
+    std::size_t escaping    = 0;
+    for (std::uint16_t raw = 0;
+         raw < static_cast<std::uint16_t>(MirOpcode::Count_); ++raw) {
+        auto const op = static_cast<MirOpcode>(raw);
+        for (std::size_t i = 0; i < 8; ++i) {
+            bool const whitelisted =
+                (op == MirOpcode::Phi)
+                || ((op == MirOpcode::Gep || op == MirOpcode::Bitcast) && i == 0)
+                || ((op == MirOpcode::Load || op == MirOpcode::AtomicLoad
+                     || op == MirOpcode::AtomicCas) && i == 0)
+                || ((op == MirOpcode::Store || op == MirOpcode::AtomicStore) && i == 1)
+                || (op == MirOpcode::ICmpEq  || op == MirOpcode::ICmpNe
+                 || op == MirOpcode::ICmpSlt || op == MirOpcode::ICmpSle
+                 || op == MirOpcode::ICmpSgt || op == MirOpcode::ICmpSge
+                 || op == MirOpcode::ICmpUlt || op == MirOpcode::ICmpUle
+                 || op == MirOpcode::ICmpUgt || op == MirOpcode::ICmpUge);
+            bool const escapes =
+                mirPointerUseKind(op, i) == MirPointerUseKind::Escapes;
+            EXPECT_EQ(escapes, !whitelisted)
+                << "opcode ordinal " << raw << " operand " << i
+                << ": every position outside the whitelist MUST classify as "
+                   "Escapes — the default arm is what makes an unknown opcode "
+                   "lose precision instead of soundness";
+            (escapes ? escaping : nonEscaping) += 1;
+        }
+    }
+    EXPECT_GT(nonEscaping, 0u);
+    EXPECT_GT(escaping, nonEscaping)
+        << "the table must be a WHITELIST — if the non-escaping positions ever "
+           "outnumber the escaping ones its polarity has inverted";
+}
+
+// ★ The CSE-substitution stability lemma's premise, swept over the whole enum.
+//
+// `mirAliasProbeSubstitutionPreservesClobberVerdict`'s theorem holds at Rule 3b
+// precision only because origin is a function of (opcode, origin of operand 0)
+// for every opcode a value-numbering pass may MERGE. The two opcodes for which
+// that is false — `Alloca` (origin is its own identity) and `Phi` (origin is a
+// join over the phi pool, which no operand list carries) — must therefore be
+// excluded from merge candidacy. The condition below MIRRORS `cse.cpp`'s
+// `isCseCandidateOpcode`; if that gate is ever relaxed, this sweep is the test
+// that reds.
+TEST(MirEscape, EveryValueNumberingCandidateHasOperandDeterminedOrigin) {
+    std::size_t candidates = 0;
+    for (std::uint16_t raw = 0;
+         raw < static_cast<std::uint16_t>(MirOpcode::Count_); ++raw) {
+        auto const op = static_cast<MirOpcode>(raw);
+        if (op == MirOpcode::Invalid) continue;
+        // `isCseCandidateOpcode` (cse.cpp), restated from public predicates.
+        if (isTerminator(op)) continue;
+        if (isPhi(op)) continue;
+        if (opcodeInfo(op).hasSideEffects) continue;
+        if (op == MirOpcode::Alloca) continue;
+        ++candidates;
+        EXPECT_TRUE(mirPointerOriginIsOperandDetermined(op))
+            << "opcode ordinal " << raw << " is a value-numbering candidate "
+               "whose origin is NOT determined by (opcode, operand-0 origin) — "
+               "merging two of them could join different provenances behind an "
+               "identical key, and Rule 3b would then answer differently for "
+               "the raw and the canonical probe";
+    }
+    EXPECT_GT(candidates, 8u)
+        << "the sweep found almost no candidates — the restated gate has "
+           "drifted from cse.cpp and this test is asserting nothing";
+    EXPECT_FALSE(mirPointerOriginIsOperandDetermined(MirOpcode::Alloca))
+        << "Alloca's origin IS its own identity — the lemma's excluded case";
+    EXPECT_FALSE(mirPointerOriginIsOperandDetermined(MirOpcode::Phi))
+        << "Phi's origin is a join over the phi pool — the lemma's other "
+           "excluded case";
+}
+
+// The FOUR-argument substitution licence: at Rule 3b precision, equal opcode +
+// equal TypeId is no longer sufficient on its own, and passing the escape
+// analysis restores the theorem's `==` conclusion. Both halves are pinned:
+// the licence REFUSES the differing-origin pair, and wherever it still says
+// yes the verdicts are bit-identical over every instruction × the flag matrix.
+TEST(MirAlias, ProbeSubstitutionUnderEscapeRequiresEqualOrigins) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto s = buildEscapeShape(interner);
+    MirPointerEscape const esc{s.mir};
+
+    // `gepSlot` and `gepParam` are both `Gep` at the same result TypeId.
+    EXPECT_TRUE(mirAliasProbeSubstitutionPreservesClobberVerdict(
+                    s.mir, s.gepSlot, s.gepParam))
+        << "the THREE-argument form is the TYPE-level licence and still says "
+           "yes here — that is exactly why the four-argument form exists";
+    EXPECT_FALSE(mirAliasProbeSubstitutionPreservesClobberVerdict(
+                     s.mir, s.gepSlot, s.gepParam, &esc))
+        << "their ORIGINS differ (a non-escaped slot vs a parameter), so at "
+           "Rule 3b precision the substitution flips a Store's verdict";
+    EXPECT_TRUE(mirAliasProbeSubstitutionPreservesClobberVerdict(
+                    s.mir, s.gepSlot, s.gepSlot, &esc));
+
+    std::vector<MirInstId> everyInst;
+    MirBlockId const entry = s.mir.instBlock(s.slot);
+    std::uint32_t const n = s.mir.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        everyInst.push_back(s.mir.blockInstAt(entry, i));
+    }
+    MirInstId const probes[] = {s.param, s.gepParam, s.slot, s.gepSlot,
+                                s.castSlot, s.leaked, s.gepLeaked};
+    struct FlagCase { StrictTbaa st; bool ca; };
+    FlagCase const flagMatrix[] = {
+        {StrictTbaa::No,  true}, {StrictTbaa::No,  false},
+        {StrictTbaa::Yes, true}, {StrictTbaa::Yes, false},
+    };
+    std::size_t licensed = 0;
+    std::size_t refused  = 0;
+    for (MirInstId const raw : probes) {
+        for (MirInstId const canonical : probes) {
+            if (!mirAliasProbeSubstitutionPreservesClobberVerdict(
+                    s.mir, raw, canonical, &esc)) {
+                ++refused;
+                continue;
+            }
+            ++licensed;
+            for (auto const [st, ca] : flagMatrix) {
+                for (MirInstId const x : everyInst) {
+                    EXPECT_EQ(mirInstClobbersLoadPtr(s.mir, interner, raw, x,
+                                                     st, ca, &esc),
+                              mirInstClobbersLoadPtr(s.mir, interner, canonical,
+                                                     x, st, ca, &esc))
+                        << "the four-argument licence claimed probe v=" << raw.v
+                        << " may be replaced by v=" << canonical.v
+                        << ", but their clobber verdicts differ on inst v="
+                        << x.v << " under Rule 3b";
+                }
+            }
+        }
+    }
+    EXPECT_GT(refused, 0u)
+        << "if the licence refuses nothing it is not discriminating origins";
+    EXPECT_GE(licensed, std::size(probes))
+        << "identity must always be licensed";
 }

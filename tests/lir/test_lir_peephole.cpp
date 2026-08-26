@@ -43,12 +43,14 @@
 #include "lir/lir_2addr_legalize.hpp"
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_node.hpp"
+#include "lir/lir_pass_util.hpp"
 #include "lir/lir_peephole.hpp"
 #include "lir/lir_reg.hpp"
 #include "lir/lir_regalloc.hpp"
 #include "lir/lir_rewrite.hpp"
 #include "lir/lir_verifier.hpp"
 #include "lir/lir_wide_call_args.hpp"
+#include "fallthrough_form_schema.hpp"
 #include "lowered_lir_fixture.hpp"
 #include "mutate_target_schema.hpp"
 
@@ -105,6 +107,74 @@ std::uint32_t ord(std::string_view name) {
             + std::string(name) + "' - this fixture names it directly");
     }
     return *o;
+}
+
+std::uint16_t opIn(TargetSchema const& schema, std::string_view mnemonic) {
+    auto const i = schema.opcodeByMnemonic(mnemonic);
+    if (!i.has_value()) {
+        throw std::runtime_error(
+            std::string("this target declares no opcode '")
+            + std::string(mnemonic) + "' - this fixture names it directly");
+    }
+    return *i;
+}
+
+using dss::test_support::schemaWithFallthroughForm;
+using dss::test_support::schemaWithoutFallthroughForm;
+
+// A three-block function whose ENTRY ends in a conditional branch:
+//
+//   ^0:  jcc(cond) ^t, ^f      ; successors [t, f]
+//   ^1:  ret rax
+//   ^2:  ret rax
+//
+// Blocks are laid out in creation order, so ^1 is ALWAYS the block laid out
+// immediately after ^0. Which of ^1 / ^2 the branch calls its FALLTHROUGH is
+// the whole experiment: `falseEdgeIsNextBlock` puts ^1 there (R2 may elide),
+// otherwise ^2 (R2 must not).
+[[nodiscard]] Lir
+condBrModule(TargetSchema const& schema, bool falseEdgeIsNextBlock) {
+    LirBuilder b{schema};
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    LirBlockId const next  = b.createBlock();
+    LirBlockId const far   = b.createBlock();
+    LirBlockId const ifTrue  = falseEdgeIsNextBlock ? far  : next;
+    LirBlockId const ifFalse = falseEdgeIsNextBlock ? next : far;
+
+    LirReg const rax = makePhysicalReg(ord("rax"), LirRegClass::GPR);
+    std::array<LirOperand, 1> const retOps{LirOperand::makeReg(rax)};
+
+    b.beginBlock(entry);
+    std::array<LirOperand, 2> const jccOps{
+        LirOperand::makeBlockRef(ifTrue.v), LirOperand::makeBlockRef(ifFalse.v)};
+    b.addCondBr(opIn(schema, "jcc"), jccOps, ifTrue, ifFalse, /*payload=*/4);
+    b.beginBlock(next);
+    b.addReturn(opIn(schema, "ret"), retOps);
+    b.beginBlock(far);
+    b.addReturn(opIn(schema, "ret"), retOps);
+    return std::move(b).finish();
+}
+
+// The terminator of the function's FIRST block, and its two channels.
+struct TerminatorShape {
+    std::size_t               operandCount = 0;
+    std::vector<std::uint32_t> blockRefs;
+    std::vector<std::uint32_t> successors;
+};
+
+[[nodiscard]] TerminatorShape entryTerminatorShape(Lir const& lir) {
+    TerminatorShape s;
+    LirFuncId const fn = lir.funcAt(0);
+    LirBlockId const bb = lir.funcBlockAt(fn, 0);
+    LirInstId const term =
+        lir.blockInstAt(bb, lir.blockInstCount(bb) - 1);
+    for (auto const& o : lir.instOperands(term)) {
+        ++s.operandCount;
+        if (o.kind == LirOperandKind::BlockRef) s.blockRefs.push_back(o.blockSlot);
+    }
+    for (LirBlockId const b : lir.blockSuccessors(bb)) s.successors.push_back(b.v);
+    return s;
 }
 
 // `f() { <opcode> pDst, pSrc ; ret pDst }` — one instruction under test in a
@@ -471,4 +541,168 @@ TEST(LirPeephole, ATargetMayDeclareA128BitEncodingVariantGuard) {
     EXPECT_EQ(info->encoding.variants[0].guardWidthBits, 128u)
         << "the declared 128-bit guard must survive the load as 128, not be "
            "truncated or silently dropped";
+}
+// ── RULE R2 — FALLTHROUGH-BRANCH ELISION (D-OPT-JCC-FALLTHROUGH) ─────────
+//
+// What these pin, in the order the hazards bite:
+//
+//   * THE VOCABULARY GATE. On the SHIPPED target — which declares only the
+//     two-blockref `jcc` form — R2 fires on NOTHING, however perfect the
+//     layout. "Elide a branch to the next block" is a universal property of a
+//     block terminator, but the SPELLING of the shorter form is target
+//     vocabulary, and a pass that assumed one would be an arch branch wearing
+//     a peephole's clothes.
+//   * THE POSITIVE, on a target that DOES declare it: the trailing operand
+//     goes and BOTH SUCCESSORS STAY. That split is the entire design — the
+//     CFG keeps its edge, the encoder loses a jump to +0.
+//   * THE LAYOUT NEGATIVE: the same module with the two edges swapped keeps
+//     its operand, because the unnamed successor would not be the block that
+//     actually comes next.
+//   * THE LAST-BLOCK NEGATIVE: a branch in the last laid-out block has
+//     nothing to fall through TO.
+//   * IDEMPOTENCE: peepholing an already-elided module elides nothing more.
+//   * AND THE VERIFIER AGREES, on the shipped (declaring) target and on one
+//     with the form removed.
+
+TEST(LirPeephole, FallthroughElisionNeedsTheTargetToSpellTheShorterForm) {
+    // A target whose `jcc` declares ONLY the two-blockref variant. Layout is
+    // perfect — the false edge IS the next block — and R2 still must not
+    // fire, because there is no shorter encoding to select and dropping the
+    // operand would only produce `A_NoMatchingEncodingVariant`.
+    //
+    // ⚠ This target is SYNTHESIZED, and it is the shipped one that has to be
+    // mutated to reach it: both shipped documents declare the fallthrough
+    // form, so the schema this test needs no longer exists on disk.
+    auto const schema = schemaWithoutFallthroughForm("x86_64");
+    Lir const before = condBrModule(*schema, /*falseEdgeIsNextBlock=*/true);
+    DiagnosticReporter rep;
+    auto const r = runLirPeephole(before, *schema, rep);
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r.fallthroughBranchesElided, 0u)
+        << "R2 fired on a target that declares no fallthrough encoding form";
+    EXPECT_EQ(entryTerminatorShape(r.lir).operandCount, 2u);
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+TEST(LirPeephole, FallthroughOperandIsElidedAndBothSuccessorsSurvive) {
+    auto const schema = schemaWithFallthroughForm("x86_64");
+    Lir const before = condBrModule(*schema, /*falseEdgeIsNextBlock=*/true);
+    ASSERT_EQ(entryTerminatorShape(before).operandCount, 2u);
+
+    DiagnosticReporter rep;
+    auto const r = runLirPeephole(before, *schema, rep);
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r.fallthroughBranchesElided, 1u);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    auto const shape = entryTerminatorShape(r.lir);
+    // ★ ONE operand fewer...
+    EXPECT_EQ(shape.operandCount, 1u);
+    EXPECT_EQ(shape.blockRefs.size(), 1u);
+    // ★ ...and the CFG UNTOUCHED. Losing the edge here is the silent
+    // miscompile this whole row is about: liveness and every CFG walk read
+    // THIS list, not the operands.
+    ASSERT_EQ(shape.successors.size(), 2u);
+    EXPECT_EQ(shape.blockRefs[0], shape.successors[0])
+        << "the operand that survived must still be the TAKEN edge";
+
+    // No instruction was deleted — R2 shortens a branch, it does not remove one.
+    EXPECT_EQ(instTotal(r.lir), instTotal(before));
+    EXPECT_EQ(r.redundantCopiesRemoved, 0u);
+
+    DiagnosticReporter vrep;
+    EXPECT_TRUE(verifyLirRebuild(before, r.lir, "lir-peephole", vrep));
+    EXPECT_TRUE(verifyLirPostRegalloc(r.lir, *schema, vrep))
+        << "the verifier must ACCEPT a legal elision";
+}
+
+TEST(LirPeephole, FallthroughOperandSurvivesWhenItIsNotTheNextBlock) {
+    auto const schema = schemaWithFallthroughForm("x86_64");
+    Lir const before = condBrModule(*schema, /*falseEdgeIsNextBlock=*/false);
+    DiagnosticReporter rep;
+    auto const r = runLirPeephole(before, *schema, rep);
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r.fallthroughBranchesElided, 0u)
+        << "R2 elided a jump whose successor is not the next-laid-out block";
+    EXPECT_EQ(entryTerminatorShape(r.lir).operandCount, 2u);
+    DiagnosticReporter vrep;
+    EXPECT_TRUE(verifyLirPostRegalloc(r.lir, *schema, vrep));
+}
+
+TEST(LirPeephole, ABranchInTheLastLaidOutBlockNeverElides) {
+    auto const schema = schemaWithFallthroughForm("x86_64");
+    // ^0: ret ; ^1: jcc ^0, ^0  — ^1 is the last block laid out, so its
+    // fallthrough edge has nowhere to fall.
+    LirBuilder b{*schema};
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const first = b.createBlock();
+    LirBlockId const last  = b.createBlock();
+    LirReg const rax = makePhysicalReg(ord("rax"), LirRegClass::GPR);
+    std::array<LirOperand, 1> const retOps{LirOperand::makeReg(rax)};
+    b.beginBlock(first);
+    b.addReturn(opIn(*schema, "ret"), retOps);
+    b.beginBlock(last);
+    std::array<LirOperand, 2> const jccOps{
+        LirOperand::makeBlockRef(first.v), LirOperand::makeBlockRef(first.v)};
+    b.addCondBr(opIn(*schema, "jcc"), jccOps, first, first, /*payload=*/4);
+    Lir const before = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto const r = runLirPeephole(before, *schema, rep);
+    ASSERT_TRUE(r.ok());
+    EXPECT_EQ(r.fallthroughBranchesElided, 0u)
+        << "R2 elided the fallthrough of the LAST block — control would leave "
+           "the function's bytes";
+}
+
+TEST(LirPeephole, ElidingIsIdempotent) {
+    auto const schema = schemaWithFallthroughForm("x86_64");
+    Lir const before = condBrModule(*schema, /*falseEdgeIsNextBlock=*/true);
+    DiagnosticReporter rep;
+    auto const once = runLirPeephole(before, *schema, rep);
+    ASSERT_TRUE(once.ok());
+    ASSERT_EQ(once.fallthroughBranchesElided, 1u);
+    auto const twice = runLirPeephole(once.lir, *schema, rep);
+    ASSERT_TRUE(twice.ok());
+    EXPECT_EQ(twice.fallthroughBranchesElided, 0u)
+        << "a second pass elided a SECOND operand off an already-elided branch";
+    EXPECT_EQ(entryTerminatorShape(twice.lir).operandCount, 1u);
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// ★ THE VOCABULARY ITSELF LOADS — on BOTH shipped targets, which is what
+// makes the rule target-agnostic rather than x86-shaped. The x86 form drops a
+// `prefixOpcodeBytes`-bridged second rel32 wire; the arm64 form drops a whole
+// 32-bit word off a `fixedWords` macro. Same JSON-only addition, two
+// completely different encoding shapes, one transform.
+TEST(LirPeephole, BothShippedTargetsDeclareTheFallthroughEncodingForm) {
+    for (std::string_view const target : {"x86_64", "arm64"}) {
+        // ★ THE SUBJECT IS THE SHIPPED DOCUMENT, and that is the whole point
+        // of this test. R2 can only elide to an encoding the target actually
+        // spells, so if `x86_64.target.json` / `arm64.target.json` lose the
+        // one-blockref `jcc` variant, the pass silently stops firing and
+        // every other test here keeps passing — they build their own schema.
+        // Nothing else in the suite reads the shipped file for this property.
+        auto const shipped = TargetSchema::loadShipped(target);
+        ASSERT_TRUE(shipped.has_value()) << target;
+        auto const jcc = (*shipped)->opcodeByMnemonic("jcc");
+        ASSERT_TRUE(jcc.has_value()) << target;
+        auto const* info = (*shipped)->opcodeInfo(*jcc);
+        ASSERT_NE(info, nullptr) << target;
+        ASSERT_EQ(info->encoding.variants.size(), 2u) << target;
+        EXPECT_EQ(info->encoding.variants[1].operandKinds.size(), 1u) << target;
+        EXPECT_EQ(info->encoding.variants[1].wires.size(), 1u) << target;
+        // And the shared predicate — the ONE owner both the peephole and the
+        // verifier consult — recognizes it for a two-operand branch.
+        EXPECT_TRUE(lir_pass_util::declaresFallthroughBranchForm(
+            **shipped, *jcc, 2)) << target;
+        // While a target with the variant removed does not — which is what
+        // keeps this a discriminating test rather than one that would pass
+        // over any document at all.
+        auto const without = schemaWithoutFallthroughForm(target);
+        auto const wjcc = without->opcodeByMnemonic("jcc");
+        ASSERT_TRUE(wjcc.has_value()) << target;
+        EXPECT_FALSE(lir_pass_util::declaresFallthroughBranchForm(
+            *without, *wjcc, 2)) << target;
+    }
 }

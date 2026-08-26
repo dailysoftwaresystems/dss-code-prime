@@ -10,7 +10,9 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/strong_ids.hpp"  // CompilationUnitId (CuMirModule member)
 #include "core/types/target_schema.hpp"
+#include "core/substrate/thread_pool.hpp"  // IExecutor (the thin-LTO stage's optional pool)
 #include "core/types/type_lattice/type_interner.hpp"  // TypeInterner (optimizeModule arg)
+#include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (CuMirModule::importedHost)
 #include "link/image_request.hpp"  // ImageRequest (linkAndWrite per-program knobs)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly arg)
@@ -440,6 +442,29 @@ struct CompileOptions {
     // differential-verify arm + MIR unit tests (D-OPT1-DIFFERENTIAL-VERIFY-RUNNER).
     ::dss::opt::OptPipeline const* pipelineOverride = nullptr;
 
+    // ── THE LINK-TIME-OPTIMIZATION TOPOLOGY (D-OPT11-LAZY-IMPORT-EDGE) ────────
+    //
+    // `Full` (the DEFAULT, and byte-identical to every build before this field
+    // existed): merge every CU's MIR into ONE module and run ONE whole-program
+    // optimize over it. Maximum interprocedural reach, entirely SERIAL — ✔the
+    // measured 77.9% of all optimizer cpu in one call on the 103-TU sqlite
+    // corpus.
+    //
+    // `Thin`: before that merge, run a PER-TU optimize in parallel, each TU
+    // paging in on demand only the bodies its own gate can use
+    // (`mir/summary/lazy_import_optimize.hpp`). The whole-program merge still
+    // runs afterwards, so this is STRICTLY ADDITIVE: it can only move inlining
+    // earlier and into parallel, never remove a splice the merged module would
+    // have made.
+    //
+    // ⚠ A DRIVER FLAG, NOT A PIPELINE-DOCUMENT KEY, AND THAT IS WHERE THE
+    // ECOSYSTEM PUTS IT: gcc and clang spell LTO as `-flto`, a driver decision
+    // about the SHAPE of the build, while the pipeline document owns the
+    // SCHEDULE of passes. Nothing here branches on a language, a target or an
+    // object format.
+    enum class LtoMode : std::uint8_t { Full, Thin };
+    LtoMode ltoMode = LtoMode::Full;
+
     // c162 (D-FF1-READER-CONSUMER): the `--resolve-library <path>` driver
     // surface. Each entry is a real binary (a `.so` / `.dll` / `.dylib`,
     // typically a DSS-BUILT library) whose export surface is READ (via the
@@ -750,12 +775,61 @@ struct DSS_EXPORT CuMirModule {
     // fails loud on nullopt. Consulted only when a stdio recipe actually appears — an empty
     // recipe map is a clean no-op either way.
     std::optional<VaListLayout> vaListLayout;
+
+    // ── THE THIN-LTO PER-TU IMPORT STAGE'S OUTPUT (D-OPT11-LAZY-IMPORT-EDGE) ──
+    //
+    // ★★ AN IMPORT REPLACES THIS CU'S TYPE LATTICE AND SYMBOL NUMBERING, so a
+    // consumer that keeps reading `model.lattice().interner()` and
+    // `model.recordFor()` afterwards is reading this module through the WRONG
+    // lattice and the wrong names. These three are populated TOGETHER, only by
+    // `runThinLtoImportStage`, and only when that stage actually imported
+    // something; `libraryShimRecipes` is REPLACED in place by the same call,
+    // because its keys are symbol ids the merge renumbered.
+    //
+    // ⓘ EMPTY IS THE NORMAL STATE. Every build that does not pass `--lto=thin`
+    // — which is every build today — leaves them untouched, and every consumer
+    // takes its existing path byte-for-byte.
+    std::unique_ptr<TypeLattice>                   importedHost;
+    std::unordered_map<std::uint32_t, std::string> importedSymbolNames;
+    // True iff `importedHost` is authoritative for this CU. A separate flag
+    // rather than a null test, because a consumer that forgets to ask reads the
+    // stale interner silently and the pointer's nullness is one indirection away
+    // from every use site.
+    bool                                           usesImportedLattice = false;
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the
 // `CuMirModule` carrying the optimized MIR + the SemanticModel (interner owner) +
 // extern imports + the cuId/schema refs the lower half needs. Returns nullopt on any
 // front-half tier failure (diagnostics emitted via `reporter`).
+// THE THIN-LTO PER-TU IMPORT STAGE (D-OPT11-LAZY-IMPORT-EDGE, plan 22 §0.2).
+//
+// Runs BETWEEN the per-CU build and the whole-program merge — the one point in
+// the process where all N independent per-TU modules co-exist, each still owning
+// its own lattice. Each TU is optimized in PARALLEL, paging in on demand only
+// the bodies its own gate can use (`SummaryIndex::definitionOf`).
+//
+// ★★ STRICTLY ADDITIVE. The whole-program merge and its single optimize still
+// run afterwards, unchanged, so this can only move cross-CU inlining earlier and
+// into parallel — never remove a splice the merged module would have made. A TU
+// it has nothing to offer is left byte-identical, including its lattice.
+//
+// ⚠ ON RETURN, A CU THAT IMPORTED SOMETHING HAS A NEW LATTICE AND NEW SYMBOL
+// NUMBERING (`usesImportedLattice`). Every downstream consumer of that CU must
+// read `importedHost` / `importedSymbolNames` instead of `model`.
+//
+// `executor` may be null (run serially — what a single-threaded caller and the
+// determinism comparison want). `cuMirs.size() < 2` is a no-op: nothing crosses
+// a translation-unit boundary in a one-module program.
+[[nodiscard]] DSS_EXPORT bool
+runThinLtoImportStage(std::span<CuMirModule>  cuMirs,
+                      TargetSchema const&     target,
+                      CSymbolDecorationScheme cSymDecor,
+                      std::string_view        targetIdentity,
+                      CompileOptions const&   opts,
+                      substrate::IExecutor*   executor,
+                      DiagnosticReporter&     reporter);
+
 [[nodiscard]] DSS_EXPORT std::optional<CuMirModule>
 buildCuMir(CompilationUnit const&         cu,
            GrammarSchema const&           grammar,

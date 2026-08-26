@@ -124,6 +124,23 @@ std::string_view compileConfigName(CompileConfig c) noexcept {
     return "unknown";
 }
 
+// D-OPT11-LAZY-IMPORT-EDGE. Case-insensitive on the same terms `--config` is,
+// and CLOSED: an unrecognized mode is a REFUSAL, never a fallback to `full`.
+std::string_view ltoModeArgName(LtoModeArg m) noexcept {
+    switch (m) {
+        case LtoModeArg::Full: return "full";
+        case LtoModeArg::Thin: return "thin";
+    }
+    return "unknown";
+}
+
+std::optional<LtoModeArg> parseLtoModeArg(std::string_view v) noexcept {
+    auto const lowered = asciiToLower(v);
+    if (lowered == "full") return LtoModeArg::Full;
+    if (lowered == "thin") return LtoModeArg::Thin;
+    return std::nullopt;
+}
+
 std::string_view cliArgsErrorName(CliArgsError e) noexcept {
     switch (e) {
         case CliArgsError::UnknownFlag:         return "UnknownFlag";
@@ -143,6 +160,7 @@ std::string_view cliArgsErrorName(CliArgsError e) noexcept {
         case CliArgsError::InvalidResolveLibrary: return "InvalidResolveLibrary";
         case CliArgsError::InvalidMaxDiagnostics: return "InvalidMaxDiagnostics";
         case CliArgsError::InvalidMaxPerCode:     return "InvalidMaxPerCode";
+        case CliArgsError::InvalidLto:           return "InvalidLto";
     }
     return "Unknown";
 }
@@ -213,6 +231,14 @@ std::string cliHelpText() {
         "  --config=<debug|release>  build config "
             "(default: debug; release applies the full optimizer "
             "pipeline — plan 22)\n"
+        // D-OPT11-LAZY-IMPORT-EDGE. Documented HERE and not only in the header,
+        // for the reason D-CLI-HELP-OMITS-DEFINE-FLAG records: a flag that is
+        // parsed but not listed has the source as its only discoverable
+        // spelling.
+        "  --lto=<full|thin>      link-time-optimization topology "
+            "(default: full = one merged module, one whole-program optimize; "
+            "thin = a parallel per-TU optimize with on-demand cross-TU body "
+            "imports first, then the same merge)\n"
         "  --jobs <N>             per-CU build parallelism "
             "(default: auto = min(cores, TUs, 16); --jobs 1 = serial). "
             "Only the multi-source build parallelizes; the `=`-form is "
@@ -751,6 +777,27 @@ parseCliArgs(int argc, char* argv[]) {
         if (a == "--force-git-cache") {
             out.forceGitCache = true;
             continue;
+        }
+        {
+            // D-OPT11-LAZY-IMPORT-EDGE: `--lto <mode>` / `--lto=<mode>` — the
+            // link-time-optimization TOPOLOGY. A CLOSED vocabulary; an
+            // unrecognized mode is refused rather than falling back to `full`,
+            // because a silent fallback reports the same green as a build that
+            // honoured the flag.
+            auto m = valueFlag(a, i, "--lto");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                auto const mode = parseLtoModeArg(**m);
+                if (!mode.has_value()) {
+                    return std::unexpected(make_error(
+                        CliArgsError::InvalidLto,
+                        std::string{"--lto: '"} + **m
+                        + "' is not a recognized link-time-optimization mode "
+                          "(accepted: full, thin)"));
+                }
+                out.lto = *mode;
+                continue;
+            }
         }
         {
             // D-PERF-4-CU-PARALLELISM: `--jobs N` / `--jobs=N` — worker count for

@@ -52,6 +52,18 @@ enum class CompileConfig : std::uint8_t {
 [[nodiscard]] DSS_EXPORT std::string_view
     compileConfigName(CompileConfig c) noexcept;
 
+// `--lto <mode>` (D-OPT11-LAZY-IMPORT-EDGE). A CLOSED vocabulary: the parser
+// refuses a mode it does not know rather than falling back, because a silent
+// fallback reports the same green as a build that honoured the flag.
+enum class LtoModeArg : std::uint8_t {
+    Full = 0,   // the DEFAULT — one merged module, one whole-program optimize
+    Thin = 1,   // per-TU optimize with on-demand imports, then the same merge
+};
+
+[[nodiscard]] DSS_EXPORT std::string_view ltoModeArgName(LtoModeArg m) noexcept;
+[[nodiscard]] DSS_EXPORT std::optional<LtoModeArg>
+    parseLtoModeArg(std::string_view v) noexcept;
+
 // `ResolveLibrarySpec` — the `--resolve-library` value type — now lives in
 // `core/types/resolve_library_spec.hpp`, which this header includes above.
 // It moved DOWN when the project-config loader that parses the same value out
@@ -316,6 +328,22 @@ struct DSS_EXPORT CliArgs {
     // pool construction. Threaded to `Program::setJobs`.
     unsigned                      jobs = 0;
 
+    // `--lto <mode>` / `--lto=<mode>` (D-OPT11-LAZY-IMPORT-EDGE): the
+    // LINK-TIME-OPTIMIZATION TOPOLOGY.
+    //
+    //   `full` (the DEFAULT, and what every build did before this flag existed)
+    //          — merge every CU's MIR into ONE module and run ONE whole-program
+    //          optimize over it. Maximum interprocedural reach, entirely SERIAL.
+    //   `thin` — run a PER-TU optimize first, in parallel, each TU paging in on
+    //          demand only the bodies its own gate can use. The whole-program
+    //          merge still runs afterwards, so `thin` is strictly ADDITIVE.
+    //
+    // ⚠ SPELLED AS A DRIVER FLAG BECAUSE THAT IS WHERE THE ECOSYSTEM PUTS IT —
+    // gcc and clang both spell LTO as `-flto`. It is a decision about the SHAPE
+    // of the build; the pipeline document owns the SCHEDULE of passes. Threaded
+    // to `CompileOptions::ltoMode`.
+    LtoModeArg                    lto = LtoModeArg::Full;
+
     // `--stack-reserve <bytes>` / `--stack-reserve=<bytes>`
     // (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH): the per-PROGRAM stack reserve
     // this build asks the emitted image to carry, in BYTES. nullopt (the
@@ -359,6 +387,13 @@ enum class CliArgsError : std::uint8_t {
                                 // supported — use a config predefine)
     InvalidJobs         = 13,   // D-PERF-4: --jobs with a non-numeric value, a
                                 // zero, or trailing junk (`--jobs 0`, `--jobs x`)
+    InvalidLto          = 18,   // D-OPT11-LAZY-IMPORT-EDGE: --lto with a mode
+                                // this driver does not know. A CLOSED
+                                // vocabulary on purpose — an unrecognized mode
+                                // silently falling back to `full` would report
+                                // the same green as a build that honoured the
+                                // flag, which is the one way an operator cannot
+                                // tell the two apart.
     InvalidStackReserve = 14,   // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH:
                                 // --stack-reserve with a non-numeric value, a
                                 // zero, or trailing junk. RANGE/alignment is

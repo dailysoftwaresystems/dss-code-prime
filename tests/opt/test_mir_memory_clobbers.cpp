@@ -30,6 +30,7 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "opt/analysis/mir_alias.hpp"
+#include "opt/analysis/mir_escape.hpp"
 #include "opt/analysis/mir_memory_clobbers.hpp"
 #include "opt/passes/cse.hpp"
 
@@ -41,6 +42,7 @@
 
 using namespace dss;
 using dss::opt::analysis::MirMemoryClobbers;
+using dss::opt::analysis::MirPointerEscape;
 using dss::opt::analysis::StrictTbaa;
 
 namespace {
@@ -50,10 +52,11 @@ namespace {
 bool oracleBlockRange(Mir const& mir, TypeInterner const& interner,
                       MirInstId loadPtr, MirBlockId blk,
                       std::uint32_t lo, std::uint32_t hi,
-                      StrictTbaa st, bool ca) {
+                      StrictTbaa st, bool ca,
+                      dss::opt::analysis::MirPointerEscape const* esc = nullptr) {
     for (std::uint32_t j = lo; j < hi; ++j) {
         if (dss::opt::analysis::mirInstClobbersLoadPtr(
-                mir, interner, loadPtr, mir.blockInstAt(blk, j), st, ca)) {
+                mir, interner, loadPtr, mir.blockInstAt(blk, j), st, ca, esc)) {
             return true;
         }
     }
@@ -64,10 +67,11 @@ bool oracleBlockRange(Mir const& mir, TypeInterner const& interner,
 bool oracleBetween(Mir const& mir, TypeInterner const& interner,
                    MirInstId loadPtr, MirBlockId a, MirBlockId b,
                    std::vector<std::vector<MirBlockId>> const& preds,
-                   StrictTbaa st, bool ca) {
+                   StrictTbaa st, bool ca,
+                   dss::opt::analysis::MirPointerEscape const* esc = nullptr) {
     auto const region = dss::opt::analysis::mirRegionBetween(mir, a, b, preds);
     return dss::opt::analysis::mirAnyMayAliasingStoreInRegion(
-        mir, interner, loadPtr, region, st, ca);
+        mir, interner, loadPtr, region, st, ca, esc);
 }
 
 // Every block of every function in the module.
@@ -92,6 +96,11 @@ void assertDifferentialEquality(Mir const& mir, TypeInterner const& interner,
                                 std::vector<MirInstId> const& loadPtrs) {
     auto const preds = mirBuildPredecessors(mir);
     MirMemoryClobbers const idx{mir, preds};
+    // ★ The oracle MUST reason at the production query PRECISION. The index
+    // builds a MirPointerEscape for its module and threads it into every
+    // probe (Rule 3b); an oracle left at the default nullptr would answer a
+    // DIFFERENT question and every equality below would be noise.
+    auto const* esc = &idx.escape();
     auto const blocks = allBlocks(mir);
 
     struct FlagCase { StrictTbaa st; bool ca; };
@@ -104,7 +113,7 @@ void assertDifferentialEquality(Mir const& mir, TypeInterner const& interner,
             for (MirBlockId const a : blocks) {
                 for (MirBlockId const b : blocks) {
                     EXPECT_EQ(idx.anyClobberBetween(interner, lp, a, b, st, ca),
-                              oracleBetween(mir, interner, lp, a, b, preds, st, ca))
+                              oracleBetween(mir, interner, lp, a, b, preds, st, ca, esc))
                         << "Q2 diverges from the region oracle: between #"
                         << a.v << " and #" << b.v << " for loadPtr v=" << lp.v
                         << " st=" << (st == StrictTbaa::Yes) << " ca=" << ca;
@@ -115,7 +124,7 @@ void assertDifferentialEquality(Mir const& mir, TypeInterner const& interner,
                         EXPECT_EQ(idx.anyClobberInBlockRange(interner, lp, a,
                                                              lo, hi, st, ca),
                                   oracleBlockRange(mir, interner, lp, a,
-                                                   lo, hi, st, ca))
+                                                   lo, hi, st, ca, esc))
                             << "Q1 diverges from the range oracle: block #"
                             << a.v << " [" << lo << ", " << hi << ") loadPtr v="
                             << lp.v;
@@ -130,7 +139,7 @@ void assertDifferentialEquality(Mir const& mir, TypeInterner const& interner,
                                                  + static_cast<std::ptrdiff_t>(take));
                 EXPECT_EQ(idx.anyClobberInBlocks(interner, lp, body, st, ca),
                           dss::opt::analysis::mirAnyMayAliasingStoreInLoop(
-                              mir, interner, lp, body, st, ca))
+                              mir, interner, lp, body, st, ca, esc))
                     << "Q3 diverges from the loop oracle: prefix size " << take
                     << " loadPtr v=" << lp.v;
             }
@@ -157,6 +166,11 @@ void assertPointCoverIsSound(Mir const& mir, TypeInterner const& interner,
                              std::vector<MirInstId> const& loadPtrs) {
     auto const preds = mirBuildPredecessors(mir);
     MirMemoryClobbers const idx{mir, preds};
+    // ★ The oracle MUST reason at the production query PRECISION. The index
+    // builds a MirPointerEscape for its module and threads it into every
+    // probe (Rule 3b); an oracle left at the default nullptr would answer a
+    // DIFFERENT question and every equality below would be noise.
+    auto const* esc = &idx.escape();
     auto const blocks = allBlocks(mir);
 
     struct FlagCase { StrictTbaa st; bool ca; };
@@ -181,7 +195,8 @@ void assertPointCoverIsSound(Mir const& mir, TypeInterner const& interner,
                             // sides fail loud on, not a question with an answer.
                             if (a.v == b.v && ai >= bi) continue;
                             if (!dss::opt::analysis::mirAnyClobberOnPathBetweenPoints(
-                                    mir, interner, lp, a, ai, b, bi, preds, st, ca)) {
+                                    mir, interner, lp, a, ai, b, bi, preds, st, ca,
+                                    esc)) {
                                 continue;
                             }
                             ++specFired;
@@ -846,4 +861,403 @@ TEST(MirMemoryClobbers, PointCoverVerdictsOnTheBackEdgeTailShapes) {
                   c.expectClobber)
             << "the program-point specification itself disagrees: " << c.why;
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// D-OPT-MEMSSA-WALK-PAST-PRECISION — the (def, location)-keyed walk-past
+// layer, and the PROVENANCE precision that made it worth building.
+//
+// Two independent things are pinned here, because either alone would be a
+// half-closure:
+//   PRECISION — a Store through a PARAMETER no longer clobbers a Load from a
+//     NON-ESCAPED local slot, through the REAL index the passes query. Without
+//     it the walk-past would still almost never fire, which is the exact
+//     reason the anchor was deferred in the first place.
+//   THE SKIP — a def whose verdict for this location is already known is
+//     passed over with NO alias reasoning, and the counters say so. The
+//     anchor's other trigger was "the index's per-query alias-TEST count
+//     dominating a pass", so that count is now a measured number.
+//
+// And the REJECTED design stays rejected: the memo must never let a nearer
+// non-aliasing def mask a farther aliasing one. `FrontierStopsAtNonAliasing
+// StoreMustStillRefuse` above pins that for the ORIGINAL frontier proposal;
+// `WalkPastMemoNeverMasksAFartherAliasingClobber` below pins it for THIS
+// layer, at the higher precision where a nearer def now really does answer No.
+// ═════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// One function, one block:
+//
+//   void probe(int *p) {
+//       int keep[4];         // never escapes
+//       int leak[4];         // escapes into sink()
+//       sink(leak);
+//       *p       = 0;        // 3 Stores through the PARAMETER — under Rule 3b
+//       *p       = 0;        //   none of them clobbers a `keep` Load, so the
+//       *p       = 0;        //   scan must walk PAST all three...
+//       keep[0]  = 0;        // ...and still find THIS one.
+//   }
+struct SlotVsParamShape {
+    Mir        mir;
+    MirBlockId entry{};
+    MirInstId  gepParam{};
+    MirInstId  gepKeep{};
+    MirInstId  gepLeak{};
+    MirInstId  storeKeep{};      // the ONE aliasing clobber of `gepKeep`
+    std::uint32_t storeKeepIdx = 0;
+};
+
+SlotVsParamShape buildSlotVsParamShape(TypeInterner& interner,
+                                       std::uint32_t paramStores) {
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const params[] = {ptrI32};
+    TypeId const fnSig  = interner.fnSig(params, voidT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const param = mb.addArg(0, ptrI32);
+    MirInstId const keep  = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+    MirInstId const leak  = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(z, i32);
+
+    SlotVsParamShape s{};
+    MirInstId const gp[] = {param, c0};
+    s.gepParam = mb.addInst(MirOpcode::Gep, gp, ptrI32);
+    MirInstId const gk[] = {keep, c0};
+    s.gepKeep  = mb.addInst(MirOpcode::Gep, gk, ptrI32);
+    MirInstId const gl[] = {leak, c0};
+    s.gepLeak  = mb.addInst(MirOpcode::Gep, gl, ptrI32);
+
+    // `leak` escapes; `keep` never does.
+    MirInstId const callee = mb.addGlobalAddr(SymbolId{200}, fnSig);
+    MirInstId const callOps[] = {callee, s.gepLeak};
+    (void)mb.addInst(MirOpcode::Call, callOps, InvalidType);
+
+    for (std::uint32_t i = 0; i < paramStores; ++i) {
+        MirInstId const st[] = {c0, s.gepParam};
+        (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+    }
+    MirInstId const stk[] = {c0, s.gepKeep};
+    s.storeKeep = mb.addInst(MirOpcode::Store, stk, InvalidType);
+    mb.addReturn();
+
+    s.mir   = std::move(mb).finish();
+    s.entry = entry;
+    std::uint32_t const n = s.mir.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        if (s.mir.blockInstAt(entry, i).v == s.storeKeep.v) s.storeKeepIdx = i;
+    }
+    return s;
+}
+
+} // namespace
+
+// ★ THE PRECISION, through the real index. The `Call` is an opaque clobber of
+// everything, so the range queried below deliberately starts AFTER it: what is
+// under test is the three parameter Stores, which Rule 3b separates from a
+// non-escaped slot and cannot separate from an escaped one.
+TEST(MirMemoryClobbers, ParameterStoresDoNotClobberANonEscapedLocalSlot) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto s = buildSlotVsParamShape(interner, /*paramStores=*/3);
+    auto const preds = mirBuildPredecessors(s.mir);
+    MirMemoryClobbers const idx{s.mir, preds};
+
+    ASSERT_GT(s.storeKeepIdx, 0u);
+    std::uint32_t const firstParamStore =
+        idxOfNthOpcode(s.mir, s.entry, MirOpcode::Store, 0);
+    ASSERT_LT(firstParamStore, s.storeKeepIdx);
+
+    EXPECT_FALSE(idx.anyClobberInBlockRange(interner, s.gepKeep, s.entry,
+                                            firstParamStore, s.storeKeepIdx,
+                                            StrictTbaa::No, true))
+        << "three Stores through a PARAMETER cannot reach a local slot whose "
+           "address never left the function — this is the precision "
+           "D-OPT-MEMSSA-WALK-PAST-PRECISION was waiting on";
+    EXPECT_TRUE(idx.anyClobberInBlockRange(interner, s.gepLeak, s.entry,
+                                           firstParamStore, s.storeKeepIdx,
+                                           StrictTbaa::No, true))
+        << "the ESCAPED slot's twin must still be clobbered by the very same "
+           "Stores — otherwise the No above is unconditional, not earned";
+    EXPECT_TRUE(idx.anyClobberInBlockRange(interner, s.gepKeep, s.entry,
+                                           firstParamStore, s.storeKeepIdx + 1u,
+                                           StrictTbaa::No, true))
+        << "the slot's OWN Store, one index further on, must still clobber it";
+    // The whole-module differential + the exhaustive program-point cover, at
+    // this precision, on this shape.
+    assertDifferentialEquality(s.mir, interner, {s.gepKeep, s.gepLeak, s.gepParam});
+    assertPointCoverIsSound(s.mir, interner, {s.gepKeep, s.gepLeak, s.gepParam});
+}
+
+// ★ THE SKIP, MEASURED. Run the identical query twice and read the index's own
+// counters: the second run must perform ZERO new alias tests and skip exactly
+// as many defs as the first run tested. Non-vacuity is asserted first — a run
+// that tested nothing would make the second half trivially true.
+//
+// RED-ON-DISABLE: delete the `verdicts_` lookup in `defClobbers_` (so every
+// visit re-runs the predicate) and `aliasTestCount()` doubles while
+// `aliasTestSkipCount()` stays 0 — both EXPECTs below fail.
+TEST(MirMemoryClobbers, WalkPastMemoSkipsEveryRepeatedAliasTest) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto s = buildSlotVsParamShape(interner, /*paramStores=*/3);
+    auto const preds = mirBuildPredecessors(s.mir);
+    MirMemoryClobbers const idx{s.mir, preds};
+
+    // The range starts AFTER the escaping slot's Call on purpose: an opaque
+    // clobber sits at
+    // the head of this block and would short-circuit the scan at its FIRST def,
+    // leaving one alias test to skip and nothing to measure. Starting at the
+    // parameter Stores makes the scan walk past three provably-non-aliasing
+    // defs before reaching the one that clobbers.
+    std::uint32_t const firstParamStore =
+        idxOfNthOpcode(s.mir, s.entry, MirOpcode::Store, 0);
+    ASSERT_LT(firstParamStore, s.storeKeepIdx);
+    EXPECT_TRUE(idx.anyClobberInBlockRange(interner, s.gepKeep, s.entry,
+                                           firstParamStore, s.storeKeepIdx + 1u,
+                                           StrictTbaa::No, true));
+    std::size_t const testsAfterFirst = idx.aliasTestCount();
+    std::size_t const skipsAfterFirst = idx.aliasTestSkipCount();
+    EXPECT_GT(testsAfterFirst, 1u)
+        << "the first sweep must genuinely alias-test several defs, or the "
+           "repeat below proves nothing (the blindness of the instrument)";
+    EXPECT_EQ(skipsAfterFirst, 0u)
+        << "nothing can be skipped before anything has been recorded";
+
+    EXPECT_TRUE(idx.anyClobberInBlockRange(interner, s.gepKeep, s.entry,
+                                           firstParamStore, s.storeKeepIdx + 1u,
+                                           StrictTbaa::No, true));
+    EXPECT_EQ(idx.aliasTestCount(), testsAfterFirst)
+        << "the repeated query must run the alias predicate ZERO more times — "
+           "every def it visits has a recorded (def, location) verdict";
+    EXPECT_EQ(idx.aliasTestSkipCount(), testsAfterFirst)
+        << "and it must have PASSED OVER exactly the defs the first run "
+           "tested — same enumeration, no alias reasoning";
+
+    // A DIFFERENT location shares no verdicts: the key carries the location,
+    // so the skip says nothing about any other pointer.
+    EXPECT_TRUE(idx.anyClobberInBlockRange(interner, s.gepLeak, s.entry,
+                                           firstParamStore, s.storeKeepIdx + 1u,
+                                           StrictTbaa::No, true));
+    EXPECT_GT(idx.aliasTestCount(), testsAfterFirst)
+        << "a second LOCATION must be tested afresh — a cache that answered it "
+           "from the first location's verdicts would be the rejected "
+           "location-independent design";
+}
+
+// ★ THE REJECTED DESIGN, re-refuted against THIS layer. A nearer def that
+// answers No must never stop the scan reaching a farther def that answers Yes.
+// At Rule 3b precision this is no longer hypothetical: the parameter Stores
+// really do answer No now, which is exactly the condition under which a
+// frontier/stop cache would have started under-reporting.
+//
+// The multi-block arm is the one that matters: the non-aliasing Stores sit in
+// an EARLIER block than the aliasing one, so a per-block stop would record
+// "block clean" and never look further.
+TEST(MirMemoryClobbers, WalkPastMemoNeverMasksAFartherAliasingClobber) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const params[] = {ptrI32};
+    TypeId const fnSig  = interner.fnSig(params, voidT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const mid   = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const tail  = mb.createBlock(StructCfMarker::ExitBlock);
+    mb.beginBlock(entry);
+    MirInstId const param = mb.addArg(0, ptrI32);
+    MirInstId const keep  = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(z, i32);
+    MirInstId const gp[] = {param, c0};
+    MirInstId const gepParam = mb.addInst(MirOpcode::Gep, gp, ptrI32);
+    MirInstId const gk[] = {keep, c0};
+    MirInstId const gepKeep  = mb.addInst(MirOpcode::Gep, gk, ptrI32);
+    MirInstId const ld[] = {gepKeep};
+    (void)mb.addInst(MirOpcode::Load, ld, i32);      // the value being reused
+    (void)mb.addBr(mid);
+    // The NEARER block: two Stores that Rule 3b proves cannot reach `keep`.
+    mb.beginBlock(mid);
+    for (int i = 0; i < 2; ++i) {
+        MirInstId const st[] = {c0, gepParam};
+        (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+    }
+    (void)mb.addBr(tail);
+    // The FARTHER block: the Store that really does clobber it.
+    mb.beginBlock(tail);
+    MirInstId const stk[] = {c0, gepKeep};
+    (void)mb.addInst(MirOpcode::Store, stk, InvalidType);
+    MirInstId const ld2[] = {gepKeep};
+    (void)mb.addInst(MirOpcode::Load, ld2, i32);
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+
+    auto const preds = mirBuildPredecessors(mir);
+    MirMemoryClobbers const idx{mir, preds};
+
+    // Q2, the strictly-between region: `mid` is clean for `keep` and must not
+    // be allowed to stand for the whole region.
+    EXPECT_FALSE(idx.anyClobberBetween(interner, gepKeep, entry, tail,
+                                       StrictTbaa::No, true))
+        << "`mid` holds only parameter Stores — strictly between entry and "
+           "tail there is nothing that reaches `keep`";
+    // Warm the memo on the clean block, THEN ask the question that must see
+    // past it. A stop-cache would answer this one wrong.
+    std::uint32_t const tailN = mir.blockInstCount(tail);
+    EXPECT_TRUE(idx.anyClobberBetweenPoints(
+                    interner, gepKeep, entry,
+                    idxOfNthOpcode(mir, entry, MirOpcode::Load, 0),
+                    tail, tailN - 1u, StrictTbaa::No, true))
+        << "the FARTHER Store in `tail` clobbers the Load's pointer; a nearer "
+           "clean block must never mask it — that is the rejected per-block "
+           "stop cache, and it ships stale Loads";
+    assertDifferentialEquality(mir, interner, {gepKeep, gepParam});
+    assertPointCoverIsSound(mir, interner, {gepKeep, gepParam});
+}
+
+// ★ THE PRECISION REACHING ITS CONSUMER, at the PASS tier.
+//
+// Every test above measures the index. This one measures what the index is
+// FOR: whether `runCse` — the real pass, unmodified, reading `Mir` exactly as
+// the shipped pipelines do — actually reuses a Load across a Store it could
+// not previously reason about. A substrate whose precision never reaches a
+// consumer is a claim, not a closure.
+//
+// The two shapes differ by ONE instruction, and it is the escape:
+//
+//   entry:                              entry:
+//     p    = Arg 0                        p    = Arg 0
+//     keep = Alloca                       keep = Alloca
+//     gk1  = Gep(keep, 0)                 gk1  = Gep(keep, 0)
+//                                         Store(gk1, GlobalAddr)  <-- THE ESCAPE
+//     l1   = Load(gk1)                    l1   = Load(gk1)
+//     Store(0, p)   <-- the parameter     Store(0, p)
+//     gk2  = Gep(keep, 0)                 gk2  = Gep(keep, 0)
+//     l2   = Load(gk2)                    l2   = Load(gk2)
+//     Return(l1 + l2)                     Return(l1 + l2)
+//
+// The escape is placed BEFORE `l1` on purpose: putting it between the two
+// Loads would clobber them for a completely different reason (a Store through
+// a global is an ordinary may-alias), and the test would then pass whatever
+// the escape analysis said. Where it sits, the ONLY thing between `l1` and
+// `l2` is the parameter Store, so the two arms differ in exactly one fact:
+// whether `keep`'s address ever left the function.
+namespace {
+
+struct ReloadPair {
+    Mir       mir;
+    MirInstId keep{};
+};
+
+// `published` adds the escape; everything else is identical.
+ReloadPair buildReloadPair(TypeInterner& interner, bool published) {
+    TypeId const i32     = interner.primitive(TypeKind::I32);
+    TypeId const ptrI32  = interner.pointer(i32);
+    TypeId const ptrPtr  = interner.pointer(ptrI32);
+    TypeId const params[] = {ptrI32};
+    TypeId const fnSig   = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const p    = mb.addArg(0, ptrI32);
+    MirInstId const keep = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(z, i32);
+
+    MirInstId const g1[] = {keep, c0};
+    MirInstId const gk1  = mb.addInst(MirOpcode::Gep, g1, ptrI32);
+    if (published) {
+        MirInstId const sym = mb.addGlobalAddr(SymbolId{300}, ptrPtr);
+        MirInstId const pub[] = {gk1, sym};
+        (void)mb.addInst(MirOpcode::Store, pub, InvalidType);
+    }
+    MirInstId const ld1[] = {gk1};
+    MirInstId const l1 = mb.addInst(MirOpcode::Load, ld1, i32);
+    MirInstId const stp[] = {c0, p};
+    (void)mb.addInst(MirOpcode::Store, stp, InvalidType);
+    MirInstId const g2[] = {keep, c0};
+    MirInstId const gk2  = mb.addInst(MirOpcode::Gep, g2, ptrI32);
+    MirInstId const ld2[] = {gk2};
+    MirInstId const l2 = mb.addInst(MirOpcode::Load, ld2, i32);
+    MirInstId const sum[] = {l1, l2};
+    mb.addReturn(mb.addInst(MirOpcode::Add, sum, i32));
+
+    return ReloadPair{std::move(mb).finish(), keep};
+}
+
+std::size_t countOpcode(Mir const& mir, MirOpcode op) {
+    std::size_t n = 0;
+    for (MirBlockId const b : allBlocks(mir)) {
+        std::uint32_t const c = mir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < c; ++i) {
+            if (mir.instOpcode(mir.blockInstAt(b, i)) == op) ++n;
+        }
+    }
+    return n;
+}
+
+} // namespace
+
+// RED-ON-DISABLE, three independent arms, each already demonstrated:
+//   * remove Rule 3b from `mirMayAlias`      -> the non-escaped arm stops
+//     CSEing and its Load count stays 2;
+//   * disable the forward escape scan        -> the PUBLISHED arm starts
+//     CSEing and its Load count drops to 1, which is a STALE LOAD;
+//   * break provenance (stop walking Geps)   -> the non-escaped arm stops
+//     CSEing, same as arm one.
+TEST(MirMemoryClobbers, CseReusesALoadAcrossAParameterStoreOnlyWhenTheSlotStayedHome) {
+    TypeInterner interner{CompilationUnitId{1}};
+
+    auto home = buildReloadPair(interner, /*published=*/false);
+    ASSERT_EQ(countOpcode(home.mir, MirOpcode::Load), 2u)
+        << "the shape must START with two Loads or there is nothing to reuse";
+    // NOTE ON THE METRIC: MEASURED — the Cse pass REDIRECTS a redundant
+    // instruction and leaves the now-dead original in place for Dce to
+    // collect, so an opcode COUNT taken after the pass is UNCHANGED and would
+    // make this test assert nothing. This was caught by running it: a first
+    // draft asserted the Load count and went red on a module the pass had in
+    // fact optimized correctly. `CseResult::instructionsCsed` is the pass's own
+    // count of redirections and is the honest measure of what it decided.
+    {
+        MirPointerEscape const esc{home.mir};
+        ASSERT_FALSE(esc.slotEscapes(home.keep))
+            << "the control arm's slot must genuinely stay home";
+    }
+    DiagnosticReporter repHome;
+    auto const rHome = dss::opt::passes::runCse(home.mir, interner, repHome);
+    EXPECT_TRUE(rHome.ok);
+    EXPECT_EQ(rHome.instructionsCsed, 2u)
+        << "BOTH the second Gep and the second Load must be REUSED (the Gep is "
+           "a pure computation and needs no gate; the Load is the one under "
+           "test). The only thing between the two Loads is "
+           "a Store through a PARAMETER, which cannot reach a local slot whose "
+           "address never left the function. Before Rule 3b this pair was "
+           "Maybe and the reuse was refused — that refusal is what "
+           "D-OPT-MEMSSA-WALK-PAST-PRECISION was waiting on";
+
+    auto pub = buildReloadPair(interner, /*published=*/true);
+    ASSERT_EQ(countOpcode(pub.mir, MirOpcode::Load), 2u);
+    {
+        MirPointerEscape const esc{pub.mir};
+        ASSERT_TRUE(esc.slotEscapes(pub.keep))
+            << "the published arm's slot must genuinely escape, or the two "
+               "arms below differ in nothing and the sweep is vacuous";
+    }
+    DiagnosticReporter repPub;
+    auto const rPub = dss::opt::passes::runCse(pub.mir, interner, repPub);
+    EXPECT_TRUE(rPub.ok);
+    EXPECT_EQ(rPub.instructionsCsed, 1u)
+        << "only the Gep may be reused here — the Load may NOT. "
+           "Once `keep`'s address is published to a global, the parameter MAY "
+           "name it — reusing the second Load here would forward a stale value, "
+           "which is a silent miscompile and not an optimization";
 }

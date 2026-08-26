@@ -2386,12 +2386,12 @@
       }
     },
     {
-      "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): conditional intra-function jump with mandatory fallthrough. Compound encoding `0F 8x rel32; E9 rel32` (11 bytes total). The cond nibble in 0x80's low 4 bits comes from the inst's payload (TargetCondCode) via the schema's condCodeEncoding table. Both target blocks pass as BlockRef operands: operand[0] = ifTrue (taken when cond holds — encoded as the first rel32); operand[1] = ifFalse (the fallthrough — encoded as the trailing `E9 rel32`). The wire-1's `prefixOpcodeBytes: [0xE9]` bridges the two displacements. A future optimizer pass elides the trailing jmp when ifFalse is the next-laid-out block (anchored D-OPT-JCC-FALLTHROUGH).",
+      "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): conditional intra-function jump with mandatory fallthrough. Compound encoding `0F 8x rel32; E9 rel32` (11 bytes total). The cond nibble in 0x80's low 4 bits comes from the inst's payload (TargetCondCode) via the schema's condCodeEncoding table. Both target blocks pass as BlockRef operands: operand[0] = ifTrue (taken when cond holds — encoded as the first rel32); operand[1] = ifFalse (the fallthrough — encoded as the trailing `E9 rel32`). The wire-1's `prefixOpcodeBytes: [0xE9]` bridges the two displacements. D-OPT-JCC-FALLTHROUGH: the SECOND variant is the FALLTHROUGH FORM — the same `0F 8x rel32` with NO trailing `E9 rel32`, 6 bytes instead of 11 — and it is selected by OPERAND COUNT: `lir_peephole`'s rule R2 drops the trailing BlockRef operand when ifFalse IS the next-laid-out block, keeping BOTH successors on the block so the CFG is untouched. `lir_verifier`'s Rule 1b refuses the shortened operand list on any module where that unnamed successor is not the block laid out next, so an elision that a later pass invalidates fails the build instead of falling into the wrong block.",
       "mnemonic":      "jcc",
       "result":        "none",
       "terminatorKind": "cond-br",
       "hasSideEffects": true,
-      "minOperands":   2,
+      "minOperands":   1,
       "maxOperands":   2,
       "minSuccessors": 2,
       "maxSuccessors": 2,
@@ -2404,6 +2404,14 @@
             "wires":    [
               { "index": 0, "slotKind": "block.rel32" },
               { "index": 1, "slotKind": "block.rel32", "prefixOpcodeBytes": [233] }
+            ]
+          },
+          {
+            "$comment": "D-OPT-JCC-FALLTHROUGH: the FALLTHROUGH FORM. Same `0F 8x rel32` conditional branch, WITHOUT the trailing `E9 rel32` — 6 bytes instead of 11. Selected when the instruction carries ONE BlockRef operand instead of two, which `lir_peephole`'s rule R2 produces by dropping the trailing operand once the ifFalse successor IS the next-laid-out block. The CFG keeps both edges; only the bytes that re-state the fallthrough go away.",
+            "guard":    { "operandKinds": ["blockref"] },
+            "template": { "opcode": [15, 128], "condCodeFromPayload": true },
+            "wires":    [
+              { "index": 0, "slotKind": "block.rel32" }
             ]
           }
         ]

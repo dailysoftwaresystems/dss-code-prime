@@ -1,0 +1,35 @@
+{
+  "$comment": "D-OPT-MEMSSA-WALK-PAST-PRECISION: the runtime witness for mirMayAlias Rule 3b (the pointer-provenance + escape substrate, src/opt/analysis/mir_escape.hpp). Both halves are RELOAD PAIRS inside a loop — a Load, a Store, the same Load again — which is the exact shape CSE's Load-admission gate decides, back edge included. The baseline arm fixes the answer; each optimized arm must reproduce it. `hot` is the PRECISION half (a Store through a parameter cannot reach a local slot whose address never leaves the function, so the reload is reusable — a pair no TYPE rule can separate, since both pointees are int). `cold` is the SHAPE control: its slot's address IS published to a file-scope pointer, so Rule 3b must NOT fire and its reload must observe the intervening write. MEASURED SCOPE: disabling Rule 3b changes the shipped release image for this file (md5 e47235c5… vs 7d83c6c8… on x86_64:pe64, both exit 16), so the example genuinely exercises the feature; disabling the ESCAPE SCAN emits a byte-identical image, so this is NOT the pin for that half — that red lives at the pass tier in tests/opt/test_mir_memory_clobbers.cpp::CseReusesALoadAcrossAParameterStoreOnlyWhenTheSlotStayedHome. exitCode 16 = 12 (hot) + 3 (cold) + 1 (the parameter Store really executed).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 16,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "cse-licm", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

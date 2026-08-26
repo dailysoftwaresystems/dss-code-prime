@@ -235,7 +235,14 @@ $CfgRoot = Join-Path $DssSrc 'src\dss-config'
 if (-not (Test-Path $CfgRoot)) {
   Die "no dss config root at $CfgRoot`n      Pass -DssSrc pointing at the checkout the compiler was built from."
 }
-& $Python.Source $BenchCore --preflight-dss $Dss --config-root $CfgRoot
+# ★★ `-Target` IS PASSED, and its absence is what let this check pass while the
+# measurement failed. ✔MEASURED 2026-08-26: the probe compiled with no --target,
+# validating whatever dsscp defaults to, so a `build/rel` that predated the
+# `encoding.registerClass` vocabulary printed `preflight: OK` and then refused
+# `x86_64:pe64-x86_64-windows-exec` as an unknown key minutes later. macOS hit the
+# mirror image in the same run. A control must match the TARGET — the twin passes
+# the same value through `--preflight-target`, one implementation, one rule.
+& $Python.Source $BenchCore --preflight-dss $Dss --config-root $CfgRoot --preflight-target $Target
 if ($LASTEXITCODE -ne 0) {
   Die @"
 the dss pre-flight refused (its diagnostic is above). Nothing is measured against

@@ -6559,20 +6559,25 @@ TEST(HirLoweringC, D5_5_EnumHirTextRoundTrip) {
         << "re-parsed enum program must verify cleanly";
 }
 
-// ── FAIL-LOUD TRIPWIRE for the inliner's IntrinsicCall relaxation ────
-// OPT7 cycle 6 made the MIR inliner blanket-admit IntrinsicCall-bearing
-// callees. That admission is correct ONLY while no frame-sensitive
-// intrinsic (va_start / frameaddress / setjmp-class) can reach the
-// inliner — and today NO shipped frontend emits ANY intrinsic at all (the
-// c sema + CST→HIR lowering never registers or constructs one;
-// only the HIR text format can, in tests). This test PINS that
-// precondition: a breadth of representative c programs each lower
-// to a HIR whose intrinsic registry is EMPTY. The day a frontend starts
-// emitting intrinsics this pin goes RED — forcing whoever adds it to
-// confront the frame-sensitivity gate (D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC)
-// BEFORE the inliner can silently inline a frame-sensitive
-// one. A prose anchor alone is not load-bearing against a code change
-// cycles away; this RED-on-emit pin is.
+// ── TRIPWIRE: no shipped C construct lowers to a HIR intrinsic ───────
+// D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC
+// This pin's JOB CHANGED, and the change is worth stating. It used to be
+// load-bearing for CORRECTNESS: OPT7 cycle 6 made the MIR inliner
+// blanket-admit IntrinsicCall-bearing callees, and that admission was safe
+// only while no frame-sensitive intrinsic (va_start / frameaddress /
+// stacksave / setjmp-class) could reach the inliner — a precondition
+// nothing but this test enforced. The inliner now REFUSES an
+// IntrinsicCall-bearing callee outright (it cannot resolve a bare MIR
+// intrinsic id, so it cannot prove frame-insensitivity), which moves that
+// correctness guarantee into the gate itself where it belongs.
+// So this is now a DESIGN tripwire, not a safety net: it records that the
+// C frontend reaches its 30 `lowering:` builtins (umulh, bswap, popcount,
+// the SEH pair, …) through DEDICATED MIR opcodes and never through the
+// HIR intrinsic registry, which stays empty through every real compile.
+// The day a frontend does mint one, this goes RED and points whoever did
+// it at the anchor — where the relaxation path (a registration-driven
+// frame-safety attribute threaded to the MIR IntrinsicCall) is written
+// down. Being red then costs them a read, not a miscompile.
 TEST(HirLoweringC, NoShippedConstructLowersToIntrinsic) {
     // Breadth of constructs (all in the shipped corpus): params +
     // arithmetic, subtraction, a cross-function call, a conditional, a
@@ -6597,9 +6602,12 @@ TEST(HirLoweringC, NoShippedConstructLowersToIntrinsic) {
         ASSERT_TRUE(res->ok);
         EXPECT_TRUE(res->hir.intrinsicRegistry().intrinsics().empty())
             << "a c program lowered to a HIR with a NON-empty intrinsic "
-               "registry — a frontend now emits intrinsics. Before relying on "
-               "the inliner's blanket IntrinsicCall admission, gate it on per-"
-               "intrinsic inline-safety: D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.";
+               "registry — a frontend now emits intrinsics. The inliner "
+               "REFUSES every IntrinsicCall-bearing callee, so this is not a "
+               "miscompile; it does mean such a callee silently stops "
+               "inlining. To let the frame-INSENSITIVE ones inline again, "
+               "build the registration-driven frame-safety attribute "
+               "described at D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.";
     }
 }
 

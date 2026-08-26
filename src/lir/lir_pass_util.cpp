@@ -1,6 +1,7 @@
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_pass_util.hpp"
 
+#include <algorithm>
 #include <format>
 #include <utility>
 #include <vector>
@@ -40,6 +41,47 @@ incomingArgRegister(TargetSchema const&            schema,
         return {IncomingArgRegKind::UnresolvableName, 0};
     }
     return {IncomingArgRegKind::Register, *ord};
+}
+
+// D-OPT-JCC-FALLTHROUGH. See the header for why this question is asked of the
+// SCHEMA rather than answered by the transform.
+//
+// The non-operand routing axes are compared WHOLESALE (`width`, `immMin`,
+// `immMax`, `negValue`, `memoryDestination`) because the selector keys on all
+// of them: two variants that agree on the operand tuple but disagree on any
+// other axis describe DIFFERENT instructions, and reaching one by dropping an
+// operand off the other would encode something the pass never asked for.
+bool
+declaresFallthroughBranchForm(TargetSchema const& schema,
+                              std::uint16_t       opcode,
+                              std::size_t         opCount) noexcept {
+    if (opCount < 2) return false;  // nothing to drop but the only target
+    auto const* info = schema.opcodeInfo(opcode);
+    if (info == nullptr) return false;
+
+    auto sameRouting = [](TargetEncodingVariant const& a,
+                          TargetEncodingVariant const& b) {
+        return a.guardWidthBits == b.guardWidthBits
+            && a.immMin == b.immMin
+            && a.immMax == b.immMax
+            && a.negValue == b.negValue
+            && a.memoryDestination == b.memoryDestination;
+    };
+
+    for (auto const& lng : info->encoding.variants) {
+        if (lng.operandKinds.size() != opCount) continue;
+        if (lng.operandKinds.back() != OperandKindFilter::BlockRef) continue;
+        for (auto const& shrt : info->encoding.variants) {
+            if (shrt.operandKinds.size() + 1 != lng.operandKinds.size()) continue;
+            if (!sameRouting(lng, shrt)) continue;
+            if (!std::equal(shrt.operandKinds.begin(), shrt.operandKinds.end(),
+                            lng.operandKinds.begin())) {
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 LirOperand

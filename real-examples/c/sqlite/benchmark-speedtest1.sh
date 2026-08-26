@@ -109,6 +109,25 @@ BENCH_CORE="$SCRIPT_DIR/speedtest1_bench.py"
 # ── defaults ─────────────────────────────────────────────────────────────────
 SQLITE_DIR="${SQLITE_DIR:-$HOME/src/sqlite}"
 SRC_DIR="${SRC_DIR:-$HOME/src/dss-code-prime}"
+# ★★ ABSENT-HOST FALLBACK — the same clause as `build-and-test.sh`, for the same
+# measured reason, and it fires ONLY when the preferred default does not exist.
+# ✔MEASURED 2026-08-26: the arm64 VPS keeps its clone at `~/src/Github/dss-code-prime`
+# (per-host locations are declared in `scripts/leg-tree/leg-tree.sh`), so this leg
+# failed with `no dsscp binary found ... Searched under
+# /home/ubuntu/src/dss-code-prime/build/` — after a full Release build had just
+# succeeded a few directories away. ★ The benchmark did not measure a slow compiler;
+# it measured a wrong path, and reported neither.
+# ★ TWIN PARITY: `benchmark-speedtest1.ps1` ALREADY derives this
+# (`$DssSrc = Resolve-Path (Join-Path $ScriptDir '..\..\..')`), so the `.sh` side was
+# the half that guessed. Deriving is the house pattern; this restores it.
+# ⓘ NOT made the unconditional default, deliberately — see the `SELF_REPO` note in
+# `build-and-test.sh`: where two checkouts exist (the WSL gate tree vs a `/mnt/c`
+# one) deriving would silently change WHICH TREE is measured.
+if [[ ! -d "$SRC_DIR" ]]; then
+  dss_self_repo="$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd)" || dss_self_repo=""
+  if [[ -n "$dss_self_repo" && -e "$dss_self_repo/.git" ]]; then SRC_DIR="$dss_self_repo"; fi
+  unset dss_self_repo
+fi
 DSS_BIN="${DSS_BIN:-}"
 OUT_DIR=""
 WORK_SIZE=25
@@ -403,19 +422,59 @@ command -v tclsh >/dev/null 2>&1 || die "'tclsh' is not on PATH.
       (speedtest1 itself links no Tcl — this is a build-host tool.)"
 
 # ★ THE BINARY IS `dsscp`, NOT `dss`, AND SEARCHING FOR THE WRONG NAME
-# LOOKS EXACTLY LIKE "NOT BUILT YET". The compiler is `dsscp[.exe]`
-# (a rename to `dsscp` is queued but has not landed); build-and-test.sh resolves
-# it by `find … -name dsscp -perm -u+x`, and this does the same rather
-# than carrying a second list of guessed paths. Preference is rel over dbg,
-# because a debug compiler's build time is not a number worth publishing.
+# LOOKS EXACTLY LIKE "NOT BUILT YET". The compiler is `dsscp[.exe]`.
+#
+# ★★★ THE BUILD TYPE IS *ASKED OF THE BUILD*, NEVER INFERRED FROM A DIRECTORY NAME.
+# This block's own comment used to say "preference is rel over dbg, because a debug
+# compiler's build time is not a number worth publishing" — the right intent, which
+# the code could not deliver: it tried `build/rel` then `build/dbg` BY NAME, and a
+# release tree called anything else was invisible to it. `CMAKE_BUILD_TYPE:STRING`
+# in each root's `CMakeCache.txt` is the authoritative answer, and it is what
+# `build-and-test.ps1` already reads ("build type READ from CMakeCache.txt").
+# ⚠ ✔MEASURED 2026-08-26 ON TWO HOSTS: the arm64 VPS keeps its Release tree in
+# `build/bench-rel` while `build/rel` exists with NO compiler in it, so the by-name
+# loop fell through to `build/dbg` and BENCHMARKED A DEBUG COMPILER — publishing a
+# number several times worse than the truth, attributed to DSS, with nothing said.
+# The WSL host produced a VALID number only by luck: it holds `bench-rel` (Release),
+# `rel` (Release) AND `dbg` (Debug), and `find` order happened to reach a Release
+# one first. **A benchmark cannot tell a slow compiler from a wrongly-selected one**,
+# so this is a measurement-VALIDITY defect, not a convenience.
+# ⇒ Enumerate every root that actually HOLDS a compiler, ask each what it is, prefer
+# Release, and REFUSE a non-Release one unless the operator says otherwise via
+# `DSS_ALLOW_NONRELEASE_COMPILER=1` — the same escape hatch, spelled the same way,
+# that `build-and-test.{sh,ps1}` already document.
 if [[ -z "$DSS_BIN" ]]; then
-  for _tree in rel dbg; do
-    DSS_BIN="$(find "$SRC_DIR/build/$_tree" -type f -name 'dsscp*' \
-                 -perm -u+x -print -quit 2>/dev/null || true)"
-    [[ -n "$DSS_BIN" ]] && break
+  _dss_rel=""; _dss_other=""; _dss_other_type=""
+  for _cand in "$SRC_DIR"/build/*/; do
+    [[ -d "$_cand" ]] || continue
+    _bin="$(find "$_cand" -type f -name 'dsscp*' -perm -u+x -print -quit 2>/dev/null || true)"
+    [[ -n "$_bin" ]] || continue
+    # No cache => the root cannot state what it is. Treated as UNKNOWN rather than
+    # assumed Release: assuming is how the defect above happened.
+    _type="$(grep -m1 '^CMAKE_BUILD_TYPE:STRING=' "$_cand/CMakeCache.txt" 2>/dev/null | cut -d= -f2)"
+    case "$_type" in
+      Release|RelWithDebInfo|MinSizeRel)
+        [[ -n "$_dss_rel" ]] || { _dss_rel="$_bin"; DSS_BUILD_TYPE="$_type"; } ;;
+      *)
+        [[ -n "$_dss_other" ]] || { _dss_other="$_bin"; _dss_other_type="${_type:-<unstated>}"; } ;;
+    esac
   done
-  [[ -n "$DSS_BIN" ]] || DSS_BIN="$(find "$SRC_DIR/build" -type f -name 'dsscp*' \
-                                      -perm -u+x -print -quit 2>/dev/null || true)"
+  if [[ -n "$_dss_rel" ]]; then
+    DSS_BIN="$_dss_rel"
+  elif [[ -n "$_dss_other" ]]; then
+    if [[ "${DSS_ALLOW_NONRELEASE_COMPILER:-0}" == "1" ]]; then
+      DSS_BIN="$_dss_other"; DSS_BUILD_TYPE="$_dss_other_type"
+      warn "measuring a NON-RELEASE compiler ($_dss_other_type) because DSS_ALLOW_NONRELEASE_COMPILER=1: $DSS_BIN"
+    else
+      die "the only dsscp under $SRC_DIR/build is a ${_dss_other_type} build: $_dss_other
+      A debug compiler's build time is not a number worth publishing, and a
+      benchmark cannot tell a slow compiler from a wrongly-selected one.
+      Build a release one:  scripts/local-build/local-build.sh --tree rel
+      Pass one explicitly:  --dss <path>
+      Or override on purpose: DSS_ALLOW_NONRELEASE_COMPILER=1 $0"
+    fi
+  fi
+  unset _dss_rel _dss_other _dss_other_type _cand _bin _type
 fi
 # ⚠ TWO DIFFERENT FACTS, TWO DIFFERENT MESSAGES. "You passed a path that is not
 # executable" and "nothing was found under the tree I searched" have different
@@ -429,7 +488,12 @@ fi
 [[ -n "${DSS_BIN:-}" ]] || die "no dsscp binary found.
       Pass --dss <path>, or build one: scripts/local-build/local-build.sh --tree rel
       Searched for an executable named dsscp* under $SRC_DIR/build/."
-info "dss       : $DSS_BIN"
+# ⚠ THE BUILD TYPE IS PRINTED BESIDE THE PATH, ALWAYS. A benchmark cannot tell a
+# slow compiler from a wrongly-selected one, so the reader must be able to. A path
+# alone let a Debug compiler be published as DSS's speed on 2026-08-26.
+# `<unstated>` when the root has no CMakeCache to ask, and `<explicit --dss>` when
+# the operator named the path and this script did no selecting.
+info "dss       : $DSS_BIN  (build type: ${DSS_BUILD_TYPE:-<explicit --dss / unstated>})"
 
 # ── THE REFERENCE C COMPILERS, PLURAL ────────────────────────────────────────
 # A benchmark that silently picked whichever `cc` happened to be first would
@@ -616,6 +680,24 @@ DSS_CONFIG_ROOT_PIN="${DSS_CONFIG_ROOT:-$SRC_DIR/src/dss-config}"
       Pass --dss-src pointing at the checkout the compiler was built from, or set
       DSS_CONFIG_ROOT. Leaving it unset would let the CWD decide which config the
       measured binary reads."
+# ★★ THE TARGET IS RESOLVED HERE, BEFORE THE PRE-FLIGHT, AND THAT ORDER IS THE
+# WHOLE POINT (D-BENCH-COMPILER-AND-CONFIG-MAY-COME-FROM-DIFFERENT-COMMITS).
+# It used to be resolved in step 5, AFTER this check — so the probe compiled for
+# whatever dsscp defaults to, and a stale arm64/pe64 target document sailed past
+# a printed `preflight: OK` straight into a 3-minute measurement that then died
+# on it. ✔MEASURED 2026-08-26 on macOS AND Windows in the same run. A control
+# must match the TARGET; resolving the target late made that impossible.
+# ⓘ Pure computation from `uname` and `$TARGET_SPEC` — it reads nothing produced
+# by the steps it now precedes, which is what makes moving it safe rather than a
+# reordering that hides a dependency.
+if [[ -z "$TARGET_SPEC" ]]; then
+  case "$(uname -s)" in
+    Linux)  TARGET_SPEC="$(uname -m | sed 's/aarch64/arm64:elf64-aarch64-linux-exec/;s/x86_64/x86_64:elf64-x86_64-linux-exec/')" ;;
+    Darwin) TARGET_SPEC="$(uname -m | sed 's/arm64/arm64:macho64-arm64-darwin-exec/;s/x86_64/x86_64:macho64-x86_64-darwin-exec/')" ;;
+    MINGW*|MSYS*|CYGWIN*) TARGET_SPEC="x86_64:pe64-x86_64-windows-exec" ;;
+    *) die "this host's uname ($(uname -s)) has no default target spec here; pass --target." ;;
+  esac
+fi
 # ⚠ SKIPPED — AND SAID — WHEN THE COMPILER IS NOT NATIVE TO THIS SHELL. Under
 # `--derive-only --path-style windows` this script is deriving on behalf of the
 # PowerShell twin, so `$DSS_BIN` is a Windows `.exe` and only the twin's host can
@@ -624,7 +706,8 @@ DSS_CONFIG_ROOT_PIN="${DSS_CONFIG_ROOT:-$SRC_DIR/src/dss-config}"
 if [[ $DERIVE_ONLY == 1 && "$PATH_STYLE" == windows ]]; then
   info "dss pre-flight: skipped — the compiler is native to the CALLING host, which"
   info "                runs this same check (speedtest1_bench.py --preflight-dss)"
-elif python3 "$BENCH_CORE" --preflight-dss "$DSS_BIN" --config-root "$DSS_CONFIG_ROOT_PIN"; then
+elif python3 "$BENCH_CORE" --preflight-dss "$DSS_BIN" --config-root "$DSS_CONFIG_ROOT_PIN" \
+       --preflight-target "$TARGET_SPEC"; then
   :
 else
   die "the dss pre-flight refused (its diagnostic is above). Nothing is measured
@@ -840,14 +923,12 @@ info "includes  : $INC_COUNT dirs (the six sqlite src/ext dirs + the generated-h
 
 # ── Step 5 — the manifest, and the ONE define set all three arms compile ─────
 step "5/6  Generate the DSS project manifest (it also fixes the shared define set)"
-if [[ -z "$TARGET_SPEC" ]]; then
-  case "$(uname -s)" in
-    Linux)  TARGET_SPEC="$(uname -m | sed 's/aarch64/arm64:elf64-aarch64-linux-exec/;s/x86_64/x86_64:elf64-x86_64-linux-exec/')" ;;
-    Darwin) TARGET_SPEC="$(uname -m | sed 's/arm64/arm64:macho64-arm64-darwin-exec/;s/x86_64/x86_64:macho64-x86_64-darwin-exec/')" ;;
-    MINGW*|MSYS*|CYGWIN*) TARGET_SPEC="x86_64:pe64-x86_64-windows-exec" ;;
-    *) die "this host's uname ($(uname -s)) has no default target spec here; pass --target." ;;
-  esac
-fi
+# ⓘ `$TARGET_SPEC` is ALREADY RESOLVED — it moved up beside the config-root pin so
+# the pre-flight could validate the document this step is about to generate against.
+# Nothing is recomputed here; see the note at that site for why the order matters.
+[[ -n "$TARGET_SPEC" ]] || die "internal: TARGET_SPEC is empty at step 5 — it is
+      resolved beside DSS_CONFIG_ROOT_PIN, and reaching here empty means that
+      resolution was removed or bypassed rather than defaulting quietly."
 # The transform follows the TARGET, matching the catalogue's own declaration:
 # every pe64 leg declares `windows-selfconfig`, every POSIX leg `none`.
 [[ -n "$RECIPE_TRANSFORM" ]] || \

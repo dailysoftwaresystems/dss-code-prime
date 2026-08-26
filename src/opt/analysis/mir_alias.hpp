@@ -32,6 +32,7 @@
 #include "mir/mir_cfg.hpp"
 #include "mir/mir_dom.hpp"
 #include "mir/mir_opcode.hpp"
+#include "opt/analysis/mir_escape.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -122,6 +123,19 @@ namespace detail {
 //   2. Both are distinct `Alloca` defs        → No   (distinct stack slots)
 //   3. Either operand isn't Ptr/Ref-typed     → Maybe (caller exploring
 //      pointer-ness on a non-pointer SSA value)
+//  3b. PROVENANCE (opt-in, `escape != nullptr`)
+//                                             → No   (`MirPointerEscape::
+//      provablyDisjoint` — two DIFFERENT local slots reached through address
+//      arithmetic, or a NON-ESCAPED local slot against a pointer of external
+//      provenance). This is the precision the docblock below used to list as
+//      out of scope, and the reason `D-OPT-MEMSSA-WALK-PAST-PRECISION`'s
+//      trigger now fires: Rules 1-7 are TYPE tests, and the pair that dominates
+//      real C — a local array or struct versus a parameter — has IDENTICAL
+//      types, so no type test can ever separate it. Evaluated AFTER Rule 3's
+//      pointer-ness screen (so a caller probing pointer-ness on a non-pointer
+//      still gets Rule 3's Maybe) and BEFORE Rules 4/5/7, whose Maybe it beats.
+//      Sound when omitted: `escape == nullptr` is the substrate's default and
+//      reproduces the pre-existing verdict exactly.
 //   4. Either pointee is `Void`               → Maybe (universal escape
 //      hatch — `void*` may legally alias anything)
 //   5. Either pointee is a character type AND `charTypesAliasAll`
@@ -144,8 +158,9 @@ namespace detail {
 // `InvalidMirInstId`). Consumers MUST pass ids that belong to `mir`.
 //
 // Out of scope (anchored):
-//   — Pointer arithmetic / GEP-derived may-alias (needs interval analysis)
-//   — Cross-function escape analysis (address-taken propagation)
+//   — Pointer arithmetic / GEP-derived may-alias WITHIN one object (two Geps
+//     off the SAME base at different offsets — that needs interval analysis;
+//     Rule 3b separates DIFFERENT bases, not different offsets on one base)
 //   — Heap-allocation tracking (malloc/calloc-distinct)
 //   — Loop-carried clobber is NOT out of scope and is NOT free: `mirMayAlias`
 //     is a pure two-pointer predicate with no notion of control flow, so a
@@ -169,7 +184,8 @@ namespace detail {
     MirInstId           ptrA,
     MirInstId           ptrB,
     StrictTbaa          strictTBAA       = StrictTbaa::No,
-    bool                charTypesAliasAll = true)
+    bool                charTypesAliasAll = true,
+    MirPointerEscape const* escape        = nullptr)
 {
     if (!ptrA.valid() || !ptrB.valid()) {
         std::fprintf(stderr,
@@ -191,6 +207,13 @@ namespace detail {
     TypeId const pointeeA = detail::mirPointeeType(interner, mir.instType(ptrA));
     TypeId const pointeeB = detail::mirPointeeType(interner, mir.instType(ptrB));
     if (!pointeeA.valid() || !pointeeB.valid()) return MirAliasResult::Maybe; // Rule 3
+
+    // Rule 3b — PROVENANCE. Both operands are genuinely pointer-typed here,
+    // which is the premise `MirPointerEscape` reasons under. See the rule list
+    // above; `escape == nullptr` reproduces the pre-Rule-3b verdict exactly.
+    if (escape != nullptr && escape->provablyDisjoint(ptrA, ptrB)) {
+        return MirAliasResult::No;
+    }
 
     if (interner.kind(pointeeA) == TypeKind::Void
      || interner.kind(pointeeB) == TypeKind::Void) {                   // Rule 4
@@ -388,7 +411,8 @@ mirInstClobbersLoadPtr(
     MirInstId           loadPtr,
     MirInstId           inst,
     StrictTbaa          strictTBAA        = StrictTbaa::No,
-    bool                charTypesAliasAll = true)
+    bool                charTypesAliasAll = true,
+    MirPointerEscape const* escape         = nullptr)
 {
     MirOpcode const op = mir.instOpcode(inst);
     if (op != MirOpcode::Store) {
@@ -403,7 +427,7 @@ mirInstClobbersLoadPtr(
         std::abort();
     }
     return mirMayAlias(mir, interner, loadPtr, ops[1],
-                       strictTBAA, charTypesAliasAll)
+                       strictTBAA, charTypesAliasAll, escape)
            != MirAliasResult::No;
 }
 
@@ -419,14 +443,15 @@ mirAnyMayAliasingStoreInRegion(
     MirInstId                        loadPtr,
     std::span<MirBlockId const>      region,
     StrictTbaa                       strictTBAA       = StrictTbaa::No,
-    bool                             charTypesAliasAll = true)
+    bool                             charTypesAliasAll = true,
+    MirPointerEscape const*          escape            = nullptr)
 {
     for (MirBlockId const b : region) {
         std::uint32_t const ninst = mir.blockInstCount(b);
         for (std::uint32_t i = 0; i < ninst; ++i) {
             if (mirInstClobbersLoadPtr(mir, interner, loadPtr,
                                        mir.blockInstAt(b, i),
-                                       strictTBAA, charTypesAliasAll)) {
+                                       strictTBAA, charTypesAliasAll, escape)) {
                 return true;  // could clobber
             }
         }
@@ -491,7 +516,8 @@ mirAnyClobberOnPathBetweenPoints(
     std::uint32_t                               toIdx,
     std::vector<std::vector<MirBlockId>> const& preds,
     StrictTbaa                                  strictTBAA        = StrictTbaa::No,
-    bool                                        charTypesAliasAll = true)
+    bool                                        charTypesAliasAll = true,
+    MirPointerEscape const*                     escape            = nullptr)
 {
     if (preds.size() != mir.blockCount()) {
         std::fprintf(stderr,
@@ -585,7 +611,7 @@ mirAnyClobberOnPathBetweenPoints(
         if (bwd.find(pt(slot, idx + 1u)) == bwd.end()) continue;
         if (mirInstClobbersLoadPtr(mir, interner, loadPtr,
                                    mir.blockInstAt(b, idx),
-                                   strictTBAA, charTypesAliasAll)) {
+                                   strictTBAA, charTypesAliasAll, escape)) {
             return true;
         }
     }
@@ -634,16 +660,47 @@ mirAnyClobberOnPathBetweenPoints(
 // key that stops discriminating opcode or type, or an opcode table that admits
 // `Alloca` to CSE, aborts instead of silently admitting a stale Load. Pinned by
 // the exhaustive differential in `tests/opt/test_mir_alias.cpp`.
+//
+// ★★ RULE 3b EXTENDS THE THEOREM, AND `escape` IS THAT EXTENSION.
+// The proof above enumerates the rules that can yield `No` and shows each is an
+// OPCODE or TYPE test. Rule 3b is neither — it reads PROVENANCE — so at Rule-3b
+// precision equal opcode + equal TypeId is NO LONGER SUFFICIENT on its own: two
+// `Gep`s of the same result type, one based on a non-escaped `Alloca` and one on
+// a parameter, have identical opcode and TypeId yet opposite Rule 3b verdicts.
+// Pass `escape` and the predicate REQUIRES equal origins as well, restoring the
+// theorem's `==` conclusion at full precision; that four-argument form is the
+// one the exhaustive differential checks.
+//
+// A three-argument call (`escape` omitted) is therefore the TYPE-LEVEL licence:
+// exactly as strong as it has always been, covering Rules 1..7. It stays the
+// right call for a value-numbering consumer, whose redirect is an EQUALITY
+// PROOF rather than a type coincidence — `raw` and `canonical` denote the same
+// runtime address, so any sound origin for one is a sound origin for the other,
+// and Rule 3b can only REFINE the verdict, never contradict it. What makes that
+// argument mechanical rather than rhetorical is
+// `mirPointerOriginIsOperandDetermined` (mir_escape.hpp): it states, per
+// opcode, that origin is a function of (opcode, origin of operand 0), which is
+// exactly what a key over canonicalized operands preserves — and it is FALSE
+// for precisely the two opcodes a value-numbering pass must already exclude
+// from candidacy, `Alloca` and `Phi`. `tests/opt/test_mir_alias.cpp` sweeps the
+// whole `MirOpcode` enum against that exclusion.
 [[nodiscard]] inline bool
 mirAliasProbeSubstitutionPreservesClobberVerdict(
-    Mir const& mir, MirInstId raw, MirInstId canonical)
+    Mir const& mir, MirInstId raw, MirInstId canonical,
+    MirPointerEscape const* escape = nullptr)
 {
     if (!raw.valid() || !canonical.valid()) return false;
     if (raw.v == canonical.v) return true;
     MirOpcode const opRaw = mir.instOpcode(raw);
     if (opRaw == MirOpcode::Alloca) return false;
-    return opRaw == mir.instOpcode(canonical)
-        && mir.instType(raw).v == mir.instType(canonical).v;
+    if (opRaw != mir.instOpcode(canonical)
+        || mir.instType(raw).v != mir.instType(canonical).v) {
+        return false;
+    }
+    if (escape != nullptr && escape->originOf(raw) != escape->originOf(canonical)) {
+        return false;
+    }
+    return true;
 }
 
 // True iff any Store in the loop body may alias the given Load
@@ -657,11 +714,12 @@ mirAnyMayAliasingStoreInLoop(
     MirInstId                        loadPtr,
     std::span<MirBlockId const>      loopBody,
     StrictTbaa                       strictTBAA       = StrictTbaa::No,
-    bool                             charTypesAliasAll = true)
+    bool                             charTypesAliasAll = true,
+    MirPointerEscape const*          escape            = nullptr)
 {
     return mirAnyMayAliasingStoreInRegion(mir, interner, loadPtr,
                                           loopBody, strictTBAA,
-                                          charTypesAliasAll);
+                                          charTypesAliasAll, escape);
 }
 
 } // namespace dss::opt::analysis

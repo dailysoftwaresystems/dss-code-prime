@@ -354,8 +354,10 @@ def build_dss(arm: dict, subject: dict, jobs: int, objdir: str,
                    f"benchmark option.\n" + log[-800:])
 
 
-def preflight_dss(binary: str, config_root: str) -> tuple[bool, str]:
-    """Can this compiler compile three lines against that config? (ok, why-not).
+def preflight_dss(binary: str, config_root: str,
+                  target: str = "") -> tuple[bool, str]:
+    """Can this compiler compile three lines against that config, FOR THE TARGET
+    THE MEASUREMENT WILL USE? (ok, why-not).
 
     ★ ONE IMPLEMENTATION, CALLED BY BOTH DRIVERS, ALWAYS ON THE HOST THAT WILL
     RUN THE COMPILER. The check has to happen before a configure, a 102-object
@@ -366,6 +368,24 @@ def preflight_dss(binary: str, config_root: str) -> tuple[bool, str]:
     ✔MEASURED 2026-08-21: a two-day-stale `build/rel` against the CURRENT config
     refuses with `unknown key 'templateLabelRule' in 'assembly'`. Correct and
     well-named — but it arrived three minutes in.
+
+    ★★ AND `target` IS WHY THIS CHECK EXISTS AT ALL, NOT A REFINEMENT OF IT.
+    ✔MEASURED 2026-08-26 on TWO hosts in one run
+    (D-BENCH-COMPILER-AND-CONFIG-MAY-COME-FROM-DIFFERENT-COMMITS): this preflight
+    printed `preflight: OK` and the measurement then died on a config-schema
+    error in the very document it was supposed to be vouching for — on macOS
+    `C_MalformedJson` at `/opcodes/10/encoding/variants/0/resultSlot` for
+    `arm64:macho64-arm64-darwin-exec`, on Windows `unknown key 'registerClass'`
+    for `x86_64:pe64-x86_64-windows-exec`. The probe compiled with NO `--target`,
+    so it validated whatever DSS defaults to rather than the document under
+    measurement. **A CONTROL MUST MATCH THE TARGET** — the same rule this
+    repository already learned about reference compilers, arriving a second time
+    wearing config's clothes.
+    ⚠ A check that passes on a DIFFERENT input than the one that then fails is
+    worse than no check: it converts "this might be stale" into a printed OK.
+    ⓘ `target` is optional ONLY so a caller that genuinely has no target yet can
+    still get the weaker check; every caller in this repository passes one, and a
+    caller that omits it is TOLD so rather than silently downgraded.
     """
     if not os.path.isdir(config_root):
         return False, f"the config root does not exist: {config_root}"
@@ -375,9 +395,12 @@ def preflight_dss(binary: str, config_root: str) -> tuple[bool, str]:
         src = os.path.join(td, "probe.c")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("int main(void){return 0;}\n")
+        argv = [binary, "--compile", src, "--output", td]
+        if target:
+            argv += ["--target", target]
         # ⚠ rc is NOT the verdict — dsscp returns 0 on fatal errors, so
         # the log is what decides, exactly as build_dss does.
-        r = run_capture([binary, "--compile", src, "--output", td], env=env)
+        r = run_capture(argv, env=env)
         log = (r.stdout or "") + (r.stderr or "")
         if "error[" in log:
             return False, next(ln for ln in log.splitlines() if "error[" in ln)[:400]
@@ -781,6 +804,10 @@ def main() -> int:
                          "for a configure and a reference build")
     ap.add_argument("--config-root", metavar="DIR",
                     help="the DSS_CONFIG_ROOT to pin for --preflight-dss")
+    ap.add_argument("--preflight-target", metavar="SPEC", default="",
+                    help="the --target the MEASUREMENT will use, so the preflight "
+                         "validates the same target document rather than whatever "
+                         "dsscp defaults to (see preflight_dss)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -790,17 +817,30 @@ def main() -> int:
             ap.error("--preflight-dss needs --config-root: leaving it unset lets "
                      "the working directory decide which config the measured "
                      "binary reads, which is the thing being pinned")
-        ok, why = preflight_dss(args.preflight_dss, args.config_root)
+        ok, why = preflight_dss(args.preflight_dss, args.config_root,
+                                args.preflight_target)
         if ok:
+            # ⚠ SAY WHICH TARGET WAS VOUCHED FOR, and say plainly when the answer
+            # is "the default one". An unqualified `preflight: OK` is what let a
+            # stale arm64/pe64 document reach a 3-minute measurement twice in one
+            # run on 2026-08-26 -- the reader had no way to see the check and the
+            # measurement were looking at different documents.
+            scope = (f"for target {args.preflight_target}" if args.preflight_target
+                     else "for the DEFAULT target -- NOT the one under measurement, "
+                          "so a target-specific config break will NOT be caught here")
             print(f"preflight: OK - {args.preflight_dss} compiles against "
-                  f"{args.config_root}")
+                  f"{args.config_root} {scope}")
             return 0
         print(f"speedtest1_bench: preflight FAILED\n"
               f"      binary : {args.preflight_dss}\n"
               f"      config : {args.config_root}\n"
+              f"      target : {args.preflight_target or '(default)'}\n"
               f"      says   : {why}\n"
               f"      The usual cause is a STALE binary against a CURRENT config "
-              f"tree. Rebuild it before measuring.", file=sys.stderr)
+              f"tree, or a CURRENT binary against a config tree some cleanup "
+              f"rolled back -- both were seen on 2026-08-26, in mirror image, in "
+              f"one run. Rebuild it before measuring, and check WHICH side moved.",
+              file=sys.stderr)
         return 1
     if args.resolve_msvc:
         env, why = msvc_env()

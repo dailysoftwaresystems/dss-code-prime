@@ -34,6 +34,28 @@ dss_add_test(NAME mir/test_mir_merge SOURCES test_mir_merge.cpp)
 dss_add_test(NAME mir/test_mir_summary   SOURCES test_mir_summary.cpp)
 dss_add_test(NAME mir/test_summary_index SOURCES test_summary_index.cpp)
 
+# D-OPT11-LAZY-IMPORT-EDGE — the TRANSFORMATION half's missing edge: a per-TU
+# optimize that ASKS the index for a body (`SummaryIndex::definitionOf`) instead
+# of being confined to the precomputed prefetch plan. A THIRD binary beside the
+# two above, on the same argument: it tests what happens when the decision is
+# ACTED ON, and a failure here must not be confusable with a bad summary or a
+# bad index. Its fixture is a FOUR-module call chain, because a two-module one is
+# green for an eager plan and a lazy edge alike.
+dss_add_test(NAME mir/test_lazy_import_optimize
+             SOURCES test_lazy_import_optimize.cpp)
+
+# D-OPT11-LAZY-IMPORT-EDGE — the `.dss.mir` section's BODY payload: the envelope,
+# its refusal rules, and the round trip a fetched body has to survive.
+dss_add_test(NAME mir/test_mir_body_codec SOURCES test_mir_body_codec.cpp)
+
+# D-OPT11-LAZY-IMPORT-EDGE — the DETERMINISM bar plan 22 §0.2 names as the arc's
+# load-bearing risk: a per-TU parallel optimize with on-demand imports must emit
+# a byte-identical artifact run to run and at any pool width. It drives the whole
+# driver (`Program::setLtoMode`) because that property is not observable at the
+# MIR tier; it lives here because its SUBJECT is the MIR-tier import stage.
+dss_add_test(NAME mir/test_thin_lto_artifact_identity
+             SOURCES test_thin_lto_artifact_identity.cpp)
+
 # D-MIR-OVERLAP-STRUCT-ZERO-INIT — brace-init of a struct whose members SHARE
 # BYTES (a c107 explicit-offset overlay). Hand-built HIR, because explicit offsets
 # cannot be spelled in C source — they arrive only from a shipped descriptor.

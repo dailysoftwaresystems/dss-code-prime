@@ -12,9 +12,19 @@
 # summaries — neither needs the optimizer, and reaching up into the driver for
 # `RuntimeObjectKey` would couple a MIR-tier leaf to the build system. The
 # Tier-1 digest is therefore carried as an OPAQUE STRING the caller supplies.
+# ★ AND STILL NO DEPENDENCY ON `opt` AFTER THE LAZY IMPORT EDGE LANDED
+# (D-OPT11-LAZY-IMPORT-EDGE). `lazy_import_optimize.cpp` runs the optimizer, but
+# it reaches it through a CALLBACK the driver supplies, so this library still
+# does not know what a pass, a pipeline or a compile stage is — and a MIR-tier
+# unit test can drive the whole import fixpoint with a hand-written no-op
+# optimizer. It does gain `mir_merge`, which IS the subset FunctionCloner: the
+# `MergeCuInput::importOnly` filter turns the whole-module clone into a subset
+# one rather than standing a second opcode-by-opcode clone switch beside it.
 add_library(mir_summary OBJECT
     mir_summary.cpp
     summary_index.cpp
+    lazy_import_optimize.cpp
+    mir_body_codec.cpp
 )
 
 target_include_directories(mir_summary PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)
@@ -23,4 +33,4 @@ target_include_directories(mir_summary PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 # MSVC for the .obj files produced here (same pattern as mir/, link/, merge/).
 target_compile_definitions(mir_summary PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 
-target_link_libraries(mir_summary PRIVATE core mir link)
+target_link_libraries(mir_summary PRIVATE core mir link mir_merge)

@@ -448,4 +448,43 @@ fi
 rc=$?
 grep -E "tests passed|tests failed|The following tests FAILED" -A20 /tmp/wsl-leg-ctest.log | tail -25
 [[ $rc -eq 0 ]] || die "ctest leg failed (rc=$rc, log /tmp/wsl-leg-ctest.log)"
+
+# ── ★★ THE EMULATOR WITNESS — the one thing the gate above CANNOT tell you ────
+# ✔MEASURED 2026-08-26 (P39), and it cost four probes to answer a question the
+# leg should answer itself. THE WHOLE REASON THIS LEG EXISTS is that it is the
+# only host that EXECUTES arm64 ELF, under qemu. Nothing above proves it did:
+#   * the test COUNT cannot -- the arm64 arms are extra coverage INSIDE example
+#     entries that also run on Windows, so a leg with no emulator at all reports
+#     exactly the same 1673 as one with a working one;
+#   * `--output-on-failure` DISCARDS the output of passing tests, and the
+#     `[arm-ledger]` / `[coverage-boundary]` lines the runner already emits to
+#     answer precisely this question are only ever printed by tests that pass.
+# ⇒ Re-run ONE example verbosely and read the ledger. A proxy, and said out loud
+# as one: it proves the EMULATOR PATH is live on this host and in this build, not
+# that every arm64 arm of every example ran. That is still the difference between
+# a leg that is known to have run and a leg that is merely green -- and this
+# project has the `QEMU_LD_PREFIX` scar to prove the two look identical.
+if [[ -z "$FILTER" ]]; then
+    say "emulator witness (is the arm64 leg actually RUNNING?)"
+    _wit=/tmp/wsl-leg-armwitness.log
+    ctest --test-dir "$BUILD" -R '^examples/c/builtin_bitcount$' -V > "$_wit" 2>&1 || true
+    # The runner's own vocabulary, not a string this script invented: `ran=` lists
+    # the specs whose artifacts were SPAWNED and completed.
+    if ! grep -qE '^\S*\s*\[coverage-boundary\].*[[:space:]]ran=[^[:space:]]*arm64:' "$_wit"; then
+        die "the arm64 emulator did NOT run: no [coverage-boundary] line lists an arm64 spec under ran= (witness $_wit).
+     A green ctest above proves the x86_64 leg only. Check qemu-aarch64 and QEMU_LD_PREFIX=$QEMU_LD_PREFIX."
+    fi
+    # ⚠ THE COUNT PRECEDES THE LABEL -- `... 0 emulator-missing, 0 launcher-...`.
+    # The first draft of this grep looked for `emulator-missing: [1-9]`, which
+    # matches NOTHING in this runner's output and so could never have fired. It
+    # was caught only by checking that the mutant log differed from the clean one
+    # at all: the "negative" arm was byte-identical, i.e. asserting nothing.
+    if grep -qE '[1-9][0-9]* emulator-missing' "$_wit"; then
+        die "the arm64 emulator is MISSING for at least one arm (witness $_wit):
+$(grep -oE '[0-9]+ emulator-missing' "$_wit" | sort -u)"
+    fi
+    grep -oE '\[arm-ledger\] [^:]+: .*poisoned' "$_wit" | head -1
+    say "emulator witness OK -- arm64 artifacts were spawned and ran on this host"
+fi
+
 say "WSL leg OK"

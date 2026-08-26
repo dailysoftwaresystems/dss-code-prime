@@ -45,20 +45,25 @@
 //      SINGLE-BLOCK LEAF) has since been generalized: multi-block
 //      callees inline via the CFG-clone + return-merge-Phi machinery
 //      (cycle 2); a callee containing a regular `Call` (non-leaf) is
-//      admitted (cycle 3); a callee containing an `IntrinsicCall` is
-//      admitted (cycle 6); a callee containing a `Phi` is admitted
+//      admitted (cycle 3); a callee containing a `Phi` is admitted
 //      (cycle 7 — cloned via a deferred-incoming-flush: value remapped
 //      via the shared `local` map, pred via the callee-block clone map;
 //      D-OPT7-MULTIBLOCK-SPLICE-PHI). What REMAINS refused: a callee with
 //      NO returning path, a recursive-cycle call (the call-graph SCC
 //      gate, rule 3), and a callee whose instruction-count exceeds the
 //      cost bound (cycle 28).
-//      The IntrinsicCall admission carries a frame-sensitivity caveat —
-//      a frame-sensitive intrinsic (va_start / frameaddress / setjmp-
-//      class) must NOT be inlined — but no shipped frontend emits any
-//      intrinsic today, so blanket admission is correct for the current
-//      model; per-intrinsic inline-safety gating is trigger-gated to the
-//      first frame-sensitive intrinsic — D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.
+//      A callee containing an `IntrinsicCall` is REFUSED (cycle 6
+//      admitted it; the refusal is restored). The splice clones an
+//      intrinsic SSA-correctly, but SSA-correctness is not FRAME-
+//      correctness: a frame-sensitive intrinsic (va_start / frameaddress
+//      / returnaddress / stacksave / setjmp-class) means the frame it
+//      runs in, and spliced into the caller it binds to the WRONG frame.
+//      The MIR payload is a BARE intrinsic id, so this gate cannot prove
+//      which kind it has — and refusing what it cannot prove safe is the
+//      rule every other arm here follows. Re-admitting the frame-
+//      INSENSITIVE ones is a pure optimization relaxation, gated on a
+//      per-intrinsic frame-safety attribute that does not exist yet —
+//      D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.
 //
 // **NEVER DELETE a callee body in this pass.** OPT7 inlines call
 // SITES only. A now-dead callee is removed by a LATER DCE pass, which

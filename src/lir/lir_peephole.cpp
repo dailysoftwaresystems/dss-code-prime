@@ -130,6 +130,48 @@ isRedundantCopy(Lir const& src, LirInstId inst, TargetSchema const& schema,
     return true;
 }
 
+// ── RULE R2 — FALLTHROUGH-BRANCH ELISION (D-OPT-JCC-FALLTHROUGH) ────────
+//
+// True iff `inst` terminates `blk` with a branch whose LAST BlockRef operand
+// names `nextBlock` — the block laid out immediately after `blk` — and the
+// target declares the shorter, fallthrough-form encoding for it.
+//
+// ★ THE OPERAND LIST MUST ALREADY AGREE WITH THE SUCCESSOR LIST EXACTLY:
+// same count, same blocks, same order. That is not a formality, it is what
+// makes "drop the LAST OPERAND" mean "stop materializing the LAST SUCCESSOR"
+// instead of "stop materializing whatever happens to sit at the end of the
+// list". It is also `lir_verifier`'s Rule 1b stated as a precondition, so an
+// instruction that already failed that rule is left exactly as it was for the
+// verifier to report rather than quietly rewritten into a second shape.
+//
+// ⚠ AND IT MAKES THE RULE IDEMPOTENT FOR FREE: an ALREADY-elided branch has
+// one fewer operand than successors, fails the count test, and is not elided
+// twice.
+[[nodiscard]] bool
+isElidableFallthroughBranch(Lir const& src, LirBlockId blk, LirInstId inst,
+                            std::optional<LirBlockId> nextBlock,
+                            TargetSchema const& schema) {
+    // The LAST block of a function has no next-laid-out block, so its
+    // fallthrough edge has nowhere to fall to and must stay materialized.
+    if (!nextBlock.has_value()) return false;
+    auto const* info = schema.opcodeInfo(src.instOpcode(inst));
+    if (info == nullptr || !info->isTerminator()) return false;
+
+    auto const ops   = src.instOperands(inst);
+    auto const succs = src.blockSuccessors(blk);
+    if (ops.empty() || ops.size() != succs.size()) return false;
+    for (std::size_t k = 0; k < ops.size(); ++k) {
+        if (ops[k].kind != LirOperandKind::BlockRef) return false;
+        if (ops[k].blockSlot != succs[k].v) return false;
+    }
+    if (succs.back().v != nextBlock->v) return false;
+
+    // ★★★ AND ONLY IF THE TARGET SAYS SO. One owner for that question, shared
+    // with the verifier arm that has to bless the result.
+    return lir_pass_util::declaresFallthroughBranchForm(
+        schema, src.instOpcode(inst), ops.size());
+}
+
 // Rewrite ONE function into `b`, dropping the instructions R1 proves
 // redundant.
 //
@@ -141,7 +183,7 @@ isRedundantCopy(Lir const& src, LirInstId inst, TargetSchema const& schema,
 [[nodiscard]] bool
 peepholeOneFunc(Lir const& src, LirFuncId srcFn, TargetSchema const& schema,
                 PassState& state, LirBuilder& b, std::size_t& removed,
-                DiagnosticReporter& reporter) {
+                std::size_t& elided, DiagnosticReporter& reporter) {
     (void)b.addFunction(src.funcSymbol(srcFn));
 
     std::unordered_map<std::uint32_t, LirBlockId> srcToDst;
@@ -152,6 +194,16 @@ peepholeOneFunc(Lir const& src, LirFuncId srcFn, TargetSchema const& schema,
     }
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const srcBlk = src.funcBlockAt(srcFn, bi);
+        // R2's layout question, asked of the module being REBUILT. The
+        // rebuild recreates blocks in source order (the loop above, and the
+        // `beginBlock` order here), so "next in the source" IS "next in the
+        // output" — the elision cannot be invalidated by this pass's own
+        // rewrite. Nothing weaker than that identity would do: an elision is
+        // a statement about the FINAL layout.
+        std::optional<LirBlockId> const srcNext =
+            (bi + 1 < blockCount)
+                ? std::optional<LirBlockId>{src.funcBlockAt(srcFn, bi + 1)}
+                : std::nullopt;
         b.beginBlock(srcToDst[srcBlk.v]);
 
         std::uint32_t const instCount = src.blockInstCount(srcBlk);
@@ -178,6 +230,14 @@ peepholeOneFunc(Lir const& src, LirFuncId srcFn, TargetSchema const& schema,
                 for (auto const& s : srcSuccs) {
                     auto it = srcToDst.find(s.v);
                     if (it != srcToDst.end()) succs.push_back(it->second);
+                }
+                // ★ R2 — and note what is NOT touched: `succs` is passed on
+                // whole. The CFG edge survives; only the ENCODER's copy of it
+                // goes away, because the layout already places it.
+                if (isElidableFallthroughBranch(src, srcBlk, inst, srcNext,
+                                                schema)) {
+                    newOps.pop_back();
+                    ++elided;
                 }
                 if (!lir_pass_util::emitTerminator(
                         b, opcode, info, succs, newOps,
@@ -223,7 +283,8 @@ runLirPeephole(Lir const&          src,
     std::size_t const funcCount = src.moduleFuncCount();
     for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
         if (peepholeOneFunc(src, src.funcAt(fi), schema, state, b,
-                            result.redundantCopiesRemoved, reporter)) {
+                            result.redundantCopiesRemoved,
+                            result.fallthroughBranchesElided, reporter)) {
             continue;
         }
         // Mid-failure the builder holds a half-open function whose current

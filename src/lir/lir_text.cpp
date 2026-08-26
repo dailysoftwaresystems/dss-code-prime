@@ -734,7 +734,7 @@ private:
     // Successor list parsed from the current block's header `-> [...]`.
     // ★ THE DISPATCH FORK KEYS ON THIS LIST, NEVER ON THE OPERAND-LIST BlockRef
     // COUNT — but NOT because a terminator has no BlockRef operands. It does:
-    // every `mir_to_lir` and `asm_text_to_lir` `cond-br` carries exactly two,
+    // every `mir_to_lir` and `asm_text_to_lir` `cond-br` is BORN carrying two,
     // and the ENCODER reads them for its displacements. This comment claimed
     // the opposite for the whole life of the file, and the code below acted on
     // the claim by FILTERING them out (D-LIR-TEXT-CONDBR-BLOCKREF-OPERANDS-DROPPED).
@@ -743,6 +743,14 @@ private:
     // operands hold no BlockRef at all (`indirect-br`'s address register), so it
     // is the only channel that can drive the fork for all of them
     // (0=Ret/Unreachable, 1=Br, 2=CondBr, N=IndirectBr).
+    //
+    // ★★ AND SINCE D-OPT-JCC-FALLTHROUGH THE HEADER LIST IS THE ONLY CHANNEL
+    // THAT CAN. `lir_peephole`'s rule R2 drops a `cond-br`'s TRAILING BlockRef
+    // operand when the successor it named is already the next-laid-out block,
+    // so a legally-elided branch reaches this parser with ONE operand and TWO
+    // successors. An operand-derived fork would now mis-dispatch it as a `Br`
+    // and silently delete the taken edge — the header list is what makes the
+    // shortened form round-trip byte-for-byte instead.
     std::vector<std::uint32_t>                  currentBlockSuccSlots_;
     bool                                        errors_ = false;
     // Set ONLY by `refuseTerminator` — "the open block was left without a

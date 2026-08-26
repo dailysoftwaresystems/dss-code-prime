@@ -10195,9 +10195,19 @@ struct Lowerer {
         // for the BlockRel32 displacement AND emits a trailing
         // unconditional `jmp` to operand[1] (fallthrough) so the
         // LIR block layout doesn't need to guarantee fallthrough
-        // order. A future optimizer pass elides the redundant
-        // trailing jmp when ifFalse IS the next-laid-out block
-        // (anchored D-OPT-JCC-FALLTHROUGH).
+        // order.
+        //
+        // ★ D-OPT-JCC-FALLTHROUGH: THE LOWERING STILL EMITS BOTH,
+        // AND THAT IS THE RIGHT PLACE FOR IT. Block layout is not
+        // settled here — regalloc, two-address legalization and the
+        // callconv rebuild all sit between this point and the bytes
+        // — so a lowering that guessed at fallthrough order would be
+        // guessing. The elision is a LAYOUT-AWARE peephole instead:
+        // `lir_peephole`'s rule R2 drops the trailing operand once
+        // the layout is final and the target declares the shorter
+        // encoding form, and `lir_verifier`'s Rule 1b refuses the
+        // shortened list on any module where the unnamed successor
+        // is not the next-laid-out block.
         std::array<LirOperand, 2> jccOps{
             LirOperand::makeBlockRef(lirIfTrue.v),
             LirOperand::makeBlockRef(lirIfFalse.v)};

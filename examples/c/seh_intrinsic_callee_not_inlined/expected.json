@@ -1,0 +1,12 @@
+{
+  "$comment": "D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC: the runtime witness that a callee containing a FRAME-SENSITIVE INTRINSIC is kept OUT OF LINE by the shipped `release` pipeline (which runs `Inlining`). The guarded region lives in `guarded_read` — static, tiny, ONE call site — the exact shape the cost model most wants to inline; its `__except` filter uses GetExceptionCode(), which `c.lang.json` binds (via `_exception_code`) to a dedicated 0-OPERAND MIR value op. Zero operands is the point: it takes nothing from the instruction stream, so its whole meaning is the frame it runs in, recovered from the __C_specific_handler dispatch context of the ESTABLISHING frame. Spliced into `main` it would read main's frame, which established no handler. UNFORGEABLE: a wrongly-inlined callee cannot return a slightly-wrong number — the scope table would describe a region in the wrong function, the AV escapes, and the process dies, so the grader sees a crash and never a silent pass. Exit 42 iff the fault was caught in the callee's own frame; 10 iff VirtualAlloc failed (environment, not SEH). WHY THIS IS NOT seh_catch_av: the existing SEH examples put the __try in `main`, so the inliner never has a decision to make and frame-sensitivity is never under test. The `release` arm is the load-bearing half — on the baseline pipeline nothing inlines, so a baseline-only example would prove nothing about the gate. pe64-ONLY: x64 SEH + __C_specific_handler + windows.h are Windows (windows.json availableObjectFormats:[pe]).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

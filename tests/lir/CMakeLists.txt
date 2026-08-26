@@ -45,6 +45,12 @@ dss_add_test(NAME lir/test_lir_asm_goto_labels SOURCES test_lir_asm_goto_labels.
 dss_add_test(NAME lir/test_lir_asm_binding_collision
              SOURCES test_lir_asm_binding_collision.cpp)
 dss_add_test(NAME lir/test_lir_text      SOURCES test_lir_text.cpp)
+# D-OPT-JCC-FALLTHROUGH: Rule 1b's ONE legal asymmetry — a branch whose
+# trailing fallthrough operand `lir_peephole` elided, verified against the
+# module's own block LAYOUT. Its fixture (`fallthrough_form_schema.hpp`) builds
+# a target that SPELLS the shorter encoding form by mutating the shipped
+# document in memory, which needs nlohmann_json.
+target_link_libraries(dss_lir_test_lir_text PRIVATE nlohmann_json::nlohmann_json)
 dss_add_test(NAME lir/test_mir_to_lir    SOURCES test_mir_to_lir.cpp)
 # FC1 (V2-4.X): the role-contract red-on-disable levers strip
 # inputRoles/outputRoles off idiv_op via mutate_target_schema.hpp.

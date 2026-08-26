@@ -1,0 +1,33 @@
+{
+  "$comment": "D-OPT11-LAZY-IMPORT-EDGE (cycle P39). A call chain FOUR translation units deep -- main -> level1 -> level2 -> level3 -- with one function per CU. FOUR CUs are the precondition, not decoration: OPT11 phase 1's precomputed prefetch plan is bounded by `SummaryIndexPolicy::maxImportDepth`, so at depth 1 it offers module 0 exactly ONE body (`level1`) and the two deeper ones are invisible to it; a two-CU example is green whether the import edge is eager or lazy and would prove nothing. The lazy edge asks the index for a body the moment the module names one it does not have (`SummaryIndex::definitionOf`), so it reaches all three. The exit code witnesses the VALUES rather than merely that the link succeeded: 3 +4 = 7, *3 = 21, *2 = 42, and each arm is a DIFFERENT operation, so a body spliced from the wrong TU, in the wrong order, or with a dropped argument lands on a different number instead of a plausible one. The `release` arm runs Inlining over the chain; the baseline arm proves the same program is correct with no optimizer at all, so a divergence is attributable.",
+  "language": "c",
+  "sources": ["main.c", "a.c", "b.c", "c.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "passes": ["ConstFold", "CopyProp", "Inlining", "Dce"], "mustDifferFromBaseline": false}
+  ]
+}

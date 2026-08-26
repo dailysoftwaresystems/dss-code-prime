@@ -77,6 +77,38 @@ struct MergeCuInput {
     // for every TU touching neither family (the overwhelming majority). Non-owning — the
     // map lives on the caller's `CuMirModule.libraryShimRecipes`, which outlives the merge.
     std::unordered_map<std::uint32_t, std::string> const* synthRecipes = nullptr;
+
+    // ★★★ THE SUBSET-IMPORT FILTER (OPT11, D-OPT11-LAZY-IMPORT-EDGE).
+    //
+    // NULL (the default, and every driver merge) — this CU is a full merge
+    // participant: every function, every global and every extern row of it takes
+    // part, exactly as before this field existed.
+    //
+    // NON-NULL — this CU is an IMPORT SOURCE, not a participant. Only the
+    // functions whose DECLARED NAME appears here contribute a definition; its
+    // globals contribute NONE and its extern rows contribute NONE. That is what
+    // turns `mergeCuMirs` into the SUBSET `FunctionCloner` the lazy import edge
+    // needs, WITHOUT a second opcode-by-opcode clone switch beside
+    // `FunctionCloner::emitValue` — a second one would have to be taught every
+    // new opcode, and the one that got taught late would silently drop operands.
+    //
+    // ★ WHY A NAME SET RATHER THAN A PRUNED `Mir`. `Mir` is immutable once
+    // frozen, so "hand me only these functions" would itself be a cross-module
+    // clone — the very operation this filter exists to provide. The name is also
+    // the only key that means the same thing on both sides of a TU boundary,
+    // which is the rule the merge already follows everywhere else.
+    //
+    // ⚠ THE CALLER OWES SATISFIABILITY. A selected body may reference symbols
+    // this CU no longer contributes (its own globals, its own extern rows). The
+    // merge assigns those references a merged id but supplies no definition, so
+    // the caller must either be merging the CU that DOES define them or must
+    // carry the reference forward as an `ExternImport` of its own. The lazy
+    // import driver (`mir/summary/lazy_import_optimize.hpp`) does exactly that,
+    // and REFUSES an import whose references it cannot satisfy — an availability
+    // decision, which is the only kind the index is allowed to make.
+    //
+    // NOT OWNED — the span/vector outlives the call, like every other field here.
+    std::vector<std::string> const* importOnly = nullptr;
 };
 
 // The merged whole-program module + the unified state the lower half consumes.

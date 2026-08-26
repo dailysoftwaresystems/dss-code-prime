@@ -27,8 +27,12 @@
 #include "link/format/coff_object_reader.hpp"  // c170: COFF .obj member reader (static-pull dispatch)
 #include "link/format/elf_object_reader.hpp"  // c165: readRelocatableObject (static-pull member parse)
 #include "link/format/macho_object_reader.hpp"  // c168: Mach-O MH_OBJECT member reader (static-pull dispatch)
+#include "core/substrate/thread_pool.hpp"      // D-OPT11-LAZY-IMPORT-EDGE: the thin stage's pool
 #include "link/linker.hpp"
 #include "link/writer.hpp"
+#include "mir/summary/lazy_import_optimize.hpp"  // D-OPT11-LAZY-IMPORT-EDGE
+#include "mir/summary/mir_summary.hpp"
+#include "mir/summary/summary_index.hpp"
 #include "lir/lir_2addr_legalize.hpp"
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_liveness.hpp"
@@ -61,6 +65,8 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <latch>   // D-OPT11-LAZY-IMPORT-EDGE: the thin stage batch join
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -3729,6 +3735,205 @@ bool compileSingleUnit(CompilationUnit const&        cu,
     if (!mod) return false;
     return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
                         target, format, outPath, reporter);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE THIN-LTO PER-TU IMPORT STAGE (D-OPT11-LAZY-IMPORT-EDGE, plan 22 §0.2)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ★★ STRICTLY ADDITIVE, AND THAT IS THE WHOLE SAFETY ARGUMENT. The whole-program
+// merge and its single optimize still run afterwards, unchanged. This stage can
+// therefore only move cross-CU inlining EARLIER and into PARALLEL; it cannot
+// remove a splice the merged module would have made, and a TU it has nothing to
+// offer is left byte-identical.
+//
+// Reached only from `--lto=thin`. Every build that does not ask for it takes the
+// identical path it took before this function existed — including the
+// `PhaseTimers::read(Optimize).runs` count three driver-supply tests pin.
+bool runThinLtoImportStage(std::span<CuMirModule>  cuMirs,
+                           TargetSchema const&     target,
+                           CSymbolDecorationScheme cSymDecor,
+                           std::string_view        targetIdentity,
+                           CompileOptions const&   opts,
+                           substrate::IExecutor*   executor,
+                           DiagnosticReporter&     reporter) {
+    if (cuMirs.size() < 2) return true;   // nothing crosses a boundary
+
+    // ── (1) THE POLICY, 100% FROM THE PIPELINE DOCUMENT ─────────────────────
+    // `inlineThreshold` is the SAME cost bound the gate applies, so the
+    // candidate filter cannot admit a callee the gate refuses on size; the
+    // prefetch batch size is the Inlining fixpoint's own `max`, because that is
+    // how many levels the in-module inliner collapses in one run. Nothing here
+    // is a new invented constant, and nothing branches on a language, a target
+    // or an object format.
+    ::dss::opt::OptPipeline        loaded;
+    ::dss::opt::OptPipeline const* effective = opts.pipelineOverride;
+    if (effective == nullptr) {
+        auto const name = resolvePipelineName(opts.config);
+        if (!name.has_value()) return false;   // already refused upstream
+        auto r = ::dss::opt::loadShippedPipeline(*name);
+        if (!r.has_value()) {
+            forwardConfigDiagnostics(r.error(), reporter);
+            return false;
+        }
+        loaded    = std::move(r).value();
+        effective = &loaded;
+    }
+    ::dss::mirsum::SummaryIndexPolicy policy;
+    policy.inlineThreshold = effective->inlineThreshold;
+    policy.maxImportDepth =
+        effective->schedule.count == 0 ? 1u : effective->schedule.count;
+
+    // ── (2) PER-TU SYMBOL NAME TABLES ───────────────────────────────────────
+    //
+    // ⚠ A FLAT TABLE, BUILT SERIALLY, NOT A CALLBACK INTO `SemanticModel`. N
+    // importers run at once and each reads every OTHER TU's names; a callback
+    // would put N threads inside one CU's symbol table. The KEY is the same
+    // string `MergeCuInput::nameOf` produces — `linkNameFor` for a definition,
+    // the import row's `mangledName` for a reference — because the import and
+    // the whole-program merge must agree about what one symbol is.
+    auto nameTableFor = [&](CuMirModule const& cu) {
+        auto nameOf = [&](SymbolId sym) -> std::string {
+            if (SymbolRecord const* r = cu.model.recordFor(sym)) {
+                return dss::ffi::linkNameFor(r->name, r->asmName, cSymDecor,
+                                             r->linkName);
+            }
+            for (ExternImport const& e : cu.externImports) {
+                if (e.symbol.v == sym.v) return e.mangledName;
+            }
+            return std::string{};
+        };
+        std::vector<std::uint32_t> ids;
+        Mir const&                 m = cu.mir;
+        for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+            ids.push_back(m.funcSymbol(m.funcAt(i)).v);
+        for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i)
+            ids.push_back(m.globalSymbol(m.globalAt(i)).v);
+        for (ExternImport const& e : cu.externImports) ids.push_back(e.symbol.v);
+        for (auto const& [v, recipe] : cu.libraryShimRecipes) ids.push_back(v);
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                    MirInstId const inst = m.blockInstAt(b, ii);
+                    if (m.instOpcode(inst) == MirOpcode::GlobalAddr)
+                        ids.push_back(m.globalAddrSymbol(inst).v);
+                    else if (m.instOpcode(inst) == MirOpcode::BlockAddressExport)
+                        ids.push_back(m.blockAddressExportSymbol(inst).v);
+                }
+            }
+        }
+        std::uint32_t maxV = 0;
+        for (std::uint32_t v : ids) maxV = std::max(maxV, v);
+        std::vector<std::string> table(static_cast<std::size_t>(maxV) + 1);
+        for (std::uint32_t v : ids) {
+            if (table[v].empty()) table[v] = nameOf(SymbolId{v});
+        }
+        return table;
+    };
+
+    std::vector<std::vector<std::string>>      nameTables;
+    std::vector<::dss::mirsum::ModuleSummary>  summaries;
+    nameTables.reserve(cuMirs.size());
+    summaries.reserve(cuMirs.size());
+    for (CuMirModule const& cu : cuMirs) nameTables.push_back(nameTableFor(cu));
+    for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+        ::dss::mirsum::SummaryCuInput in;
+        in.mir    = &cuMirs[i].mir;
+        in.nameOf = [&tbl = nameTables[i]](SymbolId s) {
+            return s.v < tbl.size() ? tbl[s.v] : std::string{};
+        };
+        in.externImports = cuMirs[i].externImports;
+        // ⚠ NO MODULE DIGEST, AND EMPTY IS THE HONEST VALUE. The digest exists
+        // to key a CACHED post-import object, and this stage caches nothing — it
+        // runs in one process over modules that are all in memory. Filling it
+        // with something unique-LOOKING (a CU index, a source path) would be
+        // exactly the P36 `CuBuildKey::languageName` mistake: a value that is
+        // not unique BY CONSTRUCTION wearing a key's face. A Tier-2 consumer
+        // must refuse an empty digest rather than treat it as one.
+        in.moduleDigest   = std::string{};
+        in.targetIdentity = std::string{targetIdentity};
+        summaries.push_back(::dss::mirsum::buildModuleSummary(in));
+    }
+
+    std::vector<::dss::mirsum::LazyImportCu> views;
+    views.reserve(cuMirs.size());
+    for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+        views.push_back(::dss::mirsum::LazyImportCu{
+            &cuMirs[i].mir, &cuMirs[i].model.lattice().interner(),
+            &nameTables[i], cuMirs[i].externImports,
+            &cuMirs[i].libraryShimRecipes});
+    }
+
+    auto index = ::dss::mirsum::buildSummaryIndex(summaries, policy, reporter);
+    if (!index.has_value()) return false;
+    if (!::dss::mirsum::summariesDescribeModules(views, summaries, reporter))
+        return false;
+
+    // ── (3) THE PER-TU STAGE, IN PARALLEL ───────────────────────────────────
+    //
+    // Every input is const, so the jobs share nothing but the index and the
+    // summaries — both read-only. Each writes its own outcome slot and its own
+    // scratch reporter, and the scratches drain in CU-index order after the
+    // join, exactly as the two existing CU batches do.
+    std::string const srcLanguage{
+        cuMirs[0].model.lattice().registry().sourceLanguage()};
+    DiagnosticReporter::Config scratchCfg = reporter.config();
+    scratchCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
+    scratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
+    scratchCfg.dedupWindow    = 0;
+    std::vector<DiagnosticReporter> scratch;
+    scratch.reserve(cuMirs.size());
+    for (std::size_t i = 0; i < cuMirs.size(); ++i)
+        scratch.emplace_back(scratchCfg);
+
+    std::vector<::dss::mirsum::LazyImportOutcome> outcomes(cuMirs.size());
+    auto runOne = [&](std::size_t i) {
+        outcomes[i] = ::dss::mirsum::lazyImportOptimize(
+            static_cast<std::uint32_t>(i), views, summaries, *index, policy,
+            srcLanguage,
+            [&](Mir& m, TypeInterner const& in,
+                std::span<ExternImport const> ex) {
+                return optimizeModule(m, target, in, opts,
+                                      PipelineStage::Program, scratch[i], ex);
+            },
+            scratch[i]);
+    };
+    if (executor == nullptr) {
+        for (std::size_t i = 0; i < cuMirs.size(); ++i) runOne(i);
+    } else {
+        std::latch done{static_cast<std::ptrdiff_t>(cuMirs.size())};
+        for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+            executor->submit([&, i] {
+                struct CountDownGuard {
+                    std::latch& latch;
+                    ~CountDownGuard() { latch.count_down(); }
+                } const guard{done};
+                runOne(i);
+            });
+        }
+        done.wait();
+    }
+
+    // ── (4) INSTALL, SERIALLY, IN CU ORDER ──────────────────────────────────
+    // Nothing is installed while a job could still be reading it: a rewritten
+    // module is also a potential import SOURCE for every other importer, which
+    // is exactly why `lazyImportOptimize` returns its module instead of writing
+    // one through a reference.
+    bool ok = true;
+    for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+        copyDiagnostics(scratch[i], reporter);
+        if (!outcomes[i].ok) { ok = false; continue; }
+        if (!outcomes[i].mir.has_value()) continue;   // imported nothing
+        cuMirs[i].mir                 = std::move(*outcomes[i].mir);
+        cuMirs[i].importedHost        = std::move(outcomes[i].host);
+        cuMirs[i].importedSymbolNames = std::move(outcomes[i].symbolNames);
+        cuMirs[i].externImports       = std::move(outcomes[i].externImports);
+        cuMirs[i].libraryShimRecipes  = std::move(outcomes[i].synthRecipes);
+        cuMirs[i].usesImportedLattice = true;
+    }
+    return ok;
 }
 
 } // namespace dss

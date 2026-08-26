@@ -64,6 +64,45 @@ emitTerminator(LirBuilder& b, std::uint16_t op,
                std::string_view passName,
                DiagnosticReporter& reporter);
 
+// ── D-OPT-JCC-FALLTHROUGH — DOES THIS TARGET SPELL A FALLTHROUGH BRANCH? ──
+//
+// A branch terminator materializes EVERY edge it owns as BYTES. The shipped
+// `jcc` rows encode operand[0] as the taken displacement AND operand[1] as a
+// TRAILING UNCONDITIONAL JUMP (x86 `0F 8x rel32; E9 rel32`; arm64 `B.cond` +
+// `B`), precisely so LIR block layout never has to guarantee fallthrough
+// order. When that fallthrough successor IS the next-laid-out block the
+// trailing jump is a jump to +0 — correct, and pure waste.
+//
+// ★★★ ELIDING IT IS A CHANGE OF ENCODING, AND ENCODING IS TARGET VOCABULARY.
+// Whether a machine HAS fallthrough semantics at all, and how the shorter
+// form spells its opcode, is not something a transform may assume: it is
+// declared in `.target.json`. So this predicate asks the SCHEMA whether the
+// target declares the shorter form, and a target that declares none simply
+// gets no elision — from this pass or any other — with no arm anywhere naming
+// a CPU, a mnemonic or a byte.
+//
+// True iff BOTH variants exist on `opcode`:
+//   * a LONG variant whose guard tuple has exactly `opCount` entries and
+//     whose LAST entry is `BlockRef` (the form an un-elided branch selects),
+//     and
+//   * a SHORT variant whose guard tuple is that same tuple MINUS its last
+//     entry, element-for-element, agreeing on EVERY OTHER ROUTING AXIS
+//     (width, immediate range, sign, memory-destination). A variant that
+//     differs on another axis is a different instruction that happens to be
+//     shorter, never this one's fallthrough form, and dropping an operand to
+//     reach it would silently encode something else.
+//
+// ⚠ THE PREDICATE HAS EXACTLY ONE OWNER ON PURPOSE. `lir_peephole` reads it
+// to decide whether it MAY drop the trailing BlockRef, and `lir_verifier`
+// reads the SAME function to decide whether a dropped one is LEGAL. Two
+// copies of this rule that drifted apart would be a verifier that blesses an
+// elision the encoder cannot spell — which is a wrong branch, not a build
+// error.
+[[nodiscard]] DSS_EXPORT bool
+declaresFallthroughBranchForm(TargetSchema const& schema,
+                              std::uint16_t       opcode,
+                              std::size_t         opCount) noexcept;
+
 // Copy EVERY module-level SIDE STRUCTURE from the source module into the
 // destination builder, PRESERVING indices. Today that is two pools:
 //

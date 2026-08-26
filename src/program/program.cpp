@@ -1513,12 +1513,45 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // assume still drove something.)
     CSymbolDecorationScheme const cSymDecor =
         (*formatR)->cSymbolDecoration().scheme;
+
+    // ── THE THIN-LTO PER-TU IMPORT STAGE (D-OPT11-LAZY-IMPORT-EDGE) ─────────
+    //
+    // This is the ONE point in the process where all N independent per-TU
+    // modules co-exist, each still owning its own lattice, with nothing
+    // collapsed — which is exactly what the summary index was shaped to consume.
+    // OFF unless `--lto=thin`, and STRICTLY ADDITIVE when on: the whole-program
+    // merge below still runs, so the stage can only move cross-CU inlining
+    // earlier and into parallel.
+    if (compileOpts.ltoMode == CompileOptions::LtoMode::Thin) {
+        // The same executor discipline the two existing CU batches use: the
+        // injected one when a caller supplied it (tests, a shared pool),
+        // otherwise a local pool sized by the SAME `resolveCuPoolWidth` — so
+        // `--jobs` means one thing across every batch in this build.
+        std::optional<substrate::ThreadPool> thinPool;
+        substrate::IExecutor* thinExec = injectedExecutor;
+        if (thinExec == nullptr) {
+            thinPool.emplace(resolveCuPoolWidth(cuMirs.size(), jobsOverride));
+            thinExec = &*thinPool;
+        }
+        if (!runThinLtoImportStage(
+                std::span<CuMirModule>{cuMirs.data(), cuMirs.size()}, **targetR,
+                cSymDecor, targetSpecStr, compileOpts, thinExec, reporter)) {
+            return std::nullopt;   // already reported
+        }
+    }
+
     std::vector<MergeCuInput> mergeInputs;
     mergeInputs.reserve(cuMirs.size());
     for (auto& cuMir : cuMirs) {
         MergeCuInput in;
-        in.mir      = &cuMir.mir;
-        in.interner = &cuMir.model.lattice().interner();
+        in.mir = &cuMir.mir;
+        // ⚠ AFTER A THIN IMPORT THIS CU'S TYPES LIVE IN A DIFFERENT LATTICE.
+        // Reading `model.lattice()` here would hand the merge an interner that
+        // does not own the module's TypeIds — a reintern against the wrong
+        // lattice, which is a silently retyped module rather than an error.
+        in.interner = cuMir.usesImportedLattice
+                          ? &cuMir.importedHost->interner()
+                          : &cuMir.model.lattice().interner();
         // nameOf: symbol id → the cross-CU MATCH KEY. Covers DEFINITIONS (SemanticModel
         // record) AND extern IMPORTS (the import's mangledName, when the symbol has no
         // record — an extern reference's SymbolId is not in the semantic symbol table).
@@ -1545,6 +1578,16 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // sibling-defined extern unstripped, and an intra-image call silently
         // emitted as a dynamic import. Byte-identical for every unlabelled symbol.
         in.nameOf = [cuMirP = &cuMir, cSymDecor](SymbolId s) -> std::string {
+            // D-OPT11-LAZY-IMPORT-EDGE: after a thin import the SemanticModel's
+            // symbol ids no longer describe this module — the import merge
+            // renumbered them — so the imported table is authoritative and is
+            // consulted FIRST. It was built from this very lambda's rule, so the
+            // key is the same string either way.
+            if (cuMirP->usesImportedLattice) {
+                auto const it = cuMirP->importedSymbolNames.find(s.v);
+                return it == cuMirP->importedSymbolNames.end() ? std::string{}
+                                                               : it->second;
+            }
             // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the fourth
             // input is passed here too — a required parameter precisely so a rail
             // cannot quietly omit it and reintroduce the divergence described
@@ -3146,6 +3189,10 @@ int runCusToTargets(
     std::optional<std::string> const&           artifactName,
     bool                                        perFormatOutputSubdir,
     CompileConfig                               config,
+    // D-OPT11-LAZY-IMPORT-EDGE: the link-time-optimization TOPOLOGY, threaded
+    // beside `config` because it is the same kind of fact — a property of the
+    // SHAPE of this build, decided by the driver, not of a pass schedule.
+    LtoModeArg                                  ltoMode,
     ::dss::opt::OptPipeline const*              pipelineOverride,
     std::vector<ResolveLibrarySpec> const&      resolveLibraries,
     // AP6: the PER-TARGET ADDITIONS channel — extra `ResolveLibrarySpec`s for
@@ -3652,6 +3699,9 @@ int runCusToTargets(
         CompileOptions compileOpts{DiagnosticBudget{rep.config()}};
         compileOpts.config           = config;
         compileOpts.pipelineOverride = pipelineOverride;
+        compileOpts.ltoMode = ltoMode == LtoModeArg::Thin
+                                  ? CompileOptions::LtoMode::Thin
+                                  : CompileOptions::LtoMode::Full;
         // c162 (D-FF1-READER-CONSUMER) + AP6: THIS target's list — the
         // program-wide entries plus whatever was added for this spec, resolved
         // in the pass above. Identical to `resolveLibraries` when no additions
@@ -3993,6 +4043,11 @@ int Program::run(int argc, char* argv[]) {
     // `--config=<debug|release>` into the kernel so the right
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
     setCompileConfig(args.config);
+    // D-OPT11-LAZY-IMPORT-EDGE: `--lto <full|thin>` — the link-time-optimization
+    // topology. Stamped beside the build configuration because it is the same
+    // kind of fact: a property of the SHAPE of this build, not of a pass
+    // schedule.
+    setLtoMode(args.lto);
     setJobs(args.jobs);  // D-PERF-4-CU-PARALLELISM: --jobs N per-CU build pool width
     // AP6 / B.4: `--force-git-cache` — bypass the `.dss-deps` cache-hit
     // short-circuit. Stamped before the dispatch fork like every other global;
@@ -4810,6 +4865,7 @@ int Program::compileFiles(
     return runCusToTargets(
         buildCus, grammar, sourceFiles, sourceStem, targets, rep,
         outputDir_, artifactName_, perFormatOutputSubdir_, compileConfig_,
+        ltoMode_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
         resolveLibraries_, resolveLibraryAdditionsByTarget_, artifactPaths_,
         executor_, jobs_,
@@ -5042,7 +5098,7 @@ int Program::compileUnits(
     return runCusToTargets(
         buildCus, grammar, sourceFiles, sourceStem,
         targets, rep, outputDir_, artifactName_, perFormatOutputSubdir_,
-        compileConfig_,
+        compileConfig_, ltoMode_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
         resolveLibraries_, resolveLibraryAdditionsByTarget_, artifactPaths_,
         executor_, jobs_,

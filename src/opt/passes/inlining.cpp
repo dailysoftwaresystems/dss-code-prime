@@ -283,11 +283,12 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
     // recursion danger a non-leaf body would introduce is handled by rule
     // 3 (the SCC refusal), NOT by a leaf restriction — a non-recursive
     // call chain inlines safely one level per pass, `maxIterations`-
-    // bounded. OPT7 cycle 6 LIFTS the `IntrinsicCall` restriction too — a
-    // callee whose body contains an `IntrinsicCall` is now ADMITTED (it
-    // clones SSA-correctly via the same generic arm; the per-op check below
-    // carries the frame-sensitivity caveat + its trigger-gated anchor
-    // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC). OPT7 (D-OPT7-MULTIBLOCK-SPLICE-PHI)
+    // bounded. OPT7 cycle 6 LIFTED the `IntrinsicCall` restriction, and it is
+    // RESTORED as a fail-SAFE refusal: the splice does clone an `IntrinsicCall`
+    // SSA-correctly, but SSA-correctness is not frame-correctness, and the bare
+    // MIR intrinsic id leaves this gate unable to prove the difference — see the
+    // per-op arm below and
+    // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC. OPT7 (D-OPT7-MULTIBLOCK-SPLICE-PHI)
     // LIFTS the callee-`Phi` refusal too — a multi-block callee
     // that carries a `Phi` at a real CFG merge (a value-producing `?:` /
     // `&&` / `||` lowers to a MIR Phi BEFORE Mem2Reg; or a post-Mem2Reg
@@ -331,25 +332,14 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // non-leaf callee whose body contains a direct/indirect `Call`
             // is now admitted (its inner Call clones correctly via the
             // splice's generic arm; recursion is caught by rule 3's SCC
-            // refusal, above). OPT7 cycle 6: an `IntrinsicCall` is likewise
-            // NO LONGER a refusal — it clones SSA-correctly via the SAME
-            // generic arm. The intrinsic id lives in the inst PAYLOAD (a
-            // module-stable integer the clone copies verbatim); its operands
-            // (the args) remap through the `local` map like any other op; no
-            // IntrinsicCall-specific field exists that the generic arm drops.
-            // FRAME-SENSITIVITY caveat: a hypothetical frame-sensitive
-            // intrinsic (va_start / frameaddress / setjmp-class) would, if
-            // inlined, bind to the CALLER's frame instead of the callee's —
-            // a miscompile. No such intrinsic exists or is emitted by any
-            // shipped frontend today: the intrinsic registry has no inline-
-            // safety attribute and is EMPTY through every real compile (no
-            // sema/lowering path registers or emits an intrinsic; only the
-            // HIR text format can, in tests). That precondition is pinned by
-            // a fail-loud tripwire (the c lowering test asserting an
-            // empty registry), so blanket admission is correct for the
-            // current intrinsic model. Gating on a per-intrinsic inline-
-            // safety attribute is trigger-gated to the first frame-sensitive
-            // intrinsic — D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.
+            // refusal, above). An `IntrinsicCall`, by contrast, IS refused —
+            // it clones SSA-correctly via the SAME generic arm (the intrinsic
+            // id lives in the inst PAYLOAD, a module-stable integer the clone
+            // copies verbatim, and its operands remap through the `local` map),
+            // but a clone that is SSA-correct can still be FRAME-incorrect, and
+            // the bare id denies this gate the means to tell. The full rationale
+            // and the relaxation path live on the refusal arm below, under
+            // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.
             //
             // OPT7 (D-OPT7-MULTIBLOCK-SPLICE-PHI): a callee `Phi` is NO
             // LONGER a refusal — `spliceMultiBlock` clones it via a deferred
@@ -399,9 +389,10 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // (forgoes the optimization, never miscompiles); reachable under the shipped
             // release.pipeline.json (which runs Inlining) — a REAL silent-miscompile fix,
             // not a speculative guard (the `varargs_sum` release arm exits wrong without
-            // it). Sibling of the RecvByValueStackParam refusal above; distinct from the
-            // hypothetical-intrinsic D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC (va_start in
-            // DSS is these dedicated MIR leaves, NOT an IntrinsicCall).
+            // it). Sibling of the RecvByValueStackParam refusal above, and a SEPARATE arm
+            // from the IntrinsicCall one below because va_start in DSS is these dedicated
+            // MIR leaves and never an `IntrinsicCall` — see
+            // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC, which closed on the same reasoning.
             if (op == MirOpcode::VaRegSaveAreaAddr
                 || op == MirOpcode::VaOverflowArgAreaAddr
                 || op == MirOpcode::VaHomeArgAreaAddr) {
@@ -421,9 +412,10 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // MIR flag, never a setjmp name/arch/format. Fail-SAFE (forgoes the
             // optimization, never miscompiles); reachable under the shipped
             // release.pipeline.json (which runs Inlining), so a REAL silent-miscompile
-            // fix. Sibling of the va_start refusal above; DISTINCT from the hypothetical-
-            // intrinsic D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC (setjmp is an FFI `Call`,
-            // NOT an `IntrinsicCall`, so that anchor stays open).
+            // fix. Sibling of the va_start refusal above, and of the IntrinsicCall arm
+            // below: setjmp is an FFI `Call`, not an `IntrinsicCall`, so the two are
+            // separate arms — but they answer the same question the same way, and
+            // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC closed on exactly that reasoning.
             if (op == MirOpcode::Call
                 && has(mir.instFlags(cid), MirInstFlags::ReturnsTwice)) {
                 return std::nullopt;
@@ -463,6 +455,56 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             if (op == MirOpcode::StackSave || op == MirOpcode::StackRestore) {
                 return std::nullopt;
             }
+            // ── FRAME-SENSITIVE INTRINSIC REFUSAL ──
+            // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC
+            // Refuse to inline a callee whose body contains an `IntrinsicCall`.
+            // OPT7 cycle 6 blanket-ADMITTED them; this restores the gate's
+            // universal fail-SAFE discipline, because the admission was a GUESS
+            // the gate had no way to check. A MIR `IntrinsicCall` carries only a
+            // BARE intrinsic id in its payload — an integer minted by a
+            // per-CU HIR registry that MIR does not carry and this gate cannot
+            // resolve. So the gate cannot tell a frame-INSENSITIVE intrinsic
+            // (`sqrt` — safe to splice anywhere) from a FRAME-SENSITIVE one
+            // (`va_start` / `frameaddress` / `returnaddress` / `stacksave` /
+            // `setjmp`-class), whose whole meaning is the frame it executes in
+            // and which, spliced into the caller, would bind to the CALLER's
+            // frame → a SILENT MISCOMPILE. Every sibling arm above (Va*Addr,
+            // returns-twice `Call`, Seh*, StackSave/StackRestore,
+            // RecvByValueStackParam, ReadIndirectResult) refuses exactly this
+            // hazard; the IntrinsicCall arm was the only one that guessed.
+            // ★ THE ADMISSION'S OLD JUSTIFICATION WAS A PRECONDITION HELD BY A
+            // TEST, NOT BY THE CODE: "no shipped frontend emits any intrinsic",
+            // pinned by the c lowering tripwire `NoShippedConstructLowersToIntrinsic`.
+            // MEASURED TRUE TODAY (`cst_to_hir` neither registers nor constructs
+            // an intrinsic; the 30 `lowering:` builtins in `c.lang.json` — umulh,
+            // bswap, popcount, the SEH pair … — every one lowers to a DEDICATED
+            // MIR opcode, never to `IntrinsicCall`; only the HIR text format
+            // mints one, in tests). So this refusal costs NOTHING on any real
+            // compile — but it converts a correctness precondition living in a
+            // test file into a property of the gate itself, which is what makes
+            // a future frontend author's first intrinsic safe BY DEFAULT instead
+            // of safe ONLY IF they read the tripwire.
+            // RELAXATION PATH (a pure optimization win, gated on a PROOF — the
+            // discipline `D-OPT7-INLINE-LEGALITY-GATE` states for its every
+            // other relaxation): give `HirIntrinsicDescriptor` a registration-
+            // driven frame-safety attribute sourced from the language's own
+            // config vocabulary, thread it to the MIR `IntrinsicCall` (a side-
+            // table or an inst flag set at `hir_to_mir`, since the MIR id is
+            // bare), then admit here iff that attribute proves the intrinsic
+            // frame-INSENSITIVE. Until such an attribute EXISTS, "cannot prove
+            // safe" is the only honest answer and refusal is the only safe one.
+            if (op == MirOpcode::IntrinsicCall) return std::nullopt;
+            // c116 H1 (D-WIN64-SEH-FUNCLETS): `RecoverParentFrameSlot` resolves
+            // its payload — a scan-order frame-SLOT INDEX — against the config-
+            // driven FrameLayout of the frame its base operand establishes, so
+            // it is frame-sensitive by construction and joins the refusal family
+            // above. MEASURED unreachable from here TODAY: it is minted only by
+            // `synthesizeSehFunclets`, which `compile_pipeline` runs strictly
+            // AFTER the optimizer, so no `IntrinsicCall`-style hazard exists yet.
+            // Kept as a one-line fail-SAFE backstop because that ordering is a
+            // pipeline property, not an invariant this gate can see — the same
+            // reason the arms above refuse rather than reason about reachability.
+            if (op == MirOpcode::RecoverParentFrameSlot) return std::nullopt;
             if (op == MirOpcode::Return
                 && mir.instOperands(cid).size() > 1) {
                 return std::nullopt;

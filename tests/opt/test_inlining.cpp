@@ -29,12 +29,14 @@
 //     refuses every call within a recursive cycle — generalizing the
 //     self-recursion refusal); an ACYCLIC non-leaf control IS inlined
 //     (proving the refusal is recursion-specific, not refuse-all).
-//   * IntrinsicCall-bearing callee → INLINED (OPT7 cycle 6): the
-//     intrinsic clones SSA-correctly via the generic arm (payload-carried
-//     id copied verbatim) — proven for the value-threaded single-block,
-//     the multi-block (non-entry block), and the void (result-unused)
-//     forms. Frame-sensitive intrinsics stay trigger-gated
-//     (D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC).
+//   * IntrinsicCall-bearing callee → NOT inlined (cycle 6 admitted it;
+//     the refusal is restored). The MIR payload is a BARE intrinsic id,
+//     so the gate cannot prove the intrinsic frame-INSENSITIVE, and a
+//     frame-sensitive one spliced into the caller binds to the CALLER's
+//     frame. Refused for the single-block (with an intrinsic-free
+//     positive control that still inlines), the multi-block (non-entry
+//     block), and the void (result-unused) forms —
+//     D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.
 //   * VOID single-block leaf callee → inlined; the invalid-result-id
 //     splice path threads cleanly + the module verifies.
 //   * callsInlined counter accuracy + verifier-clean rebuild.
@@ -1626,22 +1628,26 @@ TEST(Inlining, MutualRecursiveCallIsNotInlined) {
     }
 }
 
-// ── IntrinsicCall-bearing callee IS inlined (OPT7 cycle 6 relaxation) ─
+// ── IntrinsicCall-bearing callee is NOT inlined (frame-sensitivity) ───
+// D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC
 // f() { return some_intrinsic(5); }  main() { return f(); }
-// f is single-block and contains an `IntrinsicCall` (a distinct call-like
-// opcode). OPT7 cycle 6 LIFTS the IntrinsicCall refusal: the intrinsic
-// clones SSA-correctly via the splice's generic arm — its id lives in the
-// inst PAYLOAD (a module-stable integer copied verbatim) and its operands
-// (the args) remap through the `local` map. So f is inlined: main's Call
-// vanishes, the IntrinsicCall is CLONED into main (count 1 → 2 — f's
-// original body is not deleted; that is DCE's job), and main's Return
-// reads the spliced intrinsic.
-// RED-on-disable: re-adding the `IntrinsicCall` arm in inlineLegalityGate
-// refuses f → callsInlined stays 0 and main's Call survives → every
-// assertion below flips. (Frame-sensitivity caveat — a frame-sensitive
-// intrinsic must NOT be inlined — is trigger-gated to the first such
-// intrinsic: D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC.)
-TEST(Inlining, IntrinsicCalleeIsInlined) {
+// f is single-block and contains an `IntrinsicCall`. OPT7 cycle 6 ADMITTED
+// such a callee because the splice clones it SSA-correctly (the id lives in
+// the inst PAYLOAD, copied verbatim; the args remap through `local`). But
+// SSA-correctness is not FRAME-correctness: a frame-sensitive intrinsic
+// (va_start / frameaddress / returnaddress / stacksave / setjmp-class)
+// MEANS the frame it executes in, and spliced into the caller it binds to
+// the CALLER's frame — a silent miscompile. The MIR payload is a BARE
+// intrinsic id (a per-CU HIR-registry index MIR does not carry), so the
+// gate cannot tell the two kinds apart and REFUSES what it cannot prove
+// safe — the rule every sibling arm follows (Va*Addr, returns-twice Call,
+// Seh*, StackSave/StackRestore, RecvByValueStackParam).
+// The POSITIVE CONTROL in the same module is load-bearing: an
+// intrinsic-FREE callee still inlines, so this pins an INTRINSIC-SPECIFIC
+// refusal and goes red if the gate ever degrades into refuse-everything.
+// RED-on-disable: delete the `IntrinsicCall` arm in inlineLegalityGate →
+// f inlines → callsInlined becomes 2 and the Call count drops to 0.
+TEST(Inlining, IntrinsicCalleeIsNotInlined) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
@@ -1661,39 +1667,57 @@ TEST(Inlining, IntrinsicCalleeIsInlined) {
         mb.addInst(MirOpcode::IntrinsicCall, intrinOps, i32, kIntrinsicId);
     mb.addReturn(intrin);
 
-    // main (SymbolId 100): return f();
+    // h (SymbolId 66): the POSITIVE CONTROL — same shape as f but its body
+    // is a plain Add instead of an IntrinsicCall, so nothing about it is
+    // frame-sensitive and it MUST still inline.
+    mb.addFunction(fnSig, SymbolId{66});
+    MirBlockId const hEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(hEntry);
+    MirInstId const two   = mb.addConst(i32Lit(2), i32);
+    MirInstId const three = mb.addConst(i32Lit(3), i32);
+    MirInstId const hAddOps[] = {two, three};
+    MirInstId const hSum = mb.addInst(MirOpcode::Add, hAddOps, i32);
+    mb.addReturn(hSum);
+
+    // main (SymbolId 100): return f() + h();
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(mEntry);
     MirInstId const fAddr = mb.addGlobalAddr(SymbolId{55}, fnSig);
-    MirInstId const callOps[] = {fAddr};
-    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
-    mb.addReturn(call);
+    MirInstId const fCallOps[] = {fAddr};
+    MirInstId const fCall = mb.addInst(MirOpcode::Call, fCallOps, i32);
+    MirInstId const hAddr = mb.addGlobalAddr(SymbolId{66}, fnSig);
+    MirInstId const hCallOps[] = {hAddr};
+    MirInstId const hCall = mb.addInst(MirOpcode::Call, hCallOps, i32);
+    MirInstId const sumOps[] = {fCall, hCall};
+    mb.addReturn(mb.addInst(MirOpcode::Add, sumOps, i32));
     Mir mir = std::move(mb).finish();
 
-    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);          // main→f
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);          // main→f, main→h
     ASSERT_EQ(countOpInModule(mir, MirOpcode::IntrinsicCall), 1u);  // in f
 
     DiagnosticReporter rep;
     auto const r = opt::passes::runInlining(mir, interner, rep,
                                             opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
+    // EXACTLY ONE inline: h (intrinsic-free) yes, f (IntrinsicCall) no.
     EXPECT_EQ(r.callsInlined, 1u)
-        << "OPT7 cycle 6: a single-block callee containing an IntrinsicCall "
-           "MUST now be inlined";
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
-        << "main's Call to the IntrinsicCall-bearing f must be spliced away";
-    // BODY-PRESENT: the intrinsic is CLONED into main; f's original stays
-    // (the inliner never deletes a callee body — that is DCE's job), so the
-    // module-wide IntrinsicCall count rises 1 → 2.
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::IntrinsicCall), 2u)
-        << "the IntrinsicCall must be CLONED into main (count 1 → 2; f's "
-           "original body is not deleted by the inliner)";
+        << "the IntrinsicCall-bearing callee f must be REFUSED while the "
+           "intrinsic-free control h is inlined — a frame-sensitive intrinsic "
+           "spliced into the caller would bind to the CALLER's frame "
+           "(D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC)";
+    // f's Call SURVIVES (out-of-line); h's is spliced away → exactly 1 left.
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
+        << "main's Call to the IntrinsicCall-bearing f must SURVIVE (refused), "
+           "while the control call to h is spliced away";
+    // NOT CLONED: the intrinsic stays put in f. A count of 2 means the gate
+    // admitted f and copied the intrinsic into main's frame.
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::IntrinsicCall), 1u)
+        << "the IntrinsicCall must NOT be cloned into main (count stays 1)";
 
-    // VALUE-THREADING: main's Return now reads the spliced intrinsic — the
-    // intrinsic's result became the inlined call's result. A broken
-    // payload/operand clone would either fail to verify or thread a wrong
-    // value; this pins the result actually flows to the caller's use.
+    // The surviving Call must be the one to f (SymbolId 55) — proving the
+    // refusal is keyed on the INTRINSIC-bearing callee and not just "some
+    // call did not inline".
     {
         MirFuncId mainFn{};
         std::size_t const nf = mir.moduleFuncCount();
@@ -1701,41 +1725,43 @@ TEST(Inlining, IntrinsicCalleeIsInlined) {
             if (mir.funcSymbol(mir.funcAt(i)).v == 100u) mainFn = mir.funcAt(i);
         }
         ASSERT_TRUE(mainFn.valid());
-        bool foundReturn = false;
+        bool foundCall = false;
         std::uint32_t const nb = mir.funcBlockCount(mainFn);
         for (std::uint32_t bi = 0; bi < nb; ++bi) {
             MirBlockId const b = mir.funcBlockAt(mainFn, bi);
             std::uint32_t const ni = mir.blockInstCount(b);
             for (std::uint32_t i = 0; i < ni; ++i) {
                 MirInstId const id = mir.blockInstAt(b, i);
-                if (mir.instOpcode(id) != MirOpcode::Return) continue;
-                foundReturn = true;
-                auto const rops = mir.instOperands(id);
-                ASSERT_EQ(rops.size(), 1u);
-                EXPECT_EQ(mir.instOpcode(rops[0]), MirOpcode::IntrinsicCall)
-                    << "main's Return must read the spliced IntrinsicCall "
-                       "(value-threading through the inlined call result)";
+                if (mir.instOpcode(id) != MirOpcode::Call) continue;
+                foundCall = true;
+                auto const cops = mir.instOperands(id);
+                ASSERT_FALSE(cops.empty());
+                EXPECT_EQ(mir.globalAddrSymbol(cops[0]).v, 55u)
+                    << "the surviving Call must target f (the intrinsic-bearing "
+                       "callee), not the control h";
             }
         }
-        EXPECT_TRUE(foundReturn) << "main must have a Return";
+        EXPECT_TRUE(foundCall) << "main must retain the refused Call to f";
     }
 
     MirVerifier verifier{mir, &interner};
     EXPECT_TRUE(verifier.verify(rep));
 }
 
-// ── MULTI-BLOCK IntrinsicCall callee IS inlined (intrinsic in a NON-
-// entry block) ──────────────────────────────────────────────────────
+// ── MULTI-BLOCK IntrinsicCall callee is NOT inlined (intrinsic in a
+// NON-entry block) ──────────────────────────────────────────────────
+// D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC
 // f() { entry: Br B1; B1: t = some_intrinsic(5); return t; }
 // main() { return f(); }
 // f is 2-block (routes through MultiBlockInliner, NOT the single-block
 // linear arm) and carries the IntrinsicCall in its NON-entry block B1.
-// Proves the cycle-6 relaxation holds on the multi-block CFG-clone path
-// too: the IntrinsicCall is cloned via the same generic arm into main
-// (count 1 → 2 — body-present), no merge Phi is introduced (single
-// return), and the module verifies. RED-on-disable: re-adding the
-// IntrinsicCall gate arm refuses f → callsInlined stays 0, Call survives.
-TEST(Inlining, MultiBlockIntrinsicCalleeIsInlined) {
+// The gate's body scan walks EVERY block of the callee, so the refusal
+// must fire from a non-entry block just as it does from the entry — a
+// scan that only looked at the entry block would let a frame-sensitive
+// intrinsic through on exactly this shape.
+// RED-on-disable: delete the `IntrinsicCall` arm in inlineLegalityGate →
+// f inlines → callsInlined becomes 1 and the Call count drops to 0.
+TEST(Inlining, MultiBlockIntrinsicCalleeIsNotInlined) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
@@ -1777,62 +1803,33 @@ TEST(Inlining, MultiBlockIntrinsicCalleeIsInlined) {
     auto const r = opt::passes::runInlining(mir, interner, rep,
                                             opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
-    EXPECT_EQ(r.callsInlined, 1u)
-        << "a multi-block callee with an IntrinsicCall in a non-entry block "
-           "MUST be inlined (cycle-6 relaxation on the multi-block path)";
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
-        << "main's Call must be replaced by the spliced multi-block body";
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::IntrinsicCall), 2u)
-        << "the IntrinsicCall must be CLONED into main (count 1 → 2; f's "
-           "original body is not deleted by the inliner)";
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi), 0u)
-        << "a single-return multi-block callee elides the merge Phi — the "
-           "intrinsic relaxation must not introduce one";
-
-    // VALUE-THREADING through the multi-block return-merge: main's Return
-    // reads the spliced intrinsic (the single return edge's value, Phi
-    // elided). This pins the value path DISTINCT from the single-block
-    // linear splice — here it flows through the return-edge merge.
-    {
-        MirFuncId mainFn{};
-        std::size_t const nf = mir.moduleFuncCount();
-        for (std::uint32_t i = 0; i < nf; ++i) {
-            if (mir.funcSymbol(mir.funcAt(i)).v == 100u) mainFn = mir.funcAt(i);
-        }
-        ASSERT_TRUE(mainFn.valid());
-        bool foundReturn = false;
-        std::uint32_t const nb = mir.funcBlockCount(mainFn);
-        for (std::uint32_t bi = 0; bi < nb; ++bi) {
-            MirBlockId const b = mir.funcBlockAt(mainFn, bi);
-            std::uint32_t const ni = mir.blockInstCount(b);
-            for (std::uint32_t i = 0; i < ni; ++i) {
-                MirInstId const id = mir.blockInstAt(b, i);
-                if (mir.instOpcode(id) != MirOpcode::Return) continue;
-                foundReturn = true;
-                auto const rops = mir.instOperands(id);
-                ASSERT_EQ(rops.size(), 1u);
-                EXPECT_EQ(mir.instOpcode(rops[0]), MirOpcode::IntrinsicCall)
-                    << "main's Return must read the spliced IntrinsicCall "
-                       "(value-threading through the multi-block return merge)";
-            }
-        }
-        EXPECT_TRUE(foundReturn) << "main must have a Return";
-    }
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "a multi-block callee carrying an IntrinsicCall in a NON-ENTRY "
+           "block must be REFUSED — the gate's body scan covers every block, "
+           "so frame-sensitivity cannot hide behind a Br "
+           "(D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
+        << "main's Call must SURVIVE (f refused, kept out-of-line)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::IntrinsicCall), 1u)
+        << "the IntrinsicCall must NOT be cloned into main (count stays 1)";
 
     MirVerifier verifier{mir, &interner};
     EXPECT_TRUE(verifier.verify(rep));
 }
 
-// ── VOID callee with an IntrinsicCall whose result is UNUSED IS inlined
-// ───────────────────────────────────────────────────────────────────
+// ── VOID callee with an IntrinsicCall whose result is UNUSED is NOT
+// inlined ───────────────────────────────────────────────────────────
+// D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC
 // g() { some_intrinsic(5); return; }  main() { g(); return 0; }
-// The intrinsic is a side-effecting statement (its value is discarded)
-// and g is void. Exercises the intrinsic relocation INDEPENDENT of
-// return-value threading (the void invalid-result-id splice path): the
-// IntrinsicCall must still be spliced into main even though nothing reads
-// it, and the module must verify. RED-on-disable: re-adding the
-// IntrinsicCall gate arm refuses g.
-TEST(Inlining, VoidIntrinsicCalleeIsInlined) {
+// The intrinsic is a side-effecting STATEMENT (its value is discarded)
+// and g is void. This is the shape that matters most for frame
+// sensitivity: `va_start(ap, n)` / `stackrestore(sp)` are exactly
+// value-less intrinsics called for their frame effect alone. A gate that
+// keyed on the intrinsic's RESULT being used would wave this one through
+// while refusing the harmless value-producing ones — precisely backwards.
+// RED-on-disable: delete the `IntrinsicCall` arm in inlineLegalityGate →
+// g inlines → callsInlined becomes 1 and the Call count drops to 0.
+TEST(Inlining, VoidIntrinsicCalleeIsNotInlined) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32     = interner.primitive(TypeKind::I32);
     TypeId const voidSig = interner.fnSig({}, InvalidType, CallConv::CcSysV);
@@ -1869,17 +1866,85 @@ TEST(Inlining, VoidIntrinsicCalleeIsInlined) {
     auto const r = opt::passes::runInlining(mir, interner, rep,
                                             opt::kMaxInlineThreshold);
     EXPECT_TRUE(r.ok);
-    EXPECT_EQ(r.callsInlined, 1u)
-        << "a void callee containing an IntrinsicCall MUST be inlined";
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
-        << "main's void Call to g must be replaced by the spliced body";
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::IntrinsicCall), 2u)
-        << "the IntrinsicCall must be CLONED into main (count 1 → 2; g's "
-           "original body is not deleted by the inliner)";
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "a VOID callee whose IntrinsicCall result is unused must be "
+           "REFUSED — a value-less intrinsic is called for its FRAME EFFECT, "
+           "the most frame-sensitive shape there is "
+           "(D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
+        << "main's void Call to g must SURVIVE (refused, kept out-of-line)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::IntrinsicCall), 1u)
+        << "the IntrinsicCall must NOT be cloned into main (count stays 1)";
 
     MirVerifier verifier{mir, &interner};
     EXPECT_TRUE(verifier.verify(rep))
-        << "the void-intrinsic splice (invalid result id) must verify clean";
+        << "the module must still verify with the refused Call left in place";
+}
+
+// ── RecoverParentFrameSlot-bearing callee is NOT inlined ─────────────
+// D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC (fail-safe backstop arm)
+// f(base) { return recover_parent_frame_slot(base, slot#3); }
+// main() { return f(p); }
+// The op resolves its PAYLOAD — a scan-order frame-SLOT INDEX — against
+// the FrameLayout of the frame its base operand establishes, so it is
+// frame-sensitive by construction and belongs to the same refusal family
+// as Va*Addr / Seh* / StackSave.
+// ★ MEASURED UNREACHABLE TODAY, AND THAT IS WHY THIS PIN EXISTS: the op
+// is minted only by `synthesizeSehFunclets`, which `compile_pipeline` runs
+// strictly AFTER the optimizer, so no real compile can present one to this
+// gate. That is a PIPELINE ORDERING, not an invariant the gate can see —
+// exactly the kind of precondition that rots silently when someone
+// reorders a pass. Pinning the arm here means the guard is EXERCISED
+// rather than merely present.
+// RED-on-disable: delete the `RecoverParentFrameSlot` arm in
+// inlineLegalityGate → f inlines → callsInlined becomes 1.
+TEST(Inlining, RecoverParentFrameSlotCalleeIsNotInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr    = interner.pointer(i32);
+    TypeId const params[] = {ptr};
+    TypeId const fnSig  = interner.fnSig(params, ptr, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // f (SymbolId 55): recovers slot #3 off its establisher-frame arg.
+    mb.addFunction(fnSig, SymbolId{55});
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(fEntry);
+    MirInstId const base = mb.addArg(0, ptr);
+    MirInstId const recoverOps[] = {base};
+    constexpr std::uint32_t kSlotIndex = 3;
+    mb.addReturn(mb.addInst(MirOpcode::RecoverParentFrameSlot, recoverOps,
+                            ptr, kSlotIndex));
+
+    // main (SymbolId 100): return f(null-ish base).
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const mArg  = mb.addArg(0, ptr);
+    MirInstId const fAddr = mb.addGlobalAddr(SymbolId{55}, fnSig);
+    MirInstId const callOps[] = {fAddr, mArg};
+    mb.addReturn(mb.addInst(MirOpcode::Call, callOps, ptr));
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::RecoverParentFrameSlot), 1u);
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "a callee containing RecoverParentFrameSlot must be REFUSED — its "
+           "payload is a slot index into the frame its base establishes, so a "
+           "splice would resolve it against the WRONG FrameLayout "
+           "(D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u)
+        << "main's Call must SURVIVE (f refused, kept out-of-line)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::RecoverParentFrameSlot), 1u)
+        << "RecoverParentFrameSlot must NOT be cloned into main";
+
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep));
 }
 
 // ── VOID single-block leaf callee IS inlined (invalid-result-id path) ─
