@@ -6,6 +6,7 @@
 #include "core/substrate/relocation_table.hpp"
 #include "core/types/ascii_case.hpp"
 #include "core/types/config_document_memo.hpp"    // the ONE content-addressed schema memo
+#include "core/types/config_key_vocabulary.hpp"   // renderAllowedList (JSON-free)
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
@@ -182,6 +183,30 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         problems.push_back(makeProblem(std::move(path), std::move(msg)));
     };
 
+    // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: which register banks
+    // this target actually HAS. An encoding field declared to draw from a bank
+    // with no rows in `registers[]` can never be legally filled — naming `vr`
+    // on a target whose table has no vector registers is an authoring error
+    // that would otherwise surface as a refusal of CORRECT input at encode
+    // time. Derived from the register table (never a literal list of classes)
+    // so a target that adds a bank needs no edit here.
+    //
+    // ⚠ SCOPED TO A TARGET THAT HAS A REGISTER TABLE AT ALL, and that is a
+    // boundary rather than an exemption: with `registers[]` EMPTY the document
+    // declares no register vocabulary, so "the bank you named is not in your
+    // table" says nothing an author can act on — EVERY bank would be wrong.
+    // Such a document is already fail-loud at the encoder (`registerInfo`
+    // returns null for every ordinal, and `hwEncodingOf` refuses), so nothing
+    // silent survives the narrowing; what it buys is that a minimal
+    // schema-shape document — the loader's own unit fixtures — is not made to
+    // carry a register file it never encodes against.
+    std::array<bool, kTargetRegClassTable.rows.size()> bankPopulated{};
+    bool const hasRegisterTable = !registers.empty();
+    for (auto const& r : registers) {
+        auto const bi = static_cast<std::size_t>(r.regClass);
+        if (bi < bankPopulated.size()) bankPopulated[bi] = true;
+    }
+
     // ── Encoding facet (per-opcode variants) ──────────────────────
     //
     // Substrate-tier rules the per-row JSON parse cannot express:
@@ -222,6 +247,35 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                              "A_NoMatchingEncodingVariant)",
                              o.mnemonic,
                              targetEncodingShapeName(o.encoding.shape)));
+        }
+        // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: an
+        // `encoding.registerClass` on an opcode NO field of which ever takes a
+        // register (`nop`, `ret`, x87's stack-implicit `faddp`) governs
+        // nothing. Same coherence family as `negValue` on a guard with no
+        // value operand: a declaration that reads as a guarantee and enforces
+        // nothing is worse than its absence, because the next author trusts it.
+        if (o.encoding.registerClass.has_value()) {
+            bool anyRegisterField = false;
+            for (auto const& v : o.encoding.variants) {
+                if (v.resultSlot.has_value()) { anyRegisterField = true; break; }
+                for (auto const& w : v.wires) {
+                    if (w.index < v.operandKinds.size()
+                        && v.operandKinds[w.index] == OperandKindFilter::Reg) {
+                        anyRegisterField = true;
+                        break;
+                    }
+                }
+                if (anyRegisterField) break;
+            }
+            if (!anyRegisterField) {
+                fail(std::format("/opcodes/{}/encoding/registerClass", i),
+                     std::format("opcode '{}': declares "
+                                 "`encoding.registerClass` = '{}' but no "
+                                 "variant has a result slot or a register "
+                                 "operand — the bank governs no field",
+                                 o.mnemonic,
+                                 targetRegClassName(*o.encoding.registerClass)));
+            }
         }
         for (std::size_t vi = 0; vi < o.encoding.variants.size(); ++vi) {
             auto const& v = o.encoding.variants[vi];
@@ -358,6 +412,134 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "reference whose direction could be routed",
                                  o.mnemonic, vi));
             }
+            // ── D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD ───────
+            // TOTALITY of the register-bank declaration. Every field this
+            // variant will hand a REGISTER to must resolve to exactly one
+            // declared, operable, POPULATED bank — either the field's own
+            // `regClass`/`resultRegClass` or the opcode's
+            // `encoding.registerClass`. An unresolved field is refused HERE,
+            // at load, naming the opcode/variant/field: the encoder's class
+            // gate can only compare against a class it was given, so a field
+            // with no declared bank would be a hole in the gate, and a hole in
+            // this particular gate is a silent wrong-register miscompile (the
+            // `cvttss2si %xmm15` shape this anchor is named for).
+            //
+            // ⚠ "REGISTER-BEARING" IS READ OFF THE GUARD, NOT OFF THE SLOT
+            // KIND. The wired operand's KIND decides whether a register ever
+            // reaches the field: `modrm.rm.mem` takes a `reg` operand (a memory
+            // BASE register) while `membase.scale` takes a `membase` marker and
+            // `disp32.mem` a `memoffset` — same instruction, three slots, one
+            // register. The guard filter is the only thing that says which.
+            auto const bankName = [](std::optional<TargetRegClass> c) {
+                return c.has_value() ? targetRegClassName(*c)
+                                     : std::string_view{"<none>"};
+            };
+            auto const checkFieldBank =
+                [&](std::string path, std::string_view fieldDesc,
+                    std::optional<TargetRegClass> declared,
+                    bool overridden) {
+                    if (!declared.has_value()) {
+                        fail(std::move(path),
+                             std::format(
+                                 "opcode '{}' variant {}: {} takes a register "
+                                 "but no register bank is declared for it — "
+                                 "add `encoding.registerClass` to the opcode, "
+                                 "or `regClass`/`resultRegClass` to this field "
+                                 "(one of {}). Without it the encoder cannot "
+                                 "tell a GPR ordinal placed in an FPR field "
+                                 "from a correct encoding, and writes the "
+                                 "wrong register silently",
+                                 o.mnemonic, vi, fieldDesc,
+                                 detail::renderAllowedList(
+                                     kOperableTargetRegClassNames, " / ")));
+                        return;
+                    }
+                    if (!isOperableTargetRegClass(*declared)) {
+                        fail(std::move(path),
+                             std::format(
+                                 "opcode '{}' variant {}: {} declares register "
+                                 "bank '{}', which is the no-class sentinel — "
+                                 "a field that takes a register draws from a "
+                                 "real bank (one of {})",
+                                 o.mnemonic, vi, fieldDesc,
+                                 bankName(declared),
+                                 detail::renderAllowedList(
+                                     kOperableTargetRegClassNames, " / ")));
+                        return;
+                    }
+                    if (!hasRegisterTable) return;
+                    auto const bi = static_cast<std::size_t>(*declared);
+                    if (bi >= bankPopulated.size() || !bankPopulated[bi]) {
+                        fail(std::move(path),
+                             std::format(
+                                 "opcode '{}' variant {}: {} declares register "
+                                 "bank '{}' but this target's `registers[]` "
+                                 "table has no register of that class — no "
+                                 "operand could ever satisfy the field, so "
+                                 "every instruction using it would be refused "
+                                 "at encode time{}",
+                                 o.mnemonic, vi, fieldDesc,
+                                 bankName(declared),
+                                 overridden
+                                     ? " (the bank came from this field's own "
+                                       "override)"
+                                     : " (the bank came from the opcode's "
+                                       "`encoding.registerClass`)"));
+                    }
+                };
+            if (v.resultSlot.has_value()) {
+                checkFieldBank(
+                    std::format("/opcodes/{}/encoding/variants/{}/resultSlot",
+                                i, vi),
+                    std::format("the result field '{}'",
+                                encodingSlotKindName(*v.resultSlot)),
+                    encodingResultRegClass(o.encoding, v),
+                    v.resultRegClass.has_value());
+            } else if (v.resultRegClass.has_value()) {
+                // A bank for a field the variant does not have. Same coherence
+                // family as `negValue` without a value operand: a declaration
+                // that governs nothing reads as a guarantee and is none.
+                fail(std::format(
+                         "/opcodes/{}/encoding/variants/{}/resultRegClass",
+                         i, vi),
+                     std::format("opcode '{}' variant {}: declares "
+                                 "`resultRegClass` but has no `resultSlot` — "
+                                 "there is no result field for the bank to "
+                                 "govern",
+                                 o.mnemonic, vi));
+            }
+            for (std::size_t wi = 0; wi < v.wires.size(); ++wi) {
+                auto const& w = v.wires[wi];
+                // Out-of-range indexes are reported by their own rule below;
+                // skip them here rather than reporting the same author error
+                // twice in two vocabularies.
+                if (w.index >= v.operandKinds.size()) continue;
+                bool const carriesRegister =
+                    v.operandKinds[w.index] == OperandKindFilter::Reg;
+                if (carriesRegister) {
+                    checkFieldBank(
+                        std::format(
+                            "/opcodes/{}/encoding/variants/{}/wires/{}", i, vi,
+                            wi),
+                        std::format("operand {} → field '{}'", w.index,
+                                    encodingSlotKindName(w.slotKind)),
+                        encodingWireRegClass(o.encoding, w),
+                        w.regClass.has_value());
+                } else if (w.regClass.has_value()) {
+                    fail(std::format(
+                             "/opcodes/{}/encoding/variants/{}/wires/{}/regClass",
+                             i, vi, wi),
+                         std::format("opcode '{}' variant {}: wire {} declares "
+                                     "a `regClass` but its guard operand {} is "
+                                     "'{}', not a register — the field never "
+                                     "receives a register, so the bank governs "
+                                     "nothing",
+                                     o.mnemonic, vi, wi, w.index,
+                                     operandKindFilterName(
+                                         v.operandKinds[w.index])));
+                }
+            }
+
             // `opcodeBytes` is meaningful only for the x86-variable
             // shape. fixed32 carries the analog as `fixedWord` (a
             // 32-bit base bit pattern). The "non-empty" rule
@@ -1667,6 +1849,42 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         checkRefs(i, "returnVrs",   cc.returnVrs,   TargetRegClass::VR);
         checkRefs(i, "callerSaved", cc.callerSaved, TargetRegClass::None);
         checkRefs(i, "calleeSaved", cc.calleeSaved, TargetRegClass::None);
+
+        // ── D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD ───────────────
+        // An `aapcs64_dual_cursor` variadic prologue spills `fpSaveCount`
+        // VECTOR argument registers at `fpSlotBytes` each, through the vector
+        // class's own store opcode. The registers it spills come from
+        // `argVrs` — the list `checkRefs` above has already proved is
+        // VR-class — so the list must COVER the count.
+        //
+        // ⚠ THE RULE EXISTS BECAUSE THE PROLOGUE USED TO READ `argFprs`, and
+        // that is a different register file's NARROW VIEW of the same file.
+        // ✔MEASURED: `d0..d7` (8 bytes, class `fpr`) were emitted as the data
+        // operand of a 16-byte `STUR Qt`, and the bytes came out right only
+        // because `d0` and `v0` share hardware encoding 0 — the wrong-class
+        // operand that produces a correct-looking instruction, which is this
+        // anchor's entire subject. Its two symptoms were an operand claiming
+        // half the width the instruction moves, and two producers of one
+        // opcode disagreeing about its operand's register file.
+        //
+        // A short `argVrs` would silently spill FEWER registers than the
+        // save-area geometry reserves slots for, so `va_arg` would read
+        // uninitialised stack for the tail — refuse it here, where the ABI is
+        // declared, rather than emit a prologue that does not fill its area.
+        if (cc.vaListLayout.has_value()
+            && cc.vaListLayout->strategy == VaListStrategy::Aapcs64DualCursor
+            && cc.vaListLayout->fpSaveCount > cc.argVrs.size()) {
+            fail(std::format("/callingConventions/{}/argVrs", i),
+                 std::format("calling convention '{}': its "
+                             "`aapcs64_dual_cursor` vaListLayout reserves {} "
+                             "vector save slots but `argVrs` names only {} "
+                             "vector register(s) — the variadic prologue "
+                             "spills the FULL-WIDTH vector arg registers from "
+                             "this list, and a short list leaves the tail of "
+                             "the save area unwritten",
+                             cc.name, cc.vaListLayout->fpSaveCount,
+                             cc.argVrs.size()));
+        }
 
         // ── D-TARGET-ARG-POOLS-WITHOUT-DWARF-NUMBERS-CANNOT-BE-RELATED ──
         //

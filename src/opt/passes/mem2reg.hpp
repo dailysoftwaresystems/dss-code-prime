@@ -60,6 +60,17 @@ struct Mem2RegResult {
     std::size_t phisInserted      = 0;
     std::size_t loadsReplaced     = 0;
     std::size_t storesEliminated  = 0;
+    // Bit-preserving pointer `Bitcast`s emitted so a promoted value arrives at its
+    // use carrying the POINTEE the memory slot (or the replaced Load) declared —
+    // D-OPT-MEM2REG-ERASES-CALL-OPERAND-POINTEE. Zero for every module whose stores
+    // already write the slot's exact pointer type, which is the overwhelming
+    // majority; nonzero exactly where the pass USED to erase a pointee silently.
+    std::size_t retagsInserted    = 0;
+    // Anonymous read-only `MirGlobal`s minted to hold an FPR undef-as-zero
+    // (D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO). One per (function, float
+    // element type) that needed one; zero for every module with no conditionally-
+    // initialized float local.
+    std::size_t rodataZerosMinted = 0;
 };
 
 [[nodiscard]] DSS_EXPORT Mem2RegResult

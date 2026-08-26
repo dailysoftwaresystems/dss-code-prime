@@ -438,3 +438,11 @@ target_link_libraries(dss_link_test_merged_foreign_unwind
 # edited documents still load.
 dss_add_test(NAME link/test_lto_summary_ir_sections
              SOURCES test_lto_summary_ir_sections.cpp)
+
+# D-LINK-MERGE-DOES-NOT-REMAP-BLOCK-SYMBOLS — the cross-CU merge remapped a
+# function's own symbol and every relocation target but NOT its `blockSymbols`, so a
+# jump table's data relocation named an id the merged module never declared. Needs
+# TWO CUs by construction: with one module the id mint is the identity and the bug
+# cannot fire, which is why a 103-TU program found it and no single-CU pin did.
+dss_add_test(NAME link/test_merge_block_symbols
+             SOURCES test_merge_block_symbols.cpp)

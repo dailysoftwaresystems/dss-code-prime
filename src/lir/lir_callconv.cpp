@@ -1470,12 +1470,26 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
         // VR block: 16-byte slots via the 128-bit `fstur_q` (the class store is the
         // 8-byte D-form, which would spill only the low half of a v-register), at
         // [scratch + gpBlock + i*16]. The VR block follows the full GR block.
+        //
+        // ★★ THE REGISTERS COME FROM `argVrs`, NOT `argFprs`
+        // (D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD). Those two CC lists
+        // name TWO VIEWS of one AArch64 register file: `argFprs` = `d0..d7`
+        // (8 bytes, class `fpr`), `argVrs` = `v0..v7` (16 bytes, class `vr`).
+        // This loop emits a SIXTEEN-byte store, so its data operand is the
+        // 16-byte view — the same one the target's `registerClassOps` `vr` row
+        // binds `fstur_q` to, and the same one `mir_to_lir`'s F128 path already
+        // uses for this opcode. Reading `argFprs` here (the shape this replaced)
+        // produced the RIGHT BYTES from the WRONG REGISTER: `d0` and `v0` share
+        // hardware encoding 0, so the operand claimed half the width the
+        // instruction moves and nothing downstream could see it. The encoder's
+        // register-class gate is what surfaced it, and `validate()` now pins
+        // `argVrs` to cover `fpSaveCount` so the list cannot come up short.
         std::uint32_t const vrBase = vl.gpSaveCount * vl.gpSlotBytes;
         std::uint32_t const fpN =
             std::min<std::uint32_t>(vl.fpSaveCount,
-                                    static_cast<std::uint32_t>(cc.argFprs.size()));
+                                    static_cast<std::uint32_t>(cc.argVrs.size()));
         for (std::uint32_t i = 0; i < fpN; ++i) {
-            auto const reg = resolveCcReg(schema, cc.argFprs[i], LirRegClass::FPR,
+            auto const reg = resolveCcReg(schema, cc.argVrs[i], LirRegClass::VR,
                                           "callconv: AAPCS64 variadic VR spill",
                                           reporter);
             if (!reg.has_value()) return false;

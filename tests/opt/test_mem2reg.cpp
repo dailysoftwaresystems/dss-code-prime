@@ -349,21 +349,22 @@ TEST(Mem2Reg, ConditionallyInitializedLoadZeroFillsUninitPath) {
     EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep));
 }
 
-// D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF (FPR arm) — a conditionally-initialized DOUBLE
-// has no directly-lowerable zero Const (register machines have no float-immediate),
-// so Mem2Reg DE-PROMOTES it (leaves the alloca/store/load as memory — always correct)
-// rather than emit an unlowerable float Const. The store value is a real double ARG
-// (not a synthetic float Const), matching how HIR→MIR shapes floats. RED-on-disable:
-// remove the de-promotion → the pass tries a float Const 0 and hits the non-zeroable
-// assert (abort). A fully-initialized float (both arms store) still promotes — only
-// the conditional-init case de-promotes.
-TEST(Mem2Reg, ConditionallyInitializedFloatAllocaIsDepromoted) {
-    TypeInterner interner{CompilationUnitId{1}};
-    TypeId const f64   = interner.primitive(TypeKind::F64);
+// ── D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO ────────────────────────────
+//
+// Build `T x; if (c) x = v; return x;` for a FLOAT element type and run Mem2Reg.
+// Returns the finished module so each arm can assert on it. The store value is a
+// real ARG (not a synthetic float Const), matching how HIR→MIR shapes floats.
+struct CondInitFloatFixture {
+    Mir                        mir;
+    opt::passes::Mem2RegResult result;
+};
+
+CondInitFloatFixture runCondInitFloat(TypeInterner& interner, TypeKind floatKind) {
+    TypeId const fT    = interner.primitive(floatKind);
     TypeId const boolT = interner.primitive(TypeKind::Bool);
-    TypeId const ptr   = interner.pointer(f64);
-    TypeId const params[] = {boolT, f64};
-    TypeId const fnSig = interner.fnSig(params, f64, CallConv::CcSysV);
+    TypeId const ptr   = interner.pointer(fT);
+    TypeId const params[] = {boolT, fT};
+    TypeId const fnSig = interner.fnSig(params, fT, CallConv::CcSysV);
 
     MirBuilder mb;
     mb.addFunction(fnSig, SymbolId{100});
@@ -373,7 +374,7 @@ TEST(Mem2Reg, ConditionallyInitializedFloatAllocaIsDepromoted) {
 
     mb.beginBlock(entry);
     MirInstId const cond = mb.addArg(0, boolT);
-    MirInstId const val  = mb.addArg(1, f64);
+    MirInstId const val  = mb.addArg(1, fT);
     MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
     mb.addCondBr(cond, tArm, join);   // else edge → join: NO store to x
 
@@ -384,21 +385,214 @@ TEST(Mem2Reg, ConditionallyInitializedFloatAllocaIsDepromoted) {
 
     mb.beginBlock(join);
     MirInstId const loadOps[] = {slot};
-    MirInstId const ld = mb.addInst(MirOpcode::Load, loadOps, f64);
+    MirInstId const ld = mb.addInst(MirOpcode::Load, loadOps, fT);
     mb.addReturn(ld);
 
+    CondInitFloatFixture out{std::move(mb).finish(), {}};
+    DiagnosticReporter rep;
+    out.result = opt::passes::runMem2Reg(out.mir, interner, rep);
+    return out;
+}
+
+// D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO — a conditionally-initialized
+// DOUBLE now PROMOTES. A float has no directly-lowerable zero `Const` (register
+// machines have no float-immediate form), so the undef edge's zero is materialized
+// the way DSS materializes EVERY float constant: an anonymous read-only MirGlobal
+// holding the zero bit pattern, reached by `GlobalAddr` + `Load` in the ENTRY block
+// (which dominates every edge). The alloca / store / load all disappear.
+//
+// RED-on-disable: put F32/F64/F80/F128 back on the `ZeroForm::None` arm of
+// `zeroFormFor` (i.e. restore the de-promotion) → `allocasPromoted` falls to 0, no
+// global is minted, and the alloca/store/load survive.
+TEST(Mem2Reg, ConditionallyInitializedFloatAllocaPromotesViaRodataZero) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto fx = runCondInitFloat(interner, TypeKind::F64);
+    Mir const& mir = fx.mir;
+
+    ASSERT_TRUE(fx.result.ok) << "a conditional-init float must compile, not abort";
+    EXPECT_EQ(fx.result.allocasPromoted,   1u)
+        << "an FPR conditional-init alloca now promotes via a rodata zero";
+    EXPECT_EQ(fx.result.phisInserted,      1u);
+    EXPECT_EQ(fx.result.loadsReplaced,     1u);
+    EXPECT_EQ(fx.result.storesEliminated,  1u);
+    EXPECT_EQ(fx.result.rodataZerosMinted, 1u)
+        << "exactly one anonymous zero global for the one float element type";
+
+    // The slot is gone; what remains is the zero's GlobalAddr + Load + the phi.
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Alloca),     0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Store),      0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi),        1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::GlobalAddr), 1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Load),       1u)
+        << "the ONLY surviving Load is the rodata zero's";
+
+    // The minted global: anonymous, read-only, F64-typed, constant-initialized to
+    // +0.0, and — load-bearing — LOCAL-bound so `mergeCuMirs` can never unify it
+    // with anything by name (the c86 D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS class).
+    ASSERT_EQ(mir.moduleGlobalCount(), 1u);
+    MirGlobalId const g = mir.globalAt(0);
+    EXPECT_EQ(mir.globalBinding(g), SymbolBinding::Local)
+        << "a GLOBAL-bound anonymous constant could collapse onto a same-named "
+           "definition in another CU, or strip a real FFI import";
+    EXPECT_EQ(mir.globalVisibility(g), SymbolVisibility::Hidden);
+    EXPECT_TRUE(mir.globalIsConst(g)) << "isConst is asm.cpp's .rodata authority";
+    EXPECT_FALSE(mir.globalIsThreadLocal(g));
+    EXPECT_EQ(mir.globalType(g).v, interner.primitive(TypeKind::F64).v);
+    EXPECT_GT(mir.globalSymbol(g).v, 100u)
+        << "the minted symbol must clear every symbol the module already carries";
+    ASSERT_NE(mir.globalInitLiteralIndex(g), UINT32_MAX)
+        << "the zero must be a CONSTANT initializer, not a runtime-init global";
+    MirLiteralValue const& lv = mir.literalValue(mir.globalInitLiteralIndex(g));
+    ASSERT_TRUE(std::holds_alternative<double>(lv.value));
+    EXPECT_EQ(std::get<double>(lv.value), 0.0);
+    EXPECT_EQ(lv.core, TypeKind::F64);
+
+    // The join Phi's two incomings must BOTH be F64 (the arm's Arg and the zero).
+    forEachPhi(mir, [&](MirInstId phi) {
+        auto const incs = mir.phiIncomings(phi);
+        EXPECT_EQ(incs.size(), 2u);
+        for (auto const& inc : incs) {
+            EXPECT_EQ(mir.instType(inc.value).v, mir.instType(phi).v)
+                << "every incoming carries the slot's element type";
+        }
+    });
+
+    DiagnosticReporter vrep;
+    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep))
+        << "the rodata-zero incoming must be dominance- and type-legal";
+}
+
+// The F32 sibling — the SAME rodata producer, one float width over. Pins that the
+// zero's literal `core` follows the ELEMENT type (the globals byte-emitter narrows
+// double→float on the F32 arm and would emit 8 bytes for a 4-byte slot otherwise).
+TEST(Mem2Reg, ConditionallyInitializedFloat32AllocaPromotesViaRodataZero) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto fx = runCondInitFloat(interner, TypeKind::F32);
+    ASSERT_TRUE(fx.result.ok);
+    EXPECT_EQ(fx.result.allocasPromoted,   1u);
+    EXPECT_EQ(fx.result.rodataZerosMinted, 1u);
+    ASSERT_EQ(fx.mir.moduleGlobalCount(), 1u);
+    MirGlobalId const g = fx.mir.globalAt(0);
+    EXPECT_EQ(fx.mir.globalType(g).v, interner.primitive(TypeKind::F32).v);
+    MirLiteralValue const& lv = fx.mir.literalValue(fx.mir.globalInitLiteralIndex(g));
+    EXPECT_EQ(lv.core, TypeKind::F32) << "the literal's core is the ELEMENT width";
+    DiagnosticReporter vrep;
+    EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep));
+}
+
+// THE FAIL-LOUD-IN-PLACE BOUNDARY — the three float kinds that stay DE-PROMOTED, and
+// the reason differs between them, which is why the boundary is pinned rather than
+// assumed:
+//
+//   F16       — no encodings at any width (D-TARGET-ENCODING-WIDTH-GUARD).
+//   F80/F128  — the CONSTANT would materialize fine; the PHI would not. ✔MEASURED
+//               2026-08-26 at the CLI: with these admitted, `long double x;
+//               if(c) x=p; return x+q;` at `--config=release` refuses with
+//               `L_UnsupportedLoweringForOpcode` ("long double (F80/F128)
+//               control-flow merge (phi) is not yet lowered … needs the memory-home
+//               merge (D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE)") on BOTH
+//               x86_64:elf64-x86_64-linux-exec (long double = F80) and
+//               arm64:elf64-aarch64-linux-exec (long double = F128), while the same
+//               program builds clean at `--config=debug`.
+//
+// For all three the correct answer is DE-PROMOTION (leave it in memory, exactly what
+// the debug pipeline does), never a refusal — a PERF refinement may not turn a
+// program that compiles today into one that does not. The matching `onBlockBegin`
+// abort is the invariant assert that keeps the classification and the de-promotion
+// from drifting apart.
+//
+// RED-on-disable: move any of these onto the `RodataLoad` arm → this test sees
+// `allocasPromoted == 1` and the alloca/store/load gone for that kind.
+TEST(Mem2Reg, ConditionallyInitializedF16AndLongDoubleAllocasStayDepromoted) {
+    for (TypeKind const k : {TypeKind::F16, TypeKind::F80, TypeKind::F128}) {
+        TypeInterner interner{CompilationUnitId{1}};
+        auto fx = runCondInitFloat(interner, k);
+        unsigned const ord = static_cast<unsigned>(k);
+        ASSERT_TRUE(fx.result.ok) << "kind ordinal " << ord
+                                  << " conditional-init must still COMPILE";
+        EXPECT_EQ(fx.result.allocasPromoted,   0u)
+            << "kind ordinal " << ord << " has no usable zero form → de-promoted, "
+               "not refused";
+        EXPECT_EQ(fx.result.rodataZerosMinted, 0u) << "kind ordinal " << ord;
+        EXPECT_EQ(fx.mir.moduleGlobalCount(), 0u)
+            << "no global is minted for a de-promotion (kind ordinal " << ord << ")";
+        EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Alloca), 1u) << ord;
+        EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Store),  1u) << ord;
+        EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Load),   1u) << ord;
+        EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Phi),    0u) << ord;
+        DiagnosticReporter vrep;
+        EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep)) << ord;
+    }
+}
+
+// A GPR conditional-init must NOT have regressed onto the rodata path — an integer
+// zero is a direct `Const 0`, no global, no memory. The complement of the arm above.
+TEST(Mem2Reg, ConditionallyInitializedIntAllocaStillUsesADirectConstZero) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto fx = runCondInitFloat(interner, TypeKind::I32);
+    ASSERT_TRUE(fx.result.ok);
+    EXPECT_EQ(fx.result.allocasPromoted,   1u);
+    EXPECT_EQ(fx.result.rodataZerosMinted, 0u) << "a GPR zero needs no constant pool";
+    EXPECT_EQ(fx.mir.moduleGlobalCount(), 0u);
+    EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Load),       0u);
+    EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::GlobalAddr), 0u);
+    EXPECT_GE(countConstIntInModule(fx.mir, 0), 1u);
+}
+
+// TWO conditionally-initialized floats of DIFFERENT widths in one function: one
+// global per distinct element type, each with its OWN fresh symbol. A shared or
+// re-seeded symbol counter would collapse them onto one arena slot.
+TEST(Mem2Reg, TwoFloatWidthsMintTwoDistinctZeroGlobals) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const f32   = interner.primitive(TypeKind::F32);
+    TypeId const f64   = interner.primitive(TypeKind::F64);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const p32   = interner.pointer(f32);
+    TypeId const p64   = interner.pointer(f64);
+    TypeId const params[] = {boolT, f32, f64};
+    TypeId const fnSig = interner.fnSig(params, f64, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    MirInstId const v32  = mb.addArg(1, f32);
+    MirInstId const v64  = mb.addArg(2, f64);
+    MirInstId const s32  = mb.addInst(MirOpcode::Alloca, {}, p32);
+    MirInstId const s64  = mb.addInst(MirOpcode::Alloca, {}, p64);
+    mb.addCondBr(cond, tArm, join);
+
+    mb.beginBlock(tArm);
+    MirInstId const st32[] = {v32, s32};
+    (void)mb.addInst(MirOpcode::Store, st32, InvalidType);
+    MirInstId const st64[] = {v64, s64};
+    (void)mb.addInst(MirOpcode::Store, st64, InvalidType);
+    mb.addBr(join);
+
+    mb.beginBlock(join);
+    MirInstId const l32ops[] = {s32};
+    MirInstId const l32 = mb.addInst(MirOpcode::Load, l32ops, f32);
+    MirInstId const l64ops[] = {s64};
+    MirInstId const l64 = mb.addInst(MirOpcode::Load, l64ops, f64);
+    MirInstId const widen[] = {l32};
+    MirInstId const w = mb.addInst(MirOpcode::FPExt, widen, f64);
+    MirInstId const sum[] = {w, l64};
+    mb.addReturn(mb.addInst(MirOpcode::FAdd, sum, f64));
     Mir mir = std::move(mb).finish();
 
     DiagnosticReporter rep;
     auto const r = opt::passes::runMem2Reg(mir, interner, rep);
-    ASSERT_TRUE(r.ok) << "a conditional-init float must compile (de-promoted), not abort";
-    EXPECT_EQ(r.allocasPromoted, 0u) << "FPR conditional-init is de-promoted, not zeroed";
-    EXPECT_EQ(r.phisInserted,    0u);
-    // The alloca / store / load stay as MEMORY (unpromoted).
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::Alloca), 1u);
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::Store),  1u);
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::Load),   1u);
-    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi),    0u);
+    ASSERT_TRUE(r.ok);
+    EXPECT_EQ(r.allocasPromoted,   2u);
+    EXPECT_EQ(r.rodataZerosMinted, 2u) << "one zero global per distinct element type";
+    ASSERT_EQ(mir.moduleGlobalCount(), 2u);
+    EXPECT_NE(mir.globalSymbol(mir.globalAt(0)).v,
+              mir.globalSymbol(mir.globalAt(1)).v)
+        << "each minted global needs its OWN symbol";
     DiagnosticReporter vrep;
     EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep));
 }
@@ -992,4 +1186,251 @@ TEST(Mem2Reg, ArrayAllocaNotPromoted) {
     EXPECT_EQ(r.allocasPromoted, 0u)
         << "array alloca (with element-count operand) must not be promoted";
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Alloca), 1u);
+}
+
+// ═══ D-OPT-MEM2REG-ERASES-CALL-OPERAND-POINTEE ═══════════════════════════════
+//
+// THE MEASURED SHAPE, rebuilt at the MIR tier: `examples/c/va_list_param_forward`'s
+// `sumv` does `va_list ap; va_start(ap, n); vsum(n, ap);`. `hir_to_mir` types the
+// `VaHomeArgAreaAddr` leaf `ptr<void>` and stores it into an `ap` slot whose element
+// type is the declared `va_list` (= `ptr<i8>` under Win64). Mem2Reg promotes the slot
+// and — before this fix — forwarded that `ptr<void>` DEFINITION straight into a call
+// operand declared `ptr<i8>`, erasing the pointee with no retagging Cast.
+//
+// The rule this pins is STRICTER than `MirVerifier::sameSlotType`, deliberately:
+// the verifier admits `void*` on either side, and this asserts EXACT TypeId identity
+// at the call operand — i.e. the property the verifier had to give up because of
+// this pass, restored.
+//
+// RED-on-disable: make `isPointerRetag` return false unconditionally → the operand
+// is `ptr<void>` again and `retagsInserted` is 0.
+namespace {
+// Build `int sumv(int n) { va_list ap = <VaHomeArgAreaAddr>; return vsum(n, ap); }`
+// with `int vsum(int, ptr<i8>)`.
+struct VaForwardFixture {
+    Mir        mir;
+    TypeId     declaredVaList{};   // ptr<i8>
+    SymbolId   callee{50};
+};
+
+VaForwardFixture buildVaForward(TypeInterner& interner) {
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const i8T    = interner.primitive(TypeKind::I8);
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const vaList = interner.pointer(i8T);       // the DECLARED va_list
+    TypeId const voidP  = interner.pointer(voidT);     // what the Va* leaf carries
+    TypeId const slotTy = interner.pointer(vaList);    // the `ap` alloca's type
+    TypeId const calleeParams[] = {i32, vaList};
+    TypeId const calleeSig = interner.fnSig(calleeParams, i32, CallConv::CcSysV);
+    TypeId const callerParams[] = {i32};
+    TypeId const callerSig = interner.fnSig(callerParams, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(calleeSig, SymbolId{50},
+                   SymbolBinding::Global, SymbolVisibility::Default);
+    MirBlockId const calleeEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(calleeEntry);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(z, i32));
+
+    mb.addFunction(callerSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const n    = mb.addArg(0, i32);
+    MirInstId const ap   = mb.addInst(MirOpcode::Alloca, {}, slotTy);
+    // The `ptr<void>`-typed frame leaf — the definition that used to be forwarded.
+    MirInstId const home = mb.addInst(MirOpcode::VaHomeArgAreaAddr, {}, voidP);
+    MirInstId const st[] = {home, ap};
+    (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+    MirInstId const ld[] = {ap};
+    MirInstId const apVal = mb.addInst(MirOpcode::Load, ld, vaList);
+    MirInstId const calleeAddr = mb.addGlobalAddr(SymbolId{50}, calleeSig);
+    MirInstId const callOps[] = {calleeAddr, n, apVal};
+    mb.addReturn(mb.addInst(MirOpcode::Call, callOps, i32));
+
+    return VaForwardFixture{std::move(mb).finish(), vaList, SymbolId{50}};
+}
+
+// The type of the LAST Call instruction's operand at flat index `opIndex`
+// (0 = callee), or InvalidType if there is no Call.
+TypeId callOperandType(Mir const& mir, std::size_t opIndex) {
+    TypeId out{};
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(f, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t i2 = 0; i2 < ni; ++i2) {
+                MirInstId const id = mir.blockInstAt(b, i2);
+                if (mir.instOpcode(id) != MirOpcode::Call) continue;
+                auto const ops = mir.instOperands(id);
+                if (opIndex < ops.size()) out = mir.instType(ops[opIndex]);
+            }
+        }
+    }
+    return out;
+}
+} // namespace
+
+TEST(Mem2Reg, PromotedValueArrivesAtCallOperandWithTheDeclaredPointee) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto fx = buildVaForward(interner);
+
+    // BASELINE: the un-promoted module already passes the declared `ptr<i8>` (the
+    // Load carries the slot's element type) — the erasure was purely the pass's.
+    ASSERT_EQ(callOperandType(fx.mir, 2).v, fx.declaredVaList.v)
+        << "pre-condition: the baseline lowering is already type-exact";
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(fx.mir, interner, rep);
+    ASSERT_TRUE(r.ok);
+    EXPECT_EQ(r.allocasPromoted,  1u);
+    EXPECT_EQ(r.loadsReplaced,    1u);
+    EXPECT_EQ(r.retagsInserted,   1u)
+        << "exactly one retagging Bitcast, at the store that wrote the ptr<void>";
+    EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Bitcast), 1u);
+    EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Alloca),  0u);
+    EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Store),   0u);
+    EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Load),    0u);
+
+    // THE ASSERTION THIS ROW EXISTS FOR: exact TypeId identity, not `sameSlotType`
+    // compatibility. Before the fix this was `ptr<void>`.
+    EXPECT_EQ(callOperandType(fx.mir, 2).v, fx.declaredVaList.v)
+        << "Mem2Reg must not erase the declared pointee at a call operand";
+
+    DiagnosticReporter vrep;
+    EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep));
+}
+
+// The retag lands at the STORE, so it also fixes the PHI shape — a diamond whose two
+// arms both store `ptr<void>` into a `ptr<i8>` slot must produce a `ptr<i8>` phi with
+// two `ptr<i8>` incomings. A Load-site-only retag would leave the phi's incomings
+// carrying the erased pointee.
+TEST(Mem2Reg, RetagAtTheStoreKeepsPhiIncomingsTypeExact) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i8T    = interner.primitive(TypeKind::I8);
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const boolT  = interner.primitive(TypeKind::Bool);
+    TypeId const vaList = interner.pointer(i8T);
+    TypeId const voidP  = interner.pointer(voidT);
+    TypeId const slotTy = interner.pointer(vaList);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, vaList, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fArm  = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, slotTy);
+    mb.addCondBr(cond, tArm, fArm);
+
+    mb.beginBlock(tArm);
+    MirInstId const h1 = mb.addInst(MirOpcode::VaHomeArgAreaAddr, {}, voidP);
+    MirInstId const s1[] = {h1, slot};
+    (void)mb.addInst(MirOpcode::Store, s1, InvalidType);
+    mb.addBr(join);
+
+    mb.beginBlock(fArm);
+    MirInstId const h2 = mb.addInst(MirOpcode::VaOverflowArgAreaAddr, {}, voidP);
+    MirInstId const s2[] = {h2, slot};
+    (void)mb.addInst(MirOpcode::Store, s2, InvalidType);
+    mb.addBr(join);
+
+    mb.beginBlock(join);
+    MirInstId const ld[] = {slot};
+    mb.addReturn(mb.addInst(MirOpcode::Load, ld, vaList));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(mir, interner, rep);
+    ASSERT_TRUE(r.ok);
+    EXPECT_EQ(r.phisInserted,   1u);
+    EXPECT_EQ(r.retagsInserted, 2u) << "one retag per mismatching STORE, not per use";
+    bool sawPhi = false;
+    forEachPhi(mir, [&](MirInstId phi) {
+        sawPhi = true;
+        EXPECT_EQ(mir.instType(phi).v, vaList.v);
+        auto const incs = mir.phiIncomings(phi);
+        EXPECT_EQ(incs.size(), 2u);
+        for (auto const& inc : incs) {
+            EXPECT_EQ(mir.instType(inc.value).v, vaList.v)
+                << "a phi incoming must carry the phi's own pointee";
+        }
+    });
+    EXPECT_TRUE(sawPhi);
+    DiagnosticReporter vrep;
+    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep));
+}
+
+// THE NARROWNESS IS THE CORRECTNESS ARGUMENT. A `Bitcast` is a REINTERPRETATION, so
+// it may only be emitted where the two types are the same machine value. A store
+// whose value type differs NON-pointer-wise (here `i32` into an `f64` slot) is an
+// ill-typed store some other rule owns — Mem2Reg must leave it EXACTLY as before
+// rather than invent a conversion that would silently mis-lower it and delete the
+// diagnostic. RED-on-disable: widen `isPointerRetag` to "any differing pair" → a
+// Bitcast appears here.
+TEST(Mem2Reg, NonPointerTypeMismatchAtAStoreGetsNoInventedCast) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const f64   = interner.primitive(TypeKind::F64);
+    TypeId const ptr   = interner.pointer(f64);
+    TypeId const fnSig = interner.fnSig({}, f64, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v; v.value = std::int64_t{7}; v.core = TypeKind::I32;
+    MirInstId const c = mb.addConst(v, i32);          // i32 value into an f64 slot
+    MirInstId const st[] = {c, slot};
+    (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+    MirInstId const ld[] = {slot};
+    mb.addReturn(mb.addInst(MirOpcode::Load, ld, f64));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(mir, interner, rep);
+    ASSERT_TRUE(r.ok);
+    EXPECT_EQ(r.allocasPromoted, 1u);
+    EXPECT_EQ(r.retagsInserted,  0u)
+        << "Mem2Reg must not invent a conversion for a genuinely ill-typed store";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Bitcast), 0u);
+}
+
+// A store that ALREADY writes the slot's exact pointer type costs nothing — the
+// common case, and the pin that this fix is not a blanket instruction tax.
+TEST(Mem2Reg, MatchingPointerStoreInsertsNoRetag) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i8T    = interner.primitive(TypeKind::I8);
+    TypeId const vaList = interner.pointer(i8T);
+    TypeId const slotTy = interner.pointer(vaList);
+    TypeId const params[] = {vaList};
+    TypeId const fnSig = interner.fnSig(params, vaList, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const a    = mb.addArg(0, vaList);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, slotTy);
+    MirInstId const st[] = {a, slot};
+    (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+    MirInstId const ld[] = {slot};
+    mb.addReturn(mb.addInst(MirOpcode::Load, ld, vaList));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(mir, interner, rep);
+    ASSERT_TRUE(r.ok);
+    EXPECT_EQ(r.allocasPromoted, 1u);
+    EXPECT_EQ(r.retagsInserted,  0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Bitcast), 0u);
 }

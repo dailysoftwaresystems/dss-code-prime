@@ -563,6 +563,45 @@ void parseVariantResultSlot(json const& v, std::size_t opIdx, std::size_t vi,
     variant.resultSlot = *r;
 }
 
+// D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the shared parse of one
+// register-bank spelling. ONE reader for all three sites that carry a bank
+// name (`encoding.registerClass`, a variant's `resultRegClass`, a wire's
+// `regClass`) so the three cannot disagree about what a bank name is or which
+// names are refused. The ALLOWED list is projected off `kTargetRegClassTable`
+// — never retyped (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+//
+// ⚠ `none` PARSES HERE and is refused by `validate()` rather than by this
+// reader, deliberately: `targetRegClassFromName` owns the spelling set and
+// `isOperableTargetRegClass` owns the "may a field draw from it" question, and
+// splitting one of those two facts across two files is how the two drift. The
+// message a `"none"` author sees names the operable set, from validate().
+std::optional<TargetRegClass>
+parseRegClassField(json const& obj, std::string_view key,
+                   std::string const& path, Collector& coll) {
+    if (!obj.contains(key)) return std::nullopt;
+    auto const& n = obj.at(key);
+    if (!n.is_string()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  std::format("'{}' must be a register-class string (one "
+                              "of {})",
+                              key,
+                              detail::renderAllowedList(
+                                  allNames(kTargetRegClassTable), " / ")));
+        return std::nullopt;
+    }
+    auto const c = targetRegClassFromName(n.get<std::string>());
+    if (!c.has_value()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  std::format("unknown register class '{}' — expected one "
+                              "of {}",
+                              n.get<std::string>(),
+                              detail::renderAllowedList(
+                                  allNames(kTargetRegClassTable), " / ")));
+        return std::nullopt;
+    }
+    return c;
+}
+
 // D-AS4-3 (multi-instruction-macro encoder): parse `extraResultSlots`
 // — additional placements of the SAME result register beyond the
 // primary `resultSlot` (word 0). Each entry is { "slotKind": <name>,
@@ -653,12 +692,17 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
         // A dropped `relocationKind` is the sharpest hazard here: the wire
         // would encode literal bits where the linker was meant to patch a
         // symbol address.
-        static constexpr std::array<std::string_view, 5> kWireKeys{
+        static constexpr std::array<std::string_view, 6> kWireKeys{
             "index", "slotKind", "relocationKind", "wordIndex",
-            "prefixOpcodeBytes"};
+            "prefixOpcodeBytes",
+            // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: this field's
+            // register-bank override.
+            "regClass"};
         DSS_CHECK_KEY_VOCABULARY(kWireKeys);
         rejectUnknownKeys(o2, kWireKeys, wirePath, "an operand wire", coll);
         TargetEncodingWire wire;
+        wire.regClass = parseRegClassField(
+            o2, "regClass", std::format("{}/regClass", wirePath), coll);
         if (!o2.contains("index") || !o2.at("index").is_number_integer()) {
             coll.emit(DiagnosticCode::C_MissingField,
                       std::format("{}/index", wirePath),
@@ -803,14 +847,22 @@ void parseEncodingVariants(json const& vs,
         // leaving an ALL-DEFAULT template (fixedWord 0, no opcode bytes) that
         // the encoder would emit as zero words. The neighbouring guard loop
         // is what made the absence invisible.
-        static constexpr std::array<std::string_view, 5> kVariantKeys{
-            "guard", "template", "resultSlot", "extraResultSlots", "wires"};
+        static constexpr std::array<std::string_view, 6> kVariantKeys{
+            "guard", "template", "resultSlot", "extraResultSlots", "wires",
+            // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the result
+            // field's register-bank override.
+            "resultRegClass"};
         DSS_CHECK_KEY_VOCABULARY(kVariantKeys);
         rejectUnknownKeys(v, kVariantKeys,
                           std::format("/opcodes/{}/encoding/variants/{}",
                                       opIdx, vi),
                           "an encoding variant", coll);
         TargetEncodingVariant variant;
+        variant.resultRegClass = parseRegClassField(
+            v, "resultRegClass",
+            std::format("/opcodes/{}/encoding/variants/{}/resultRegClass",
+                        opIdx, vi),
+            coll);
         parseVariantGuard      (v, opIdx, vi, variant, coll);
         parseVariantTemplate   (v, opIdx, vi, variant.tmpl, coll);
         parseVariantResultSlot (v, opIdx, vi, variant, coll);
@@ -2262,8 +2314,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // intent to declare an encoding would be silently dropped.
         if (o.contains("encoding")) {
             auto const& enc = o.at("encoding");
-            static constexpr std::array<std::string_view, 2> kEncodingKeys{
-                "format", "variants"};
+            static constexpr std::array<std::string_view, 3> kEncodingKeys{
+                "format", "variants",
+                // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the register
+                // bank this opcode's fields draw from unless a field overrides
+                // it. validate() proves every register-bearing field resolves.
+                "registerClass"};
             DSS_CHECK_KEY_VOCABULARY(kEncodingKeys);
             rejectUnknownKeys(enc, kEncodingKeys,
                               std::format("/opcodes/{}/encoding", i),
@@ -2304,6 +2360,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                                   " / ")));
                     }
                 }
+                // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the
+                // opcode-wide register bank. Read BEFORE the variants so a
+                // malformed spelling is reported once, at the opcode, rather
+                // than once per field that would have inherited it.
+                info.encoding.registerClass = parseRegClassField(
+                    enc, "registerClass",
+                    std::format("/opcodes/{}/encoding/registerClass", i), coll);
                 // AS2: parse the per-variant rows when present. Walker
                 // consumes via the schema accessor; validate() pins
                 // cross-field invariants (opcode bytes non-empty,

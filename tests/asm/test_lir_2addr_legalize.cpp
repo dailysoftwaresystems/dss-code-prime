@@ -40,7 +40,7 @@ constexpr char const* kSyntheticJson = R"({
         { "mnemonic": "mov", "result": "value",
           "minOperands": 1, "maxOperands": 1,
           "encoding": {
-            "format": "x86-variable",
+            "format": "x86-variable", "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["reg"] },
                 "template": { "rexW": true, "opcode": [139] },
@@ -53,7 +53,7 @@ constexpr char const* kSyntheticJson = R"({
           "requires2Address": true,
           "minOperands": 2, "maxOperands": 2,
           "encoding": {
-            "format": "x86-variable",
+            "format": "x86-variable", "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["reg", "reg"] },
                 "template": { "rexW": true, "opcode": [1] },
@@ -67,7 +67,7 @@ constexpr char const* kSyntheticJson = R"({
         { "mnemonic": "nonbin", "result": "value",
           "minOperands": 1, "maxOperands": 1,
           "encoding": {
-            "format": "x86-variable",
+            "format": "x86-variable", "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["reg"] },
                 "template": { "rexW": true, "opcode": [3] },
@@ -261,7 +261,7 @@ TEST(LirTwoAddrLegalize, MissingMovOpcodeIsRejectedAtSchemaLoad) {
               "requires2Address": true,
               "minOperands": 2, "maxOperands": 2,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg", "reg"] },
                     "template": { "rexW": true, "opcode": [1] },
@@ -292,7 +292,7 @@ TEST(LirTwoAddrLegalize, Requires2AddressOnVoidResultIsRejected) {
             { "mnemonic": "mov", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -322,7 +322,7 @@ TEST(LirTwoAddrLegalize, Requires2AddressOnZeroOperandsIsRejected) {
             { "mnemonic": "mov", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -351,7 +351,7 @@ TEST(LirTwoAddrLegalize, Requires2AddressOnImmFirstOperandIsRejected) {
             { "mnemonic": "mov", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -364,7 +364,7 @@ TEST(LirTwoAddrLegalize, Requires2AddressOnImmFirstOperandIsRejected) {
               "requires2Address": true,
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["imm32"] },
                     "template": { "rexW": true, "opcode": [129], "modrmRegExt": 0 },

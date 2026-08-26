@@ -17,6 +17,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 using namespace dss;
 using namespace dss::opt::analysis;
@@ -548,6 +549,168 @@ TEST(MirAlias, RegionWalkTreatsMemoryClobberOpsAsClobber) {
         fenced.mir, interner, fenced.loadPtr, fencedRegion))
         << "a memory-clobbering non-Store op (CompilerBarrier) must be an "
            "opaque clobber — Loads may not move across the fence";
+}
+
+// ── D-OPT-CSE-LOAD-PTR-KEY-UNRESOLVED ────────────────────────────────
+// `mirAliasProbeSubstitutionPreservesClobberVerdict` is the licence that lets a
+// value-numbering consumer hand the alias gate the CANONICAL pointer id instead
+// of the raw operand its key already resolved away. Its docblock states a
+// THEOREM; these two tests are its polarity pin and its proof-by-exhaustion.
+//
+// Half 1 — the predicate's own polarity. Same id ⇒ licensed. Same opcode AND
+// same TypeId AND not an `Alloca` ⇒ licensed. A different TypeId, a different
+// opcode, or an `Alloca` at either end ⇒ REFUSED — and it is those refusals
+// that make the consumer's fail-loud reachable rather than decorative.
+TEST(MirAlias, ProbeSubstitutionLicenceRequiresBothOpcodeAndType) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const i64    = interner.primitive(TypeKind::I64);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const ptrI64 = interner.pointer(i64);
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const fnSig  = interner.fnSig({}, voidT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(z, i32);
+    MirInstId const gops[] = {slot, c0};
+    MirInstId const gepA = mb.addInst(MirOpcode::Gep, gops, ptrI32);
+    MirInstId const gepB = mb.addInst(MirOpcode::Gep, gops, ptrI32);
+    MirInstId const gepW = mb.addInst(MirOpcode::Gep, gops, ptrI64);  // wider
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+
+    EXPECT_TRUE(mirAliasProbeSubstitutionPreservesClobberVerdict(mir, gepA, gepA))
+        << "identity is always licensed";
+    EXPECT_TRUE(mirAliasProbeSubstitutionPreservesClobberVerdict(mir, gepA, gepB))
+        << "same opcode + same TypeId is exactly the theorem's premise";
+    EXPECT_FALSE(mirAliasProbeSubstitutionPreservesClobberVerdict(mir, gepA, gepW))
+        << "different pointee type unlocks Rule 6's No — must be REFUSED";
+    EXPECT_FALSE(mirAliasProbeSubstitutionPreservesClobberVerdict(mir, gepA, slot))
+        << "different opcode unlocks Rule 2's distinct-Alloca No — must be "
+           "REFUSED even though the TypeIds match";
+
+    // The `Alloca` exclusion, which is the ONE case where same-opcode +
+    // same-type is NOT enough: substituting one distinct stack slot for another
+    // flips a Store through either from Yes (Rule 1) to No (Rule 2).
+    MirBuilder mb2;
+    mb2.addFunction(fnSig, SymbolId{101});
+    MirBlockId const e2 = mb2.createBlock(StructCfMarker::EntryBlock);
+    mb2.beginBlock(e2);
+    MirInstId const slotP = mb2.addInst(MirOpcode::Alloca, {}, ptrI32);
+    MirInstId const slotQ = mb2.addInst(MirOpcode::Alloca, {}, ptrI32);
+    mb2.addReturn();
+    Mir mir2 = std::move(mb2).finish();
+    EXPECT_TRUE(mirAliasProbeSubstitutionPreservesClobberVerdict(mir2, slotP, slotP))
+        << "identity stays licensed even for an Alloca";
+    EXPECT_FALSE(mirAliasProbeSubstitutionPreservesClobberVerdict(mir2, slotP, slotQ))
+        << "two DISTINCT Allocas share opcode and TypeId, yet the substitution "
+           "WEAKENS Rule 1's Yes into Rule 2's No — must be REFUSED";
+}
+
+// Half 2 — the THEOREM by exhaustion. Wherever the licence says yes, every
+// clobber verdict is bit-identical for the two probes, over EVERY instruction
+// in the module × the full StrictTbaa × charTypesAliasAll matrix. The module
+// deliberately mixes Allocas (Rule 2), Args of three different pointee types
+// (Rules 4/5/6), Geps (neither), Stores through most of them, and an opaque
+// non-Store clobber.
+// RED-ON-DISABLE, three independent arms:
+//   * drop the TypeId comparison  → the Ptr<I32>/Ptr<I64> Arg pair becomes
+//     "licensed" and diverges under strict TBAA (No vs Maybe);
+//   * drop the opcode comparison  → the Alloca/Arg pair at the same TypeId
+//     becomes "licensed" and diverges on a Store through the OTHER Alloca;
+//   * drop the `Alloca` exclusion → the slotA/slotB pair becomes "licensed"
+//     and diverges on a Store through either of them (Rule 1 Yes vs Rule 2 No)
+//     — the only direction that WEAKENS a clobber verdict.
+TEST(MirAlias, ProbeSubstitutionPreservesEveryClobberVerdict) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const i64    = interner.primitive(TypeKind::I64);
+    TypeId const charT  = interner.primitive(TypeKind::Char);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const ptrI64 = interner.pointer(i64);
+    TypeId const ptrCh  = interner.pointer(charT);
+    TypeId const voidT  = interner.primitive(TypeKind::Void);
+    TypeId const params[] = {ptrI32, ptrI64, ptrCh, ptrI32};
+    TypeId const fnSig  = interner.fnSig(params, voidT, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const aI32  = mb.addArg(0, ptrI32);
+    MirInstId const aI64  = mb.addArg(1, ptrI64);
+    MirInstId const aCh   = mb.addArg(2, ptrCh);
+    MirInstId const aI32b = mb.addArg(3, ptrI32);
+    MirInstId const slotA = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+    MirInstId const slotB = mb.addInst(MirOpcode::Alloca, {}, ptrI32);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(z, i32);
+    MirInstId const gops[] = {slotA, c0};
+    MirInstId const gepA = mb.addInst(MirOpcode::Gep, gops, ptrI32);
+    MirInstId const gepB = mb.addInst(MirOpcode::Gep, gops, ptrI32);
+    MirLiteralValue z64; z64.value = std::int64_t{0}; z64.core = TypeKind::I64;
+    MirInstId const c64 = mb.addConst(z64, i64);
+    MirLiteralValue zc; zc.value = std::int64_t{0}; zc.core = TypeKind::Char;
+    MirInstId const cch = mb.addConst(zc, charT);
+    for (auto const& st : {std::array<MirInstId, 2>{c0, slotA},
+                           std::array<MirInstId, 2>{c0, slotB},
+                           std::array<MirInstId, 2>{c0, aI32},
+                           std::array<MirInstId, 2>{c64, aI64},
+                           std::array<MirInstId, 2>{cch, aCh},
+                           std::array<MirInstId, 2>{c0, aI32b},
+                           std::array<MirInstId, 2>{c0, gepA},
+                           std::array<MirInstId, 2>{c0, gepB}}) {
+        (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+    }
+    (void)mb.addInst(MirOpcode::CompilerBarrier, {}, InvalidType);
+    mb.addReturn();
+    Mir mir = std::move(mb).finish();
+
+    std::vector<MirInstId> everyInst;
+    std::uint32_t const n = mir.blockInstCount(entry);
+    for (std::uint32_t i = 0; i < n; ++i) everyInst.push_back(mir.blockInstAt(entry, i));
+
+    MirInstId const probes[] = {aI32, aI64, aCh, aI32b, slotA, slotB, gepA, gepB};
+    struct FlagCase { StrictTbaa st; bool ca; };
+    FlagCase const flagMatrix[] = {
+        {StrictTbaa::No,  true}, {StrictTbaa::No,  false},
+        {StrictTbaa::Yes, true}, {StrictTbaa::Yes, false},
+    };
+    std::size_t licensedPairs = 0;
+    for (MirInstId const raw : probes) {
+        for (MirInstId const canonical : probes) {
+            if (!mirAliasProbeSubstitutionPreservesClobberVerdict(
+                    mir, raw, canonical)) {
+                continue;
+            }
+            ++licensedPairs;
+            for (auto const [st, ca] : flagMatrix) {
+                for (MirInstId const x : everyInst) {
+                    EXPECT_EQ(mirInstClobbersLoadPtr(mir, interner, raw, x, st, ca),
+                              mirInstClobbersLoadPtr(mir, interner, canonical, x,
+                                                     st, ca))
+                        << "the licence claimed probe v=" << raw.v
+                        << " may be replaced by v=" << canonical.v
+                        << ", but their clobber verdicts differ on inst v="
+                        << x.v << " (st=" << (st == StrictTbaa::Yes)
+                        << " ca=" << ca << ") — the substitution theorem is "
+                           "broken (D-OPT-CSE-LOAD-PTR-KEY-UNRESOLVED)";
+                }
+            }
+        }
+    }
+    // Non-vacuity: 8 identity pairs are free, so the licence must admit MORE
+    // than 8 or the sweep proved nothing about substitution at all. The real
+    // ones are the two Arg<Ptr<I32>> orderings and the two Gep orderings; the
+    // two Alloca orderings must NOT be among them.
+    EXPECT_EQ(licensedPairs, 12u)
+        << "expected 8 identity + 2 same-type Arg + 2 Gep pairs, and NO Alloca "
+           "pair — a different count means the licence's polarity moved";
 }
 
 // D-CSUBSET-ATOMIC-FENCE: the AtomicFence (__sync_synchronize) twin of the

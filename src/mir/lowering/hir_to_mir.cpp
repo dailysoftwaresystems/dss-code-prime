@@ -133,6 +133,14 @@ struct Lowerer {
                                            // storage duration (TLS C1,
                                            // D-CSUBSET-THREAD-LOCAL). nullptr / no
                                            // entry ⇒ ordinary process-shared.
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: optional — which function
+    // body a block-scope `static` was written in, kept on the hidden module GLOBAL
+    // the D-CSUBSET-LOCAL-STATIC promotion produced. Read ONLY when that global's
+    // initializer contains a `&&label`, to resolve the (per-function) label ordinal
+    // against the right function. nullptr / no entry ⇒ a file-scope global, where a
+    // `&&label` cannot occur; a `&&label` WITH no entry fails loud rather than
+    // guessing an owner.
+    HirEnclosingFunctionMap const* enclosingFunctionMap = nullptr;
     // VLA C1a/C3 (D-CSUBSET-VLA): optional — a block-scope variable-length array
     // local's per-DIMENSION SIZE-expression HIR nodes (outer→inner order), keyed by
     // SymbolId.v. nullptr / no entry ⇒ the local is not a VLA. Read in
@@ -393,6 +401,43 @@ struct Lowerer {
     // even for a `&&end` that appears textually AFTER the `goto *p`. The blocks
     // themselves are created on demand via getOrCreateLabelBlock.
     std::unordered_set<std::uint32_t> addressTakenLabelOrdinals_;
+
+    // ── D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED ──────────────────────
+    // `static void *tbl[] = {&&L0, &&L1};` — a label address that escapes into
+    // STATIC DATA. gcc emits `.quad .L3` into `.rdata` for exactly this shape
+    // (✔measured, gcc 13.2), i.e. a link-time relocation against an INTERIOR block
+    // label, not a runtime store. DSS already emits abs64 data relocations against
+    // a symbol (`MirSymbolAddrValue`), and already mints synthetic per-block
+    // symbols with interior VAs — what was missing is the bridge between them.
+    //
+    // The bridge is: mint the block's symbol HERE (so a literal can name it before
+    // any MIR block exists), and publish the (symbol ↔ block) pairing in the
+    // OWNING FUNCTION as `BlockAddressExport(BlockAddress(L))`. That instruction
+    // pair is what survives the optimizer — a block id parked in a literal would
+    // not, because a rebuild copies literals verbatim while renumbering blocks.
+    //
+    // `pendingLabelExports_` is keyed by the owner function's SymbolId.v and drained
+    // when that function is lowered (its label blocks exist only then).
+    struct PendingLabelExport {
+        std::uint32_t labelOrdinal = 0;
+        SymbolId      blockSymbol{};   // minted here; the data relocation's target
+        TypeId        ptrType{};       // the `&&label` node's type (void*)
+        HirNodeId     at{};            // diagnostic position
+    };
+    std::unordered_map<std::uint32_t, std::vector<PendingLabelExport>>
+        pendingLabelExports_;
+    // (ownerFuncSymbol.v, labelOrdinal) → the ONE block symbol for that label.
+    // `static void *a = &&L, *b = &&L;` must relocate both slots against a SINGLE
+    // symbol — declaring one symbol twice is a link error the computed-goto path
+    // already hit once ("ONE ENTRY PER SYMBOL, NOT PER PATCH", asm.cpp).
+    // Key = (ownerFuncSymbol.v << 32) | labelOrdinal. Iteration order is never
+    // read; the minting ORDER is the classify walk's, which is deterministic.
+    std::unordered_map<std::uint64_t, SymbolId> labelExportSymbols_;
+    // The module Global declaration `classifyGlobals` is currently classifying —
+    // the key into `enclosingFunctionMap`. Threaded as state rather than as a
+    // parameter because the aggregate-member classifier recurses through four
+    // helpers that have no business knowing about it.
+    HirNodeId classifyingGlobalDecl_{};
 
     // D-LK4-RODATA-PRODUCER-STRING (2026-06-02): synthetic-symbol
     // counter for string-literal-promoted globals. Initialized to
@@ -3241,6 +3286,32 @@ struct Lowerer {
                 // this BlockAddress is ALSO what marks `b` address-taken
                 // (Mir::isBlockAddressTaken), so opt + codegen see it.
                 std::uint32_t const ordinal = hir.labelAddressOrdinal(node);
+                // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: a label
+                // ordinal is only meaningful inside the function that declared it,
+                // and `getOrCreateLabelBlock` will happily CREATE a block for an
+                // ordinal this function does not have — a block nothing ever fills,
+                // which kills the process later with `MirBuilder fatal: block was
+                // created but never filled + terminated`, naming neither the label
+                // nor what asked for it.
+                //
+                // ★ THE REACHABLE PATH IS THE SYNTHESIZED `__module_init__`. If a
+                // static initializer holding a `&&label` ALSO holds a member that
+                // is not a constant expression, the aggregate classifier bails and
+                // the whole initializer falls to a runtime store chain lowered in
+                // THAT function — where the ordinal names nothing. Such a program
+                // is not valid C either (a static initializer must be constant, and
+                // gcc rejects it), so a REFUSAL is the right answer; an abort is
+                // not. `labelNodeByOrdinal_` is cleared before the init function's
+                // body is built, so the check is exact there rather than reading
+                // the previous function's labels.
+                if (!resolveLabelNode(ordinal).valid()) {
+                    unsupported(node,
+                        "the address of a label (`&&label`) is taken where no such "
+                        "label is in scope — a label ordinal belongs to the "
+                        "function that declared it, and this context has none "
+                        "(D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)");
+                    return InvalidMirInst;
+                }
                 MirBlockId const target = getOrCreateLabelBlock(ordinal);
                 return mir.addBlockAddress(target, t);
             }
@@ -12020,6 +12091,13 @@ struct Lowerer {
         MirBlockId const entry = mir.createBlock(StructCfMarker::EntryBlock);
         mir.beginBlock(entry);
 
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: publish every label of
+        // THIS function whose address a static-storage initializer took. FIRST in
+        // the entry block, before params and allocas: the exports are pure metadata
+        // (they emit no machine instruction), and putting them at a fixed position
+        // keeps the MIR text stable for the round-trip pins.
+        emitOwnedLabelExports(symbol);
+
         // FC7 C1c: the per-class arg-ordinal counter is SHARED by the sret hidden
         // pointer (below) and the real params, so a struct-returning function's
         // first INTEGER arg register goes to the result pointer and every real arg
@@ -12925,6 +13003,122 @@ struct Lowerer {
         return r;
     }
 
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: recognize a `&&label` in a
+    // STATIC-STORAGE initializer — `static void *p = &&L;` and the array/struct
+    // member form `static void *tbl[] = {&&L0, &&L1};`. Both gcc and clang accept
+    // the construct, so the bar (`DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C`) makes it
+    // REQUIRED. gcc's own output is the specification of the SHAPE: `tbl.1:` in
+    // `.rdata` holding `.quad .L3` — a relocation against an interior block label,
+    // never a startup store (✔measured, gcc 13.2 x86_64, `-O0 -S`).
+    //
+    // Returns a pointer LEAF the caller drops into static data: a plain
+    // `MirSymbolAddrValue` against a freshly minted per-block symbol, so the ENTIRE
+    // downstream data path (aggregate encoder, section choice, abs64 relocation,
+    // cross-CU merge, linker) needs no new case at all — a label address IS a
+    // symbol address, once the label has a symbol.
+    //
+    // A pointer-typed Cast is peeled first, exactly as `tryClassifyAsSymbolAddrImpl`
+    // peels `(void*)&x`: `(char*)&&L` reinterprets a pointer, so it is the SAME
+    // link-time address.
+    [[nodiscard]] std::optional<MirLiteralValue>
+    tryClassifyAsLabelAddr(HirNodeId initNode) {
+        HirNodeId n = initNode;
+        while (n.valid() && hir.kind(n) == HirKind::Cast) {
+            TypeId const ct = hir.typeId(n);
+            if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr) return std::nullopt;
+            auto kids = hir.children(n);
+            if (kids.size() != 1) return std::nullopt;
+            n = kids[0];
+        }
+        if (!n.valid() || hir.kind(n) != HirKind::LabelAddressOf) return std::nullopt;
+
+        // ★ THE OWNER IS NOT OPTIONAL AND IS NOT GUESSABLE. Label ordinals restart
+        // at 0 per function, so "ordinal 3" names a different block in every
+        // function. Attributing it to whichever function happens to be lowering
+        // would resolve one function's label to another function's block — a silent
+        // wrong-address jump. Absence is therefore a hard error, not a fallback.
+        std::uint32_t ownerFn = 0;
+        if (enclosingFunctionMap != nullptr && classifyingGlobalDecl_.valid()) {
+            if (auto const* p = enclosingFunctionMap->tryGet(classifyingGlobalDecl_))
+                ownerFn = p->functionSymbol;
+        }
+        if (ownerFn == 0) {
+            unsupported(n,
+                "the address of a label (`&&label`) appears in a static-storage "
+                "initializer whose enclosing function is unknown — a label ordinal "
+                "is only meaningful inside the function that declared it, so this "
+                "cannot be resolved to a block "
+                "(D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)");
+            return std::nullopt;
+        }
+
+        std::uint32_t const ordinal = hir.labelAddressOrdinal(n);
+        std::uint64_t const key =
+            (static_cast<std::uint64_t>(ownerFn) << 32) | ordinal;
+        SymbolId blockSym{};
+        if (auto it = labelExportSymbols_.find(key); it != labelExportSymbols_.end()) {
+            blockSym = it->second;   // the SAME label ⇒ the SAME symbol
+        } else {
+            blockSym = mintSyntheticGlobalSymbol();
+            if (!blockSym.valid()) {
+                unsupported(n,
+                    "the synthetic SymbolId space is exhausted — cannot mint a "
+                    "block symbol for a label address in a static initializer "
+                    "(D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)");
+                return std::nullopt;
+            }
+            labelExportSymbols_.emplace(key, blockSym);
+            TypeId ptrTy = hir.typeId(n);
+            if (!ptrTy.valid())
+                ptrTy = interner.pointer(interner.primitive(TypeKind::Void));
+            pendingLabelExports_[ownerFn].push_back(
+                PendingLabelExport{ordinal, blockSym, ptrTy, n});
+        }
+        MirLiteralValue leaf;
+        leaf.value = MirSymbolAddrValue{blockSym.v, 0};
+        leaf.core  = TypeKind::Ptr;
+        return leaf;
+    }
+
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: drain the exports this
+    // function owns, at the top of its ENTRY block. Emitted here — not at the
+    // global — because a label ordinal only maps to a block inside the function
+    // that owns it, and because the `BlockAddress` must live in that function for
+    // `Mir::isBlockAddressTaken` (and hence SimplifyCfg's MF-B fold guard) to
+    // protect the block. Also unions the ordinals into the address-taken set, which
+    // is what makes `goto *tbl[i]` legal: the function DOES take those labels'
+    // addresses, and the refusal that this row was filed for was a true statement
+    // about the tree the collector searched, not about the source.
+    //
+    // The owning function's body is already scanned (`collectLabelNodes`) when this
+    // runs, so a label ordinal with no LabelStmt is provably impossible from C
+    // source — checked anyway, because the failure mode of NOT checking is a block
+    // created and never filled, which aborts the MirBuilder with a message that
+    // names neither the label nor the global.
+    void emitOwnedLabelExports(SymbolId funcSymbol) {
+        auto it = pendingLabelExports_.find(funcSymbol.v);
+        if (it == pendingLabelExports_.end()) return;
+        for (PendingLabelExport const& ex : it->second) {
+            if (!resolveLabelNode(ex.labelOrdinal).valid()) {
+                unsupported(ex.at, std::format(
+                    "a static-storage initializer takes the address of label "
+                    "ordinal {}, but function SymbolId={{ {} }} defines no such "
+                    "label (D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)",
+                    ex.labelOrdinal, funcSymbol.v));
+                continue;
+            }
+            MirBlockId const b  = getOrCreateLabelBlock(ex.labelOrdinal);
+            MirInstId const  ba = mir.addBlockAddress(b, ex.ptrType);
+            if (!ba.valid()) continue;
+            mir.addBlockAddressExport(ba, ex.blockSymbol);
+            // The function takes this label's address — the IndirectBr successor
+            // set must list it, or `goto *tbl[i]` would branch to a block the CFG
+            // says is unreachable.
+            addressTakenLabelOrdinals_.insert(ex.labelOrdinal);
+        }
+        pendingLabelExports_.erase(it);
+    }
+
     // TLS C1 (★CRIT-1, belt over the fold path): screen a CONST-EVAL-FOLDED
     // literal for symbol-address leaves targeting a thread-local object —
     // the third producer of MirSymbolAddrValue (toMirLiteral's
@@ -13068,6 +13262,15 @@ struct Lowerer {
         auto kids = hir.children(initNode);
         agg.fields.reserve(kids.size());
         for (HirNodeId child : kids) {
+            // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: a `&&label` MEMBER
+            // (`static void *tbl[] = {&&L0, &&L1};`). FIRST, because a label address
+            // is a link-time constant that const-eval provably cannot fold and no
+            // other arm recognizes — leaving it to the fallback is exactly how the
+            // whole aggregate used to bail to a runtime store-chain.
+            if (auto la = tryClassifyAsLabelAddr(child)) {
+                agg.fields.push_back(std::move(*la));
+                continue;
+            }
             if (auto sa = tryClassifyAsSymbolAddr(child, env, opts)) {
                 MirLiteralValue leaf;
                 leaf.value = MirSymbolAddrValue{sa->first.v, sa->second};
@@ -13325,6 +13528,9 @@ struct Lowerer {
         opts.allowFloat = config.globalsAllowFloat;
         for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
             if (hir.kind(decl) != HirKind::Global) continue;
+            // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the declaration
+            // whose provenance a `&&label` leaf in this initializer will need.
+            classifyingGlobalDecl_ = decl;
             PendingGlobal pg;
             pg.symbol = hir.globalSymbol(decl);
             pg.type   = hir.globalType(decl);
@@ -13345,7 +13551,16 @@ struct Lowerer {
                 // "...";`) is a LINK-TIME constant const-eval cannot fold —
                 // recognize it FIRST (and route to a MirSymbolAddrValue / abs64
                 // reloc) before falling back to const-eval / runtime-init.
-                if (auto sa = tryClassifyAsSymbolAddr(*initN, env, opts)) {
+                // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the TOP-LEVEL
+                // scalar `static void *p = &&L;`. Before every other arm for the
+                // same reason as the aggregate member: const-eval cannot fold a
+                // label address, and without this the initializer fell through to
+                // `runtimeInit` — which lowered the `&&label` inside the synthesized
+                // `__module_init__`, where the ordinal names no block, aborting the
+                // MirBuilder with "created but never filled".
+                if (auto la = tryClassifyAsLabelAddr(*initN)) {
+                    pg.constInit = std::move(*la);
+                } else if (auto sa = tryClassifyAsSymbolAddr(*initN, env, opts)) {
                     pg.symbolAddrInit   = sa->first;
                     pg.symbolAddrAddend = sa->second;
                 } else {
@@ -13409,6 +13624,7 @@ struct Lowerer {
                     }
                 }
             }
+            classifyingGlobalDecl_ = HirNodeId{};
             pendingGlobals.push_back(std::move(pg));
         }
     }
@@ -13500,6 +13716,15 @@ struct Lowerer {
         // affects whether each global's initial value is actually
         // installed at module load.
         if (anyRuntime) {
+            // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: `__module_init__`
+            // is a FUNCTION, and the per-function label state still holds whichever
+            // real function was lowered last. Left stale, a `&&label` reaching this
+            // body could resolve against ANOTHER function's ordinal — the same
+            // cross-function confusion the provenance side-table exists to prevent,
+            // arriving from the other direction. It owns no labels; say so.
+            labelBlocks_.clear();
+            labelNodeByOrdinal_.clear();
+            addressTakenLabelOrdinals_.clear();
             mir.beginBlock(initEntry);
             for (auto const& pg : pendingGlobals) {
                 if (!pg.runtimeInit.valid()) continue;
@@ -13605,6 +13830,24 @@ struct Lowerer {
                     return;
             }
         }
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: every export must have
+        // been drained by ITS function. A leftover means a static initializer took
+        // the address of a label in a function this module never lowered — the data
+        // relocation would then target a symbol nothing ever defines, which the
+        // linker reports as an undefined symbol with no hint of where it came from.
+        // Say it HERE, where the label and the owner are both still known.
+        for (auto const& [ownerFnV, exports] : pendingLabelExports_) {
+            for (PendingLabelExport const& ex : exports) {
+                unsupported(ex.at, std::format(
+                    "a static-storage initializer takes the address of label "
+                    "ordinal {} in function SymbolId={{ {} }}, but that function "
+                    "has no definition in this module "
+                    "(D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)",
+                    ex.labelOrdinal, ownerFnV));
+            }
+        }
+        pendingLabelExports_.clear();
+
         // Emit deferred globals last: builds the synthesized module-init
         // function (if any runtime-init globals exist) and then `addGlobal`
         // for every pending entry. Done after all real functions so the
@@ -13642,7 +13885,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirNoOptimizeMap const*  noOptimizeMap,
                           HirNoSanitizeThreadMap const* noSanitizeThreadMap,
                           HirInlineAsmPool const*  inlineAsmPool,
-                          HirInlineDefinitionMap const* inlineDefinitionMap) {
+                          HirInlineDefinitionMap const* inlineDefinitionMap,
+                          HirEnclosingFunctionMap const* enclosingFunctionMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -13668,6 +13912,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .returnsTwiceMap = returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)
         .alignmentMap = alignmentMap,
         .threadLocalMap = threadLocalMap,
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED
+        .enclosingFunctionMap = enclosingFunctionMap,
         .vlaSizeMap = vlaSizeMap,
         .sizeofVlaSymMap = sizeofVlaSymMap,
         .typedefVlaOriginMap = typedefVlaOriginMap,

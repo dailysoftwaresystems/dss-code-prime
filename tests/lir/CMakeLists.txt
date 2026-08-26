@@ -132,3 +132,13 @@ dss_add_test(NAME lir/test_lir_outgoing_arg_cursor
 dss_add_test(NAME lir/test_lir_peephole
              SOURCES test_lir_peephole.cpp)
 target_link_libraries(dss_lir_test_lir_peephole PRIVATE nlohmann_json::nlohmann_json)
+
+# D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: `&&label` as a LINK-TIME
+# address constant. Pins what this tier owes the static-data path — the block
+# symbol published with a byte offset for a block NO instruction names, one symbol
+# per block when the body addresses it too, and no register materialized for an
+# address that only ever reaches data. Drives the REAL c -> HIR -> MIR -> LIR
+# lowering, because the property is a relation between what HIR->MIR minted and
+# what this tier bound.
+dss_add_test(NAME lir/test_lir_label_address_static_table
+             SOURCES test_lir_label_address_static_table.cpp)

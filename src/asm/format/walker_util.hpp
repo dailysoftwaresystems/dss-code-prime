@@ -9,7 +9,12 @@
 //   * `hwEncodingOf` — encoder-side: resolve a Reg operand's hwEncoding
 //     ordinal with a target-blind register-table lookup + bit-width
 //     defense (parameterized so x86's 4-bit limit and fixed32's 5-bit
-//     limit both fit the same shape)
+//     limit both fit the same shape) + the REGISTER-CLASS gate
+//     (D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD): every register
+//     either belongs to the bank its destination field declares, or the
+//     instruction is refused. Both walkers resolve every register they
+//     emit through this one function, which is what makes one check
+//     here cover every register field of every shape.
 //   * `operandsMatchGuard` — encoder-side + disasm-side: per-position
 //     LIR-operand-kind vs. variant-guard equality, with `filterToLirKind`
 //     translating the closed `OperandKindFilter` vocabulary to the LIR
@@ -44,14 +49,58 @@ namespace dss::walker_util {
 // (x86-variable: 4 bits / ordinal 0..15 for REX-extended ModR/M;
 // fixed32: 5 bits / ordinal 0..31 for AArch64-style 5-bit reg fields).
 // Emits `A_NoMatchingEncodingVariant` and returns nullopt on any of:
-// non-physical register, unknown ordinal, or hwEncoding exceeding the
-// shape's bit width.
+// non-physical register, unknown ordinal, hwEncoding exceeding the
+// shape's bit width, or — D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD —
+// a register whose CLASS is not the one the destination field draws from.
+//
+// ★★★ THE CLASS GATE IS THE ONLY THING BETWEEN A WRONG-BANK OPERAND AND A
+// SILENT MISCOMPILE, and this is the choke point: both walkers resolve every
+// register they will ever emit through this one function, so a check here
+// covers the result slot, every source wire, and every future shape's
+// register field with no per-walker repetition.
+//
+// The bug it is named for: `cvttss2si %xmm15`. A GPR ordinal (`r15` = 15)
+// reached an XMM field, 15 is a legal value for that field, and the encoder
+// wrote it. The bytes decoded cleanly, the disassembler round-trip agreed with
+// itself, and the program read whatever `%xmm15` held. There is no later stage
+// that could have noticed.
+//
+// ★★ TWO COMPARISONS, AND THEY ARE ORTHOGONAL — WHICH TOOK A MUTANT TO GET
+// RIGHT. A `LirReg` carries THREE facts about its class, not two: the operand's
+// own class TAG, the class the target's `registers[]` row for that ORDINAL
+// declares, and the bank the destination FIELD draws from. The first draft
+// compared tag-vs-field and table-vs-field; ✔MEASURED by disabling the first,
+// the suite stayed GREEN, because a tag that agrees with its ordinal makes
+// table-vs-field subsume tag-vs-field entirely. A comparison no test can
+// distinguish from its own absence asserts nothing.
+//
+// The orthogonal pair, each with a case ONLY it catches:
+//   (1) TAG vs TABLE — the operand lies about ITSELF: its tag says `fpr` while
+//       its ordinal names a GPR row. Independent of the field: an `xmm1`
+//       ordinal tagged `gpr` reaching an `fpr` field passes (2) and fails here.
+//       This is the ordinal-collision family — the register FILES number from
+//       zero independently, so the class tag is the only thing that says which
+//       file an ordinal came from, and a producer that picks from the wrong
+//       pool gets a plausible number.
+//   (2) TABLE vs FIELD — the wrong-BANK operand, the anchor's own defect: an
+//       `r15` honestly tagged `gpr` reaching an XMM field passes (1) and fails
+//       here. The comparison is against the TABLE, not the tag, because the
+//       table is the authority on what a register IS; (1) has already proved
+//       the tag agrees with it.
+//
+// `expected` is `optional` only because a caller could reach here with an
+// unresolved bank; `validate()` proves every register-bearing field resolves,
+// so a nullopt here means a schema bypassed validation — which is reported,
+// never assumed benign. `fieldName` names the destination field in the
+// message; the caller passes its `EncodingSlotKind` spelling.
 [[nodiscard]] inline std::optional<std::uint8_t>
-hwEncodingOf(LirReg                 reg,
-             TargetSchema const&    schema,
-             std::string_view       mnemonic,
-             std::uint8_t           maxBitWidth,
-             DiagnosticReporter&    reporter) {
+hwEncodingOf(LirReg                        reg,
+             TargetSchema const&           schema,
+             std::string_view              mnemonic,
+             std::uint8_t                  maxBitWidth,
+             std::optional<TargetRegClass> expected,
+             std::string_view              fieldName,
+             DiagnosticReporter&           reporter) {
     using dss::report;
     if (!reg.valid() || reg.isPhysical == 0) {
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
@@ -62,6 +111,17 @@ hwEncodingOf(LirReg                 reg,
                            mnemonic));
         return std::nullopt;
     }
+    if (!expected.has_value()) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': field '{}' takes a register but the "
+                           "target schema declares no register bank for it — "
+                           "`validate()` refuses such a document, so this "
+                           "schema reached the encoder unvalidated "
+                           "(D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD)",
+                           mnemonic, fieldName));
+        return std::nullopt;
+    }
     auto const* info = schema.registerInfo(static_cast<std::uint16_t>(reg.id));
     if (info == nullptr) {
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
@@ -70,6 +130,42 @@ hwEncodingOf(LirReg                 reg,
                            "target schema '{}' register table",
                            mnemonic, static_cast<unsigned>(reg.id),
                            schema.name()));
+        return std::nullopt;
+    }
+    // (1) TAG vs TABLE — does the operand agree with itself?
+    auto const taggedClass = static_cast<TargetRegClass>(reg.regClass());
+    if (taggedClass != info->regClass) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': the operand wired to field '{}' is "
+                           "tagged '{}'-class, but ordinal {} is '{}' — a "
+                           "'{}'-class register in the target's `registers[]` "
+                           "table. The operand's class tag and its ordinal "
+                           "disagree, so one of them names a register the "
+                           "producer did not mean; the register files number "
+                           "from zero independently, so the ordinal alone "
+                           "cannot say which file it came from "
+                           "(D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD)",
+                           mnemonic, fieldName,
+                           targetRegClassName(taggedClass),
+                           static_cast<unsigned>(reg.id), info->name,
+                           targetRegClassName(info->regClass)));
+        return std::nullopt;
+    }
+    // (2) TABLE vs FIELD — is this register in the bank the field draws from?
+    if (info->regClass != *expected) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': field '{}' encodes a register from "
+                           "the '{}' bank, but the LIR operand is a '{}'-class "
+                           "register (ordinal {}, '{}'). The field would accept "
+                           "the ordinal and name a DIFFERENT physical register "
+                           "— the wrong-register-class miscompile, refused "
+                           "(D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD)",
+                           mnemonic, fieldName,
+                           targetRegClassName(*expected),
+                           targetRegClassName(info->regClass),
+                           static_cast<unsigned>(reg.id), info->name));
         return std::nullopt;
     }
     std::uint16_t const cap =

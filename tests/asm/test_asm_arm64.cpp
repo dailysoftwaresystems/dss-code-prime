@@ -2540,7 +2540,7 @@ TEST(EncodingValidate, RejectsModRmSlotInFixed32Variant) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "fixed32",
+                "format": "fixed32", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "fixedWord": 1 },
@@ -2563,7 +2563,7 @@ TEST(EncodingValidate, RejectsRdSlotInX86VariableVariant) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -2744,7 +2744,7 @@ TEST(EncodingValidate, MultiWordPerWordSlotReuseLoads) {
             { "mnemonic": "macro", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "fixed32",
+                "format": "fixed32", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["symbol"] },
                     "template": { "fixedWords": [2415919104, 2432696320] },
@@ -2777,7 +2777,7 @@ TEST(EncodingValidate, SameWordSlotDoubleWriteRejected) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "fixed32",
+                "format": "fixed32", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "fixedWord": 1 },
@@ -2827,7 +2827,7 @@ TEST(EncodingValidate, MultiWordRejectsWordIndexBeyondTemplate) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "fixed32",
+                "format": "fixed32", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "fixedWords": [1, 2] },
@@ -3209,7 +3209,17 @@ TEST(Arm64Encoder, FsturQEncodesByteExact) {
     auto blk = b.createBlock();
     b.beginBlock(blk);
     LirOperand const ops[] = {
-        LirOperand::makeReg(fpr(**s, "d0")),   // q0 shares the d0 ordinal (V register)
+        // ★ THE 128-BIT V VIEW, NOT THE 64-BIT D ONE
+        // (D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD). This line used to
+        // read `fpr(**s, "d0")` with the comment "q0 shares the d0 ordinal",
+        // and that sharing is precisely why the substitution was invisible:
+        // `d0` and `v0` carry the same hardware encoding, so a sixteen-byte
+        // `STUR Qt` naming an EIGHT-byte register emitted the right bytes. The
+        // target's `registerClassOps` binds `fstur_q` as the `vr` class's
+        // store; its data operand is a `vr` register.
+        LirOperand::makeReg(makePhysicalReg(
+            static_cast<std::uint32_t>(*(*s)->registerByName("v0")),
+            LirRegClass::VR)),
         LirOperand::makeReg(gpr(**s, "x1")),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(0)

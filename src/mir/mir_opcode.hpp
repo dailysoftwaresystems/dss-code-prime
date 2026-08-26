@@ -41,6 +41,33 @@ enum class MirOpcode : std::uint16_t {
     // that block `b` is ADDRESS-TAKEN (Mir::isBlockAddressTaken scans for these),
     // so reachability / SimplifyCfg / the block-symbol emit all read one source.
     BlockAddress,
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the STATIC-DATA half of
+    // `&&label`. `BlockAddress` makes a block's address a VALUE; this makes it a
+    // LINK-TIME CONSTANT, which is what `static void *tbl[] = {&&L0, &&L1};`
+    // needs (gcc emits `.quad .L3` into `.rdata` for exactly this — ✔measured).
+    // It is the DSS analogue of LLVM's `blockaddress(@f, %bb)` Constant and of
+    // gcc's `ADDR_EXPR<LABEL_DECL>` + `FORCED_LABEL`.
+    //   operands = [the BlockAddress value being exported]  (exactly one)
+    //   payload  = the SymbolId.v of the synthetic per-block symbol the data
+    //              relocation targets, MINTED AT HIR→MIR so a `MirSymbolAddrValue`
+    //              initializer literal can name it before any block ids exist
+    //   result   = NONE (it emits no machine instruction; it publishes a binding)
+    // ★ WHY THE SYMBOL RIDES THE INSTRUCTION AND THE BLOCK RIDES AN OPERAND, and
+    // not the other way round: the optimizer's rebuild copies a literal pool entry
+    // VERBATIM but RE-NUMBERS every block, so a block id parked in a literal goes
+    // silently stale. A SymbolId never renumbers, and the operand edge to the
+    // `BlockAddress` is re-mapped by the ordinary rebuild machinery — so the pair
+    // (symbol, block) survives every rebuild with no pass-specific code at all.
+    // ★ Its presence also keeps the exported block ADDRESS-TAKEN by the ordinary
+    // rule (it holds the `BlockAddress` live as an operand), so SimplifyCfg's MF-B
+    // fold guard needs no new input to protect a block reached only from data.
+    // ★ AND IT CLOSES THE DUPLICATION HAZARD FOR FREE. Inlining an exporting
+    // function at two call sites would leave TWO exports carrying ONE symbol and
+    // naming DIFFERENT blocks — one symbol, two definitions. It cannot happen,
+    // because the mandatory `BlockAddress` operand is exactly what the inliner
+    // already refuses to inline (`functionHasComputedGoto`). Naming the block
+    // directly from this instruction would have removed that refusal's trigger.
+    BlockAddressExport,
 
     // ── integer arithmetic ──
     Add, Sub, Mul, SDiv, UDiv, SMod, UMod, Neg,
@@ -442,6 +469,13 @@ struct MirOpcodeInfo {
         // SimplifyCfg could fold a block the IndirectBr still lists as a successor —
         // a dangling edge. Pinning it keeps the address-taken set stable.
         case MirOpcode::BlockAddress: return {0, 0, 0, 0, R::Value, false, true, false, "blockaddress"};
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: one operand (the
+        // exported `BlockAddress` value), NO result (R::None — it emits no machine
+        // instruction), side-effecting so DCE keeps it AND keeps its `BlockAddress`
+        // operand live. NOT in `opcodeClobbersMemory`: it constrains nothing at
+        // runtime, it publishes a link-time binding.
+        case MirOpcode::BlockAddressExport:
+            return {1, 1, 0, 0, R::None, false, true, false, "blockaddress_export"};
 
         // integer arithmetic.
         case MirOpcode::Add:  return {2, 2, 0, 0, R::Value, false, false, false, "add"};

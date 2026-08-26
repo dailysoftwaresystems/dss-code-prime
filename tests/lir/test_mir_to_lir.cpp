@@ -97,7 +97,19 @@ struct Lowered {
                                     /*volatileMap=*/nullptr,
                                     &hir->alignmentMap,    // VLA C1b over-align gate
                                     /*threadLocalMap=*/nullptr,
-                                    &hir->vlaSizeExprBySymbol);   // VLA C1a
+                                    &hir->vlaSizeExprBySymbol,   // VLA C1a
+                                    /*sizeofVlaSymMap=*/nullptr,
+                                    /*typedefVlaOriginMap=*/nullptr,
+                                    /*synthRecipeMap=*/nullptr,
+                                    /*returnsTwiceMap=*/nullptr,
+                                    /*noInlineMap=*/nullptr,
+                                    /*alwaysInlineMap=*/nullptr,
+                                    /*noOptimizeMap=*/nullptr,
+                                    /*noSanitizeThreadMap=*/nullptr,
+                                    /*inlineAsmPool=*/nullptr,
+                                    /*inlineDefinitionMap=*/nullptr,
+                                    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED
+                                    &hir->enclosingFunctionMap);
     DiagnosticReporter lirReporter;
     auto lir = lowerToLir(mir.mir, *tgt, model.lattice().interner(), lirReporter);
     return Lowered{

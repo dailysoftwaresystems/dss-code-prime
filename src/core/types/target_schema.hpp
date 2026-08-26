@@ -582,6 +582,17 @@ struct VaListLayout {
     std::uint32_t gpSlotBytes = 0;    // bytes per integer save slot (SysV/AAPCS64: 8)
     std::uint32_t fpSaveCount = 0;    // SSE/VR arg regs spilled (SysV/AAPCS64: 8)
     std::uint32_t fpSlotBytes = 0;    // bytes per SSE/VR save slot (SysV/AAPCS64: 16)
+    // ── WHICH REGISTERS THE VR BLOCK SAVES IS NOT DECLARED HERE ─────────────
+    // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD. It is the CC's OWN
+    // `argVrs` list, and this note exists because the prologue used to read
+    // `argFprs` instead. On AArch64 those name the SIXTY-FOUR-BIT `d0..d7`
+    // views, so a 16-byte `STUR Qt` was emitted naming an 8-byte register;
+    // ✔MEASURED, it produced the right BYTES only because `d0` and `v0` share
+    // hwEncoding 0, which is exactly why nothing caught it. `validate()` now
+    // requires `argVrs` to cover `fpSaveCount` on an `Aapcs64DualCursor`
+    // layout, so the list the prologue reads is the one the ABI names
+    // (AAPCS64 §B saves `q0..q7`, sixteen bytes each) and no inference stands
+    // in for it.
 
     // `va_arg` reg-vs-overflow thresholds. gp_offset < gpOffsetLimit ⇒ read from
     // the save area (SysV: 48 = 6×8); fp_offset < fpOffsetLimit ⇒ likewise
@@ -2099,6 +2110,13 @@ struct DSS_EXPORT TargetEncodingWire {
     std::uint8_t     index           = 0;
     EncodingSlotKind slotKind        = EncodingSlotKind::ModRmReg;
     std::optional<RelocationKind> relocationKind;
+    // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the REGISTER BANK this
+    // field draws from, when the wired operand is a register — the JSON key
+    // `regClass`. ABSENT means "inherit the opcode's `encoding.registerClass`";
+    // PRESENT overrides it for this one field. See the block comment on
+    // `encodingWireRegClass` below for why the two levels exist and why
+    // neither one may be missing for a register-bearing field.
+    std::optional<TargetRegClass> regClass;
     // D-AS4-3 (multi-instruction-macro encoder): which 32-bit word
     // (0-based) of a multi-word `fixed32` template this wire's slot
     // lives in. DEFAULT 0 — every existing single-word wire is
@@ -2258,6 +2276,14 @@ struct DSS_EXPORT TargetEncodingVariant {
     // filling the reg field. Implicitly word 0 for multi-word
     // templates; additional placements go in `extraResultSlots`.
     std::optional<EncodingSlotKind>    resultSlot;
+    // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the REGISTER BANK the
+    // RESULT field draws from — the JSON key `resultRegClass`. ABSENT means
+    // "inherit the opcode's `encoding.registerClass`"; PRESENT overrides it.
+    // Governs `resultSlot` AND every `extraResultSlots` placement, because
+    // those are additional placements of the SAME register and a register has
+    // one class. Meaningful only with a `resultSlot` (validate() refuses it
+    // otherwise — a class for a field the variant does not have).
+    std::optional<TargetRegClass>      resultRegClass;
     // D-AS4-3: additional placements of the SAME result register in a
     // multi-word template (see `ResultSlotExtra`). Empty for every
     // single-word / single-placement opcode. validate() requires a
@@ -2277,8 +2303,67 @@ struct DSS_EXPORT TargetEncodingVariant {
 // `shape == None`.
 struct DSS_EXPORT TargetEncodingInfo {
     TargetEncodingShape                shape = TargetEncodingShape::None;
+    // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the register bank THIS
+    // OPCODE's register fields draw from unless a field says otherwise — the
+    // JSON key `encoding.registerClass`. See the block comment on
+    // `encodingWireRegClass` / `encodingResultRegClass` just below.
+    std::optional<TargetRegClass>      registerClass;
     std::vector<TargetEncodingVariant> variants;
 };
+
+// ── WHICH REGISTER BANK DOES THIS ENCODING FIELD DRAW FROM? ───────────────
+// D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD.
+//
+// ★★★ THE DEFECT THIS VOCABULARY EXISTS FOR. The mixed-class argument
+// miscompile (`D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP`, audit F8)
+// disassembled to `cvttss2si %xmm15`: a GPR ordinal — `r15` — reached the
+// ModR/M.rm field of an instruction whose rm field is an XMM field, and the
+// encoder wrote 15 there without a word. Ordinal 15 is a perfectly legal
+// value for that 4-bit field, so the bytes were VALID and named a DIFFERENT
+// PHYSICAL REGISTER than the LIR meant. Nothing downstream could tell: the
+// disassembler read back the same bytes, the linker patched nothing, the
+// program simply computed with whatever `%xmm15` happened to hold. Every
+// wrong-class-operand bug in the tiers above the encoder — regalloc handing
+// out of the wrong bank, a lowering splicing the wrong actual, a hand-built
+// test LIR — lands here as a silent miscompile unless the encoder knows what
+// the field WANTS.
+//
+// ★★ WHY IT IS DECLARED RATHER THAN DERIVED. The slot KIND cannot answer it:
+// x86's `modrm.reg` is a GPR field under `add` and an XMM field under `addsd`,
+// and one instruction can want BOTH banks at once — `cvttsd2si` reads xmm
+// through `modrm.rm` and writes a GPR through `modrm.reg`, while `cvtsi2sd`
+// does exactly the reverse. Neither the mnemonic nor the opcode bytes are
+// something the engine may branch on (that is the agnosticism rule), so the
+// bank a field draws from is TARGET VOCABULARY and lives in `.target.json`
+// beside the `registers[]` table that declares each register's own class.
+//
+// ★ TWO LEVELS, AND THE OUTER ONE IS NOT A FALLBACK. `encoding.registerClass`
+// states the bank the instruction is ABOUT ("this is an FP instruction"); a
+// per-field `regClass` / `resultRegClass` states the exceptions the machine
+// actually has (an FP load's ADDRESS is still a GPR; a convert's other half is
+// the other bank). That is how the ISA manuals read, and it keeps the
+// declaration count proportional to the machine facts instead of restating
+// `gpr` on ~750 fields. It is NOT a silent default: `validate()` REFUSES a
+// document in which any register-bearing field resolves to nothing, naming the
+// opcode, the variant and the field — so every field has a declared class or
+// the target does not load.
+//
+// ⚠ AND THE FAILURE MODE OF A FORGOTTEN DECLARATION IS THE LOUD ONE. If an
+// author adds an FP opcode and forgets `registerClass`, the document is
+// refused at load. If they declare the WRONG bank, the first instruction
+// encoded through it fails loud with both classes named. The only way to get
+// silence is to declare a bank AND feed it a matching wrong-class operand —
+// i.e. to state the lie twice, in config and in the LIR.
+[[nodiscard]] inline std::optional<TargetRegClass>
+encodingWireRegClass(TargetEncodingInfo const& enc,
+                     TargetEncodingWire const& w) noexcept {
+    return w.regClass.has_value() ? w.regClass : enc.registerClass;
+}
+[[nodiscard]] inline std::optional<TargetRegClass>
+encodingResultRegClass(TargetEncodingInfo const& enc,
+                       TargetEncodingVariant const& v) noexcept {
+    return v.resultRegClass.has_value() ? v.resultRegClass : enc.registerClass;
+}
 
 // One relocation kind declared by the target schema (plan 13 §2.6, the
 // bucket-1 reloc taxonomy facet). Each row defines an opaque

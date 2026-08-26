@@ -1011,7 +1011,7 @@ TEST(X86VariableEncoder, NoMatchingVariantFiresLoudDiagnostic_KindMismatch) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -1052,7 +1052,7 @@ TEST(X86VariableEncoder, NoMatchingVariantFiresLoudDiagnostic_KindMismatch) {
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -1115,7 +1115,7 @@ TEST(X86VariableEncoder, NoMatchingVariantFiresOnArityMismatch) {
             { "mnemonic": "wrong", "result": "none",
               "terminatorKind": "unreachable",
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "opcode": [144] },
@@ -1236,7 +1236,7 @@ TEST(TargetEncodingValidate, RejectsModrmRegExtOverflow) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "opcode": [199], "modrmRegExt": 8 },
@@ -1258,7 +1258,7 @@ TEST(TargetEncodingValidate, RejectsWireIndexOutOfRange) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -1281,7 +1281,7 @@ TEST(TargetEncodingValidate, RejectsModrmRegExtWithModRmRegWire) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "opcode": [199], "modrmRegExt": 0 },
@@ -1304,7 +1304,7 @@ TEST(TargetEncodingValidate, RejectsUncoveredGuardPosition) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "none",
               "terminatorKind": "unreachable",
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg", "reg"] },
                     "template": { "opcode": [144] },
@@ -1326,7 +1326,7 @@ TEST(TargetEncodingValidate, RejectsDuplicateModRmRegWires) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 2, "maxOperands": 2,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg", "reg"] },
                     "template": { "rexW": true, "opcode": [1] },
@@ -1352,7 +1352,7 @@ TEST(TargetEncodingValidate, RejectsOverlappingVariantGuards) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -1378,7 +1378,7 @@ TEST(TargetEncodingValidate, RejectsValueResultWithoutDestSlot) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "opcode": [144] },
@@ -1403,7 +1403,7 @@ TEST(X86VariableEncoder, RexNotEmittedWhenAllBitsZero) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op32", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": false, "opcode": [139] },
@@ -1464,7 +1464,7 @@ TEST(X86VariableEncoder, MultiByteOpcodeEmitsBytesInDeclaredOrder) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "two", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [15, 175] },
@@ -1523,7 +1523,7 @@ TEST(X86VariableEncoder, ModrmRegExtNonZeroFillsRegField) {
             { "mnemonic": "invalid", "result": "none" },
             { "mnemonic": "op", "result": "value",
               "minOperands": 1, "maxOperands": 1,
-              "encoding": { "format": "x86-variable",
+              "encoding": { "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["imm32"] },
                     "template": { "rexW": true, "opcode": [199], "modrmRegExt": 7 },

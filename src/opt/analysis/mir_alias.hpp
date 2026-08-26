@@ -434,6 +434,218 @@ mirAnyMayAliasingStoreInRegion(
     return false;
 }
 
+// ── The point-to-point clobber cover: SPECIFICATION ──────────────────
+//
+// `MirMemoryClobbers::anyClobberBetweenPoints` is the production chokepoint for
+// "may a value loaded at program point `from` still be reused at program point
+// `to`?". It answers with a FOUR-SLICE, block-granular decomposition over the
+// memoized clobber index. THIS function answers the same question a completely
+// different way — an exhaustive walk of the (block, instruction-index)
+// PROGRAM-POINT graph — and it is TOTAL BY CONSTRUCTION: it enumerates every
+// instruction that can actually execute on a path, so no slice can go missing.
+//
+// WHY IT EXISTS (`D-OPT-CSE-CLOBBER-COVER-CHOKEPOINT`): before this, the four
+// slices were open-coded at the CSE use site and their completeness was a hand
+// argument re-done at every edit. `D-OPT-CSE-LOAD-BACKEDGE-TAIL` is what that
+// costs — a three-slice cover looked complete because nothing in the API or the
+// type system said what "complete" meant, and the missing wrap-around slice
+// shipped a release-only silent miscompile. The differential pins assert
+// `spec ⇒ production` (production may over-approximate; it may never MISS), so
+// deleting any slice now reds a test instead of a customer's build.
+//
+// SEMANTICS. A program point is a pair (block, i), 0 <= i <= blockInstCount(b):
+// "about to execute instruction i", with i == count meaning "the terminator has
+// run; about to enter a successor at ITS index 0". Executing (b, i) steps to
+// (b, i+1); (b, count) steps to (s, 0) for every successor s. Since a block is
+// entered ONLY at index 0, a point in the middle of a block is a cut vertex of
+// every path that re-enters that block.
+//   from = (fromBlock, fromIdx)  — where the value was produced (EXCLUSIVE)
+//   to   = (toBlock,   toIdx)    — where it would be reused     (EXCLUSIVE)
+// True iff some instruction that clobbers `loadPtr` executes on a path that
+// starts just after `from` and ends at ANY execution of `to`, WITHOUT
+// re-executing `from`.
+//
+// ★ "without re-executing `from`" is the RE-EXECUTION LEMMA made mechanical: a
+// wrap that runs the producing instruction again REFRESHES the value, so only
+// the suffix since the LAST execution of `from` can invalidate it. Dropping
+// that clause would make this spec reject two provably-sound classes — the ones
+// pinned by `LoadCsedSameBlockInLoopDespiteTailStore` and
+// `LoadCsedFromLoopHeaderIntoBodyDespiteTailStore` — and CSE would then have to
+// be pessimised to keep the differential green. It is modelled here as removing
+// the single point `from` from the graph, which is exact precisely because of
+// the entered-only-at-index-0 property above.
+//
+// Precondition: in the SAME block, fromIdx < toIdx (what "the value is
+// available at `to`" means there); fail-loud otherwise, matching the production
+// query's contract. `preds` MUST be `mirBuildPredecessors(mir)` for the SAME
+// module. REFERENCE implementation — quadratic-ish in program points and NOT
+// memoized; production consumers query the index.
+[[nodiscard]] inline bool
+mirAnyClobberOnPathBetweenPoints(
+    Mir const&                                  mir,
+    TypeInterner const&                         interner,
+    MirInstId                                   loadPtr,
+    MirBlockId                                  fromBlock,
+    std::uint32_t                               fromIdx,
+    MirBlockId                                  toBlock,
+    std::uint32_t                               toIdx,
+    std::vector<std::vector<MirBlockId>> const& preds,
+    StrictTbaa                                  strictTBAA        = StrictTbaa::No,
+    bool                                        charTypesAliasAll = true)
+{
+    if (preds.size() != mir.blockCount()) {
+        std::fprintf(stderr,
+            "dss::opt::analysis::mirAnyClobberOnPathBetweenPoints fatal: "
+            "preds.size()=%zu != mir.blockCount()=%zu — caller passed a "
+            "stale/foreign predecessor map.\n",
+            preds.size(), mir.blockCount());
+        std::abort();
+    }
+    std::uint32_t const blockCount = static_cast<std::uint32_t>(mir.blockCount());
+    std::uint32_t const fromN = mir.blockInstCount(fromBlock);
+    std::uint32_t const toN   = mir.blockInstCount(toBlock);
+    if (fromIdx >= fromN || toIdx >= toN) {
+        std::fprintf(stderr,
+            "dss::opt::analysis::mirAnyClobberOnPathBetweenPoints fatal: "
+            "program point out of range (from #%u idx=%u of %u, to #%u idx=%u "
+            "of %u) — both indices must name an instruction in their block.\n",
+            fromBlock.v, fromIdx, fromN, toBlock.v, toIdx, toN);
+        std::abort();
+    }
+    if (fromBlock.v == toBlock.v && fromIdx >= toIdx) {
+        std::fprintf(stderr,
+            "dss::opt::analysis::mirAnyClobberOnPathBetweenPoints fatal: "
+            "same-block points out of program order (#%u idx=%u then idx=%u) "
+            "— the produced value must precede its reuse.\n",
+            fromBlock.v, fromIdx, toIdx);
+        std::abort();
+    }
+
+    auto const pt = [](std::uint32_t blockSlot, std::uint32_t idx) noexcept {
+        return (static_cast<std::uint64_t>(blockSlot) << 32) | idx;
+    };
+    std::uint64_t const barrier = pt(fromBlock.v, fromIdx);   // never traversed
+    std::uint64_t const dest    = pt(toBlock.v,   toIdx);
+
+    // Forward closure: every point reachable from just after `from`.
+    std::unordered_set<std::uint64_t> fwd;
+    {
+        std::vector<std::uint64_t> work;
+        auto const push = [&](std::uint64_t p) {
+            if (p == barrier) return;
+            if (fwd.insert(p).second) work.push_back(p);
+        };
+        push(pt(fromBlock.v, fromIdx + 1u));
+        while (!work.empty()) {
+            std::uint64_t const p = work.back();
+            work.pop_back();
+            auto const slot = static_cast<std::uint32_t>(p >> 32);
+            auto const idx  = static_cast<std::uint32_t>(p & 0xFFFFFFFFu);
+            MirBlockId const b{slot, mir.id().v};
+            if (idx < mir.blockInstCount(b)) { push(pt(slot, idx + 1u)); continue; }
+            for (MirBlockId const s : mir.blockSuccessors(b)) {
+                if (!s.valid() || s.v >= blockCount) continue;
+                push(pt(s.v, 0u));
+            }
+        }
+    }
+
+    // Backward closure: every point from which `to` is still reachable.
+    std::unordered_set<std::uint64_t> bwd;
+    {
+        std::vector<std::uint64_t> work;
+        auto const push = [&](std::uint64_t p) {
+            if (p == barrier) return;
+            if (bwd.insert(p).second) work.push_back(p);
+        };
+        push(dest);
+        while (!work.empty()) {
+            std::uint64_t const p = work.back();
+            work.pop_back();
+            auto const slot = static_cast<std::uint32_t>(p >> 32);
+            auto const idx  = static_cast<std::uint32_t>(p & 0xFFFFFFFFu);
+            if (idx > 0u) { push(pt(slot, idx - 1u)); continue; }
+            if (slot >= preds.size()) continue;
+            for (MirBlockId const q : preds[slot]) {
+                if (!q.valid() || q.v >= blockCount) continue;
+                push(pt(q.v, mir.blockInstCount(q)));
+            }
+        }
+    }
+
+    // A clobber invalidates the reuse iff it can EXECUTE after `from` (its own
+    // point is forward-reachable) AND `to` can still be reached afterwards (the
+    // point just AFTER it is backward-reachable). `to` itself is EXCLUSIVE.
+    for (std::uint64_t const p : fwd) {
+        if (p == dest) continue;
+        auto const slot = static_cast<std::uint32_t>(p >> 32);
+        auto const idx  = static_cast<std::uint32_t>(p & 0xFFFFFFFFu);
+        MirBlockId const b{slot, mir.id().v};
+        if (idx >= mir.blockInstCount(b)) continue;   // an inter-block edge point
+        if (bwd.find(pt(slot, idx + 1u)) == bwd.end()) continue;
+        if (mirInstClobbersLoadPtr(mir, interner, loadPtr,
+                                   mir.blockInstAt(b, idx),
+                                   strictTBAA, charTypesAliasAll)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ── Alias-probe substitution licence (`D-OPT-CSE-LOAD-PTR-KEY-UNRESOLVED`) ──
+//
+// A value-numbering consumer resolves an instruction's operands through its
+// redirect map before building a key, and MUST hand the alias gate the SAME
+// canonical id — a gate probing with the RAW id is reasoning about a value the
+// rebuild is about to delete, and the two sites can then silently disagree
+// about what "this pointer" means. Swapping one pointer id for another inside
+// `mirInstClobbersLoadPtr` is legitimate only when it cannot WEAKEN a clobber
+// verdict. This predicate is that licence, stated once and checkable:
+//
+//   THEOREM. If `raw` and `canonical` have the SAME opcode, the SAME TypeId,
+//   and that opcode is NOT `Alloca`, then for every instruction X and every
+//   flag setting
+//       mirInstClobbersLoadPtr(…, raw, X, …) == mirInstClobbersLoadPtr(…, canonical, X, …).
+//   PROOF. `mirInstClobbersLoadPtr` is `mirMayAlias(probe, storePtr) != No` for
+//   a Store and probe-INDEPENDENT for every other opcode. Of `mirMayAlias`'s
+//   rules only Rule 2 (BOTH operands are `Alloca` — an OPCODE test) and Rule 6
+//   (distinct primitive pointees under strict TBAA — a TYPE test) can yield
+//   `No`; Rules 3/4/5/7 are type tests too. Equal opcode + equal type therefore
+//   give an IDENTICAL verdict on Rules 2..7 — and with neither probe an
+//   `Alloca`, Rule 2 is unreachable for both. Rule 1 (same SSA id ⇒ `Yes`) is
+//   then the only rule that can differ, and only when X's Store writes through
+//   `raw` or through `canonical`; there the alternative verdict is `Maybe`
+//   (equal TypeIds are not DISTINCT pointees, so Rule 6 cannot fire, and Rule 2
+//   is already excluded), and `Yes` and `Maybe` are BOTH `!= No` — so the
+//   clobber predicate is unchanged. ∎
+//
+// ★ The `Alloca` exclusion is NOT decoration: two DISTINCT `Alloca`s have the
+// same opcode and, at the same pointee type, the same TypeId, yet substituting
+// one for the other flips a Store through either of them from `Yes` (Rule 1) to
+// `No` (Rule 2, distinct stack slots) — the one direction that WEAKENS a
+// clobber verdict and would admit a stale Load. `tests/opt/test_mir_alias.cpp`
+// pins exactly that pair as REFUSED.
+//
+// CSE satisfies the premise by construction: its key carries both the opcode
+// and the result TypeId, so a redirect can only join same-opcode/same-type
+// instructions, and `Alloca` is excluded from CSE candidacy so it can never be
+// either end of a redirect. The consumer nevertheless CHECKS rather than
+// assumes — this is the fail-loud gate at the substitution site, so a future
+// key that stops discriminating opcode or type, or an opcode table that admits
+// `Alloca` to CSE, aborts instead of silently admitting a stale Load. Pinned by
+// the exhaustive differential in `tests/opt/test_mir_alias.cpp`.
+[[nodiscard]] inline bool
+mirAliasProbeSubstitutionPreservesClobberVerdict(
+    Mir const& mir, MirInstId raw, MirInstId canonical)
+{
+    if (!raw.valid() || !canonical.valid()) return false;
+    if (raw.v == canonical.v) return true;
+    MirOpcode const opRaw = mir.instOpcode(raw);
+    if (opRaw == MirOpcode::Alloca) return false;
+    return opRaw == mir.instOpcode(canonical)
+        && mir.instType(raw).v == mir.instType(canonical).v;
+}
+
 // True iff any Store in the loop body may alias the given Load
 // pointer. Convenience wrapper over `mirAnyMayAliasingStoreInRegion`
 // for LICM's hoist-admission gate. Loop body comes from

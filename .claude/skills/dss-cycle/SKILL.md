@@ -91,6 +91,65 @@ python scripts/check-anchor-balance/check-anchor-balance.py --breakdown --denomi
 between buckets is correctly a no-op — so its breakdown gives the registry TOTAL, and a per-bucket
 split must sum to it. ★ **That sum is the cross-check that catches a mis-bucketed or double-counted
 row, and it is the only reason the P34 error surfaced at all.**
+
+## ★★★★ NO FOLLOW-UPS. A ROW YOU OPEN, YOU CLOSE — operator ruling 2026-08-26
+
+> *"I'M REALLY UPSET with the follow UPS.... OUR PROJECT SEEMS TO BE A FOLLOW UP!! THIS MUST STOP
+> NOW."* … *"opened anchors that are not closed in the immediate cycle or the next are brutally
+> rare exceptions now, not the rule. found something new that must be done? DO IT. Priority
+> production, then harness. Fix harnesses immediately when they become a blocker."* … *"If I keep
+> seeing anchors rising after implementations or fixes I'll be really pissed!"*
+
+**This section is the enforcement of [[feedback-close-do-not-file]], which existed as a ruling
+since 2026-08-24 and — ✔MEASURED 2026-08-26 — had NEVER BEEN WRITTEN INTO EITHER SKILL. That is
+exactly why it eroded: a ruling that lives only in a memory index has no teeth at the moment of
+the decision. The absence of this section IS the defect this section closes.**
+
+### The rule
+
+1. **A row you open, you close — in this cycle, or the next one.** Longer than that is a
+   **brutally rare exception**, and an exception must be NAMED as one in the row, with the reason
+   it could not be closed and the predicate that will close it.
+2. **"Found something new that must be done?" → DO IT.** Discovering work is not a licence to
+   file it. A new row is the LAST RESORT, never the first response to a finding.
+3. **Priority is PRODUCTION, then harness. A harness defect that BLOCKS you is fixed the moment
+   you face it** — in this cycle, in the lane that hit it. Never later.
+4. **"Refused but not fixed" is NOT closed.** Neither is "measured and understood". Neither is
+   "the row now describes the real scope". A row closes when the BEHAVIOUR changed.
+
+### The gate — this is measured, not asserted
+
+`scripts/check-anchor-balance/check-anchor-balance.py` **already** implements
+*"a cycle may not end with more OPEN deferral rows than it began"*, comparing **by row name**
+across every sanctioned home. Run it against the cycle's OWN start commit and treat a rise as a
+**HARD STOP**, not a note:
+
+```
+python scripts/check-anchor-balance/check-anchor-balance.py --base <cycle-start-sha> --breakdown
+```
+
+⚠ **The delta the operator cares about is NET OPEN, and it must be ≤ 0.** A cycle that closes
+three and opens three has, from outside, done nothing. Report closed / opened / **net** as three
+separate numbers in the cycle report — a single total hides exactly the thing being asked about.
+
+### ⚠ A row that is SHIPPED but not marked ✅ is an anchor "rising" for free
+
+✔MEASURED 2026-08-26, and it is why this warning is here rather than in prose somewhere: of the
+15 `D-OPT*` rows the instrument reported OPEN, **three were shipped work** —
+`D-OPT-NOOPTIMIZE-NEUTERS-POLICY`, `D-OPT-REBUILD-POLICY-NEUTERED-STATE-HOOK`, and
+`D-OPT-REBUILD-MANDATORY-NORMALIZATION`, each whose own status cell opens with
+*"🟢 DESIGN RECORD — SHIPPED 2026-07-29 (TF-C85), NOT deferred work"*, and each verified present
+in the tree (`onFunctionNeutered`, `mandatoryNormalization`, the `funcNoOptimize` neuter, with
+their pins). **They counted as OPEN solely because the status cell begins with 🟢 instead of ✅**
+— the gate's deliberate "open unless explicitly closed" polarity, which is the right polarity and
+must not be softened.
+
+⇒ **The fix is never to relax the instrument. It is to mark a shipped row ✅ at the moment it
+ships.** A design record of landed work is CLOSED work; if it must stay legible as a record, it
+opens `✅ **CLOSED — DESIGN RECORD …**`. **Auditing for this class is part of the cycle**, because
+an inflated OPEN count is indistinguishable from a cycle that is filing instead of fixing — and
+the operator is reading that number.
+
 ## ★★★ A GATE HOST HOLDS THE REPO AND NOTHING ELSE — operator ruling 2026-08-25
 
 *"keep macos and vps linux arm64 updated with our repo files, and free of stale files/worktrees.
@@ -251,6 +310,45 @@ the references' acceptance genuinely IS conditional (under `__STRICT_ANSI__` the
 `__asm__`), so a **trigger-gated** row was opened for the day a strict-conformance mode ships —
 the §B's original concern preserved and made testable, without holding the fix hostage to it.
 
+### ★★★★ A TRIGGER WAITING ON A COMPONENT *WE* BUILD IS NOT A GATE (operator ruling 2026-08-26)
+
+> *"if C has any intrinsic, good time to build the intrinsic then the OPT"* … *"if [it] needs
+> something also to be built that can be built, build the one that can be built, then the
+> [gated row]"*
+
+Said while overruling the two rows a cycle had defended as *"legitimately gated"*.
+
+**The distinction, and it silently re-verdicts a large slice of the registry's ⏳ rows —
+classify every gated row by WHO OWNS THE TRIGGER:**
+- **Outside us** → genuinely gated: an operator decision, a profile from a real workload, an
+  upstream project, a hardware platform we do not have.
+- **A component of THIS compiler** → **NOT gated.** It is a two-part task that was written down
+  as one part. **Build the prerequisite, then close the row — in the same cycle.**
+
+⚠ **§E#5 (don't build a consumer-less mechanism) DOES NOT APPLY when the missing consumer is
+itself something we are supposed to build.** That is the exact misreading this ruling corrects.
+The test is still *"does a consumer exist?"* — what changed is that **a consumer we are committed
+to building counts**, so the honest response is to build it now, not to record that it is absent.
+⇒ And filing the prerequisite as its own new row is the follow-up habit wearing a different hat.
+
+★ **Prefer a prerequisite that unblocks MORE THAN ONE row, and name which when you pick it.**
+✔The case that produced the ruling: an escape-analysis / points-to substrate for `mirMayAlias` is
+the stated trigger for `D-OPT-MEMSSA-WALK-PAST-PRECISION` **and** the stated prerequisite for
+`D-OPT7-INLINE-LEGALITY-GATE` clause (c). One substrate, two rows.
+
+⚠ **CHECK THE TREE BEFORE CALLING THE PREREQUISITE MISSING.** ✔MEASURED 2026-08-26: DSS's HIR
+intrinsic registry was about to be described as absent. It EXISTS — `HirIntrinsicRegistry`,
+`Hir::intrinsicRegistry()`, `makeIntrinsicCall`, and a shipped `D-CSUBSET-INTRINSIC-UMULH`
+builtin-intrinsic node. Only the *routing* of a shipped C construct through it is missing, which
+is a far smaller job than the row implied.
+
+⚠ **AND THE MIRROR-IMAGE ERROR, corrected by the operator the SAME DAY: scheduling lives in the
+PLANS, not in the tree.** A cycle concluded from `src/dss-config/targets/` holding only
+little-endian `x86_64` and `arm64` that the big-endian trigger *"had not fired"* — while it is
+operator-sequenced as plan 23 **FC19** with a toolchain verified by execution. ★ **The absence of
+a thing in the tree is not evidence that it is unscheduled.** Read a trigger predicate against
+the plans AND the tree, never the tree alone.
+
 ## Workflow
 
 **Delegation is the default** — see the file map. The orchestrator judges; it should not be the one
@@ -297,6 +395,24 @@ hand-typing every edit or reading every subsystem.
    until the lanes that read it have reported, or hand it to a lane that owns it. Re-measure
    anything a lane reported across such an edit before acting on it — and when a lane's
    report and the tree disagree, suspect the SEQUENCING before suspecting the lane.
+   ★★★★ **HANDING `src/dss-config/**` TO A LANE DOES NOT FIX THIS — IT ONLY MOVES WHOSE
+   HAND IS ON IT, AND ✔THE HAZARD RECURRED THAT WAY ON 2026-08-26 (cycle P38).** The P22
+   row [[D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-OWNERSHIP]] is CLOSED and the
+   mechanism it built is sound; what recurred was the SCHEDULING. A lane was given
+   `src/dss-config/targets/**` + `src/core/types/target_schema.*` and run CONCURRENTLY
+   with three lanes that gate — so `test_support/test_config_snapshot` reddened in one
+   lane and `core/test_target_schema` was momentarily UNCOMPILABLE in another, neither
+   caused by the lane reporting it. ★ **`test_config_snapshot` WAS RIGHT AND MUST NOT BE
+   "FIXED": it deliberately compares the run's snapshot against the LIVE tree, which is
+   the only clause proving the copy is still taken at ctest RUN time.** Softening it to
+   stop the flap would delete the mechanism's honesty check to hide an orchestration
+   error — the *guard weakened every time it fires* failure, exactly.
+   ⇒ **THE RULE: at most ONE lane may hold `src/dss-config/**` or `src/core/types/*schema*`
+   at a time, and NO OTHER LANE'S ctest VERDICT IS TRUSTWORTHY WHILE IT DOES.** Either
+   sequence that lane alone, or treat the concurrent lanes' gates as PROVISIONAL and
+   re-gate the integrated tree once it is quiescent. ★ A lane reporting "N-1/N, the one
+   red is another lane's config edit" has diagnosed it correctly — that report is a
+   SEQUENCING finding, and the integration gate, not the lane, is what settles it.
    ★★ **AND THE TREE THAT RULE NAMES IS TOO NARROW: `.plans/**` IS AN INPUT TO A
    GUARD, AND A GUARD IS A CTEST ENTRY, SO EVERY LANE'S GATE READS IT.**
    ⚠ ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-THE-ORCHESTRATOR-EDITED-PLANS-UNDER-A-RUNNING-LANE-AND-FLIPPED-ITS-GATE`):

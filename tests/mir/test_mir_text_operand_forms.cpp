@@ -183,6 +183,47 @@ TEST(MirTextOperandForms, BlockAddressCarriesItsTargetBlockThroughText) {
         << rt.secondEmit;
 }
 
+// D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: `blockaddress_export` carries
+// its SYMBOL in the payload and reaches its block THROUGH its operand, so both must
+// survive the text. It rides the paired GENERIC arms on both sides rather than
+// getting explicit ones — which is a claim about this format, not an assumption, so
+// it is measured here. The class guard this file exists for (a writer arm that
+// renders a field its reader arm drops) fires as a byte mismatch OR as the
+// unconsumed-tail refusal; both are covered by the two assertions below.
+TEST(MirTextOperandForms, BlockAddressExportCarriesItsSymbolAndOperandThroughText) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const vptr  = ti.pointer(ti.primitive(TypeKind::Void));
+    TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
+
+    MirBuilder b;
+    b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tgt   = b.createBlock(StructCfMarker::Linear);
+    b.beginBlock(entry);
+    MirInstId const addr = b.addBlockAddress(tgt, vptr);
+    // SymbolId 9 — deliberately NOT 1 (the function's own) and NOT 0 (the invalid
+    // sentinel the writer suppresses), so a dropped payload re-emits a DIFFERENT
+    // string instead of coincidentally the same one.
+    b.addBlockAddressExport(addr, SymbolId{9});
+    std::array<MirBlockId, 1> succs{tgt};
+    b.addIndirectBr(addr, succs);
+    b.beginBlock(tgt);
+    b.addReturn(b.addConst(i32Lit(3), i32));
+    Mir m = std::move(b).finish();
+
+    std::vector<std::string> names{"", "cg"};
+    RoundTrip const rt = roundTrip(m, ti, names);
+    EXPECT_NE(rt.firstEmit.find("blockaddress_export"), std::string::npos)
+        << rt.firstEmit;
+    EXPECT_TRUE(rt.parseOk) << rt.firstEmit;
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+    // The symbol is stated directly, not only through the byte compare: a reader
+    // that dropped the payload would re-emit the instruction with NO payload tail
+    // at all, and `9` would vanish from the text.
+    EXPECT_NE(rt.secondEmit.find("payload 9"), std::string::npos) << rt.secondEmit;
+}
+
 // ── (c) `byvaluestackarg` — a PACKED payload, spelled in two fields ──────────
 //
 // The writer renders ` size <bytes> exhaust <class>`; the reader's generic arm

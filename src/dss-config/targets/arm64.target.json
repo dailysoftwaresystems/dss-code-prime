@@ -145,6 +145,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "★★ WIDTH-KEYED TO 64 AS OF 2026-08-13, AND THE KEY IS A SILENT-MISCOMPILE FIX RATHER THAN TIDYING. This variant carried NO `guard.width`, and `walker_util::variantMatchesInst` treats a width-absent guard as matching ANY width — so a width-32 `mov` with a register source selected THIS word and encoded `ORR Xd, XZR, Xm`, a 64-bit move. Nothing reported it: the guard matched, the encoder emitted, the build was green. It became reachable the moment a hand-written `.s` could write `mov w0, w1`, whose ONLY observable difference from `mov x0, x1` is that it zeroes bits 63:32. ✔MEASURED before the change: every `mov` the compiler emits with a REGISTER operand passes width-default flags (64) — the one flags-carrying emitter, `mir_to_lir.cpp`'s `emitMovToFresh`, is reached only from the constant-materialization paths, whose operand is an ImmInt32 or a LiteralIndex — so keying this to 64 and adding the W sibling below is BYTE-NEUTRAL for existing codegen. (The `[\"imm32\"]` MOVZ variant below WAS deliberately left width-absent on that same reasoning — width-32 constants DO reach it, and an X-form MOVZ zeroes all 64 bits, which is value-identical to the W form. ⓘ UPDATED 2026-08-13: it is now width-keyed at 64 with a width-32 W sibling (D-ASM-ARM64-MOVZ-W-FORM-UNDECLARED), because value-identity was never the blocker — `variantHonorsDeclaredWidth` refuses a width-absent variant elected by a width-32 REQUEST, so `mov w0, #5` could not be written at all. Every variant of this opcode is width-keyed now.)",
@@ -216,6 +217,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "imm32"] },
@@ -240,6 +242,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "imm32"] },
@@ -264,6 +267,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "imm32"] },
@@ -325,6 +329,7 @@
       "encoding": {
         "$comment": "FC3 c2 (D-CSUBSET-32BIT-ALU-FORMS): the reg-reg shape is width-keyed 64/32 — the W-form is the SAME shifted-register ADD word with sf (bit 31) CLEARED (ARM ARM C6.2.5: a W-register write zeroes the upper 32 bits of the X register, the C-defined unsigned-int wraparound for free). The imm12 shape stays width:64-only — its sole producer is the callconv sp-adjust (Ptr-width); a width-32 add-imm inst would match NOTHING and fail loud rather than silently compute with a 64-bit carry.",
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -388,6 +393,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -455,6 +461,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -478,6 +485,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -501,6 +509,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -521,6 +530,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -552,6 +562,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -573,6 +584,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -601,6 +613,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -629,6 +642,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -666,6 +680,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 32 },
@@ -695,6 +710,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
@@ -726,6 +742,7 @@
       "maxOperands":   3,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
@@ -759,6 +776,7 @@
       "maxOperands":   4,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
@@ -792,6 +810,7 @@
       "maxOperands":   4,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
@@ -843,6 +862,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -872,6 +892,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -901,6 +922,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -932,6 +954,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -963,6 +986,7 @@
       "maxOperands":   3,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg", "reg"], "width": 64 },
@@ -996,6 +1020,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1027,6 +1052,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1057,6 +1083,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1087,6 +1114,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1118,6 +1146,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1149,6 +1178,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1183,6 +1213,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64 — `CSET Xd, <cc>` (0x9A9F07E0, sf=1). ★ THE `width` KEY IS NEW BESIDE THE width-32 SIBLING BELOW AND IS NOT OPTIONAL: `variantMatchesInst` reads an ABSENT width as MATCH-ANY, so a match-any variant beside a width-keyed one either shadows it (if first) or silently absorbs the widths it does not declare (if last) — `validateTargetSchema`'s convergence-fix D refuses the mix outright (D-CSUBSET-32BIT-ALU-FORMS), which is why this key and the sibling below arrive together or not at all. ⓘ IT CHANGES NOTHING FOR THE COMPILER'S OWN PATH: every LIR `setcc` the C front-end emits comes from `lowerICmp`/`lowerFCmp`, which pass NO width flags, so `lirInstWidthBits(0)` = 64 and this guard is exactly what they already matched.",
@@ -1210,6 +1241,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64 (Bool default, flags=0): MOV Wd, Wm = ORR Wd, WZR, Wm (0x2A0003E0). A Bool 0/1 register zero-extends to X via the W-write (bits 63:32 cleared). Width-keyed now that the byte/half forms below are declared (the convergence rule forbids a match-any sibling beside width-keyed ones).",
@@ -1261,6 +1293,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 32: SXTW Xd, Wn (SBFM Xd,Xn,#0,#31 = 0x93407C00) — I32→I64. Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. The MIR→LIR SExt arm threads widthFlagsForType(source): an I32 source → width 32 → here.",
@@ -1303,6 +1336,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 32 },
@@ -1335,6 +1369,7 @@
       "maxOperands":      255,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["symbol"] },
@@ -1403,6 +1438,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64: LDUR Xt, [Xn, #simm9] (0xF8400000). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. Every GPR integer/pointer load carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types).",
@@ -1462,6 +1498,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64: STUR Xt, [Xn, #simm9] (0xF8000000). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. Every GPR integer/pointer store carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types).",
@@ -1521,6 +1558,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64: LDR Xt, [Xn, #pimm] (0xF9400000). accessSize 8 ⇒ imm12 = byteOffset/8 (e.g. [sp,#192] ⇒ imm12=24). Every GPR integer/pointer load carries width 64.",
@@ -1580,6 +1618,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 64: STR Xt, [Xn, #pimm] (0xF9000000). accessSize 8 ⇒ imm12 = byteOffset/8. Every GPR integer/pointer store carries width 64.",
@@ -1639,6 +1678,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": [] },
@@ -1678,6 +1718,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": [] },
@@ -1698,6 +1739,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["symbol"] },
@@ -1851,6 +1893,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["symbol"] },
@@ -1879,6 +1922,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1953,6 +1997,7 @@
       "maxSuccessors": 255,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"] },
@@ -1996,6 +2041,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -2027,6 +2073,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -2058,6 +2105,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -2089,6 +2137,7 @@
       "maxOperands":   2,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -2120,6 +2169,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -2152,6 +2202,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -2181,6 +2232,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "$comment": "F64 source → FCVT Sd, Dn (narrow to single).",
@@ -2211,13 +2263,14 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 2658664448 },
             "resultSlot": "rd",
             "wires":      [
-              { "index": 0, "slotKind": "rn" }
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
           },
           {
@@ -2226,7 +2279,7 @@
             "template":   { "fixedWord": 2654470144 },
             "resultSlot": "rd",
             "wires":      [
-              { "index": 0, "slotKind": "rn" }
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
           }
         ]
@@ -2257,6 +2310,7 @@
       },
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "F64 source → FCVTZU Xd, Dn — ftype=01 double, base 0x9E790000 (the low 32 bits are the in-range U32 result; the full Xd is the NATIVE full-range U64).",
@@ -2264,7 +2318,7 @@
             "template":   { "fixedWord": 2658729984 },
             "resultSlot": "rd",
             "wires":      [
-              { "index": 0, "slotKind": "rn" }
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
           },
           {
@@ -2273,7 +2327,7 @@
             "template":   { "fixedWord": 2654535680 },
             "resultSlot": "rd",
             "wires":      [
-              { "index": 0, "slotKind": "rn" }
+              { "index": 0, "slotKind": "rn", "regClass": "fpr" }
             ]
           }
         ]
@@ -2287,12 +2341,13 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "SCVTF Dd, Xn — sf=1 64-bit signed source -> double. base 0x9E620000. The sqlite i64 -> volatile double blocker.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 2657222656 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
@@ -2301,7 +2356,7 @@
             "$comment": "SCVTF Dd, Wn — sf=0 32-bit signed source -> double. base 0x1E620000 (the arm64 analog of cvtsi2sd xmm,r32; an I32 fits the F64 result exactly).",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 509739008 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
@@ -2334,12 +2389,13 @@
       },
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "UCVTF Dd, Xn — sf=1 64-bit unsigned source -> double. base 0x9E630000.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "fixedWord": 2657288192 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
@@ -2348,7 +2404,7 @@
             "$comment": "UCVTF Dd, Wn — sf=0 32-bit unsigned source -> double. base 0x1E630000.",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 509804544 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
@@ -2364,6 +2420,7 @@
       "maxOperands":   1,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"] },
@@ -2388,11 +2445,12 @@
       "encoding": {
         "$comment": "FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN): width-keyed pair — LDUR Dt (8-byte, 0xFC400000, width 64) vs LDUR St (4-byte, size=10 → 0xBC400000, width 32; ARM ARM C7.2 LDUR SIMD&FP). lowerLoad threads the loaded type's width for FPR-class results: an 8-byte D-load of a 4-byte F32 rodata item would read past the item.",
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
             "template":   { "fixedWord": 4232052736 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"             },
               { "index": 1, "slotKind": "membase.noscale" },
@@ -2403,7 +2461,7 @@
             "$comment": "FC3.5: LDUR St, [Xn, #simm9] — size=10 single, base 0xBC400000 (4-byte load).",
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
             "template":   { "fixedWord": 3158310912 },
-            "resultSlot": "rd",
+            "resultRegClass": "fpr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"             },
               { "index": 1, "slotKind": "membase.noscale" },
@@ -2425,12 +2483,13 @@
       "encoding": {
         "$comment": "FC3.5 sweep-c2: width-keyed pair — STUR Dt (8-byte, width 64) vs STUR St (4-byte, 0xBC000000, width 32). lowerStore threads the stored VALUE's type width for FPR-class stores; the regalloc spill path stays width-default 64 over 8-byte slots (value-preserving for both float widths).",
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "fixedWord": 4227858432 },
             "wires":    [
-              { "index": 0, "slotKind": "rd"             },
+              { "index": 0, "slotKind": "rd", "regClass": "fpr"             },
               { "index": 1, "slotKind": "rn"             },
               { "index": 2, "slotKind": "membase.noscale" },
               { "index": 3, "slotKind": "imm9"           }
@@ -2441,7 +2500,7 @@
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
             "template": { "fixedWord": 3154116608 },
             "wires":    [
-              { "index": 0, "slotKind": "rd"             },
+              { "index": 0, "slotKind": "rd", "regClass": "fpr"             },
               { "index": 1, "slotKind": "rn"             },
               { "index": 2, "slotKind": "membase.noscale" },
               { "index": 3, "slotKind": "imm9"           }
@@ -2461,12 +2520,13 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
             "template": { "fixedWord": 1015021568 },
             "wires":    [
-              { "index": 0, "slotKind": "rd"             },
+              { "index": 0, "slotKind": "rd", "regClass": "vr"             },
               { "index": 1, "slotKind": "rn"             },
               { "index": 2, "slotKind": "membase.noscale" },
               { "index": 3, "slotKind": "imm9"           }
@@ -2486,11 +2546,12 @@
       "maxSuccessors": 0,
       "encoding": {
         "format":   "fixed32",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"] },
             "template":   { "fixedWord": 1019215872 },
-            "resultSlot": "rd",
+            "resultRegClass": "vr", "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn"             },
               { "index": 1, "slotKind": "membase.noscale" },

@@ -253,6 +253,14 @@ MirBlockId Mir::blockAddressTarget(MirInstId id) const {
                                         "blockAddressTarget"),
                       this->id().v};
 }
+SymbolId Mir::blockAddressExportSymbol(MirInstId id) const {
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the synthetic per-block
+    // symbol a static-data abs64 relocation names (payload). NOT tagged with a
+    // module id — a SymbolId is module-independent, which is precisely why the
+    // export carries the SYMBOL and reaches its BLOCK through an operand.
+    return SymbolId{payloadForOpcode_(instArena_.at(id), MirOpcode::BlockAddressExport,
+                                      id, "blockAddressExportSymbol")};
+}
 std::uint32_t Mir::intrinsicId(MirInstId id) const {
     return payloadForOpcode_(instArena_.at(id), MirOpcode::IntrinsicCall, id, "intrinsicId");
 }
@@ -358,6 +366,17 @@ bool Mir::isBlockAddressTaken(MirBlockId block) const {
     // side-table to maintain. Consumed by SimplifyCfg (don't fold an address-taken
     // target) and codegen (emit a synthetic block symbol). Scans only the owning
     // function's instructions (computed gotos are same-function in GNU C).
+    //
+    // ★ THE ONE-FUNCTION SCAN STAYS COMPLETE FOR A LABEL WHOSE ADDRESS ESCAPES INTO
+    // STATIC DATA (D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED), and that is a
+    // DESIGN CONSTRAINT this function imposes on its producer, not a happy accident.
+    // `static void *tbl[] = {&&L0};` puts the address in a module global — nothing
+    // this scan can see — so HIR→MIR is REQUIRED to emit a real `BlockAddress(L0)`
+    // in the OWNING FUNCTION and hand it to a `BlockAddressExport`. Had the export
+    // instead named the block directly from the global, this predicate would answer
+    // FALSE for a block an IndirectBr can still reach, and SimplifyCfg would be free
+    // to fold it — a silent miscompile. Any future producer of block addresses owes
+    // the same in-function `BlockAddress`.
     MirFuncId const fn = blockFunc(block);
     std::uint32_t const nb = funcBlockCount(fn);
     for (std::uint32_t bi = 0; bi < nb; ++bi) {
@@ -1081,6 +1100,33 @@ MirInstId MirBuilder::addBlockAddress(MirBlockId target, TypeId type, MirInstFla
     pod.typeId  = type;
     pod.payload = target.v;
     return appendInst_(pod, {}, /*terminates=*/false);
+}
+
+MirInstId MirBuilder::addBlockAddressExport(MirInstId blockAddr, SymbolId blockSymbol,
+                                            MirInstFlags flags) {
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED. Two loud preconditions,
+    // both of which a silent accept would turn into a wrong-address miscompile:
+    //   * the operand MUST be a BlockAddress — the exported block is read back
+    //     through it, so any other opcode would publish the symbol at nothing;
+    //   * the symbol MUST be valid — SymbolId{} is the invalid sentinel, and an
+    //     abs64 relocation against it resolves to whatever occupies slot 0.
+    if (!blockAddr.valid() || instArena_.at(blockAddr).opcode != MirOpcode::BlockAddress) {
+        std::fputs("dss::MirBuilder fatal: addBlockAddressExport: operand is not a "
+                   "BlockAddress instruction\n", stderr);
+        std::abort();
+    }
+    if (!blockSymbol.valid()) {
+        std::fputs("dss::MirBuilder fatal: addBlockAddressExport: block symbol must "
+                   "be valid\n", stderr);
+        std::abort();
+    }
+    detail::MirInst pod;
+    pod.opcode  = MirOpcode::BlockAddressExport;
+    pod.flags   = flags;
+    pod.typeId  = TypeId{};          // R::None — publishes a binding, yields no value
+    pod.payload = blockSymbol.v;
+    std::array<MirInstId, 1> ops{blockAddr};
+    return appendInst_(pod, ops, /*terminates=*/false);
 }
 
 // D5.6: first-class aggregate ops. Each path element is interned as a

@@ -49,6 +49,11 @@ using ::dss::encodingSlotKindName;
 using ::dss::encodingSlotKindFromName;
 using ::dss::isSymbolBearingSlot;
 using ::dss::slotShapeFor;
+// D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the encoding-field
+// register-bank resolvers + the va_list strategy the AAPCS64 VR-save pin reads.
+using ::dss::encodingResultRegClass;
+using ::dss::encodingWireRegClass;
+using ::dss::VaListStrategy;
 
 bool anyHasCode(auto const& diags, DiagnosticCode code) {
     return std::ranges::any_of(diags, [code](auto const& d) {
@@ -2766,7 +2771,7 @@ namespace {
               {"mnemonic":"invalid","result":"none"},
               {"mnemonic":"mov","result":"value",
                "minOperands":1,"maxOperands":1,
-               "encoding":{"format":"fixed32","variants":[
+               "encoding":{"format":"fixed32","registerClass":"gpr","variants":[
                  {"guard":{)"} + std::string{guardBody} + R"(},
                   "template":{"fixedWord":2457862144},
                   "resultSlot":"rd",
@@ -4251,4 +4256,229 @@ TEST(TargetSchema, TheResultSlotRuleExemptsTheShapesThatLegitimatelyHaveNone) {
     EXPECT_TRUE(anyWithoutSlot)
         << "`call` no longer exercises the exemption — re-aim this pin at "
            "whatever shape does, or the rule's exemption is untested";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE REGISTER-BANK DECLARATION ON AN ENCODING FIELD
+// D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD.
+//
+// The encoder can only compare an operand's class against a class it was
+// GIVEN. So the loader's job is TOTALITY: every field that will ever receive a
+// register resolves to exactly one declared, operable bank — from the field's
+// own `regClass`/`resultRegClass` or the opcode's `encoding.registerClass` —
+// or the document does not load. These pins cover the totality rule, both
+// override levels, and the four coherence rules that keep a declaration from
+// reading as a guarantee it does not make.
+// ─────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// One fixed32 opcode with a result field and one register operand, plus a
+// register table so the bank a field names can be checked against real rows.
+// `encBody` is spliced into the `encoding` object before `variants`.
+[[nodiscard]] std::string bankDoc(std::string_view encBody,
+                                  std::string_view resultBody,
+                                  std::string_view wireBody) {
+    return std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "registers":[
+          {"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0},
+          {"name":"d0","class":"fpr","widthBytes":8,"hwEncoding":0}
+        ],
+        "opcodes":[
+          {"mnemonic":"invalid","result":"none"},
+          {"mnemonic":"mov","result":"value",
+           "minOperands":1,"maxOperands":1,
+           "encoding":{"format":"fixed32",)"} + std::string{encBody} +
+        R"("variants":[
+             {"guard":{"operandKinds":["reg"]},
+              "template":{"fixedWord":2457862144},)" +
+        std::string{resultBody} + R"("resultSlot":"rd",
+              "wires":[{"index":0,"slotKind":"rn")" + std::string{wireBody} +
+        R"(}]}
+           ]}}
+        ]})";
+}
+
+} // namespace
+
+TEST(TargetSchema, RegisterFieldWithNoDeclaredBankIsRefused) {
+    // THE TOTALITY RULE. Without a bank the encoder has nothing to compare an
+    // operand against, which is the state that let a GPR ordinal into an XMM
+    // field and emit `cvttss2si %xmm15` with no diagnostic.
+    auto r = TargetSchema::loadFromText(bankDoc("", "", ""), "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "a register-bearing field with no declared bank must be refused";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+    bool named = false;
+    for (auto const& d : r.error()) {
+        named = named || d.message.find("no register bank is declared")
+                             != std::string::npos;
+    }
+    EXPECT_TRUE(named) << "the refusal must say what is missing";
+}
+
+TEST(TargetSchema, OpcodeWideBankCoversEveryFieldOfTheOpcode) {
+    auto r = TargetSchema::loadFromText(
+        bankDoc(R"("registerClass":"gpr",)", "", ""), "<inline>");
+    ASSERT_TRUE(r.has_value());
+    auto const* info = (*r)->opcodeInfo(*(*r)->opcodeByMnemonic("mov"));
+    ASSERT_NE(info, nullptr);
+    ASSERT_FALSE(info->encoding.variants.empty());
+    auto const& v = info->encoding.variants[0];
+    EXPECT_EQ(encodingResultRegClass(info->encoding, v), TargetRegClass::GPR);
+    ASSERT_FALSE(v.wires.empty());
+    EXPECT_EQ(encodingWireRegClass(info->encoding, v.wires[0]),
+              TargetRegClass::GPR);
+}
+
+TEST(TargetSchema, PerFieldBankOverridesTheOpcodeWideOne) {
+    // The mixed-class shape every convert instruction has: one field from each
+    // bank. The result override must beat the opcode-wide declaration while
+    // the wire keeps it, INDEPENDENTLY of each other.
+    auto r = TargetSchema::loadFromText(
+        bankDoc(R"("registerClass":"gpr",)", R"("resultRegClass":"fpr",)",
+                R"(,"regClass":"gpr")"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    auto const* info = (*r)->opcodeInfo(*(*r)->opcodeByMnemonic("mov"));
+    ASSERT_NE(info, nullptr);
+    auto const& v = info->encoding.variants[0];
+    EXPECT_EQ(encodingResultRegClass(info->encoding, v), TargetRegClass::FPR)
+        << "the variant's own `resultRegClass` must win";
+    EXPECT_EQ(encodingWireRegClass(info->encoding, v.wires[0]),
+              TargetRegClass::GPR)
+        << "and the wire keeps the opcode-wide bank it re-states";
+}
+
+TEST(TargetSchema, PerFieldBankAloneSatisfiesTotality) {
+    // No opcode-wide declaration at all — every field declares its own. The
+    // totality rule is about RESOLUTION, not about which level supplied it.
+    auto r = TargetSchema::loadFromText(
+        bankDoc("", R"("resultRegClass":"fpr",)", R"(,"regClass":"gpr")"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value());
+    auto const* info = (*r)->opcodeInfo(*(*r)->opcodeByMnemonic("mov"));
+    ASSERT_NE(info, nullptr);
+    EXPECT_EQ(encodingWireRegClass(info->encoding,
+                                   info->encoding.variants[0].wires[0]),
+              TargetRegClass::GPR);
+}
+
+TEST(TargetSchema, NoneIsNotAnOperableBankForAField) {
+    // `none` is a legitimate `TargetRegClass` VALUE (a register can have no
+    // class) and an illegitimate SUBJECT here — the same split
+    // `registerClassOps` already draws. It must be refused by the coherence
+    // rule, not silently taken as row 0.
+    auto r = TargetSchema::loadFromText(
+        bankDoc(R"("registerClass":"none",)", "", ""), "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, UnknownBankSpellingIsRefusedNotIgnored) {
+    auto r = TargetSchema::loadFromText(
+        bankDoc(R"("registerClass":"xmm",)", "", ""), "<inline>");
+    ASSERT_FALSE(r.has_value())
+        << "an unknown bank name must be refused — silently ignoring it would "
+           "leave the field with no bank and no message";
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, BankWithNoRegistersOfThatClassIsRefused) {
+    // The target's table has gpr + fpr rows and no vector ones, so a `vr`
+    // field could never be filled: every instruction using it would be refused
+    // at ENCODE time, which is a loud refusal of correct input rather than a
+    // caught defect. Refuse the document instead.
+    auto r = TargetSchema::loadFromText(
+        bankDoc(R"("registerClass":"vr",)", "", ""), "<inline>");
+    ASSERT_FALSE(r.has_value());
+    bool named = false;
+    for (auto const& d : r.error()) {
+        named = named || d.message.find("no register of that class")
+                             != std::string::npos;
+    }
+    EXPECT_TRUE(named) << "the refusal must say the table has no such register";
+}
+
+TEST(TargetSchema, ResultRegClassWithoutAResultSlotIsRefused) {
+    // A bank for a field the variant does not have. Same coherence family as
+    // `negValue` on a guard with no value operand: a declaration that reads as
+    // a guarantee and governs nothing is worse than its absence.
+    auto const doc = std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "registers":[{"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0}],
+        "opcodes":[
+          {"mnemonic":"invalid","result":"none"},
+          {"mnemonic":"nop2","result":"none","terminatorKind":"unreachable",
+           "encoding":{"format":"fixed32","variants":[
+             {"guard":{"operandKinds":[]},"template":{"fixedWord":1},
+              "resultRegClass":"gpr"}
+           ]}}
+        ]})"};
+    auto r = TargetSchema::loadFromText(doc, "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, RegClassOnANonRegisterWireIsRefused) {
+    // The wired operand is an IMMEDIATE, so the field never receives a
+    // register and the bank governs nothing.
+    auto const doc = std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "registers":[{"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0}],
+        "opcodes":[
+          {"mnemonic":"invalid","result":"none"},
+          {"mnemonic":"movi","result":"value","minOperands":1,"maxOperands":1,
+           "encoding":{"format":"fixed32","registerClass":"gpr","variants":[
+             {"guard":{"operandKinds":["imm32"]},"template":{"fixedWord":1},
+              "resultSlot":"rd",
+              "wires":[{"index":0,"slotKind":"imm16","regClass":"gpr"}]}
+           ]}}
+        ]})"};
+    auto r = TargetSchema::loadFromText(doc, "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, OpcodeWideBankGoverningNoFieldIsRefused) {
+    // `nop2` has neither a result slot nor a register operand.
+    auto const doc = std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "registers":[{"name":"x0","class":"gpr","widthBytes":8,"hwEncoding":0}],
+        "opcodes":[
+          {"mnemonic":"invalid","result":"none"},
+          {"mnemonic":"nop2","result":"none","terminatorKind":"unreachable",
+           "encoding":{"format":"fixed32","registerClass":"gpr","variants":[
+             {"guard":{"operandKinds":[]},"template":{"fixedWord":1}}
+           ]}}
+        ]})"};
+    auto r = TargetSchema::loadFromText(doc, "<inline>");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
+}
+
+TEST(TargetSchema, ShippedTargetsStillLoadWithTheBankRuleInForce) {
+    for (char const* name : {"x86_64", "arm64"}) {
+        auto shipped = TargetSchema::loadShipped(name);
+        EXPECT_TRUE(shipped.has_value())
+            << name << " must still load with the register-bank rule in force";
+    }
+}
+
+// ── the AAPCS64 variadic VR save block's register source ─────────────────
+//
+// The prologue spills `fpSaveCount` FULL-WIDTH vector registers, and it takes
+// them from `argVrs`. It used to take them from `argFprs` — the 64-bit `d`
+// views of the same file — so a 16-byte `STUR Qt` named an 8-byte register and
+// emitted the right bytes only because `d0` and `v0` share hardware encoding 0.
+// A short `argVrs` would spill fewer registers than the save area reserves
+// slots for, leaving `va_arg` reading uninitialised stack for the tail.
+TEST(TargetSchema, Aapcs64VariadicSaveNeedsArgVrsToCoverFpSaveCount) {
+    auto shipped = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(shipped.has_value());
+    auto const* cc = (*shipped)->callingConventionByName("aapcs64");
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->vaListLayout.has_value());
+    EXPECT_EQ(cc->vaListLayout->strategy, VaListStrategy::Aapcs64DualCursor);
+    EXPECT_GE(cc->argVrs.size(), cc->vaListLayout->fpSaveCount)
+        << "the prologue spills argVrs[0..fpSaveCount)";
+    EXPECT_GT(cc->vaListLayout->fpSaveCount, 0u)
+        << "a zero count would make this pin vacuous";
 }

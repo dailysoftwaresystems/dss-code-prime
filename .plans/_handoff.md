@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-08-26 — cycles **P14 … P36**. ★★★ **P36: THE GOAL CORPUS BUILDS AND RUNS AT RELEASE FOR THE FIRST TIME, AND THE THING IN THE WAY WAS ONE C TYPE COUNTED TWICE.** ✔MEASURED, Windows x86_64, 103-TU sqlite via `--project … --config=release --jobs 4`: **rc=1, 5 × `I_StoreValueTypeMismatch`, NO ARTIFACT → rc=0, ZERO errors, a 5,108,736-byte `speedtest1.exe` that RUNS** (`--size 3 --testset main`, every test executes, `PRAGMA integrity_check` passes, exit 0). ★★ **THE DEFECT: `reinternType` KEYED A HOST COMPOSITE ON ITS SOURCE DECLARATION SITE**, so `typedef struct Bitvec Bitvec;` in a header gave every TU its own incomplete `Bitvec` and the merge kept them all apart. Host identity is now a cross-CU STRUCTURAL identity (`CompositeIdentityIndex`), and a forward declaration RESOLVES to its tag's definition rather than being erased. ★★★ **FOUR ATTEMPTS, AND THE THREE FAILURES ARE WORTH MORE THAN THE FIX** — (1) a full recursive layout digest still forked `BtCursor`, because *the completeness of something you only POINT AT was leaking into your own identity*, this very defect one level down; (2) the obvious repair (tag-only behind a pointer) made two structs share a key while their fields still reinterned apart and `completeComposite` ABORTED ⇒ **the invariant everything since is built on: equal identity ⇒ every field reinterns to the same host type**; (3) the exact de Bruijn digest was CORRECT and took **952 s of CPU with no output** on sqlite's mutually recursive `sqlite3`/`Vdbe`/`Parse` cluster — a subtree that back-references an OUTER composite cannot be memoized ⇒ replaced by ordinary **iterative partition refinement**, which converges in **2 rounds over 14,663 nodes**; and (4) a bug in the memo key itself, which bit-packed a mode flag into bit 63 and then XOR-ed a constant whose bit 63 is also set. **Hash a key; never bit-pack one into a word whose width nobody re-checked.** ★★★ **AND THE LAST FORK WAS NOT IN THE MERGE AT ALL: A PER-CU AST NODE ID INSIDE A TYPE'S NAME.** ✔The index counts its own failures, and that count is what found it — **98 tags FORKED, EVERY ONE WITH A SINGLE LOCAL LAYOUT SIGNATURE** (`Parse`, `Table`, `Select`, `Index`, `KeyInfo` …), which cannot be a layout difference. An anonymous member is bound as `<anon:RULE:NODEID>` and that name reaches the interned TYPE, so two CUs including one header give one anonymous `union` two names and **every named struct that reaches it inherits the split**. The spelling had THREE inline readers and no owner; it has one now (`core/types/anon_member_name.hpp`). **98 → 0.** ★ **THE VERIFIER'S TYPE-MISMATCH MESSAGES NOW NAME THE TYPE, NOT JUST THE ID** — *"typed 5167 (kind 27) … pointee 6074 (kind 27)"* said *"two pointers, different numbers"* and stopped; it now reads `Ptr<Struct 'Bitvec'>` vs `Ptr<Struct 'Bitvec' incomplete>`, **and that sentence is what identified defect (1)**. The id stays — it is the only thing that distinguishes two forks of one spelling. ⚠⚠ **P36 RAN ACROSS TWO SESSIONS AND THE INTERRUPTION COST THE REPORTS, NOT THE WORK.** Every one of nine lanes' CODE is in the tree and gated. Lanes J, P and S wrote their rows to FILES and those applied verbatim; lanes **G, K, L, N, Q and R reported by citing a scratchpad PATH**, and their row text, red-on-disable transcripts and mutant md5s went with the session. The fold RE-DERIVED their rows by measuring the tree — the staticlib member names and the object-input link re-proved by RUNNING the shipped binary, the summary sections by reading the ten shipped format documents — but **a passing test is not proof that the test can fail**, so six rows close on the fix being present and exercised, say so in as many words, and owe their falsifiability arm. ⚠ **AND A STALE TEST HAD TO BE INVERTED:** `AsmDataSection.Int128GlobalFailsLoud` asserted a refusal a lane had since implemented — **a test that asserts a refusal is a claim about the product, and inverting the product without inverting the test leaves a gate that contradicts the compiler.** ⚠ **A TEST SOURCE CARRYING FOUR RAW NUL BYTES** made `grep` call it binary, which blinded every text-scanning guard and made `anchor_registry_guard` report the sentence *"Binary file … matches"* AS AN ANCHOR ID. Fixed; the loud half was the smaller half. ⚠ RE-MEASURE the balance with `python scripts/check-anchor-balance/check-anchor-balance.py` rather than re-quoting any figure on this line.
+**Last updated:** 2026-08-26 — cycles **P14 … P37**. ★★★ **P37: THE sqlite PROBE FOUND A P36 REGRESSION THAT BROKE EVERY MULTI-CU PROGRAM CARRYING A JUMP TABLE — the cross-CU merge remapped a function's symbol and its relocations but not its `blockSymbols`, so a switch table pointed at ids the merged module never declared (1313 undefined symbols on the sqlite3 CLI for pe64, 1483 on testfixture). FIXED, red-on-disable exercised with an md5 witness, and pinned by a two-CU corpus arm that exits 42. ⚠ THE OPERATOR'S FIRST HYPOTHESIS (`D-OPT11-LAZY-IMPORT-EDGE`) WAS REFUTED BY ONE COMMAND — the same manifest fails at `--config=debug` too, and debug carries no import machinery. P36 REMAINS TRUE:** THE GOAL CORPUS BUILDS AND RUNS AT RELEASE, AND THE THING IN THE WAY WAS ONE C TYPE COUNTED TWICE.** ✔MEASURED, Windows x86_64, 103-TU sqlite via `--project … --config=release --jobs 4`: **rc=1, 5 × `I_StoreValueTypeMismatch`, NO ARTIFACT → rc=0, ZERO errors, a 5,108,736-byte `speedtest1.exe` that RUNS** (`--size 3 --testset main`, every test executes, `PRAGMA integrity_check` passes, exit 0). ★★ **THE DEFECT: `reinternType` KEYED A HOST COMPOSITE ON ITS SOURCE DECLARATION SITE**, so `typedef struct Bitvec Bitvec;` in a header gave every TU its own incomplete `Bitvec` and the merge kept them all apart. Host identity is now a cross-CU STRUCTURAL identity (`CompositeIdentityIndex`), and a forward declaration RESOLVES to its tag's definition rather than being erased. ★★★ **FOUR ATTEMPTS, AND THE THREE FAILURES ARE WORTH MORE THAN THE FIX** — (1) a full recursive layout digest still forked `BtCursor`, because *the completeness of something you only POINT AT was leaking into your own identity*, this very defect one level down; (2) the obvious repair (tag-only behind a pointer) made two structs share a key while their fields still reinterned apart and `completeComposite` ABORTED ⇒ **the invariant everything since is built on: equal identity ⇒ every field reinterns to the same host type**; (3) the exact de Bruijn digest was CORRECT and took **952 s of CPU with no output** on sqlite's mutually recursive `sqlite3`/`Vdbe`/`Parse` cluster — a subtree that back-references an OUTER composite cannot be memoized ⇒ replaced by ordinary **iterative partition refinement**, which converges in **2 rounds over 14,663 nodes**; and (4) a bug in the memo key itself, which bit-packed a mode flag into bit 63 and then XOR-ed a constant whose bit 63 is also set. **Hash a key; never bit-pack one into a word whose width nobody re-checked.** ★★★ **AND THE LAST FORK WAS NOT IN THE MERGE AT ALL: A PER-CU AST NODE ID INSIDE A TYPE'S NAME.** ✔The index counts its own failures, and that count is what found it — **98 tags FORKED, EVERY ONE WITH A SINGLE LOCAL LAYOUT SIGNATURE** (`Parse`, `Table`, `Select`, `Index`, `KeyInfo` …), which cannot be a layout difference. An anonymous member is bound as `<anon:RULE:NODEID>` and that name reaches the interned TYPE, so two CUs including one header give one anonymous `union` two names and **every named struct that reaches it inherits the split**. The spelling had THREE inline readers and no owner; it has one now (`core/types/anon_member_name.hpp`). **98 → 0.** ★ **THE VERIFIER'S TYPE-MISMATCH MESSAGES NOW NAME THE TYPE, NOT JUST THE ID** — *"typed 5167 (kind 27) … pointee 6074 (kind 27)"* said *"two pointers, different numbers"* and stopped; it now reads `Ptr<Struct 'Bitvec'>` vs `Ptr<Struct 'Bitvec' incomplete>`, **and that sentence is what identified defect (1)**. The id stays — it is the only thing that distinguishes two forks of one spelling. ⚠⚠ **P36 RAN ACROSS TWO SESSIONS AND THE INTERRUPTION COST THE REPORTS, NOT THE WORK.** Every one of nine lanes' CODE is in the tree and gated. Lanes J, P and S wrote their rows to FILES and those applied verbatim; lanes **G, K, L, N, Q and R reported by citing a scratchpad PATH**, and their row text, red-on-disable transcripts and mutant md5s went with the session. The fold RE-DERIVED their rows by measuring the tree — the staticlib member names and the object-input link re-proved by RUNNING the shipped binary, the summary sections by reading the ten shipped format documents — but **a passing test is not proof that the test can fail**, so six rows close on the fix being present and exercised, say so in as many words, and owe their falsifiability arm. ⚠ **AND A STALE TEST HAD TO BE INVERTED:** `AsmDataSection.Int128GlobalFailsLoud` asserted a refusal a lane had since implemented — **a test that asserts a refusal is a claim about the product, and inverting the product without inverting the test leaves a gate that contradicts the compiler.** ⚠ **A TEST SOURCE CARRYING FOUR RAW NUL BYTES** made `grep` call it binary, which blinded every text-scanning guard and made `anchor_registry_guard` report the sentence *"Binary file … matches"* AS AN ANCHOR ID. Fixed; the loud half was the smaller half. ⚠ RE-MEASURE the balance with `python scripts/check-anchor-balance/check-anchor-balance.py` rather than re-quoting any figure on this line.
 **Branch:** `feature/c23-conformance-burndown-4` · **HEAD:** the P36 commit — re-derive it with `git log --oneline -1` rather than reading a hash here: the public-repo bot rebases and squash-merges, so a written hash is UNSTABLE. ⚠ **Any `dss-code-prime` spelled as the BUILT COMMAND in a row or commit message older than 2026-08-24 is HISTORICAL, not stale** — the tool is named `dsscp` since that date, while the PROJECT and the REPOSITORY keep `dss-code-prime` (`project(…)`, the GitHub URLs, the funding and issue-template identity, `.claude/skills/dss-code-prime/`, and **every checkout path on every host**). ⚠ **Any path spelled `tools/…` in a commit message or a row older than 2026-08-19 is HISTORICAL, not stale** — that directory no longer exists; every script lives at `scripts/<name>/<name>.{sh,ps1,py}`. ⚠ **Likewise, any `c-subset` in a commit message or a row older than 2026-08-24 is HISTORICAL, not stale** — the C front end has been named `c` since that date, and the mapping is MECHANICAL — ✔MEASURED 2026-08-24 by applying it to every path-shaped mention in `.plans/**` + `.claude/**` and asking the filesystem: **834 of 862 resolve**, the 28-mention residue being examples deleted or renamed for reasons unrelated to this rename, so a miss is pre-existing staleness rather than a hole in the rule: `examples/c-subset/…` reads `examples/c/…`, `tests/corpus/c-subset/…` reads `tests/corpus/c/…`, `tests/corpus/diagnostics/c-subset/…` reads `tests/corpus/diagnostics/c/…`, `c-subset.lang.json` reads `c.lang.json`, and `--language c-subset` reads `--language c`. ⚠ `tsql-subset` is a DIFFERENT language and is spelled correctly — it is not part of this mapping. ★★ **BOTH `D-C-*` AND `D-CSUBSET-*` ANCHOR-ID PREFIXES DENOTE THE C LANGUAGE**: the 426 `D-CSUBSET-*` ids are FROZEN by operator ruling and are never to be renamed, so a grep for either prefix ALONE misses part of the language's rows.
 
 ---
@@ -849,9 +849,51 @@ disk, not correctness: no leg reddened. **Deliberately NOT fixed between a green
 gate and the commit** — `scripts/**` is a ctest subject, and editing one there
 would have voided the four leg results this table reports.
 
+### ★★★★ THE STANDING ROADMAP — operator, 2026-08-26. THIS ORDERS EVERYTHING BELOW.
+
+> *"so the goal is: optimizations (compile time + optimization pipeline), then production
+> anchors then FC20 and FC19"*
+
+| # | phase | what it means |
+|---|---|---|
+| **1** | **OPTIMIZATIONS** — and it is TWO halves, both in this phase | **(a) COMPILE TIME**: the campaign pinned in `project-compile-time-baseline-2026-08-25` — 77% of a one-line compile is not compilation, and the unidentified 383 ms decides the cache payoff. **(b) THE OPTIMIZATION PIPELINE**: the `D-OPT*` burndown. |
+| **2** | **PRODUCTION ANCHORS** | the rest of `_deferred-anchor-registry-production.md`, which is already the standing priority (operator, 2026-08-25). |
+| **3** | **FC20** | plan 23. |
+| **4** | **FC19** | big-endian conformance on s390x. ⚠ **FC20 BEFORE FC19 — that reversal of plan 23's numeric order is DELIBERATE and a future reader must not "correct" it.** Four phases, not a target-descriptor edit. |
+
+⚠ **This roadmap does not repeal the no-follow-ups rule** — it says which work is picked NEXT,
+never that a row opened in phase 1 may be carried into phase 3. A row you open, you close.
+
+⚠ **A sequencing constraint measured 2026-08-26:** FC19 declares the `endianness` target key and
+so writes `src/core/types/target_schema.*` + `src/dss-config/targets/**`. It may not run beside
+any lane holding those files — the P38 register-class lane held exactly them.
+
 ### ★★★ NEXT — in order
 
-1. ✅ **DONE 2026-08-26, and it is item 1 only so a reader can see the list was
+1. ★★★ **RE-RUN THE FOUR-HOST sqlite PROBE AND THE speedtest1 BENCHMARK — THEY WERE
+   CANCELLED MID-FLIGHT, ON PURPOSE.** The operator's instruction was to run the probe
+   and the benchmark on all four hosts and update the README; the probe found
+   [[D-LINK-MERGE-DOES-NOT-REMAP-BLOCK-SYMBOLS]] on its first host and everything was
+   stopped to fix that first (*"cancel ALL other probes. let's address issues first,
+   then we re start them on a fixed basis"*). ⚠ **NO README NUMBER WAS UPDATED THIS
+   CYCLE AND NONE SHOULD BE** — every figure now in the README predates this fix, and
+   a benchmark taken against a compiler that could not link the subject is not a
+   number. ⓘ What IS re-usable from the aborted run: the macOS driver self-test and
+   the VPS `SRC_DIR` are both fixed, so the next run starts from four hosts that can
+   actually reach the corpus.
+   ★ Known before starting: the pe64 leg has **NO CONTROL** — its mingw reference
+   oracle fails to compile `ext/misc/fileio.c` on missing `windows.h` types
+   (`CP_UTF8`/`WCHAR`/`HANDLE`), so the harness correctly reports NO ORACLE and that
+   leg's failures are unattributable until someone fixes the oracle's define set.
+2. **[[D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED]]** — opened this cycle,
+   OPEN. Both gcc and clang accept `static void* const tbl[] = {&&L0};`; DSS refuses
+   with `H0009`. Filed rather than fixed because the corpus arm reached the same
+   jump-table lowering through an ISO-C dense `switch`, so nothing was blocked on it.
+3. **[[D-OPT11-LAZY-IMPORT-EDGE]]** is still OPEN and was NOT this cycle's defect —
+   ⚠ it was the operator's first hypothesis for the pe64 failure and was refuted by
+   measurement (the same manifest fails at `--config=debug`, which carries no
+   summary/index import machinery). Its own option-A contamination note stands.
+4. ✅ **DONE 2026-08-26, and it is kept only so a reader can see the list was
    maintained rather than quietly edited.** All four legs ran green — the figures
    are in the gate table above, not restated here. ⚠ The clause *"a gate host holds
    the repo and nothing else"* was **NOT** true when they ran, and proving it took a
@@ -863,7 +905,7 @@ would have voided the four leg results this table reports.
    because that runner globs; a stale `node_modules` is transport waste. **Ask what
    the stale tree is an INPUT to** — the same question that governs which files an
    orchestrator may edit under a running lane.
-2. **⚠ OPERATOR DECISION — `.secrets/` KEY MATERIAL SAT ON BOTH GATE HOSTS.**
+5. **⚠ OPERATOR DECISION — `.secrets/` KEY MATERIAL SAT ON BOTH GATE HOSTS.**
    ✔MEASURED 2026-08-26: all four files (`macos.env`, `macos.key`, `arm64-vps.env`,
    `arm64-vps.key`) were on the Mac **and** on the VPS, md5-identical to the local
    originals — so each host held the *other* host's private key. Removed from both,
@@ -874,30 +916,26 @@ would have voided the four leg results this table reports.
    removing it. **The remaining question is not cleanup, it is ROTATION, and that is
    the operator's alone.** These keys reach real machines and this repo is slated to
    go public.
-3. **The red-on-disable arms owed for the lost lanes' rows** — named in each row.
+6. **The red-on-disable arms owed for the lost lanes' rows** — named in each row.
    These are the falsifiability half of six rows that closed on presence and
    execution alone.
-4. **[[D-OPT11-LAZY-IMPORT-EDGE]]** is still OPEN and is this cycle's only
-   surviving opener besides Lane S's. ⚠ Its option A ("reuse the fixpoint's own
-   max") is CONTAMINATED — every figure derived from the old `max` is an artifact
-   of a runaway process.
-5. **The four re-verdict rows the balance gate keeps flagging.** ⚠ ✔MEASURED at
+7. **The four re-verdict rows the balance gate keeps flagging.** ⚠ ✔MEASURED at
    this fold: the gate's *"opener discharged"* heuristic is NOT the same predicate
    as *"trigger fired"*. `D-FULLC-STDBIT-BIG-ENDIAN-NATIVE`'s trigger is *a
    big-endian target lands*, which has not happened, and
    `D-FULLC-STDBIT-ADDRESSABLE-FN`'s is *a program takes `&stdc_*`*. Three of the
    four are the guard being right about the opener and wrong about the gate; the
    honest fix is to annotate each row, not to flip a status.
-6. **README correction still owed** from session one: the *"the answer is the pool"*
+8. **README correction still owed** from session one: the *"the answer is the pool"*
    claim was refuted, a `-flto` arm is wanted, `5.4×` → `5.5×`. ⚠ **NOT DONE, and
    deliberately not guessed:** the refuting measurement was in a lost lane report.
    Re-measure before editing.
-7. **The interner-level arc** behind the merge fix: `sameRepresentation` still
+9. **The interner-level arc** behind the merge fix: `sameRepresentation` still
    compares a composite's operands by raw TypeId, so representation neutrality does
    not survive one level of indirection. 1–2 cycles, with this cycle's measurement
    as its witness. The `instType(cid).v != instType(actual).v` guard in
    `inlining.cpp` is named as a consumer that gets to shrink.
-8. **A MEASURED `.sh`/`.ps1` PARITY GAP IN `macos-leg`, recorded rather than filed.**
+10. **A MEASURED `.sh`/`.ps1` PARITY GAP IN `macos-leg`, recorded rather than filed.**
    ✔MEASURED at this fold by reading both siblings: `macos-leg.sh` accepts
    `--guards`, `--mode`, `--tree` and `--build-type`; `macos-leg.ps1` accepts none
    of the four (`-Src`, `-Filter`, `-Jobs`, `-NoPush`, `-Dst`, `-ResetTo` only).
@@ -918,7 +956,7 @@ would have voided the four leg results this table reports.
    not a missing option, it is a different behaviour.** A parity gap is harmless only
    when the missing half has no default worth having. The other three flags remain
    open and remain a note, on exactly that test.
-9. **Two worktrees deliberately KEPT**, with uncommitted work nobody has
+11. **Two worktrees deliberately KEPT**, with uncommitted work nobody has
    adjudicated: `C:/Source/DailySoftware/dss-lane-r` (136 dirty files) and
    `dss-perf-probe` (4, including a `src/perf_sampler.cpp` that exists nowhere
    else). Five others were removed after verifying their work is in HEAD or in the

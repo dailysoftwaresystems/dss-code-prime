@@ -928,12 +928,19 @@ struct Lowerer {
     // (unreachable for a TLS symbol by construction).
     std::optional<std::uint32_t>                  nextBlockSym_;
     std::unordered_map<std::uint32_t, SymbolId>   blockToSym_;
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the highest block symbol
+    // PRE-MINTED at HIR→MIR (a label whose address a static initializer took). Such
+    // a symbol is neither a function, a global, nor an extern, so the high-water
+    // scan below would step right over it and this minter would hand the SAME id to
+    // a different block — two definitions of one symbol, which the linker reports
+    // as "declared more than once". Folded into the seed of BOTH minters.
+    std::uint32_t preMintedBlockSymCeiling_ = 0;
     [[nodiscard]] SymbolId mintBlockSymbol(MirBlockId block) {
         if (auto it = blockToSym_.find(block.v); it != blockToSym_.end()) {
             return it->second;
         }
         if (!nextBlockSym_.has_value()) {
-            std::uint32_t maxV = 0;
+            std::uint32_t maxV = preMintedBlockSymCeiling_;
             for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
                 if (std::uint32_t const v = mir.funcSymbol(mir.funcAt(fi)).v; v > maxV) {
                     maxV = v;
@@ -957,6 +964,30 @@ struct Lowerer {
         blockToSym_.emplace(block.v, sym);
         return sym;
     }
+
+    // ── D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED ──────────────────────
+    // The static-data half of `&&label`. A `BlockAddressExport` names a block (via
+    // its `BlockAddress` operand) and the SymbolId a data relocation targets. Two
+    // things follow, both handled by `bindPreMintedBlockSymbols` before ANY function
+    // is lowered so neither depends on lowering order:
+    //   * `blockToSym_` is PRIMED with the pre-minted symbol, so a later `&&label`
+    //     `lea` for the same block resolves to the SAME symbol — the one-symbol-per-
+    //     block invariant `asm.cpp` records as a live bug when it was broken;
+    //   * the block's byte offset must be published as a `SyntheticBlockSymbol`.
+    //     When the exported address is ALSO materialized in the body, the `lea`'s
+    //     trailing `BlockRef` already does that at assemble time. When it is NOT
+    //     (`static void *tbl[] = {&&L0}; goto *tbl[i];` — gcc emits no `lea` here
+    //     either), nothing names the block from code, so the binding rides a
+    //     descriptor the pipeline resolves from `blockByteOffsets`. That is the
+    //     SAME two lines the dense-switch jump table and a hand-written `.s` table
+    //     already share (`bindBlockSymbol`), reached by a third producer.
+    std::vector<LirBlockSymbolBinding> blockSymbolBindings_;
+    // BlockAddress insts whose ONLY use is a `BlockAddressExport` — no register is
+    // ever read from them, so materializing one would be a dead `lea` in the
+    // function's entry block. The `foldedGlobalAddrs_` / `foldedConstDisps_`
+    // fold-skip precedent: any OTHER consumer reaching such a value via
+    // `regForValue` fails loud on the undefined vreg, never silently mis-encodes.
+    std::unordered_set<std::uint32_t> exportOnlyBlockAddrs_;
 
     // D-OPT-SWITCH-JUMP-TABLE (c70): the jump-table lowerer's state.
     //   * `jumpTableDescriptors_` accumulates one descriptor per dense switch;
@@ -992,7 +1023,9 @@ struct Lowerer {
     // Not deduped (each dense switch gets its own table).
     [[nodiscard]] SymbolId mintJumpTableSymbol() {
         if (!nextBlockSym_.has_value()) {
-            std::uint32_t maxV = 0;
+            // Same pre-minted-symbol ceiling as `mintBlockSymbol` — the two draw
+            // from ONE monotone sequence, so a gap in either seed is a gap in both.
+            std::uint32_t maxV = preMintedBlockSymCeiling_;
             for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
                 if (std::uint32_t const v = mir.funcSymbol(mir.funcAt(fi)).v; v > maxV) {
                     maxV = v;
@@ -2536,6 +2569,11 @@ struct Lowerer {
             case MirOpcode::GlobalAddr:    return lowerGlobalAddr(id);
             // D-CSUBSET-COMPUTED-GOTO: `&&label` block address materialization.
             case MirOpcode::BlockAddress:  return lowerBlockAddress(id);
+            // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: pure metadata —
+            // the symbol was installed by `bindPreMintedBlockSymbols` and the byte
+            // offset is published by `lowerBlockAddress`. Emitting nothing IS the
+            // lowering, the way a SEH marker lowers to no runtime instruction.
+            case MirOpcode::BlockAddressExport: return;
             case MirOpcode::ByValueStackArg: return lowerByValueStackArg(id);
             case MirOpcode::Call:          return lowerCall(id);
             case MirOpcode::IntrinsicCall: return lowerIntrinsicCall(id);
@@ -6751,6 +6789,16 @@ struct Lowerer {
         }
         LirBlockId const lirTarget = mirBlockToLirBlock.get(mirTarget);
         SymbolId const sym = mintBlockSymbol(mirTarget);
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: an address that only
+        // ever reaches STATIC DATA needs the block's SYMBOL, not a register holding
+        // it. Emit no `lea` (gcc emits none for `static void *tbl[]={&&L0,&&L1};`
+        // either — ✔measured) and publish the binding for the pipeline to resolve
+        // from the assembled function's byte offsets instead.
+        if (exportOnlyBlockAddrs_.count(id.v) != 0) {
+            blockSymbolBindings_.push_back(
+                LirBlockSymbolBinding{currentFuncIndex_, lirTarget.v, sym});
+            return;
+        }
         LirReg const result = lir.newVReg(regClassFor(id));
         std::array<LirOperand, 2> ops{
             LirOperand::makeSymbolRef(sym.v),
@@ -10863,6 +10911,19 @@ struct Lowerer {
         allocaSlotIndex_.clear();
         allocaLirCount_ = 0;
         computeValueUses(mf);
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: which of this
+        // function's `BlockAddress` values exist ONLY to be exported to static
+        // data. Read off the use census `computeValueUses` just built, so it needs
+        // no second walk. HIR→MIR emits ONE `BlockAddress` per exported label (the
+        // export symbol is memoized per label), so an export-only value has exactly
+        // one use; a label whose address the BODY also takes gets its own separate
+        // `BlockAddress`, which is materialized normally.
+        exportOnlyBlockAddrs_.clear();
+        for (auto const& [valueV, use] : mirValueUses_) {
+            if (use.count != 1 || !use.user.valid()) continue;
+            if (mir.instOpcode(use.user) != MirOpcode::BlockAddressExport) continue;
+            exportOnlyBlockAddrs_.insert(valueV);
+        }
         lir.addFunction(mir.funcSymbol(mf));
 
         // Pre-pass 1: pre-allocate LIR blocks (1:1 with MIR blocks).
@@ -10964,7 +11025,64 @@ struct Lowerer {
         return li;
     }
 
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: install every pre-minted
+    // block symbol BEFORE the first function is lowered.
+    //
+    // ★ WHY A MODULE-WIDE PRE-PASS AND NOT A PER-FUNCTION ONE. Both facts it
+    // installs are order-sensitive in opposite directions: the symbol-space CEILING
+    // must be known before the FIRST call to either minter (the seed is computed
+    // once, lazily), and the `blockToSym_` priming must be in place before ANY
+    // `lea` of an exported block anywhere in the module. Deriving either while
+    // walking a function would make the answer depend on which function happened to
+    // be lowered first — the class of bug that stays invisible in a one-function
+    // test and appears in a corpus.
+    void bindPreMintedBlockSymbols() {
+        std::size_t const fnCount = mir.moduleFuncCount();
+        for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+            MirFuncId const mf = mir.funcAt(fi);
+            std::uint32_t const nb = mir.funcBlockCount(mf);
+            for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                MirBlockId const b  = mir.funcBlockAt(mf, bi);
+                std::uint32_t const ni = mir.blockInstCount(b);
+                for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                    MirInstId const inst = mir.blockInstAt(b, ii);
+                    if (mir.instOpcode(inst) != MirOpcode::BlockAddressExport) continue;
+                    auto const ops = mir.instOperands(inst);
+                    // ⚠ `blockAddressTarget` ABORTS on a wrong-opcode id, so a
+                    // malformed module would kill the process HERE rather than be
+                    // reported. The MirBuilder and the MIR verifier both refuse a
+                    // non-`BlockAddress` operand, but neither runs on a hand-built
+                    // LIR fixture that calls `lowerToLir` directly — and a refusal
+                    // that crashes is not a refusal.
+                    if (ops.empty()
+                        || mir.instOpcode(ops[0]) != MirOpcode::BlockAddress) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.actual   = std::format(
+                            "MIR blockaddress_export (SymbolId={{ {} }}) does not "
+                            "carry a blockaddress operand — it names no block "
+                            "(D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)",
+                            mir.instPayload(inst));
+                        reporter.report(std::move(d));
+                        continue;
+                    }
+                    SymbolId const sym = mir.blockAddressExportSymbol(inst);
+                    MirBlockId const target = mir.blockAddressTarget(ops[0]);
+                    blockToSym_[target.v] = sym;
+                    if (sym.v > preMintedBlockSymCeiling_)
+                        preMintedBlockSymCeiling_ = sym.v;
+                    // The census `lowerFunction` builds is per-function and is not
+                    // available yet; the export-only decision is made there.
+                }
+            }
+        }
+    }
+
     [[nodiscard]] MirToLirResult run() {
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED — must precede every
+        // symbol mint and every block-address lowering. See the function's docblock.
+        bindPreMintedBlockSymbols();
         std::size_t const fnCount = mir.moduleFuncCount();
         for (std::uint32_t i = 0; i < fnCount; ++i) {
             // D-OPT-SWITCH-JUMP-TABLE (c70): `lir.addFunction` runs in this same
@@ -11048,6 +11166,8 @@ struct Lowerer {
             .lirToMir             = std::move(lirToMir),
             .jumpTableDescriptors = std::move(jumpTableDescriptors_),
             .signMaskConstants    = std::move(signMaskConstants_),
+            // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED
+            .blockSymbolBindings  = std::move(blockSymbolBindings_),
             .sehScopeDescriptors  = std::move(sehScopeDescriptors_),
             // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the extern imports the
             // F128 softcall verb MINTED during this lowering walk (empty for

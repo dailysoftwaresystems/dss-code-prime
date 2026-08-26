@@ -388,6 +388,7 @@ TEST(X86TlsSchema, MemRelocDisp32WithoutRelocationKindRejectedAtLoad) {
           "minOperands": 2, "maxOperands": 2,
           "encoding": {
             "format": "x86-variable",
+            "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["reg", "symbol"] },
                 "template": { "rexW": true, "opcode": [141] },
@@ -413,6 +414,7 @@ TEST(X86TlsSchema, MemRelocDisp32PlusLiteralDisp32MemRejectedAtLoad) {
           "minOperands": 3, "maxOperands": 3,
           "encoding": {
             "format": "x86-variable",
+            "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["reg", "memoffset", "symbol"] },
                 "template": { "rexW": true, "opcode": [141] },
@@ -441,6 +443,7 @@ TEST(X86TlsSchema, MemRelocDisp32WithoutMemBaseWireRejectedAtLoad) {
           "minOperands": 1, "maxOperands": 1,
           "encoding": {
             "format": "x86-variable",
+            "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["symbol"] },
                 "template": { "rexW": true, "opcode": [141] },
@@ -466,6 +469,7 @@ TEST(X86TlsSchema, AbsoluteDisp32MemCoWiredWithBaseRejectedAtLoad) {
           "minOperands": 2, "maxOperands": 2,
           "encoding": {
             "format": "x86-variable",
+            "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["reg", "memoffset"] },
                 "template": { "rexW": true, "opcode": [139] },
@@ -491,6 +495,7 @@ TEST(X86TlsSchema, PayloadBytePrefixOnFixed32VariantRejectedAtLoad) {
           "minOperands": 1, "maxOperands": 1,
           "encoding": {
             "format": "fixed32",
+            "registerClass": "gpr",
             "variants": [
               { "guard": { "operandKinds": ["reg"] },
                 "template": { "payloadBytePrefix": true,

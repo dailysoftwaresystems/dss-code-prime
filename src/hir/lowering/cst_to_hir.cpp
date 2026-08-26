@@ -286,6 +286,12 @@ struct Lowerer {
     // Only THREAD-LOCAL decls are recorded (absence ⇒ ordinary process-shared
     // storage), so the side-table stays sparse.
     std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& threadLocalAcc;
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: shared accumulator of
+    // (promoted-GLOBAL HIR node → EnclosingFunctionAttr) pairs, written at the ONE
+    // site that performs the D-CSUBSET-LOCAL-STATIC promotion. Sparse: only a
+    // block-scope `static` gets an entry — a file-scope global has no enclosing
+    // function, and its absence is a complete answer, not a hole.
+    std::vector<std::pair<HirNodeId, EnclosingFunctionAttr>>& enclosingFunctionAcc;
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared accumulator of (ACCESS HIR node
     // → VolatileAttr) pairs, populated from the bound symbol's / field's
     // `SymbolRecord.isVolatile` at each USER-access lowering site (object Ref,
@@ -452,6 +458,11 @@ struct Lowerer {
     // three are saved/restored around each function body, like `labelOrdinals_`.
     std::unordered_map<std::uint32_t, std::uint32_t> caseLabelOrdinals_;  // NodeId.v -> ordinal
     std::uint32_t                                    nextLabelOrdinal_{};
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the function whose body is
+    // being lowered — the OTHER half of the label-ordinal key, saved/restored on
+    // exactly the same three lines as the maps above. Invalid at file scope, which
+    // is correct: no label is in scope there, so no ordinal can be minted either.
+    SymbolId                                         currentFunctionSymbol_{};
     // The depth of switch BODIES we are currently lowering inside (per the CST
     // subtree). A `caseStmt`/bare `caseLabel` reached as a statement is an
     // IN-SWITCH nested case (lower to a LabelStmt marker) iff this is > 0 AND the
@@ -1134,6 +1145,7 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, NoSanitizeThreadAttr>>& nosanthr,
             std::vector<std::pair<HirNodeId, InlineDefinitionAttr>>& inldef,
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
+            std::vector<std::pair<HirNodeId, EnclosingFunctionAttr>>& enclFn,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
             std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>>& rtwice,
             std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln,
@@ -1147,7 +1159,7 @@ struct Lowerer {
           linkage(lk), mutability(mut), noInlineAcc(noinl),
           alwaysInlineAcc(alwinl), noOptimizeAcc(noopt),
           noSanitizeThreadAcc(nosanthr), inlineDefinitionAcc(inldef),
-          threadLocalAcc(tls), volatileAcc(vol),
+          threadLocalAcc(tls), enclosingFunctionAcc(enclFn), volatileAcc(vol),
           returnsTwiceAcc(rtwice), alignmentAcc(aln), vlaSizeAcc(vlaSz),
           sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin),
           synthRecipeAcc(synthRecipe) {
@@ -9458,6 +9470,19 @@ struct Lowerer {
                 recordVolatility(g, sym);   // c21: volatile static-local global init store
                 recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
                 recordLinkage(g, staticLinkage);  // {Local, Default} — internal
+                // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: keep the
+                // provenance the promotion would otherwise destroy. The storage
+                // leaves the function; the INITIALIZER may still name something
+                // only the function has (`static void *tbl[] = {&&L0};`), and label
+                // ordinals restart per function, so HIR→MIR cannot re-derive which
+                // function's label ordinal 0 means. Recorded UNCONDITIONALLY (not
+                // only when a `&&label` is present): a conditional record would make
+                // the map's absence mean two different things, and a later consumer
+                // asking a different question would read the silence as an answer.
+                if (currentFunctionSymbol_.valid()) {
+                    enclosingFunctionAcc.push_back(
+                        {g, EnclosingFunctionAttr{currentFunctionSymbol_.v}});
+                }
                 moduleDecls_->push_back(g);
                 continue;
             }
@@ -10030,6 +10055,12 @@ struct Lowerer {
         auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
         auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
         std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the owning function
+        // travels WITH the label-ordinal scope, saved and restored on the SAME
+        // three lines, because the two are the two halves of one key — an ordinal
+        // means nothing without the function whose namespace it was drawn from.
+        SymbolId const savedFnSym = currentFunctionSymbol_;
+        currentFunctionSymbol_ = sym;
         labelOrdinals_.clear();
         caseLabelOrdinals_.clear();
         nextLabelOrdinal_ = 0;
@@ -10042,6 +10073,7 @@ struct Lowerer {
         labelOrdinals_ = std::move(savedLabels);
         caseLabelOrdinals_ = std::move(savedCaseLabels);
         nextLabelOrdinal_ = savedNextOrd;
+        currentFunctionSymbol_ = savedFnSym;
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(node, body, sym, retType, decl);
         HirNodeId const fn_ =
@@ -10363,6 +10395,12 @@ struct Lowerer {
         auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
         auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
         std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the owning function
+        // travels WITH the label-ordinal scope, saved and restored on the SAME
+        // three lines, because the two are the two halves of one key — an ordinal
+        // means nothing without the function whose namespace it was drawn from.
+        SymbolId const savedFnSym = currentFunctionSymbol_;
+        currentFunctionSymbol_ = sym;
         labelOrdinals_.clear();
         caseLabelOrdinals_.clear();
         nextLabelOrdinal_ = 0;
@@ -10375,6 +10413,7 @@ struct Lowerer {
         labelOrdinals_ = std::move(savedLabels);
         caseLabelOrdinals_ = std::move(savedCaseLabels);
         nextLabelOrdinal_ = savedNextOrd;
+        currentFunctionSymbol_ = savedFnSym;
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
@@ -10750,6 +10789,12 @@ struct Lowerer {
         auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
         auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
         std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the owning function
+        // travels WITH the label-ordinal scope, saved and restored on the SAME
+        // three lines, because the two are the two halves of one key — an ordinal
+        // means nothing without the function whose namespace it was drawn from.
+        SymbolId const savedFnSym = currentFunctionSymbol_;
+        currentFunctionSymbol_ = sym;
         labelOrdinals_.clear();
         caseLabelOrdinals_.clear();
         nextLabelOrdinal_ = 0;
@@ -10760,6 +10805,7 @@ struct Lowerer {
         labelOrdinals_ = std::move(savedLabels);
         caseLabelOrdinals_ = std::move(savedCaseLabels);
         nextLabelOrdinal_ = savedNextOrd;
+        currentFunctionSymbol_ = savedFnSym;
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
@@ -10940,6 +10986,10 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared (decl node → ThreadLocalAttr)
     // accumulator, moved onto result->threadLocalMap after finish().
     std::vector<std::pair<HirNodeId, ThreadLocalAttr>> threadLocalAcc;
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: shared (promoted-global
+    // node → EnclosingFunctionAttr) accumulator, moved onto
+    // result->enclosingFunctionMap after finish().
+    std::vector<std::pair<HirNodeId, EnclosingFunctionAttr>> enclosingFunctionAcc;
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared (access node → VolatileAttr)
     // accumulator, moved onto result->volatileMap after finish().
     std::vector<std::pair<HirNodeId, VolatileAttr>> volatileAcc;
@@ -10983,7 +11033,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
             reporter, builder, literals, inlineAsmPool, spans, externDecls, linkage,
             mutability, noInlineAcc, alwaysInlineAcc, noOptimizeAcc,
             noSanitizeThreadAcc, inlineDefinitionAcc,
-            threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
+            threadLocalAcc, enclosingFunctionAcc,
+            volatileAcc, returnsTwiceAcc, alignmentAcc,
             vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc, synthRecipeAcc));
     }
 
@@ -11094,6 +11145,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
     for (auto& [id, attr] : threadLocalAcc)
         result->threadLocalMap.set(id, attr);   // TLS C1
+    for (auto& [id, attr] : enclosingFunctionAcc)   // static-local provenance
+        result->enclosingFunctionMap.set(id, attr);
     for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
     for (auto& [id, attr] : returnsTwiceAcc)   // FC17.9(c) (D-CSUBSET-SETJMP)
         result->returnsTwiceMap.set(id, attr);

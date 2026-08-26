@@ -909,7 +909,13 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           // function-plus-extern SymbolId pair CST→HIR now emits
                           // for such a definition — loudly, which is the safe
                           // direction, but the feature is dead.
-                          &hir->inlineDefinitionMap);
+                          &hir->inlineDefinitionMap,
+                          // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: which
+                          // function body each block-scope `static` came out of.
+                          // Without it a `&&label` in a static initializer is refused
+                          // (loudly — a per-function label ordinal is unresolvable
+                          // without its function), and nothing else changes.
+                          &hir->enclosingFunctionMap);
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
@@ -1499,6 +1505,48 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             return std::nullopt;
         }
         assembled.dataItems.push_back(std::move(table));
+    }
+
+    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: bind each block whose
+    // address a STATIC-STORAGE initializer took and that no instruction names.
+    // `static void *tbl[] = {&&L0, &&L1}; goto *tbl[i];` reads the addresses out of
+    // the table rather than materializing them, so the encoder's `BlockSymPatch`
+    // channel never fires for those blocks. THE BYTES ARE NOT OURS TO EMIT — they
+    // are the C object's own initializer, already emitted by
+    // `lowerMirGlobalsToDataItems` with one abs64 relocation per slot; only the
+    // binding is missing, which is the third producer this comment block's own
+    // header (at `bindBlockSymbol`) describes.
+    for (auto const& b : lir.blockSymbolBindings) {
+        if (b.funcIndex >= assembled.functions.size()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "a label-address block binding names function index {} but the "
+                "assembled module has {} function(s) "
+                "(D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)",
+                b.funcIndex, assembled.functions.size());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        AssembledFunction& outFn = assembled.functions[b.funcIndex];
+        // Seeded per function from what `assemble()` already bound (the same block
+        // may ALSO carry a computed-goto `lea`), so one symbol never gets two VAs.
+        std::unordered_set<std::uint32_t> alreadyBound;
+        for (auto const& bs : outFn.blockSymbols) alreadyBound.insert(bs.symbol.v);
+        if (!bindBlockSymbol(outFn, b.lirBlockV, b.symbol, alreadyBound)) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "a static initializer takes the address of block {} in fn '{}', but "
+                "the assembler published no byte offset for it — the block was "
+                "elided after its address was taken "
+                "(D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)",
+                b.lirBlockV, outFn.symbol.v);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
     }
 
     // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): materialize each x86-style float-negate

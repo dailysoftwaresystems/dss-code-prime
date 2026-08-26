@@ -12,6 +12,16 @@
 // regression shape: the design-audit's concrete counterexample against the
 // REJECTED "nearest-clobber frontier" design (a nearer non-aliasing Store must
 // NOT mask a farther aliasing one) — pinned so that design can never sneak back.
+//
+// D-OPT-CSE-CLOBBER-COVER-CHOKEPOINT adds a SECOND proof strategy for Q5
+// (`anyClobberBetweenPoints`), because equality against a same-shaped oracle
+// cannot catch a hole that BOTH sides share. `mirAnyClobberOnPathBetweenPoints`
+// is not a re-composition of the same slices: it walks the (block, index)
+// PROGRAM-POINT graph exhaustively, so it is total by construction, and
+// `assertPointCoverIsSound` asserts `spec ⇒ production` over EVERY ordered pair
+// of program points × the flag matrix on every shape in this file. Production
+// may over-approximate; it may never MISS. Deleting any one of the four slices
+// reds this file, and a non-vacuity counter refuses a silent specification.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -128,6 +138,88 @@ void assertDifferentialEquality(Mir const& mir, TypeInterner const& interner,
     }
 }
 
+// ── D-OPT-CSE-CLOBBER-COVER-CHOKEPOINT ───────────────────────────────
+// `anyClobberBetweenPoints` (Q5) is the ONE point-to-point clobber cover, and
+// its completeness is CHECKABLE instead of argued. `mirAnyClobberOnPathBetweenPoints`
+// (mir_alias.hpp) answers the same question by exhaustively walking the
+// (block, instruction-index) PROGRAM-POINT graph — total by construction, so no
+// slice can go missing from it — and this sweep asserts `spec ⇒ production`
+// over EVERY ordered pair of program points in the module × the full flag
+// matrix. Production is allowed to OVER-approximate (its reachability is
+// block-granular, and a cross-function pair trivially over-reports); it is
+// never allowed to MISS. Each of the four slices has curated shapes below that
+// red when it is deleted:
+//   (a) producer's block TAIL   — LinearChain / Diamond
+//   (b) STRICTLY-BETWEEN blocks — Diamond / LinearChain
+//   (c) consumer's block HEAD   — LinearChain / SelfLoop
+//   (d) WRAP-AROUND tail        — SelfLoop / MultiBlockLoop  (this is TF-C58)
+void assertPointCoverIsSound(Mir const& mir, TypeInterner const& interner,
+                             std::vector<MirInstId> const& loadPtrs) {
+    auto const preds = mirBuildPredecessors(mir);
+    MirMemoryClobbers const idx{mir, preds};
+    auto const blocks = allBlocks(mir);
+
+    struct FlagCase { StrictTbaa st; bool ca; };
+    FlagCase const flagMatrix[] = {
+        {StrictTbaa::No,  true}, {StrictTbaa::No,  false},
+        {StrictTbaa::Yes, true}, {StrictTbaa::Yes, false},
+    };
+    // A specification that never fires would make every EXPECT below
+    // unreachable and the sweep a green no-op — count the firings and assert
+    // the instrument was not blind.
+    std::size_t specFired = 0;
+    for (auto const [st, ca] : flagMatrix) {
+        for (MirInstId const lp : loadPtrs) {
+            for (MirBlockId const a : blocks) {
+                std::uint32_t const na = mir.blockInstCount(a);
+                for (std::uint32_t ai = 0; ai < na; ++ai) {
+                    for (MirBlockId const b : blocks) {
+                        std::uint32_t const nb = mir.blockInstCount(b);
+                        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                            // Same block ⇒ the producer must precede its reuse;
+                            // an unordered pair is a contract violation both
+                            // sides fail loud on, not a question with an answer.
+                            if (a.v == b.v && ai >= bi) continue;
+                            if (!dss::opt::analysis::mirAnyClobberOnPathBetweenPoints(
+                                    mir, interner, lp, a, ai, b, bi, preds, st, ca)) {
+                                continue;
+                            }
+                            ++specFired;
+                            EXPECT_TRUE(idx.anyClobberBetweenPoints(
+                                            interner, lp, a, ai, b, bi, st, ca))
+                                << "the point-to-point cover MISSED a clobber the "
+                                   "program-point specification found: from #"
+                                << a.v << "[" << ai << "] to #" << b.v << "["
+                                << bi << "] for loadPtr v=" << lp.v
+                                << " st=" << (st == StrictTbaa::Yes) << " ca=" << ca
+                                << " — a missing slice is a silent stale-Load "
+                                   "miscompile (D-OPT-CSE-LOAD-BACKEDGE-TAIL)";
+                        }
+                    }
+                }
+            }
+        }
+    }
+    EXPECT_GT(specFired, 0u)
+        << "the program-point specification never once reported a clobber on "
+           "this shape — every assertion above was unreachable, so this sweep "
+           "proved nothing (the blindness of the instrument)";
+}
+
+// Locate an instruction by opcode + ordinal within a block (never a line
+// number, and robust to a shape gaining an instruction).
+std::uint32_t idxOfNthOpcode(Mir const& mir, MirBlockId b, MirOpcode op,
+                             std::uint32_t nth) {
+    std::uint32_t const n = mir.blockInstCount(b);
+    std::uint32_t seen = 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        if (mir.instOpcode(mir.blockInstAt(b, i)) != op) continue;
+        if (seen == nth) return i;
+        ++seen;
+    }
+    return n;   // caller ASSERTs on this
+}
+
 } // namespace
 
 // Linear chain, multiple clobbers of two distinct allocas — the bread-and-
@@ -176,6 +268,7 @@ TEST(MirMemoryClobbers, LinearChainDifferentialEquality) {
     Mir mir = std::move(mb).finish();
 
     assertDifferentialEquality(mir, interner, {p, q});
+    assertPointCoverIsSound(mir, interner, {p, q});
 }
 
 // The design-audit's REJECTED-frontier counterexample, pinned forever:
@@ -288,6 +381,7 @@ TEST(MirMemoryClobbers, DiamondOneArmClobberDifferentialEquality) {
     Mir mir = std::move(mb).finish();
 
     assertDifferentialEquality(mir, interner, {p});
+    assertPointCoverIsSound(mir, interner, {p});
 }
 
 // Loop with the clobber in the body: the back-edge region case (a block
@@ -344,6 +438,7 @@ TEST(MirMemoryClobbers, LoopBackEdgeRegionDifferentialEquality) {
         << "the loop-body Store is region-reachable only via the back edge";
 
     assertDifferentialEquality(mir, interner, {p});
+    assertPointCoverIsSound(mir, interner, {p});
 }
 
 // Every opaque-clobber opcode mints a def: the non-Store `opcodeClobbersMemory`
@@ -413,6 +508,7 @@ TEST(MirMemoryClobbers, OpaqueClobberOpsMintDefsDifferentialEquality) {
            "Load may be forwarded across it (D-CSUBSET-ATOMIC-FENCE)";
 
     assertDifferentialEquality(mir, interner, {p});
+    assertPointCoverIsSound(mir, interner, {p});
 }
 
 // Off-by-one boundary pins on Q1's [lo, hi) filter + the TERMINATOR-slot
@@ -478,6 +574,7 @@ TEST(MirMemoryClobbers, BoundaryAndSehTryBeginTerminatorPins) {
         << "the canonical-tail range including the terminator must clobber";
 
     assertDifferentialEquality(mir, interner, {p});
+    assertPointCoverIsSound(mir, interner, {p});
 }
 
 // Multi-function module: the ledger is whole-module, the queries per-function —
@@ -530,6 +627,7 @@ TEST(MirMemoryClobbers, MultiFunctionIsolationDifferentialEquality) {
         << "function 0's clobbers must not leak into function 1's region";
 
     assertDifferentialEquality(mir, interner, ptrs);
+    assertPointCoverIsSound(mir, interner, ptrs);
 }
 
 // Seeded randomized-CFG sweep: 25 modules × full differential equality. The
@@ -616,5 +714,136 @@ TEST(MirMemoryClobbers, RandomizedCfgDifferentialSweep) {
         }
         Mir mir = std::move(mb).finish();
         assertDifferentialEquality(mir, interner, allocas);
+        assertPointCoverIsSound(mir, interner, allocas);
+    }
+}
+
+// D-OPT-CSE-CLOBBER-COVER-CHOKEPOINT — the TIGHT verdicts. The soundness sweeps
+// above prove the cover never MISSES; they cannot prove it stays PRECISE, and a
+// cover that answered "clobber" unconditionally would pass every one of them
+// while silently disabling Load CSE. These three shapes pin the exact boolean
+// on the pair that decides TF-C58, plus the two RE-EXECUTION-LEMMA classes that
+// must stay ADMITTED. One builder, three CFGs, so the shapes cannot drift apart:
+//
+//   SelfLoop        entry[ …, Ld ] → body[ Ld, …, Store, condbr → body ]
+//                   wrap does NOT re-execute entry's Ld  ⇒ slice (d) REFUSES
+//   MultiBlockLoop  same, but the back edge runs body → latch → body, so the
+//                   self-reach walk must POP the worklist to see it
+//   ViaHeader       canonical lives in the loop HEADER, so every wrap
+//                   RE-EXECUTES it and refreshes the value ⇒ must ADMIT
+//
+// RED-ON-DISABLE (precision half): make `blockReachesItselfAvoiding` ignore its
+// `avoid` argument and the ViaHeader expectation flips false → true.
+// RED-ON-DISABLE (soundness half): delete slice (d) and the two loop shapes
+// flip true → false.
+TEST(MirMemoryClobbers, PointCoverVerdictsOnTheBackEdgeTailShapes) {
+    enum class Shape { SelfLoop, MultiBlockLoop, ViaHeader };
+    struct Built {
+        Mir           mir;
+        MirInstId     ptr;
+        MirBlockId    canonicalBlock;
+        MirBlockId    useBlock;
+    };
+    auto const build = [](TypeInterner& interner, Shape shape) {
+        TypeId const i32   = interner.primitive(TypeKind::I32);
+        TypeId const ptrT  = interner.pointer(i32);
+        TypeId const boolT = interner.primitive(TypeKind::Bool);
+        TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+        bool const viaHeader = (shape == Shape::ViaHeader);
+        bool const viaLatch  = (shape == Shape::MultiBlockLoop);
+
+        MirBuilder mb;
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const header = viaHeader
+            ? mb.createBlock(StructCfMarker::LoopHeader) : MirBlockId{};
+        MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+        MirBlockId const latch  = viaLatch
+            ? mb.createBlock(StructCfMarker::LoopLatch) : MirBlockId{};
+        MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+
+        mb.beginBlock(entry);
+        MirInstId const p = mb.addInst(MirOpcode::Alloca, {}, ptrT);
+        MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+        MirInstId const c0 = mb.addConst(z, i32);
+        MirInstId const st0[] = {c0, p};
+        (void)mb.addInst(MirOpcode::Store, st0, InvalidType);
+        MirInstId const lops[] = {p};
+        // The canonical lives in `entry` for the two loop shapes and in the
+        // loop HEADER for the re-execution shape — that ONE difference is what
+        // slice (d)'s `avoid` argument is about.
+        if (!viaHeader) (void)mb.addInst(MirOpcode::Load, lops, i32);
+        mb.addBr(viaHeader ? header : body);
+
+        if (viaHeader) {
+            mb.beginBlock(header);
+            (void)mb.addInst(MirOpcode::Load, lops, i32);   // the canonical
+            mb.addBr(body);
+        }
+
+        mb.beginBlock(body);
+        MirInstId const ldBody = mb.addInst(MirOpcode::Load, lops, i32);
+        MirLiteralValue one; one.value = std::int64_t{1}; one.core = TypeKind::I32;
+        MirInstId const c1 = mb.addConst(one, i32);
+        MirInstId const inc[] = {ldBody, c1};
+        MirInstId const next = mb.addInst(MirOpcode::Add, inc, i32);
+        MirInstId const stTail[] = {next, p};
+        (void)mb.addInst(MirOpcode::Store, stTail, InvalidType);   // the TAIL store
+        MirInstId const cmp[] = {next, c0};
+        if (viaLatch) {
+            mb.addBr(latch);
+            mb.beginBlock(latch);                    // clobber-free back edge
+            MirInstId const condL = mb.addInst(MirOpcode::ICmpSlt, cmp, boolT);
+            mb.addCondBr(condL, body, exitB);
+        } else {
+            MirInstId const cond = mb.addInst(MirOpcode::ICmpSlt, cmp, boolT);
+            mb.addCondBr(cond, viaHeader ? header : body, exitB);
+        }
+
+        mb.beginBlock(exitB);
+        mb.addReturn(c0);
+
+        return Built{std::move(mb).finish(), p,
+                     viaHeader ? header : entry, body};
+    };
+
+    struct Case { Shape shape; bool expectClobber; char const* why; };
+    Case const cases[] = {
+        {Shape::SelfLoop, true,
+         "the body's own back edge carries its TAIL store into the next "
+         "execution of the use — slice (d) must REFUSE"},
+        {Shape::MultiBlockLoop, true,
+         "the wrap body→latch→body carries the TAIL store into the next "
+         "execution of the use — slice (d)'s walk must POP the worklist"},
+        {Shape::ViaHeader, false,
+         "every wrap re-enters the canonical's own block, which RE-EXECUTES "
+         "the canonical Load and refreshes the value — must ADMIT"},
+    };
+    for (auto const& c : cases) {
+        TypeInterner interner{CompilationUnitId{1}};
+        auto const b = build(interner, c.shape);
+        auto const preds = mirBuildPredecessors(b.mir);
+        MirMemoryClobbers const idx{b.mir, preds};
+
+        std::uint32_t const ci =
+            idxOfNthOpcode(b.mir, b.canonicalBlock, MirOpcode::Load, 0);
+        std::uint32_t const ui =
+            idxOfNthOpcode(b.mir, b.useBlock, MirOpcode::Load, 0);
+        ASSERT_LT(ci, b.mir.blockInstCount(b.canonicalBlock));
+        ASSERT_LT(ui, b.mir.blockInstCount(b.useBlock));
+
+        EXPECT_EQ(idx.anyClobberBetweenPoints(interner, b.ptr,
+                                              b.canonicalBlock, ci,
+                                              b.useBlock, ui,
+                                              StrictTbaa::No, true),
+                  c.expectClobber) << c.why;
+        // The specification must agree EXACTLY here — these shapes are inside
+        // the class where the block-granular cover is not an approximation.
+        EXPECT_EQ(dss::opt::analysis::mirAnyClobberOnPathBetweenPoints(
+                      b.mir, interner, b.ptr, b.canonicalBlock, ci,
+                      b.useBlock, ui, preds, StrictTbaa::No, true),
+                  c.expectClobber)
+            << "the program-point specification itself disagrees: " << c.why;
     }
 }

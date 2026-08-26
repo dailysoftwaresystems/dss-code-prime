@@ -388,6 +388,31 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
                         info.mnemonic, idx, mir_.asmDescriptorPool().size()));
             }
         }
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: a `BlockAddressExport`
+        // publishes a symbol for the block its OPERAND names, so an operand that is
+        // not a `BlockAddress` publishes the symbol at nothing and a zero symbol
+        // relocates against slot 0. `MirBuilder::addBlockAddressExport` aborts on
+        // both, but a directly-constructed module reaches neither: `.dssir` text
+        // parses through the generic `addInst`, and so does any future deserializer
+        // or hand-built fixture. Those are exactly the producers this verifier
+        // exists for — the builder's abort covers the compiler's own path only.
+        if (op == MirOpcode::BlockAddressExport) {
+            auto const ops = mir_.instOperands(id);
+            if (!ops.empty()
+                && mir_.instOpcode(ops[0]) != MirOpcode::BlockAddress) {
+                reportInst(reporter, DiagnosticCode::I_VerifierFailure, id,
+                    std::format("blockaddress_export operand is a {}, not a "
+                                "blockaddress — the exported block is read through "
+                                "this operand, so it names no block",
+                        opcodeInfo(mir_.instOpcode(ops[0])).mnemonic));
+            }
+            if (mir_.instPayload(id) == 0) {
+                reportInst(reporter, DiagnosticCode::I_VerifierFailure, id,
+                    "blockaddress_export carries the invalid SymbolId 0 — a data "
+                    "relocation against it resolves to whichever symbol occupies "
+                    "slot 0");
+            }
+        }
         if (op == MirOpcode::Alloca) {
             // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: the Alloca's secondary payload
             // is the local's EFFECTIVE alignment in bytes (0 = no over-alignment

@@ -139,6 +139,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -219,6 +220,7 @@
       "encoding": {
         "$comment": "2-address shape: `operands[0]` IS the destination after `lir_2addr_legalize` ensures result==operands[0]. So no resultSlot — the wire for operands[0] handles the destination placement (its hwEncoding goes into ModR/M.rm). validate() rule G has a `requires2Address` exception for exactly this shape. FC3 c2: width-keyed 64/32 pairs — the 32-bit forms are the SAME opcodes without REX.W (Intel SDM ADD), computing mod-2^32 with auto-zero-extension (the C-defined `unsigned int` wraparound).\n★★★ THE MEMORY-SOURCE PAIR (D-TARGET-X86-64-DECLARES-NO-MEMORY-DESTINATION-ARITHMETIC, 2026-08-23): `addq -16(%rbp), %rax` — an ADD whose SECOND operand is a memory reference — is `0x03 /r` (ADD r64, r/m64), the direction-swapped twin of the `0x01 /r` rows above: destination in ModR/M.reg, memory in ModR/M.rm. ✔MEASURED, GNU as 2.42 assembles it (`add -0x10(%rbp),%rax`) and gcc 13.3.0 emits it for an `\"m\"`-constrained input, so bar §A.3b makes it REQUIRED. It rides the SAME `requires2Address` tie: the assembly-text lowering's two-address retry builds `[dst, base, MemBase, MemOffset]`, operand 0 IS the destination, and its wire targets `modrm.reg` (a destination-bearing slot, so validate() rule G's 2-addr exception applies).\n⚠ `maxOperands` WIDENED 2→4 FOR THESE ROWS. The count is a DECLARATION, not an enforcement point — ✔MEASURED, no tier checks a LIR instruction's operand count against `TargetOpcodeInfo::min/maxOperands` (only MIR does, against `MirOpcodeInfo`), which is why `load` has shipped 4-operand variants under `maxOperands: 3`. Widening keeps the declaration TRUE of the variants beside it rather than letting it read as a bound the file does not honour.\n★ THE MEMORY-**DESTINATION** DIRECTION IS A DIFFERENT OPCODE, `add_mem`, AND THE SPLIT IS FORCED BY THE ENGINE'S OWN ELECTION RULE: `AsmInstructionLowering::buildLirInst` elects a memory-destination shape among the row's `result: none` candidates ONLY (shape 3), and a memory-source shape among its `result: value` candidates (shape 1). One opcode cannot be both, so the two directions are two rows — exactly the `load`/`store` split one mnemonic already has.",
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -350,6 +352,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -480,6 +483,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "add [base + disp32], imm32 — REX.W 0x81 /0 (ADD r/m64, imm32 sign-extended). ✔MEASURED: gcc 13.3.0 emits exactly this for a `\"+m\"` read-modify-write at -O0 AND -O2 (`addq $5, -16(%rbp)`), and GNU as 2.42 assembles it. Byte order is the walker's canonical x86 one — ModR/M, SIB (when the base is rsp/r12), disp32, THEN the immediate — so the imm32 wire's declaration position does not move it ahead of the displacement.",
@@ -583,6 +587,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
@@ -682,6 +687,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
@@ -781,6 +787,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
@@ -880,6 +887,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
@@ -979,6 +987,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
@@ -1032,6 +1041,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
@@ -1082,6 +1092,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "Width 64: `movq $5, 4096(%r15)`. \u2714MEASURED against GNU as 2.42: `movq $5, 4096(%r15)`.",
@@ -1138,6 +1149,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "Register source, width 8: `movzbl %cl, %ecx`. `forceRexPrefix` is a CORRECTNESS requirement: without a REX prefix the byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. \u2714MEASURED against GNU as 2.42: `movzbl %cl, %ecx`.",
@@ -1190,6 +1202,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "Register source, width 8: `movsbl %cl, %ecx`. `forceRexPrefix` is a CORRECTNESS requirement: without a REX prefix the byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. \u2714MEASURED against GNU as 2.42: `movsbl %cl, %ecx`.",
@@ -1242,6 +1255,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "Register source, width 8: `movzbw %cl, %cx`. `forceRexPrefix` is a CORRECTNESS requirement: without a REX prefix the byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. \u2714MEASURED against GNU as 2.42: `movzbw %cl, %cx`.",
@@ -1274,6 +1288,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "Register source, width 8: `movsbw %cl, %cx`. `forceRexPrefix` is a CORRECTNESS requirement: without a REX prefix the byte-register encodings 4..7 name the LEGACY HIGH bytes ah/ch/dh/bh instead of spl/bpl/sil/dil \u2014 a DIFFERENT physical register, silently. \u2714MEASURED against GNU as 2.42: `movsbw %cl, %cx`.",
@@ -1306,6 +1321,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "Three-operand, width 64: `imulq $300, %rcx, %rdx`. Operand 0 is the immediate, operand 1 the multiplicand (ModR/M.rm); the result register is its own slot. \u2714MEASURED against GNU as 2.42.",
@@ -1381,6 +1397,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1404,6 +1421,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -1425,6 +1443,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1469,6 +1488,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -1622,6 +1642,7 @@
       },
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"], "width": 64 },
@@ -1683,6 +1704,7 @@
       },
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"], "width": 64 },
@@ -1720,6 +1742,7 @@
       },
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"], "width": 64 },
@@ -1746,6 +1769,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -1769,6 +1793,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -1792,6 +1817,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
@@ -1816,6 +1842,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"], "width": 64 },
@@ -1849,6 +1876,7 @@
       },
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
@@ -1885,6 +1913,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
@@ -1920,6 +1949,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
@@ -1955,6 +1985,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
@@ -2009,6 +2040,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -2226,6 +2258,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "\u2605\u2605\u2605 THE 8-BIT-KEYED TWIN, AND IT IS DECLARED FIRST ON PURPOSE (D-ASM-X86-NO-8BIT-REGISTER-FILE, 2026-08-13). `0F 90+cc /0 r8` writes a BYTE register and always did; what was missing was any variant SAYING so, and the consequence was that gas's `sete %al` \u2014 the only spelling gas accepts \u2014 could not be shipped. The text-lowering derives width 8 from `%al`, and `variantHonorsDeclaredWidth` refuses a width-absent variant at any width other than the target's natural 64, so without this row `sete %al` failed loud and `sete %rax` (which gas REJECTS) was the only form DSS could take: bidirectional non-conformance.\n\u2605 VARIANT ORDER IS THE MECHANISM: `selectEncodingVariant` is FIRST-MATCH, so an 8-bit instruction takes this row and a 64-bit one falls through to the width-absent row below. \u2714MEASURED that the fall-through is required: the C path (`lowerICmp` in mir_to_lir.cpp) emits `setcc` with DEFAULT flags, i.e. width 64, and making the existing row width-8 instead of adding this one would have broken every C compare.\n\u26a0 THE TEMPLATE IS BYTE-IDENTICAL to the row below, including `forceRexPrefix` \u2014 the encoder reads width ONLY to select a variant, never to choose a prefix, so the two rows differ in what they MATCH and not in what they EMIT.",
@@ -2340,6 +2373,7 @@
       "maxSuccessors": 255,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"] },
@@ -2387,6 +2421,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["symbol"] },
@@ -2448,6 +2483,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "3-op no-index form, width 64: `mov reg, [base + disp32]` (REX.W 0x8B). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one of the SAME operandKinds. Every GPR integer/pointer load carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types — full-slot read, value-correct since loaded ints are consumed low-bits-only).",
@@ -2531,6 +2567,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "mov r8, [base + disp32] — 0x8A /r. Writes bits 7:0 only.",
@@ -2568,6 +2605,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "4-op no-index form (D-AS4-1), width 64: `mov [base + disp32], reg` (REX.W 0x89). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one of the SAME operandKinds. Every GPR integer/pointer store carries width 64 (memAccessWidthFlags returns 0 ⇒ width 64 for non-Char GPR types).",
@@ -2651,6 +2689,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "1-op absolute-SIB form: `mov r64, seg:[disp32]`. Byte layout: payload(seg) + REX.W(0x48|R) + 0x8B + ModRM(mod=00 reg=dest rm=100) + SIB(0x25 = scale0 index-none base-disp32) + disp32 LE. The MemOffset operand supplies the literal disp32 (format config's tlsAccess.baseDisplacement).",
@@ -2675,6 +2714,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "3-op no-index form: `lea reg, [base + disp32]`. \u2605 WIDTH-KEYED 2026-08-13 (D-ASM-ATT-LEAL-UNREACHABLE-NO-WIDTH-KEYED-LEA): every `lea` variant used to be width-ABSENT, and `variantMatchesInst` treats a width-absent guard as matching ANY width \u2014 so a dialect row for gas's 32-bit `leal` elected THIS REX.W form and would have encoded a 64-bit address computation. The text-lowering gate (`variantHonorsDeclaredWidth`) caught it and refused, which made `leal` UNSHIPPABLE rather than wrong; keying the width is what makes it shippable. \u2714MEASURED that this is a no-op for the C path: every `lea` emission in `mir_to_lir.cpp` passes default flags, i.e. width 64.",
@@ -2764,6 +2804,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "width 32: I32→I64 movsxd r64, r/m32 (REX.W 0x63). Width-keyed (was width-absent) now that the byte form below is declared — convergence-fix D forbids mixing a match-any sibling with a width-keyed one. The MIR→LIR SExt arm threads widthFlagsForType(source): an I32 source → width 32 → here.",
@@ -2833,6 +2874,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"], "width": 64 },
@@ -2899,6 +2941,7 @@
       "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 32 },
@@ -2918,6 +2961,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -3046,6 +3090,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -3174,6 +3219,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -3307,6 +3353,7 @@
       },
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "SHL r/m64, CL — REX.W D3 /4. ONE explicit operand (the value/destination); CL is implicit.",
@@ -3355,6 +3402,7 @@
       },
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"], "width": 64 },
@@ -3399,6 +3447,7 @@
       },
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"], "width": 64 },
@@ -3437,6 +3486,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"], "width": 64 },
@@ -3480,6 +3530,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg"], "width": 64 },
@@ -3523,6 +3574,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -3552,6 +3604,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -3581,6 +3634,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -3610,6 +3664,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -3639,6 +3694,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
@@ -3674,6 +3730,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "fpr",
         "variants": [
           {
             "$comment": "F64: XORPD xmm, [rip+mask] — 66 0F 57 /r. Mirrors the fadd/fmul 2-address shape (NO explicit resultSlot — the result register IS op[0], guaranteed by the requires2Address legalize's `movaps dst, value` + operands[0]:=result rewrite; wire index:0 writes ModR/M.reg = that register). op[1] (mask symbol) -> the riprel.disp32 slot (mod=00 rm=101 + a rel32 reloc against the mask symbol).",
@@ -3704,6 +3761,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
@@ -3725,6 +3783,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
@@ -3798,6 +3857,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
@@ -3818,6 +3878,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "fpr",
         "variants": [
           {
             "$comment": "F64 source → CVTSD2SS (narrow to single).",
@@ -3843,19 +3904,20 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 44] },
             "resultSlot": "modrm.reg",
-            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm", "regClass": "fpr" }]
           },
           {
             "$comment": "FC3.5: CVTTSS2SI r64, xmm — F3 REX.W 0F 2C /r (truncating scalar-single → signed 64-bit).",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 44] },
             "resultSlot": "modrm.reg",
-            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm", "regClass": "fpr" }]
           }
         ]
       }
@@ -3903,19 +3965,20 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "$comment": "CVTSI2SD xmm, r64 — F2 REX.W 0F 2A /r (64-bit signed source). The sqlite i64 -> double blocker.",
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 42] },
-            "resultSlot": "modrm.reg",
+            "resultRegClass": "fpr", "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
             "$comment": "CVTSI2SD xmm, r32 — F2 0F 2A /r (32-bit signed source, no REX.W).",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "mandatoryPrefix": [242], "opcode": [15, 42] },
-            "resultSlot": "modrm.reg",
+            "resultRegClass": "fpr", "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
         ]
@@ -3966,12 +4029,13 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [102], "rexW": true, "opcode": [15, 126] },
             "resultSlot": "modrm.rm",
-            "wires":      [{ "index": 0, "slotKind": "modrm.reg" }]
+            "wires":      [{ "index": 0, "slotKind": "modrm.reg", "regClass": "fpr" }]
           }
         ]
       }
@@ -3984,11 +4048,12 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "gpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [102], "rexW": true, "opcode": [15, 110] },
-            "resultSlot": "modrm.reg",
+            "resultRegClass": "fpr", "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
         ]
@@ -4027,6 +4092,7 @@
       "minSuccessors": 0, "maxSuccessors": 0,
       "encoding": {
         "format": "x86-variable",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg"] },
@@ -4046,13 +4112,14 @@
       "encoding": {
         "$comment": "FC3.5 sweep-c2 (D-CSUBSET-F32-CODEGEN): width-keyed pairs — MOVSD xmm, m64 = F2 0F 10 (8-byte read, width 64) vs MOVSS xmm, m32 = F3 0F 10 (4-byte read, width 32; Intel SDM MOVSS). The MIR→LIR lowerLoad threads the loaded type's width for FPR-class results: an 8-byte movsd read of a 4-byte F32 rodata item would read past the item (potential fault at a section edge) — the width axis makes the access width type-exact. Both operandKinds shapes carry the pair (the loader's keyed/absent-mix rule).",
         "format": "x86-variable",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "opcode": [15, 16] },
             "resultSlot": "modrm.reg",
             "wires":      [
-              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 0, "slotKind": "modrm.rm.mem", "regClass": "gpr"  },
               { "index": 1, "slotKind": "membase.scale" },
               { "index": 2, "slotKind": "disp32.mem"    }
             ]
@@ -4063,7 +4130,7 @@
             "template":   { "mandatoryPrefix": [243], "opcode": [15, 16] },
             "resultSlot": "modrm.reg",
             "wires":      [
-              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 0, "slotKind": "modrm.rm.mem", "regClass": "gpr"  },
               { "index": 1, "slotKind": "membase.scale" },
               { "index": 2, "slotKind": "disp32.mem"    }
             ]
@@ -4097,13 +4164,14 @@
       "encoding": {
         "$comment": "FC3.5 sweep-c2: width-keyed pair — MOVSD m64, xmm (F2, width 64) vs MOVSS m32, xmm (F3 0F 11, width 32; Intel SDM MOVSS). lowerStore threads the stored VALUE's type width for FPR-class stores (type-exact access width); the regalloc spill path stays width-default 64 over 8-byte slots (value-preserving for both float widths — the F32 value is the low 4 bytes either way).",
         "format": "x86-variable",
+        "registerClass": "fpr",
         "variants": [
           {
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "mandatoryPrefix": [242], "opcode": [15, 17] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg"     },
-              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "modrm.rm.mem", "regClass": "gpr"  },
               { "index": 2, "slotKind": "membase.scale" },
               { "index": 3, "slotKind": "disp32.mem"    }
             ]
@@ -4114,7 +4182,7 @@
             "template": { "mandatoryPrefix": [243], "opcode": [15, 17] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg"     },
-              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "modrm.rm.mem", "regClass": "gpr"  },
               { "index": 2, "slotKind": "membase.scale" },
               { "index": 3, "slotKind": "disp32.mem"    }
             ]

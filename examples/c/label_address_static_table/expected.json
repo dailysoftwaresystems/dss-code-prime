@@ -1,0 +1,33 @@
+{
+  "$comment": "D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED. `&&label` used as a LINK-TIME ADDRESS CONSTANT in a static-storage initializer -- `static void *const tbl[] = {&&L0, &&L1}; goto *tbl[i];` -- which BOTH gcc and clang accept and DSS refused with H0009 'a function that takes no label address'. The refusal was true about the tree the collector searched and false about the source: D-CSUBSET-LOCAL-STATIC promotes a `static` local to a hidden module global and appends NOTHING to the function body, so the `&&label` nodes had already left the body. The fix makes a block address a CONSTANT and not only a value: HIR->MIR mints the block's synthetic symbol, puts an ordinary MirSymbolAddrValue in the initializer literal (so the entire data path -- aggregate encoder, section choice, abs64 relocation, cross-CU merge, linker -- needed no new case), and publishes the symbol<->block pairing in the owning function as BlockAddressExport(BlockAddress(L)). gcc's own output is the specification of the shape: `.quad .L3` in `.rdata`, a relocation against an interior block label, never a startup store (MEASURED, gcc 13.2 x86_64 -O0 -S). FIVE shapes are pinned because they fail DIFFERENTLY: the plain table (no `lea` names the blocks, so the binding must come from the function's byte offsets); trampoline-shaped targets (single-branch address-taken blocks, the shape SimplifyCfg elides -- which is why the release arm names it); one label addressed from BOTH the body and the table (two references, ONE symbol, or the linker reports it declared twice); the SCALAR form (which used to abort the MirBuilder rather than bail like the aggregate); and two functions whose labels share ordinal 0 (label ordinals restart per function, so resolving one without its owner sends one function's computed goto into the other's block -- a defect each function is individually correct under). The exit code witnesses the RELOCATION VALUES, not merely that the link succeeded: 30+7+5 = 42, so a slot bound to the wrong block changes it.",
+  "language": "c",
+  "sources": ["main.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true}
+  ]
+}

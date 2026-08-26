@@ -149,6 +149,58 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 // schema's `allowsUndefinedImports()` (never a format name). Returns true when `m`
 // flowed through untouched (no drops), false when `filtered` holds the dropped-row
 // copy. Rejects (if any) are reported regardless of the return value.
+// ── NAMING AN UNDEFINED SYMBOL ──────────────────────────────────────────────
+// D-DIAG-K-SYMBOLUNDEFINED-NAMES-NO-SYMBOL
+//
+// ★★★ `K_SymbolUndefined` printed `symbol #2776 references undefined symbol
+// #13420` and NOTHING ELSE. A `SymbolId` is a per-CU integer with no meaning
+// outside the compiler, so the message named neither the thing that broke nor
+// the thing it wanted — the reader is told a number is missing and left to
+// guess which of 103 translation units it belonged to.
+// ✔MEASURED 2026-08-26: the pe64 sqlite CLI build emitted **1313** of these and
+// not one of them could be acted on; three separate hypotheses had to be built
+// and refuted by experiment purely because the diagnostic would not say what
+// 13420 WAS. A diagnostic that cannot be acted on has the cost of a failure and
+// the value of silence.
+//
+// ★ THE NAMES WERE ALREADY IN THE MODULE, which is what makes this a defect
+// rather than a missing feature: `ModuleSymbol` carries `name` for every DEFINED
+// function and global, and `ExternImport` carries `mangledName` for every import.
+// The undefined target is looked up in BOTH, and WHICH table answers is itself
+// the diagnosis:
+//   * found in `symbols`      — the symbol IS declared and its BODY did not
+//                               survive to the assembled module. That is a
+//                               dropped/merged-away definition, not a missing
+//                               extern, and it is the case a reader would never
+//                               have guessed from a bare number.
+//   * found in `externImports` — the import row exists but was not indexed.
+//   * found in neither         — a dangling target: minted by a producer and
+//                               never declared anywhere.
+// ⓘ Deliberately does NOT search sibling modules: this runs on ONE module, and a
+// name borrowed from another CU would be a guess wearing the same clothes as a
+// fact. Cheap by construction — only ever called on the error path.
+[[nodiscard]] std::string describeUndefinedSymbol(AssembledModule const& m, SymbolId id) {
+    for (auto const& s : m.symbols) {
+        if (s.symbol.v == id.v) {
+            return " '" + s.name + "' (declared in this module's symbol table as "
+                 + (s.binding == SymbolBinding::Local  ? "Local"
+                  : s.binding == SymbolBinding::Weak   ? "Weak" : "Global")
+                 + ", but NO assembled function or data item carries it — its"
+                   " definition did not survive to the assembled module)";
+        }
+    }
+    for (auto const& e : m.externImports) {
+        if (e.symbol.v == id.v) {
+            return " '" + e.mangledName + "' (an extern import"
+                 + (e.libraryPath.empty() ? ", no owning library declared"
+                                          : " from " + e.libraryPath)
+                 + ", but it is not in the link's symbol index)";
+        }
+    }
+    return " (no name: this id appears in no ModuleSymbol and no ExternImport of"
+           " this module, so it was minted by a producer and never declared)";
+}
+
 [[nodiscard]] bool rejectOrDropUnreferencedExterns(
     AssembledModule const& m,
     AssembledModule&       filtered,
@@ -980,6 +1032,28 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             if (isShadowedAtom(i, fn.symbol)) continue;  // shadowed weak body — drop
             AssembledFunction out = fn;  // bytes + relocations + sourceMap copied
             out.symbol = SymbolId{mergedIdFor(i, fn.symbol)};
+            // ★★★ THE BLOCK SYMBOLS ARE REMAPPED TOO, AND OMITTING THEM WAS A
+            // WHOLE-PROGRAM LINK FAILURE. D-LINK-MERGE-DOES-NOT-REMAP-BLOCK-SYMBOLS
+            // `AssembledFunction out = fn` copies `blockSymbols` VERBATIM, so before
+            // this line a synthetic per-block symbol kept its ORIGINAL per-CU id while
+            // every relocation naming it was retargeted through `retargetRelocs` to a
+            // freshly minted merged id. `buildCompoundIndex` then declared the OLD id
+            // and the reference asked for the NEW one, so the target resolved against
+            // nothing.
+            // ⚠ It is invisible in a single-CU build: with one module the mint is the
+            // identity, so the two ids coincide and the bug cannot fire. It needs a
+            // MERGE, which is why a 103-TU program found it and no test did.
+            // ✔MEASURED 2026-08-26 on the sqlite CLI for pe64: **1313**
+            // `K_SymbolUndefined`, every one of them a data-item relocation (a switch
+            // jump table is a data item whose relocations name block symbols) into an
+            // id that no ModuleSymbol and no ExternImport could name -- because a block
+            // symbol has neither, which is exactly what a dangling mint looks like.
+            // ★ `mergedIdFor` MEMOIZES into `remap`, so this call and the one inside
+            // `retargetRelocs` return the SAME id regardless of which runs first --
+            // the declaration and the reference cannot disagree by construction, which
+            // is the property that was missing rather than any particular ordering.
+            for (auto& bs : out.blockSymbols)
+                bs.symbol = SymbolId{mergedIdFor(i, bs.symbol)};
             retargetRelocs(i, out.relocations);
             combined.functions.push_back(std::move(out));
         }
@@ -1506,8 +1580,10 @@ LinkedImage link(std::span<AssembledModule const> modules,
                 && !isWriterReservedSymbolIdValue(reloc.target.v)) {
                 std::string msg = "relocation in symbol #";
                 msg += std::to_string(fn.symbol.v);
+                msg += describeUndefinedSymbol(module, fn.symbol);
                 msg += " references undefined symbol #";
                 msg += std::to_string(reloc.target.v);
+                msg += describeUndefinedSymbol(module, reloc.target);
                 msg += " (not declared by any AssembledFunction, "
                        "ExternImport, nor AssembledData item)";
                 report(reporter,
@@ -1538,8 +1614,10 @@ LinkedImage link(std::span<AssembledModule const> modules,
                 && !isWriterReservedSymbolIdValue(reloc.target.v)) {
                 std::string msg = "data-item relocation in symbol #";
                 msg += std::to_string(di.symbol.v);
+                msg += describeUndefinedSymbol(module, di.symbol);
                 msg += " references undefined symbol #";
                 msg += std::to_string(reloc.target.v);
+                msg += describeUndefinedSymbol(module, reloc.target);
                 msg += " (not declared by any AssembledFunction, "
                        "ExternImport, nor AssembledData item)";
                 report(reporter,

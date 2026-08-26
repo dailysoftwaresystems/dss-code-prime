@@ -802,8 +802,18 @@ bool encode(Lir const&                  lir,
 
     // Wire the result register into its declared slot.
     if (selected->resultSlot.has_value()) {
+        // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the bank this
+        // variant declares for its result field (its own `resultRegClass`, or
+        // the opcode's `encoding.registerClass`). Resolved from config here
+        // and compared inside `hwEncodingOf` — never inferred from the slot
+        // kind, which is a GPR field under `add` and an XMM field under
+        // `addsd`.
         auto const hw = hwEncodingOf(result, schema, info->mnemonic,
-                                      kX86RegFieldBits, reporter);
+                                      kX86RegFieldBits,
+                                      encodingResultRegClass(info->encoding,
+                                                             *selected),
+                                      encodingSlotKindName(*selected->resultSlot),
+                                      reporter);
         if (!hw.has_value()) return false;
         if (!wireSlot(st, *selected->resultSlot, *hw,
                       info->mnemonic, reporter)) {
@@ -827,8 +837,14 @@ bool encode(Lir const&                  lir,
         }
         auto const& srcOp = instOps[wire.index];
         if (srcOp.kind == LirOperandKind::Reg) {
+            // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: this wire's
+            // declared bank (its own `regClass`, else the opcode's).
             auto const hw = hwEncodingOf(srcOp.reg, schema, info->mnemonic,
-                                          kX86RegFieldBits, reporter);
+                                          kX86RegFieldBits,
+                                          encodingWireRegClass(info->encoding,
+                                                               wire),
+                                          encodingSlotKindName(wire.slotKind),
+                                          reporter);
             if (!hw.has_value()) return false;
             if (!wireSlot(st, wire.slotKind, *hw,
                           info->mnemonic, reporter)) {

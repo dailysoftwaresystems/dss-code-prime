@@ -344,8 +344,20 @@ if [[ "$MODE" != "test-only" ]]; then
     carriage "cd $REMOTE_DIR && printf '%s\n' \"$stamp\" > .dss-leg-stamp && cat .dss-leg-stamp" \
         || die "could not write the leg stamp"
     remote_head=$(carriage "cd $REMOTE_DIR && git log --oneline -1 2>/dev/null || echo '(no git)'" 2>&1 | tail -1)
-    printf '\n⚠ remote .git still says: %s\n' "$remote_head"
-    printf '⚠ that describes the OLD checkout, NOT the files just pushed. Read .dss-leg-stamp.\n'
+    # ★ THIS LINE USED TO WARN THAT THE REMOTE `.git` DESCRIBED THE OLD CHECKOUT.
+    # Under the 2026-08-26 clone standard it no longer does -- `leg_tree_prepare` put
+    # that clone on this branch at this commit before the sync -- so the warning was
+    # not merely redundant, it was FALSE, and a false warning is worse than none: it
+    # trains a reader to disregard the one place the host says what it is. ⓘ The
+    # remaining honest note is the DIRTY delta, which git on the host reports itself.
+    printf '\nremote HEAD : %s\n' "$remote_head"
+    if [[ "$remote_head" == "$(printf '%.7s' "$LOCAL_SHA")"* ]]; then
+        printf 'remote HEAD matches this driver. The working tree above it is the synced one;\n'
+        printf '`git status` there shows the same paths `git status` shows here.\n'
+    else
+        printf '⚠ remote HEAD does NOT match this driver (%s). leg-tree could not place it --\n' "$LOCAL_SHA"
+        printf '  read .dss-leg-stamp, which names what was actually pushed.\n'
+    fi
 fi
 
 [[ "$MODE" == "sync-only" ]] && { say "sync-only: done"; exit 0; }

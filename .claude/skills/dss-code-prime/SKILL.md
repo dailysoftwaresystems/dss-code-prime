@@ -82,6 +82,35 @@ the registry**, and the production half is the one that ranks. ⚠ **Never quote
 from prose; re-derive it** (`check-anchor-balance.py --breakdown --denominator registry`, whose
 registry total the two buckets must sum to) — the P34 handoff's own production figure was wrong by
 20, and that sum is what caught it.
+
+## ★★★★ NO FOLLOW-UPS — A ROW YOU OPEN, YOU CLOSE (operator ruling 2026-08-26)
+
+> *"THIS MUST STOP NOW."* — *"opened anchors that are not closed in the immediate cycle or the
+> next are brutally rare exceptions now, not the rule. found something new that must be done? DO
+> IT."* — *"If I keep seeing anchors rising after implementations or fixes I'll be really
+> pissed!"*
+
+**The full ruling, the gate command, and the shipped-but-unmarked failure class live in
+`dss-cycle` SKILL.md — this is the same rule, restated where a reader of THIS skill will meet it.**
+It was a standing operator ruling from 2026-08-24 (*"every time opens more anchors than closes"*)
+that had never been written into either skill; ✔MEASURED 2026-08-26. That omission is why it kept
+eroding.
+
+- **Close it this cycle, or the next.** Anything longer is a rare exception that must NAME itself
+  as one, with the predicate that will close it.
+- **Found new work? DO IT.** A new row is the LAST RESORT, not the first response to a finding.
+- **Production first, then harness — and a harness defect that BLOCKS you is fixed the moment you
+  face it,** in the lane that hit it, never later.
+- **"Refused but not fixed" is not closed.** Nor is "measured", nor "the row now states the real
+  scope". A row closes when the BEHAVIOUR changed.
+- **NET OPEN must be ≤ 0 for the cycle**, measured — not asserted — against the cycle's own start
+  commit, and reported as closed / opened / net rather than one flattering total:
+  `python scripts/check-anchor-balance/check-anchor-balance.py --base <cycle-start-sha> --breakdown`
+- ⚠ **Mark a shipped row ✅ THE MOMENT IT SHIPS.** The gate counts a row OPEN unless its status
+  cell explicitly says closed — correct polarity, never to be softened — so a 🟢 "DESIGN RECORD —
+  SHIPPED" row inflates the OPEN count for free. Three `D-OPT*` rows were doing exactly that on
+  2026-08-26.
+
 ## The rules that actually break things when ignored
 
 These three cause real damage, so they get the emphasis rather than every convention:

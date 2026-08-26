@@ -421,6 +421,20 @@ private:
                 src_.instFlags(id)));
             return;
         }
+        if (op == MirOpcode::BlockAddressExport) {
+            // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the payload is a
+            // per-CU SymbolId, which the merge RENUMBERS — a generic `addInst` copy
+            // would carry the stale id, and the initializer literal's own
+            // `MirSymbolAddrValue` (remapped by `remapLiteralSymbols`) would then
+            // relocate against a DIFFERENT symbol than the one the block is bound
+            // to. Both sides must go through the SAME `symMerged` map, which is
+            // exactly why step 3d assigns these symbols a merged id.
+            local_.emplace(id.v, dst_.addBlockAddressExport(
+                mapValue(src_.instOperands(id)[0], id),
+                mergedSymbolOf(plan_, cuIdx_, src_.blockAddressExportSymbol(id)),
+                src_.instFlags(id)));
+            return;
+        }
         if (op == MirOpcode::InlineAsm) {
             // Inline-asm P5. The payload indexes the SOURCE CU's asm-descriptor
             // pool; the merged module is a DIFFERENT `Mir` whose pool starts
@@ -830,6 +844,35 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             // the import identity the FFI collapse keys on.
             assignSymbol(ci, e.symbol, e.mangledName, /*ffiRow=*/&e,
                          /*isLocalDef=*/false);
+        }
+        // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: a BLOCK symbol minted
+        // at HIR→MIR for a label whose address a static initializer took. It is a
+        // real symbol in every downstream sense — a `MirSymbolAddrValue` initializer
+        // relocates against it and the object file defines it as a local — but it is
+        // NOT a function, a global, or an extern, so the three loops above walk past
+        // it. Left unassigned, `remapLiteralSymbols` aborts the merge on the first
+        // 2-TU build containing one ("no unified merged id"), and no single-CU test
+        // can see that.
+        //
+        // ANONYMOUS AND LOCAL, both deliberately: it names an interior point of one
+        // function's code, so it must never collapse onto a same-named winner from
+        // another CU. Passing an empty name routes it straight to the mint arm,
+        // which is the same treatment the merge already gives a `static` object.
+        std::size_t const nfx = m.moduleFuncCount();
+        for (std::uint32_t fi = 0; fi < nfx; ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            std::uint32_t const nb = m.funcBlockCount(f);
+            for (std::uint32_t bi = 0; bi < nb; ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                std::uint32_t const ni = m.blockInstCount(b);
+                for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                    MirInstId const inst = m.blockInstAt(b, ii);
+                    if (m.instOpcode(inst) != MirOpcode::BlockAddressExport) continue;
+                    assignSymbol(ci, m.blockAddressExportSymbol(inst),
+                                 /*name=*/std::string{}, /*ffiRow=*/nullptr,
+                                 /*isLocalDef=*/true);
+                }
+            }
         }
     }
 

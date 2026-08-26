@@ -164,3 +164,21 @@ target_link_libraries(dss_asm_test_asm_x86_width_and_direction
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_x86_width_and_direction
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the encoder's register-CLASS
+# gate — an FPR-class LIR operand must encode through an FPR field and a
+# GPR-class one through a GPR field, per the bank each field DECLARES in
+# `.target.json`. Drives BOTH shipped targets UNMUTATED for the refusals, plus
+# one mutant that re-points a field's declared bank and watches the verdict
+# flip (which is what proves the gate reads config rather than a table in the
+# encoder).
+# WARNING ITS RED-ON-DISABLE MUTANT IS CONFIG-LEVEL, so it MUST run through
+# ctest -- dss_add_test sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd
+# and would read whichever tree the shell stands in
+# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_register_class_gate
+             SOURCES test_asm_register_class_gate.cpp)
+target_link_libraries(dss_asm_test_asm_register_class_gate
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_register_class_gate
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)

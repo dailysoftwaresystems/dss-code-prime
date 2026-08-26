@@ -478,8 +478,15 @@ bool encode(Lir const&                  lir,
     // destination register through later words, e.g. lea's ADD reads
     // Xd as both its dest AND its source base).
     if (selected->resultSlot.has_value()) {
+        // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the declared bank of
+        // the result field. `extraResultSlots` are additional placements of
+        // the SAME register, so one class governs all of them.
         auto const hw = hwEncodingOf(result, schema, info->mnemonic,
-                                      kFixed32RegFieldBits, reporter);
+                                      kFixed32RegFieldBits,
+                                      encodingResultRegClass(info->encoding,
+                                                             *selected),
+                                      encodingSlotKindName(*selected->resultSlot),
+                                      reporter);
         if (!hw.has_value()) return false;
         if (!orInto(*selected->resultSlot, *hw, /*wordIndex=*/0)) return false;
         for (auto const& extra : selected->extraResultSlots) {
@@ -522,8 +529,14 @@ bool encode(Lir const&                  lir,
         }
         auto const& srcOp = instOps[wire.index];
         if (srcOp.kind == LirOperandKind::Reg) {
+            // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: this wire's
+            // declared bank (its own `regClass`, else the opcode's).
             auto const hw = hwEncodingOf(srcOp.reg, schema, info->mnemonic,
-                                          kFixed32RegFieldBits, reporter);
+                                          kFixed32RegFieldBits,
+                                          encodingWireRegClass(info->encoding,
+                                                               wire),
+                                          encodingSlotKindName(wire.slotKind),
+                                          reporter);
             if (!hw.has_value()) return false;
             if (!orInto(wire.slotKind, *hw, wire.wordIndex)) return false;
         } else if (srcOp.kind == LirOperandKind::SymbolRef) {

@@ -146,7 +146,14 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
                                     /*alwaysInlineMap=*/nullptr,
                                     /*noOptimizeMap=*/nullptr,
                                     /*noSanitizeThreadMap=*/nullptr,
-                                    &hir->inlineAsmPool);
+                                    &hir->inlineAsmPool,
+                                    /*inlineDefinitionMap=*/nullptr,
+                                    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED:
+                                    // without it a `&&label` in a static initializer is
+                                    // REFUSED at MIR and never reaches this tier at all
+                                    // — the exact shape of the miss the block above
+                                    // records hitting three times.
+                                    &hir->enclosingFunctionMap);
     DiagnosticReporter lirReporter;
     MirToLirResult lir = lowerToLir(mir.mir, *target,
                                     model.lattice().interner(),

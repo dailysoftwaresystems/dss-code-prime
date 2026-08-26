@@ -249,7 +249,15 @@ struct Lowered {
                                     // unreachable. `compile_pipeline.cpp` passes
                                     // it; a harness that does not cannot see an
                                     // asm statement at all.
-                                    &hir->inlineAsmPool);
+                                    &hir->inlineAsmPool,
+                                    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED:
+                                    // and the FOURTH miss of the class the block above
+                                    // warns about would be RIGHT HERE. Without this map
+                                    // a `&&label` in a static initializer is REFUSED, so
+                                    // a test asserting the refusal would pass against a
+                                    // working compiler for the wrong reason.
+                                    /*inlineDefinitionMap=*/nullptr,
+                                    &hir->enclosingFunctionMap);
     return Lowered{
         .target      = std::move(targetSchema),
         .model       = std::move(model),
@@ -608,7 +616,15 @@ namespace {
                                     // unreachable. `compile_pipeline.cpp` passes
                                     // it; a harness that does not cannot see an
                                     // asm statement at all.
-                                    &hir->inlineAsmPool);
+                                    &hir->inlineAsmPool,
+                                    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED:
+                                    // and the FOURTH miss of the class the block above
+                                    // warns about would be RIGHT HERE. Without this map
+                                    // a `&&label` in a static initializer is REFUSED, so
+                                    // a test asserting the refusal would pass against a
+                                    // working compiler for the wrong reason.
+                                    /*inlineDefinitionMap=*/nullptr,
+                                    &hir->enclosingFunctionMap);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -687,7 +703,15 @@ namespace {
                                     // unreachable. `compile_pipeline.cpp` passes
                                     // it; a harness that does not cannot see an
                                     // asm statement at all.
-                                    &hir->inlineAsmPool);
+                                    &hir->inlineAsmPool,
+                                    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED:
+                                    // and the FOURTH miss of the class the block above
+                                    // warns about would be RIGHT HERE. Without this map
+                                    // a `&&label` in a static initializer is REFUSED, so
+                                    // a test asserting the refusal would pass against a
+                                    // working compiler for the wrong reason.
+                                    /*inlineDefinitionMap=*/nullptr,
+                                    &hir->enclosingFunctionMap);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -8853,6 +8877,233 @@ TEST(MirLoweringC, ComputedGotoBlockAddressTargetsAreAddressTaken) {
         << "a non-&&label block is not address-taken (the negative pin)";
 }
 
+// ── D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: HIR→MIR structural pins ──
+//
+// `static void *const tbl[] = {&&L0, &&L1}; goto *tbl[i];` — a label address used
+// as a LINK-TIME CONSTANT rather than as a value. Both gcc and clang accept it.
+//
+// Each pin below asserts an APPLIED FACT off the MIR, never merely "it compiled":
+// the whole defect this row names WAS a clean refusal, so a compile-only assertion
+// would have passed the moment the refusal was deleted, with nothing emitted.
+
+namespace {
+// Collect (exportSymbol.v → exported MirBlockId.v) for one function. The exported
+// block is read THROUGH the export's operand — the pairing the design keeps in the
+// instruction graph precisely so a rebuild re-maps it.
+[[nodiscard]] std::vector<std::pair<std::uint32_t, std::uint32_t>>
+collectBlockAddressExports(Mir const& m, std::uint32_t fi) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> out;
+    MirFuncId const fn = m.funcAt(fi);
+    std::uint32_t const nb = m.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        std::uint32_t const ni = m.blockInstCount(b);
+        for (std::uint32_t ii = 0; ii < ni; ++ii) {
+            MirInstId const inst = m.blockInstAt(b, ii);
+            if (m.instOpcode(inst) != MirOpcode::BlockAddressExport) continue;
+            auto const ops = m.instOperands(inst);
+            if (ops.empty()) continue;
+            out.emplace_back(m.blockAddressExportSymbol(inst).v,
+                             m.blockAddressTarget(ops[0]).v);
+        }
+    }
+    return out;
+}
+// Every SymbolId a global's initializer literal relocates against, recursively.
+void collectLiteralSymbolTargets(MirLiteralValue const& v,
+                                 std::vector<std::uint32_t>& out) {
+    if (auto const* sa = std::get_if<MirSymbolAddrValue>(&v.value)) {
+        out.push_back(sa->symbol);
+        return;
+    }
+    if (auto const* agg = std::get_if<MirAggregateValue>(&v.value)) {
+        for (auto const& f : agg->fields) collectLiteralSymbolTargets(f, out);
+    }
+}
+[[nodiscard]] std::vector<std::uint32_t> globalInitSymbolTargets(Mir const& m) {
+    std::vector<std::uint32_t> out;
+    for (std::uint32_t gi = 0; gi < m.moduleGlobalCount(); ++gi) {
+        std::uint32_t const idx = m.globalInitLiteralIndex(m.globalAt(gi));
+        if (idx == UINT32_MAX) continue;
+        collectLiteralSymbolTargets(m.literalValue(idx), out);
+    }
+    return out;
+}
+} // namespace
+
+TEST(MirLoweringC, LabelAddressInStaticArrayBecomesRelocatableStaticData) {
+    // THE ROW'S HEADLINE SHAPE. The table must become STATIC DATA carrying one
+    // relocation per slot — the shape gcc emits (`.quad .L3` in `.rdata`) — and
+    // NOT a `__module_init__` store chain.
+    auto L = lowerC(
+        "int f(int i) {\n"
+        "  static void *const tbl[] = {&&L0, &&L1};\n"
+        "  goto *tbl[i];\n"
+        "L0:\n"
+        "  return 1;\n"
+        "L1:\n"
+        "  return 2;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic: " << (L.model.diagnostics().all().empty()
+            ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "HIR: " << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u)
+        << "no `__module_init__` may be synthesized — the initializer is a "
+           "LINK-TIME constant, not a startup store";
+
+    // Two exports, two DISTINCT symbols, two DISTINCT blocks.
+    auto const exports = collectBlockAddressExports(m, 0);
+    ASSERT_EQ(exports.size(), 2u) << "one BlockAddressExport per exported label";
+    EXPECT_NE(exports[0].first, exports[1].first) << "distinct labels, distinct symbols";
+    EXPECT_NE(exports[0].second, exports[1].second) << "distinct labels, distinct blocks";
+
+    // ★ THE JOIN: every symbol the table relocates against is an EXPORTED symbol.
+    // This is the pin that catches the whole class of "the data names one symbol
+    // and the code binds another" — the failure mode that links cleanly and jumps
+    // to the wrong address.
+    auto const targets = globalInitSymbolTargets(m);
+    ASSERT_EQ(targets.size(), 2u) << "the two-slot table carries two relocations";
+    for (std::uint32_t const t : targets) {
+        bool matched = false;
+        for (auto const& [sym, blk] : exports) if (sym == t) matched = true;
+        EXPECT_TRUE(matched)
+            << "initializer slot relocates against symbol " << t
+            << ", which no BlockAddressExport binds to a block";
+    }
+
+    // The exported blocks are address-taken — the SimplifyCfg MF-B fold guard's
+    // only input, and the reason the export holds a real BlockAddress operand
+    // instead of naming the block directly.
+    for (auto const& [sym, blkV] : exports) {
+        (void)sym;
+        EXPECT_TRUE(m.isBlockAddressTaken(MirBlockId{blkV, m.id().v}))
+            << "a block whose address reached static data must read back as "
+               "address-taken, or SimplifyCfg may fold it";
+    }
+
+    // And `goto *tbl[i]` must reach BOTH — the H0009 refusal this row was filed
+    // for was exactly an EMPTY address-taken set.
+    MirInstId const ibr = findIndirectBr(m, 0);
+    ASSERT_TRUE(ibr.valid()) << "goto *tbl[i] must lower to an IndirectBr";
+    EXPECT_EQ(m.blockSuccessors(m.instBlock(ibr)).size(), 2u)
+        << "the IndirectBr must list both statically-addressed labels";
+}
+
+TEST(MirLoweringC, LabelAddressInStaticScalarBecomesRelocatableStaticData) {
+    // The SCALAR shape fails differently from the array: it used to reach the
+    // synthesized `__module_init__`, where the label ordinal names no block, and
+    // abort the MirBuilder ("created but never filled"). Pinned separately.
+    auto L = lowerC(
+        "int g(int i) {\n"
+        "  static void *const p = &&S;\n"
+        "  if (i) goto *p;\n"
+        "  return 0;\n"
+        "S:\n"
+        "  return 7;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    EXPECT_EQ(m.moduleFuncCount(), 1u) << "no runtime-init function";
+    auto const exports = collectBlockAddressExports(m, 0);
+    ASSERT_EQ(exports.size(), 1u);
+    auto const targets = globalInitSymbolTargets(m);
+    ASSERT_EQ(targets.size(), 1u);
+    EXPECT_EQ(targets[0], exports[0].first)
+        << "the scalar initializer relocates against the exported block symbol";
+}
+
+TEST(MirLoweringC, LabelAddressedFromBodyAndStaticDataSharesOneSymbol) {
+    // Two references to ONE label — one materialized in the body, one relocated
+    // from static data — must resolve to ONE symbol. Declaring a symbol twice is
+    // a link error the computed-goto path already hit once, which is why the mint
+    // is memoized per label rather than per use.
+    auto L = lowerC(
+        "int f(int i) {\n"
+        "  static void *const tbl[] = {&&A, &&A};\n"
+        "  void *body = &&A;\n"
+        "  if (i == 2) goto *body;\n"
+        "  goto *tbl[i];\n"
+        "A:\n"
+        "  return 5;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const exports = collectBlockAddressExports(m, 0);
+    ASSERT_EQ(exports.size(), 1u)
+        << "one LABEL exports ONE symbol however many slots name it";
+    auto const targets = globalInitSymbolTargets(m);
+    ASSERT_EQ(targets.size(), 2u) << "both table slots carry a relocation";
+    EXPECT_EQ(targets[0], targets[1]) << "both name the SAME block symbol";
+    EXPECT_EQ(targets[0], exports[0].first);
+}
+
+TEST(MirLoweringC, LabelAddressOrdinalsAreResolvedPerOwningFunction) {
+    // ★ THE AMBIGUITY THIS ROW'S PROVENANCE SIDE-TABLE EXISTS FOR. Label ordinals
+    // restart at 0 per function, so BOTH initializers below say "ordinal 0".
+    // Resolving one without its owner sends one function's computed goto into the
+    // OTHER function's block — and each function is individually correct, so
+    // nothing else in this file would notice.
+    auto L = lowerC(
+        "int a(int i) { static void *const p = &&X; if (i) goto *p; return 0; X: return 11; }\n"
+        "int b(int i) { static void *const p = &&Y; if (i) goto *p; return 0; Y: return 22; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u);
+    auto const ea = collectBlockAddressExports(m, 0);
+    auto const eb = collectBlockAddressExports(m, 1);
+    ASSERT_EQ(ea.size(), 1u) << "function a exports its own label";
+    ASSERT_EQ(eb.size(), 1u) << "function b exports its own label";
+    EXPECT_NE(ea[0].first, eb[0].first) << "two labels, two symbols";
+    EXPECT_NE(ea[0].second, eb[0].second) << "two labels, two blocks";
+    // Each exported block belongs to the function that exported it — the exact
+    // statement a per-function ordinal cannot make on its own.
+    EXPECT_EQ(m.blockFunc(MirBlockId{ea[0].second, m.id().v}).v, m.funcAt(0).v);
+    EXPECT_EQ(m.blockFunc(MirBlockId{eb[0].second, m.id().v}).v, m.funcAt(1).v);
+}
+
+TEST(MirLoweringC, LabelAddressInStaticInitializerIsRefusedWithoutProvenance) {
+    // ★ THE FAIL-LOUD ARM, EXERCISED RATHER THAN READ. With no provenance map the
+    // ordinal is unresolvable, and the ONLY safe answer is a refusal — never a
+    // guess. Threading `nullptr` here reproduces exactly the state every caller
+    // that forgets the map is in, and asserts the compiler REFUSES instead of
+    // resolving ordinal 0 against whichever function is convenient.
+    std::string const src =
+        "int f(int i) {\n"
+        "  static void *const p = &&S;\n"
+        "  if (i) goto *p;\n"
+        "  return 0;\n"
+        "S:\n"
+        "  return 7;\n"
+        "}\n";
+    auto withMap    = lowerC(src);
+    ASSERT_TRUE(withMap.mir.ok) << "the control arm must lower cleanly";
+
+    // Re-lower the SAME HIR with the provenance map withheld.
+    DiagnosticReporter rep;
+    MirLoweringConfig cfg;
+    auto const bare = lowerToMir(withMap.hir->hir, withMap.hir->literalPool,
+                                 withMap.model.lattice().interner(), rep,
+                                 &withMap.hir->sourceMap, cfg);
+    EXPECT_FALSE(bare.ok)
+        << "a `&&label` static initializer with no enclosing-function provenance "
+           "must be REFUSED, not resolved by guessing an owner";
+    bool named = false;
+    for (auto const& d : rep.all())
+        if (d.actual.find("enclosing function is unknown") != std::string::npos)
+            named = true;
+    EXPECT_TRUE(named)
+        << "the refusal must say WHY, naming the missing provenance";
+}
+
 // ─── Plan 24 Stage 4 — iterative HIR→MIR straight-line expression driver ────
 //
 // SF-4 differential pin (synthetic deep HIR): a DEEPLY-nested left-associative
@@ -13238,7 +13489,15 @@ constexpr char const* kSetjmpRoundTripSrc =
                                     // unreachable. `compile_pipeline.cpp` passes
                                     // it; a harness that does not cannot see an
                                     // asm statement at all.
-                                    &hir->inlineAsmPool);
+                                    &hir->inlineAsmPool,
+                                    // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED:
+                                    // and the FOURTH miss of the class the block above
+                                    // warns about would be RIGHT HERE. Without this map
+                                    // a `&&label` in a static initializer is REFUSED, so
+                                    // a test asserting the refusal would pass against a
+                                    // working compiler for the wrong reason.
+                                    /*inlineDefinitionMap=*/nullptr,
+                                    &hir->enclosingFunctionMap);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),

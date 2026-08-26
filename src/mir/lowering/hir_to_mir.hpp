@@ -379,6 +379,18 @@ lowerToMir(Hir const&               hir,
            // it should not: the cross-table guard simply rejects the extern and
            // says so. The failure is loud and localized, so a pool-free test
            // fixture stays correct rather than becoming subtly wrong.
-           HirInlineDefinitionMap const* inlineDefinitionMap = nullptr);
+           HirInlineDefinitionMap const* inlineDefinitionMap = nullptr,
+           // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: per-promoted-GLOBAL
+           // provenance for a block-scope `static` — which function's body it was
+           // written in. Supplied by the driver as
+           // `&CstToHirResult::enclosingFunctionMap`.
+           //
+           // ⚠ `nullptr` IS SAFE AND LOUD, never silently wrong. It is consulted
+           // ONLY when a static-storage initializer contains a `&&label`; with no
+           // map (or no entry) that initializer is REFUSED with a diagnostic naming
+           // this row, because a per-function label ordinal cannot be resolved
+           // without knowing its function. Every OTHER initializer is unaffected, so
+           // a map-free test fixture keeps working exactly as before.
+           HirEnclosingFunctionMap const* enclosingFunctionMap = nullptr);
 
 } // namespace dss

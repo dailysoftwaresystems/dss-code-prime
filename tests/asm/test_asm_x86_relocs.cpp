@@ -111,7 +111,7 @@ TEST(X86Relocations, RelocationKindForbiddenOnNonSymbolSlot) {
             { "mnemonic": "mov", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -180,7 +180,7 @@ TEST(X86Relocations, IsCallWithResultSlotIsRejected) {
               "isCall": true,
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -208,7 +208,7 @@ TEST(X86Relocations, Requires2AddressWithoutWireOnOperand0IsRejected) {
             { "mnemonic": "mov", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -221,7 +221,7 @@ TEST(X86Relocations, Requires2AddressWithoutWireOnOperand0IsRejected) {
               "requires2Address": true,
               "minOperands": 2, "maxOperands": 2,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg", "reg"] },
                     "template": { "rexW": true, "opcode": [1] },
@@ -266,7 +266,7 @@ TEST(X86Relocations, Requires2AddressWireToOpcodePlusRegIsAccepted) {
             { "mnemonic": "mov", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -279,7 +279,7 @@ TEST(X86Relocations, Requires2AddressWireToOpcodePlusRegIsAccepted) {
               "requires2Address": true,
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [15, 200] },
@@ -331,7 +331,7 @@ TEST(X86Relocations, Requires2AddressWireToSourceOnlySlotIsStillRejected) {
             { "mnemonic": "mov", "result": "value",
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [139] },
@@ -344,7 +344,7 @@ TEST(X86Relocations, Requires2AddressWireToSourceOnlySlotIsStillRejected) {
               "requires2Address": true,
               "minOperands": 1, "maxOperands": 1,
               "encoding": {
-                "format": "x86-variable",
+                "format": "x86-variable", "registerClass": "gpr",
                 "variants": [
                   { "guard": { "operandKinds": ["reg"] },
                     "template": { "rexW": true, "opcode": [15, 200] },

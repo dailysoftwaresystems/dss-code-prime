@@ -13,6 +13,18 @@
 // predicate called at QUERY time — this class only memoizes the ENUMERATION
 // (which instructions to test), never an alias judgment.
 //
+// The queries, and which one a consumer wants:
+//   Q1 `anyClobberInBlockRange`     — one block, one index range
+//   Q2 `anyClobberBetween`          — the STRICTLY-BETWEEN block region
+//   Q3 `anyClobberInBlocks`         — a whole block set (LICM's loop body)
+//   Q4 `blockReachesItselfAvoiding` — the wrap-around trigger
+//   Q5 `anyClobberBetweenPoints`    — ★ THE point-to-point cover: TWO PROGRAM
+//      POINTS, every path between them, back edge included. A consumer asking
+//      "may this value still be reused over there?" wants Q5 and ONLY Q5 —
+//      Q1/Q2/Q4 are its PARTS, and hand-assembling them at a use site is what
+//      shipped `D-OPT-CSE-LOAD-BACKEDGE-TAIL`
+//      (`D-OPT-CSE-CLOBBER-COVER-CHOKEPOINT`).
+//
 // WHY NOT a full LLVM MemorySSA (MemoryDef/MemoryUse/MemoryPhi + a
 // walk-past-non-aliasing-defs clobber walker): the walk-past cache must key on
 // (def, location) to be sound — a per-block cache that stops the backward walk
@@ -192,16 +204,124 @@ public:
         return false;
     }
 
+    // Q5 — THE point-to-point clobber cover (`D-OPT-CSE-CLOBBER-COVER-CHOKEPOINT`).
+    //
+    // "May a value produced at program point (fromBlock, fromIdx) still be
+    // reused at program point (toBlock, toIdx)?" — i.e. does any may-aliasing
+    // clobber of `loadPtr` execute on a path that starts just after `from` and
+    // ends at ANY execution of `to`, without re-executing `from`? BOTH
+    // endpoints are EXCLUSIVE. Precondition: `from` is available at `to` (it
+    // dominates it); in the same block that means fromIdx < toIdx — fail-loud
+    // otherwise, because two unordered points have no such question to answer.
+    //
+    // ★ WHY THIS IS ONE FUNCTION AND NOT FOUR CALLS AT THE USE SITE. The cover
+    // below is NOT self-evidently total, and open-coding it is precisely what
+    // let `D-OPT-CSE-LOAD-BACKEDGE-TAIL` ship a release-only silent miscompile:
+    // a THREE-slice cover looked complete because nothing in the API or the
+    // type system said what complete meant. Completeness is now a checkable
+    // property of ONE named query against ONE specification —
+    // `mirAnyClobberOnPathBetweenPoints` (mir_alias.hpp), an exhaustive walk of
+    // the (block, index) PROGRAM-POINT graph that is total by construction —
+    // and the differential pins assert `spec ⇒ this` over curated AND
+    // randomized CFGs. Deleting any slice reds a test. Consumers get all four
+    // by construction and can no longer reimplement three of them.
+    //
+    // The four slices, and why they cover every path:
+    //   (a) `from`'s block TAIL, after the producing instruction.
+    //   (b) the STRICTLY-BETWEEN blocks — Q2's fwd(from) ∩ bwd(to) region,
+    //       which drops both endpoint blocks so the responsibilities stay
+    //       disjoint (overlapping scans hide each other's gaps).
+    //   (c) `to`'s block HEAD, before the reusing instruction.
+    //   (d) `to`'s block TAIL, when `to`'s block sits on a cycle that does not
+    //       pass through `from`'s block: execution then WRAPS
+    //       (to → tail → back edge → to again) and a clobber in that tail
+    //       reaches the NEXT execution of `to`. Slices (a)-(c) cover only an
+    //       ACYCLIC path — (b) drops both endpoints and (c) stops at toIdx —
+    //       so without (d) that region is scanned by nothing. That gap was
+    //       sqlite's `balance_nonroot` miscompile. Ordered cheap-scan-FIRST:
+    //       the reachability walk runs only when a clobber is actually there.
+    //
+    // RE-EXECUTION LEMMA (why `from`'s block HEAD and the same-block branch need
+    // no slice) — stated over the MODELED CFG, where every edge originates at a
+    // terminator (an `IndirectBr` lists all address-taken blocks as successors,
+    // and the SEH region ops are themselves terminators AND memory clobbers, so
+    // no mid-block fault edge can smuggle a path past this): a block is entered
+    // ONLY at index 0, so any wrap that re-enters `from`'s block must walk
+    // through `from` itself, which RE-EXECUTES the producing instruction and
+    // refreshes the value. Hence [0, fromIdx) is not a hole and the same-block
+    // branch below is already exact; scanning either would only lose precision.
+    // The same property is why slice (d) may gate on avoiding the whole BLOCK
+    // rather than the single point. That admission carries one obligation — the
+    // producer must stay inside the cycle — which LICM discharges: its Load
+    // hoist gate scans the WHOLE loop body (licm.cpp), so it refuses to hoist
+    // exactly when such a clobber exists.
+    //
+    // Every slice funnels through the SAME per-instruction predicate
+    // (`mirInstClobbersLoadPtr`) called at QUERY time, so no two scans can
+    // disagree about what clobbers. For a consumer whose reuse candidate is a
+    // memory-READING opcode beyond `Load` (a future AtomicLoad / VolatileLoad),
+    // note the alias substrate does not know about it — admission must add it
+    // explicitly at the consumer.
+    [[nodiscard]] bool anyClobberBetweenPoints(
+        TypeInterner const& interner, MirInstId loadPtr,
+        MirBlockId fromBlock, std::uint32_t fromIdx,
+        MirBlockId toBlock,   std::uint32_t toIdx,
+        StrictTbaa strictTbaa, bool charTypesAliasAll) const {
+        checkModule_();
+        std::uint32_t const fromN = mir_.blockInstCount(fromBlock);
+        std::uint32_t const toN   = mir_.blockInstCount(toBlock);
+        if (fromIdx >= fromN || toIdx >= toN) {
+            std::fprintf(stderr,
+                "dss::opt::analysis::MirMemoryClobbers fatal: program point out "
+                "of range in anyClobberBetweenPoints (from #%u idx=%u of %u, to "
+                "#%u idx=%u of %u) — both indices must name an instruction in "
+                "their own block.\n",
+                fromBlock.v, fromIdx, fromN, toBlock.v, toIdx, toN);
+            std::abort();
+        }
+        if (fromBlock.v == toBlock.v) {
+            if (fromIdx >= toIdx) {
+                std::fprintf(stderr,
+                    "dss::opt::analysis::MirMemoryClobbers fatal: same-block "
+                    "program points out of program order in "
+                    "anyClobberBetweenPoints (#%u idx=%u then idx=%u) — the "
+                    "producing instruction must precede its reuse. A consumer "
+                    "walking the dominator tree gets this for free; seeing it "
+                    "here means the caller's scope/order invariant broke.\n",
+                    fromBlock.v, fromIdx, toIdx);
+                std::abort();
+            }
+            // Exact by the RE-EXECUTION LEMMA above — a wrap re-enters this
+            // block at index 0 and must re-execute `from` before reaching `to`.
+            return anyClobberInBlockRange(interner, loadPtr, fromBlock,
+                                          fromIdx + 1u, toIdx,
+                                          strictTbaa, charTypesAliasAll);
+        }
+        return anyClobberInBlockRange(interner, loadPtr, fromBlock,          // (a)
+                                      fromIdx + 1u, fromN,
+                                      strictTbaa, charTypesAliasAll)
+            || anyClobberBetween(interner, loadPtr, fromBlock, toBlock,      // (b)
+                                 strictTbaa, charTypesAliasAll)
+            || anyClobberInBlockRange(interner, loadPtr, toBlock,            // (c)
+                                      0u, toIdx,
+                                      strictTbaa, charTypesAliasAll)
+            || (anyClobberInBlockRange(interner, loadPtr, toBlock,           // (d)
+                                       toIdx + 1u, toN,
+                                       strictTbaa, charTypesAliasAll)
+                && blockReachesItselfAvoiding(toBlock, fromBlock));
+    }
+
     // Q4 — does `blk` lie on a cycle that does NOT pass through `avoid`?
     // (an invalid `avoid` ⇒ plain self-reachability). Forward walk from `blk`'s
     // successors that never expands THROUGH `avoid`, asking whether `blk` is
     // re-reached.
     //
-    // WHY THIS EXISTS: a two-program-point Load query (CSE) decomposes the
-    // canonical→use region into slices, and that decomposition is complete only
-    // for an ACYCLIC path. When the use sits on a canonical-free cycle, execution
-    // WRAPS and the use block's TAIL runs before the NEXT execution of the use —
-    // so the caller must scan that tail too. This predicate is the trigger.
+    // WHY THIS EXISTS: the point-to-point cover (Q5) decomposes the from→to
+    // region into slices, and that decomposition is complete only for an
+    // ACYCLIC path. When `to` sits on a `from`-free cycle, execution WRAPS and
+    // `to`'s block TAIL runs before the NEXT execution of `to` — so slice (d)
+    // must scan that tail too. This predicate is slice (d)'s trigger; Q5 is its
+    // only production caller, and consumers should ask Q5, not assemble slices.
     // Reachability (not `mirNaturalLoops`) is deliberate: DSS has computed goto /
     // IndirectBr, so an IRREDUCIBLE cycle yields no natural loop and any
     // loop-structure-based trigger would silently miss it.
