@@ -134,6 +134,71 @@ makes `git status` worth reading after a merge you are sure about.
 `git clean`, no `reset --hard`, no `checkout --` on either machine unless the operator names it
 (`macos-leg --reset-to` stays opt-in for exactly that reason). What is authorised is removing
 what the repo does not have: stale files and worktrees.
+⇒ ★★★ **THE OPERATOR NAMED IT ON 2026-08-26. Read the next section — restoring a leg clone is
+now REQUIRED where this paragraph once forbade it, and `scripts/leg-tree/` is the only thing
+that may do it.**
+
+## ★★★ EVERY LEG HOST KEEPS A CLONE, AND THE LEG CLEANS UP AFTER ITSELF — operator ruling 2026-08-26
+
+> *"we should use already cloned repo in each leg [...] you can keep using the sync process you
+> already use, but CLEAN UP the changes after you finish them (you can also use worktree in leg
+> host if needed for parallel legs, clean up also needed). [...] don't forget to check each leg
+> branch before working in it, and also clean up the changes after finished. that's the standard"*
+
+| host | leg repository |
+|---|---|
+| WSL | `~/src/dss-code-prime` |
+| arm64 VPS | `~/src/Github/dss-code-prime` |
+| macOS | `~/src/dss-code-prime` |
+
+**The shape, and all four steps are the standard:**
+1. **PREPARE** — `git fetch`, put the host's clone on the DRIVER's branch at the DRIVER's commit,
+   `git clean -fd`. *This is the "check each leg branch before working in it" clause, and it is
+   done by MOVING the host rather than by asserting about it.*
+2. **SYNC** — the existing rsync/tar carriage, `.git` withheld on **all three** now. The host's
+   own history is the authority; the sync supplies only the working tree.
+3. **RUN** — build + ctest. Repo guards on the **root host only**.
+4. **RESTORE** — `git reset --hard`, `git clean -fd`, `git worktree prune`. On **every** exit
+   path, `die` included.
+
+★ **ONE OWNER: `scripts/leg-tree/leg-tree.sh`.** Both verbs, all three hosts. The two remote legs
+inline its text into their payload (`"$(cat …)"` — command-substitution output is not re-expanded,
+so the script's own `$` and quotes arrive verbatim); the WSL leg sources it. **Never hand-roll
+these git commands in a leg** — that is the four-hand-written-exclude-lists mistake with a
+destructive verb attached.
+
+⚠ **`-fd`, NEVER `-fdx`.** Ignored paths (`build/`, the ccache) are the leg's own working state;
+deleting them buys tidiness and costs every leg a cold rebuild.
+
+⚠ **CLEANUP BELONGS TO THE MODE THAT MADE THE MESS, not to every mode that runs afterwards.**
+✔Caught while wiring this: `remote-leg --mode sync-only` exists to LEAVE a host staged for a
+manual probe, and `--mode test-only` runs over whatever is already there. A restore on exit would
+have deleted the staging as the command returned, and a prepare would have made `test-only` test
+HEAD while reporting on the staged tree. ⇒ `full` prepares and restores; `sync-only` prepares
+only; `test-only` does neither.
+
+⚠ **WHY THIS REPLACED THE OLD ARRANGEMENT.** ✔MEASURED 2026-08-26: the macOS clone sat on branch
+`…-3` at `8cb9afbd` (**three commits back**) with a **2,696-path index under a 2,759-path working
+tree**, while two carriages withheld `.git` and one shipped it. ★ **The cost is not the disk — it
+is that guards ask git questions.** `check-line-endings` reads `git ls-files --eol`;
+`check-shell-portability` had ALREADY been rewritten in 2026-08-22 to stop asking `git ls-files`
+because this very host answered about a commit that deleted `tools/*.sh` in P17 and produced
+**seven violations against files that do not exist**. A host whose git disagrees with its files
+makes every git-reading guard a coin flip, and the flip is invisible from the driver.
+
+★★ **`git worktree prune` IS PART OF RESTORE, and it is the clause a human cleanup cannot cover.**
+✔MEASURED 2026-08-26: both remote hosts carried a registered, `prunable` `dss-probe-6f4aab73`
+worktree from a cycle that never cleaned up — and it **survived the operator's own manual pass**,
+because a stale worktree registration lives in `.git/worktrees/` and **never appears in
+`git status`**. A parallel lane may take a worktree on a leg host; the lane that takes it owns
+removing it.
+
+⚠ **AND THE TILDE DOES NOT EXPAND.** ✔MEASURED against the live VPS on the first run: every leg
+names its repo `~/src/…`, and `cd "$var"` does **not** expand a tilde held in a variable — `~` is
+expanded only where it appears unquoted in the source text. `leg-tree` normalises the path once,
+where both verbs share it. ★ The dangerous half was not the failed `cd`: `restore` returns 0 when
+the directory is missing, so an unexpanded path would have left every host dirty forever while
+every leg reported success.
 
 ## The pause-and-ask gate — the most important behavioral rule
 

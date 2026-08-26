@@ -237,6 +237,33 @@ if [ -n "$RESET_TO" ]; then
     fi
 fi
 
+# ── the leg repository is a CLONE, put on the tree under test ────────────────
+# Operator ruling 2026-08-26: every leg host keeps its own clone (`~/src/dss-code-prime`
+# here), the leg CHECKS ITS BRANCH before working in it, and the leg cleans up after
+# itself. One owner for all three hosts: `scripts/leg-tree/`.
+# ★ The script text is INLINED rather than assumed present on the far side -- the Mac's
+# checkout can predate this file, and a bootstrap that needs the thing it bootstraps is
+# not a bootstrap. `"$(cat …)"` is what makes that safe: command-substitution output is
+# NOT re-expanded, so the script's own `$` and quotes arrive verbatim while the three
+# values written explicitly expand here, once, under this shell's control.
+# ⚠ THIS RUNS EVEN WHEN `--no-push` IS GIVEN, and deliberately: `--no-push` means "do
+# not replace the files", not "do not know which commit they belong to".
+leg_tree_remote() {
+    _ltr_verb="$1"; shift
+    _ltr_args=""
+    for _a in "$@"; do _ltr_args="$_ltr_args '$_a'"; done
+    bash "$CARRIAGE" "$(cat "$SRC/scripts/leg-tree/leg-tree.sh")
+leg_tree_${_ltr_verb}${_ltr_args}"
+}
+LEG_BRANCH=$(git -C "$SRC" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')
+LEG_SHA=$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo '')
+[ -n "$LEG_BRANCH" ] || die "cannot read this checkout's branch -- the host's clone is put on the DRIVER's branch, so a driver that cannot name its own has nothing to ask for"
+say "leg-tree prepare $DST -> $LEG_BRANCH @ $LEG_SHA"
+leg_tree_remote prepare "$DST" "$LEG_BRANCH" "$LEG_SHA" || die "leg-tree could not prepare $DST"
+# ★ Restore on EVERY exit path, `die` included: a leg that dies half way leaves the
+# dirtiest tree of all, which is exactly when the next leg most needs a clean one.
+trap 'leg_tree_remote restore "$DST" "$LEG_SHA" 2>&1 | tail -2 || true' EXIT
+
 if [ "$DO_PUSH" = "1" ]; then
     say "push $SRC -> $DST"
     # --prune, because a LEG's contract is "test THIS tree". Without it the Mac keeps

@@ -907,6 +907,17 @@ would have voided the four leg results this table reports.
    ruling met. ⚠ It blocked nothing here (a plain full leg needs none of the
    four), which is why it is a note and not a row — but a Windows-side caller
    wanting `--mode build` today has no way to ask for it.
+   ⚠⚠ **THE `--guards` QUARTER OF THIS NOTE WAS WRONG TO CALL HARMLESS, AND IS NOW
+   FIXED AND FILED: [[D-SCRIPT-MACOS-LEG-PS1-CANNOT-SKIP-THE-REPO-GUARDS]].** The
+   `.ps1` did not merely lack the flag — it had no `-LE repo-guard` line at all, so
+   every PowerShell-driven macOS leg RAN the repo guards whatever was asked for.
+   ✔MEASURED at the P36 gate: macOS **1671** against WSL and VPS **1653**, the
+   difference being exactly the 18 `repo-guard` entries. ★ **The judgement that went
+   wrong is worth keeping: "it blocked nothing" was true of the other three flags and
+   false of this one, because a missing flag whose DEFAULT the caller cannot reach is
+   not a missing option, it is a different behaviour.** A parity gap is harmless only
+   when the missing half has no default worth having. The other three flags remain
+   open and remain a note, on exactly that test.
 9. **Two worktrees deliberately KEPT**, with uncommitted work nobody has
    adjudicated: `C:/Source/DailySoftware/dss-lane-r` (136 dirty files) and
    `dss-perf-probe` (4, including a `src/perf_sampler.cpp` that exists nowhere

@@ -18,33 +18,37 @@
 #     `--rsync <args...> <dest>`, which `exec`s rsync directly so `$?` is rsync's own
 #     status. This script uses that and never stdin.
 #
-# ★★ WHAT THIS DOES NOT SYNC, AND THE TRAP IT LEAVES BEHIND.
-# `.git` is EXCLUDED: ✔MEASURED 2026-08-21 it is **1.4 GB** against a **122 MB**
-# working tree, which is not a sane payload for a gate leg over ssh. The consequence
-# is NOT cosmetic and is stated loudly rather than hidden: rsync does not delete
-# excluded paths, so the remote keeps ITS OWN `.git` -- and on both hosts that
-# checkout sits at an old commit (✔2026-08-21: `b52784a`, Cycle P5c, 2,501 dirty
-# files, the SAME on each). **After a push, `git log` on the remote describes a
-# commit that has nothing to do with the files beside it.** So this script writes
-# `.dss-leg-stamp` at the remote root naming the LOCAL head, dirty count and mode,
-# and prints the divergence. Read the stamp, never the remote `git log`.
+# ★★★ THE LEG HOST KEEPS A CLONE. Operator ruling 2026-08-26, and it REPLACES the
+# arrangement this header used to describe rather than extending it.
+# `.git` is still not SYNCED -- ✔MEASURED 2026-08-21 it is **1.4 GB** against a
+# **122 MB** working tree, not a sane payload over ssh -- but the remote no longer
+# has to live with whatever `.git` it happens to hold. Before the push,
+# `leg_tree_prepare` fetches on the host, puts its clone on the DRIVER's branch at
+# the DRIVER's commit, and cleans it; after the leg, `leg_tree_restore` returns it
+# to pristine. So the remote `git log` now describes the tree under test, and
+# `git status` there shows what `git status` shows here.
+# ⚠ WHAT THIS RETIRES, stated because the old sentence is still quoted elsewhere:
+# *"read the stamp, never the remote `git log`"* was correct when the remote sat at
+# `b52784a` / Cycle P5c with 2,501 dirty files. It is no longer the arrangement.
+# `.dss-leg-stamp` is still written -- it names the mode and the run, which git
+# cannot -- but it is a RECORD now, not a workaround for a lying history.
 # See D-HARNESS-ARM64-VPS-CHECKOUT-IS-STALE-AND-ITS-PREBUILT-COMPILER-REFUSES-ITS-OWN-CONFIG.
 #
-# ★ `.secrets/` IS EXCLUDED DELIBERATELY AND THAT IS A SECURITY PROPERTY, NOT TIDINESS.
-# It holds the private keys for these very carriages; pushing it would copy the macOS
-# key onto the VPS and vice versa. An exclude here is the only thing preventing that.
+# ★★ AND THE LEG CLEANS UP AFTER ITSELF, which is the other half of the ruling. A
+# sync leaves the clone dirty by construction; left that way the next leg starts from
+# a tree nobody described. Restore runs on EVERY exit path, `die` included, and
+# `git worktree prune` goes with it -- ✔MEASURED 2026-08-26, both remote hosts carried
+# a registered, `prunable` `dss-probe-6f4aab73` worktree from a cycle that never
+# cleaned up, and it survived a MANUAL cleanup because a stale worktree registration
+# lives in `.git/worktrees/` and never appears in `git status`.
 #
-# ★★ `/.claude/worktrees` IS EXCLUDED, AND IT IS THE LARGEST ONE. An agent worktree is
-# a FULL COPY OF THE REPO -- ✔MEASURED 2026-08-25 on the macOS host, 9,638 files across
-# the live worktrees, pushed on every leg. A gate host must never hold one: the examples
-# runner GLOBS `examples/<lang>/*`, so a worktree's own `examples/` tree is visible to a
-# suite that has no idea it is looking at somebody's uncommitted lane. ⓘ rsync's
-# `--delete` means this host never ACCUMULATED the way the tar-transported Mac did, so
-# this exclude is about transport cost and glob hygiene rather than about staleness.
-#
-# ⚠ EVERY EXCLUDE IS ANCHORED (`/build`, not `build`). An unanchored `build*` once
-# silently skipped `src/program/build_scripts.cpp` and a leg was configured against a
-# tree missing a changed `.cpp`.
+# ★ WHAT IS WITHHELD IS DERIVED, NOT TYPED (`scripts/carriage-excludes/`). `.secrets/`,
+# `/.claude/worktrees` and every build tree are withheld because GIT IGNORES THEM, at
+# any depth -- which is the fix for the four hand-written lists that each missed
+# something different. `.git` is the one remaining POLICY withhold and is passed with
+# `--also`. ⚠ The security property the old list asserted by hand still holds and is
+# now structural: `.secrets/` holds the private keys for these very carriages, and
+# ✔MEASURED 2026-08-26 both hosts were holding BOTH keys before the derivation landed.
 #
 # ★★ RUN THIS FROM WSL, FOR EITHER CARRIAGE. ✔MEASURED 2026-08-21, and it corrected
 # this header's own first draft: **Git Bash on Windows has no `rsync`**, so the macOS
@@ -162,6 +166,25 @@ esac
 
 carriage() { bash "$CARRIAGE_SH" "$@"; }
 
+# ── the leg repository is a CLONE (operator ruling 2026-08-26) ───────────────
+# Run one `leg-tree` verb on the carriage. The script text is INLINED rather than
+# assumed present on the far side: the host's checkout can predate this file, and a
+# bootstrap that needs the thing it bootstraps is not a bootstrap.
+# ★ `"$(cat …)"` IS WHAT MAKES THIS SAFE, and the distinction is the one this project
+# keeps paying for: command-substitution output is NOT re-expanded, so the script's own
+# `$`, backticks and quotes reach the remote verbatim, while the few values written
+# explicitly below expand locally, once, under this shell's control. Writing the body
+# inside the same double quotes would have expanded the SCRIPT's variables here.
+# ⓘ The inlined text ends in a dispatch guarded by `${1:-}`; with no argument it takes
+# the no-op arm and only the verb appended below runs.
+leg_tree_remote() {
+    _ltr_verb="$1"; shift
+    _ltr_args=""
+    for _a in "$@"; do _ltr_args="$_ltr_args '$_a'"; done
+    carriage "$(cat "$REPO_ROOT/scripts/leg-tree/leg-tree.sh")
+leg_tree_${_ltr_verb}${_ltr_args}"
+}
+
 # ── reachability, BEFORE anything expensive ─────────────────────────────────
 say "carriage $CARRIAGE ($CARRIAGE_SH)"
 remote_uname=$(carriage "uname -sm" 2>&1 | tail -1)
@@ -199,8 +222,14 @@ printf 'jobs   : %s (ctest -j)\n' "$JOBS"
 
 LOCAL_HEAD=$(git log --oneline -1 2>/dev/null || echo '(no git)')
 LOCAL_DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+# ★ `LOCAL_HEAD` is a LOG LINE and cannot be handed to git as a revision. The clone
+# handling below needs a bare sha and a branch NAME, so they are read as themselves
+# rather than sliced out of a human-facing string.
+LOCAL_SHA=$(git rev-parse HEAD 2>/dev/null || echo '')
+LOCAL_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')
 printf 'local  : %s\n' "$LOCAL_HEAD"
 printf 'dirty  : %s path(s)\n' "$LOCAL_DIRTY"
+[ -n "$LOCAL_BRANCH" ] || die "cannot read this checkout's branch -- the leg host's clone is put on the DRIVER's branch, so a driver that cannot name its own has nothing to ask for"
 
 # ── the interlock, BEFORE the first byte is written to the remote ───────────
 #
@@ -243,7 +272,44 @@ case "$lock_out" in
 esac
 # Released on EVERY exit path, `die` included -- a lock that outlives its holder
 # is a lock that reds the next honest run.
-trap 'bash "$CARRIAGE_SH" "rm -f $LOCK" >/dev/null 2>&1 || true' EXIT
+# ★★ WHICH MODES TOUCH THE CLONE, AND WHY IT IS NOT "ALL OF THEM".
+# The operator ruling is that a leg cleans up after itself -- but two of this script's
+# three modes exist precisely to LEAVE something behind, and a restore that ignored
+# that would silently destroy the thing the caller asked for:
+#   full       prepare + restore. The ordinary gate: stage, measure, leave pristine.
+#   sync-only  prepare, NO restore. Its whole contract is "stage this host so I can
+#              probe it by hand" -- restoring on exit would delete the staging as the
+#              command returned, and the caller would find a clean tree and no
+#              explanation.
+#   test-only  NEITHER. It runs ctest over whatever is already there, usually what a
+#              previous `sync-only` staged. `prepare` resets the working tree, so
+#              running it here would test HEAD while reporting on the staged tree --
+#              a wrong answer rather than a missing one.
+# ★ The general shape: cleanup belongs to the mode that CREATED the mess, never to
+# every mode that happens to run afterwards.
+case "$MODE" in
+    full)      LEG_TREE_PREPARE=1; LEG_TREE_RESTORE=1 ;;
+    sync-only) LEG_TREE_PREPARE=1; LEG_TREE_RESTORE=0 ;;
+    *)         LEG_TREE_PREPARE=0; LEG_TREE_RESTORE=0 ;;
+esac
+
+# ★ RESTORE RUNS ON EVERY EXIT PATH, `die` included, and BEFORE the lock is dropped:
+# a leg that dies half way leaves the dirtiest tree of all, and the next leg to take
+# this lock must find the clone pristine rather than carrying the wreckage.
+trap '[[ "$LEG_TREE_RESTORE" == "1" ]] && { leg_tree_remote restore "$REMOTE_DIR" "$LOCAL_SHA" 2>&1 | tail -2 || true; };
+      bash "$CARRIAGE_SH" "rm -f $LOCK" >/dev/null 2>&1 || true' EXIT
+
+# ── put the host's own clone on the tree under test ─────────────────────────
+# Operator ruling 2026-08-26: the leg host keeps a CLONE, the leg checks its branch
+# before working in it, and the leg cleans up after itself.
+if [[ "$LEG_TREE_PREPARE" == "1" ]]; then
+    say "leg-tree prepare $CARRIAGE:$REMOTE_DIR -> $LOCAL_BRANCH @ ${LOCAL_SHA}"
+    leg_tree_remote prepare "$REMOTE_DIR" "$LOCAL_BRANCH" "$LOCAL_SHA" \
+        || die "leg-tree could not prepare $CARRIAGE:$REMOTE_DIR"
+else
+    printf '\nleg-tree: SKIPPED for --mode %s -- this mode runs over whatever is already\n' "$MODE"
+    printf '  on the host, so preparing would test HEAD while reporting on the staged tree.\n'
+fi
 
 # ── push ────────────────────────────────────────────────────────────────────
 if [[ "$MODE" != "test-only" ]]; then
@@ -258,9 +324,10 @@ if [[ "$MODE" != "test-only" ]]; then
     # explicit removal, and the same is true of the next tree to leak.
     # D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES
     # ⓘ `.secrets` no longer needs naming here -- it is git-ignored, so the
-    # derivation withholds it. `.git` is the one genuine POLICY withhold on this
-    # carriage: the remote history is deliberately NOT synced, which is exactly
-    # why the leg stamp below exists to say what the remote actually holds.
+    # derivation withholds it. `.git` stays withheld, but since 2026-08-26 that is
+    # no longer a gap being papered over by the leg stamp: `leg_tree_prepare` above
+    # has put the host's OWN clone on the driver's branch at the driver's commit, so
+    # the remote git now describes the tree under test rather than an old checkout.
     EXCLUDES="$(mktemp)" || die "cannot create the exclude list"
     "$PY" "$REPO_ROOT/scripts/carriage-excludes/carriage-excludes.py" \
         --format rsync --repo "$REPO_ROOT" --also .git --out "$EXCLUDES" \

@@ -203,7 +203,10 @@ if [[ "$MODE" == "guards" ]]; then
 fi
 
 # ── sync ────────────────────────────────────────────────────────────────────
-say "rsync $SRC -> $DST (excludes ANCHORED)"
+# "DERIVED", not "ANCHORED": the excludes stopped being a hand-written anchored list
+# on 2026-08-26 and became a question put to git. A status line that still described
+# the old mechanism is the cheapest kind of stale comment and the easiest to believe.
+say "rsync $SRC -> $DST (excludes DERIVED from git; .git withheld, this host has its own clone)"
 mkdir -p "$DST" || die "cannot create $DST"
 
 # ── MUTUAL EXCLUSION ON THE DESTINATION TREE ────────────────────────────────
@@ -249,6 +252,27 @@ printf 'pid=%s\nrun=%s\nmode=%s\n' "$$" "$LEG_RUN" "$MODE" > "$LOCK" \
 trap 'rm -f "$LOCK"' EXIT INT TERM
 printf 'lock : %s (run %s)\n' "$LOCK" "$LEG_RUN"
 
+# ── the leg repository is a CLONE, put on the tree under test ────────────────
+# Operator ruling 2026-08-26: every leg host keeps its own clone, the leg checks
+# the branch before working in it, and the leg cleans up after itself. One owner
+# for all three hosts: `scripts/leg-tree/`.
+# ★ Sourced rather than run, so `leg_tree_restore` is reachable from the EXIT trap
+# below -- a leg that dies half way leaves the dirtiest tree of all, which is
+# exactly when the next leg most needs a clean one.
+# ⚠ THE EMPTY ARGUMENT IS LOAD-BEARING. `.` passes the CALLER's positional
+# parameters through to the sourced file unless it is given its own, so without it
+# `leg-tree.sh`'s dispatch would read this leg's `--mode` as a subcommand and die
+# with "unknown subcommand '--mode'". Passing `""` selects its no-op arm, which is
+# what "define the functions and do nothing" means.
+# shellcheck source=../leg-tree/leg-tree.sh
+. "$SRC/scripts/leg-tree/leg-tree.sh" "" || die "cannot load scripts/leg-tree/leg-tree.sh"
+DRIVER_BRANCH=$(git -C "$SRC" rev-parse --abbrev-ref HEAD 2>/dev/null) \
+    || die "cannot read the driver's branch from $SRC"
+DRIVER_SHA=$(git -C "$SRC" rev-parse HEAD 2>/dev/null) \
+    || die "cannot read the driver's HEAD from $SRC"
+( leg_tree_prepare "$DST" "$DRIVER_BRANCH" "$DRIVER_SHA" ) \
+    || die "leg-tree could not prepare $DST (rc=$?)"
+
 # ★★★ AGENT WORKTREES NEVER TRAVEL TO A GATE HOST. Operator ruling 2026-08-25
 # (cycle P34) required this on BOTH carriages and the macOS/VPS side got it; THIS
 # carriage was missed, and the omission was ✔MEASURED on 2026-08-25 (cycle P35)
@@ -270,13 +294,24 @@ printf 'lock : %s (run %s)\n' "$LOCK" "$LEG_RUN"
 # D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES
 # ★ Handed over as a FILE (`--exclude-from`), never as shell words: this project
 # has lost a day to quoting more than once, and a file has no quoting.
-# ⓘ This carriage ships `.git` DELIBERATELY -- the attribution lines below read
-# it, which is why there is no `--also .git` here and there is one on the two
-# carriages that sync no history.
+# ★★★ `.git` IS WITHHELD SINCE 2026-08-26, AND THAT IS A REVERSAL: this carriage
+# used to ship it so the attribution lines below could read a HEAD. Operator ruling
+# the same day made every leg host keep its OWN CLONE, which is a better answer to
+# the same question -- `leg_tree_prepare` above has already put that clone on the
+# driver's branch at the driver's commit, so `git log` here now describes the tree
+# under test instead of describing whatever was last rsynced over it.
+# ⚠ The old arrangement was not merely redundant, it was WRONG on the other hosts:
+# ✔MEASURED 2026-08-26, the macOS clone sat three commits back on a DIFFERENT
+# branch with a 2,696-path index under a 2,759-path tree, and `check-line-endings`
+# reads `git ls-files --eol`.
 EXCLUDES="$(mktemp)" || die "cannot create the exclude list"
-trap 'rm -f "$LOCK" "$EXCLUDES"' EXIT INT TERM
+# ★ `leg_tree_restore` runs in a SUBSHELL because it `cd`s: a trap that moves the
+# dying shell's working directory makes every later line in the trap mean something
+# else. The lock and exclude paths are absolute, so they are unaffected either way --
+# which is exactly the kind of "it happens to work" this project does not build on.
+trap '( leg_tree_restore "$DST" "$DRIVER_SHA" ); rm -f "$LOCK" "$EXCLUDES"' EXIT INT TERM
 "$PY" "$SRC/scripts/carriage-excludes/carriage-excludes.py" \
-    --format rsync --repo "$SRC" --out "$EXCLUDES" \
+    --format rsync --repo "$SRC" --also .git --out "$EXCLUDES" \
     || die "carriage-excludes refused (rc=$?) -- refusing to rsync with a list it would not vouch for"
 rsync -a --delete --exclude-from="$EXCLUDES" \
     "$SRC/" "$DST/" || die "rsync failed"

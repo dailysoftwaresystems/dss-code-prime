@@ -62,9 +62,26 @@ param(
     [string] $Jobs = '',
     [switch] $NoPush,
     [string] $Dst,
-    [string] $ResetTo
+    [string] $ResetTo,
+    [switch] $Guards
 )
 $ErrorActionPreference = 'Stop'
+
+# ★★★ THE REPO GUARDS ARE SKIPPED ON THIS INDIRECT LEG, and until 2026-08-26 this
+# sibling COULD NOT SKIP THEM AT ALL. The `.sh` twin has carried
+# `[ "${LEG_GUARDS:-0}" = "1" ] || CTEST_ARGS="$CTEST_ARGS -LE repo-guard"` since the
+# operator ruling that put guards on the root host only; this file had no `LEG_GUARDS`,
+# no `-Guards`, and no `-LE repo-guard` anywhere in it, so every PowerShell-driven
+# macOS leg ran the full suite regardless of what was asked for.
+# ✔MEASURED at the P36 gate: macOS reported **1671** where WSL and the VPS reported
+# **1653**, the difference being exactly the 18 `repo-guard` entries -- ~170 s per leg
+# re-checking a source tree the root host had already checked.
+# ★ THE COST IS NOT ONLY THE TIME. Two legs both reporting "1671/1671" were not running
+# the same 1671, and a figure that silently means something different per host is worse
+# than a slower one. D-SCRIPT-MACOS-LEG-PS1-CANNOT-SKIP-THE-REPO-GUARDS
+# ⓘ `$env:DSS_LEG_GUARDS` is honoured for parity with the three `.sh` legs, so one
+# standing switch still means the same thing everywhere.
+$legGuards = if ($Guards) { '1' } elseif ($env:DSS_LEG_GUARDS) { $env:DSS_LEG_GUARDS } else { '0' }
 
 if (-not $Src) { $Src = (Get-Location).Path }
 if (-not $Dst) {
@@ -72,7 +89,19 @@ if (-not $Dst) {
 }
 $carriage = 'scripts/ssh-macos/ssh-macos.ps1'
 
-function Die([string]$m) { Write-Host ""; Write-Host "[X] macos-leg: $m"; exit 1 }
+# ★ `Die` RESTORES THE LEG CLONE BEFORE IT EXITS, which is the PowerShell answer to the
+# `.sh` twin's `trap … EXIT`. A leg that dies half way leaves the dirtiest tree of all,
+# and that is exactly when the next leg most needs a clean one.
+# ⚠ GUARDED THREE WAYS, because `Die` is reachable BEFORE any of them exists -- a
+# missing carriage is refused above this point. A cleanup that throws inside a failure
+# path replaces the real diagnosis with its own, which is the one thing a `Die` must
+# never do; hence the `-ErrorAction SilentlyContinue` probe and the empty catch.
+function Die([string]$m) {
+    if ((Get-Command Invoke-LegTree -ErrorAction SilentlyContinue) -and $script:legSha -and $Dst) {
+        try { Invoke-LegTree 'restore' @($Dst, $script:legSha) | Select-Object -Last 2 } catch { }
+    }
+    Write-Host ""; Write-Host "[X] macos-leg: $m"; exit 1
+}
 function Say([string]$m) { Write-Host ""; Write-Host "=== $m ===" }
 
 if (-not (Test-Path $carriage)) { Die "carriage not found at $carriage (run from the repo root)" }
@@ -93,6 +122,27 @@ if ($ResetTo) {
         Write-Host "  A stale tree that git stopped tracking is still visible to every glob in the suite."
     }
 }
+
+# ── the leg repository is a CLONE, put on the tree under test ────────────────
+# Operator ruling 2026-08-26: every leg host keeps its own clone (`~/src/dss-code-prime`
+# here), the leg CHECKS ITS BRANCH before working in it, and the leg cleans up after
+# itself. One owner for all three hosts: `scripts/leg-tree/`.
+# ★ The script text is INLINED rather than assumed present on the far side -- the Mac's
+# checkout can predate this file, and a bootstrap that needs the thing it bootstraps is
+# not a bootstrap. `-Raw` keeps it one string; the verb is appended on its own line.
+# ⚠ This runs even under `-NoPush`, deliberately: `-NoPush` means "do not replace the
+# files", not "do not know which commit they belong to".
+function Invoke-LegTree([string] $Verb, [string[]] $Args) {
+    $body = Get-Content -Raw (Join-Path $PSScriptRoot '..\leg-tree\leg-tree.sh')
+    $quoted = ($Args | ForEach-Object { "'$_'" }) -join ' '
+    & pwsh -NoProfile -File $carriage -Command "$body`nleg_tree_$Verb $quoted"
+}
+$legBranch = (& git -C $Src rev-parse --abbrev-ref HEAD 2>$null)
+$legSha    = (& git -C $Src rev-parse HEAD 2>$null)
+if (-not $legBranch) { Die "cannot read this checkout's branch - the host's clone is put on the DRIVER's branch, so a driver that cannot name its own has nothing to ask for" }
+Say "leg-tree prepare $Dst -> $legBranch @ $legSha"
+Invoke-LegTree 'prepare' @($Dst, $legBranch, $legSha)
+if ($LASTEXITCODE -ne 0) { Die "leg-tree could not prepare $Dst" }
 
 if (-not $NoPush) {
     Say "push $Src -> $Dst"
@@ -173,6 +223,11 @@ if [ $rc -ne 0 ]; then echo "[X] remote build rc=$rc"; grep -iE 'error' "$LOGDIR
 echo "build OK: $(tail -1 "$LOGDIR/build.log")"; _phase build
 CTEST_ARGS="--test-dir build/dbg --output-on-failure -j $JOBS"
 [ -n "${LEG_FILTER:-}" ] && CTEST_ARGS="$CTEST_ARGS -R ${LEG_FILTER}"
+# THE REPO GUARDS ARE SKIPPED HERE, by operator ruling: this is an INDIRECT leg, the
+# guards check the SOURCE TREE, and that tree is the root host's own. `-Guards` (or
+# DSS_LEG_GUARDS=1) restores them. This line is the one the `.sh` twin has always had
+# and this file never did -- see the header block beside `$legGuards`.
+[ "${LEG_GUARDS:-0}" = "1" ] || CTEST_ARGS="$CTEST_ARGS -LE repo-guard"
 # shellcheck disable=SC2086
 "${CMAKE%cmake}ctest" $CTEST_ARGS > "$LOGDIR/ctest.log" 2>&1
 rc=$?
@@ -187,7 +242,7 @@ exit $rc
 $legRun = "$PID-" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
 # LEG is emitted UNQUOTED so a leading `~` still expands on the remote side.
-$payload = "LEG=$Dst`nLEG_FILTER='$Filter'`nLEG_RUN='$legRun'`nLEG_JOBS='$Jobs'`n$remoteBody`n"
+$payload = "LEG=$Dst`nLEG_FILTER='$Filter'`nLEG_RUN='$legRun'`nLEG_JOBS='$Jobs'`nLEG_GUARDS='$legGuards'`n$remoteBody`n"
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "macos-leg-$legRun.out"
 $payload | & pwsh -NoProfile -File $carriage -Command 'bash -s' 2>&1 | Tee-Object -FilePath $tmp | Write-Host
 
@@ -200,4 +255,7 @@ Remove-Item $tmp -ErrorAction SilentlyContinue
 if (-not $witness) { Die "no REMOTE_CTEST_RC[$legRun] witness came back - this run's real status is UNKNOWN, which is not a pass" }
 $rc = [int]$witness.Matches[0].Groups[1].Value
 if ($rc -ne 0) { Die "macOS ctest leg FAILED (rc=$rc)" }
+# The success path restores too -- `Die` covers every other exit, and between them the
+# clone is left pristine however this run ended.
+Invoke-LegTree 'restore' @($Dst, $legSha) | Select-Object -Last 2
 Say "macOS leg OK (run $legRun)"
