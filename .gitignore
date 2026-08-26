@@ -176,6 +176,21 @@ __pycache__/
 # corrupted somebody else's vendored tree to silence a guard about our own.
 .claude/worktrees/
 
+# Agent-manager tooling and third-party dependency trees. THE SAME SHAPE AS THE
+# RULE ABOVE, and it cost the same way: `.kilo/` was covered only by
+# `.git/info/exclude` plus a `.kilo/.gitignore` the tool writes itself, both
+# per-clone, so every OTHER machine saw it as ordinary repository content.
+# ✔MEASURED 2026-08-26: the arm64 VPS gate host held `.kilo/` — 3,671 files, 61 MB,
+# 3,667 of them `node_modules` — because every carriage excluded `node_modules`
+# ANCHORED at the top level and `.kilo/node_modules` is not at the top level.
+# ★ Since 2026-08-26 the carriages derive their exclude list from git
+# (`scripts/carriage-excludes/`), so a rule written HERE is what keeps a tree off
+# every gate host, and a rule written only in `.git/info/exclude` protects one.
+# D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES
+.kilo/
+node_modules/
+.venv/
+
 #.plans/ -- Not for now, but will be used when first minimal implementation is done and we start working on the next steps.
 
 # Operator connection data for scripts/ssh-*/ — hosts, logins, key PATHS.

@@ -213,12 +213,38 @@ if ($PushSource -or $PushDest) {
     # a full copy of the repo per live agent. The examples runner GLOBS `examples/<lang>/*`
     # and a worktree carries its own, so a gate host holding one can run somebody's
     # uncommitted corpus.
-    $out = & tar -c -C $src `
-        --exclude=./build --exclude=./.git --exclude=./scratchpad `
-        --exclude=./target --exclude=./.venv --exclude=./node_modules `
-        --exclude=./.claude/worktrees `
+    # ★★★ AND THE EXCLUDE LIST IS DERIVED, NOT TYPED. This enumeration was one of
+    # four, and every one spelled `node_modules` ANCHORED at the top level, which
+    # `.kilo/node_modules` is not. ✔MEASURED 2026-08-26: the arm64 VPS gate host
+    # held that tree -- 3,671 files, 61 MB -- and the `.sh` sibling's identical list
+    # ships 9,284 members against this derivation's 3,583, `.secrets/` included.
+    # ⚠ THIS path did NOT leak `node_modules`, and that is the uncomfortable half:
+    # bsdtar and GNU tar disagreed about what the SAME pattern meant, so two
+    # carriages written to be siblings were shipping different trees. A derivation
+    # both read the same way is what removes that, not a better-typed list.
+    # D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES
+    # ⓘ `.git` stays a POLICY withhold (`--also`): this carriage syncs no history.
+    # ★ `tar` here is System32 bsdtar 3.8.4, NOT the Git Bash GNU tar 1.35 the `.sh`
+    # sibling gets -- ✔MEASURED 2026-08-26. `-X` is the exclude-from spelling BOTH
+    # accept, which is why `carriage-excludes` emits `./`-anchored patterns and no
+    # `--anchored` flag: bsdtar has no such flag, and the `./` prefix already
+    # anchors against a `./`-rooted member name.
+    $excl = Join-Path ([System.IO.Path]::GetTempPath()) "ssh-macos-excludes.$PID"
+    $xs = Join-Path $PSScriptRoot '..\carriage-excludes\carriage-excludes.py'
+    & python $xs --format tar --repo $src --also .git --out $excl
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item -LiteralPath $excl -ErrorAction SilentlyContinue
+        Write-Error 'ssh-macos: carriage-excludes refused - refusing to push a list it would not vouch for'
+        exit 1
+    }
+    $out = & tar -c -C $src -X $excl `
         -f - . | & ssh @sshArgs 2>&1
+    # ⚠ `$LASTEXITCODE` IS CAPTURED FIRST AND THE CLEANUP RUNS AFTER. A cmdlet does
+    # not set `$LASTEXITCODE`, so the other order happens to work -- but "happens to"
+    # is how a status gets silently replaced by an unrelated one, and the push's exit
+    # status is the only thing standing between a truncated archive and a green leg.
     $tarRc = $LASTEXITCODE
+    Remove-Item -LiteralPath $excl -ErrorAction SilentlyContinue
     $landed = ($out | Select-String -Pattern "$witness`:(.*)" | Select-Object -Last 1)
     if ($tarRc -ne 0 -and -not $landed) {
         Write-Error "ssh-macos: push FAILED (rc=$tarRc)"

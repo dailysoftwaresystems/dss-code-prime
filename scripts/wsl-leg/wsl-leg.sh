@@ -85,6 +85,18 @@ DST="${DSS_WSL_CHECKOUT:-$HOME/src/dss-code-prime}"
 die() { printf '\n[X] wsl-leg: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n=== %s ===\n' "$*"; }
 
+# ★ RESOLVED, NOT ASSUMED. `python3` is the name on this distro and on macOS;
+# `python` is the one a Windows install puts on PATH. A carriage that hardcodes
+# either fails on the other host with "command not found", which reads as a
+# missing dependency rather than as a name. Both are PROBED by execution, because
+# `command -v` has lied on these hosts before -- a `WindowsApps` stub answers yes
+# and then does nothing.
+PY=""
+for _c in python3 python; do
+    if "$_c" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then PY="$_c"; break; fi
+done
+[[ -n "$PY" ]] || die "no working python3/python on PATH -- carriage-excludes cannot run"
+
 # Which flags the CALLER actually typed, as opposed to which ones hold a default.
 # The refusal below can only be honest about "this mode never reads that" if it can
 # tell a supplied value from an inherited one.
@@ -247,10 +259,26 @@ printf 'lock : %s (run %s)\n' "$LOCK" "$LEG_RUN"
 # D-SCRIPT-WSL-LEG-RSYNCS-AGENT-WORKTREES-ONTO-THE-GATE-HOST
 # ⚠ rsync does NOT delete an EXCLUDED path, so adding this line does not clean a
 # distro that already holds one -- that needs an explicit removal, once.
-rsync -a --delete \
-    --exclude='/build' --exclude='/build-*' --exclude='/target' \
-    --exclude='/.dss-deps' --exclude='/scratchpad' --exclude='/Testing' \
-    --exclude='/test-scratch' --exclude='/.claude/worktrees' \
+#
+# ★★★ THE LIST IS DERIVED, NOT TYPED. Until 2026-08-26 this was a hand-written
+# enumeration and so were the three other carriages -- four guesses at the
+# complement of the repository, which is one guess too many to keep in step and
+# was already wrong: ✔MEASURED 2026-08-26, every list spelled `node_modules`
+# ANCHORED at the top level, so `.kilo/node_modules` sailed through and the arm64
+# VPS gate host held 3,671 files / 61 MB git had ignored the whole time.
+# `carriage-excludes` asks git instead, which knows about every depth.
+# D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES
+# ★ Handed over as a FILE (`--exclude-from`), never as shell words: this project
+# has lost a day to quoting more than once, and a file has no quoting.
+# ⓘ This carriage ships `.git` DELIBERATELY -- the attribution lines below read
+# it, which is why there is no `--also .git` here and there is one on the two
+# carriages that sync no history.
+EXCLUDES="$(mktemp)" || die "cannot create the exclude list"
+trap 'rm -f "$LOCK" "$EXCLUDES"' EXIT INT TERM
+"$PY" "$SRC/scripts/carriage-excludes/carriage-excludes.py" \
+    --format rsync --repo "$SRC" --out "$EXCLUDES" \
+    || die "carriage-excludes refused (rc=$?) -- refusing to rsync with a list it would not vouch for"
+rsync -a --delete --exclude-from="$EXCLUDES" \
     "$SRC/" "$DST/" || die "rsync failed"
 cd "$DST" || die "cannot enter $DST"
 # ── THE ATTRIBUTION LINES, AND WHY THEY MAY NOT INVENT A CLEAN TREE ─────────

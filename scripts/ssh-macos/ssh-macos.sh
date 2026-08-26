@@ -41,6 +41,17 @@ set -uo pipefail
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 CONF=$REPO/.secrets/macos.env
 
+# ★ RESOLVED BY EXECUTION, NOT BY `command -v` -- which LIES on these hosts, and a
+# `WindowsApps` stub answers yes and then does nothing. `python` is the name a
+# Windows install puts on PATH, `python3` the one WSL and macOS use; a carriage that
+# hardcodes either fails elsewhere with a message that reads as a missing dependency
+# rather than as a missing name. ⓘ Only the `--push` path needs it, so a host with no
+# python can still use every other subcommand: the refusal is at the use, not here.
+PY=""
+for _c in python3 python; do
+    if "$_c" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then PY="$_c"; break; fi
+done
+
 # ★ ENV MUST WIN OVER THE CONFIG FILE, AND THAT TAKES DELIBERATE CODE. `.` sources
 # the file INTO THIS SHELL, so a bare `. "$CONF"` OVERWRITES whatever the caller put
 # in the environment — the exact reverse of the precedence stated at the top of this
@@ -317,16 +328,37 @@ if [ "${1:-}" = "--push" ]; then
     # (2) It is what makes `--prune` below SAFE -- "was this file in the archive" becomes
     #     "is it newer than the stamp", which is a question the remote can answer without
     #     trusting a manifest that could itself have arrived truncated.
-    tar -c -C "$_src" \
-        --exclude=./build --exclude=./.git --exclude=./scratchpad \
-        --exclude=./target --exclude=./.venv --exclude=./node_modules \
-        --exclude=./.claude/worktrees \
+    # ★★★ AND THE EXCLUDE LIST IS DERIVED, NOT TYPED. This enumeration was one of
+    # four, and every one of them spelled `node_modules` ANCHORED at the top level,
+    # which `.kilo/node_modules` is not. ✔MEASURED 2026-08-26 by running THIS list
+    # against the live tree: it ships **9,284 members where the derivation ships
+    # 3,583** -- 3,938 of `.kilo/node_modules`, 1,431 of `test-scratch/`, 268 of
+    # `.temp/`, 49 `__pycache__` entries, `.claude/settings.local.json`, and FIVE
+    # FILES OF `.secrets/` -- connection data and key PATHS for real machines, in a
+    # repository slated to go public. This list named none of them.
+    # ⚠ The Mac itself holds only 4 `.kilo` files, because the pushes that built it
+    # ran through the `.ps1`/bsdtar path; the leak here is latent, not historical.
+    # A host is not interchangeable with the list that feeds it.
+    # D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES
+    # ⓘ `.git` stays a POLICY withhold (`--also`): this carriage syncs no history,
+    # and the remote `.git` would otherwise name an unrelated commit.
+    _excl="${TMPDIR:-/tmp}/ssh-macos-excludes.$$"
+    if [ -z "$PY" ]; then
+        echo "ssh-macos: --push needs python3/python on PATH to derive the exclude list" >&2
+        exit 1
+    fi
+    if ! "$PY" "$REPO/scripts/carriage-excludes/carriage-excludes.py" \
+            --format tar --repo "$_src" --also .git --out "$_excl"; then
+        echo "ssh-macos: carriage-excludes refused -- refusing to push a list it would not vouch for" >&2
+        rm -f "$_excl"; exit 1
+    fi
+    tar -c -C "$_src" -X "$_excl" \
         -f - . \
       | ssh "${args[@]}" "mkdir -p $_dst && cd $_dst && mkdir -p build && touch build/.dss-push-stamp && sleep 1 && tar -x -m -f - && echo $_witness:\$(pwd -P)" \
       > "${TMPDIR:-/tmp}/ssh-macos-push.$$" 2>&1
     _st=("${PIPESTATUS[@]}")
     _out=$(cat "${TMPDIR:-/tmp}/ssh-macos-push.$$" 2>/dev/null)
-    rm -f "${TMPDIR:-/tmp}/ssh-macos-push.$$"
+    rm -f "${TMPDIR:-/tmp}/ssh-macos-push.$$" "$_excl"
     if [ "${_st[0]}" != "0" ] || [ "${_st[1]}" != "0" ]; then
         echo "ssh-macos: --push FAILED (local tar rc=${_st[0]}, remote rc=${_st[1]})" >&2
         echo "$_out" >&2

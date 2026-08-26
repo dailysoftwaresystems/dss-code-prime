@@ -104,6 +104,16 @@ FORCE_LOCK=0
 die() { printf '\n[X] remote-leg: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n=== %s ===\n' "$*"; }
 
+# ★ RESOLVED BY EXECUTION, NOT BY `command -v`, which has answered yes for a stub
+# on these hosts. `python3` is the name in WSL and on macOS, `python` the one a
+# Windows install provides; a carriage that hardcodes one fails on the other with
+# a message that reads as a missing dependency rather than as a missing name.
+PY=""
+for _c in python3 python; do
+    if "$_c" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then PY="$_c"; break; fi
+done
+[[ -n "$PY" ]] || die "no working python3/python on PATH -- carriage-excludes cannot run"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --carriage) CARRIAGE="${2:?--carriage needs a value}"; shift 2 ;;
@@ -237,15 +247,28 @@ trap 'bash "$CARRIAGE_SH" "rm -f $LOCK" >/dev/null 2>&1 || true' EXIT
 
 # ── push ────────────────────────────────────────────────────────────────────
 if [[ "$MODE" != "test-only" ]]; then
-    say "rsync -> $CARRIAGE:$REMOTE_DIR (excludes ANCHORED; .git and .secrets withheld)"
-    carriage --rsync \
-        --exclude='/.git' --exclude='/.secrets' \
-        --exclude='/build' --exclude='/build-*' --exclude='/target' \
-        --exclude='/.dss-deps' --exclude='/scratchpad' --exclude='/Testing' \
-        --exclude='/test-scratch' \
-        --exclude='/.claude/worktrees' \
+    say "rsync -> $CARRIAGE:$REMOTE_DIR (excludes DERIVED from git; .git withheld)"
+    # ★★★ THE LIST IS DERIVED, NOT TYPED -- see `scripts/carriage-excludes/`. Four
+    # carriages each carried their own enumeration until 2026-08-26, and all four
+    # spelled `node_modules` ANCHORED at the top level, so a nested one was
+    # invisible to every last of them. ✔MEASURED the same day, ON THE HOST THIS
+    # CARRIAGE FEEDS: the VPS held `.kilo/` -- **3,671 files, 61 MB, 3,667 of them
+    # `node_modules`** -- out of 25,198 files. ⚠ rsync does NOT delete an EXCLUDED
+    # path, so the derivation alone would not have cleaned it; that took one
+    # explicit removal, and the same is true of the next tree to leak.
+    # D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES
+    # ⓘ `.secrets` no longer needs naming here -- it is git-ignored, so the
+    # derivation withholds it. `.git` is the one genuine POLICY withhold on this
+    # carriage: the remote history is deliberately NOT synced, which is exactly
+    # why the leg stamp below exists to say what the remote actually holds.
+    EXCLUDES="$(mktemp)" || die "cannot create the exclude list"
+    "$PY" "$REPO_ROOT/scripts/carriage-excludes/carriage-excludes.py" \
+        --format rsync --repo "$REPO_ROOT" --also .git --out "$EXCLUDES" \
+        || die "carriage-excludes refused (rc=$?) -- refusing to rsync with a list it would not vouch for"
+    carriage --rsync --exclude-from="$EXCLUDES" \
         "$REPO_ROOT/" "$REMOTE_DIR" \
-        || die "rsync failed (rc=$?)"
+        || { rm -f "$EXCLUDES"; die "rsync failed (rc=$?)"; }
+    rm -f "$EXCLUDES"
 
     # The stamp is the ONLY honest description of what is on that host: the remote
     # `.git` was deliberately not synced and still names an unrelated commit.

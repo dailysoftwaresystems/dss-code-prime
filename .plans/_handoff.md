@@ -851,33 +851,53 @@ would have voided the four leg results this table reports.
 
 ### ★★★ NEXT — in order
 
-1. **The remaining legs**: WSL x86_64 + qemu arm64 (**`QEMU_LD_PREFIX=/usr/aarch64-linux-gnu`
-   or ~450 examples false-red at 255`) + macOS + the arm64 VPS. Push to each
-   carriage first. ⚠ A gate host holds the repo and nothing else.
-2. **The red-on-disable arms owed for the lost lanes' rows** — named in each row.
+1. ✅ **DONE 2026-08-26, and it is item 1 only so a reader can see the list was
+   maintained rather than quietly edited.** All four legs ran green — the figures
+   are in the gate table above, not restated here. ⚠ The clause *"a gate host holds
+   the repo and nothing else"* was **NOT** true when they ran, and proving it took a
+   follow-up: see [[D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES]].
+   ⓘ **The legs' verdicts survive it.** What leaked was ignored trees (`.kilo/`,
+   `test-scratch/`, `__pycache__`, `.temp/`) — nothing the examples runner globs and
+   nothing `ctest` reads — which is why this is a follow-up and not a re-gate. ★ The
+   distinction worth keeping: a stale `examples/` tree would have invalidated them,
+   because that runner globs; a stale `node_modules` is transport waste. **Ask what
+   the stale tree is an INPUT to** — the same question that governs which files an
+   orchestrator may edit under a running lane.
+2. **⚠ OPERATOR DECISION — `.secrets/` KEY MATERIAL SAT ON BOTH GATE HOSTS.**
+   ✔MEASURED 2026-08-26: all four files (`macos.env`, `macos.key`, `arm64-vps.env`,
+   `arm64-vps.key`) were on the Mac **and** on the VPS, md5-identical to the local
+   originals — so each host held the *other* host's private key. Removed from both,
+   after hashing to prove the originals were intact; the derivation withholds them
+   now because git ignores them. ★ Only `remote-leg.sh` had ever named `.secrets` in
+   its exclude list, and it STILL leaked, because **rsync does not delete an EXCLUDED
+   path** — an exclude added after the fact protects the stale copy instead of
+   removing it. **The remaining question is not cleanup, it is ROTATION, and that is
+   the operator's alone.** These keys reach real machines and this repo is slated to
+   go public.
+3. **The red-on-disable arms owed for the lost lanes' rows** — named in each row.
    These are the falsifiability half of six rows that closed on presence and
    execution alone.
-3. **[[D-OPT11-LAZY-IMPORT-EDGE]]** is still OPEN and is this cycle's only
+4. **[[D-OPT11-LAZY-IMPORT-EDGE]]** is still OPEN and is this cycle's only
    surviving opener besides Lane S's. ⚠ Its option A ("reuse the fixpoint's own
    max") is CONTAMINATED — every figure derived from the old `max` is an artifact
    of a runaway process.
-4. **The four re-verdict rows the balance gate keeps flagging.** ⚠ ✔MEASURED at
+5. **The four re-verdict rows the balance gate keeps flagging.** ⚠ ✔MEASURED at
    this fold: the gate's *"opener discharged"* heuristic is NOT the same predicate
    as *"trigger fired"*. `D-FULLC-STDBIT-BIG-ENDIAN-NATIVE`'s trigger is *a
    big-endian target lands*, which has not happened, and
    `D-FULLC-STDBIT-ADDRESSABLE-FN`'s is *a program takes `&stdc_*`*. Three of the
    four are the guard being right about the opener and wrong about the gate; the
    honest fix is to annotate each row, not to flip a status.
-5. **README correction still owed** from session one: the *"the answer is the pool"*
+6. **README correction still owed** from session one: the *"the answer is the pool"*
    claim was refuted, a `-flto` arm is wanted, `5.4×` → `5.5×`. ⚠ **NOT DONE, and
    deliberately not guessed:** the refuting measurement was in a lost lane report.
    Re-measure before editing.
-6. **The interner-level arc** behind the merge fix: `sameRepresentation` still
+7. **The interner-level arc** behind the merge fix: `sameRepresentation` still
    compares a composite's operands by raw TypeId, so representation neutrality does
    not survive one level of indirection. 1–2 cycles, with this cycle's measurement
    as its witness. The `instType(cid).v != instType(actual).v` guard in
    `inlining.cpp` is named as a consumer that gets to shrink.
-7. **A MEASURED `.sh`/`.ps1` PARITY GAP IN `macos-leg`, recorded rather than filed.**
+8. **A MEASURED `.sh`/`.ps1` PARITY GAP IN `macos-leg`, recorded rather than filed.**
    ✔MEASURED at this fold by reading both siblings: `macos-leg.sh` accepts
    `--guards`, `--mode`, `--tree` and `--build-type`; `macos-leg.ps1` accepts none
    of the four (`-Src`, `-Filter`, `-Jobs`, `-NoPush`, `-Dst`, `-ResetTo` only).
@@ -887,7 +907,7 @@ would have voided the four leg results this table reports.
    ruling met. ⚠ It blocked nothing here (a plain full leg needs none of the
    four), which is why it is a note and not a row — but a Windows-side caller
    wanting `--mode build` today has no way to ask for it.
-8. **Two worktrees deliberately KEPT**, with uncommitted work nobody has
+9. **Two worktrees deliberately KEPT**, with uncommitted work nobody has
    adjudicated: `C:/Source/DailySoftware/dss-lane-r` (136 dirty files) and
    `dss-perf-probe` (4, including a `src/perf_sampler.cpp` that exists nowhere
    else). Five others were removed after verifying their work is in HEAD or in the
