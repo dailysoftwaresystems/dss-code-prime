@@ -216,6 +216,12 @@ using json = nlohmann::json;
 // down (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
 constexpr std::string_view kVersionKindName             = "version";
 
+// D-PP-PREDEFINE-REDEFINITION-PARTITION: the ONE owner of the entry key that
+// answers "may a PROGRAM `#define`/`#undef` this name?". Named here rather than
+// spelled at its three read sites for the reason the block above records — a
+// retyped key spelling is a second owner, and the disagreement is silent.
+constexpr std::string_view kProgramRedefinitionKey      = "programRedefinition";
+
 constexpr std::string_view kImpliedSurfaceKindKey       = "kind";
 constexpr std::string_view kSurfaceHeadersKey           = "headers";
 constexpr std::string_view kClaimsNothingReasonKey      = "reason";
@@ -342,9 +348,10 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
         // emitted diagnostic already fails the load, and continuing lets the
         // author see every problem with the row in one pass.
         {
-            static constexpr std::array<std::string_view, 7> kMacroEntryKeys{
+            static constexpr std::array<std::string_view, 8> kMacroEntryKeys{
                 "name", "kind", "value", "params", "componentWeights",
-                "availableObjectFormats", "impliedSurface"};
+                "availableObjectFormats", "impliedSurface",
+                kProgramRedefinitionKey};
             DSS_CHECK_KEY_VOCABULARY(kMacroEntryKeys);
             // The allowed list is RENDERED FROM THE TABLE by the shared check,
             // never retyped into the message — a hand-written list is one that
@@ -652,6 +659,126 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                 pm.availableObjectFormats.push_back(std::move(fmt));
             }
             if (!afOk) continue;
+        }
+        // ── D-PP-PREDEFINE-REDEFINITION-PARTITION ─────────────────────────
+        //
+        // `programRedefinition` -- MANDATORY on EVERY entry, a string from the
+        // closed verb set. It answers ONE question, and it is narrower than it
+        // first looks: when a PROGRAM `#define`s or `#undef`s this name, is that
+        // DIAGNOSED? The change ALWAYS takes effect either way. The standard
+        // text (6.10.10 carries no `Constraints` heading, so 4p2 makes it UB and
+        // no diagnostic is required) and the two-reference measurement behind
+        // the verbs live on `PredefinedMacroRedefinition` in
+        // `preprocess_config.hpp`.
+        //
+        // ** MANDATORY, and for the same reason as `impliedSurface`: NEITHER
+        // DEFAULT IS SAFE. Defaulting to a warn verb makes DSS noisy about the
+        // next `__ARM_NEON` an author adds -- a warning gcc and clang do not
+        // emit. Defaulting to ordinary drops the diagnostic on the next
+        // `__STDC_ISO_10646__`, which both references DO emit. Both failures are
+        // silent and point in opposite directions, so the question is asked out
+        // loud on every row rather than answered by omission.
+        if (!e.contains(kProgramRedefinitionKey)) {
+            coll.emit(DiagnosticCode::C_MissingField,
+                      std::format("{}/{}", mpath, kProgramRedefinitionKey),
+                      std::format(
+                          "a 'predefinedMacros' entry requires '{}' - accepted: "
+                          "{}. It selects whether a program's '#define' or "
+                          "'#undef' of this name is DIAGNOSED (the change "
+                          "applies either way): '{}' for a name ISO C 6.10.10 "
+                          "itself lists, '{}' for one whose value the engine "
+                          "derives per use, '{}' for an implementation extension "
+                          "that is neither. There is no default, because "
+                          "guessing a warn verb emits a diagnostic gcc and clang "
+                          "do not, and guessing ordinary drops one they do",
+                          kProgramRedefinitionKey,
+                          detail::renderAllowedList(
+                              allNames(kPredefinedMacroRedefinitionTable), " / "),
+                          predefinedMacroRedefinitionName(
+                              PredefinedMacroRedefinition::WarnIsoMacro),
+                          predefinedMacroRedefinitionName(
+                              PredefinedMacroRedefinition::WarnDerivedMacro),
+                          predefinedMacroRedefinitionName(
+                              PredefinedMacroRedefinition::Ordinary)));
+            continue;
+        }
+        if (!e.at(kProgramRedefinitionKey).is_string()) {
+            coll.emit(entryCode,
+                      std::format("{}/{}", mpath, kProgramRedefinitionKey),
+                      std::format("'predefinedMacros.{}' must be a string",
+                                  kProgramRedefinitionKey));
+            continue;
+        }
+        {
+            const std::string rdText =
+                e.at(kProgramRedefinitionKey).get<std::string>();
+            auto const rdOpt = predefinedMacroRedefinitionFromName(rdText);
+            if (!rdOpt.has_value()) {
+                coll.emit(entryCode,
+                          std::format("{}/{}", mpath, kProgramRedefinitionKey),
+                          std::format("unknown '{}' '{}' - accepted: {}",
+                                      kProgramRedefinitionKey, rdText,
+                                      detail::renderAllowedList(
+                                          allNames(
+                                              kPredefinedMacroRedefinitionTable),
+                                          " / ")));
+                continue;
+            }
+            pm.programRedefinition = *rdOpt;
+            // ★ THE STRUCTURAL RULE, and it is about the KIND, never about any
+            // NAME. `ordinary` is implemented by LOWERING the row to a
+            // `#define name value` line in the synthetic "<built-in>" prologue
+            // -- the c105 mechanism the function-like rows already use, and the
+            // very model the references' own built-in buffer implements (gcc
+            // reports a `-D` clash as `<command-line>` over `<built-in>`; clang's
+            // reads `In file included from <built-in>:388:`). That lowering needs
+            // the row's replacement to BE `value`, which is true only of
+            // `constant` (the `version` kind lowers to `constant` at load, so it
+            // qualifies). A `line`/`file`/`date`/`time`/`counter` row declared
+            // ordinary would lower to `#define __LINE__` -- an EMPTY object-like
+            // macro -- so the name would still be "defined" and would expand to
+            // NOTHING. Fail loud instead of shipping a predefine that silently
+            // evaporates.
+            if (pm.programRedefinition == PredefinedMacroRedefinition::Ordinary
+                && pm.kind != PredefinedMacroKind::Constant) {
+                coll.emit(entryCode,
+                          std::format("{}/{}", mpath, kProgramRedefinitionKey),
+                          std::format(
+                              "a '{}' predefinedMacros entry cannot be '{}': its "
+                              "replacement is DERIVED per use, not the static "
+                              "'value' text, so there is nothing to lower into "
+                              "the built-in prologue and the macro would expand "
+                              "to nothing. Declare it '{}'",
+                              predefinedMacroKindName(pm.kind),
+                              predefinedMacroRedefinitionName(
+                                  PredefinedMacroRedefinition::Ordinary),
+                              predefinedMacroRedefinitionName(
+                                  PredefinedMacroRedefinition::WarnDerivedMacro)));
+                continue;
+            }
+            // ★ AND THE MIRROR RULE, which records a fact that was true and
+            // UNSAID before this field existed: a FUNCTION-LIKE predefine has
+            // ALWAYS been an ordinary macro. c105 lowers it to a "<built-in>"
+            // `#define name(params) value`, so the directive handler owns it and
+            // it has always been `#undef`-able -- the c105 note says so in as
+            // many words. A warn verb on one would promise a diagnostic the
+            // engine never had a place to emit, i.e. config asserting behaviour
+            // that is already false in the shipped binary.
+            if (pm.isFunctionLike
+                && predefinedNameIsDiagnosedOnChange(pm.programRedefinition)) {
+                coll.emit(entryCode,
+                          std::format("{}/{}", mpath, kProgramRedefinitionKey),
+                          std::format(
+                              "a FUNCTION-LIKE predefinedMacros entry ('params' "
+                              "present) must be '{}': it lowers to an ordinary "
+                              "'#define' in the built-in prologue, so it has "
+                              "always been '#undef'-able with no diagnostic and "
+                              "a '{}' claim here would be unenforceable",
+                              predefinedMacroRedefinitionName(
+                                  PredefinedMacroRedefinition::Ordinary),
+                              rdText));
+                continue;
+            }
         }
         // -- D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE (ruling B') ----
         //

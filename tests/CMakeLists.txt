@@ -384,43 +384,94 @@ dss_add_shuffle_arm(NAME analysis/semantic/test_fc3_width_semantics REPEAT 20)
 # vacuous. `unset:` (CMake 3.22+) is what actually removes it.
 #
 # ★ THE WORKING DIRECTORY MUST HAVE NO REPO ANCESTRY, and "the build dir" is
-# NOT sufficient — for an in-tree build (build-dbg/) the repo root is an
-# ancestor, candidate (3) resolves, and the arm proves nothing again. So the
-# location is chosen per build layout and then VERIFIED below.
-cmake_path(IS_PREFIX CMAKE_SOURCE_DIR "${CMAKE_BINARY_DIR}" NORMALIZE
-           _dss_binary_inside_source)
-if (_dss_binary_inside_source)
-    # In-tree build: anything under the build dir inherits the repo as an
-    # ancestor, so step OUT of the repo entirely.
-    set(_dss_norepo_cwd "${CMAKE_SOURCE_DIR}/../dss-no-repo-ancestry-cwd")
-else()
-    set(_dss_norepo_cwd "${CMAKE_BINARY_DIR}/no-repo-ancestry-cwd")
+# NOT sufficient — for an in-tree build (build/dbg/) the repo root is an
+# ancestor, candidate (3) resolves, and the arm proves nothing again.
+#
+# ⚠ D-CYCLE-A-WORKTREE-INSIDE-THE-REPO-ROOT-CANNOT-BE-CONFIGURED.
+# THIS USED TO **GUESS** THE LOCATION FROM THE BUILD LAYOUT — "in-tree ⇒
+# CMAKE_SOURCE_DIR/.." — and then verify the guess. The guess is wrong for a
+# lane worktree: since the 2026-08-26 ruling those live at
+# <repo>/.worktrees/<name>, so CMAKE_SOURCE_DIR/.. is <repo>/.worktrees, which
+# is STILL INSIDE <repo>, and <repo> holds src/dss-config. A guess-then-verify
+# shape can only ever REPORT that mismatch, so configure died here and EVERY
+# sanctioned lane worktree was unconfigurable — not merely awkward.
+# ✔MEASURED 2026-08-27: <repo>/.worktrees/n carried a CMakeCache.txt with no
+# build.ninja and no CTestTestfile.cmake, and the empty cwd directory this
+# block creates sat one line above the fatal.
+#
+# ⇒ THE LOCATION IS NOW **DERIVED** FROM THE SAME PREDICATE THE CHECK ASSERTS,
+# so choice and check cannot disagree: climb to the OUTERMOST ancestor holding
+# src/dss-config and step above it. Stepping out of CMAKE_SOURCE_DIR is not
+# stepping out of the REPOSITORY — for a worktree the outermost holder is
+# <repo>, not the worktree, which holds one of its own. That distinction is
+# the entire defect, and deriving rather than guessing is what removes it.
+#
+# ⚠ AND IT MUST STAY OUTSIDE THE REPOSITORY. This is the one directory the
+# "keep it inside repo bounds" ruling cannot reach: "no ancestor holds
+# src/dss-config" IS the condition under test, so moving it inside makes the
+# arm silently vacuous — the exact rot the paragraph above describes. It is an
+# EMPTY cwd and never a build tree, so it contaminates nothing; the ruling is
+# about worktrees and build output. The main tree and every worktree share the
+# one directory, which is strictly less clutter than a per-tree sibling.
+
+# The predicate, defined ONCE and used by both the choice and the check.
+# Returns the OUTERMOST ancestor of _dir (inclusive) that holds src/dss-config,
+# or "" when none does — so an empty result IS "no repo ancestry". The walk
+# must not stop at the first non-holder: for <repo>/.worktrees/<name> the gap
+# at <repo>/.worktrees sits BETWEEN two holders.
+function(_dss_outermost_repo_ancestor _dir _out)
+    cmake_path(SET _probe NORMALIZE "${_dir}")
+    set(_found "")
+    foreach(_hop RANGE 32)
+        if (IS_DIRECTORY "${_probe}/src/dss-config")
+            set(_found "${_probe}")   # keep climbing; remember the HIGHEST hit
+        endif()
+        cmake_path(GET _probe PARENT_PATH _parent)
+        if (_parent STREQUAL _probe)
+            break()
+        endif()
+        set(_probe "${_parent}")
+    endforeach()
+    set(${_out} "${_found}" PARENT_SCOPE)
+endfunction()
+
+# Prefer the build directory when it genuinely has no repo ancestry (a true
+# out-of-tree build): the directory is then tidy and dies with the build. That
+# is a PREFERENCE, not a guess — it is taken only when the predicate says so.
+set(_dss_norepo_cwd "${CMAKE_BINARY_DIR}/no-repo-ancestry-cwd")
+_dss_outermost_repo_ancestor("${_dss_norepo_cwd}" _dss_cwd_repo)
+if (NOT _dss_cwd_repo STREQUAL "")
+    _dss_outermost_repo_ancestor("${CMAKE_SOURCE_DIR}" _dss_outer_repo)
+    if (_dss_outer_repo STREQUAL "")
+        message(FATAL_ERROR
+            "dss: cannot place the out-of-tree regression arm's working "
+            "directory. '${_dss_norepo_cwd}' has repo ancestry at "
+            "'${_dss_cwd_repo}', yet no ancestor of the source directory "
+            "'${CMAKE_SOURCE_DIR}' holds src/dss-config, so there is nothing "
+            "to step above.")
+    endif()
+    cmake_path(GET _dss_outer_repo PARENT_PATH _dss_above_repo)
+    set(_dss_norepo_cwd "${_dss_above_repo}/dss-no-repo-ancestry-cwd")
 endif()
 cmake_path(SET _dss_norepo_cwd NORMALIZE "${_dss_norepo_cwd}")
 file(MAKE_DIRECTORY "${_dss_norepo_cwd}")
 
-# VERIFY the property rather than trusting the branch above. A guard whose own
-# precondition can rot silently is not a guard; if someone nests a checkout such
-# that this directory gains a src/dss-config ancestor, that is a CONFIGURE-time
-# error here, not a quietly-vacuous green arm later. (The runtime half of the
-# same check lives in BakedRootOnly.PreconditionsHold, which re-verifies from
-# inside the running process where ctest's cwd actually applies.)
-set(_dss_probe "${_dss_norepo_cwd}")
-foreach(_dss_hop RANGE 12)
-    if (IS_DIRECTORY "${_dss_probe}/src/dss-config")
-        message(FATAL_ERROR
-            "dss: the out-of-tree regression arm's working directory "
-            "'${_dss_norepo_cwd}' has repo ancestry at '${_dss_probe}' "
-            "(it contains src/dss-config). The arm would then resolve via the "
-            "cwd ancestor walk and silently stop testing the CMake-baked "
-            "DSS_TEST_REPO_ROOT, which is the only thing it exists to test.")
-    endif()
-    cmake_path(GET _dss_probe PARENT_PATH _dss_parent)
-    if (_dss_parent STREQUAL _dss_probe)
-        break()
-    endif()
-    set(_dss_probe "${_dss_parent}")
-endforeach()
+# VERIFY the property rather than trusting the derivation. The derivation above
+# is built from this same predicate, so this cannot fire today — that is the
+# point: it is what CATCHES a future edit that reintroduces a guess, which is
+# precisely how this block broke. A guard whose own precondition can rot
+# silently is not a guard. (The runtime half lives in
+# BakedRootOnly.PreconditionsHold, which re-verifies from inside the running
+# process where ctest's cwd actually applies, and is the non-vacuity proof.)
+_dss_outermost_repo_ancestor("${_dss_norepo_cwd}" _dss_leftover_repo)
+if (NOT _dss_leftover_repo STREQUAL "")
+    message(FATAL_ERROR
+        "dss: the out-of-tree regression arm's working directory "
+        "'${_dss_norepo_cwd}' has repo ancestry at '${_dss_leftover_repo}' "
+        "(it contains src/dss-config). The arm would then resolve via the "
+        "cwd ancestor walk and silently stop testing the CMake-baked "
+        "DSS_TEST_REPO_ROOT, which is the only thing it exists to test.")
+endif()
 
 # ★ ONE entry, not three — and the reason is a MEASURED constraint, not a
 # preference. The obvious design is to point this condition at real consumers

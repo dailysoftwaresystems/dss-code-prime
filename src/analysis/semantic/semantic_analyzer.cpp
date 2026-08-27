@@ -565,30 +565,26 @@ isDefinitionAtNode(DeclarationRule const& decl, Tree const& tree, NodeId node) {
     return nodeHasVisibleChildOfRule(tree, node, *decl.definesWhenChildRule);
 }
 
-// D-CSUBSET-FN-PROTOTYPE: does the declarator NAME carry a function suffix —
-// i.e. is `nameNode` the name of a function declarator (`int f(int)` /
-// `int f(int x){…}`) rather than a function POINTER (`int (*fp)(int)`)? True
-// iff the name's DIRECT declarator (its parent) is the config's `directRule`
-// AND has a `fnSuffixRule` child. For a function pointer the suffix sits on the
-// OUTER declarator (the name's direct declarator is the inner group's, which
-// carries no suffix), so this cleanly distinguishes a prototype from a fnptr.
+// D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED: the declarator
+// shape questions this file asks are answered by the SHARED upward walk in
+// `core/types/declarator_walk.hpp` (`innermostNameDerivation` /
+// `declaratorFnSuffixNode`) rather than by a local scan, because the CST->HIR
+// lowering asks the very same questions and the two tiers disagreeing about a
+// declarator's shape is not a loud failure -- it is a wrong answer that compiles.
+// See that header for C 6.7.6p1, the parenthesis rule, and the four measured
+// symptoms one single-level look produced.
+
+// D-CSUBSET-FN-PROTOTYPE: is `nameNode` the name of a FUNCTION declarator
+// (`int f(int)` / `int f(int x){…}` / the parenthesized `int (f)(int x){…}`)
+// rather than a function POINTER (`int (*fp)(int)`) or any other object? True iff
+// the name's INNERMOST DERIVATION is a function suffix — for a function pointer
+// the pointer layer reaches the name first, so the two stay cleanly distinct.
 // Shared by Pass 1 (proto detection) and Pass 1.5 (definition's fn-declarator
 // constraint check) so the two never diverge.
 [[nodiscard]] bool
 hasFnSuffixOnName(Tree const& tree, NodeId nameNode,
                   DeclaratorConfig const& dc) {
-    NodeId const direct = tree.parent(nameNode);
-    if (!direct.valid() || tree.kind(direct) != NodeKind::Internal
-        || tree.rule(direct) != dc.directRule) {
-        return false;
-    }
-    for (NodeId c : visibleChildren(tree, direct)) {
-        if (tree.kind(c) == NodeKind::Internal
-            && isFnSuffixRule(tree.rule(c), dc)) {
-            return true;
-        }
-    }
-    return false;
+    return declaratorFnSuffixNode(tree, nameNode, dc).valid();
 }
 
 // C34c (D-CSUBSET-FN-TYPEDEF-PROTOTYPE): is `nameNode` the name of an
@@ -676,28 +672,44 @@ headNamesPotentialTypedef(Tree const& tree, NodeId headNode,
     return false;
 }
 
-// c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): is `directNode` (a `directRule` node) a
-// NAME-bearing direct declarator — i.e. does it have a direct visible child that
-// is the declarator NAME token (`int f(int)` / `int f(int){…}`)? A function
-// POINTER's direct declarator (`int (*fp)(int)`) instead carries a
-// `groupRule`/`parenDeclarator` base (the name is nested INSIDE it), so this is
-// false for it. This is the same name-vs-fnptr distinction `hasFnSuffixOnName`
-// draws, expressed at the direct-declarator node (where the fnSuffix-suffix walk
-// lands) rather than at the name node.
+// c32 (D-CSUBSET-FNPTR-PARAM-SCOPE), generalized by
+// D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED: is
+// `fnSuffixNode` the suffix that MAKES THE DECLARED NAME A FUNCTION — as opposed
+// to a suffix that builds some inner or outer function type the name merely
+// points at or returns?
+//
+// ★ IT IS A NODE-IDENTITY TEST, and that is what makes it exact. The name is
+// found by the shared declarator walk from the suffix's own direct declarator, and
+// `innermostNameDerivation` — run from that name — must land back on THIS very
+// node. Nothing else can be substituted for it:
+//   * `int (*fp)(int x)`         the pointer layer reaches `fp` first ⇒ this
+//                                suffix builds the POINTEE ⇒ false (isolate).
+//   * `int (foo)(int x) {…}`     `foo` is merely GROUPED, so the walk steps out of
+//                                the parens and lands here ⇒ true. The predecessor
+//                                asked only whether the suffix's direct declarator
+//                                carried a name TOKEN directly; a grouped name is
+//                                nested one level down, so it answered "function
+//                                pointer" and isolated a DEFINITION's parameters
+//                                away from its own body (MEASURED: S0001 on the
+//                                parameter, on code gcc and clang both run).
+//   * `int (*(foo)(void))(int)`  TWO fn-suffixes over one name. `(void)` is the
+//                                innermost derivation ⇒ true for it; `(int)`
+//                                belongs to the RETURNED function type ⇒ false,
+//                                so its parameter names stay isolated. A
+//                                shape-only test cannot tell those two apart —
+//                                identity can.
 [[nodiscard]] bool
-directDeclaratorIsNameBearing(Tree const& tree, NodeId directNode,
-                              DeclaratorConfig const& dc) {
-    if (!directNode.valid() || tree.kind(directNode) != NodeKind::Internal
-        || tree.rule(directNode) != dc.directRule) {
+fnSuffixDeclaresTheName(Tree const& tree, NodeId fnSuffixNode,
+                        DeclaratorConfig const& dc) {
+    NodeId const direct = tree.parent(fnSuffixNode);
+    if (!direct.valid() || tree.kind(direct) != NodeKind::Internal
+        || tree.rule(direct) != dc.directRule) {
         return false;
     }
-    for (NodeId c : visibleChildren(tree, directNode)) {
-        if (tree.kind(c) == NodeKind::Token
-            && tree.tokenKind(c) == dc.nameToken) {
-            return true;
-        }
-    }
-    return false;
+    NodeId const nameNode = declaratorNameNode(tree, direct, dc);
+    if (!nameNode.valid()) return false;   // abstract declarator — no name
+    NodeId const der = innermostNameDerivation(tree, nameNode, dc);
+    return der.valid() && der.v == fnSuffixNode.v;
 }
 
 // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): is the declaration `decl` at `node` a
@@ -727,18 +739,21 @@ nodeOpensChildScope(EngineState const& s, SemanticConfig const& cfg,
 // TRUE for every fn-declarator's param list EXCEPT a function DEFINITION's OWN
 // params — a definition's params must keep binding into the definition's scope so
 // they reach the body. A param list is a definition's own iff its owning fnSuffix
-// sits on a NAME-bearing direct declarator (NOT a function pointer, whose suffix
-// rides a `parenDeclarator` base) AND the enclosing declaration is a function
-// DEFINITION (a body present). So:
-//   * fn-ptr member / typedef / param (`int (*a)(int x)`): base is a
-//     parenDeclarator ⇒ not name-bearing ⇒ OPEN an isolated scope.
-//   * a bare prototype (`int f(int x);`): name-bearing BUT no body ⇒ OPEN an
+// is the one that DECLARES THE NAME (not a function pointer's, and not an inner or
+// outer function type's) AND the enclosing declaration is a function DEFINITION (a
+// body present). So:
+//   * fn-ptr member / typedef / param (`int (*a)(int x)`): the pointer layer
+//     reaches the name first ⇒ this suffix does not declare it ⇒ OPEN an isolated
+//     scope.
+//   * a bare prototype (`int f(int x);`): declares the name BUT no body ⇒ OPEN an
 //     isolated scope (the proto's params have function-prototype scope; the proto
 //     name itself re-homes to file scope via the separate `isProto` path).
-//   * a function definition (`int add(int x){…}`): name-bearing AND a body ⇒ do
-//     NOT open — its params bind into the topLevelDecl scope, body-visible.
-// Reuses the config-driven `hasFnSuffixOnName`/`directDeclaratorIsNameBearing`
-// shape tests and `declNodeIsFunctionDefinition`; no rule/keyword hardcoded.
+//   * a function definition (`int add(int x){…}`, and equally the parenthesized
+//     `int (add)(int x){…}` — D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED):
+//     declares the name AND a body ⇒ do NOT open — its params bind into the
+//     topLevelDecl scope, body-visible.
+// Reuses the config-driven `hasFnSuffixOnName`/`fnSuffixDeclaresTheName` shape
+// tests and `declNodeIsFunctionDefinition`; no rule/keyword hardcoded.
 [[nodiscard]] bool
 isPrototypeParamScopeNode(EngineState const& s, SemanticConfig const& cfg,
                           Tree const& tree, NodeId node) {
@@ -762,12 +777,13 @@ isPrototypeParamScopeNode(EngineState const& s, SemanticConfig const& cfg,
         return false;
     }
     // fnSuffix → direct declarator. A DEFINITION's own params require the suffix
-    // to sit on a NAME-bearing direct declarator AND the enclosing declaration to
-    // be a function definition (a body). Anything else is a non-definition
-    // declarator's param list → an isolated prototype scope.
+    // to be the one that DECLARES THE NAME (through any number of redundant
+    // parentheses) AND the enclosing declaration to be a function definition (a
+    // body). Anything else is a non-definition declarator's param list → an
+    // isolated prototype scope.
     NodeId const direct = tree.parent(fnSuffix);
-    bool const nameBearing = directDeclaratorIsNameBearing(tree, direct, dc);
-    if (!nameBearing) return true;   // fn-pointer suffix ⇒ isolate
+    if (!fnSuffixDeclaresTheName(tree, fnSuffix, dc))
+        return true;   // fn-pointer / inner / outer fn type ⇒ isolate
     // Walk up to the nearest enclosing declaration-row node; it is a function
     // definition iff its kindByChild resolves to Function (a body present).
     for (NodeId cur = tree.parent(direct); cur.valid(); cur = tree.parent(cur)) {
@@ -6511,9 +6527,33 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // TYPEDEF spelling (`void f(Fn g)`) never reached here (its
                         // declarator carries no `()` suffix), which is precisely why
                         // it worked while the inline twin did not.
+                        //
+                        // ★★ A COMPOSITE MEMBER IS NEVER A PROTOTYPE EITHER, and
+                        // the conjunct that says so is the one the fn-typedef
+                        // candidate gate below already uses: `bitfieldSuffix` is a
+                        // slot only a struct/union FIELD row can have, so its
+                        // presence IS the row's member-ness — the same shape of
+                        // signal `paramAdjustments` is for parameter-ness, read from
+                        // config, never from a rule name.
+                        // D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED:
+                        // C 6.7.2.1p9 forbids a member of function type, and the
+                        // TYPEDEF spelling (`typedef int Fn(int); struct S { Fn f; };`)
+                        // has always been refused loud. The SYNTACTIC spelling
+                        // (`struct S { int f(int); };`) was NOT — MEASURED accepted
+                        // clean, because the name carries a `()` suffix and this test
+                        // was purely syntactic, so the field was flagged a prototype
+                        // and the Pass-1.5 arm upgraded it silently. That is a
+                        // PRE-EXISTING silent acceptance, not a new one: the plain
+                        // spelling behaves identically before and after this cycle's
+                        // walk change. It is closed HERE rather than filed because
+                        // teaching the walk to see through parentheses gives
+                        // `struct S { int (f)(int); };` the same path, and widening a
+                        // silent acceptance by one spelling is not an acceptable way
+                        // to leave it.
                         bool const isProto =
                             (effectiveKind == DeclarationKind::Variable)
                             && !decl.paramAdjustments
+                            && !decl.bitfieldSuffix.has_value()
                             && nameNode.valid()
                             && hasFnSuffixOnName(tree, nameNode, *cfg.declarators);
                         // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE: a block-scope function
@@ -8217,6 +8257,43 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         bool const isFnSig = declTy.valid()
                             && s.lattice.interner().kind(declTy)
                                    == TypeKind::FnSig;
+                        // ★★ C 6.7.6.3p1 — A FUNCTION DECLARATOR SHALL NOT SPECIFY
+                        // A FUNCTION RETURN TYPE. `int f(int)(int);` and its typedef
+                        // spelling `typedef int Fn(int); Fn (f)(int);` declare "f: a
+                        // function returning a function", which no C implementation
+                        // accepts. ✔MEASURED: gcc 13.3.0 says "'f' declared as
+                        // function returning a function", clang 18.1.3 "function
+                        // cannot return function type".
+                        //
+                        // ★ THIS CHECK IS NEW, AND IT REPLACES AN ACCIDENT WITH AN
+                        // ANSWER — D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED.
+                        // The typedef spelling used to be refused only as a
+                        // SIDE EFFECT of the declarator-shape walk being blind to
+                        // redundant parentheses: `f` was not recognized as carrying a
+                        // function suffix, so it fell through to the arm below and was
+                        // reported as "function prototype declarations are not
+                        // supported here" — a message naming a construct the source
+                        // does not contain, and a shipped pin
+                        // (SemanticAnalyzerC.FnTypedefParenGroupFnSuffixIsNotAPrototype)
+                        // depended on it. Teaching the walk to see through the
+                        // parentheses is correct and REMOVES that accident, so the
+                        // constraint it was standing in for has to be checked on
+                        // purpose. Checking it here — off the RESOLVED type, not off
+                        // the declarator's shape — also catches the INLINE spelling
+                        // `int f(int)(int);`, which the accident never covered at all.
+                        if (isFnSig && nameNode.valid()) {
+                            TypeId const fnRet =
+                                s.lattice.interner().fnResult(declTy);
+                            if (fnRet.valid()
+                                && s.lattice.interner().kind(fnRet)
+                                       == TypeKind::FnSig) {
+                                emitInvalidFn(nameNode,
+                                              "a function declarator cannot specify "
+                                              "a function return type (C 6.7.6.3p1) "
+                                              "— declare it as returning a POINTER "
+                                              "to function instead");
+                            }
+                        }
                         // ★★ TF-C93: "WHAT KIND OF ENTITY DOES THIS DECLARATOR
                         // EFFECTIVELY DECLARE?" — ONE definition, THREE readers.
                         //
@@ -9071,6 +9148,16 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 || symRec.maybeFnTypedefProto) {
                                 symRec.kind = DeclarationKind::Function;
                                 symRec.isProtoDeclaration = true;
+                            } else if (decl.bitfieldSuffix.has_value()) {
+                                // A struct/union FIELD row (bitfieldSuffix is a
+                                // member-only slot). C 6.7.2.1p9: a member shall not
+                                // have function type. Naming THAT is the point —
+                                // the generic message below tells a reader to add
+                                // `extern`, which is not a thing a member can be.
+                                emitInvalidFn(nameNode,
+                                              "a struct/union member cannot have a "
+                                              "function type (C 6.7.2.1p9) — declare "
+                                              "it as a POINTER to function instead");
                             } else {
                                 emitInvalidFn(nameNode,
                                               "function prototype declarations "

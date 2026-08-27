@@ -995,3 +995,104 @@ TEST(WorkspaceProjectE2E, ADocumentOpenedBeforeInitializeSaysExactlyThat) {
         << "the pre-initialize reason must not be replaced by the "
            "no-workspace-folder one; got: " << errs[0];
 }
+
+// ══ D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES ════════
+//
+// `fileUriFromPath` is the EXACT INVERSE of `pathFromFileUri`, and it did not
+// exist in `src/` at all until this row -- only `tests/lsp/lsp_test_helpers.hpp`
+// had a copy. That is why production could name no file but the one the request
+// arrived on, and a definition inside a header was reported as living in the
+// open document.
+//
+// ★ THE TEST-TREE COPY ALSO DID LESS THAN IT CLAIMED: it did no
+// percent-encoding whatever, while its comment asserted that fixtures built
+// with it "round-trip through `dss::lsp::pathFromFileUri`". A path containing a
+// space decoded back to a DIFFERENT path, so the round-trip it advertised was
+// never closed. The helper now forwards here, and this pins the three shapes
+// that actually have to survive the trip.
+TEST(WorkspaceProject, FileUriRoundTrip) {
+    // (1) Plain POSIX-shaped absolute path.
+    {
+        const std::filesystem::path p{"/home/user/src/main.c"};
+        const std::string uri = dss::lsp::fileUriFromPath(p);
+        EXPECT_EQ(uri, "file:///home/user/src/main.c");
+        auto back = dss::lsp::pathFromFileUri(uri);
+        ASSERT_TRUE(back.has_value());
+        EXPECT_EQ(back->generic_string(), p.generic_string());
+    }
+    // (2) WINDOWS DRIVE LETTER. `C:/dir/x.c` is `file:///C:/dir/x.c`: the URI
+    // grammar's leading slash is added by the encoder and stripped by the
+    // decoder, and `:` is deliberately NOT encoded -- that is what every LSP
+    // client emits, so encoding it would produce a uri no editor matches.
+    {
+        const std::filesystem::path p{"C:/dev/proj/main.c"};
+        const std::string uri = dss::lsp::fileUriFromPath(p);
+        EXPECT_EQ(uri, "file:///C:/dev/proj/main.c");
+        auto back = dss::lsp::pathFromFileUri(uri);
+        ASSERT_TRUE(back.has_value());
+        EXPECT_EQ(back->generic_string(), p.generic_string());
+    }
+    // (3) PERCENT-ENCODING. The character the old test-tree copy silently got
+    // wrong: a space must encode, or the uri terminates early in a client.
+    {
+        const std::filesystem::path p{"C:/dev/my proj/a b.c"};
+        const std::string uri = dss::lsp::fileUriFromPath(p);
+        EXPECT_EQ(uri, "file:///C:/dev/my%20proj/a%20b.c");
+        auto back = dss::lsp::pathFromFileUri(uri);
+        ASSERT_TRUE(back.has_value());
+        EXPECT_EQ(back->generic_string(), p.generic_string())
+            << "a space must survive the round trip; the pre-row helper did no "
+               "encoding at all and this decoded to a different path";
+    }
+    // A `#` would otherwise be read as a fragment delimiter.
+    {
+        const std::filesystem::path p{"/tmp/a#b.c"};
+        const std::string uri = dss::lsp::fileUriFromPath(p);
+        EXPECT_EQ(uri, "file:///tmp/a%23b.c");
+        auto back = dss::lsp::pathFromFileUri(uri);
+        ASSERT_TRUE(back.has_value());
+        EXPECT_EQ(back->generic_string(), p.generic_string());
+    }
+    // (4) A UNC-SHAPED PATH. ⚠ THE INVARIANT IS THE ROUND TRIP; THE EXACT URI
+    // TEXT IS PLATFORM-DEFINED, AND PINNING ONE PLATFORM'S TEXT WAS A DEFECT.
+    // ✔MEASURED on TWO legs, and they disagree for a good reason:
+    //   * MinGW/GCC on Windows — `fs::path{"//server/share/x.c"}` reports an
+    //     EMPTY `root_name()` and renders with a SINGLE leading slash: the path
+    //     type discards the UNC authority at construction, so this encodes as an
+    //     ordinary absolute path → `file:///server/share/x.c`.
+    //   * libc++ on Darwin — POSIX makes a leading `//` IMPLEMENTATION-DEFINED
+    //     and libc++ PRESERVES it, because `//server/share` there is a LOCAL
+    //     path, not a network authority. `root_name()` is still empty (POSIX has
+    //     none), so the generic string keeps both slashes →
+    //     `file:////server/share/x.c`, an empty authority plus that path.
+    // ★ BOTH ARE CORRECT FOR THEIR PLATFORM, and treating Darwin's `server` as
+    // a URI authority would be the actual bug — it is a directory there.
+    // ⚠ THIS ASSERTION USED TO HARDCODE THE FIRST FORM, and the macOS leg is
+    // what caught it: the lane that wrote it said, accurately, that it pinned
+    // "what THIS leg actually does rather than a portability claim it cannot
+    // keep" — but "this leg" is FOUR legs. The two known-correct renderings are
+    // named explicitly rather than derived from `p`, because deriving the
+    // expectation would make this test re-implement the function it tests and
+    // assert nothing; a THIRD rendering still fails loudly here.
+    {
+        const std::filesystem::path p{"//server/share/x.c"};
+        const std::string uri = dss::lsp::fileUriFromPath(p);
+        const bool knownForm = uri == "file:///server/share/x.c"
+                            || uri == "file:////server/share/x.c";
+        EXPECT_TRUE(knownForm)
+            << "unexpected UNC rendering '" << uri << "' — neither the "
+               "authority-discarding form nor the POSIX `//`-preserving one. "
+               "If a platform models a real UNC root this needs a third arm, "
+               "NOT a widened check";
+        auto back = dss::lsp::pathFromFileUri(uri);
+        ASSERT_TRUE(back.has_value());
+        EXPECT_EQ(back->generic_string(), p.generic_string())
+            << "whatever the platform makes of a UNC spelling, the trip must "
+               "be lossless in the form the path type actually holds — THIS is "
+               "the property, and it holds on every leg";
+    }
+    // The inbound REFUSAL of a real remote authority is the property that
+    // matters for safety, and it is pinned separately by
+    // `NonFileUriIsRefusedRatherThanGuessed`: a network host is not a local
+    // directory to scan, so `file://someremotehost/share/x` yields nullopt.
+}

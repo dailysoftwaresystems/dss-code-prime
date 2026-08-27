@@ -361,25 +361,31 @@ TEST(ShippedLibDescriptor, SymbolLibraryOverrideSentinelFormatFailsLoud) {
            "the table";
 }
 
-// ══ A MACRO THAT SHADOWS A SYMBOL WITHOUT REFERENCING IT (UCRT-P4) ═══════════
+// ══ AN OBJECT-LIKE MACRO THAT SHADOWS A SYMBOL WITHOUT REFERENCING IT ════════
+// ══ (UCRT-P4, narrowed by P41) ═══════════════════════════════════════════════
 //
 // Before this guard the shape below compiled rc=0 with NO diagnostic: the macro
 // silently won at preprocess time, nothing could ever call the symbol, and the
 // symbol was STILL eagerly imported (D-FFI-DESCRIPTOR-EAGER-IMPORT) — a dead import
 // in every binary that included the header.
 //
-// ★ THE THREE TESTS BELOW ARE ONE ARGUMENT AND MUST BE READ TOGETHER. The naive
-// rule "same name + overlapping format = error" is FALSE and would red 17 in-tree,
-// standard-mandated rows; the two BENIGN pins are what stop this guard from being
-// re-cut into that false rule the first time someone "simplifies" it.
+// ★ THE TESTS BELOW ARE ONE ARGUMENT AND MUST BE READ TOGETHER. The naive rule
+// "same name + overlapping format = error" is FALSE and would red 21 in-tree,
+// standard-mandated rows; the BENIGN pins are what stop this guard from being
+// re-cut into that false rule the first time someone "simplifies" it. The
+// FUNCTION-LIKE pin is the SECOND false rule, the one this guard actually shipped:
+// see D-FFI-MACRO-SHADOWING-GUARD-IGNORES-C-7-1-4-FUNCTION-ADDRESSABILITY.
 //
 // RED-ON-DISABLE (for the defect pin): delete the `checkMacroSymbolShadowing` call
-// at step (7.5) of `readShippedLibDescriptor` and the read SUCCEEDS. Neither benign
-// pin changes, so removing the guard is distinguishable from loosening it.
-TEST(ShippedLibDescriptor, MacroShadowingSymbolWithoutReferenceFailsLoud) {
+// at step (7.5) of `readShippedLibDescriptor` and the read SUCCEEDS. No benign pin
+// changes, so removing the guard is distinguishable from loosening it.
+TEST(ShippedLibDescriptor, ObjectLikeMacroShadowingSymbolWithoutReferenceFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
-    // `g` is declared as a symbol AND defined as a macro expanding to something
-    // ELSE, on the same (unrestricted) formats. Nothing can ever reach the symbol.
+    // `g` is declared as a symbol AND defined as an OBJECT-LIKE macro expanding to
+    // something ELSE, on the same (unrestricted) formats. An object-like macro is
+    // replaced at EVERY occurrence of the name — `&g` and `(g)(1)` are eaten along
+    // with the plain call — so nothing short of `#undef` can reach the symbol, and
+    // `#undef` frees a function-like macro just as well and so decides nothing.
     auto const path = writeTemp(dir, "shadow_defect.json", R"JSON({
         "header": "x.h",
         "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
@@ -388,7 +394,7 @@ TEST(ShippedLibDescriptor, MacroShadowingSymbolWithoutReferenceFailsLoud) {
             { "name": "h", "signature": "fn(i32) -> i32" }
         ],
         "macros": [
-            { "name": "g", "params": ["x"], "replacement": "h((x))" }
+            { "name": "g", "replacement": "h" }
         ]
     })JSON");
     TypeInterner interner{CompilationUnitId{1}};
@@ -403,6 +409,79 @@ TEST(ShippedLibDescriptor, MacroShadowingSymbolWithoutReferenceFailsLoud) {
     EXPECT_TRUE(anyDiagMentions(rep, "does not reference"))
         << "and it must state the DISCRIMINATOR, or the reader will conclude that "
            "a same-name macro is itself illegal (it is not — see the tgmath pin)";
+    EXPECT_TRUE(anyDiagMentions(rep, "OBJECT-LIKE"))
+        << "and it must name the FORM, because that is the half the guard shipped "
+           "WRONG: the old wording said 'nothing can ever call the symbol' of a "
+           "FUNCTION-LIKE macro too, which C 7.1.4p2 flatly contradicts";
+    EXPECT_TRUE(anyDiagMentions(rep, "params"))
+        << "and it must offer the remedy that the true rule creates — declaring "
+           "'params' makes the macro function-like and the symbol addressable — or "
+           "an author facing a genuinely addressable function has no way out";
+}
+
+// ── THE SHAPE THIS GUARD USED TO REFUSE, AND MUST NOT ────────────────────────
+// D-FFI-MACRO-SHADOWING-GUARD-IGNORES-C-7-1-4-FUNCTION-ADDRESSABILITY
+//
+// ★ IDENTICAL TO THE DEFECT PIN ABOVE IN EVERY RESPECT BUT ONE: `params`. That one
+// key is the whole difference between "nothing can ever reach the symbol" and "the
+// standard GUARANTEES the symbol is reachable", because a function-like macro is
+// expanded only where its name is followed by `(` (C 6.10.3p10) — so `&g` and
+// `(g)(1)` bind to the SYMBOL, which C 7.1.4p2 states outright ("it is permitted to
+// take the address of a library function even if it is also defined as a macro").
+// ✔MEASURED in gcc 13.3.0 and clang 18.1.3 separately, and in DSS itself.
+//
+// RED-ON-DISABLE: drop the `body.functionLike` test in `checkMacroSymbolShadowing`
+// and this read starts failing again, while the defect pin above stays red — so
+// re-widening the guard is distinguishable from deleting it.
+TEST(ShippedLibDescriptor, FunctionLikeMacroShadowingSymbolWithoutReferenceIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "shadow_fnlike_ok.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "g", "signature": "fn(i32) -> i32" },
+            { "name": "h", "signature": "fn(i32) -> i32" }
+        ],
+        "macros": [
+            { "name": "g", "params": ["x"], "replacement": "h((x))" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_TRUE(desc.has_value())
+        << "C 7.1.4p2 guarantees '&g' and '(g)(1)' reach the SYMBOL, so the eager "
+           "import is LIVE — refusing this makes a standard-mandated shape "
+           "undeclarable (it is exactly C23 <stdbit.h>'s stdc_* shape)";
+    EXPECT_FALSE(rep.hasErrors());
+}
+
+// A ZERO-PARAMETER function-like macro is still function-like: `M()` expands, `&M`
+// does not. `decodeShippedMacros` already spells this rule "params ABSENT =
+// object-like; PRESENT (even []) = function-like", and the guard MUST read the form
+// from that same key or the two drift.
+TEST(ShippedLibDescriptor, ZeroParamFunctionLikeMacroShadowingSymbolIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "shadow_zeroparam_ok.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "g", "signature": "fn() -> i32" },
+            { "name": "h", "signature": "fn() -> i32" }
+        ],
+        "macros": [
+            { "name": "g", "params": [], "replacement": "h()" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_TRUE(desc.has_value())
+        << "an EMPTY 'params' array is still 'params' — the guard must agree with "
+           "decodeShippedMacros about what makes a macro function-like";
+    EXPECT_FALSE(rep.hasErrors());
 }
 
 TEST(ShippedLibDescriptor, MacroShadowingSymbolItReferencesIsAccepted) {
@@ -475,11 +554,15 @@ TEST(ShippedLibDescriptor, MacroShadowingSymbolOnDisjointFormatsIsAccepted) {
 TEST(ShippedLibDescriptor, MacroVariantWhoseOtherFormatBodyDropsTheNameFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     // ★ EVERY VARIANT BODY IS CHECKED INDEPENDENTLY, NOT "ANY BODY REFERENCES IT".
-    // The pe body REFERENCES `q` (legitimate — the tgmath `fabs`/`ldexp` shape), the
-    // elf body does NOT, and the symbol is available on BOTH formats. So this is a
-    // real defect ON ELF that its own pe sibling must not excuse.
+    // The pe body REFERENCES `q` (legitimate — the glibc `#define stdin stdin`
+    // shape), the elf body does NOT, and the symbol is available on BOTH formats.
+    // So this is a real defect ON ELF that its own pe sibling must not excuse.
+    // ⚠ BOTH BODIES ARE OBJECT-LIKE ON PURPOSE. Written function-like, this pin
+    // would prove nothing after P41 — a function-like body is excused by C 7.1.4p2
+    // regardless of what it references, so the reference axis has to be tested on
+    // the form where the reference is what decides.
     // RED-ON-DISABLE: change the predicate to "any body references the name" and
-    // this read starts succeeding, while all three pins above stay green — so the
+    // this read starts succeeding, while every pin above stays put — so the
     // weakening is distinguishable from removing the guard outright.
     auto const path = writeTemp(dir, "shadow_variant_mixed.json", R"JSON({
         "header": "x.h",
@@ -491,8 +574,8 @@ TEST(ShippedLibDescriptor, MacroVariantWhoseOtherFormatBodyDropsTheNameFailsLoud
         "macros": [
             { "name": "q",
               "variants": [
-                { "when": { "format": "pe" },  "params": ["x"], "replacement": "q((x))" },
-                { "when": { "format": "elf" }, "params": ["x"], "replacement": "r((x))" }
+                { "when": { "format": "pe" },  "replacement": "q" },
+                { "when": { "format": "elf" }, "replacement": "r" }
               ] }
         ]
     })JSON");
@@ -502,6 +585,74 @@ TEST(ShippedLibDescriptor, MacroVariantWhoseOtherFormatBodyDropsTheNameFailsLoud
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_FALSE(desc.has_value());
     EXPECT_TRUE(anyDiagMentions(rep, "SHADOWS"));
+}
+
+// ★ THE **FORM** IS PER BODY TOO, EXACTLY AS THE REFERENCE IS. The pe arm is
+// FUNCTION-LIKE and non-referencing (benign — C 7.1.4p2 keeps `&q` bound to the
+// symbol there); the elf arm is OBJECT-LIKE and non-referencing (a real dead import
+// ON ELF). Its function-like pe sibling must not excuse it.
+// ⚠ THIS IS THE MIRROR OF THE PIN ABOVE, and it is what makes the P41 narrowing a
+// NARROWING rather than a per-entry escape hatch: read `params` off the macro ENTRY
+// (or off the first body) instead of off each BODY and this read starts succeeding.
+// `decodeShippedMacros` refuses an entry that carries both a body key and
+// `variants`, so a variants macro's `params` can ONLY live on the variant — an
+// entry-level read would find none and call every arm object-like, or find one and
+// call every arm function-like; either way one of the two pins here goes red.
+TEST(ShippedLibDescriptor, MacroVariantObjectLikeArmNotExcusedByFunctionLikeSibling) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "shadow_variant_form_mixed.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "q", "signature": "fn(i32) -> i32" },
+            { "name": "r", "signature": "fn(i32) -> i32" }
+        ],
+        "macros": [
+            { "name": "q",
+              "variants": [
+                { "when": { "format": "pe" },  "params": ["x"], "replacement": "r((x))" },
+                { "when": { "format": "elf" }, "replacement": "r" }
+              ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value())
+        << "the elf arm is an object-like non-referencing shadow — a dead import on "
+           "elf — and its function-like pe sibling says nothing about elf";
+    EXPECT_TRUE(anyDiagMentions(rep, "OBJECT-LIKE"));
+}
+
+// The same entry with the elf arm ALSO function-like must LOAD. Without this the
+// test above is satisfied by a guard that simply refuses every `variants` macro.
+TEST(ShippedLibDescriptor, MacroVariantEveryArmFunctionLikeIsAccepted) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "shadow_variant_form_ok.json", R"JSON({
+        "header": "x.h",
+        "library": { "pe": "ucrtbase.dll", "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "q", "signature": "fn(i32) -> i32" },
+            { "name": "r", "signature": "fn(i32) -> i32" }
+        ],
+        "macros": [
+            { "name": "q",
+              "variants": [
+                { "when": { "format": "pe" },  "params": ["x"], "replacement": "r((x))" },
+                { "when": { "format": "elf" }, "params": ["x"], "replacement": "r((x))" }
+              ] }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    // activeFormat deliberately NOT supplied — the nullopt path, where `out.macros`
+    // is EMPTY for a variants-only macro and only the raw-JSON read can see either
+    // arm at all.
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
 }
 
 // A per-symbol `library` VALUE that is not a string fails loud (mirrors the

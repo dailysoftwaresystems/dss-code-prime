@@ -1996,7 +1996,7 @@ TEST(TargetSchema, TFC74PredefinedMacroUnknownKindRejected) {
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
-            "predefinedMacros":[{"name":"__X__","kind":"consant","value":"1","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+            "predefinedMacros":[{"name":"__X__","kind":"consant","value":"1","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "the `kind` verb set is CLOSED — a typo must never load as some "
@@ -2008,7 +2008,7 @@ TEST(TargetSchema, TFC74PredefinedMacroConstantRequiresValue) {
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
-            "predefinedMacros":[{"name":"__X__","kind":"constant","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+            "predefinedMacros":[{"name":"__X__","kind":"constant","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "a constant predefine with no `value` would expand to nothing — "
@@ -2021,7 +2021,7 @@ TEST(TargetSchema, TFC74PredefinedMacroBadObjectFormatRejected) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "availableObjectFormats":["machoo"],"impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+                                 "availableObjectFormats":["machoo"],"programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "an unknown object-format name is a typo that would make the macro "
@@ -2036,8 +2036,8 @@ TEST(TargetSchema, TFC74PredefinedMacroDuplicateNameRejected) {
     auto r = TargetSchema::loadFromText(
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
-            "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}},
-                                {"name":"__X__","kind":"constant","value":"2","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+            "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}},
+                                {"name":"__X__","kind":"constant","value":"2","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "two entries for one name would make the effective value depend on "
@@ -2066,7 +2066,7 @@ TEST(TargetSchema, PredefinedMacroEntryUnknownKeyRejectedAndNamed) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "availabelObjectFormats":["elf"],"impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+                                 "availabelObjectFormats":["elf"],"programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "a misspelled entry key must be REFUSED — silently ignoring this "
@@ -2091,7 +2091,7 @@ TEST(TargetSchema, PredefinedMacroEntryDollarPrefixedKeyStillAccepted) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "$valueComment":"why this spelling","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+                                 "$valueComment":"why this spelling","programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_TRUE(r.has_value())
         << "`$`-prefixed keys are prose, not knobs — and the carve-out must be "
@@ -2726,7 +2726,7 @@ TEST(TargetSchema, TFC76PredefinedMacroSentinelObjectFormatRejected) {
         R"({"dssTargetVersion":1,"target":{"name":"X"},
             "opcodes":[{"mnemonic":"invalid","result":"none"}],
             "predefinedMacros":[{"name":"__X__","kind":"constant","value":"1",
-                                 "availableObjectFormats":["unknown"],"impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
+                                 "availableObjectFormats":["unknown"],"programRedefinition":"ordinary","impliedSurface":{"kind":"claims-nothing","reason":"arch-property"}}]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
         << "'unknown' spells correctly, so only an explicit selectability check "

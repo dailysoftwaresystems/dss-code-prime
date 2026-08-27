@@ -7242,11 +7242,161 @@ TEST(MirToLir, BitCountLowersToNativeOnX86) {
         << "the native path emits no SWAR multiply";
 }
 
+// ── D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: the DECLARED-SEQUENCE realization ─────
+//
+// AArch64 has no scalar-GPR population count, so its `popcount` row carries no
+// `encoding` at all and a four-step `lowering` sequence instead (GPR→SIMD move,
+// per-byte lane count, lane reduction, SIMD→GPR move). These pins hold the two
+// halves apart: the SHIPPED document is the POSITIVE case, and the negative is
+// synthesized by REMOVING the row — never by adding one, because an addition
+// always changes the document while a removal that finds nothing to remove
+// THROWS, and that difference is what keeps the pins honest if the shipped
+// config ever loses the feature.
+
+namespace {
+// The ONE question both pins ask, asked of the SCHEMA rather than of the file:
+// does this target realize `popcount` as a declared instruction SEQUENCE?
+// `lowerPopcount` reads exactly this (via `lowerViaDeclaredSequence`), so a
+// reverted or mis-merged config edit fails loudly HERE instead of becoming a
+// silent nothing-to-expand everywhere downstream.
+[[nodiscard]] bool declaresPopcountSequence(TargetSchema const& sch) {
+    auto const op = sch.opcodeByMnemonic("popcount");
+    if (!op.has_value()) return false;
+    auto const* info = sch.opcodeInfo(*op);
+    return info != nullptr && !info->lowering.sequences.empty();
+}
+} // namespace
+
+// The shipped arm64 target lowers MIR Popcount to its declared FOUR-STEP vector
+// sequence at BOTH promotion widths — and to NONE of the SWAR's arithmetic.
+TEST(MirToLir, PopcountLowersToDeclaredVectorSequenceOnArm64) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value()) << "loadShipped(arm64) failed";
+    // The POSITIVE case is the shipped document itself — but only as long as it
+    // really carries the sequence, which is a property of a `.target.json` file
+    // and therefore a property that can be edited away.
+    ASSERT_TRUE(declaresPopcountSequence(**target))
+        << "the SHIPPED arm64 target no longer declares a `lowering` sequence "
+           "on `popcount`. Without it MIR Popcount falls back to the SWAR and "
+           "this pin would be testing the schema against itself "
+           "(D-FULLC-STDBIT-ARM64-CNT-POPCOUNT).";
+    auto L = lowerCToLir(
+        "int pc32(unsigned int x){return __builtin_popcount(x);}\n"
+        "int pc64(unsigned long long x){return __builtin_popcountll(x);}\n",
+        *target);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "the declared sequence must lower cleanly: "
+        << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    // Two popcounts → one whole sequence each. Counting EVERY step (not just
+    // the recognisable `cnt`) is what catches a truncated expansion: a sequence
+    // missing its lane reduction would still show a lane count.
+    EXPECT_EQ(countLirOp(lir, sch, "movq_gpr_to_xmm"), 2)
+        << "the GPR->SIMD entry move, once per popcount";
+    EXPECT_EQ(countLirOp(lir, sch, "popcount_bytes"), 2)
+        << "the per-byte lane count, once per popcount";
+    EXPECT_EQ(countLirOp(lir, sch, "addlanes_bytes"), 2)
+        << "the lane REDUCTION — without it the result is eight separate "
+           "per-byte counts, not a population count";
+    EXPECT_EQ(countLirOp(lir, sch, "movq_xmm_to_gpr"), 2)
+        << "the SIMD->GPR exit move, once per popcount";
+    // And none of the SWAR's arithmetic: the 0x0101.. multiply is its signature.
+    EXPECT_EQ(countLirOp(lir, sch, "mul"), 0)
+        << "the declared sequence emits no SWAR multiply";
+}
+
+// RED-ON-DISABLE, the REMOVAL direction: take the `popcount` row away from the
+// SHIPPED arm64 document and MIR Popcount must fall back to the SWAR bit-trick —
+// not fail loud, not emit a lane count. This is what keeps the SWAR path
+// REACHABLE and TESTED for every target that declares no realization, now that
+// both shipped targets declare one. `mutateShippedTargetSchemaJson` THROWS if the
+// row it was asked to remove is not there, so this pin cannot go vacuously green.
+TEST(MirToLir, PopcountFallsBackToSwarWhenArm64DeclaresNoPopcountRow) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
+        "arm64", {"popcount"});
+    ASSERT_TRUE(mutated.has_value())
+        << "mutateShippedTargetSchemaJson(arm64, -popcount) failed";
+    // The mutant must actually DIFFER in the property under test — asserting
+    // only "it loaded" is the vacuous arm this suite has been bitten by.
+    ASSERT_FALSE(declaresPopcountSequence(**mutated))
+        << "the mutant still declares a popcount sequence — it asserts nothing";
+    auto L = lowerCToLir(
+        "int pc(unsigned long long x){return __builtin_popcountll(x);}\n",
+        *mutated);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "the SWAR fallback must lower cleanly, NOT fail loud: "
+        << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    EXPECT_EQ(countLirOp(lir, sch, "popcount_bytes"), 0)
+        << "no lane count when the target declares no popcount row";
+    EXPECT_EQ(countLirOp(lir, sch, "addlanes_bytes"), 0);
+    EXPECT_EQ(countLirOp(lir, sch, "movq_gpr_to_xmm"), 0);
+    EXPECT_GE(countLirOp(lir, sch, "mul"), 1)
+        << "the SWAR popcount's distinctive 0x0101.. multiply";
+    EXPECT_GE(countLirOp(lir, sch, "and"), 3)
+        << "the SWAR popcount masks with 0x55/0x33/0x0F";
+    EXPECT_GE(countLirOp(lir, sch, "sub"), 1)
+        << "the SWAR popcount's x -= (x>>1)&m1 step";
+}
+
+// The sequence's TEMPORARIES must live in the SIMD/FP bank and its RESULT in the
+// integer bank. A class mistake here is exactly the silent miscompile the
+// encoder's register-bank vocabulary exists to prevent
+// (D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD): a GPR ordinal written into
+// an FP register field is VALID bytes naming the WRONG register, and nothing
+// downstream can tell. Asserted on the vregs, before regalloc, because that is
+// where the lowering decides it.
+TEST(MirToLir, Arm64PopcountSequenceKeepsItsTemporariesInTheFpBank) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ASSERT_TRUE(declaresPopcountSequence(**target));
+    auto L = lowerCToLir(
+        "int pc(unsigned long long x){return __builtin_popcountll(x);}\n",
+        *target);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    auto opOf = [&](char const* m) { return sch.opcodeByMnemonic(m); };
+    auto const toFp   = opOf("movq_gpr_to_xmm");
+    auto const lanes  = opOf("popcount_bytes");
+    auto const reduce = opOf("addlanes_bytes");
+    auto const toGpr  = opOf("movq_xmm_to_gpr");
+    ASSERT_TRUE(toFp && lanes && reduce && toGpr);
+    int checked = 0;
+    for (std::size_t f = 0; f < lir.moduleFuncCount(); ++f) {
+        LirFuncId const fn = lir.funcAt(static_cast<std::uint32_t>(f));
+        for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+            LirBlockId const bb = lir.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+                LirInstId const id = lir.blockInstAt(bb, i);
+                std::uint16_t const op = lir.instOpcode(id);
+                if (op == *toFp || op == *lanes || op == *reduce) {
+                    EXPECT_EQ(lir.instResult(id).regClass(), LirRegClass::FPR)
+                        << "a sequence temporary must be FP-bank";
+                    ++checked;
+                } else if (op == *toGpr) {
+                    EXPECT_EQ(lir.instResult(id).regClass(), LirRegClass::GPR)
+                        << "the sequence's RESULT must match the MIR result's "
+                           "integer class";
+                    ++checked;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(checked, 4) << "all four steps must have been inspected";
+}
+
 // RED-ON-DISABLE: drop the `popcount` mnemonic from x86_64 and MIR Popcount MUST
 // lower to the SWAR bit-trick sequence (a `mul` by the 0x0101.. magic + the
-// 0x55/0x33/0x0F masks) — NOT fail loud, NOT a `popcount` op. This proves the
-// fallback is REAL (arm64 declares no popcount, so it lands here at runtime — the
-// runnable example `builtin_bitcount` witnesses the SWAR result on qemu-arm64).
+// 0x55/0x33/0x0F masks) — NOT fail loud, NOT a `popcount` op. The x86 half of the
+// same falsifiability arm as the arm64 pin above: with BOTH shipped targets now
+// declaring a realization, a removal mutant is the only way the SWAR is reached
+// at all, so it is pinned from both sides.
 TEST(MirToLir, PopcountFallsBackToSwarWhenNoNativeMnemonic) {
     auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
         "x86_64", {"popcount"});

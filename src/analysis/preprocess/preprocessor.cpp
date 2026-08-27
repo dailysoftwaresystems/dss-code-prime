@@ -269,21 +269,6 @@ std::vector<PPToken> tokenizeToPP(
 
 } // namespace
 
-LineMap::Resolved LineMap::resolve(ByteOffset synthOffset) const noexcept {
-    if (segments_.empty()) return {};
-    LineMapSegment const* best = &segments_.front();
-    for (auto const& seg : segments_) {
-        if (seg.synthStart <= synthOffset) best = &seg;
-        else break;
-    }
-    Resolved r;
-    r.origin = best->origin.get();
-    const ByteOffset delta = (synthOffset >= best->synthStart)
-                                 ? (synthOffset - best->synthStart) : 0;
-    r.offset = best->originStart + delta;
-    return r;
-}
-
 Token const& PreprocessResult::eofToken() const {
     // Fail LOUD and NAMED rather than reading past the end. `preprocess()`'s
     // single exit (`establishResultContract`) guarantees both conditions for
@@ -1032,6 +1017,33 @@ struct SynthBuilder {
         // language one does.
         if (localMacros.find(std::string{n}) != localMacros.end()) return true;
         for (PredefinedMacroDef const& pm : effectivePredefines) {
+            // ★★ D-PP-PREDEFINE-REDEFINITION-PARTITION — THIS CLAUSE CLOSES THE
+            // LATENT SEAM THE PARTITION WOKE UP; IT IS NOT A TIDY-UP.
+            // The EDGE the block above documents — "a `#undef` of a PREDEFINED
+            // name is still not reflected by the predefined for-loop arm, so the
+            // pre-scan may read MORE-live than the authoritative pass" — was
+            // UNREACHABLE while the authoritative pass REFUSED every such
+            // `#undef`: a directive that never takes effect cannot desynchronise
+            // anything. Making `#undef` take effect makes the edge reachable for
+            // EVERY row, so it is closed here, in the same change that opens it.
+            // ★ The fix is to narrow the arm to exactly what it was always FOR.
+            // Every OBJECT-like row — warn-class and ordinary alike — is already
+            // seeded into `localMacros` by the C21 value prefix
+            // (`preScanDefinePrefix`), so the branch above answers for it AND a
+            // source `#undef` composes with it, exactly as for a command-line
+            // `--define`. Only a FUNCTION-like row is absent from that prefix
+            // (FINDING-A deliberately excludes it, so a bare `#if NAME` folds to
+            // 0 in both passes), and answering for those is this arm's whole
+            // C19/FINDING-A job.
+            // ⚠ THE FIRST CUT OF THIS CLAUSE SKIPPED `ordinary` ROWS INSTEAD,
+            // AND THAT BROKE THE INVARIANT IN THE DANGEROUS DIRECTION: a
+            // function-like predefine is ordinary by construction (the loader
+            // enforces it), so `#ifdef __declspec` would have read DEAD here
+            // while the authoritative pass — holding it in `table_` from the
+            // built-in prologue — read it LIVE. That is a quote-`#include`
+            // silently not spliced, i.e. P0016 itself, not the tolerated
+            // more-live direction.
+            if (!pm.isFunctionLike) continue;
             if (pm.name == n) return true;
         }
         // TF-C86 (D-CSUBSET-STDARG-F001A): the language's conditional-inclusion
@@ -2772,6 +2784,16 @@ public:
             // expansion). Seeding it here too would make the prologue #define
             // trip the C 6.10.8.1 predefined-collision guard against itself.
             if (pm.isFunctionLike) continue;
+            // D-PP-PREDEFINE-REDEFINITION-PARTITION: an `ordinary` row is NOT
+            // seeded here either — it lowers to a "<built-in>" `#define` beside
+            // the function-like ones, so `table_` owns it and the ordinary
+            // directive handler gives `#undef`, the 6.10.5p2 redefinition
+            // policy and `#ifdef` agreement with no new machinery. `predefined_`
+            // is now exactly the WARN set, which is also exactly the set
+            // `handleDefine`/`handleUndef` diagnose — the two facts are one fact.
+            if (!predefinedNameIsDiagnosedOnChange(pm.programRedefinition)) {
+                continue;
+            }
             predefined_.emplace(pm.name, pm);
         }
         // FC15b: compute the translation DATE/TIME spellings ONCE (C 6.10.8.1 --
@@ -4329,16 +4351,53 @@ private:
         const std::size_t nameIdx = p;
         ++p;
 
-        // FC15b (C 6.10.8.1p2): a PREDEFINED macro name shall not be the subject
-        // of a `#define`. Reject loudly and DO NOT alter the table (the predefined
-        // name keeps materializing its configured value). Looked up in the
-        // config-seeded set, so the engine never hard-codes a name.
-        if (predefined_.find(name) != predefined_.end()) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorPredefinedMacro,
-                   synth_->id(), in[nameIdx].span,
-                   std::string{"'"} + name
-                       + "' is a predefined macro and may not be #defined");
-            return;
+        // FC15b (C23 6.10.10.1p2): a `#define` of a name this implementation
+        // predefined. Looked up in the config-seeded set, so the engine never
+        // hard-codes a name.
+        //
+        // ★ D-PP-PREDEFINE-REDEFINITION-PARTITION — WHAT THIS SET NOW IS.
+        // `predefined_` holds exactly the rows whose config `programRedefinition`
+        // is a WARN verb. An implementation-supplied extension — a compiler- or
+        // arch-identity row, whatever the config names it — is no longer in it: it
+        // lowers to an ordinary "<built-in>" `#define`, so it never reaches this
+        // arm and only the ordinary 6.10.5p2 policy applies — which is the
+        // reference behaviour, MEASURED on gcc 13.3.0 and clang 18.1.3
+        // SEPARATELY over a 36-name sweep. ⚠ SO THIS ARM IS NO LONGER "the
+        // predefined guard": it is the DIAGNOSED half of a partition, and
+        // widening `predefined_` back to every config row would make DSS warn
+        // about an `#undef` of an ordinary identity macro, which neither
+        // reference does.
+        //
+        // ★★ IT IS A WARNING AND IT FALLS THROUGH — AND THAT REVERSAL IS THE
+        // POINT OF THE ROW. It used to be an ERROR with an early `return`, on
+        // the reading that 6.10.10.1p2 is a CONSTRAINT. ✔RE-MEASURED against
+        // N3220: 6.10.10 carries no `Constraints` heading (6.10.5 does), so
+        // C23 4p2 makes the violation UNDEFINED BEHAVIOUR, and 5.1.1.3 requires
+        // a diagnostic only for a syntax-rule or CONSTRAINT violation. Nothing
+        // is required here at all. ✔MEASURED on gcc 13.3.0 and clang 18.1.3
+        // separately: both WARN and both APPLY — `#undef __STDC__` then
+        // `#define __STDC__ 77` prints 77 on both, and `#undef __LINE__` then
+        // `int __LINE__ = 9;` compiles on both. So refusing was a divergence,
+        // and it is the same shape as D-PP-INCOMPATIBLE-REDEFINITION-IS-FATAL
+        // one tier up: being stricter than every reference is not rigor.
+        // ⚠ The `erase` is load-bearing, not cleanup. It is what makes the
+        // directive TAKE EFFECT: `expand` materializes a predefined value only
+        // on a `table_` MISS, and `isDefined` ORs the two maps, so a name left
+        // in `predefined_` would keep expanding and keep reading `#ifdef`-true
+        // no matter what the program wrote. Erasing also makes the FIRST
+        // program action consume the name's diagnosed status — matching clang,
+        // where a second `#undef`/`#define` cycle is silent.
+        if (auto pit = predefined_.find(name); pit != predefined_.end()) {
+            if (predefinedNameIsDiagnosedOnChange(
+                    pit->second.programRedefinition)) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorPredefinedMacro,
+                       synth_->id(), in[nameIdx].span,
+                       std::string{"'"} + name
+                           + "' is a predefined macro of this implementation; "
+                             "#defining it replaces the implementation's value",
+                       DiagnosticSeverity::Warning);
+            }
+            predefined_.erase(pit);
         }
 
         // TF-C86 (D-CSUBSET-STDARG-F001A): the sibling constraint for the
@@ -4955,15 +5014,38 @@ private:
             return;
         }
         const std::string name{text(in[p])};
-        // FC15b (C 6.10.8.1p2): a PREDEFINED macro name shall not be the subject
-        // of a `#undef`. Reject loudly and DO NOT touch the table (config-seeded
-        // lookup, no hard-coded name).
-        if (predefined_.find(name) != predefined_.end()) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorPredefinedMacro,
-                   synth_->id(), in[p].span,
-                   std::string{"'"} + name
-                       + "' is a predefined macro and may not be #undef'd");
-            return;
+        // FC15b (C23 6.10.10.1p2): an `#undef` of a name this implementation
+        // predefined (config-seeded lookup, no hard-coded name).
+        //
+        // ★ D-PP-PREDEFINE-REDEFINITION-PARTITION: the `#undef` half, and it is
+        // the half where the two classes separate most cleanly. ✔MEASURED
+        // 2026-08-26 on gcc 13.3.0 and clang 18.1.3, probed separately: a bare
+        // `#undef __STDC_VERSION__` DIAGNOSES on both, while an `#undef` of an
+        // ordinary compiler- or arch-identity row is SILENT on both (16 such
+        // names swept, zero diagnostics between them) — the
+        // warn-class diagnostic is attached to the NAME, the ordinary one only
+        // to a REDEFINITION. An `ordinary` row is not in `predefined_` at all
+        // (it lowers to a "<built-in>" `#define`), so its `#undef` reaches the
+        // ordinary handler below and simply erases it, silently.
+        //
+        // ★★ WARN AND FALL THROUGH — see the twin block in `handleDefine` for
+        // why this stopped being an error. ✔MEASURED on both references: after
+        // a bare `#undef`, `#ifdef __LINE__` / `__STDC__` / `__COUNTER__` are
+        // all FALSE, i.e. the directive really removes the name. The `erase`
+        // below is what reproduces that; without it `isDefined` would keep
+        // answering true from `predefined_` and the `#undef` would be a
+        // diagnostic with no effect, which is the worst of both readings.
+        if (auto pit = predefined_.find(name); pit != predefined_.end()) {
+            if (predefinedNameIsDiagnosedOnChange(
+                    pit->second.programRedefinition)) {
+                emitPP(rep_, DiagnosticCode::P_PreprocessorPredefinedMacro,
+                       synth_->id(), in[p].span,
+                       std::string{"'"} + name
+                           + "' is a predefined macro of this implementation; "
+                             "#undef'ing it removes the implementation's value",
+                       DiagnosticSeverity::Warning);
+            }
+            predefined_.erase(pit);
         }
         // TF-C86 (D-CSUBSET-STDARG-F001A): the `#undef` half. An `#undef
         // __has_include` that SUCCEEDED would silently turn the operator back
@@ -6891,16 +6973,52 @@ PreprocessResult preprocessRun(
         // format-resolved, so no filter is re-applied here. A TARGET-declared
         // function-like predefine lowers to a "<built-in>" `#define` exactly
         // like a language-declared one.
+        // D-PP-PREDEFINE-REDEFINITION-PARTITION: the prologue now also carries
+        // every OBJECT-like row whose config says a program may redefine it.
+        // That is not a relaxation bolted onto the refusal — it is the SAME
+        // mechanism the references use, in their own words: gcc reports a
+        // redefined compiler-identity macro at `<command-line>` over a
+        // `<built-in>` definition, and clang's diagnostic literally reads
+        // `In file included from <built-in>:388:`. ✔MEASURED 2026-08-26 (both,
+        // probed separately). Lowering an implementation predefine to an
+        // ordinary `#define` here is therefore the reference architecture, and
+        // every behaviour the partition owes falls out of the directive handler
+        // that already exists: `#undef` composes, an incompatible redefinition
+        // warns and the new definition wins (D-PP-INCOMPATIBLE-REDEFINITION-IS-FATAL,
+        // itself measured against those same references), an IDENTICAL
+        // redefinition is silent per 6.10.5p2, and `#ifdef` tracks all of it.
         for (PredefinedMacroDef const& pm : merged.effective) {
-            if (!pm.isFunctionLike) continue;
+            // A WARN row stays in the `predefined_` name set, where the two
+            // diagnostics live. It must never be lowered here: a `#define` line
+            // for a derived kind would shadow the ENGINE-COMPUTED value with a
+            // static one, and lowering an ISO-listed constant would turn the
+            // program's own `#define` of it into an ordinary redefinition — the
+            // wrong diagnostic, from the wrong rule.
+            // ⚠ THE `isFunctionLike` CLAUSE IS NOT REDUNDANT, even though the
+            // loader refuses a function-like row that is not `ordinary`. This
+            // site must agree with the `predefined_` seed, which skips EVERY
+            // function-like row unconditionally — and a `PredefinedMacroDef`
+            // built in C++ (tests, and any future programmatic producer) never
+            // passes through that loader, so it carries the struct's default
+            // verb. Keyed on the verb alone, such a row would be in NEITHER
+            // map: silently not predefined at all. Structural agreement here
+            // costs one clause; relying on a validator two tiers away to keep
+            // an invariant that this loop could just state is how a hole opens.
+            if (!pm.isFunctionLike
+                && predefinedNameIsDiagnosedOnChange(pm.programRedefinition)) {
+                continue;
+            }
             builtinText += "#define ";
             builtinText += pm.name;
-            builtinText += '(';
-            for (std::size_t i = 0; i < pm.params.size(); ++i) {
-                if (i != 0) builtinText += ',';
-                builtinText += pm.params[i];
+            if (pm.isFunctionLike) {
+                builtinText += '(';
+                for (std::size_t i = 0; i < pm.params.size(); ++i) {
+                    if (i != 0) builtinText += ',';
+                    builtinText += pm.params[i];
+                }
+                builtinText += ')';
             }
-            builtinText += ") ";
+            builtinText += ' ';
             builtinText += pm.value;
             builtinText += '\n';
         }

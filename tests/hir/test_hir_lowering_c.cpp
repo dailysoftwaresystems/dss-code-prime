@@ -8671,3 +8671,232 @@ TEST(HirLoweringC, TFC112IncompatibleInlineDefinitionOfAShimSymbolFailsLoud) {
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 1u);
     EXPECT_EQ(externRowsNamed(*res, "printf"), 0u);
 }
+
+// ★★ D-CSUBSET-ENUM-FNSIG-NULLPTR-CONDITIONS-SKIP-THE-TRUTHINESS-CHOKEPOINT
+//
+// C 6.8.4.1 / 6.8.5 / 6.5.15 / 6.5.13 / 6.5.14 all state ONE rule — a
+// controlling (or logical-operand) expression "shall have scalar type" and is
+// compared unequal to 0 — and `coerceCondition` is the ONE place every such
+// site funnels through. Scalar is arithmetic (which INCLUDES the enumerated
+// types, C 6.2.5p17) union pointer (C 6.2.5p21); a function designator joins by
+// C 6.3.2.1p4 and C23 `nullptr_t` by C 6.3.2.4p2. Before this closed, those
+// three kinds fell through that function UNCHANGED and reached the MIR CondBr
+// terminator still carrying their source type, where the verifier fired
+// I_TerminatorTypeMismatch (I_NullptrTypeInMir for nullptr) on LEGAL input —
+// while `int y = e; if (y)`, `!e` and `e != 0` all worked.
+//
+// This pin names the HIR tier: the SHAPE the conversion must produce. The MIR
+// sibling (MirLoweringC.ScalarFamilyConditionsLowerToABoolCondBr) pins the
+// consequence, and examples/c/scalar_condition_conversions proves the VALUES on
+// every run leg.
+//
+// RED-ON-DISABLE (REMOVE direction): delete the `ck == TypeKind::Enum` arm in
+// `coerceCondition` and an enum condition synthesizes NO Ne at all — the count
+// below goes 7 -> 0. The count is per-SITE on purpose: reverting the arm cannot
+// be masked by any one site keeping a private conversion of its own.
+TEST(HirLoweringC, EnumConditionTakesTheTruthinessChokepointAtEverySite) {
+    SemanticModel model = analyzeC(
+        "enum Color { NONE = 0, EVEN = 4 };\n"
+        "int f(enum Color c) {\n"
+        "    int r = 0;\n"
+        "    if (c) r = 1;\n"                       // 6.8.4.1  selection
+        "    while (c) { r = 2; c = NONE; }\n"      // 6.8.5    iteration
+        "    for (; c; c = NONE) r = 3;\n"          // 6.8.5    iteration
+        "    r = c ? 4 : 5;\n"                      // 6.5.15   conditional
+        "    r = (c && 1) ? 6 : 7;\n"               // 6.5.13   logical AND
+        "    r = (c || 0) ? 8 : 9;\n"               // 6.5.14   logical OR
+        "    _Bool b = c; r = b ? 10 : 11;\n"       // 6.3.1.2  assignment form
+        "    return r;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    auto const& ti = model.lattice().interner();
+
+    // Count the SYNTHESIZED truth tests whose left operand is the enum→int
+    // projection: a `Ne` BinaryOp typed Bool whose child[0] is a Cast FROM an
+    // Enum-typed node. That is exactly the shape this arm owes, and nothing
+    // else in the program produces it.
+    std::size_t enumTruthTests = 0;
+    auto const walkEnum = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::BinaryOp
+            && isCoreOp(res->hir.payload(n))
+            && decodeCoreOp(res->hir.payload(n)) == HirOpKind::Ne) {
+            auto const kids = res->hir.children(n);
+            if (kids.size() == 2 && res->hir.kind(kids[0]) == HirKind::Cast) {
+                auto const inner = res->hir.children(kids[0]);
+                if (!inner.empty() && res->hir.typeId(inner[0]).valid()
+                    && ti.kind(res->hir.typeId(inner[0])) == TypeKind::Enum) {
+                    ++enumTruthTests;
+                    // The projection target is the enum's UNDERLYING integer
+                    // (C 6.7.2.2), and the test itself is Bool — the two
+                    // properties the MIR CondBr invariant depends on.
+                    EXPECT_EQ(ti.kind(res->hir.typeId(kids[0])), TypeKind::I32)
+                        << "the enum must project to its underlying integer, "
+                           "not to Bool: a Cast-to-Bool lowers as Trunc and "
+                           "would report the EVEN=4 enumerator as false";
+                    EXPECT_EQ(ti.kind(res->hir.typeId(n)), TypeKind::Bool)
+                        << "the synthesized truth test is Bool-typed";
+                }
+            }
+        }
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    walkEnum(walkEnum, res->hir.functionBody(fn));
+
+    EXPECT_EQ(enumTruthTests, 7u)
+        << "one enum->int truth test per controlling-expression site: if, "
+           "while, for, ternary, &&, ||, and the `_Bool b = c` assignment form "
+           "-- before the Enum arm, every one of these emitted NONE";
+}
+
+// The FUNCTION DESIGNATOR member of the same class.
+//
+// C 6.3.2.1p4: a function designator used anywhere but as the operand of
+// `sizeof`/`_Alignof`/unary `&` converts to pointer-to-function — so `if (fn)`
+// and `fn ? a : b` are legal (gcc's -Waddress warns that the address is never
+// null; the code compiles and the always-true truth value is CORRECT). It
+// decays through the SAME `coerce` FnSig→Ptr funnel the assignment and argument
+// paths use, then re-enters so the pointer takes the EXISTING null-pointer `Ne`
+// arm — the Array arm's shape exactly.
+//
+// RED-ON-DISABLE (REMOVE direction): delete the FnSig arm in `coerceCondition`
+// and `fnDecayTests` goes 2 -> 0 (and the MIR sibling reds with
+// I_TerminatorTypeMismatch, which is what the defect looked like).
+TEST(HirLoweringC, FunctionDesignatorConditionDecaysAndTakesTheChokepoint) {
+    SemanticModel model = analyzeC(
+        "static int helper(int v) { return v + 1; }\n"
+        "int f(void) {\n"
+        "    int r = 0;\n"
+        "    if (helper) r = 1;\n"          // function designator, `if`
+        "    r = helper ? 2 : 3;\n"         // function designator, ternary
+        "    return r;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& ti = model.lattice().interner();
+
+    std::size_t fnDecayTests = 0;       // Ne(Cast(FnSig -> Ptr), null)
+    auto const walkScalar = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::BinaryOp
+            && isCoreOp(res->hir.payload(n))
+            && decodeCoreOp(res->hir.payload(n)) == HirOpKind::Ne) {
+            auto const kids = res->hir.children(n);
+            if (kids.size() == 2 && res->hir.kind(kids[0]) == HirKind::Cast) {
+                auto const inner = res->hir.children(kids[0]);
+                if (!inner.empty() && res->hir.typeId(inner[0]).valid()
+                    && ti.kind(res->hir.typeId(inner[0])) == TypeKind::FnSig) {
+                    ++fnDecayTests;
+                    EXPECT_EQ(ti.kind(res->hir.typeId(kids[0])), TypeKind::Ptr)
+                        << "a function designator decays to pointer-to-function "
+                           "(C 6.3.2.1p4) before the truth test";
+                }
+            }
+        }
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    // ⚠ EVERY function, not `firstFunction`: `helper` is declared first here, so
+    // scanning only the first body would count nothing and the test would be
+    // vacuously satisfiable by deleting the conditions from the fixture.
+    std::size_t bodies = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) != HirKind::Function) continue;
+        ++bodies;
+        walkScalar(walkScalar, res->hir.functionBody(d));
+    }
+    ASSERT_EQ(bodies, 2u) << "both `helper` and `f` must have been lowered";
+
+    EXPECT_EQ(fnDecayTests, 2u)
+        << "one FnSig->Ptr decay + truth test per designator condition";
+}
+
+// The C23 `nullptr_t` member of the same class.
+//
+// ⚠ WHAT IS AND IS NOT CLAIMED HERE, because the first measurement of this arm
+// conflated two defects and the distinction is the whole value of the pin.
+// `if (nullptr)` — the LITERAL — always worked: the literal is already lowered
+// to an integer zero before `coerceCondition` sees it, so it took the arithmetic
+// arm. What did NOT work is a NullptrT-typed VALUE reaching a condition, which
+// is what a `nullptr_t`-typed object produces: `coerceCondition` dropped it
+// through unchanged and the semantic-tier-only kind reached MIR, tripping
+// `I_NullptrTypeInMir` — the invariant that says NullptrT must never get there.
+// C 6.3.2.4p2 settles it without a comparison at all: a `nullptr_t` converts to
+// `_Bool` as FALSE. Emitting the Bool literal is therefore what KEEPS that
+// tripwire true, rather than weakening it.
+//
+// ⚠ THIS TEST STOPS AT THE HIR TIER ON PURPOSE. A `nullptr_t`-typed OBJECT is
+// still refused further down (`I_StoreValueTypeMismatch` on its initializing
+// store — a SEPARATE defect, ✔MEASURED in cycle P41 and reported with it),
+// so an end-to-end witness is not available yet. HIR lowering itself is
+// clean, which is exactly the tier this arm lives at, so the property is pinned
+// where it is decided rather than left unproven until the sibling gap closes.
+//
+// RED-ON-DISABLE (REMOVE direction): delete the `ck == TypeKind::NullptrT` arm
+// in `coerceCondition` and `boolFalseLiterals` goes 2 -> 0 while
+// `nullptrCondNodes` goes 0 -> 2 — the NullptrT value survives the condition
+// position, which is the defect.
+TEST(HirLoweringC, NullptrTypedValueInAConditionBecomesTheBoolFalseLiteral) {
+    SemanticModel model = analyzeC(
+        "int f(void) {\n"
+        "    int r = 0;\n"
+        "    typeof(nullptr) v = nullptr;\n"
+        "    if (v) r = 1;\n"               // nullptr_t VALUE, `if`
+        "    r = v ? 2 : 3;\n"              // nullptr_t VALUE, ternary
+        "    return r;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    auto const& ti = model.lattice().interner();
+
+    // The two condition slots: an `If`'s condition child and a `Ternary`'s.
+    // Reading them by POSITION is what makes the assertion about the CONDITION
+    // rather than about the program's NullptrT nodes in general — the
+    // declaration's own initializer is legitimately NullptrT-typed and must not
+    // be counted.
+    std::size_t boolFalseLiterals = 0;
+    std::size_t nullptrCondNodes  = 0;
+    auto const inspectCond = [&](HirNodeId c) {
+        if (!c.valid()) return;
+        TypeId const t = res->hir.typeId(c);
+        if (!t.valid()) return;
+        if (ti.kind(t) == TypeKind::NullptrT) ++nullptrCondNodes;
+        if (res->hir.kind(c) == HirKind::Literal && ti.kind(t) == TypeKind::Bool)
+            ++boolFalseLiterals;
+    };
+    auto const walkConds = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::IfStmt)
+            inspectCond(res->hir.ifCondition(n));
+        if (res->hir.kind(n) == HirKind::Ternary) {
+            auto const kids = res->hir.children(n);
+            if (!kids.empty()) inspectCond(kids[0]);
+        }
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    walkConds(walkConds, res->hir.functionBody(fn));
+
+    EXPECT_EQ(boolFalseLiterals, 2u)
+        << "a nullptr_t condition becomes the Bool literal `false` "
+           "(C 6.3.2.4p2), NOT a run-time comparison";
+    EXPECT_EQ(nullptrCondNodes, 0u)
+        << "no NullptrT-typed node may survive a condition slot -- it is a "
+           "semantic-tier-only kind, and the I_NullptrTypeInMir tripwire firing "
+           "on it is what exposed the defect";
+}

@@ -1,0 +1,35 @@
+{
+  "$comment": "D-CSUBSET-ENUM-FNSIG-NULLPTR-CONDITIONS-SKIP-THE-TRUTHINESS-CHOKEPOINT: the end-to-end RUNTIME witness that C's SCALAR family reaches the front end's one truthiness chokepoint. C 6.8.4.1/6.8.5/6.5.15/6.5.13/6.5.14 all say a controlling expression 'shall have scalar type' and is compared unequal to 0; scalar is arithmetic (which INCLUDES enumerated types, 6.2.5p17) union pointer (6.2.5p21), and a function designator becomes a pointer by 6.3.2.1p4. Before this closed, an Enum condition and a function-DESIGNATOR condition fell through `coerceCondition` UNCHANGED and reached the MIR CondBr terminator still carrying their source type -- I_TerminatorTypeMismatch on legal input -- while `int y = e; if (y)`, `!e` and `e != 0` all worked. Both references accept every form (clang 18.1.3 and gcc 13.3.0, MEASURED over a 297-probe battery; this file's own exit code re-measured at -O0 and -O2 under both). ⚠ THE THIRD MEMBER, C23 nullptr_t, IS FIXED IN THE SAME CHOKEPOINT BUT IS DELIBERATELY NOT CLAIMED HERE: `if (nullptr)` -- the LITERAL, the only spelling this file can carry -- ALWAYS worked, because the literal is an integer zero before the chokepoint sees it; only a nullptr_t-typed VALUE was broken, and such an object is still refused one tier down by a separate open gap, so that arm is pinned at the HIR tier instead. The two nullptr arms stay as REGRESSION coverage that `nullptr` remains statically false. The 14 arms cover the six controlling-expression SITES (if / while / for / do-while / ternary / && / ||) plus the C 6.3.1.2 `_Bool b = e` assignment form, on an enum local, on a WIDER-valued enum, on an enum-typed BIT-FIELD, on a function designator (if + ternary) and on `nullptr` (if + &&). ⭐ THE INPUTS ARE WHAT MAKE IT FAIL-ABLE, not the shapes: every enumerator used as a truth value is EVEN and nonzero (EVEN=4, W_HIGH=256), because the tempting wrong fix -- coercing the enum to _Bool with a Cast, which MIR lowers as Trunc -- keeps only the LOW BIT and would report `if (EVEN)` as FALSE; an odd probe value cannot see that bug at all. W_HIGH=256 is nonzero only ABOVE the low byte, so an enum projected to a narrower container than its underlying int also scores 0. Every arm returns a DISTINCT weight (1..14, sum 105), so any single arm going wrong lands on an exit code no other single failure produces; the FALSE side of each site is scored too, so a truth value stuck at `true` moves the total the other way. Fold-resistant: the enum values arrive through `pick`/`pick_wide` taking a caller-computed int, so Inlining + ConstFold + Mem2Reg in the `release` arm cannot fold the conditions away. ⭐ ARMS 15-16 CARRY A SECOND ANCHOR, D-CSUBSET-LOGICAL-NOT-ON-A-FLOAT-MINTS-A-BARE-FLOAT-CONST, because `!E` is `(0 == E)` (C 6.5.3.3p5) and is therefore the same truth-value question as the sites above: `!f` and `!d` were refused for EVERY float width with L_UnsupportedLoweringForOpcode while `if (f)` compiled, because the `!` lowering minted its comparison zero as a bare MIR float Const (no encoder path) instead of reusing the rodata promotion the condition path goes through. Both arms take a runtime-produced value so no fold can hide the lowering, and both score on the NONZERO input -- on `!x` being FALSE -- so an arm that lost the comparison and returned a constant true scores 0. exit = 28 (the seven sites) + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 = 136.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 136,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

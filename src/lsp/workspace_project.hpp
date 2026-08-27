@@ -167,6 +167,32 @@ inline constexpr std::string_view kProjectFileSuffix = ".dss-project.json";
 [[nodiscard]] DSS_EXPORT std::optional<std::filesystem::path>
     pathFromFileUri(std::string_view uri);
 
+// D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES: the EXACT
+// INVERSE, declared beside its twin so the two halves of one encoding cannot
+// drift. Total (every path has a uri), unlike the partial inbound direction.
+// ⚠ It did not exist in `src/` before — only `tests/lsp/lsp_test_helpers.hpp`
+// had a copy — which is why production could name no file but the request's
+// own, and a definition inside a header was reported at the open document's
+// uri. The test helper now FORWARDS here so there is ONE owner.
+// Round-trip contract (percent-encoding, Windows drive letters, UNC) is on the
+// definition and pinned by `WorkspaceProject.FileUriRoundTrip`.
+[[nodiscard]] DSS_EXPORT std::string
+    fileUriFromPath(std::filesystem::path const& path);
+
+// The same conversion for a caller that holds a path as TEXT — a
+// `SourceBuffer::name()`, for instance.
+//
+// ⚠ IT EXISTS SO THAT CALLERS DO NOT HAVE TO INCLUDE <filesystem> TO NAME A
+// FILE. `check-path-identity` refuses a NEW `src/` file that includes it
+// without a recorded decision, and the decision for `lsp_coordinates.cpp` was
+// that it has no path work of its own: it was constructing an
+// `fs::path` for the sole purpose of handing it straight back to this
+// function. Path construction belongs with the path<->uri conversion, which is
+// here, so the caller keeps no filesystem surface at all. Removing the include
+// was the better close than widening the allowlist for a file that does no I/O.
+[[nodiscard]] DSS_EXPORT std::string
+    fileUriFromPath(std::string_view path);
+
 // The message an editor sees when a document opens with no schema. Joins the
 // RESOLVER's reason (which claimants exist, what the preference matched) to the
 // WORKSPACE's reason (why no preference was available) — neither half is

@@ -21,6 +21,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
+#include "core/types/line_map.hpp"           // LineMap (D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES)
 #include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
@@ -94,6 +95,36 @@ struct DSS_EXPORT PreprocessedPositionMap {
     // that do not belong to it. That is what makes the CU-level application
     // order-free and idempotent.
     std::function<void(BufferId&, SourceSpan&)> remap;
+
+    // ── D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES ────
+    //
+    // THE MAP ITSELF, by value, beside the closure it is derived from.
+    //
+    // ★ THIS COSTS NOTHING AND IT IS WHY THE CLOSURE WAS NEVER ENOUGH.
+    // `makeRemap()` ALREADY copies the whole `LineMap` into the closure (its
+    // own note says so: the FC2 oracle reparse re-invokes it long after the
+    // `PreprocessResult` dies, so a pointer would dangle). So the segments were
+    // always here — sealed inside a `std::function` that exposes exactly ONE
+    // direction. Carrying the map openly makes BOTH directions derivable from
+    // one owner that cannot drift, instead of inviting a second table.
+    //
+    // ⚠ The closure is NOT deleted and must not be: `Tree::remapDiagnostics`
+    // and the FC2 oracle reparse take a closure-shaped adapter. It is DERIVED
+    // from this same map (`PreprocessResult::makeRemap`), so there stays
+    // exactly one implementation of the forward direction.
+    LineMap map;
+
+    // The MAIN source's origin buffer — the file the user actually opened, as
+    // opposed to a spliced header or a synthetic prologue.
+    //
+    // ★ WITHOUT THIS THE ONLY WAY TO FIND IT IS BY NAME among
+    // `auxiliaryBuffers()`, which is a workaround wearing a lookup's clothes:
+    // the synth buffer is CONSTRUCTED WITH THE MAIN SOURCE'S NAME (that is the
+    // very reason this whole defect class stayed invisible), so a name match
+    // has two right answers and no way to choose. `PreprocessResult` already
+    // knows the id — it is `mainSourceId` — so it is carried rather than
+    // re-derived.
+    BufferId mainOrigin;
 };
 
 // Single CompilationUnit. Move-only, single-use (built by UnitBuilder::finish,
@@ -288,6 +319,47 @@ public:
     // covering — an internal invariant violation, not a user error. Refusing is
     // the point: a SILENTLY wrong line is exactly the defect this closes.
     void remapPreprocessedPosition(BufferId& buffer, SourceSpan& span) const;
+
+    // ── D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES ────
+    //
+    // THE INVERSE of the above, and the direction that did not exist: given a
+    // position in a REAL file the user can open, where is it in the synthesized
+    // buffer a tree was actually parsed from?
+    //
+    // Appends every synth image to `out` (CLEARED first), in ascending synth
+    // order, across every preprocessed tree of this CU. EMPTY is a legitimate,
+    // meaningful answer — see `LineMap::inverse` for the three cases — and the
+    // caller must treat it as "this position is not in the program" rather than
+    // reaching for a nearby offset.
+    //
+    // ⚠ THE MIRROR OF THE FORWARD REFUSAL, AND IT IS NOT SYMMETRY FOR ITS OWN
+    // SAKE. The forward direction fails loud rather than hand back a plausible
+    // wrong line. An inverse that quietly returned a plausible-but-wrong synth
+    // offset is the SAME defect facing the other way — it would answer a hover
+    // about a different token and look entirely reasonable doing it. So the one
+    // thing this cannot do is guess: it returns exactly the images the map
+    // records, or none.
+    //
+    // ⓘ It CANNOT fail loud the way the forward direction does, and the
+    // asymmetry is real rather than an oversight: "no image" is a legal state
+    // of the world (an `#if 0` region genuinely is not in the program), whereas
+    // "still in synth coordinates after the remap ran" is a contradiction. A
+    // refusal here would fire on correct input.
+    void inversePreprocessedPositions(BufferId originBuffer,
+                                      ByteOffset originOffset,
+                                      std::vector<ByteOffset>& out) const;
+
+    // The MAIN origin buffer recorded for the tree whose `source()` is `synth`,
+    // or an INVALID BufferId when that tree was not preprocessed. This is the
+    // buffer an editor's document coordinates are expressed in.
+    //
+    // ⚠ KEYED BY SYNTH BUFFER, NOT BY TREE INDEX, and that is load-bearing:
+    // `preprocessedPositionMaps_` SKIPS every tree that was not preprocessed
+    // (`if (!sc.ppRemap) continue;`), so it is NOT index-parallel to `trees()`
+    // — its own construction note says only the SET carries meaning, not the
+    // order. An index-based lookup would silently return another tree's map in
+    // any CU that mixes preprocessed and non-preprocessed files.
+    [[nodiscard]] BufferId mainOriginForSynth(BufferId synth) const;
 
     // The same rewrite over every diagnostic a reporter has accumulated —
     // primary AND related locations (`DiagnosticReporter::remapBuffers` applies
@@ -558,6 +630,13 @@ private:
         // which keeps the CU's refusal EXACT: it fires only where the remap was
         // known to be able to act and did not. See `PreprocessedPositionMap`.
         BufferId                                        ppSynthBuffer;
+        // D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES: the
+        // LINE MAP itself and the MAIN origin buffer, carried beside the closure
+        // that is derived from them so BOTH directions have one owner. Recorded
+        // under exactly the same condition as `ppSynthBuffer` — see
+        // `PreprocessedPositionMap` for why the closure alone was never enough.
+        LineMap                                         ppMap;
+        BufferId                                        ppMainOrigin;
         // TF-C82 (D-PP-PRAGMA-REGISTRY): synth byte offset of an emitted token ->
         // the `#pragma pack` member-alignment cap in effect when the preprocessor
         // emitted it. EMPTY for a tree that was not preprocessed, and for every

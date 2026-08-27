@@ -25,13 +25,13 @@
   "$predefinedMacrosComment": "TF-C74: the per-ARCHITECTURE identity macros this CPU predefines, merged with the language's `preprocess.predefinedMacros` at preprocess time. Declared on the TARGET (like charIsUnsigned/aggregateLayout/tls above) because they are per-CPU facts; putting them on the language would force c.lang.json to enumerate CPU architectures. COLLISION POLICY: a name declared by BOTH this file and the language config is a LOAD-TIME-equivalent FATAL (C_ConflictingPredefinedMacro) — neither side silently wins. GATING (MEASURED 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>`): `__aarch64__` and `__ARM_ARCH_ISA_A64` are defined by EVERY AArch64 toolchain (present on both arm64-apple-darwin and aarch64-linux-gnu) so they are UNGATED; `__arm64__` and `__arm64` are APPLE-ONLY (present on arm64-apple-darwin, ABSENT on aarch64-linux-gnu) so they are gated [\"macho\"] — shipping them ungated would leak an Apple spelling onto the ELF leg, and shipping only `__aarch64__` would clear nothing on macOS, whose SDK arch ladders (machine/_types.h, sys/cdefs.h) gate on `__arm64__`. ★ `__CHAR_UNSIGNED__` is gated [\"elf\"] (TF-C75) and is the ONE ROW HERE WHOSE GATE IS AN ABI PROPERTY RATHER THAN A VENDOR SPELLING. It is not an identity macro at all: it is the PREPROCESSOR-VISIBLE FACE of this file's `charIsUnsigned` key above. That key is the SINGLE SOURCE OF TRUTH for bare-`char` signedness — `default: true` (the AArch64 processor's answer) with `byObjectFormat` overrides making macho and pe SIGNED — so this macro must be defined on exactly the leg where the `default` is the effective answer, i.e. elf, and must NOT appear where an override fires. MEASURED BY THIS AGENT 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>` (/usr/bin/clang, Apple clang 21.0.0 / clang-2100.1.1.101): DEFINED as 1 for aarch64-linux-gnu, and NOT defined for arm64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc or x86_64-apple-darwin — so arm64×elf defines it, arm64×macho does not, and x86_64 never does (x86_64.target.json ships no such row and declares no `charIsUnsigned` at all). It could not be expressed before TF-C75 because the split is (architecture × PLATFORM) and this file is per-ARCHITECTURE; the gate now supplies the platform half, exactly as it already does for `__arm64__`. ★ THIS ROW AND THE `charIsUnsigned` KEY ABOVE STATE THE SAME FACT IN TWO NOTATIONS — a preprocessor macro and a codegen switch — SO THEY CAN DRIFT. No engine-side coherence check is possible: any such check would have to name `__CHAR_UNSIGNED__` in engine code, which is a forbidden identity branch. The anti-drift device is therefore a TEST: examples/c/char_signedness_macro_coherence asserts the macro and the emitted char codegen in ONE program with per-leg exit codes, so a disagreement between the two declarations cannot be made green. If you change this row, change `charIsUnsigned` above to match, and expect that example to be the thing that tells you if you did not. SHIPPED, BUT NOT HERE -- LANDED ON THE OBJECT FORMAT (TF-C97, D-PP-FORMAT-DATA-MODEL-PREDEFINES): `__LP64__`/`_LP64` are a DATA MODEL, not an architecture -- x86_64:pe64 is LLP64 while the SAME CPU is LP64 under elf64/macho64 -- so a row here would be wrong on one of this target's own formats. This note used to read 'DELIBERATELY NOT SHIPPED' and was a HANDOFF that went four cycles uncompleted; it is now DONE: every LP64 `*.format.json` declares both spellings through the format schema's own `predefinedMacros` key (the same key name, the same shared entry grammar, the same C_ConflictingPredefinedMacro collision policy as this file's), and every LLP64/ILP32 one declares NEITHER -- the negative being the whole reason the channel sits at the format layer. Do not add them here. ★ `__BYTE_ORDER__` WAS LISTED HERE AS 'DELIBERATELY NOT SHIPPED (its value must be a macro REFERENCE, e.g. `__ORDER_LITTLE_ENDIAN__`, which needs a different mechanism than a literal Constant body)'. THAT CLAIM WAS NEVER TESTED AND IS NOW REFUTED BY MEASUREMENT (TF-C115, D-PP-ENDIANNESS-PREDEFINES): a materialized predefine is spliced over its invocation and RESCANNED like any other replacement (`preprocessor.cpp` — `spliceOver(...); continue;   // rescan from the materialized value`), so a `constant` body that NAMES another macro resolves for free. MEASURED 2026-08-04 against a patched config copy reached through DSS_CONFIG_ROOT: with `__BYTE_ORDER__` = `__ORDER_LITTLE_ENDIAN__` the probe compiled rc 0 with all 8 `#error` legs silent (`defined(__BYTE_ORDER__)`, `__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__`, `__BYTE_ORDER__ == 1234`, `__BYTE_ORDER__ != __ORDER_BIG_ENDIAN__`); the same probe on the UNPATCHED config fired 6 of the 8 (6 x P001E), one of which was the big-endian leg — the unshipped state SELECTED THE BIG-ENDIAN ARM (`0 == 0`, C 6.10.1p4), silently. The two legs that stayed SILENT on the unpatched config are the instructive pair: `__BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__` was FALSE (both operands undefined, so `0 != 0`) — an accidental agreement that would have read as a pass — and the `__BIG_ENDIAN__`-absence leg, which was correctly quiet then and must stay quiet now. Zero engine change was required. The rows are SHIPPED below. Still DELIBERATELY NOT SHIPPED: toolchain identity (`__GNUC__`/`__clang__`/`__APPLE_CC__`) which is a COMPILER profile, not a CPU, and is blocked on two absent parser features anyway (leading-position `__attribute__`, and the `inline` function specifier).",
   "$endiannessPredefinesComment": "TF-C115 (D-PP-ENDIANNESS-PREDEFINES) — the arm64 twin of the x86_64 note; read that file's copy for the full argument, and keep the two in step. ★ DOCUMENTATION KEY ONLY: there is deliberately NO `endianness` root key. THE LAYER: endianness varies by CPU (MEASURED 2026-08-04, `clang-19 -dM -E -x c /dev/null -target <triple>`, Ubuntu clang 19.1.1 — `aarch64_be-linux-gnu` defines `__BIG_ENDIAN__` 1 and `__BYTE_ORDER__` `__ORDER_BIG_ENDIAN__`, while `aarch64-linux-gnu` defines `__LITTLE_ENDIAN__` 1 and `__BYTE_ORDER__` `__ORDER_LITTLE_ENDIAN__`) and does NOT vary across the object formats one DSS target serves — arm64 is little-endian under BOTH elf64-aarch64-linux and macho64-arm64-darwin — so it passes the very test `__LP64__` failed and belongs on the TARGET. THAT IS ALSO WHY THIS ROW IS UNLIKE `__CHAR_UNSIGNED__` ABOVE, the one row here whose gate is an ABI property: bare-`char` signedness genuinely splits (architecture × PLATFORM) and needed `availableObjectFormats`; endianness does not split on this CPU, so both rows are UNGATED. GATING (MEASURED, same run): `__LITTLE_ENDIAN__` is defined as 1 on arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu, x86_64-unknown-linux-gnu AND x86_64-pc-windows-msvc — every triple DSS targets — so, unlike `__arm64__`/`__arm64`, it is NOT an Apple-only spelling and must not be gated `[\"macho\"]`; gating it would leave the ELF leg answering `#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__` with a silent TRUE. ★ `__BIG_ENDIAN__` IS DELIBERATELY ABSENT AND THE ABSENCE IS THE DECLARATION — MEASURED present ONLY on the big-endian triple. Apple's `libkern/OSByteOrder.h:165` tests `defined(__BIG_ENDIAN__)` BEFORE the little-endian arm, so a stray row would silently select byte-swapping macros; `examples/c/endianness_predefines` is red if it ever appears on any leg. NO `endianness` KEY ACCOMPANIES THESE ROWS, on the `charIsUnsigned` lesson stated above: a second notation of one fact is a drift source that needs its own coherence example to be safe, and unlike `charIsUnsigned` — which HIR→MIR really reads — no engine consumer for an endianness value exists today. THE `__ORDER_*` CONSTANTS THE VALUE NAMES LIVE ON THE LANGUAGE (c.lang.json): they are invariant across every measured triple including the big-endian one, so they are a naming vocabulary, not a per-CPU fact.",
   "predefinedMacros": [
-    { "name": "__aarch64__",          "kind": "constant", "value": "1", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
-    { "name": "__ARM_ARCH_ISA_A64",   "kind": "constant", "value": "1", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
-    { "name": "__arm64__",            "kind": "constant", "value": "1", "availableObjectFormats": ["macho"], "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
-    { "name": "__arm64",              "kind": "constant", "value": "1", "availableObjectFormats": ["macho"], "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
-    { "name": "__CHAR_UNSIGNED__",    "kind": "constant", "value": "1", "availableObjectFormats": ["elf"], "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" }   },
-    { "name": "__LITTLE_ENDIAN__",    "kind": "constant", "value": "1", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
-    { "name": "__BYTE_ORDER__",       "kind": "constant", "value": "__ORDER_LITTLE_ENDIAN__", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } }
+    { "name": "__aarch64__",          "kind": "constant", "value": "1", "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "__ARM_ARCH_ISA_A64",   "kind": "constant", "value": "1", "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "__arm64__",            "kind": "constant", "value": "1", "availableObjectFormats": ["macho"], "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "__arm64",              "kind": "constant", "value": "1", "availableObjectFormats": ["macho"], "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "__CHAR_UNSIGNED__",    "kind": "constant", "value": "1", "availableObjectFormats": ["elf"], "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" }   },
+    { "name": "__LITTLE_ENDIAN__",    "kind": "constant", "value": "1", "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } },
+    { "name": "__BYTE_ORDER__",       "kind": "constant", "value": "__ORDER_LITTLE_ENDIAN__", "programRedefinition": "ordinary", "impliedSurface": { "kind": "claims-nothing", "reason": "arch-property" } }
   ],
   "opcodes": [
     {
@@ -2564,6 +2564,157 @@
               { "index": 0, "slotKind": "rn"             },
               { "index": 1, "slotKind": "membase.noscale" },
               { "index": 2, "slotKind": "imm9"           }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: cross-class bit-copy GPR -> SIMD&FP register. The arm64 declaration of the SAME shared verb x86_64 declares as MOVQ xmm, r/m64 — the vocabulary is `movq_gpr_to_xmm` on BOTH targets and the bytes differ, which is the whole point of a target descriptor. FMOV (general), 'Conversion between FP and integer' group: sf [31] | 00 [30:29] | 11110 [28:24] | ftype [23:22] | 1 [21] | rmode=00 [20:19] | opcode=111 [18:16] | 000000 [15:10] | Rn [9:5] | Rd [4:0]. WIDTH AXIS = the SOURCE INTEGER width, the same axis si_to_fp/ui_to_fp above key on: width 64 -> FMOV Dd, Xn (sf=1, ftype=01, base 0x9E670000 = 2657550336); width 32 -> FMOV Sd, Wn (sf=0, ftype=00, base 0x1E270000 = 505872384). ★ THE UPPER-LANE ZEROING IS LOAD-BEARING AND IT IS MEASURED, NOT ASSUMED: a write to the D or S view of a SIMD&FP register zeroes every bit above it, so after the width-32 form bytes 4..7 of the register read ZERO and a following byte-lane count over 8 bytes still answers the 32-bit population count. ✔MEASURED 2026-08-26 by EXECUTION under qemu-aarch64 with the destination register pre-dirtied to all-ones via `movi v0.16b, #0xFF` — had the zeroing not happened the probe would have reported 32 extra bits. `registerClass: gpr` is the SOURCE bank (Rn); `resultRegClass: fpr` is the DESTINATION bank (Rd) — the identical split si_to_fp declares, and the reason the encoder cannot silently write a GPR ordinal into an FP field (D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD). Byte-pins verified against aarch64-linux-gnu-as: `fmov s3, w7` = 0x1E2700E3, `fmov d3, x7` = 0x9E6700E3.",
+      "mnemonic":      "movq_gpr_to_xmm",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "FMOV Dd, Xn — 64-bit source integer into the D view. base 0x9E670000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657550336 },
+            "resultRegClass": "fpr", "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FMOV Sd, Wn — 32-bit source integer into the S view; bits 32..127 of the destination are zeroed by the write.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505872384 },
+            "resultRegClass": "fpr", "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: cross-class bit-copy SIMD&FP register -> GPR — the EXACT MIRROR of `movq_gpr_to_xmm` above, and a SEPARATE opcode for the reason x86_64's twin rows state verbatim: the variant guard keys only on (operandKinds, width) and BOTH directions are `reg` at the same width, so one opcode carrying both would silently pick a direction. Same FMOV (general) group with opcode=110 [18:16] instead of 111: width 64 -> FMOV Xd, Dn (sf=1, ftype=01, base 0x9E660000 = 2657484800); width 32 -> FMOV Wd, Sn (sf=0, ftype=00, base 0x1E260000 = 505806848). `registerClass: fpr` is the SOURCE bank (Rn), `resultRegClass: gpr` the DESTINATION bank (Rd) — the reverse of the row above, exactly as fp_to_si is the reverse of si_to_fp. ⚠ NOT declared on `movq_xclass`: that opcode is consumed BIDIRECTIONALLY by MIR Bitcast, and giving it either direction's bytes would silently mis-encode the other — the same trap x86_64's row documents. arm64 therefore still declares NO `movq_xclass` and a cross-class Bitcast still fails loud there; closing that is a different row's work, not this one's. Byte-pins verified against aarch64-linux-gnu-as: `fmov w7, s3` = 0x1E260067, `fmov x7, d3` = 0x9E660067.",
+      "mnemonic":      "movq_xmm_to_gpr",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "$comment": "FMOV Xd, Dn — the D view's 64 bits into a 64-bit GPR. base 0x9E660000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657484800 },
+            "resultRegClass": "gpr", "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FMOV Wd, Sn — the S view's 32 bits into a 32-bit GPR (a W write zeroes bits 63:32 of the X view).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505806848 },
+            "resultRegClass": "gpr", "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: PER-LANE population count over the register's EIGHT BYTE LANES — each byte of the operand is replaced by the number of set bits in that byte (0..8). The DSS verb is `popcount_bytes` and it names the OPERATION and the lane element, never the ISA: an x86_64 target with AVX-512 VPOPCNTB would declare this same row with its own bytes and inherit the sequence below unchanged. AArch64 realization CNT Vd.8B, Vn.8B (AdvSIMD two-register misc): 0 [31] | Q=0 8B [30] | U=0 [29] | 01110 [28:24] | size=00 [23:22] | 10000 [21:17] | opcode=00101 [16:12] | 10 [11:10] | Rn [9:5] | Rd [4:0] = 0x0E205800 = 237000704. Q=0 selects the 8-BYTE arrangement, which reads and writes only the low 64 bits and zeroes bits 64..127 — so this row is honestly a 64-bit operation on the `fpr` (D-view) bank and needs no allocatable `vr` register. The guard is keyed at width 64 for that reason: the instruction always processes eight bytes regardless of how wide the VALUE that reached it was, and a caller emitting it at any other width gets A_NoMatchingEncodingVariant rather than a lane count it did not ask for. Byte-pin verified against aarch64-linux-gnu-as: `cnt v3.8b, v7.8b` = 0x0E2058E3.",
+      "mnemonic":      "popcount_bytes",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 237000704 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: HORIZONTAL ADD of the register's eight byte lanes into the lowest lane — the reduction that turns eight per-byte counts into one total. The DSS verb is `addlanes_bytes`; it is the necessary partner of `popcount_bytes` and the reason this row's registry entry could NOT be closed by 'declare arm64 popcount as CNT', which was the closing work the row carried from 2026-07-15 until it was measured: CNT ALONE answers eight separate per-byte counts sitting in eight lanes, not a population count, so a single-opcode declaration on the `popcount` slot would have been a silent miscompile. AArch64 realization ADDV Bd, Vn.8B (AdvSIMD across lanes): 0 [31] | Q=0 8B [30] | U=0 [29] | 01110 [28:24] | size=00 [23:22] | 11000 [21:17] | opcode=11011 [16:12] | 10 [11:10] | Rn [9:5] | Rd [4:0] = 0x0E31B800 = 238139392. The destination is the B (8-bit) view, which is sufficient WITHOUT SATURATION: eight lanes of at most 8 sum to at most 64, and 64 fits an unsigned byte. Writing the B view zeroes bits 8..127, so the following cross-class move reads the total with no masking step. Guard keyed at width 64 for the same reason as `popcount_bytes` — the instruction always reduces eight bytes. Byte-pin verified against aarch64-linux-gnu-as: `addv b3, v7.8b` = 0x0E31B8E3.",
+      "mnemonic":      "addlanes_bytes",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 238139392 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-FULLC-STDBIT-ARM64-CNT-POPCOUNT (2026-08-26): MIR Popcount's arm64 realization. ★ THIS ROW HAS NO `encoding`, AND THAT IS THE FACT — AArch64 has no scalar-GPR population-count instruction at all, so there is no single instruction to name; what it has is a SIMD lane counter plus a lane reduction, reached through a register-bank round trip. That is four instructions, and D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE is exactly the vocabulary for saying so: the row states 'on this target this operation is realized by these machine instructions', PLURAL, and the shared substrate emits what it was told. ★★ WHAT THIS REPLACES AND WHY THE OLD PLAN WAS WRONG. Both this registry row and the x86_64 `popcount` row's own comment said a future arm64 would 'share this slot' with CNT and need no lowering change. ✔MEASURED and REFUTED: CNT alone produces eight per-byte counts in eight lanes and is not a population count, and it writes the SIMD bank while MIR Popcount's result is an integer — so a one-instruction declaration would have been a silent miscompile in two independent ways. The capability split DID survive intact, but at the level of the SEQUENCE, not the instruction. ★ NO REGISTER CLASS IS ADDED. The temporaries are `fpr` (the D/S views), which AAPCS64 already makes allocatable; the 8-byte lane arrangement touches only the low 64 bits, so the 128-bit `vr` class stays non-allocatable exactly as its register rows say. Sequence temporaries are FRESH VIRTUAL REGISTERS the ordinary allocator assigns — nothing is reserved and no fixed scratch is stolen. ★ THE FALLBACK STAYS REACHABLE. `lowerPopcount` probes this mnemonic; a target that declares no `popcount` row still lowers MIR Popcount to the branchless SWAR bit-trick, which remains pinned by the x86_64-minus-`popcount` mutant in tests/lir/test_mir_to_lir.cpp and by the arm64 mutant beside it. ✔MEASURED 2026-08-26 by EXECUTION under qemu-aarch64: the exact four-instruction sequence answers __builtin_popcountl for 0, 1, all-ones, the single high bit, byte-spread patterns and 0x5555...., at BOTH widths, with the destination register pre-dirtied to all-ones first. 4 instructions replace the SWAR's 22.",
+      "mnemonic":      "popcount",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "lowering": {
+        "$comment": "The width axis is the OPERAND's promotion width P, which is what mir_to_lir's bit-count arms thread as the operation width (the count itself is always a small integer). Both sequences share steps 2 and 3 — the lane count and the lane reduction are width-blind because the 8-byte arrangement is a property of the INSTRUCTION, not of the value that reached it. Only the two cross-class moves carry the width, and on the 32-bit arm the entry move's upper-lane zeroing is what makes the shared 8-byte tail correct.",
+        "sequences": [
+          {
+            "$comment": "P = 64. vec = FMOV Dd,Xn (all eight source bytes land in lanes 0..7); lanes = CNT (per-byte counts); sum = ADDV (total, 0..64, in the B view); result = FMOV Xd,Dn.",
+            "guard": { "width": 64 },
+            "steps": [
+              { "op": "movq_gpr_to_xmm", "result": "vec",    "resultClass": "fpr", "width": 64, "operands": [{ "source": 0 }] },
+              { "op": "popcount_bytes",  "result": "lanes",  "resultClass": "fpr", "width": 64, "operands": [{ "temp": "vec"   }] },
+              { "op": "addlanes_bytes",  "result": "sum",    "resultClass": "fpr", "width": 64, "operands": [{ "temp": "lanes" }] },
+              { "op": "movq_xmm_to_gpr", "result": "result", "resultClass": "gpr", "width": 64, "operands": [{ "temp": "sum"   }] }
+            ]
+          },
+          {
+            "$comment": "P = 32. Identical but for the two moves: FMOV Sd,Wn puts the four source bytes in lanes 0..3 AND zeroes lanes 4..7, so the shared 8-byte CNT/ADDV tail counts exactly the 32 bits that were asked about; FMOV Wd,Sn reads the total back into a W register.",
+            "guard": { "width": 32 },
+            "steps": [
+              { "op": "movq_gpr_to_xmm", "result": "vec",    "resultClass": "fpr", "width": 32, "operands": [{ "source": 0 }] },
+              { "op": "popcount_bytes",  "result": "lanes",  "resultClass": "fpr", "width": 64, "operands": [{ "temp": "vec"   }] },
+              { "op": "addlanes_bytes",  "result": "sum",    "resultClass": "fpr", "width": 64, "operands": [{ "temp": "lanes" }] },
+              { "op": "movq_xmm_to_gpr", "result": "result", "resultClass": "gpr", "width": 32, "operands": [{ "temp": "sum"   }] }
             ]
           }
         ]

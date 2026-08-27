@@ -368,17 +368,30 @@ TEST(Preprocessor, EveryIncompatibleRedefinitionShapeWarnsAndTakesTheNew) {
     }
 }
 
-// THE BOUNDARY THAT DOWNGRADING P0014 CREATED, pinned because nothing else
-// enforces it. Two redefinition guards now sit side by side at DIFFERENT
-// severities: an ORDINARY macro redefinition is a Warning (C 6.10.3p2, above),
-// while redefining a CONFIG PREDEFINED macro stays a hard Error (C 6.10.8.1).
-// The distinction is not stylistic — the tests around `--define` call the
-// predefined path the `_MSC_VER`/`_WIN32` SILENT-MISCOMPILE CHANNEL, since a
-// user who flips a profile macro changes which target the program is compiled
-// for. A later "tidy-up" unifying the two severities would take that guard down
-// with it and nothing would have failed, so this asserts BOTH halves in one
-// place: the pair is the invariant, not either one alone.
-TEST(Preprocessor, PredefinedMacroGuardStaysFatalWhileOrdinaryRedefinitionWarns) {
+// D-PP-PREDEFINE-REDEFINITION-PARTITION — THIS TEST USED TO ASSERT THE
+// OPPOSITE, AND THE REVERSAL IS THE POINT.
+//
+// It previously pinned "an ordinary redefinition is a Warning, while redefining
+// a CONFIG PREDEFINED macro stays a hard Error", on the reading that C
+// 6.10.10.1p2 is a CONSTRAINT. ✔RE-MEASURED against N3220: 6.10.10 carries NO
+// `Constraints` heading (6.10.5 Macro replacement DOES), so C23 4p2 —
+// "If a 'shall' or 'shall not' requirement that appears outside of a constraint
+// or runtime-constraint is violated, the behavior is undefined" — makes it
+// UNDEFINED BEHAVIOUR, which 5.1.1.3 requires NO diagnostic for. J.2 lists it
+// as UB explicitly.
+// ★ So the standard is STRICTER about an ordinary redefinition (a real
+// constraint) than about `#define __STDC__ 9` (UB). The old test encoded the
+// intuitive inversion of that, and reading `shall not` as `constraint` without
+// checking the enclosing subclause is what produced it.
+// ✔MEASURED 2026-08-26, gcc 13.3.0 and clang 18.1.3 probed SEPARATELY: both
+// WARN, both continue at rc=0, and both APPLY — `#undef __STDC__` then
+// `#define __STDC__ 77` prints 77 on both.
+//
+// The PAIR is still the invariant, and it is still asserted in one place — but
+// the invariant is now that BOTH are warnings that let translation continue,
+// and that the predefined one TAKES EFFECT. A future "tidy-up" that restored
+// the refusal would fail here.
+TEST(Preprocessor, PredefinedMacroDefineWarnsAndAppliesLikeOrdinaryRedefinition) {
     PreprocessResult ordinary;
     (void)ppLexemes("#define X 1\n#define X 2\nint v = X;\n", ordinary);
     EXPECT_EQ(ppCodeSeverity(ordinary, DiagnosticCode::P_PreprocessorMacroRedefinition),
@@ -387,13 +400,22 @@ TEST(Preprocessor, PredefinedMacroGuardStaysFatalWhileOrdinaryRedefinitionWarns)
         << "an ordinary redefinition must not stop translation";
 
     PreprocessResult predefined;
-    (void)ppLexemes("#define __STDC__ 9\nint v = 0;\n", predefined);
+    auto lexs = ppLexemes("#define __STDC__ 9\nint v = __STDC__;\n", predefined);
     EXPECT_EQ(ppCodeSeverity(predefined, DiagnosticCode::P_PreprocessorPredefinedMacro),
-              DiagnosticSeverity::Error)
-        << "C 6.10.8.1 is a DIFFERENT rule and keeps its own severity — the "
-           "6.10.3p2 downgrade must not leak across to it";
-    EXPECT_TRUE(predefined.diagnostics->hasErrors())
-        << "redefining a predefined macro must still be fatal";
+              DiagnosticSeverity::Warning)
+        << "6.10.10.1p2 sits OUTSIDE any Constraints subclause, so 4p2 makes it "
+           "UB and no diagnostic is required at all — a warning is already more "
+           "than the standard asks, and it is what both references emit";
+    EXPECT_FALSE(predefined.diagnostics->hasErrors())
+        << "refusing this was the divergence the row closed: gcc and clang both "
+           "continue at rc=0";
+    // AND IT TOOK EFFECT. Without this clause the test would still pass over an
+    // engine that warned and then ignored the directive — which is the worst of
+    // both readings, and exactly what the old code did.
+    ASSERT_EQ(lexs.size(), 5u) << "int v = 9 ;";
+    EXPECT_EQ(lexs[3], "9")
+        << "the program's definition must WIN — gcc and clang both print the "
+           "program's value";
 }
 
 // D-PP-REDEFINITION-IGNORES-WHITESPACE-PRESENCE — the OPPOSITE direction of the
@@ -948,7 +970,13 @@ TEST(Preprocessor, NonDirectiveInputIsIdentity) {
     PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, DiagnosticBudget::libraryDefault());
     EXPECT_FALSE(r.diagnostics->hasErrors());
 
-    Tokenizer tk{r.synthBuffer, schema, DiagnosticBudget::libraryDefault()};
+    // ⚠ The ORIGINAL buffer, not `r.synthBuffer`. The synth buffer now carries
+    // the "<built-in>" prologue ahead of the source, so tokenizing IT would
+    // count the prologue's own `#define` tokens as "raw input" and compare 83
+    // tokens against 20 — a mismatch that says nothing about the identity
+    // property. `buf` is what the caller actually handed the preprocessor, and
+    // it is what "in == out" is a claim about.
+    Tokenizer tk{buf, schema, DiagnosticBudget::libraryDefault()};
     auto rawResult = std::move(tk).tokenize();
     std::vector<Token> raw;
     while (!rawResult.stream.isAtEnd()) {
@@ -957,16 +985,44 @@ TEST(Preprocessor, NonDirectiveInputIsIdentity) {
 
     // Compare the non-Eof content tokens (the PP appends its own single Eof;
     // the raw drain above stops before Eof). Identity means: same count, same
-    // core kinds, same spans, in order.
+    // core kinds, same lexemes, in order — and the spans related by ONE
+    // CONSTANT TRANSLATION.
+    //
+    // ★ D-PP-PREDEFINE-REDEFINITION-PARTITION — WHY THE SPAN CLAIM IS STATED
+    // THIS WAY AND NOT WEAKENED. It used to be raw span EQUALITY, which was a
+    // proxy that silently assumed the synthetic "<built-in>" prologue is EMPTY.
+    // That held only because the sole prologue occupants were the two pe-gated
+    // function-like predefines, absent on the format this test loads. The
+    // partition lowers every ORDINARY predefine into that prologue (the model
+    // the references themselves implement), so the prologue is now non-empty on
+    // every format and every span shifts by its length.
+    // ⚠ The property under test is UNCHANGED and is still fully asserted: the
+    // preprocessor is an identity pass on directive-free, macro-free input.
+    // Same count, same kinds, same TEXT — and requiring the span delta to be
+    // the SAME for every token is strictly STRONGER than the old equality was,
+    // because it also catches a prologue that translated tokens unevenly, which
+    // raw equality could never have detected. `raw` is re-tokenized from the
+    // synth buffer, so a prologue whose own tokens leaked into the output would
+    // change the COUNT and fail the assert above.
     std::vector<Token> ppNoEof;
     for (Token const& t : r.tokens) {
         if (t.coreKind != CoreTokenKind::Eof) ppNoEof.push_back(t);
     }
     ASSERT_EQ(ppNoEof.size(), raw.size())
         << "non-directive input must be identity (content token count)";
+    ASSERT_FALSE(raw.empty());
+    const std::int64_t delta = static_cast<std::int64_t>(ppNoEof[0].span.start())
+                             - static_cast<std::int64_t>(raw[0].span.start());
     for (std::size_t i = 0; i < raw.size(); ++i) {
         EXPECT_EQ(ppNoEof[i].coreKind, raw[i].coreKind) << "at index " << i;
-        EXPECT_EQ(ppNoEof[i].span, raw[i].span) << "at index " << i;
+        EXPECT_EQ(ppNoEof[i].span.length(), raw[i].span.length())
+            << "at index " << i;
+        EXPECT_EQ(static_cast<std::int64_t>(ppNoEof[i].span.start())
+                      - static_cast<std::int64_t>(raw[i].span.start()),
+                  delta)
+            << "at index " << i
+            << ": identity means ONE constant translation for the whole stream, "
+               "not a per-token adjustment";
     }
 }
 
@@ -2637,34 +2693,168 @@ TEST(Preprocessor, FC15bTimeShapeOnly) {
     }
 }
 
-// FAIL-LOUD (C 6.10.8.1p2): `#define` of a predefined name is a constraint
-// violation -> P_PreprocessorPredefinedMacro, and the directive does NOT alter
-// the table (a subsequent `__LINE__` still materializes its line value).
-TEST(Preprocessor, FC15bDefineOfPredefinedFailsLoud) {
+// D-PP-PREDEFINE-REDEFINITION-PARTITION (C23 6.10.10.1p2 + 4p2): a `#define` of
+// an ENGINE-DERIVED predefine is DIAGNOSED and then APPLIED. Both halves are
+// asserted, and the second is the one that changed: this test previously pinned
+// that the directive did NOT alter the table.
+// ✔MEASURED on gcc 13.3.0 and clang 18.1.3 separately: `#undef __LINE__` then
+// `#define __LINE__ 4242` then `printf("%d", __LINE__)` prints 4242 on BOTH.
+TEST(Preprocessor, FC15bDefineOfPredefinedWarnsAndTakesEffect) {
     PreprocessResult r;
     auto lexs = ppLexemes("#define __LINE__ 5\nint x = __LINE__;\n", r);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
-        << "#define of a predefined macro name must fail loud";
-    // The rejected #define did not bind __LINE__ to 5; line-2 __LINE__ is 2.
+        << "a warn-class predefine must still be DIAGNOSED";
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+              DiagnosticSeverity::Warning);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // The program's definition WINS: line-2 `__LINE__` is now 5, not 2.
     ASSERT_EQ(lexs.size(), 5u);
-    EXPECT_EQ(lexs[3], "2")
-        << "the rejected #define must NOT alter the table -- __LINE__ still "
-           "resolves to its invocation line (2), not the rejected value 5";
+    EXPECT_EQ(lexs[3], "5")
+        << "the #define must REPLACE the derived line value — 2 here would mean "
+           "DSS warned and then ignored the directive, which is the one "
+           "behaviour neither the old reading nor the new one licenses";
 }
 
-// FAIL-LOUD (C 6.10.8.1p2): `#undef` of a predefined name is a constraint
-// violation -> P_PreprocessorPredefinedMacro, and the name still materializes.
-TEST(Preprocessor, FC15bUndefOfPredefinedFailsLoud) {
+// The `#undef` half: DIAGNOSED, and the name is really GONE afterwards.
+// ✔MEASURED on both references: after a bare `#undef`, `#ifdef __LINE__` /
+// `__STDC__` / `__COUNTER__` are all FALSE, and `int __LINE__ = 9;` compiles.
+TEST(Preprocessor, FC15bUndefOfPredefinedWarnsAndRemovesTheName) {
     PreprocessResult r;
     auto lexs = ppLexemes("#undef __FILE__\nconst char* f = __FILE__;\n", r);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
-        << "#undef of a predefined macro name must fail loud";
-    // __FILE__ still materializes (the #undef was rejected, not applied).
-    // ★ 8 -> 9 (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN): the materialized literal
-    // carries its closer token. The fail-loud property under test is unaffected.
-    ASSERT_EQ(lexs.size(), 9u);
-    EXPECT_EQ(reconstructStringLiteral(lexs, 5), "\"main.c\"")
-        << "the rejected #undef must NOT remove the predefined macro";
+        << "a warn-class predefine must still be DIAGNOSED on #undef";
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+              DiagnosticSeverity::Warning);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // `__FILE__` is now an ORDINARY IDENTIFIER — it no longer materializes a
+    // string literal, so the token count collapses from 9 to 7.
+    ASSERT_EQ(lexs.size(), 7u)
+        << "const char * f = __FILE__ ;  — the name passes through unexpanded";
+    EXPECT_EQ(lexs[5], "__FILE__")
+        << "an applied #undef leaves a bare identifier; a materialized "
+           "\"main.c\" here would mean the directive was diagnosed and dropped";
+}
+
+// The OTHER half of the partition, and the half with no diagnostic at all: an
+// IMPLEMENTATION-SUPPLIED predefine is an ordinary macro. ✔MEASURED over a
+// 36-name sweep on gcc 13.3.0 and clang 18.1.3 separately — `#undef __GNUC__`,
+// `#undef __BYTE_ORDER__`, `#undef __SIZE_TYPE__`, `#undef __CHAR_BIT__` and
+// 12 more are all SILENT on both, while every ISO-6.10.10 name and every
+// engine-derived one warns on both.
+// ⚠ THE SILENCE IS THE ASSERTION. A partition that emitted the warning for
+// every config row would still pass every test above; only this one fails.
+TEST(Preprocessor, OrdinaryPredefineUndefIsSilentAndTakesEffect) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#undef __GNUC__\nint x = __GNUC__;\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
+        << "neither reference diagnoses `#undef __GNUC__`; DSS must not either";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroRedefinition));
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "__GNUC__")
+        << "the #undef must take effect — the name is a bare identifier now";
+}
+
+// And the redefinition arm of the ordinary half: NO predefined diagnostic, but
+// the ORDINARY 6.10.5p2 policy still applies over the built-in definition, so a
+// DIFFERING body warns and the NEW body wins. ✔MEASURED: gcc is silent for
+// `#define __GNUC__ 13` (its own value is 13 ⇒ identical replacement list ⇒
+// benign per 6.10.5p2) and clang warns for the same line (its `__GNUC__` is 4).
+// Same rule, different inventories — which is why this asserts the RULE.
+TEST(Preprocessor, OrdinaryPredefineRedefinitionUsesTheOrdinary61052Policy) {
+    PreprocessResult differing;
+    auto lexs = ppLexemes("#define __GNUC__ 99\nint x = __GNUC__;\n", differing);
+    EXPECT_FALSE(hasPPCode(differing, DiagnosticCode::P_PreprocessorPredefinedMacro))
+        << "an ordinary predefine is not in the diagnosed set";
+    EXPECT_TRUE(hasPPCode(differing, DiagnosticCode::P_PreprocessorMacroRedefinition))
+        << "but it IS a live macro, so a differing body is a 6.10.5p2 "
+           "redefinition — the built-in prologue is what makes it visible";
+    EXPECT_FALSE(differing.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "99") << "the NEW definition wins";
+
+    // An `#undef` FIRST suppresses that warning, because there is then no live
+    // definition to conflict with — the shape both references implement.
+    PreprocessResult undefFirst;
+    (void)ppLexemes("#undef __GNUC__\n#define __GNUC__ 99\nint x = __GNUC__;\n",
+                    undefFirst);
+    EXPECT_FALSE(hasPPCode(undefFirst, DiagnosticCode::P_PreprocessorMacroRedefinition))
+        << "an explicit #undef reads as a deliberate replacement and silences "
+           "the redefinition warning — MEASURED on gcc and clang";
+    EXPECT_FALSE(hasPPCode(undefFirst, DiagnosticCode::P_PreprocessorPredefinedMacro));
+}
+
+// ══ D-PP-PREDEFINE-REDEFINITION-PARTITION — AGNOSTICISM / RED-ON-DISABLE ═════
+//
+// The partition is CONFIG DATA, not a name list in `src/`. This is the arm that
+// proves it, and it runs the mutant in BOTH DIRECTIONS over the SHIPPED
+// document so neither can pass vacuously:
+//   (1) flip `__GNUC__` from `ordinary` to a warn verb  ⇒ the diagnostic APPEARS
+//       on a name that is silent today;
+//   (2) flip `__STDC__` from a warn verb to `ordinary`  ⇒ the diagnostic
+//       DISAPPEARS from a name that warns today.
+// ⚠ THE THIRD ASSERTION IS THE ONE THAT MATTERS: each case also asserts the
+// CLEAN (unmutated) verdict is the OPPOSITE. Without it a mutant that silently
+// failed to apply — or an engine that hard-coded a name and ignored the config
+// entirely — would still be green in one direction, which is exactly how two of
+// four arms asserted nothing in an earlier cycle.
+// ⓘ `reboundC` ADD_FAILUREs when its `from` text is absent, so a mutation that
+// stops matching the shipped document is LOUD rather than silently a no-op.
+namespace {
+[[nodiscard]] bool
+predefinedDiagnosedUnder(std::shared_ptr<GrammarSchema const> const& schema,
+                         std::string const& text) {
+    if (schema == nullptr) return false;
+    auto buf = SourceBuffer::fromString(text, "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    PreprocessResult r =
+        preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+                   DiagnosticBudget::libraryDefault());
+    return hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro);
+}
+} // namespace
+
+TEST(Preprocessor, PredefineRedefinitionVerbIsConfigDrivenNotHardcoded) {
+    const std::string undefGnuc = "#undef __GNUC__\nint a;\n";
+    const std::string undefStdc = "#undef __STDC__\nint a;\n";
+
+    // The CLEAN baseline, from the shipped document. Both halves are asserted so
+    // the mutants below have something to differ FROM.
+    EXPECT_FALSE(predefinedDiagnosedUnder(cSubset(), undefGnuc))
+        << "shipped `__GNUC__` is `ordinary` ⇒ silent";
+    EXPECT_TRUE(predefinedDiagnosedUnder(cSubset(), undefStdc))
+        << "shipped `__STDC__` is a warn verb ⇒ diagnosed";
+
+    // (1) ordinary -> warn: the diagnostic must APPEAR.
+    {
+        auto mutated = reboundC(
+            "\"value\": \"4\", \"programRedefinition\": \"ordinary\"",
+            "\"value\": \"4\", \"programRedefinition\": \"warn-iso-macro\"",
+            "<gnuc-to-warn>");
+        ASSERT_NE(mutated, nullptr);
+        EXPECT_TRUE(predefinedDiagnosedUnder(mutated, undefGnuc))
+            << "the verb is read from config: flipping `__GNUC__` to a warn "
+               "verb must start diagnosing it. Still silent here means the "
+               "engine is deciding by NAME, not by the declared verb";
+        // The mutant must not have moved the OTHER name — a mutation that
+        // changed everything would make (1) green for the wrong reason.
+        EXPECT_TRUE(predefinedDiagnosedUnder(mutated, undefStdc));
+    }
+
+    // (2) warn -> ordinary: the diagnostic must DISAPPEAR.
+    {
+        auto mutated = reboundC(
+            "\"name\": \"__STDC__\",            \"kind\": \"constant\", "
+            "\"value\": \"1\", \"programRedefinition\": \"warn-iso-macro\"",
+            "\"name\": \"__STDC__\",            \"kind\": \"constant\", "
+            "\"value\": \"1\", \"programRedefinition\": \"ordinary\"",
+            "<stdc-to-ordinary>");
+        ASSERT_NE(mutated, nullptr);
+        EXPECT_FALSE(predefinedDiagnosedUnder(mutated, undefStdc))
+            << "and the reverse: declaring `__STDC__` ordinary must silence it. "
+               "Still diagnosed here means a hard-coded ISO name list survived";
+        EXPECT_FALSE(predefinedDiagnosedUnder(mutated, undefGnuc));
+    }
 }
 
 // AGNOSTICISM (RED-ON-DISABLE): the predefined-macro set is CONFIG-driven
@@ -5876,14 +6066,45 @@ TEST(Preprocessor, UserDefineDuplicatePolicyIsC61032) {
         << "conflicting duplicate --define must fail loud";
 }
 
-// A --define naming a CONFIG PREDEFINED macro (here `__STDC__`) trips the
-// C 6.10.8.1 guard — a user may not silently flip a profile macro (the
-// _MSC_VER/_WIN32 silent-miscompile channel).
-TEST(Preprocessor, UserDefineCollidingWithConfigPredefineIsLoud) {
+// D-PP-PREDEFINE-REDEFINITION-PARTITION: a `--define` naming a WARN-CLASS
+// config predefine (here `__STDC__`) is DIAGNOSED and then APPLIED — the same
+// partition as the in-source directive, because the CLI entry lowers to an
+// ordinary `<command-line>` `#define` that runs through the very same handler.
+// ✔MEASURED 2026-08-26, gcc 13.3.0 and clang 18.1.3 separately: `-D__STDC__=0`
+// warns, rc=0, on both; `-U__GNUC__` and `-U__BYTE_ORDER__` are SILENT on both;
+// only `-Ddefined=1`/`-Udefined` are hard errors.
+// ⚠ THIS TEST USED TO SAY THE OPPOSITE ("must fail loud, not override") and to
+// justify it as the `_MSC_VER`/`_WIN32` SILENT-MISCOMPILE CHANNEL. That framing
+// does not survive the measurement: `_WIN32` is an implementation-supplied
+// name, not an ISO-6.10.10 one, so both references let a program flip it
+// silently — and in this architecture the OBJECT FORMAT, never the macro,
+// decides which descriptors and which target a build actually uses, so flipping
+// the macro changes what USER code sees in an `#ifdef` and nothing else.
+TEST(Preprocessor, UserDefineCollidingWithConfigPredefineWarnsAndApplies) {
     PreprocessResult r;
-    (void)ppLexemesWithDefines("int a = 0;\n", {"__STDC__=0"}, r);
+    auto lexs = ppLexemesWithDefines("int a = __STDC__;\n", {"__STDC__=0"}, r);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
-        << "--define of a predefined macro must fail loud, not override";
+        << "a warn-class predefine is diagnosed however the definition arrives";
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+              DiagnosticSeverity::Warning);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "0") << "--define overrides, as it does on gcc and clang";
+}
+
+// The ORDINARY half of the same axis, and the arm that would survive a
+// blanket relaxation OR a blanket refusal only by accident: `--define` of an
+// implementation-supplied predefine is SILENT about the predefined rule and
+// governed purely by 6.10.5p2 over the built-in definition.
+TEST(Preprocessor, UserDefineCollidingWithOrdinaryPredefineIsNotAPredefinedDiagnostic) {
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDefines("int a = __GNUC__;\n", {"__GNUC__=9"}, r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
+        << "gcc reports `-D__GNUC__=9` as a plain <command-line> redefinition "
+           "of a <built-in> macro, not as a protected-name violation";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "9") << "and it takes effect";
 }
 
 // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): the pe-gated `__declspec(x)` → empty
@@ -6582,15 +6803,24 @@ TEST(Preprocessor, FC179EmbedInDeadBranchIsSilent) {
     }
 }
 
-// T13 (C 6.10.8.1): a `#define` of a predefined `__STDC_EMBED_*` macro fails loud.
-TEST(Preprocessor, FC179EmbedStdcMacrosAreProtectedPredefines) {
+// T13 (C23 6.10.10.1p2): a `#define` of a predefined `__STDC_EMBED_*` macro is
+// DIAGNOSED. These three are ISO 6.10.10.2 MANDATORY macros, so they carry the
+// warn verb — and this loop is what keeps them there if somebody re-classifies
+// the `__STDC_*` family. ⚠ Post D-PP-PREDEFINE-REDEFINITION-PARTITION the
+// directive is no longer REFUSED: 6.10.10 sits outside any Constraints
+// subclause, so 4p2 makes it UB and both references warn-and-apply.
+TEST(Preprocessor, FC179EmbedStdcMacrosAreDiagnosedPredefines) {
     for (std::string const& name : {"__STDC_EMBED_NOT_FOUND__",
                                     "__STDC_EMBED_FOUND__",
                                     "__STDC_EMBED_EMPTY__"}) {
         PreprocessResult r;
         (void)ppEmbedTokens("#define " + name + " 9\nint a;\n", r, {});
         EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
-            << "#define of a predefined embed macro must fail loud: " << name;
+            << "#define of a predefined embed macro must be diagnosed: " << name;
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+                  DiagnosticSeverity::Warning)
+            << "diagnosed, not refused: " << name;
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << name;
     }
 }
 
@@ -7629,6 +7859,14 @@ TEST(Preprocessor, TFC74TargetPredefineGatesQuoteIncludeSeedSitePreScan) {
     fn.value          = "";
     fn.params         = {"x"};
     fn.isFunctionLike = true;
+    // D-PP-PREDEFINE-REDEFINITION-PARTITION: STATED, not defaulted. A
+    // function-like predefine has always been an ORDINARY macro (c105 lowers it
+    // to a `<built-in>` `#define`, so it is `#undef`-able and carries no
+    // predefined-name diagnostic), and the JSON loader now REFUSES any other
+    // verb on such a row. A `PredefinedMacroDef` built here never passes
+    // through that loader, so it would otherwise inherit the struct's
+    // conservative default and misdescribe itself.
+    fn.programRedefinition = PredefinedMacroRedefinition::Ordinary;
     std::vector<PredefinedMacroDef> tms{fn};
 
     static constexpr char const* kSrc = "#ifdef __ARCHFNPROBE__\n"
@@ -7713,6 +7951,14 @@ TEST(Preprocessor, TFC74FunctionLikeTargetPredefineSeedSiteBuiltinPrologue) {
     fn.value          = "";              // erase the call entirely
     fn.params         = {"x"};
     fn.isFunctionLike = true;
+    // D-PP-PREDEFINE-REDEFINITION-PARTITION: STATED, not defaulted. A
+    // function-like predefine has always been an ORDINARY macro (c105 lowers it
+    // to a `<built-in>` `#define`, so it is `#undef`-able and carries no
+    // predefined-name diagnostic), and the JSON loader now REFUSES any other
+    // verb on such a row. A `PredefinedMacroDef` built here never passes
+    // through that loader, so it would otherwise inherit the struct's
+    // conservative default and misdescribe itself.
+    fn.programRedefinition = PredefinedMacroRedefinition::Ordinary;
     std::vector<PredefinedMacroDef> tms{fn};
 
     PreprocessResult r;
@@ -7797,8 +8043,14 @@ namespace {
     // tests that use this fixture fail for the wrong reason: the unknown-key
     // test would go green on an impliedSurface diagnostic instead of the key one
     // it is pinning, and the `$`-prefix carve-out test could not load at all.
+    // D-PP-PREDEFINE-REDEFINITION-PARTITION added a SECOND mandatory key with
+    // the same "no default, answer it out loud" contract, and it fails the same
+    // two tests the same way when omitted. `ordinary` is the honest answer for a
+    // synthetic probe: it is not a name ISO C 6.10.10 lists, and its value is a
+    // static constant rather than one the engine derives.
     std::string entry = "{\"name\":\"__DSS_KEY_GATE_PROBE__\","
                         "\"kind\":\"constant\",\"value\":\"1\","
+                        "\"programRedefinition\":\"ordinary\","
                         "\"impliedSurface\":{\"kind\":\"claims-nothing\","
                         "\"reason\":\"standard-defined\"},";
     entry += '"';
@@ -7855,6 +8107,96 @@ TEST(Preprocessor, PredefinedMacroEntryDollarPrefixedKeyStillAccepted) {
            "be the PREFIX predicate, not a literal `$comment` compare, or "
            "`$valueComment` would be rejected as a typo. First diagnostic: "
         << (loaded.error().empty() ? "<none>" : loaded.error()[0].message);
+}
+
+// ══ D-PP-PREDEFINE-REDEFINITION-PARTITION — the LOADER's three refusals ═════
+//
+// `programRedefinition` is MANDATORY and its two structural rules are enforced
+// at load. Each sub-case mutates the SHIPPED document by REMOVAL or by an
+// impossible pairing and asserts the load REFUSES, naming the key.
+// ⚠ REMOVAL, not addition, for the missing-key case: `loadCExpectingFailure`
+// ADD_FAILUREs when its `from` text is absent, so a removal that finds nothing
+// is LOUD — whereas an added key always "succeeds" and would keep reporting
+// green over a document that had lost the field entirely.
+TEST(Preprocessor, PredefineRedefinitionVerbIsMandatoryAndStructurallyChecked) {
+    // (1) MISSING — remove the key from `__STDC__`'s row.
+    {
+        auto diags = loadCExpectingFailure(
+            "\"value\": \"1\", \"programRedefinition\": \"warn-iso-macro\", "
+            "\"impliedSurface\": { \"kind\": \"claims-nothing\", "
+            "\"reason\": \"standard-defined\" } }",
+            "\"value\": \"1\", "
+            "\"impliedSurface\": { \"kind\": \"claims-nothing\", "
+            "\"reason\": \"standard-defined\" } }",
+            "<no-program-redefinition>");
+        bool named = false;
+        for (auto const& d : diags) {
+            // The KEY may be named in the message text OR carried by the JSON
+            // POINTER — a structural refusal points at the field and explains
+            // the rule in prose, so searching only the message would miss it.
+            if (d.message.find("programRedefinition") != std::string::npos
+                || d.path.find("programRedefinition") != std::string::npos) {
+                named = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(named)
+            << "an omitted `programRedefinition` must be REFUSED and NAMED: "
+               "neither default is safe, so the question cannot be answered by "
+               "omission";
+    }
+    // (2) A DERIVED kind declared `ordinary`. It would lower to `#define
+    // __LINE__` — an EMPTY object-like macro — so the name would stay defined
+    // and expand to nothing. That is a silently-evaporating predefine.
+    {
+        auto diags = loadCExpectingFailure(
+            "\"name\": \"__LINE__\",            \"kind\": \"line\", "
+            "\"programRedefinition\": \"warn-iso-macro\"",
+            "\"name\": \"__LINE__\",            \"kind\": \"line\", "
+            "\"programRedefinition\": \"ordinary\"",
+            "<derived-kind-ordinary>");
+        bool named = false;
+        for (auto const& d : diags) {
+            // The KEY may be named in the message text OR carried by the JSON
+            // POINTER — a structural refusal points at the field and explains
+            // the rule in prose, so searching only the message would miss it.
+            if (d.message.find("programRedefinition") != std::string::npos
+                || d.path.find("programRedefinition") != std::string::npos) {
+                named = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(named)
+            << "a `line`/`file`/`date`/`time`/`counter` row has no static "
+               "`value` to lower into the built-in prologue, so `ordinary` is "
+               "unimplementable and must fail at LOAD, not at first use";
+    }
+    // (3) A FUNCTION-LIKE row declared with a warn verb. c105 lowers it to an
+    // ordinary `<built-in>` `#define`, so it has ALWAYS been `#undef`-able with
+    // no diagnostic — a warn verb there promises behaviour the engine has no
+    // place to produce.
+    {
+        auto diags = loadCExpectingFailure(
+            "\"params\": [\"x\"], \"availableObjectFormats\": [\"pe\"], "
+            "\"programRedefinition\": \"ordinary\"",
+            "\"params\": [\"x\"], \"availableObjectFormats\": [\"pe\"], "
+            "\"programRedefinition\": \"warn-derived-macro\"",
+            "<function-like-warn>");
+        bool named = false;
+        for (auto const& d : diags) {
+            // The KEY may be named in the message text OR carried by the JSON
+            // POINTER — a structural refusal points at the field and explains
+            // the rule in prose, so searching only the message would miss it.
+            if (d.message.find("programRedefinition") != std::string::npos
+                || d.path.find("programRedefinition") != std::string::npos) {
+                named = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(named)
+            << "a function-like predefine is an ordinary macro by construction; "
+               "config must not be able to claim otherwise";
+    }
 }
 
 // ── the COLLISION policy ──────────────────────────────────────────────────
@@ -8311,6 +8653,10 @@ TEST(Preprocessor, PeIdentityRedOnDisableRemovingTheGroupReadmitsTheCoDefinition
     std::string const withMsc =
         "{ \"name\": \"_MSC_VER\",            \"kind\": \"constant\", "
         "\"value\": \"1943\", \"availableObjectFormats\": [\"pe\"], "
+        // D-PP-PREDEFINE-REDEFINITION-PARTITION: a second mandatory key with no
+        // default. `ordinary` is what the row would carry if it still shipped —
+        // a compiler-identity spelling is not an ISO 6.10.10 name.
+        "\"programRedefinition\": \"ordinary\", "
         "\"impliedSurface\": { \"kind\": \"not-expressible\", \"note\": "
         "\"the historical row, re-created by this red-on-disable pin only\" } },\n      "
         + winRowOpen;
@@ -11227,12 +11573,36 @@ TEST(PreprocessorCounter, IsVisibleToIfdefWithoutConsumingACount) {
         << "a definedness TEST is not an expansion, so it must not burn a count";
 }
 
-// A predefined name may not be `#undef`'d (C 6.10.8.1p2) — the counter inherits
-// that guard from the shared predefined table rather than needing its own.
-TEST(PreprocessorCounter, MayNotBeUndefd) {
+// D-PP-PREDEFINE-REDEFINITION-PARTITION: `#undef` of the counter is DIAGNOSED
+// and then APPLIED — it inherits that from the shared predefined table rather
+// than needing its own rule, exactly as before; what changed is the rule.
+//
+// ★ THIS NAME IS THE INDEPENDENT CONFIRMATION THAT THE PARTITION'S SECOND ARM
+// IS REAL AND NOT A DSS INVENTION. The counter is a pure compiler extension —
+// ISO C never mentions it, so no clause of 6.10.10 reaches it — and yet
+// ✔MEASURED 2026-08-26, gcc 13.3.0 AND clang 18.1.3 BOTH diagnose
+// `#undef __COUNTER__`, exactly as they diagnose `#undef __LINE__`, while
+// staying silent for 16 other extension-supplied names in the same sweep. The
+// property that separates it from those 16 is that its value is DERIVED per
+// use, which is precisely what the `warn-derived-macro` verb declares. The
+// references drew that line first; the verb records it.
+// ⚠ It was previously pinned as a hard ERROR. Both references warn and
+// continue, and 6.10.10 sits outside any Constraints subclause (C23 4p2 ⇒ UB,
+// no diagnostic required at all), so refusing was the divergence.
+TEST(PreprocessorCounter, UndefIsDiagnosedThenApplied) {
     PreprocessResult r;
-    (void)ppLexemes("#undef __COUNTER__\nint x;\n", r);
-    EXPECT_TRUE(r.diagnostics->hasErrors());
+    auto lexs = ppLexemes("#undef __COUNTER__\nint x = __COUNTER__;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
+        << "a derived-value predefine must be diagnosed on #undef — gcc and "
+           "clang both are, for this name specifically";
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+              DiagnosticSeverity::Warning);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "diagnosed, not refused";
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "__COUNTER__")
+        << "and APPLIED: the name is a bare identifier now, not a minted count. "
+           "A `0` here would mean the #undef was diagnosed and then ignored";
 }
 
 // PER-TRANSLATION-UNIT RESET. Two independent preprocess runs must both start at

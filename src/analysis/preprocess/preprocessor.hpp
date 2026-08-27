@@ -68,6 +68,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
+#include "core/types/line_map.hpp"              // LineMap / LineMapSegment (the coordinate map, shared with the CU + src/lsp/)
 #include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
@@ -95,45 +96,13 @@ namespace dss {
 // collide with a real cap.
 inline constexpr std::uint32_t kPragmaPackAmbiguous = 0xFFFFFFFFu;
 
-// One contiguous run of the synthesized buffer that came VERBATIM from a
-// single origin buffer. The synth buffer is a concatenation of such runs
-// (header text spliced in where a quote-include was), so a binary search on
-// `synthStart` resolves any synth offset to its origin.
-struct DSS_EXPORT LineMapSegment {
-    ByteOffset                    synthStart = 0;   // inclusive, synth coords
-    ByteOffset                    synthEnd   = 0;   // exclusive, synth coords
-    std::shared_ptr<SourceBuffer> origin;           // the real file this run came from
-    ByteOffset                    originStart = 0;   // origin offset of synthStart
-};
-
-// synth-offset -> (origin buffer, origin offset). Built by the synth-buffer
-// builder; consumed to remap diagnostics off the synth buffer back onto the
-// real header/main file. A run is a VERBATIM copy (offsets advance 1:1 within
-// a segment), so the origin offset of a synth offset `o` in segment `s` is
-// `s.originStart + (o - s.synthStart)`. Offsets that land in SYNTHESIZED
-// glue (e.g. an injected newline between concatenated files) map to the
-// nearest preceding segment's origin -- good enough for attribution and never
-// out of bounds.
-class DSS_EXPORT LineMap {
-public:
-    void addSegment(LineMapSegment seg) { segments_.push_back(std::move(seg)); }
-
-    // Resolve a synth offset. Returns {origin buffer (may be null if the map
-    // is empty), origin offset}. Never aborts.
-    struct Resolved {
-        SourceBuffer const* origin = nullptr;
-        ByteOffset          offset = 0;
-    };
-    [[nodiscard]] Resolved resolve(ByteOffset synthOffset) const noexcept;
-
-    [[nodiscard]] std::span<LineMapSegment const> segments() const noexcept {
-        return segments_;
-    }
-    [[nodiscard]] bool empty() const noexcept { return segments_.empty(); }
-
-private:
-    std::vector<LineMapSegment> segments_;
-};
+// D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES:
+// `LineMapSegment` and `LineMap` MOVED to `core/types/line_map.hpp` (pure
+// move, no logic change). They are the coordinate map BETWEEN tiers, so
+// they cannot live inside the surface of one of them: `CompilationUnit`
+// carries the map and `src/lsp/` reads it, and neither should have to pull
+// the whole preprocessor to speak about a byte offset. Both operations are
+// inline there, so this stayed a header-only dependency with no link edge.
 
 // The product of a preprocess run.
 struct DSS_EXPORT PreprocessResult {

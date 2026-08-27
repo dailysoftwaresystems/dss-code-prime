@@ -2,8 +2,18 @@
 
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
+// `ArgCursors` + `argPassingRegister` — the ONE owner of "which register does
+// outgoing argument k of class C land in", reused by the outgoing-argument
+// pre-coloring hint rather than re-derived. A .cpp-level dependency only:
+// `lir_callconv.hpp` includes `lir_regalloc.hpp` (for `LirAllocation`), so the
+// edge runs one way and no header cycle is created.
+#include "lir/lir_callconv.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
+// `kByValueStackArgExhaust{Gpr,Fpr}` — the by-value stack-aggregate class-
+// exhaust codes the outgoing-argument cursor walk must honour, read from the
+// same declaration `lir_rewrite` and `lir_callconv` read them from.
+#include "mir/mir_opcode.hpp"
 #include "lir/lir_reg_constraints.hpp"
 
 #include <algorithm>
@@ -16,6 +26,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -574,6 +585,13 @@ struct ActiveEntry {
     LirRegClass   cls;
     std::uint16_t physOrdinal;
     bool          isCalleeSaved;
+    // OPT8: the COALESCED CLASS this entry stands for. `range` is that class's
+    // hull, and eviction must spill every member — a spill written onto the
+    // representative alone would leave the other members pointing at a register
+    // the evicting range now owns, which is a silent miscompile rather than a
+    // missed optimization. Zero for a caller that builds an entry outside the
+    // class-driven scan (there is none today; the field is not optional).
+    std::uint32_t classRoot = 0;
 };
 
 void expireActive(std::vector<ActiveEntry>& active,
@@ -703,6 +721,72 @@ tryAllocateExcluding(FreeListsByClass& free,
     return std::nullopt;
 }
 
+// ── PRE-COLORING: COALESCING A VREG AGAINST A **PHYSICAL** REGISTER ─────────
+//
+// ★★★ THE THIRD KIND OF COPY, AND ✔MEASURED 2026-08-26 IT IS THE BIG ONE. Over
+// 500 `examples/c/**` compiles, counted through the compiler's own post-stage
+// LIR dump: at POST-REWRITE — the tier the union-find coalescer acts on — only
+// **1110** register-to-register copies survive. At POST-CALLCONV there are
+// **14487**. `materializeCallingConvention` MINTS roughly thirteen thousand of
+// them, and it runs AFTER `lir_peephole`, so R1 never sees one.
+//
+// They are ABI moves: `mov <param's home>, <incoming arg register>` per
+// register-resident parameter, and the mirrored moves for outgoing arguments,
+// call results and return values. Each is a copy whose one end is a FIXED
+// PHYSICAL register, which no union-find over virtual registers can reach —
+// there is no vreg on that side to merge with. The instrument that removes them
+// is a PREFERENCE: allocate the vreg INTO the fixed register, and the copy
+// stops being minted at all (`lir_callconv.cpp`'s `maybeMov` emits nothing when
+// `dest.id == src.id`).
+//
+// This closes the long-standing `D-ML7-2.5` (plan 12) — "regalloc pre-coloring
+// hint for `arg`/`call` arg-position vregs" — whose own trigger names this
+// cycle: *"when the redundant-mov count becomes a measurable perf issue … or
+// the codegen-quality/peephole arc (plan 22) opens"*. Plan 22 OPT8 is that arc.
+//
+// **A PREFERENCE, NEVER A PIN, AND THE DISTINCTION IS THE WHOLE SAFETY
+// ARGUMENT.** This function can only reorder choices that were ALREADY legal:
+// it draws from the same bucket `tryAllocate` would have drawn from, honours
+// the same `excluded` set, and returns nullopt — falling back to the ordinary
+// policy — whenever the preferred register is unavailable. It cannot widen what
+// a range may be given, so every existing exclusion (cross-call envelope,
+// implicit clobbers, arg-register occupancy, the two-address anti-clobber set)
+// binds it unchanged.
+//
+// ⚠ WHICH SIDE IS HINTED, AND WHY ONLY THAT SIDE. The hint used here is the
+// DEF-side one for an incoming parameter, and it comes from
+// `collectArgRegisterOccupied` — i.e. from `lir_pass_util::incomingArgRegister`,
+// the ONE formula the rewriter's spill-scratch forbid already shares. No second
+// owner of "which register holds parameter k" is created by this.
+[[nodiscard]] std::optional<AllocPick>
+tryAllocatePreferred(FreeListsByClass& free, LirRegClass cls, bool crossesCall,
+                     std::span<std::uint16_t const> excluded,
+                     std::optional<std::uint16_t> preferred) {
+    if (!preferred.has_value()) return std::nullopt;
+    for (auto e : excluded) {
+        if (e == *preferred) return std::nullopt;
+    }
+    auto takeFrom = [&](std::vector<std::uint16_t>& regs) -> bool {
+        for (auto it = regs.begin(); it != regs.end(); ++it) {
+            if (*it != *preferred) continue;
+            regs.erase(it);
+            return true;
+        }
+        return false;
+    };
+    auto& bucket = free[static_cast<std::size_t>(cls)];
+    // Same partition order as `tryAllocate` — the preference reorders WITHIN
+    // what the policy already allows and never across it. A cross-call range
+    // still cannot be handed a caller-saved register, which is exactly what
+    // makes an incoming-arg hint silently decline for a parameter that lives
+    // across a call.
+    if (!crossesCall && takeFrom(bucket.callerSaved)) {
+        return AllocPick{*preferred, false};
+    }
+    if (takeFrom(bucket.calleeSaved)) return AllocPick{*preferred, true};
+    return std::nullopt;
+}
+
 [[nodiscard]] std::vector<ActiveEntry>::iterator
 findSpillCandidate(std::vector<ActiveEntry>& active, LirRegClass cls,
                    bool requireCalleeSaved,
@@ -806,6 +890,84 @@ LirFuncAllocation::forVReg(std::uint32_t vregId) const noexcept {
     return &a;
 }
 
+// ── the independent coalescing auditor (contract: `lir_regalloc.hpp`) ───────
+//
+// Deliberately NOT written in terms of the coalescer's data structures. Its
+// only inputs are the ranges liveness produced and the assignments the
+// allocator wrote — the two things a WRONG merge would have to corrupt
+// together to escape. It is a pure function so a test can hand it a
+// hand-built, deliberately-broken allocation and observe the refusal directly,
+// rather than reading the arm and believing it.
+std::optional<LirAllocationConflict>
+findAllocationConflict(LirFuncLiveness const&   flow,
+                       LirFuncAllocation const& alloc) noexcept {
+    // Ranges carrying an assignment, paired with the resource they landed on.
+    struct Placed {
+        LirLiveRange const* range = nullptr;
+        std::uint32_t       resource = 0;
+        bool                isSpill  = false;
+    };
+    std::vector<Placed> placed;
+    placed.reserve(flow.ranges.size());
+    for (auto const& rng : flow.ranges) {
+        if (rng.vreg.id == 0) continue;
+        auto const* a = alloc.forVReg(rng.vreg.id);
+        if (a == nullptr) continue;
+        if (a->isSpilled()) {
+            placed.push_back({&rng, a->spillSlot().v, true});
+        } else {
+            // A physical ordinal is only comparable WITHIN a register class:
+            // GPR 0 and FPR 0 are different registers. Fold the class into the
+            // key rather than comparing ordinals across classes, which would
+            // manufacture conflicts that do not exist.
+            placed.push_back({&rng,
+                              (static_cast<std::uint32_t>(a->physReg().id) << 8)
+                                  | static_cast<std::uint32_t>(
+                                        a->vreg.regClass()),
+                              false});
+        }
+    }
+    // ── GROUP BY RESOURCE, THEN COMPARE ONLY ADJACENT RANGES.
+    //
+    // ⚠ THE ALL-PAIRS SCAN THIS REPLACED WAS A COMPILE-TIME HAZARD, NOT A
+    // TIDINESS ONE. It ran on EVERY function of every compile, so its cost is
+    // Σ n² over functions — a shape that is invisible on a corpus of small
+    // examples and expensive on the one real-world function with twenty
+    // thousand virtual registers. A wrong-answer guard has to be cheap enough
+    // that nobody is ever tempted to make it conditional.
+    //
+    // ★ The reduction is exact, not a heuristic: within ONE resource, sort the
+    // ranges by start; if any two of them overlap, then SOME ADJACENT PAIR
+    // overlaps. (If `a` precedes `c` in start order and they overlap, then any
+    // `b` between them has `a.start ≤ b.start ≤ c.start < a.end`, so `a` and
+    // `b` overlap too.) One sort plus one linear pass per resource finds every
+    // conflict the quadratic scan would have.
+    std::sort(placed.begin(), placed.end(),
+              [](Placed const& x, Placed const& y) {
+                  return std::tie(x.isSpill, x.resource, x.range->start,
+                                  x.range->vreg.id)
+                       < std::tie(y.isSpill, y.resource, y.range->start,
+                                  y.range->vreg.id);
+              });
+    for (std::size_t i = 1; i < placed.size(); ++i) {
+        auto const& prev = placed[i - 1];
+        auto const& cur  = placed[i];
+        if (prev.isSpill != cur.isSpill) continue;
+        if (prev.resource != cur.resource) continue;
+        // Two vregs COALESCED into one class share a resource ON PURPOSE and
+        // are not a conflict — but that is decided HERE by the ranges, never
+        // by asking the coalescer whether it meant it.
+        if (!lirRangesInterfere(*prev.range, *cur.range)) continue;
+        LirAllocationConflict c;
+        c.a = prev.range->vreg;
+        c.b = cur.range->vreg;
+        c.isSpillSlot = prev.isSpill;
+        c.sharedResource = prev.isSpill ? prev.resource : (prev.resource >> 8);
+        return c;
+    }
+    return std::nullopt;
+}
+
 bool LirAllocation::ok() const noexcept {
     for (auto const& f : perFunc) {
         if (!f.ok) return false;
@@ -840,6 +1002,652 @@ functionContainsOpcode(Lir const& lir, LirFuncId fn, std::uint16_t op) noexcept 
     }
     return false;
 }
+
+// ── REGISTER COALESCING (plan 22 OPT8) ──────────────────────────────────────
+//
+// The contract, the two edge kinds and the three vetoes are written out in
+// `lir_regalloc.hpp`'s "REGISTER COALESCING" section; what follows is the
+// mechanism. Everything here reads DECLARED vocabulary — the class move
+// resolved through `regClassOpOpcode`, the register's own `widthBytes`, the
+// opcode's `requires2Address` index — and holds no mnemonic, no register name
+// and no target identity.
+
+// The full declared width, in bits, of register class `cls` on this target:
+// the widest register the table declares for that class.
+//
+// ⚠ WHY THE **WIDEST** AND NOT THE FIRST. A target register table declares the
+// narrow VIEWS alongside their parents (x86-64 `eax` is a 4-byte GPR row whose
+// `subOf` is `rax`), so "the first GPR row" answers 4 bytes on a 64-bit machine.
+// Taking the maximum answers the question this predicate actually asks — is
+// this copy writing the WHOLE register — which is the same question
+// `lir_peephole`'s R1 asks post-regalloc, where it can read the assigned
+// register's own row directly. Pre-regalloc there is no assigned row yet, so
+// the class's own maximum is the honest stand-in, and it is CONSERVATIVE in the
+// direction that matters: a narrow copy can never equal it, so a partial-
+// register write is never mistaken for a full one.
+//
+// Returns 0 when the class declares no register at all — a caller reads that as
+// "cannot prove full width" and coalesces nothing.
+[[nodiscard]] std::uint32_t
+classFullWidthBits(TargetSchema const& schema, LirRegClass cls) noexcept {
+    std::uint32_t widest = 0;
+    for (auto const& info : schema.registers()) {
+        if (static_cast<LirRegClass>(info.regClass) != cls) continue;
+        auto const bits = static_cast<std::uint32_t>(info.widthBytes) * 8u;
+        if (bits > widest) widest = bits;
+    }
+    return widest;
+}
+
+// One copy-affinity edge: `dst` and `src` are copy-related vreg ids and want
+// the same physical register.
+struct CopyEdge {
+    std::uint32_t dst = 0;
+    std::uint32_t src = 0;
+};
+
+// One anti-affinity pair: `a` and `b` are vreg ids that must NEVER share a
+// physical register even when their live ranges are disjoint. Veto 2 in the
+// header — a `requires2Address` result against each UNTIED register operand of
+// its own defining instruction.
+struct AntiAffinityPair {
+    std::uint32_t a = 0;
+    std::uint32_t b = 0;
+};
+
+// A PHYSICAL-register affinity: vreg `vregId` is one end of a copy whose other
+// end is the fixed physical ordinal `ordinal`. There is no vreg on that side to
+// merge with, so the affinity is expressed as a PREFERENCE at allocation time
+// (`tryAllocatePreferred`) rather than as a union-find edge — get the vreg into
+// that register and the copy becomes a move onto itself, which R1 deletes.
+//
+// ⓘ This is the shape `D-ML7-2.5`'s SECOND consumer names: the div/mod family
+// captures its implicit-output register with `result = mov <rax>`, so the
+// capture disappears exactly when the result vreg is allocated there. Nothing
+// about the rule is div-specific — it reads the operand's `isPhysical` bit, so
+// any lowering that pins one end of a copy gets the same treatment.
+struct PhysAffinity {
+    std::uint32_t vregId  = 0;
+    std::uint16_t ordinal = 0;
+};
+
+struct CoalesceInput {
+    std::vector<CopyEdge>         edges;
+    std::vector<AntiAffinityPair> forbidden;
+    std::vector<PhysAffinity>     physHints;
+};
+
+// The register a value of class `cls` is RETURNED in under `cc`, or nullopt
+// when this function cannot answer for that class.
+//
+// ★★ IT DECLINES RATHER THAN GUESSES, AND THAT IS WHAT KEEPS IT FROM BECOMING
+// A SECOND OWNER OF THE RETURN-REGISTER FORMULA. `lir_callconv.cpp`'s
+// `returnRegisterForClass` is the owner: it MUST answer for every class,
+// including the VR case that `D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR`
+// records going wrong when a two-way `(cls == FPR) ? fprs : gprs` was written
+// out by hand. This one answers ONLY where the vocabulary is unambiguous and
+// returns nullopt everywhere else, so it cannot reproduce that defect: the
+// class it refuses is exactly the class the real formula has to think about.
+//
+// ⚠ AND THE CONSEQUENCE OF BEING WRONG IS BOUNDED BY CONSTRUCTION. The answer
+// is used ONLY as a `tryAllocatePreferred` hint. A hint that names the wrong
+// register produces a legal allocation in a different register, and
+// `materializeCallingConvention` then emits the copy it would always have
+// emitted — a missed optimization, never a wrong answer. Nothing downstream
+// reads this to decide where the value IS.
+[[nodiscard]] std::optional<std::uint16_t>
+returnRegisterHint(TargetSchema const& schema,
+                   TargetCallingConvention const& cc, LirRegClass cls) {
+    std::vector<std::string> const* names = nullptr;
+    if (cls == LirRegClass::GPR)      names = &cc.returnGprs;
+    else if (cls == LirRegClass::FPR) names = &cc.returnFprs;
+    else                              return std::nullopt;
+    if (names->empty()) return std::nullopt;
+    return schema.registerByName(names->front());
+}
+
+// Resolve the class-move opcode per register class, once per function.
+// Deliberately the SAME resolution `lir_2addr_legalize` uses to SYNTHESIZE a
+// copy and `lir_peephole` uses to RECOGNIZE one: three passes, one question,
+// one owner (`TargetSchema::regClassOpOpcode`).
+struct MoveOpcodeCache {
+    TargetSchema const& schema;
+    std::array<std::optional<std::optional<std::uint16_t>>,
+               kLirRegClassCount> byClass{};
+    std::array<std::optional<std::uint32_t>, kLirRegClassCount> widthByClass{};
+
+    [[nodiscard]] std::optional<std::uint16_t> moveOpcode(LirRegClass cls) {
+        auto const c = static_cast<std::size_t>(cls);
+        if (c >= byClass.size()) return std::nullopt;
+        if (!byClass[c].has_value()) {
+            byClass[c] = schema.regClassOpOpcode(
+                static_cast<TargetRegClass>(c), RegClassOp::Move);
+        }
+        return *byClass[c];
+    }
+    [[nodiscard]] std::uint32_t fullWidthBits(LirRegClass cls) {
+        auto const c = static_cast<std::size_t>(cls);
+        if (c >= widthByClass.size()) return 0;
+        if (!widthByClass[c].has_value()) {
+            widthByClass[c] = classFullWidthBits(schema, cls);
+        }
+        return *widthByClass[c];
+    }
+};
+
+// ── THE OUTGOING-ARGUMENT HINT (D-ML7-2.5, the half that was withheld) ───────
+//
+// The DEF-side hints cover where a value is BORN: an incoming parameter
+// arrives in its ABI register, a call result arrives in the return register.
+// This one covers where a value must BE AT ITS LAST USE — the argument
+// register the call reads it out of. Together they are the whole population of
+// ABI copies `materializeCallingConvention` mints after the peephole has run.
+//
+// ★★★ WHY IT IS SAFE TO LAND, AND THE REASON IT WAS HELD BACK IS REFUTED BY
+// EXECUTION RATHER THAN BY ARGUMENT. The stated hazard was that pre-coloring an
+// outgoing argument makes some argument-move SOURCES be argument registers,
+// producing the move-graph cycle `L_MoveCycleUnsupported` used to refuse. Two
+// independent measurements say otherwise:
+//
+//   * THE REFUSAL IS GONE. `D-ML7-2.3`'s parallel-copy resolution shipped in
+//     c76: `emitParallelRegMoves` emits the acyclic part in dependency order
+//     and breaks each remaining cycle with a scratch drawn from
+//     `cc.callerSaved`. The v1 O(N^2) detector it superseded was deleted.
+//   * AND THE DEF-SIDE HINT ALREADY PRODUCES THAT EXACT SHAPE. Pinning an
+//     incoming parameter to its home makes that home an argument register, so
+//     `int f(int a,int b){ return g(b,a); }` is ALREADY a 2-cycle whose two
+//     sources are both argument registers — before this function exists.
+//     ✔MEASURED on that source at post-callconv: three moves through a
+//     scratch, and the program exits 42.
+//
+// ⇒ this hint reaches a population no DEF-side hint can (a COMPUTED value
+// passed as an argument has no ABI birthplace to be hinted from) while adding
+// no move-graph shape the allocator was not already producing.
+//
+// ⚠ THE ARGUMENT POSITION IS NOT THE OPERAND INDEX, AND THAT IS WHY THIS
+// FUNCTION IS SHORT. Which register argument k lands in is a cursor walk:
+// an indirect-result operand shifts the base, a by-value stack aggregate
+// consumes a position and can EXHAUST a whole class, two pools may share one
+// cursor when they are two views of one physical register file, `slotAligned`
+// collapses every class onto a single positional cursor, and a variadic call
+// past its fixed count may be forced to the stack. That walk has exactly ONE
+// owner — `ArgCursors` — because it previously existed in three hand-kept
+// copies that disagreed
+// (D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR). This
+// reuses the owner and re-derives nothing; likewise the slot→register step is
+// `argPassingRegister`, the published owner of that lookup.
+//
+// ⓘ WHY PASSING THE REAL REPORTER ADDS NO FAILURE SURFACE. `argPassingRegister`
+// refuses loudly in three cases — the class owns no pool, the cc declares the
+// pool empty, the pool is exhausted — and all three are excluded by the guards
+// below (a class with no row yields no cursor slot; an empty or overrun pool
+// fails `index < poolSize`). Were one to fire anyway it would mean `ArgCursors`
+// and `argPassingRegister` disagree, and `materializeCallingConvention` calls
+// the SAME function with the SAME index for the SAME operand a few passes
+// later — so the refusal is one this compile was already going to make, raised
+// one tier earlier. Nothing here can refuse a program the pipeline accepts.
+void collectOutgoingArgHints(std::span<LirOperand const> ops,
+                             std::uint32_t                 payload,
+                             TargetSchema const&           schema,
+                             TargetCallingConvention const& cc,
+                             DiagnosticReporter&           reporter,
+                             CoalesceInput&                out) {
+    ArgCursors argCursors{schema, cc};
+
+    bool const hasIrr = ::dss::call_payload::hasIndirectResult(payload);
+    std::size_t const firstArgIdx = hasIrr ? 2u : 1u;
+    bool const variadicForcesStack =
+        cc.variadicArgsAlwaysStack && ::dss::call_payload::isVariadic(payload);
+    std::uint32_t const fixedOps = ::dss::call_payload::fixedOperandCount(payload);
+
+    std::uint32_t argRegionIdx = 0;
+    for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
+        LirOperand const& argOp = ops[k];
+        // The marker and its MemOffset are consumed WITH the carrier, never
+        // argument positions of their own — the same reading
+        // `classifyCallRegArgs` and the callconv placement site perform.
+        if (lirIsByValueStackAggDescriptor(ops, k)) continue;
+        if (lirIsByValueStackAggCarrier(ops, k)) {
+            std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
+            if (ex == kByValueStackArgExhaustGpr) {
+                argCursors.exhaust(LirRegClass::GPR);
+            } else if (ex == kByValueStackArgExhaustFpr) {
+                argCursors.exhaust(LirRegClass::FPR);
+            }
+            ++argRegionIdx;
+            continue;
+        }
+        if (argOp.kind != LirOperandKind::Reg) { ++argRegionIdx; continue; }
+        LirRegClass const cls = argOp.reg.regClass();
+        // ⚠ THE CURSOR ADVANCES FOR EVERY REGISTER OPERAND, HINTED OR NOT.
+        // Skipping the advance for an operand this function declines to hint
+        // (a physical register, say) would shift every LATER argument's
+        // position and hint them into the wrong registers.
+        auto const slot = argCursors.next(cls);
+        bool const forceStack = variadicForcesStack && argRegionIdx >= fixedOps;
+        ++argRegionIdx;
+        if (!slot.has_value()) continue;              // class owns no pool
+        if (slot->index >= slot->poolSize) continue;  // stack-passed
+        if (forceStack) continue;
+        // Only a VIRTUAL register can be hinted; a physical one already IS
+        // somewhere and the allocator has nothing left to choose.
+        if (!argOp.reg.valid() || argOp.reg.isPhysical != 0) continue;
+        auto const reg = argPassingRegister(
+            schema, cc, slot->index, cls,
+            "regalloc: outgoing-argument pre-coloring hint", reporter);
+        if (!reg.has_value()) continue;
+        out.physHints.push_back(
+            {argOp.reg.id, static_cast<std::uint16_t>(reg->id)});
+    }
+}
+
+// Collect both edge kinds and the anti-affinity pairs in ONE walk of the
+// function, in instruction order — which is what makes the merge sequence
+// deterministic and therefore the allocation reproducible.
+[[nodiscard]] CoalesceInput
+collectCoalesceInput(Lir const& lir, TargetSchema const& schema,
+                     TargetCallingConvention const& cc,
+                     LirFuncLiveness const& flow, MoveOpcodeCache& moves,
+                     DiagnosticReporter& reporter) {
+    CoalesceInput out;
+    for (auto const& blk : flow.blockOrder) {
+        std::uint32_t const n = lir.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = lir.blockInstAt(blk, i);
+            auto const  opcode = lir.instOpcode(inst);
+            auto const* info   = schema.opcodeInfo(opcode);
+            if (info == nullptr) continue;
+            LirReg const result = lir.instResult(inst);
+            auto const   ops    = lir.instOperands(inst);
+
+            // ── the IMPLICIT copy: a `requires2Address` (result, tied) pair,
+            // plus the anti-affinity against every UNTIED register operand.
+            // Both come from the same declaration, so a target that ties its
+            // result to operand 1 gets the affinity on 1 and the veto on 0
+            // with no edit here.
+            if (info->requires2Address.has_value()) {
+                std::size_t const tied = *info->requires2Address;
+                if (result.valid() && result.isPhysical == 0) {
+                    // The tied operand's own vreg id, needed BEFORE the loop:
+                    // an untied operand that IS the tied one carries no
+                    // clobber hazard and must not veto the merge.
+                    std::uint32_t tiedId = 0;
+                    if (ops.size() > tied && ops[tied].kind == LirOperandKind::Reg
+                        && ops[tied].reg.valid()
+                        && ops[tied].reg.isPhysical == 0) {
+                        tiedId = ops[tied].reg.id;
+                    }
+                    for (std::size_t k = 0; k < ops.size(); ++k) {
+                        if (ops[k].kind != LirOperandKind::Reg) continue;
+                        LirReg const r = ops[k].reg;
+                        if (!r.valid() || r.isPhysical != 0) continue;
+                        if (k == tied) {
+                            if (r.regClass() == result.regClass()) {
+                                out.edges.push_back({result.id, r.id});
+                            }
+                            continue;
+                        }
+                        // ⚠ `add r, [x, x]` — the SAME vreg in both operand
+                        // slots — is the shape that made this veto too strong.
+                        // The hazard the veto exists for is legalize's
+                        // `mov result, ops[tied]` destroying a DIFFERENT
+                        // value; when the untied operand IS the tied one the
+                        // copy is `mov R, R`, nothing is destroyed, and
+                        // `add R, [R, R]` computes exactly x+x.
+                        // ✔MEASURED: without this clause `int f(int x)
+                        // { return x + x; }` — the simplest two-address shape
+                        // there is — coalesced NOTHING.
+                        if (tiedId != 0 && r.id == tiedId) continue;
+                        out.forbidden.push_back({result.id, r.id});
+                    }
+                }
+                continue;  // a 2-addr op is never also a plain copy
+            }
+
+            // ── the ABI copies `materializeCallingConvention` will mint AFTER
+            // the peephole has run, hinted here so it mints nothing instead.
+            // ✔MEASURED 2026-08-26 through the compiler's own post-stage LIR
+            // dump over 500 examples: 1110 copies exist at post-rewrite and
+            // 14487 at post-callconv, so this population is roughly THIRTEEN
+            // TIMES the one a vreg-to-vreg union-find can reach.
+            //
+            //   * a CALL's result arrives in the cc's return register;
+            //   * a RETURN's operand must be in it.
+            //
+            // Both are read from DECLARED vocabulary — `isCall` and
+            // `terminatorKind == Return`, never a mnemonic — and both are
+            // PREFERENCES, so a class that already owes its register to
+            // something stronger simply keeps it.
+            if (info->isCall) {
+                if (result.valid() && result.isPhysical == 0) {
+                    if (auto const rr = returnRegisterHint(schema, cc,
+                                                           result.regClass());
+                        rr.has_value()) {
+                        out.physHints.push_back({result.id, *rr});
+                    }
+                }
+                // ── and the USE side: every register-passed outgoing argument
+                // wants to already BE in the register the call will read it
+                // from. This is the population `materializeCallingConvention`
+                // mints after the peephole has run — see
+                // `collectOutgoingArgHints` for why it is safe and why the
+                // position comes from `ArgCursors` rather than from `k`.
+                collectOutgoingArgHints(ops, lir.instPayload(inst), schema, cc,
+                                        reporter, out);
+                continue;
+            }
+            if (info->terminatorKind == TargetTerminatorKind::Return) {
+                for (auto const& o : ops) {
+                    if (o.kind != LirOperandKind::Reg) continue;
+                    if (!o.reg.valid() || o.reg.isPhysical != 0) continue;
+                    if (auto const rr = returnRegisterHint(schema, cc,
+                                                           o.reg.regClass());
+                        rr.has_value()) {
+                        out.physHints.push_back({o.reg.id, *rr});
+                    }
+                }
+                continue;
+            }
+
+            // ── the EXPLICIT copy. The admission test is R1's, asked one tier
+            // earlier and against VIRTUAL registers.
+            if (info->isTerminator()) continue;
+            if (info->hasSideEffects) continue;
+            if (info->implicitRegisters.has_value()) continue;
+            // A per-INSTRUCTION constraint entry is referenced BY INDEX from
+            // the instruction stream; R1 refuses to delete such an instruction
+            // for that reason, so merging across it would buy nothing and
+            // would put a pinned-register instruction inside a merged class
+            // whose exclusion set is computed per member. Fail-safe: skip.
+            // Ask via the raw HANDLE, not the resolved pointer: the resolver
+            // aborts on a dangling index, and a fail-safe skip must not be the
+            // thing that kills the process on malformed input.
+            if (lir.instRegConstraintHandle(inst) != kLirNoRegConstraints) {
+                continue;
+            }
+            if (!result.valid()) continue;
+            if (ops.size() != 1) continue;
+            if (ops[0].kind != LirOperandKind::Reg) continue;
+            LirReg const src = ops[0].reg;
+            if (!src.valid()) continue;
+            if (src.regClass() != result.regClass()) continue;
+            auto const mov = moves.moveOpcode(result.regClass());
+            if (!mov.has_value() || opcode != *mov) continue;
+            // ── ONE END PHYSICAL: a PREFERENCE, not a union-find edge. Emitted
+            // before the width clause deliberately — a preference cannot change
+            // what any instruction MEANS (it only picks which legal register a
+            // vreg gets), so the partial-register hazard the width clause
+            // guards does not apply to it. The worst case for a narrow copy is
+            // that the copy survives, which is where it started.
+            if (result.isPhysical != 0 && src.isPhysical == 0) {
+                out.physHints.push_back(
+                    {src.id, static_cast<std::uint16_t>(result.id)});
+                continue;
+            }
+            if (result.isPhysical == 0 && src.isPhysical != 0) {
+                out.physHints.push_back(
+                    {result.id, static_cast<std::uint16_t>(src.id)});
+                continue;
+            }
+            if (result.isPhysical != 0 || src.isPhysical != 0) continue;
+            // THE WIDTH CLAUSE — R1's second, independent guard. A copy
+            // narrower than its register writes bits it did not read, so
+            // merging its two ends changes what the surviving instruction
+            // means. Only a FULL-width class move is an edge.
+            auto const full = moves.fullWidthBits(result.regClass());
+            if (full == 0) continue;
+            if (static_cast<std::uint32_t>(lirInstWidthBits(lir.instFlags(inst)))
+                != full) {
+                continue;
+            }
+            out.edges.push_back({result.id, src.id});
+        }
+    }
+    return out;
+}
+
+// The coalesced partition. `parent` is a union-find over vreg ids; `hull` holds
+// each ROOT's merged live range (the interval the linear scan will actually
+// hold the register over) and `members` its vreg ids.
+//
+// ★ THE HULL IS THE SUBJECT OF THE INTERFERENCE TEST, NOT THE MEMBER LIST, AND
+// THAT IS DELIBERATE. The allocator will hold one register over the hull, so
+// asking about the hull is asking about what will actually happen. A hull can
+// only be coarser than the union of its members, so the test can only REFUSE
+// merges a member-wise test would have allowed — never admit one it would have
+// refused.
+struct CoalescePartition {
+    std::vector<std::uint32_t>              parent;
+    std::vector<LirLiveRange>               hull;
+    std::vector<std::vector<std::uint32_t>> members;
+    std::uint32_t                           unions = 0;
+
+    [[nodiscard]] std::uint32_t find(std::uint32_t x) noexcept {
+        while (parent[x] != x) {
+            parent[x] = parent[parent[x]];  // path halving
+            x = parent[x];
+        }
+        return x;
+    }
+};
+
+// ── THE PRESSURE MAP — VETO 4, AND IT IS **MEASURED**, NOT REASONED ─────────
+//
+// ★★★ COALESCING INTO A REGION WHERE A SPILL IS ALREADY FORCED MAKES THE
+// FUNCTION WORSE, AND THE FIRST BUILD OF THIS PASS PROVED IT.
+//
+// ✔MEASURED 2026-08-26 over 517 `examples/c/**` ELF64/x86_64 artifacts, with
+// vetoes 1–3 only: 1069 register-to-register copies removed and 151 examples
+// smaller — while SIXTEEN grew, one by 96 instructions with 218 extra memory
+// operands, and EVERY ONE of the sixteen was a function that already spills.
+// `examples/c/arg_reg_fp_pressure` is the clean specimen: a 16-term
+// floating-point accumulator chain. Each `sum = sum + x` is a two-address op,
+// so the tied edges merge the WHOLE CHAIN into one class — and the resulting
+// class has, by construction, the LATEST end of anything active.
+// `findSpillCandidate` spills the latest-ending active range, so the merged
+// accumulator became the guaranteed victim and sixteen register adds turned
+// into sixteen store/reload pairs.
+//
+// ★ AND THE MERGE BOUGHT NOTHING THERE: the copy count was UNCHANGED (the
+// pre-OPT8 allocator already handed that chain one register, by the free
+// list's LIFO order). Pure cost, zero benefit — which is what makes this a
+// veto rather than a trade-off to price.
+//
+// ⚠ THE FIRST HYPOTHESIS WAS WRONG AND IS RECORDED BECAUSE IT WAS TESTED. It
+// looked like POOL pressure — a merge re-homing a non-crossing range into the
+// scarcer callee-saved pool — so a veto on exactly that was built and
+// measured: it fixed ONE of the sixteen regressions and gave up THIRTY-SEVEN
+// improvements. Reverted. The mechanism is the spill-victim heuristic, not the
+// pool split.
+//
+// **THE RULE:** refuse a merge whose hull spans a position where at least K
+// same-class values are simultaneously live, K being the number of registers
+// the calling convention makes allocatable for that class. Inside such a
+// region SOMETHING must go to memory; a merged class is what will, and it
+// takes every member's uses with it.
+//
+// ⓘ WHY THIS IS NOT THE COST MODEL OPT23 OWES. It prices nothing. There is no
+// spill weight, no block frequency, no latency and no machine model — it
+// compares a COUNT of live ranges against a COUNT of declared registers, both
+// of which this function already has in hand. What a cost model would add is
+// the judgement to overrule it ("this merge is worth a spill anyway"), which
+// is a refinement of a rule that already errs toward leaving the pre-OPT8
+// allocation alone.
+//
+// ⓘ AND IT IS EXACTLY THE CLASSICAL "CONSERVATIVE COALESCING" INTUITION
+// (Briggs / George) reduced to what this substrate can answer honestly: with
+// no interference GRAPH there are no neighbour degrees to count, but the live
+// count at a position is a sound stand-in for the one question that matters —
+// is this region already over capacity.
+struct PressureMap {
+    // `nextHot[cls][p]` — the smallest position ≥ p at which class `cls` is at
+    // or over capacity, or `kNoHot` when there is none at or after p. One
+    // backward sweep to build, O(1) to query, and it never materialises the
+    // per-position live counts a range-max structure would need.
+    static constexpr std::uint32_t kNoHot = UINT32_MAX;
+    std::array<std::vector<std::uint32_t>, kLirRegClassCount> nextHot{};
+
+    [[nodiscard]] bool spansHotRegion(LirRegClass cls,
+                                      LirLiveRange const& r) const noexcept {
+        auto const& v = nextHot[static_cast<std::size_t>(cls)];
+        if (v.empty()) return false;
+        auto const lo = (r.start < v.size())
+                            ? r.start
+                            : static_cast<std::uint32_t>(v.size() - 1u);
+        return v[lo] < r.end;
+    }
+};
+
+[[nodiscard]] PressureMap
+buildPressureMap(LirFuncLiveness const& flow,
+                 std::array<std::uint32_t, kLirRegClassCount> const& capacity) {
+    PressureMap out;
+    std::uint32_t const positions = flow.totalPositions + 1u;
+    for (std::size_t c = 0; c < kLirRegClassCount; ++c) {
+        if (capacity[c] == 0) continue;   // no allocatable register: no map
+        // Difference array → live count per position.
+        std::vector<std::int32_t> delta(positions + 1u, 0);
+        bool any = false;
+        for (auto const& rng : flow.ranges) {
+            if (rng.vreg.id == 0) continue;
+            if (static_cast<std::size_t>(rng.vreg.regClass()) != c) continue;
+            if (rng.start >= positions) continue;
+            any = true;
+            ++delta[rng.start];
+            --delta[(rng.end < positions) ? rng.end : positions];
+        }
+        if (!any) continue;
+        std::vector<std::uint32_t> next(positions, PressureMap::kNoHot);
+        std::int32_t live = 0;
+        std::vector<bool> hot(positions, false);
+        for (std::uint32_t p = 0; p < positions; ++p) {
+            live += delta[p];
+            hot[p] = (live >= static_cast<std::int32_t>(capacity[c]));
+        }
+        std::uint32_t seen = PressureMap::kNoHot;
+        for (std::uint32_t p = positions; p-- > 0;) {
+            if (hot[p]) seen = p;
+            next[p] = seen;
+        }
+        out.nextHot[c] = std::move(next);
+    }
+    return out;
+}
+
+// Build the partition. `rangeOf` is the per-vreg-id live range (`.vreg.id == 0`
+// marks a vreg with no range — one that liveness never saw). `callPositions`
+// `pressure` is the per-class capacity map VETO 4 consults.
+[[nodiscard]] CoalescePartition
+buildCoalescePartition(CoalesceInput const&             in,
+                       std::vector<LirLiveRange> const&  rangeOf,
+                       PressureMap const&                pressure) {
+    CoalescePartition p;
+    std::uint32_t const n = static_cast<std::uint32_t>(rangeOf.size());
+    p.parent.resize(n);
+    p.hull = rangeOf;
+    p.members.resize(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        p.parent[i] = i;
+        if (rangeOf[i].vreg.id != 0) p.members[i].push_back(i);
+    }
+    // Anti-affinity is checked against the CLASSES being merged, so it must be
+    // asked as "does any forbidden pair straddle these two roots" — a pair
+    // whose two ends have already been pulled into one class by an unrelated
+    // chain would otherwise slip through. Kept as a flat list and re-resolved
+    // through `find` on every query: the lists are short (one entry per untied
+    // register operand of a 2-address instruction) and re-resolution is what
+    // keeps the answer true as the partition evolves.
+    auto const straddles = [&](std::uint32_t ra, std::uint32_t rb) {
+        for (auto const& f : in.forbidden) {
+            if (f.a >= n || f.b >= n) continue;
+            auto const fa = p.find(f.a);
+            auto const fb = p.find(f.b);
+            if ((fa == ra && fb == rb) || (fa == rb && fb == ra)) return true;
+        }
+        return false;
+    };
+    for (auto const& e : in.edges) {
+        if (e.dst == 0 || e.src == 0) continue;
+        if (e.dst >= n || e.src >= n) continue;
+        if (rangeOf[e.dst].vreg.id == 0 || rangeOf[e.src].vreg.id == 0) continue;
+        auto const ra = p.find(e.dst);
+        auto const rb = p.find(e.src);
+        if (ra == rb) continue;
+        // VETO 3 — class.
+        if (p.hull[ra].vreg.regClass() != p.hull[rb].vreg.regClass()) continue;
+        // VETO 1 — interference, on the hulls, through the ONE predicate.
+        if (lirRangesInterfere(p.hull[ra], p.hull[rb])) continue;
+        // ── VETO 2 — anti-affinity.
+        //
+        // ⚠⚠ ✔MEASURED 2026-08-26 (cycle P40 red-on-disable arm M3): DISABLING
+        // THIS VETO CHANGES NOTHING ON THE CORPUS — the mutant built, the
+        // subject `.obj` and `libdsscp.dll` md5s both differed from clean, and
+        // every scoped test stayed GREEN. It is recorded here rather than
+        // quietly enjoyed, because a guard whose mutant reddens nothing is the
+        // shape `D-LIR-RETURN-REG-REFUSAL-IS-UNREACHABLE-FROM-THE-TEST-TIER`
+        // names, and the honest response is to say WHY, not to claim an arm.
+        //
+        // ★ WHY IT CANNOT FIRE, AND THE ARGUMENT IS STRUCTURAL RATHER THAN
+        // INCIDENTAL. A forbidden pair is always (result, UNTIED operand) of
+        // ONE instruction, and the tied operand is the only thing an edge ever
+        // connects the result to. So for a forbidden pair to straddle two
+        // classes about to merge, the untied operand `b` must have been pulled
+        // into the same class as the tied operand `a` by some chain. But `a`
+        // and `b` are BOTH READ AT THAT INSTRUCTION'S EARLY SLOT, so each of
+        // their ranges contains that position, so they INTERFERE — and veto 1,
+        // asked on the class HULLS (each of which covers its members), refuses
+        // any merge that would put them together. Veto 1 therefore implies
+        // veto 2 for any liveness analysis in which a use is live at the
+        // position it is used, which is every correct one, split intervals
+        // (D-ML6-1.1) included.
+        //
+        // ⇒ IT STAYS, DELIBERATELY, AS DEFENCE IN DEPTH WITH ITS PROOF
+        // ATTACHED. What it guards — legalize's `mov result, operands[tied]`
+        // destroying an untied operand before the operation reads it — is
+        // D-CSUBSET-BINOP-RIGHT-CLOBBER, a SILENT miscompile that cost this
+        // project a cycle to find once already. Deleting a correctness veto on
+        // the strength of an argument, when the argument's premise lives in a
+        // different file (`lir_liveness.cpp`'s use recording) and the failure
+        // mode is silence, is the trade this project does not take. The
+        // measurement above is what a reader needs to know it is dormant; the
+        // proof is what they need to know it is dormant for a REASON.
+        if (straddles(ra, rb)) continue;
+        // VETO 4 — pressure. See `PressureMap`'s docblock for the measurement
+        // that produced this and for the hypothesis it replaced.
+        LirLiveRange const mergedProbe = LirLiveRange::make(
+            p.hull[ra].vreg,
+            (p.hull[ra].start < p.hull[rb].start) ? p.hull[ra].start
+                                                  : p.hull[rb].start,
+            (p.hull[ra].end > p.hull[rb].end) ? p.hull[ra].end
+                                              : p.hull[rb].end);
+        if (pressure.spansHotRegion(p.hull[ra].vreg.regClass(), mergedProbe)) {
+            continue;
+        }
+        // Merge. The surviving root is the LOWER vreg id so the representative
+        // is a deterministic function of the class's membership rather than of
+        // the order the edges happened to arrive in.
+        auto const keep = (ra < rb) ? ra : rb;
+        auto const drop = (ra < rb) ? rb : ra;
+        p.parent[drop] = keep;
+        auto const lo = (p.hull[keep].start < p.hull[drop].start)
+                            ? p.hull[keep].start : p.hull[drop].start;
+        auto const hi = (p.hull[keep].end > p.hull[drop].end)
+                            ? p.hull[keep].end : p.hull[drop].end;
+        p.hull[keep] = LirLiveRange::make(p.hull[keep].vreg, lo, hi);
+        p.members[keep].insert(p.members[keep].end(),
+                               p.members[drop].begin(), p.members[drop].end());
+        p.members[drop].clear();
+        ++p.unions;
+    }
+    return p;
+}
+
+// A spill slot in circulation, with the position past which it is reusable.
+struct SlotInFlight {
+    LirSpillSlot  slot{};
+    LirRegClass   cls = LirRegClass::None;
+    std::uint32_t end = 0;
+};
 
 // Per-function core. Wraps the linear-scan loop with `ok` derivation
 // via reporter delta + emits the per-function spill summary at the
@@ -974,6 +1782,68 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
     }
     out.assignments.assign(maxVRegId + 1u, LirRegAssignment{});
 
+    // ── OPT8: partition the vregs into COPY-RELATED CLASSES before the scan.
+    // `rangeOf[id]` is the per-id view of `flow.ranges` the partition needs;
+    // a `vreg.id == 0` entry means liveness never saw that id.
+    std::vector<LirLiveRange> rangeOf(maxVRegId + 1u, LirLiveRange{});
+    for (auto const& r : flow.ranges) {
+        if (r.vreg.id == 0 || r.vreg.id > maxVRegId) continue;
+        rangeOf[r.vreg.id] = r;
+    }
+    MoveOpcodeCache moves{schema};
+    // Capacity per class, taken BEFORE the scan consumes the free lists: the
+    // number of registers this calling convention actually makes allocatable
+    // for that class, which is the only honest K to compare a live count
+    // against. Reserved registers and the VLA frame pointer are already out.
+    std::array<std::uint32_t, kLirRegClassCount> classCapacity{};
+    for (std::size_t c = 0; c < kLirRegClassCount; ++c) {
+        classCapacity[c] = static_cast<std::uint32_t>(
+            free[c].calleeSaved.size() + free[c].callerSaved.size());
+    }
+    CoalesceInput const coalesceIn =
+        collectCoalesceInput(lir, schema, *cc, flow, moves, reporter);
+    CoalescePartition part = buildCoalescePartition(
+        coalesceIn, rangeOf, buildPressureMap(flow, classCapacity));
+    out.coalescedCopies = part.unions;
+
+    // ── PRE-COLORING HINTS, one per vreg. Two sources, and the DEF-SIDE ABI
+    // hint wins: an incoming parameter's home is fixed by the calling
+    // convention at function entry, while a physical-register copy inside the
+    // body is a lowering's local pin. Both are PREFERENCES — see
+    // `tryAllocatePreferred` for why neither can widen what a range may take.
+    std::vector<std::optional<std::uint16_t>> hintOf(maxVRegId + 1u);
+    for (auto const& h : coalesceIn.physHints) {
+        if (h.vregId == 0 || h.vregId > maxVRegId) continue;
+        if (!hintOf[h.vregId].has_value()) hintOf[h.vregId] = h.ordinal;
+    }
+    for (auto const& ao : argOccupied) {
+        if (ao.paramVregId == 0 || ao.paramVregId > maxVRegId) continue;
+        hintOf[ao.paramVregId] = ao.ordinal;
+    }
+
+    // The scan's subjects: one entry per CLASS, in hull-start order. A
+    // singleton class is byte-identical to the range it wraps, so a function
+    // with no coalescable copy walks exactly the sequence it walked before.
+    //
+    // ⚠ THE SORT KEY MUST STAY (hull.start, representative id) — the same key
+    // `analyzeFuncLiveness` sorts `ranges` by. A class's hull start is the
+    // MINIMUM of its members' starts, so this ordering still visits every
+    // operand's class before the class of any instruction that reads it, which
+    // is what keeps `tryAllocateExcluding`'s operand-ordinal exclusion able to
+    // SEE the operand's assignment.
+    std::vector<std::uint32_t> classRoots;
+    classRoots.reserve(flow.ranges.size());
+    for (std::uint32_t id = 1; id <= maxVRegId; ++id) {
+        if (rangeOf[id].vreg.id == 0) continue;
+        if (part.find(id) != id) continue;
+        classRoots.push_back(id);
+    }
+    std::sort(classRoots.begin(), classRoots.end(),
+              [&](std::uint32_t a, std::uint32_t b) {
+                  return std::tie(part.hull[a].start, a)
+                       < std::tie(part.hull[b].start, b);
+              });
+
     std::vector<ActiveEntry> active;
     active.reserve(flow.ranges.size());
 
@@ -1001,16 +1871,26 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         return s;
     };
 
-    for (auto const& r : flow.ranges) {
+    // Slots in circulation, for spill-slot coalescing. Expired against the
+    // same monotonic scan position the register free lists are.
+    std::vector<SlotInFlight> slotsInFlight;
+
+    for (std::uint32_t const classRoot : classRoots) {
+        // THE SUBJECT OF THE SCAN IS THE CLASS HULL. For a singleton class it
+        // IS the vreg's own range, byte-for-byte, which is why a function with
+        // no coalescable copy allocates exactly as it did before OPT8.
+        LirLiveRange const& r = part.hull[classRoot];
+        std::vector<std::uint32_t> const& classMembers = part.members[classRoot];
         if (r.vreg.id == 0) continue;
         LirRegClass const cls = r.vreg.regClass();
         if (cls == LirRegClass::None) {
-            report(reporter, DiagnosticCode::R_VRegHasNoClass,
-                   DiagnosticSeverity::Error,
-                   std::format("func {} vreg id {} has LirRegClass::None — "
-                               "run LirVerifier before allocator",
-                               flow.fn.v,
-                               static_cast<std::uint32_t>(r.vreg.id)));
+            for (std::uint32_t const mid : classMembers) {
+                report(reporter, DiagnosticCode::R_VRegHasNoClass,
+                       DiagnosticSeverity::Error,
+                       std::format("func {} vreg id {} has LirRegClass::None — "
+                                   "run LirVerifier before allocator",
+                                   flow.fn.v, mid));
+            }
             continue;
         }
 
@@ -1052,9 +1932,22 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         // array<uint16_t, 8> tripped regallocFatal past 8, which
         // was not total (the loader caps nothing).
         excludedScratch.clear();
+        // ★★ OPT8: THE EXCLUSION SET OF A COALESCED CLASS IS THE **UNION** OVER
+        // ITS MEMBERS, AND ANYTHING LESS IS A SILENT MISCOMPILE. Every rule
+        // below is keyed on a range's own DEFINING INSTRUCTION or on its own
+        // start position, so a class holding N vregs has N defining
+        // instructions and N start positions to answer for. Computing the set
+        // from the representative alone would honour one member's constraints
+        // and quietly drop the other N-1 — and the dropped ones are exactly the
+        // `requires2Address` operand exclusions whose whole job is to stop
+        // `add r, [r, r]`. A singleton class walks this loop once, over its own
+        // range, which is what it did before OPT8.
+        for (std::uint32_t const memberId : classMembers) {
+            LirLiveRange const& mr = rangeOf[memberId];
+            if (mr.vreg.id == 0) continue;
         if (LirInstId const producingInst =
-                (r.start < flow.positionToInst.size())
-                    ? flow.positionToInst[r.start]
+                (mr.start < flow.positionToInst.size())
+                    ? flow.positionToInst[mr.start]
                     : LirInstId{};
             producingInst.valid()) {
             auto const opcode = lir.instOpcode(producingInst);
@@ -1070,7 +1963,7 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
             // misallocate r.vreg. Skip the exclusion when the
             // looked-up inst isn't this range's definer.
             if (info != nullptr && info->requires2Address.has_value()
-                && lir.instResult(producingInst) == r.vreg) {
+                && lir.instResult(producingInst) == mr.vreg) {
                 auto const ops = lir.instOperands(producingInst);
                 // The COALESCE TARGET is the operand the schema ties
                 // the result to, not a literal 0
@@ -1170,10 +2063,18 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                                                  excludedScratch);
             }
         }
+        }  // end per-member exclusion walk
         // Augment exclusion with implicit-register clobbers from any
         // opcode this range crosses (cycle 10q substrate consumer).
         // Universal across CPUs — driven entirely by the per-opcode
         // schema declaration; no `if (opcode == idiv)` branch.
+        //
+        // ⓘ OPT8: asked over the CLASS HULL rather than per member. The hull is
+        // the interval the register is actually held over, and it is a
+        // SUPERSET of every member's, so this can only exclude MORE — the
+        // conservative direction. It also needs no argument about whether a
+        // merged hull can contain a gap: a clobber sitting in one would be
+        // excluded anyway.
         implicitClobbersCrossedBy(r, implicitClobbers, excludedScratch);
         // FC4 c2 (R2): when THIS range is the callee vreg of an
         // indirect call it covers, exclude the cc's argGprs ∪ argFprs
@@ -1191,8 +2092,17 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                 }
                 excludedScratch.push_back(ord);
             };
+            auto const classHoldsVreg = [&](std::uint32_t id) {
+                for (std::uint32_t const m : classMembers) {
+                    if (m == id) return true;
+                }
+                return false;
+            };
             for (auto const& ic : indirectCallees) {
-                if (ic.calleeVregId != r.vreg.id) continue;
+                // OPT8: "is THIS range the callee vreg" becomes "does this
+                // CLASS hold it" — the class is what receives the register, so
+                // it is the class that must be kept off the arg set.
+                if (!classHoldsVreg(ic.calleeVregId)) continue;
                 if (ic.position < r.start || ic.position >= r.end) continue;
                 for (std::uint16_t const ord : ccArgRegOrdinals) {
                     addExcluded(ord);
@@ -1229,25 +2139,101 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
             };
             for (auto const& ao : argOccupied) {
                 if (ao.cls != cls) continue;              // class-partitioned pools
-                if (r.vreg.id == ao.paramVregId) continue; // its own home
-                if (r.start < ao.releasePos) addExcludedArg(ao.ordinal);
+                // OPT8: per MEMBER, and the "its own home" exemption stays per
+                // member too. A class that holds the param AND some other vreg
+                // live before `releasePos` must still avoid the arg register:
+                // the incoming value sits there from function entry, which is
+                // BEFORE the param's own range even starts, so merging the
+                // param into a class does not make that window safe.
+                for (std::uint32_t const memberId : classMembers) {
+                    if (memberId == ao.paramVregId) continue;  // its own home
+                    if (rangeOf[memberId].start < ao.releasePos) {
+                        addExcludedArg(ao.ordinal);
+                    }
+                }
             }
         }
 
         std::span<std::uint16_t const> const excluded{
             excludedScratch.data(), excludedScratch.size()};
 
-        if (auto pick = tryAllocateExcluding(free, cls, crossesCall, excluded);
-            pick.has_value()) {
-            LirReg const phys = makePhysicalReg(pick->ordinal, cls);
-            out.assignments[r.vreg.id] =
-                LirRegAssignment::makePhys(r.vreg, phys);
-            active.push_back({r, cls, pick->ordinal, pick->isCalleeSaved});
+        // The class's pre-coloring hint (see `tryAllocatePreferred`). Taken
+        // from the LOWEST member id that carries one, so the choice is a
+        // function of the class's MEMBERSHIP rather than of iteration order —
+        // two members with different hints is a real shape (a parameter
+        // copy-related to a physically-pinned temp) and the tie-break is what
+        // keeps the allocation reproducible when it happens.
+        std::optional<std::uint16_t> preferredOrdinal;
+        {
+            std::uint32_t bestMember = 0;
+            for (std::uint32_t const memberId : classMembers) {
+                if (memberId == 0 || memberId >= hintOf.size()) continue;
+                if (!hintOf[memberId].has_value()) continue;
+                if (bestMember == 0 || memberId < bestMember) {
+                    bestMember = memberId;
+                    preferredOrdinal = hintOf[memberId];
+                }
+            }
+        }
+
+        // Write one decision onto EVERY member of the class — that identity is
+        // the whole mechanism: `rewriteWithAllocation` is a per-vreg lookup, so
+        // members sharing an assignment turn the copy that related them into a
+        // register-to-register move onto itself, which `lir_peephole` R1 then
+        // deletes.
+        auto const assignClassPhys = [&](std::uint16_t ordinal) {
+            LirReg const phys = makePhysicalReg(ordinal, cls);
+            for (std::uint32_t const memberId : classMembers) {
+                LirLiveRange const& mr = rangeOf[memberId];
+                if (mr.vreg.id == 0) continue;
+                out.assignments[memberId] =
+                    LirRegAssignment::makePhys(mr.vreg, phys);
+            }
+        };
+        auto const assignClassSpill = [&](std::vector<std::uint32_t> const& mem,
+                                          LirSpillSlot slot) {
+            for (std::uint32_t const memberId : mem) {
+                LirLiveRange const& mr = rangeOf[memberId];
+                if (mr.vreg.id == 0) continue;
+                out.assignments[memberId] =
+                    LirRegAssignment::makeSpill(mr.vreg, slot);
+            }
+        };
+        // ── SPILL-SLOT COALESCING. A slot whose occupant's hull has ENDED is
+        // reusable, by the same `end <= start` test `expireActive` applies to
+        // registers — i.e. by the same `!lirRangesInterfere` fact. Restricted
+        // to one REGISTER CLASS: the frame's slot stride is a per-function
+        // maximum over the classes present, so sharing across classes would be
+        // sound only by an argument about that stride, and there is nothing to
+        // buy by making it.
+        auto const acquireSlot = [&](LirRegClass slotCls,
+                                     LirLiveRange const& hull) -> LirSpillSlot {
+            for (auto& s : slotsInFlight) {
+                if (s.cls != slotCls) continue;
+                if (s.end > hull.start) continue;   // still live — interferes
+                s.end = hull.end;
+                ++out.coalescedSpillSlots;
+                return s.slot;
+            }
+            LirSpillSlot const fresh = mintSlot();
+            slotsInFlight.push_back({fresh, slotCls, hull.end});
+            return fresh;
+        };
+
+        auto pick = tryAllocatePreferred(free, cls, crossesCall, excluded,
+                                         preferredOrdinal);
+        if (!pick.has_value()) {
+            pick = tryAllocateExcluding(free, cls, crossesCall, excluded);
+        }
+        if (pick.has_value()) {
+            assignClassPhys(pick->ordinal);
+            active.push_back({r, cls, pick->ordinal, pick->isCalleeSaved,
+                              classRoot});
             continue;
         }
 
-        // Invariant: every spill emits exactly one slot increment via
-        // `mintSlot` and contributes to one `SpillStats` counter.
+        // Invariant: every spill takes exactly one slot via `acquireSlot`
+        // (fresh or reused) and contributes to one `SpillStats` counter.
         // The `excluded` set is propagated so the evictee's physical
         // ordinal is never in operand[1..N]'s set — closes the
         // silent-failure HIGH-1 audit fold: without this, the spill
@@ -1259,21 +2245,21 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
             spillIt != active.end() && spillIt->range.end > r.end;
 
         if (!evictCandidate) {
-            // Spill r itself.
-            LirSpillSlot const slot = mintSlot();
-            out.assignments[r.vreg.id] =
-                LirRegAssignment::makeSpill(r.vreg, slot);
+            // Spill this class itself.
+            assignClassSpill(classMembers, acquireSlot(cls, r));
             if (crossesCall) ++spills.crossCallExhaustion;
             else             ++spills.pressure;
             continue;
         }
 
-        // Evict spillIt: its vreg goes to a new spill slot; r gets its
-        // physical register. The evicted range's spill cause is its
-        // OWN crossesCall status, not r's — they may differ.
-        LirSpillSlot const slot = mintSlot();
-        out.assignments[spillIt->range.vreg.id] =
-            LirRegAssignment::makeSpill(spillIt->range.vreg, slot);
+        // Evict spillIt: its whole CLASS goes to a spill slot; this class gets
+        // its physical register. The evicted range's spill cause is its
+        // OWN crossesCall status, not this one's — they may differ.
+        // ⚠ The evictee is still LIVE (that is why it was chosen: its end is
+        // later), so `acquireSlot` records its hull end and the slot stays out
+        // of circulation for exactly as long as the value does.
+        assignClassSpill(part.members[spillIt->classRoot],
+                         acquireSlot(spillIt->cls, spillIt->range));
         bool const evictedCrossesCall =
             rangeCrossesCall(spillIt->range, callPositions);
         if (evictedCrossesCall) ++spills.crossCallExhaustion;
@@ -1283,13 +2269,42 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         bool const freedIsCalleeSaved    = spillIt->isCalleeSaved;
         active.erase(spillIt);
 
-        LirReg const phys = makePhysicalReg(freedOrdinal, cls);
-        out.assignments[r.vreg.id] =
-            LirRegAssignment::makePhys(r.vreg, phys);
-        active.push_back({r, cls, freedOrdinal, freedIsCalleeSaved});
+        assignClassPhys(freedOrdinal);
+        active.push_back({r, cls, freedOrdinal, freedIsCalleeSaved, classRoot});
     }
 
     emitSpillSummary(reporter, flow.fn, spills);
+
+    // ── THE FAIL-LOUD SELF-CHECK, AND IT RUNS UNCONDITIONALLY.
+    //
+    // ★ It is `regallocFatal` rather than a diagnostic ON PURPOSE, and the
+    // choice follows this file's own stated split: a `DiagnosticReporter` code
+    // is for a DATA-DRIVEN failure the user can act on (a schema with no
+    // calling convention, a vreg with no class); this is a PRODUCER-SIDE
+    // INVARIANT — the allocator contradicting itself. There is no user input
+    // that can reach it and no source edit that can avoid it, so a
+    // recoverable, suppressible diagnostic would be the wrong shape: the only
+    // correct response is to stop before a wrong artifact exists. It joins
+    // `makePhys`'s class-mismatch abort, three lines up the same wall.
+    //
+    // ⚠ It is NOT a debug assertion. A miscompile that only fails to be caught
+    // in release builds is a miscompile that ships.
+    if (auto const conflict = findAllocationConflict(flow, out);
+        conflict.has_value()) {
+        std::fprintf(stderr,
+                     "dss::LirRegAlloc: allocation conflict in func %u — "
+                     "vreg %u and vreg %u have overlapping live ranges but "
+                     "were both assigned %s %u\n",
+                     flow.fn.v,
+                     static_cast<unsigned>(conflict->a.id),
+                     static_cast<unsigned>(conflict->b.id),
+                     conflict->isSpillSlot ? "spill slot" : "physical register",
+                     static_cast<unsigned>(conflict->sharedResource));
+        regallocFatal("interfering live ranges share one resource — the "
+                      "coalescer or the linear scan is unsound; refusing to "
+                      "emit a silently wrong artifact");
+    }
+
     out.ok = (reporter.errorCount() == baseline);
     return out;
 }

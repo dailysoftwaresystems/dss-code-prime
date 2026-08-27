@@ -355,8 +355,15 @@ enum class MnemonicSlot : std::uint8_t {
     SpRestore,
     // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the NATIVE hardware bit-count
     // realizations, probed by mnemonic presence (the umulh/div capability split).
-    // `PopcountNative` = x86 POPCNT (arm64 declares none → SWAR, the fallback the
-    // arm64-elf example arm witnesses). `ClzNative` = x86 LZCNT / arm64 CLZ (BOTH
+    // ⚠ "NATIVE" MEANS "THE TARGET NAMES A REALIZATION", NOT "ONE INSTRUCTION" —
+    // D-FULLC-STDBIT-ARM64-CNT-POPCOUNT, 2026-08-26. `PopcountNative` = x86
+    // POPCNT, ONE instruction; on arm64 the same slot resolves a `popcount` row
+    // that carries NO encoding and a FOUR-STEP `lowering` sequence instead,
+    // because AArch64 has no scalar-GPR population count and reaches the
+    // operation through the SIMD bank. `lowerBitCountViaDeclaredRealization` is
+    // where that second level is read; see its docblock for why a
+    // one-instruction emit of a sequence-declaring mnemonic would be a silent
+    // miscompile. `ClzNative` = x86 LZCNT / arm64 CLZ (BOTH
     // targets declare "clz" — same 1-source result:value shape, defined =width at
     // 0). `CtzNative` = x86 TZCNT (arm64 declares none — it composes `Rbit`+CLZ).
     // `Rbit` = arm64 bit-reverse (RBIT), which turns leading-zeros (CLZ) into
@@ -8650,6 +8657,55 @@ struct Lowerer {
     // Shared preamble: validate the single operand + return (operandReg, pWidth,
     // is64). pWidth keys on the OPERAND type (P), not the I32 result. nullopt ⇒
     // a diagnostic already fired (bad arity / poisoned operand).
+    // ── D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: the ONE place a bit-count op asks
+    // the target what its declared realization IS ────────────────────────────
+    //
+    // The capability split above ("probe the mnemonic; absent ⇒ SWAR") answers
+    // only HALF the question, because it silently assumes the realization is
+    // ONE INSTRUCTION. It is not, on any machine that reaches the operation
+    // through a different register bank: AArch64 has no scalar-GPR population
+    // count at all, and its realization is a GPR→SIMD move, a per-byte lane
+    // count, a lane reduction and a SIMD→GPR move. That is precisely the fact
+    // `TargetOpcodeInfo::lowering` exists to state
+    // (D-TARGET-ENCODING-TABLE-EXPRESSES-ONLY-THE-DEGENERATE-SEQUENCE), and a
+    // one-instruction emit of a mnemonic whose row declares a SEQUENCE would be
+    // a silent miscompile — on arm64 specifically it would emit CNT alone,
+    // which answers EIGHT PER-BYTE COUNTS IN EIGHT LANES, not a population
+    // count, into the wrong register bank.
+    //
+    // ★ SO THE PROBE IS TWO-LEVELED AND BOTH LEVELS ARE THE TARGET'S ANSWER:
+    // does the target name a realization at all (the mnemonic), and does it
+    // spell that realization as one instruction or as several (the `lowering`
+    // block). NOTHING here names a CPU, a mnemonic or a lane arrangement; a
+    // target whose hardware does the job in one instruction simply declares no
+    // sequence and takes the second arm, byte-identically to before.
+    //
+    // ⚠ ONE OWNER, DELIBERATELY. Popcount, Clz and Ctz asked this question in
+    // three copies that differed only in the slot; a fourth bit-count verb, or
+    // a target that grows a sequence for `clz`, would have needed all of them
+    // edited in step and the miss would have been a wrong instruction rather
+    // than a build error.
+    //
+    // Returns TRUE when the target's declared realization owned the lowering
+    // (including its failure paths, which report and poison). FALSE only when
+    // `slot` resolves to no opcode at all — the caller then emits its SWAR
+    // fallback, which is what keeps the fallback reachable for every target
+    // that declares no realization.
+    [[nodiscard]] bool lowerBitCountViaDeclaredRealization(
+            MirInstId id, MnemonicSlot slot, LirReg src, std::uint8_t pWidth) {
+        auto const nativeOp = opcode(slot);
+        if (!nativeOp.has_value()) return false;
+        std::array<LirReg, 1> const srcRegs{src};
+        if (lowerViaDeclaredSequence(id, *nativeOp, srcRegs, pWidth)) return true;
+        auto const r = emitNativeUnary(*nativeOp, src, pWidth, regClassFor(id));
+        if (!r.has_value()) { poisonValue(id); return true; }
+        defineValue(id, *r);
+        return true;
+    }
+
+    // Shared preamble: validate the single operand + return (operandReg, pWidth,
+    // is64). pWidth keys on the OPERAND type (P), not the I32 result. nullopt ⇒
+    // a diagnostic already fired (bad arity / poisoned operand).
     struct BitCountOperand { LirReg reg; std::uint8_t pWidth; bool is64; };
     [[nodiscard]] std::optional<BitCountOperand> bitCountOperand(MirInstId id) {
         auto const operands = mir.instOperands(id);
@@ -8666,15 +8722,14 @@ struct Lowerer {
     void lowerPopcount(MirInstId id) {
         auto const in = bitCountOperand(id);
         if (!in.has_value()) return;
-        if (auto const nativeOp = opcode(MnemonicSlot::PopcountNative);
-            nativeOp.has_value()) {  // x86 POPCNT
-            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
-            if (!r.has_value()) { poisonValue(id); return; }
-            defineValue(id, *r);
+        // x86 POPCNT (one instruction); arm64 the declared four-step SIMD
+        // sequence (D-FULLC-STDBIT-ARM64-CNT-POPCOUNT). Which one is entirely
+        // the target document's answer — see the helper.
+        if (lowerBitCountViaDeclaredRealization(
+                id, MnemonicSlot::PopcountNative, in->reg, in->pWidth)) {
             return;
         }
-        // SWAR fallback (arm64 + any ISA without a scalar popcount;
-        // D-FULLC-STDBIT-ARM64-CNT-POPCOUNT trigger-gates a future arm64 NEON CNT).
+        // SWAR fallback — any ISA declaring NO popcount realization at all.
         auto const r = emitSwarPopcount(in->reg, in->is64, in->pWidth);
         if (!r.has_value()) { poisonValue(id); return; }
         defineValue(id, *r);
@@ -8683,11 +8738,9 @@ struct Lowerer {
     void lowerClz(MirInstId id) {
         auto const in = bitCountOperand(id);
         if (!in.has_value()) return;
-        if (auto const nativeOp = opcode(MnemonicSlot::ClzNative);
-            nativeOp.has_value()) {  // x86 LZCNT / arm64 CLZ (defined =width at 0)
-            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
-            if (!r.has_value()) { poisonValue(id); return; }
-            defineValue(id, *r);
+        // x86 LZCNT / arm64 CLZ (both defined = width at 0).
+        if (lowerBitCountViaDeclaredRealization(
+                id, MnemonicSlot::ClzNative, in->reg, in->pWidth)) {
             return;
         }
         // SWAR fallback.
@@ -8700,11 +8753,8 @@ struct Lowerer {
         auto const in = bitCountOperand(id);
         if (!in.has_value()) return;
         // Rule 1 — native ctz (x86 TZCNT, defined =width at 0).
-        if (auto const nativeOp = opcode(MnemonicSlot::CtzNative);
-            nativeOp.has_value()) {
-            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
-            if (!r.has_value()) { poisonValue(id); return; }
-            defineValue(id, *r);
+        if (lowerBitCountViaDeclaredRealization(
+                id, MnemonicSlot::CtzNative, in->reg, in->pWidth)) {
             return;
         }
         // Rule 2 — RBIT then CLZ (arm64: reverse the bits, then leading-zeros of
@@ -8712,13 +8762,24 @@ struct Lowerer {
         // ctz(0): RBIT(0)=0, CLZ(0)=P. Requires BOTH — a target with rbit but no
         // clz falls through to the SWAR (a legitimate realization, not fail-loud).
         if (auto const rbitOp = opcode(MnemonicSlot::Rbit); rbitOp.has_value()) {
-            if (auto const clzOp = opcode(MnemonicSlot::ClzNative); clzOp.has_value()) {
-                auto const rev = emitNativeUnary(*rbitOp, in->reg, in->pWidth, regClassFor(id));
+            if (opcode(MnemonicSlot::ClzNative).has_value()) {
+                // ⚠ The REVERSE step stays a direct single-instruction emit and
+                // does NOT consult `lowering`, because it is an INTERMEDIATE:
+                // `lowerViaDeclaredSequence` binds the sequence's result to THIS
+                // MIR id via `defineValue`, and there is only one MIR id here.
+                // A target that realized `rbit` as a sequence would need a seam
+                // that yields a register instead of defining a value; none does
+                // (✔MEASURED 2026-08-26: no shipped target declares a `lowering`
+                // block on `rbit`), and inventing that seam for no consumer is
+                // the speculative build the bar forbids. The CLZ half IS the
+                // sequence's result, so it goes through the shared helper.
+                auto const rev = emitNativeUnary(*rbitOp, in->reg, in->pWidth,
+                                                 regClassFor(id));
                 if (!rev.has_value()) { poisonValue(id); return; }
-                auto const r = emitNativeUnary(*clzOp, *rev, in->pWidth, regClassFor(id));
-                if (!r.has_value()) { poisonValue(id); return; }
-                defineValue(id, *r);
-                return;
+                if (lowerBitCountViaDeclaredRealization(
+                        id, MnemonicSlot::ClzNative, *rev, in->pWidth)) {
+                    return;
+                }
             }
         }
         // Rule 3 — SWAR fallback (neither TZCNT nor RBIT+CLZ).

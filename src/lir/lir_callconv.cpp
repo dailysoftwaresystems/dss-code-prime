@@ -3348,10 +3348,16 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             //
             // Move-graph cycles (when regalloc pins src args to dest
             // arg-passing regs in a way that produces a cycle —
-            // e.g. arg0 in argGprs[1], arg1 in argGprs[0] would need
-            // `mov rdi, rsi; mov rsi, rdi`, where the second read sees
-            // the clobbered rdi) trip `L_MoveCycleUnsupported` loud.
-            // Proper parallel-copy resolution is anchored at D-ML7-2.3.
+            // e.g. arg0 in argGprs[1], arg1 in argGprs[0], which an
+            // in-order emit would lower as `mov rdi, rsi; mov rsi, rdi`
+            // with the second read seeing the clobbered rdi) are
+            // RESOLVED, not refused: `emitParallelRegMoves` emits the
+            // acyclic part in dependency order and breaks each cycle
+            // with a scratch drawn from `cc.callerSaved`. That is
+            // `D-ML7-2.3`, closed in c76; the v1 O(N^2) detector this
+            // sentence used to describe was deleted with it.
+            // `L_MoveCycleUnsupported` survives as the resolver's own
+            // fail-loud backstop — see `pickScratchReg`.
             // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold: arg-setup
             // + return-value handling are identical across every call-
             // shaped opcode (direct `call`, `call_indirect_via_extern`,

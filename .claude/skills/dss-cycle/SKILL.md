@@ -150,6 +150,33 @@ opens `✅ **CLOSED — DESIGN RECORD …**`. **Auditing for this class is part 
 an inflated OPEN count is indistinguishable from a cycle that is filing instead of fixing — and
 the operator is reading that number.
 
+### ⚠ A LANE THAT **EXITS** DISCHARGES NOTHING — operator, 2026-08-27
+
+> *"if they don't address you must create another lane once they finish using /dss-cycle to
+> address remanescent anchors from current running lanes"*
+
+⚠ **This is not a new ruling — it is the rule above, applied to the one case the text did not
+spell out: the lane that owns the row is GONE.** (Stated as such by the operator when it was first
+written up as if it were new.) The rule binds the lane that opens a row; without this clause, a
+lane's exit silently converts *"my row"* into *"nobody's row"*, and the anchor count stops falling
+while every individual lane still looks compliant.
+
+⇒ **When a lane finishes with assigned rows still OPEN — or having minted an anchor id in source
+without filing its row — the orchestrator SPAWNS A NEW `/dss-cycle` LANE to close the remnants**,
+naming them explicitly. "Next cycle will notice" is the follow-up culture this section ends.
+
+⚠⚠ **AND THE BALANCE GATE IS BLIND TO HALF OF IT. `check-anchor-balance` COUNTS *ROWS*, so an
+anchor cited in source with NO ROW IS INVISIBLE TO IT.** ✔MEASURED P40: it reported **"opened 0"**
+while a finished lane had cited `D-PP-PREDEFINE-REDEFINITION-PARTITION` across **six** files with
+no row anywhere in `.plans/`. Only `scripts/check-anchor-registry/check-anchor-registry.sh` catches
+that class, and there it is the one telling the truth.
+⇒ **Run BOTH before calling a cycle clean. A green balance is NOT evidence that nothing was
+opened.**
+
+✔MEASURED P40, the sideways-move class: `D-FULLC-STDBIT-ADDRESSABLE-FN` was **re-verdicted** from
+*"⏳ DEFERRED, trigger-gated"* to plain 🟠 OPEN by a lane that then exited — better described, still
+open. **"Re-verdicted" is not closed**, exactly as *"refused but not fixed"* is not.
+
 ## ★★★ A GATE HOST HOLDS THE REPO AND NOTHING ELSE — operator ruling 2026-08-25
 
 *"keep macos and vps linux arm64 updated with our repo files, and free of stale files/worktrees.
@@ -258,6 +285,49 @@ expanded only where it appears unquoted in the source text. `leg-tree` normalise
 where both verbs share it. ★ The dangerous half was not the failed `cd`: `restore` returns 0 when
 the directory is missing, so an unexpanded path would have left every host dirty forever while
 every leg reported success.
+
+## ★★★ A LANE WORKTREE LIVES INSIDE THE REPO, AT `.worktrees/<short-name>` — operator ruling 2026-08-26
+
+> *"I want the worktrees implementation to be inside the project root, .worktrees directory (where
+> 100% of it's internal content ignored by .gitignore). This way we stop contaminating builds
+> outside repository bounds."* … *"worktrees MUST be ignored by ALL host copies to run legs"*
+
+**This SUPERSEDES the short-absolute-root convention** (`C:/dssp40k`, `C:/dss-<cycle><lane>-rod`).
+A worktree outside the repository is a full checkout — plus its `build/` — that nothing owns and no
+guard can see. ✔MEASURED 2026-08-26: the tree was already carrying **9,661 files / 410 MB** of
+orphaned checkouts under `.claude/worktrees/`, three full copies, one of them 287 MB, and
+**`git worktree list` knew about none of them**.
+
+**★ ONE OWNER: `scripts/lane-worktree/lane-worktree.sh`** (`add` / `remove` / `list`) — the same
+shape as `scripts/leg-tree/`, and binding for the same reason: **never hand-roll `git worktree add`
+in a lane.**
+
+```bash
+bash scripts/lane-worktree/lane-worktree.sh add k      # -> <repo>/.worktrees/k
+bash scripts/lane-worktree/lane-worktree.sh remove k   # removes AND prunes
+```
+
+Four clauses, and each is measured rather than asserted — detail in `references/worktrees.md` §H.0b:
+
+1. **`.gitignore`'s `/.worktrees/` rule is what satisfies the "ALL host copies" clause.** The
+   carriages derive their exclude list from git (`scripts/carriage-excludes/`), so that one line is
+   what stops four full repo copies riding to macOS and the arm64 VPS on every push. It is ALSO
+   pinned in that script's `MUST_NEVER_TRAVEL` floor, which re-asks git and **refuses the carriage**
+   if the line is ever edited away (refusal arm exercised: exit 3, naming `.worktrees/`).
+2. ⚠ **The MAX_PATH budget is now SPENT, not slack.** The move costs **46 characters** on every
+   build path: longest build-relative suffix **163**, so `C:/dssp40k` had **87 spare** and
+   `.worktrees/k` has **46**. `lane-worktree.sh` refuses by arithmetic any root leaving under 20,
+   naming `D-CYCLE-WORKTREE-UNDER-THE-SESSION-SCRATCH-PATH-CANNOT-BE-BUILT-ON-WINDOWS` — the defect
+   whose failure mode is a per-TU compile error in files the lane never touched.
+   ⇒ **Keep lane names SHORT** (`k`, `l`, `rod`); a descriptive name spends that margin.
+3. **The lane that takes a worktree owns removing it**, via `remove` — which prunes, because a stale
+   registration lives in `.git/worktrees/` and **never appears in `git status`**.
+4. ⚠ **`-fd`, never `-fdx`.** `git clean -fd` does not delete ignored paths, so a live worktree
+   survives a leg restore; `-fdx` would destroy it mid-build.
+
+✔**The move was measured, not hoped:** a real 2,792-file worktree at `.worktrees/probe` moved
+**zero** of the 16 runnable registered guards — identical verdicts and output volume — and
+`git status` reported 0 lines for it.
 
 ## The pause-and-ask gate — the most important behavioral rule
 

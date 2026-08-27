@@ -752,23 +752,23 @@ struct Lowerer {
         // Cast — `_Bool b = 2` MUST be true, but a `Cast -> MIR Trunc(2 -> Bool)`
         // keeps only the low bit (false). REUSE the ONE truthiness chokepoint
         // `coerceCondition` (the exact shape `if(x)` lowers) so the assignment and
-        // condition paths cannot drift. An Enum bridges to its underlying integer
-        // first (coerceCondition's arithmetic predicate excludes Enum); a `nullptr`
-        // is already an I32 0 here, so `Ne(0,0)` -> false as C requires. The
-        // semantic tier admits this via isAssignable's `scalarConvertsToBool` arm;
-        // coerce REALIZES it. Placed BEFORE the enum / int->ptr / arithmetic-core
-        // arms so a `_Bool` target never materializes the low-bit-truncating Cast.
+        // condition paths cannot drift. A `nullptr` is already an I32 0 here, so
+        // `Ne(0,0)` -> false as C requires. The semantic tier admits this via
+        // isAssignable's `scalarConvertsToBool` arm; coerce REALIZES it. Placed
+        // BEFORE the enum / int->ptr / arithmetic-core arms so a `_Bool` target
+        // never materializes the low-bit-truncating Cast.
+        // ⚠ THIS ARM USED TO BRIDGE AN ENUM TO ITS UNDERLYING INTEGER FIRST, and
+        // that bridge is DELETED rather than left standing beside its own
+        // replacement. It existed because `coerceCondition`'s arithmetic
+        // predicate excludes Enum; that function now owns the enum projection
+        // itself (D-CSUBSET-ENUM-FNSIG-NULLPTR-CONDITIONS-SKIP-THE-TRUTHINESS-CHOKEPOINT),
+        // so keeping a local copy would leave TWO owners of the enum→int rule in
+        // one file — the exact shape that drifts. The `_Bool b = e` case is
+        // covered by the same pins as every other site.
         if (tk == TypeKind::Bool
             && ((isArithmeticCore(ck) && ck != TypeKind::Bool)
                 || ck == TypeKind::Enum || ck == TypeKind::Ptr)) {
-            E scalar = child;
-            if (ck == TypeKind::Enum) {
-                auto const scals = interner.scalars(child.type);
-                if (!scals.empty())
-                    scalar = coerce(child,
-                        interner.primitive(static_cast<TypeKind>(scals[0])));
-            }
-            E const asBool = coerceCondition(scalar, NodeId{});
+            E const asBool = coerceCondition(child, NodeId{});
             if (asBool.type.valid()
                 && interner.kind(asBool.type) == TypeKind::Bool) {
                 // Alias the synthetic truthiness node to the operand's span
@@ -956,9 +956,12 @@ struct Lowerer {
     //    for a source-level zero in pointer context ("scalar" in C
     //    6.8.4.1 includes pointers). Languages without the rule keep the
     //    pass-through below.
-    //  - everything else (Struct, Array, Enum, FnSig, Void, …) →
+    //  - Enum / FnSig / NullptrT → the C-scalar family's remaining three
+    //    members, each PROJECTED onto a kind this function already tests
+    //    and then re-entered (see the arms below).
+    //  - everything else (Struct, Union, Void, …) →
     //    UNCHANGED: exactly the prior coerce(_, Bool) pass-through for
-    //    non-arithmetic kinds; the MIR verifier's CondBr-expects-Bool
+    //    non-scalar kinds; the MIR verifier's CondBr-expects-Bool
     //    check remains the loud gate.
     //
     // Replaced `coerce(cond, boolType())` at every condition site
@@ -1015,6 +1018,122 @@ struct Lowerer {
                                             std::array{promoted.id, zero},
                                             boolType(),
                                             encodeOp(HirOpKind::Ne)),
+                          anchor),
+                    boolType()};
+        }
+        // ★★ THE C SCALAR FAMILY'S REMAINING THREE MEMBERS — Enum, FnSig and
+        // NullptrT — each PROJECTED onto a kind the arms above/below already
+        // test, then re-entered. Anchored as
+        // D-CSUBSET-ENUM-FNSIG-NULLPTR-CONDITIONS-SKIP-THE-TRUTHINESS-CHOKEPOINT
+        //
+        // ★ WHAT WAS WRONG, AND WHY IT WAS ONE DEFECT AND NOT THREE. C 6.8.4.1 /
+        // 6.8.5 / 6.5.15 / 6.5.13 / 6.5.14 all say the SAME thing — the
+        // controlling (or logical-operand) expression "shall have scalar type"
+        // and is compared unequal to 0 — and this function is the ONE place
+        // every one of those sites funnels through (`ifPrologue`, the While /
+        // DoWhile / For prologues, `lowerTernary`, `combineBinary`'s
+        // LogicalAnd/LogicalOr arm, and `coerce`'s `_Bool`-target arm). Scalar
+        // is ARITHMETIC ∪ POINTER (C 6.2.5p21), and the dispatch above covered
+        // only the arith-CORE kinds plus Ptr plus the Array decay — so the three
+        // kinds that are scalar-after-a-conversion fell through the whole
+        // function UNCHANGED and reached `mir.addCondBr` still carrying their
+        // source type. The MIR verifier then fired its CondBr-expects-Bool
+        // invariant (I_TerminatorTypeMismatch; I_NullptrTypeInMir for NullptrT)
+        // ON LEGAL USER INPUT.
+        // ⚠ THE INVARIANT WAS RIGHT AND IS NOT TOUCHED. A front-end conversion
+        // was MISSING; relaxing the terminator check would have traded a loud
+        // refusal for a silent miscompile (a raw Enum/pointer word used as a
+        // branch predicate). The fix is owed HERE, at the conversion.
+        // ✔MEASURED at the defect (297-probe battery, 9 controlling-expression
+        // contexts × 33 scalar shapes, x86_64:pe64-x86_64-windows-exec): 54
+        // I_TerminatorTypeMismatch across five enum shapes (a local, a bare
+        // enumerator, a `const enum`, a call result, an enum-typed BIT-FIELD)
+        // and the function designator, against clang 18.1.3 accepting all 297
+        // and gcc 13.3.0 accepting all but its own missing `_BitInt`. `if (e)`
+        // was refused while `int y = e; if (y)`, `!e` and `e != 0` all worked —
+        // the classic shape of a missing conversion at ONE chokepoint rather
+        // than a missing capability.
+        // ⚠ THE NullptrT ARM IS NARROWER THAN THE OTHER TWO AND SAYS SO: `if
+        // (nullptr)` — the LITERAL — always worked, because the literal is
+        // already an integer zero before this function sees it. What did not
+        // work is a NullptrT-typed VALUE reaching a condition, which is what a
+        // `nullptr_t`-typed OBJECT produces. Recording the narrower true claim
+        // rather than the tidier false one is the point: the first measurement
+        // of this arm conflated the two.
+        //
+        // ★ WHY PROJECT-AND-RE-ENTER RATHER THAN A FOURTH `Ne` SPELLING. Each
+        // arm converts to a kind that is ALREADY handled and recurses, exactly
+        // as the Array arm below does. That keeps ONE construction of the
+        // truthiness test, so the C 6.3.1.1 integer promotion, the FCmpUNE NaN
+        // rule and the null-pointer-constant shape can never drift between
+        // scalar kinds — and a future scalar kind joins by naming its
+        // projection, not by copying a test.
+        //
+        // ★ UNGATED, deliberately, and this is the same division of labour
+        // `coerce`'s Enum↔arith arm already states: the SEMANTIC tier owns
+        // WHETHER a language admits the conversion (`isAssignable`'s
+        // `scalarConvertsToBool` / `enumConvertsToArith` verbs); this tier only
+        // REALIZES what was admitted. Nothing here reads a language identity —
+        // the dispatch is a TypeKind SHAPE predicate, and a language whose
+        // enums are not int-compatible simply never reaches HIR with one in a
+        // condition.
+        //
+        // C 6.2.5p17 + 6.7.2.2: an ENUMERATED type IS an integer type, hence
+        // arithmetic, hence scalar. `isArithmeticCore` excludes Enum on purpose
+        // (Enum is the NOMINAL kind, not an arith-core kind), so the projection
+        // to the underlying integer is explicit — through `enumUnderlyingOrSelf`,
+        // the SAME owner `usualArithmeticCommonType` / `integerPromotedType`
+        // call, so the enum→int projection cannot drift; and through the ONE
+        // `coerce` funnel, whose Enum↔arith arm mints the width-exact synthetic
+        // Cast. Covers every enum shape measured: a variable, a bare enumerator,
+        // a `const enum`, `*p`, a call result, and an enum-typed BIT-FIELD. A
+        // shapeless Enum (empty scalar pool — malformed) leaves `under` equal to
+        // the input and falls through unchanged: it stays loud downstream.
+        if (ck == TypeKind::Enum) {
+            TypeId const under = enumUnderlyingOrSelf(interner, cond.type);
+            if (under.valid() && under.v != cond.type.v) {
+                E const asInt = coerce(cond, under);
+                if (asInt.type.valid() && asInt.type.v == under.v)
+                    return coerceCondition(asInt, anchor);
+            }
+        }
+        // C 6.3.2.1p4: a FUNCTION DESIGNATOR used anywhere but as the operand of
+        // `sizeof`/`_Alignof`/unary `&` is converted to "pointer to function" —
+        // so `if (fn)` / `fn ? a : b` / `fn && x` are legal (gcc warns
+        // -Waddress because the address is never null; the code compiles, and
+        // the always-true truth value is the CORRECT answer). Decays through the
+        // SAME `coerce` FnSig→Ptr funnel the assignment/argument paths use (a
+        // representation-free Bitcast at MIR), then RE-ENTERS so the pointer
+        // takes the null-pointer `Ne` arm below — the Array arm's shape exactly.
+        // ⚠ Note this is the DESIGNATOR (`fn`), not a function POINTER VALUE
+        // (`int (*p)(void)`): the latter is already Ptr and was always handled.
+        if (ck == TypeKind::FnSig) {
+            E const decayed = coerce(cond, interner.pointer(cond.type));
+            if (decayed.type.valid()
+                && interner.kind(decayed.type) == TypeKind::Ptr)
+                return coerceCondition(decayed, anchor);
+        }
+        // C23 6.3.2.4p2 (D-CSUBSET-NULLPTR): a `nullptr_t` value converts to
+        // `_Bool` as FALSE — "the result is false" — with no comparison at all.
+        // Yield the Bool literal directly rather than routing through the Ptr
+        // arm: a `Ne(nullptr, null)` would be the same answer computed at run
+        // time, and NullptrT is a SEMANTIC-TIER-ONLY kind that must never reach
+        // MIR (the `I_NullptrTypeInMir` tripwire). Emitting `false` here is what
+        // KEEPS that invariant true instead of weakening it.
+        // ⚠ The reachable input is a NullptrT-typed VALUE, not the `nullptr`
+        // LITERAL: the literal is already an integer zero by the time it gets
+        // here and takes the arithmetic arm above. Today that value comes from a
+        // `nullptr_t`-typed object, whose initializing STORE is still refused
+        // one tier down (I_StoreValueTypeMismatch, ✔MEASURED cycle P41) — a
+        // SEPARATE defect, and not this arm's. So this arm is pinned at the HIR tier
+        // (HirLoweringC.NullptrTypedValueInAConditionBecomesTheBoolFalseLiteral)
+        // where it is DECIDED, and it will need no revisit when that gap closes.
+        if (ck == TypeKind::NullptrT) {
+            HirLiteralValue fv;
+            fv.core  = TypeKind::Bool;
+            fv.value = std::int64_t{0};
+            return {track(builder.makeLiteral(boolType(), literals.add(fv),
+                                              HirFlags::Synthetic),
                           anchor),
                     boolType()};
         }
@@ -10029,21 +10148,22 @@ struct Lowerer {
         SymbolId const sym = model.symbolAt(fnName);
         TypeId sig = InvalidType;
         if (auto const* rec = model.recordFor(sym)) sig = rec->type;
-        // Params live in the fn suffix attached to the NAME's direct
-        // declarator (`int (*f(int a))(int b)` — f's params are `a`;
-        // the outer suffix shapes the return type only).
+        // Params live in the fn suffix that DECLARES the name — `f`'s own, not an
+        // inner or outer function type's (`int (*f(int a))(int b)` — f's params are
+        // `a`; the outer suffix shapes the return type only).
+        //
+        // ★ D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED: this
+        // used to be a single-level scan of the NAME'S OWN direct declarator, which
+        // finds nothing when C 6.7.6p1's redundant parentheses sit between them —
+        // `int (foo)(int x) { … }`, the glibc/musl macro-shadowing idiom that gcc and
+        // clang both compile and run. The harvest then came back EMPTY while the
+        // FnSig still carried the parameter, and the two disagreed one tier later
+        // (MEASURED: H0009 "Function param count 0 mismatches FnSig param count 1").
+        // The shared upward walk in `core/types/declarator_walk.hpp` answers the same
+        // question the semantic tier asks, so the two tiers cannot drift apart on it.
         std::vector<HirNodeId> params;
-        NodeId const direct = tree().parent(fnName);
-        if (direct.valid() && tree().kind(direct) == NodeKind::Internal
-            && tree().rule(direct).v == dc.directRule.v) {
-            for (NodeId c : visible(direct)) {
-                if (tree().kind(c) == NodeKind::Internal
-                    && isFnSuffixRule(tree().rule(c), dc)) {
-                    collectParams(c, params);
-                    break;
-                }
-            }
-        }
+        NodeId const fnSuffix = declaratorFnSuffixNode(tree(), fnName, dc);
+        if (fnSuffix.valid()) collectParams(fnSuffix, params);
         NodeId const bodyNode =
             (decl.kindByChild && !decl.kindByChild->bodyPath.empty())
                 ? descend(discNode, decl.kindByChild->bodyPath)

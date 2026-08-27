@@ -695,6 +695,140 @@ TEST(Arm64Encoder, RbitX3X4EncodesDataProc1Source) {
     EXPECT_EQ(bytes[3], 0xDA);
 }
 
+// ── D-FULLC-STDBIT-ARM64-CNT-POPCOUNT: the four steps of the vector popcount ──
+//
+// Every word below was VERIFIED AGAINST `aarch64-linux-gnu-as` (binutils 2.42)
+// rather than hand-derived, and the reason is recorded because it cost a
+// debugging round: the first draft of these rows carried hand-converted decimal
+// `fixedWord` values and ALL SIX WERE WRONG — `0x9E670000` had been written as
+// 2657419264, which is `0x9E650000`, i.e. FCVTAU. The compiler happily emitted
+// it, the disassembler read back `fcvtau x29, d16`, and qemu killed the program
+// with SIGILL on the two lane instructions. ⚠ A byte pin whose expected value
+// comes from the same head that wrote the config proves only that the head is
+// self-consistent. These come from the assembler.
+//
+// The registers are deliberately DIFFERENT (Rd=3, Rn=7) so a wire that swapped
+// the two slots — or a variant that placed the source in `rm` instead of `rn` —
+// changes the bytes. Rd rides bits 4:0 and Rn bits 9:5 on all four, so
+// Rn=7<<5=0xE0 | Rd=3 = 0xE3 is the low byte of every expected word.
+
+namespace {
+// The cross-class sibling of `assembleArm64Unary`: the destination and the
+// source can sit in DIFFERENT register banks, which is the whole point of the
+// two move rows and is a shape the GPR-only helper above cannot express.
+[[nodiscard]] std::vector<std::uint8_t>
+assembleArm64UnaryCrossClass(char const* mnemonic,
+                             char const* dst, LirRegClass dstCls,
+                             char const* src, LirRegClass srcCls,
+                             bool width32) {
+    auto s = TargetSchema::loadShipped("arm64");
+    EXPECT_TRUE(s.has_value());
+    auto const op    = (*s)->opcodeByMnemonic(mnemonic);
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    EXPECT_TRUE(op.has_value()) << "arm64 declares no `" << mnemonic << "`";
+    EXPECT_TRUE(retOp.has_value());
+    if (!op.has_value() || !retOp.has_value()) return {};
+    auto const dstOrd = (*s)->registerByName(dst);
+    auto const srcOrd = (*s)->registerByName(src);
+    EXPECT_TRUE(dstOrd.has_value() && srcOrd.has_value());
+    if (!dstOrd.has_value() || !srcOrd.has_value()) return {};
+    // ⚠⚠ DESIGNATED INITIALIZERS, AND THE POSITIONAL FORM IS A TRAP THIS
+    // FUNCTION FELL INTO. `LirReg`'s declaration order is
+    // {id, classKind, isPhysical, _pad}, but the ~29 GPR-only helpers in this
+    // file all spell it `{ordinal, 1, cls}` — which binds the literal 1 to
+    // classKind and `cls` to the ONE-BIT isPhysical. That is correct ONLY
+    // because `LirRegClass::GPR` IS 1, so both fields land right by coincidence,
+    // twice over. ✔MEASURED 2026-08-26: the identical spelling with
+    // `LirRegClass::FPR` (2) yields classKind=GPR and isPhysical=0, and the
+    // encoder correctly refuses it — "register operand is not a physical
+    // register". The coincidence is invisible until someone writes the first
+    // non-GPR test, which is this one.
+    LirReg const rd{.id         = static_cast<std::uint32_t>(*dstOrd),
+                    .classKind  = static_cast<std::uint32_t>(dstCls),
+                    .isPhysical = 1};
+    LirReg const rn{.id         = static_cast<std::uint32_t>(*srcOrd),
+                    .classKind  = static_cast<std::uint32_t>(srcCls),
+                    .isPhysical = 1};
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(rn) };
+    (void)b.addInst(*op, rd, ops, /*payload=*/0,
+                    width32 ? ::dss::kLirInstFlagWidth32 : std::uint8_t{0});
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    // ⚠ A COUNT IS NOT A DIAGNOSIS. The GPR-only sibling above asserts only
+    // `errorCount() == 0`, and when this helper first failed that told me two
+    // errors had happened and nothing whatever about which. Carry the reporter's
+    // own text into the failure message so the next reader is not where I was.
+    std::string why;
+    for (auto const& d : rep.all()) { why += "\n    "; why += d.actual; }
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "assembling `" << mnemonic << "` " << dst << " <- " << src
+        << (width32 ? " (width 32)" : " (width 64)") << why;
+    return bytes;
+}
+
+void expectWord(std::vector<std::uint8_t> const& bytes, std::uint32_t word) {
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], static_cast<std::uint8_t>( word        & 0xFF));
+    EXPECT_EQ(bytes[1], static_cast<std::uint8_t>((word >>  8) & 0xFF));
+    EXPECT_EQ(bytes[2], static_cast<std::uint8_t>((word >> 16) & 0xFF));
+    EXPECT_EQ(bytes[3], static_cast<std::uint8_t>((word >> 24) & 0xFF));
+}
+} // namespace
+
+TEST(Arm64Encoder, MovqGprToFpEncodesFmovBothWidths) {
+    // `fmov d3, x7` = 0x9E6700E3 and `fmov s3, w7` = 0x1E2700E3 (assembler-
+    // verified). The width axis is the SOURCE INTEGER width, as on si_to_fp.
+    expectWord(assembleArm64UnaryCrossClass("movq_gpr_to_xmm",
+                                            "d3", LirRegClass::FPR,
+                                            "x7", LirRegClass::GPR,
+                                            /*width32=*/false), 0x9E6700E3u);
+    expectWord(assembleArm64UnaryCrossClass("movq_gpr_to_xmm",
+                                            "d3", LirRegClass::FPR,
+                                            "x7", LirRegClass::GPR,
+                                            /*width32=*/true),  0x1E2700E3u);
+}
+
+TEST(Arm64Encoder, MovqFpToGprEncodesFmovBothWidths) {
+    // `fmov x7, d3` = 0x9E660067 and `fmov w7, s3` = 0x1E260067. ⚠ Bit 16 is the
+    // ONLY thing separating this direction from the one above (opcode 110 vs
+    // 111): one opcode carrying both would silently pick a direction, which is
+    // why they are two rows — the trap x86_64's `movq_xmm_to_gpr` was minted for.
+    expectWord(assembleArm64UnaryCrossClass("movq_xmm_to_gpr",
+                                            "x7", LirRegClass::GPR,
+                                            "d3", LirRegClass::FPR,
+                                            /*width32=*/false), 0x9E660067u);
+    expectWord(assembleArm64UnaryCrossClass("movq_xmm_to_gpr",
+                                            "x7", LirRegClass::GPR,
+                                            "d3", LirRegClass::FPR,
+                                            /*width32=*/true),  0x1E260067u);
+}
+
+TEST(Arm64Encoder, PopcountBytesEncodesLaneCount) {
+    // `cnt v3.8b, v7.8b` = 0x0E2058E3. Q=0 (bit 30 clear) selects the EIGHT-byte
+    // arrangement; setting it would count sixteen bytes, half of them lanes the
+    // entry move zeroed but which a 16B read would still traverse.
+    expectWord(assembleArm64UnaryCrossClass("popcount_bytes",
+                                            "d3", LirRegClass::FPR,
+                                            "d7", LirRegClass::FPR,
+                                            /*width32=*/false), 0x0E2058E3u);
+}
+
+TEST(Arm64Encoder, AddLanesBytesEncodesLaneReduction) {
+    // `addv b3, v7.8b` = 0x0E31B8E3. Byte 2 (0x31 vs CNT's 0x20) is the across-
+    // lanes group plus the reduction opcode; without this instruction the result
+    // is eight separate per-byte counts and not a population count at all.
+    expectWord(assembleArm64UnaryCrossClass("addlanes_bytes",
+                                            "d3", LirRegClass::FPR,
+                                            "d7", LirRegClass::FPR,
+                                            /*width32=*/false), 0x0E31B8E3u);
+}
+
 // ── D-CSUBSET-INTRINSIC-BSWAP: REV16 / REV / REV(X) ──
 //
 // The arm64 byte-reverse trio — the same data-processing 1-source shape as
@@ -3825,20 +3959,40 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
     EXPECT_TRUE(containsWordMasked(ws, kFcvtzsMask, kFcvtzsBase))
         << "encoded function must contain FCVTZS Xd, Dn";
 
-    // The AAPCS64 d-register arg path: FMOV copies reading d0 (arg 0)
-    // and d1 (arg 1). Rn (the FMOV source) sits at bits 5..9.
+    // The AAPCS64 d-register arg path: the incoming doubles arrive in d0 and
+    // d1 and must be CONSUMED from there. Two encodings satisfy that, and the
+    // test admits both:
+    //   * an FMOV copying the argument out (Rn at bits 5..9) — what the
+    //     calling-convention materializer emits when the allocator homed the
+    //     parameter somewhere else;
+    //   * the FADD reading d0/d1 DIRECTLY (Rn at 5..9, Rm at 16..20) — which
+    //     is what happens once regalloc PRE-COLORS each parameter into its own
+    //     incoming register (plan 22 OPT8 / D-ML7-2.5) and `maybeMov` therefore
+    //     emits nothing at all.
+    // ⚠ The second form is strictly better code and used to read here as a
+    // failure. The property under test was never "a copy exists" — it is that
+    // the AAPCS64 d-register path is wired, which a direct read proves at
+    // least as well as a copy does.
     bool sawArgFromD0 = false;
     bool sawArgFromD1 = false;
     for (auto const w : ws) {
-        if ((w & kFmovMask) != kFmovBase) continue;
+        bool const isFmov = (w & kFmovMask) == kFmovBase;
+        bool const isFadd = (w & kFaddMask) == kFaddBase;
+        if (!isFmov && !isFadd) continue;
         std::uint32_t const rn = (w >> 5) & 0x1Fu;
         if (rn == 0u) sawArgFromD0 = true;
         if (rn == 1u) sawArgFromD1 = true;
+        if (!isFadd) continue;
+        std::uint32_t const rm = (w >> 16) & 0x1Fu;
+        if (rm == 0u) sawArgFromD0 = true;
+        if (rm == 1u) sawArgFromD1 = true;
     }
     EXPECT_TRUE(sawArgFromD0)
-        << "aapcs64 arg 0 must materialize as an FMOV reading d0";
+        << "aapcs64 arg 0 must be consumed from d0 — either an FMOV copies it "
+           "out or the FADD reads it in place";
     EXPECT_TRUE(sawArgFromD1)
-        << "aapcs64 arg 1 must materialize as an FMOV reading d1";
+        << "aapcs64 arg 1 must be consumed from d1 — either an FMOV copies it "
+           "out or the FADD reads it in place";
 
     // Callee-saved d-reg discipline (d8-d15 + callee-saved-first
     // regalloc): the prologue spills via FSTUR, the epilogue reloads

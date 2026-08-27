@@ -6,6 +6,7 @@
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/transport.hpp"
+#include "lsp/workspace_project.hpp"   // fileUriFromPath - the ONE owner this helper forwards to
 #include "test_wait_budget.hpp"
 
 #include <gtest/gtest.h>
@@ -240,15 +241,26 @@ private:
 }
 
 // `file:///…` URI for a local path — the spelling every LSP client uses for a
-// workspace folder. Backslashes become forward slashes and a Windows drive path
-// gains the extra leading slash the URI grammar requires (`C:\d` →
-// `file:///C:/d`), so a fixture built here round-trips through
-// `dss::lsp::pathFromFileUri`.
+// workspace folder.
+//
+// ⚠ IT FORWARDS TO PRODUCTION NOW, AND THAT IS THE POINT
+// (D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES). This used
+// to be a SECOND implementation, and it was the ONLY one that existed anywhere:
+// `src/` had `pathFromFileUri` but no inverse, so production could not name a
+// file at all and `locationJson` stamped the request's uri onto every result —
+// which is how a definition inside a header was reported as living in the open
+// document. A helper that exists only in the test tree is a helper the product
+// cannot use, and the tests then measure their own copy rather than the
+// shipping one.
+//
+// The old body also did LESS than it claimed: no percent-encoding at all, so a
+// fixture path containing a space produced a uri that `pathFromFileUri` decoded
+// back to a DIFFERENT path — the round-trip this comment asserted was never
+// actually closed. `dss::lsp::fileUriFromPath` does encode, and
+// `WorkspaceProject.FileUriRoundTrip` pins the three shapes.
 [[nodiscard]] inline std::string fileUriFromPath(
     std::filesystem::path const& p) {
-    auto s = p.generic_string();
-    return (!s.empty() && s.front() == '/') ? "file://" + s
-                                            : "file:///" + s;
+    return dss::lsp::fileUriFromPath(p);
 }
 
 // `initialize` naming workspace folders — the ONLY message that carries them,

@@ -25,3 +25,6 @@ target_link_libraries(dss_lsp_test_lsp_semantic   PRIVATE nlohmann_json::nlohman
 # test). Mirror the include path the semantic suite already wires up.
 target_include_directories(dss_lsp_test_lsp_semantic
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+dss_add_test(NAME lsp/test_lsp_coordinates      SOURCES test_lsp_coordinates.cpp)
+target_include_directories(dss_lsp_test_lsp_coordinates
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

@@ -2,6 +2,7 @@ add_library(lsp OBJECT
     diagnostic_translator.cpp
     document_store.cpp
     json_rpc.cpp
+    lsp_coordinates.cpp
     lsp_semantic_query.cpp
     lsp_server.cpp
     method_dispatcher.cpp

@@ -178,3 +178,18 @@ dss_add_test(NAME analysis/semantic/test_nodiscard_discard_context
              SOURCES test_nodiscard_discard_context.cpp)
 target_include_directories(dss_analysis_semantic_test_nodiscard_discard_context
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P41 lane N: [[D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED]] --
+# C 6.7.6p1 permits redundant parentheses around a declarator, so
+# `int (foo)(int x) { … }` defines the FUNCTION foo (the glibc/musl idiom for a name
+# that is also a function-like macro). The runnable example
+# `examples/c/paren_fn_def_declarator/` owns the accepting half and the runtime
+# proof; this file owns the REFUSING half, which an example structurally cannot
+# carry -- a function-POINTER, an ARRAY, or an UNDECORATED parenthesized name with a
+# body must all STAY refused by code, and the parameter of a returned function
+# type's suffix must stay invisible to the body. Without those, "make the
+# parenthesized form work" is indistinguishable from "stop checking definitions".
+dss_add_test(NAME analysis/semantic/test_paren_declarator_function
+             SOURCES test_paren_declarator_function.cpp)
+target_include_directories(dss_analysis_semantic_test_paren_declarator_function
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

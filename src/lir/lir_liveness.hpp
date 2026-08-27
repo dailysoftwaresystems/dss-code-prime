@@ -85,6 +85,44 @@ struct DSS_EXPORT LirLiveRange {
                                            std::uint32_t end);
 };
 
+// ── THE ONE INTERFERENCE PREDICATE (plan 22 OPT8 — register coalescing) ──────
+//
+// ★★★ TWO RANGES INTERFERE IFF THEIR HALF-OPEN POSITION INTERVALS OVERLAP, AND
+// THIS FUNCTION IS THE ONLY PLACE THAT SENTENCE IS SPELLED. Three consumers ask
+// it, and the whole safety argument for coalescing is that they ask the SAME
+// one:
+//
+//   * the COALESCER (`lir_regalloc.cpp`) — may merge two live ranges into one
+//     register only when this returns false;
+//   * the ALLOCATOR's own register reuse — `expireActive` returns a register to
+//     the free list when `active.range.end <= currentStart`, and because
+//     `LirFuncLiveness::ranges` is sorted ascending by `start`, that condition
+//     is exactly `!lirRangesInterfere(active.range, current)`. The linear scan
+//     was ALREADY permitted to hand two ranges one register on precisely this
+//     test; coalescing only makes it do so deliberately. **That is why
+//     coalescing introduces no new class of hazard: every assignment it
+//     produces is one the allocator could already have produced by luck.**
+//   * the AUDITOR (`findAllocationConflict`, `lir_regalloc.hpp`) — re-derives
+//     the question on the FINISHED assignment table, from liveness alone,
+//     without consulting the coalescer's union-find. A coalescer that merged
+//     two interfering ranges is a SILENT MISCOMPILE (two live values, one
+//     register), so the check that catches it must not be able to inherit the
+//     transform's own belief. That independence is the whole point, and it is
+//     the `D-OPT-JCC-FALLTHROUGH` shape: one shared predicate, consulted by the
+//     transform AND by a verifier that re-derives rather than re-reads.
+//
+// ⚠ THE PREDICATE IS AN OVER-APPROXIMATION OF LIVENESS, AND THAT DIRECTION IS
+// THE SAFE ONE. `LirFuncLiveness` ships FLAT single-interval ranges (see the
+// header note above), so a value dead in a hole is still reported live across
+// it. Over-approximating liveness makes this return `true` where a
+// split-interval analysis would return `false` — a MISSED coalesce, never an
+// unsound one. When split-aware sub-intervals land (D-ML6-1.1) this predicate
+// gains precision and every consumer gains it at once.
+[[nodiscard]] constexpr bool
+lirRangesInterfere(LirLiveRange const& a, LirLiveRange const& b) noexcept {
+    return a.start < b.end && b.start < a.end;
+}
+
 // Per-function liveness result. Owned by the module-level wrapper.
 //
 // Invariants (asserted by the producer; consumers may rely):

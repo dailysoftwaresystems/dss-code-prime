@@ -178,6 +178,28 @@ void CompilationUnit::remapPreprocessedPosition(BufferId&   buffer,
     }
 }
 
+// D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES — the
+// inverse. Contract and the reason it does NOT mirror the forward refusal are
+// on the declaration.
+void CompilationUnit::inversePreprocessedPositions(
+        BufferId originBuffer, ByteOffset originOffset,
+        std::vector<ByteOffset>& out) const {
+    out.clear();
+    if (preprocessedPositionMaps_.empty()) return;
+    std::vector<ByteOffset> perMap;
+    for (PreprocessedPositionMap const& m : preprocessedPositionMaps_) {
+        m.map.inverse(originBuffer, originOffset, perMap);
+        out.insert(out.end(), perMap.begin(), perMap.end());
+    }
+}
+
+BufferId CompilationUnit::mainOriginForSynth(BufferId synth) const {
+    for (PreprocessedPositionMap const& m : preprocessedPositionMaps_) {
+        if (m.synth == synth) return m.mainOrigin;
+    }
+    return BufferId{};
+}
+
 void CompilationUnit::remapPreprocessedPositions(
         DiagnosticReporter& reporter) const {
     if (preprocessedPositionMaps_.empty()) return;
@@ -463,6 +485,13 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         }
         if (remapCoversEverySegment) {
             sidecar.ppSynthBuffer = sidecar.source->id();
+            // D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES:
+            // carry the MAP and the MAIN ORIGIN under the SAME condition as the
+            // synth id, so all three are recorded together or not at all. A
+            // half-populated bridge is the state where one direction silently
+            // answers and the other silently does not.
+            sidecar.ppMap        = pp.lineMap;
+            sidecar.ppMainOrigin = pp.mainSourceId;
         }
         // TF-C82 (D-PP-PRAGMA-REGISTRY): carry the `#pragma pack` stamps to the
         // finished CU. Empty for a TU with no `#pragma pack`, which is every TU
@@ -1111,7 +1140,8 @@ CompilationUnit UnitBuilder::finish() && {
     for (auto& sc : sidecars_) {
         if (!sc.ppRemap) continue;
         preprocessedPositionMaps.push_back(
-            PreprocessedPositionMap{sc.ppSynthBuffer, std::move(sc.ppRemap)});
+            PreprocessedPositionMap{sc.ppSynthBuffer, std::move(sc.ppRemap),
+                                    std::move(sc.ppMap), sc.ppMainOrigin});
     }
 
     // TF-C82: flatten the per-tree `#pragma pack` stamps out of the sidecars, in

@@ -9,12 +9,15 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "lsp/diagnostic_translator.hpp"
 #include "lsp/json_rpc.hpp"
+#include "lsp/lsp_coordinates.hpp"
 #include "lsp/lsp_semantic_query.hpp"
 #include "lsp/workspace_project.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <map>
+#include <set>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -729,15 +732,65 @@ void LspServer::publishDiagnostics_(std::string const& uri) {
     if (!snap.has_value()) return;
     auto diags = documents_.diagnosticsFor(uri);
 
-    // Re-construct a SourceBuffer over the document's current text
-    // so the translator can compute line/col + UTF-16 columns.
-    // Cheap: SourceBuffer's ctor just builds the line-offset table.
-    auto src = dss::SourceBuffer::fromString(snap->text, uri);
+    // == D-LSP-DIAGNOSTIC-RENDERED-AGAINST-THE-OPEN-DOCUMENT-IGNORING-ITS-BUFFER
+    //
+    // Each diagnostic is rendered against the buffer IT NAMES, and published to
+    // THAT buffer's uri. This used to build one SourceBuffer over the open
+    // document and translate every diagnostic against it, whatever buffer the
+    // diagnostic actually pointed at.
+    //
+    // * THE SPANS ARE ALREADY IN ORIGIN COORDINATES -- that is what made the
+    // old code wrong rather than merely incomplete. Both streams published here
+    // have been remapped: `analyze()` calls `remapPreprocessedPositions`, and a
+    // tree's parse diagnostics go through `Tree::remapDiagnostics` at build
+    // time. So a header-origin diagnostic carried a HEADER offset and was
+    // rendered against the DOCUMENT's text -- a line number belonging to a
+    // different file, on a file the user did have open, which is the most
+    // plausible-looking form this defect takes.
+    //
+    // * ITS "trigger-gated" DEFERRAL WAS VOID, AND THE REASONING IS WORTH
+    // KEEPING: the row gated itself on `src/lsp/` acquiring an INCLUDE SEARCH
+    // PATH, on the reasoning that a single-file LSP CU can only ever hold the
+    // one buffer the user opened. That confuses "which files can be INCLUDED"
+    // with "which buffers a POSITION can name". The preprocessor's synthetic
+    // origins -- the built-in prologue and the command-line prologue -- are
+    // spliced origin buffers with no include path, no search, and no file at
+    // all, and they are present on EVERY preprocessed TU. The trigger had
+    // therefore already fired everywhere, with no include path in sight.
+    auto snapshotBuffer = dss::SourceBuffer::fromString(snap->text, uri);
+    auto model = documents_.semanticModelFor(uri);
+    std::optional<dss::lsp::DocumentCoordinates> coords;
+    if (model) coords.emplace(model->unit(), uri, snap->text);
+
+    // Grouped by origin uri. The document's OWN entry is created up front so a
+    // clean document still publishes an EMPTY array -- without that a squiggle
+    // outlives the edit that fixed it, forever.
+    std::map<std::string, std::vector<Diagnostic>> byUri;
+    byUri.emplace(uri, std::vector<Diagnostic>{});
+    for (auto const& pd : diags) {
+        if (!coords.has_value()) {
+            byUri[uri].push_back(translateDiagnostic(pd, *snapshotBuffer));
+            continue;
+        }
+        auto placed = coords->locateDiagnostic(pd.buffer, pd.span);
+        Diagnostic d = translateDiagnostic(pd, *snapshotBuffer);
+        d.range = placed.range;
+        if (!placed.syntheticOrigin.empty()) {
+            // A position in a compiler-generated buffer has no file to point
+            // at. It is published on the DOCUMENT at 0:0 with the origin NAMED
+            // -- the same shape the schema-less-document diagnostic below
+            // already uses for a condition that belongs to no span. Naming it
+            // is what keeps 0:0 from reading as "an error on line 1".
+            d.message = "in " + placed.syntheticOrigin + ": " + d.message;
+        }
+        byUri[placed.uri].push_back(std::move(d));
+    }
+
     PublishDiagnosticsParams params;
     params.uri         = uri;
     params.version     = snap->clientVersion;
-    params.diagnostics = translateDiagnostics(
-        std::span<dss::ParseDiagnostic const>{diags}, *src);
+    params.diagnostics = std::move(byUri[uri]);
+    byUri.erase(uri);
     // ★ THE SCHEMA-LESS DOCUMENT SPEAKS. Emitted on EVERY publish, not just the
     // first: the reason lives on the document, so an edit that re-publishes an
     // (still) unresolvable file restates it instead of clearing it. Placed
@@ -768,6 +821,19 @@ void LspServer::publishDiagnostics_(std::string const& uri) {
     const auto notif = JsonRpc::serializeNotification(
         "textDocument/publishDiagnostics", body);
     (void)transport_->writeMessage(notif);
+
+    // One further publish per NON-document origin (a spliced header). No
+    // `version`: the client's version counter belongs to the document it sent,
+    // and stamping it onto another file's publish would claim an edit history
+    // this server never saw.
+    for (auto& [otherUri, otherDiags] : byUri) {
+        PublishDiagnosticsParams p;
+        p.uri         = otherUri;
+        p.diagnostics = std::move(otherDiags);
+        for (auto& d : p.diagnostics) d.source = options_.diagnosticSource;
+        (void)transport_->writeMessage(JsonRpc::serializeNotification(
+            "textDocument/publishDiagnostics", serializePublishDiagnostics(p)));
+    }
 }
 
 // ── Semantic request handlers (SE7) ────────────────────────────────────
@@ -778,11 +844,19 @@ namespace {
 // handler needs. Returns false when no model/tree/node is available — the
 // caller returns the LSP default. The tree is always trees()[0] (single-
 // file CU per LSP document).
+// ══ D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES ════════
+//
+// EVERY handler resolves its position through `DocumentCoordinates` and renders
+// every span through it. `tree.source()` does not appear below, and that is not
+// a style preference — it is the anti-regression device, enforced mechanically
+// by `scripts/check-lsp-coordinates/`. See `lsp_coordinates.hpp` for why the
+// TYPE is the fix and patched arithmetic is not.
 struct ResolvedQuery {
-    std::shared_ptr<dss::SemanticModel const> model;
-    dss::Tree const*                          tree   = nullptr;
-    dss::ByteOffset                           offset{};
-    NodeId                                    node{};
+    std::shared_ptr<dss::SemanticModel const>   model;
+    std::optional<dss::lsp::DocumentCoordinates> coords;
+    dss::Tree const*                            tree   = nullptr;
+    dss::ByteOffset                             offset{};
+    NodeId                                      node{};
 };
 
 [[nodiscard]] bool resolveQuery(DocumentStore const& docs,
@@ -790,21 +864,37 @@ struct ResolvedQuery {
                                 ResolvedQuery& out) {
     out.model = docs.semanticModelFor(tp.uri);
     if (!out.model) return false;
+    auto snap = docs.snapshot(tp.uri);
+    if (!snap.has_value()) return false;
     auto trees = out.model->unit().trees();
     if (trees.empty() || !trees[0].root().valid()) return false;
-    out.tree   = &trees[0];
-    out.offset = positionToByteOffset(out.tree->source(), tp.position);
+    out.coords.emplace(out.model->unit(), tp.uri, snap->text);
+    // ★ NOTHING here is a failure to report: a position with no synth image is
+    // a position that is not in the program (an `#if 0` region, the `#include`
+    // line the splice consumed, a cursor past the last byte). The handler
+    // returns its protocol default, and MUST NOT reach for a nearby offset.
+    auto point = out.coords->toSynth(tp.position);
+    if (!point.has_value()) return false;
+    out.tree   = point->tree;
+    out.offset = point->offset;
     out.node   = nodeAtOffset(*out.tree, out.offset);
     return out.node.valid();
 }
 
-// A Location {uri, range} for a node's span in `tree`.
-[[nodiscard]] json locationJson(std::string const& uri, dss::Tree const& tree,
-                                NodeId node) {
-    return json{
-        {"uri", uri},
-        {"range", rangeJson(spanToRange(tree.source(), tree.span(node)))},
-    };
+// A Location {uri, range} for a node's span, resolved onto the ORIGIN file.
+//
+// ⚠ THE REQUEST'S URI IS GONE, AND ITS ABSENCE IS THE FEATURE. This used to
+// take the uri the request arrived on and stamp it onto every result, so a
+// definition inside an `#include`d header was reported as living in the open
+// document, at a synth offset. A header definition now returns the HEADER's
+// `file://` uri. `nullopt` when the span's origin is synthetic (`<built-in>`):
+// LSP has no location in no file, so the caller omits the entry.
+[[nodiscard]] std::optional<json> locationJson(
+        dss::lsp::DocumentCoordinates const& coords, dss::Tree const& tree,
+        NodeId node) {
+    auto loc = coords.locate(tree, tree.span(node));
+    if (!loc.has_value()) return std::nullopt;
+    return json{{"uri", loc->uri}, {"range", rangeJson(loc->range)}};
 }
 
 } // namespace
@@ -827,8 +917,9 @@ std::optional<std::string> LspServer::handleHover_(Request const& req) {
             {"value", "```\n" + typeString(q.model->lattice().interner(), ty)
                       + "\n```"},
         };
-        result["range"] = rangeJson(spanToRange(q.tree->source(),
-                                                q.tree->span(q.node)));
+        if (auto loc = q.coords->locate(*q.tree, q.tree->span(q.node))) {
+            result["range"] = rangeJson(loc->range);
+        }
         return result.dump();
     }
 
@@ -845,8 +936,11 @@ std::optional<std::string> LspServer::handleHover_(Request const& req) {
 
     json result;
     result["contents"] = {{"kind", "markdown"}, {"value", md}};
-    result["range"] = rangeJson(spanToRange(q.tree->source(),
-                                            q.tree->span(q.node)));
+    // A hover whose node came from a synthetic origin still HOVERS — the label
+    // is about the symbol, not about a file — it just carries no range.
+    if (auto loc = q.coords->locate(*q.tree, q.tree->span(q.node))) {
+        result["range"] = rangeJson(loc->range);
+    }
     return result.dump();
 }
 
@@ -865,7 +959,9 @@ std::optional<std::string> LspServer::handleDefinition_(Request const& req) {
     for (auto const& t : q.model->unit().trees()) {
         if (t.id().v == rec->tree.v) { declTree = &t; break; }
     }
-    return locationJson(tp->uri, *declTree, rec->declNode).dump();
+    auto loc = locationJson(*q.coords, *declTree, rec->declNode);
+    if (!loc.has_value()) return std::string{"null"};
+    return loc->dump();
 }
 
 std::optional<std::string> LspServer::handleReferences_(Request const& req) {
@@ -890,13 +986,22 @@ std::optional<std::string> LspServer::handleReferences_(Request const& req) {
         }
     } catch (...) { /* keep default */ }
 
+    // DEDUPED BY (uri, range): a header spliced twice yields two synth images
+    // of one token, and both map BACK to the same origin range. Collapsing them
+    // is why the multi-image case changes where results POINT and never what
+    // "references" MEANS.
     json arr = json::array();
-    if (includeDecl && rec->declNode.valid()) {
-        arr.push_back(locationJson(tp->uri, *q.tree, rec->declNode));
-    }
-    for (NodeId use : q.model->usesOf(sym)) {
-        arr.push_back(locationJson(tp->uri, *q.tree, use));
-    }
+    std::set<std::pair<std::string, std::string>> seen;
+    auto push = [&](NodeId n) {
+        auto loc = locationJson(*q.coords, *q.tree, n);
+        if (!loc.has_value()) return;   // synthetic origin: no location exists
+        auto key = std::make_pair((*loc)["uri"].get<std::string>(),
+                                  (*loc)["range"].dump());
+        if (!seen.insert(std::move(key)).second) return;
+        arr.push_back(std::move(*loc));
+    };
+    if (includeDecl && rec->declNode.valid()) push(rec->declNode);
+    for (NodeId use : q.model->usesOf(sym)) push(use);
     return arr.dump();
 }
 
@@ -919,19 +1024,39 @@ std::optional<std::string> LspServer::handleRename_(Request const& req) {
     auto const* rec = q.model->recordFor(sym);
     if (rec == nullptr) return std::string{"null"};
 
-    json edits = json::array();
+    // * EDITS ARE GROUPED PER URI, which LSP has always modelled and this
+    // server never used: every edit was stamped with the REQUEST's uri, so
+    // renaming a symbol declared in a header wrote the header's edit into the
+    // OPEN DOCUMENT at a synth offset -- a corrupting edit, not merely a wrong
+    // report. An occurrence in a header now lands in the HEADER's entry.
+    //
+    // DEDUPED BY (uri, range) for the same reason `references` is: a header
+    // spliced twice gives two synth images of one token that map BACK to one
+    // origin range. Two identical edits at one range is what would change what
+    // a rename MEANS; collapsing them keeps it a rename that merely points
+    // somewhere new.
+    std::map<std::string, json> byUri;
+    std::set<std::pair<std::string, std::string>> seen;
     auto pushEdit = [&](NodeId n) {
-        edits.push_back(json{
-            {"range", rangeJson(spanToRange(q.tree->source(), q.tree->span(n)))},
-            {"newText", newName},
-        });
+        auto loc = q.coords->locate(*q.tree, q.tree->span(n));
+        // A SYNTHETIC origin (the built-in prologue) is not renameable: there
+        // is no file to edit. Dropping it is correct -- inventing a document
+        // edit would write compiler-generated text into the user's source.
+        if (!loc.has_value()) return;
+        auto rangeJs = rangeJson(loc->range);
+        if (!seen.insert({loc->uri, rangeJs.dump()}).second) return;
+        auto it = byUri.find(loc->uri);
+        if (it == byUri.end()) it = byUri.emplace(loc->uri, json::array()).first;
+        it->second.push_back(json{{"range", std::move(rangeJs)},
+                                  {"newText", newName}});
     };
     if (rec->declNode.valid()) pushEdit(rec->declNode);
     for (NodeId use : q.model->usesOf(sym)) pushEdit(use);
+    if (byUri.empty()) return std::string{"null"};
 
     json result;
     result["changes"] = json::object();
-    result["changes"][tp->uri] = std::move(edits);
+    for (auto& [uri, edits] : byUri) result["changes"][uri] = std::move(edits);
     return result.dump();
 }
 
@@ -942,9 +1067,14 @@ std::optional<std::string> LspServer::handleCompletion_(Request const& req) {
     if (!model) return std::string{"null"};
     auto trees = model->unit().trees();
     if (trees.empty() || !trees[0].root().valid()) return std::string{"null"};
-    dss::Tree const& tree = trees[0];
-    const dss::ByteOffset offset =
-        positionToByteOffset(tree.source(), tp->position);
+    auto snap = documents_.snapshot(tp->uri);
+    if (!snap.has_value()) return std::string{"null"};
+    const dss::lsp::DocumentCoordinates coords{model->unit(), tp->uri,
+                                               snap->text};
+    auto point = coords.toSynth(tp->position);
+    if (!point.has_value()) return std::string{"null"};
+    dss::Tree const& tree = *point->tree;
+    const dss::ByteOffset offset = point->offset;
 
     // Find the deepest scope containing the offset, then collect bindings
     // up the parent chain (inner shadows outer — first-seen wins).

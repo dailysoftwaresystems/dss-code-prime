@@ -3610,12 +3610,41 @@ struct Lowerer {
                 // — any `==` already produces whatever type the
                 // result-type rule says, so this is symmetric with
                 // the cycle-1 BinaryOp Eq path. (Review I-5)
-                MirLiteralValue zero;
-                if (isFloat) { zero.value = 0.0; }
-                else { zero.value = std::int64_t{0}; }
-                zero.core = tk;
-                MirInstId const zeroConst = mir.addConst(std::move(zero),
-                                                          operandType);
+                //
+                // ★★ D-CSUBSET-LOGICAL-NOT-ON-A-FLOAT-MINTS-A-BARE-FLOAT-CONST
+                // A FLOAT operand's comparison zero MUST be promoted to an
+                // anonymous rodata global (GlobalAddr + Load), never minted as a
+                // bare MIR `Const`: register machines have no float-immediate
+                // instruction form and the LirLiteralPool has no float encoder
+                // path, so a bare float Const DEAD-ENDS at MIR→LIR. This site
+                // minted one, and did so for EVERY float width.
+                // ✔MEASURED before this changed (297-probe battery,
+                // x86_64:pe64-x86_64-windows-exec): `!f`, `!d` and `!ld` were
+                // each refused with L_UnsupportedLoweringForOpcode, while
+                // `if (f)` / `f ? a : b` / `f && x` all compiled — because the
+                // CONDITION path's zero comes from `coerceCondition`, which
+                // routes through the promotion, and this one did not. gcc 13.3.0
+                // and clang 18.1.3 both accept all three (C 6.5.3.3p5: `!E` is
+                // `(0 == E)`, and E may be ANY scalar).
+                // ★ Reuse `elementFloatConst` — the SAME promotion the complex
+                // construct and the body-float-literal arm already use. A third
+                // CONSUMER of one owner, not a third spelling of the promotion:
+                // this defect exists precisely because the rule lived in the
+                // consumers rather than in a place every consumer must pass.
+                // ⚠ F16/F80/F128 fall through inside that helper to a bare Const
+                // and keep walling loud at the LIR encoded-width guard. That is
+                // the pre-existing long-double / half-float deferral, NOT this
+                // defect, and it is left loud rather than papered over.
+                MirInstId zeroConst = InvalidMirInst;
+                if (isFloat) {
+                    zeroConst = elementFloatConst(0.0, operandType);
+                } else {
+                    MirLiteralValue zero;
+                    zero.value = std::int64_t{0};
+                    zero.core = tk;
+                    zeroConst = mir.addConst(std::move(zero), operandType);
+                }
+                if (!zeroConst.valid()) return InvalidMirInst;
                 std::array<MirInstId, 2> ops2{operand, zeroConst};
                 return mir.addInst(
                     isFloat ? MirOpcode::FCmpOeq : MirOpcode::ICmpEq,

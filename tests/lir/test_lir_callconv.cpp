@@ -2024,13 +2024,33 @@ TEST(LirCallconvAbi, CallSiteMaterializesArgIntoArgGprAndResultFromReturnGpr) {
             }
         }
     }
+    // ★ THE `OR` CLAUSE THIS TEST'S OWN DOCBLOCK ALWAYS STATED, NOW
+    // IMPLEMENTED (plan 22 OPT8 / D-ML7-2.5). The property under test is that
+    // the ABI register HOLDS the value at the call — not that an instruction
+    // moved it there. With regalloc pre-coloring the allocator homes the
+    // parameter IN `argGprs[0]`, so `maybeMov` emits NOTHING, which is the
+    // stronger outcome and used to read here as a failure. The docblock above
+    // has said "OR src/dest already == argGprs[0] because regalloc happened to
+    // pick it" since ML7; only the assertion lagged behind it.
+    // ⚠ NOT weakened into vacuity: if the allocator homes nothing on the ABI
+    // register AND no mov targets it, the argument is not in it and this fires.
+    auto const allocHomes = [&](std::uint16_t ordinal) {
+        for (auto const& fa : bundle.alloc.perFunc) {
+            for (auto const& a : fa.assignments) {
+                if (a.vreg.id == 0 || a.isSpilled()) continue;
+                if (a.physReg().id == ordinal) return true;
+            }
+        }
+        return false;
+    };
     ASSERT_TRUE(sawCall) << "the corpus has a call site";
-    EXPECT_TRUE(sawArgMov)
-        << "ML7 cycle 2 must emit a mov INTO " << cc->argGprs[0]
-        << " before the call (arg-passing mov)";
-    EXPECT_TRUE(sawReturnMov)
-        << "ML7 cycle 2 must emit a mov FROM " << cc->returnGprs[0]
-        << " after the call (return-value mov)";
+    EXPECT_TRUE(sawArgMov || allocHomes(*argGpr0))
+        << "the argument must be IN " << cc->argGprs[0]
+        << " at the call — either a mov puts it there, or regalloc homed it "
+           "there and the materializer correctly emitted nothing";
+    EXPECT_TRUE(sawReturnMov || allocHomes(*retGpr0))
+        << "the call result must come FROM " << cc->returnGprs[0]
+        << " — either a mov copies it out, or regalloc homed the result there";
 }
 
 // VoidReturnCallExercisesNoPostCallReturnMov — synthesizes a LIR
@@ -2323,11 +2343,27 @@ TEST(LirCallconvAbi, MultiArgFunctionMaterializesEveryArgGpr) {
             }
         }
     }
+    // ★ THE THIRD WAY THE PARAMETER CAN BE "ALREADY THERE" (plan 22 OPT8 /
+    // D-ML7-2.5): regalloc pre-coloring homes it IN the arg register, so
+    // `maybeMov` emits no instruction at all and the ordinal surfaces in
+    // NEITHER a mov result nor a mov operand. The docblock above already
+    // admitted "no explicit copy was needed because the param is already
+    // there" — this is that case, read from the allocation rather than from an
+    // instruction that no longer needs to exist.
+    auto const allocHomes = [&](std::uint16_t ordinal) {
+        for (auto const& fa : bundle.alloc.perFunc) {
+            for (auto const& a : fa.assignments) {
+                if (a.vreg.id == 0 || a.isSpilled()) continue;
+                if (a.physReg().id == ordinal) return true;
+            }
+        }
+        return false;
+    };
     for (std::size_t k = 0; k < 3; ++k) {
-        EXPECT_TRUE(seen[k])
+        EXPECT_TRUE(seen[k] || allocHomes(*argOrds[k]))
             << "argGprs[" << k << "] (" << cc->argGprs[k]
-            << ") must surface in the post-callconv output (as a mov "
-               "src or result, depending on regalloc's choice)";
+            << ") must carry parameter " << k << " — as a mov src, a mov "
+               "result, or as the home regalloc pre-colored it into";
     }
 }
 
@@ -3106,6 +3142,125 @@ TEST(LirCallconvAbi, CycleBreakScratchAvoidsCommittedArgDestination) {
             << wantToken << " — a cycle-break scratch clobbered a committed "
                "argument destination (the scratch-collapse miscompile)";
     }
+}
+
+// ★★★ THE FAIL-LOUD BOUNDARY OF THE PARALLEL-COPY RESOLVER, SHOWN FIRING.
+//
+// `D-ML7-2.3` closed by REPLACING a refusal with a resolution, and the tests
+// above prove the resolution. That leaves a question none of them can answer:
+// is `L_MoveCycleUnsupported` still REACHABLE, or has closing the row quietly
+// turned this project's loudest post-regalloc diagnostic into dead code? A
+// fail-loud boundary nobody has seen fire is indistinguishable from one that
+// was deleted, and the failure mode of being wrong here is a SILENT
+// miscompile — the resolver emitting a move sequence it could not sequence.
+//
+// The resolver breaks a cycle with a caller-saved register of the cycle's own
+// class that no move in the set touches. On every shipped ABI such a register
+// exists (SysV's rax/r10/r11 sit outside argGprs), which is exactly why no
+// ordinary program reaches this arm. So the NEGATIVE is synthesized BY
+// REMOVAL from the shipped document — `mutateShippedTargetSchemaDoc` throws on
+// a mutation that changes nothing, so if `callerSaved` ever stopped carrying a
+// non-argument GPR this fixture would fail loudly instead of testing the
+// schema against itself.
+//
+// ⓘ Deliberately NOT a claim that the shipped targets can reach this. They
+// cannot, and that is the design. The claim is that the diagnostic is
+// unreachable BY CONSTRUCTION rather than by deletion: hand the resolver a
+// calling convention with no spare register of the class and it still refuses
+// rather than emitting a clobbering sequence.
+TEST(LirCallconvAbi, MoveCycleUnsupportedStillFiresWhenNoScratchOfItsClassIsFree) {
+    // REMOVE from `callerSaved` every register that is not an ARG-PASSING
+    // register of some pool, leaving a cc whose entire caller-saved set is the
+    // arg registers themselves — so a move set occupying a whole pool has no
+    // spare register of that class to break its cycle with.
+    //
+    // ⓘ The kept set is the UNION of the cc's own arg pools, so nothing here
+    // names rax/r10/r11 and nothing keys on a register-name SHAPE (an earlier
+    // draft filtered GPRs with `name starts with 'r'`, which is an x86 spelling
+    // fact and would have been quietly wrong on a target whose GPRs are named
+    // otherwise). Both pool names are read from the document being mutated.
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [](nlohmann::json& doc) {
+            for (auto& cc : doc.at("callingConventions")) {
+                if (!cc.is_object()) continue;
+                if (!cc.contains("callerSaved")) continue;
+                std::unordered_set<std::string> argRegs;
+                for (char const* pool : {"argGprs", "argFprs"}) {
+                    if (!cc.contains(pool)) continue;
+                    for (auto const& a : cc.at(pool)) {
+                        argRegs.insert(a.get<std::string>());
+                    }
+                }
+                if (argRegs.empty()) continue;
+                nlohmann::json kept = nlohmann::json::array();
+                for (auto const& r : cc.at("callerSaved")) {
+                    if (argRegs.count(r.get<std::string>()) != 0) {
+                        kept.push_back(r);
+                    }
+                }
+                cc["callerSaved"] = kept;
+            }
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "a cc whose caller-saved GPRs are exactly its arg GPRs must still LOAD "
+           "— the refusal under test is a materialization-time one, not a "
+           "load-time one";
+    TargetSchema const& sch = **mutated;
+
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(callOp.has_value() && retOp.has_value());
+    // ⚠ A 2-CYCLE IS NOT ENOUGH, AND FINDING THAT OUT IS THE POINT OF WRITING
+    // THE TEST RATHER THAN ASSUMING IT. ✔MEASURED: with only two of the six
+    // argument GPRs inside the move set, the four others are still caller-saved
+    // and one of them becomes the scratch — the pass SUCCEEDS. The move set has
+    // to occupy the WHOLE class, so this is a full-length rotation across every
+    // arg-passing GPR: source k is `argGprs[(k+1) % N]`, making every one of
+    // them simultaneously a source and a destination.
+    auto const* ccDecl = sch.callingConvention(0);
+    ASSERT_NE(ccDecl, nullptr);
+    std::size_t const nArgs = ccDecl->argGprs.size();
+    ASSERT_GE(nArgs, 2u) << "the rotation needs at least two arg GPRs";
+    std::vector<LirReg> argRegs;
+    for (auto const& name : ccDecl->argGprs) {
+        auto const ord = sch.registerByName(name);
+        ASSERT_TRUE(ord.has_value()) << "cc names an unresolvable GPR " << name;
+        argRegs.push_back(makePhysicalReg(*ord, LirRegClass::GPR));
+    }
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{99});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    std::vector<LirOperand> callOps;
+    callOps.push_back(LirOperand::makeSymbolRef(7));
+    for (std::size_t k = 0; k < nArgs; ++k) {
+        callOps.push_back(LirOperand::makeReg(argRegs[(k + 1u) % nArgs]));
+    }
+    b.addInst(*callOp, InvalidLirReg, callOps);
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{99};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    EXPECT_FALSE(result.ok())
+        << "a cycle with no free scratch of its class must be REFUSED, never "
+           "emitted as a clobbering in-order sequence";
+    bool sawIt = false;
+    for (auto const& d : ccRep.all()) {
+        if (d.code == DiagnosticCode::L_MoveCycleUnsupported) sawIt = true;
+    }
+    EXPECT_TRUE(sawIt)
+        << "the refusal must be L_MoveCycleUnsupported specifically — that "
+           "diagnostic is the resolver's fail-loud boundary and this is the "
+           "test that proves it is still able to fire";
 }
 
 TEST(LirCallconvAbi, IndependentGprAndFprCyclesBothResolved) {

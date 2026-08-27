@@ -6180,7 +6180,30 @@ TEST(SemanticAnalyzerC, NamedVoidParamFiresInvalidVoidParamPositioned) {
                         DiagnosticCode::S_InvalidVoidParam), 1u);
     for (auto const& d : model.diagnostics().all()) {
         if (d.code != DiagnosticCode::S_InvalidVoidParam) continue;
-        EXPECT_EQ(cu->trees()[0].source().slice(d.span), "void x")
+        // ⚠ SLICE THE BUFFER THE DIAGNOSTIC POINTS AT, not `trees()[0].source()`.
+        // A preprocessed tree's `source()` is the SYNTH buffer, while a
+        // diagnostic's span has been REMAPPED onto its ORIGIN buffer
+        // (`CompilationUnit::remapPreprocessedPosition`) — so the two are in
+        // different coordinate systems the moment anything precedes the main
+        // source in the synth text: a spliced `#include`, a `--define`, or the
+        // "<built-in>" prologue.
+        // ★ This read was latent-wrong and passed only because all three were
+        // empty on this path. It surfaced when D-PP-PREDEFINE-REDEFINITION-PARTITION
+        // made the prologue non-empty on every format: the slice came back
+        // "e __BI", six bytes of a prologue `#define` line, instead of "void x".
+        // Nothing about the DIAGNOSTIC changed — only whether the wrong buffer
+        // happened to coincide with the right one.
+        std::string_view text;
+        for (auto const& buf : cu->auxiliaryBuffers()) {
+            if (buf != nullptr && buf->id() == d.buffer) {
+                text = buf->slice(d.span);
+                break;
+            }
+        }
+        if (text.empty() && d.buffer == cu->trees()[0].source().id()) {
+            text = cu->trees()[0].source().slice(d.span);
+        }
+        EXPECT_EQ(text, "void x")
             << "the diagnostic must span the offending param";
     }
 }
@@ -6751,12 +6774,26 @@ TEST(SemanticAnalyzerC, FnTypedefPointerObjectIsNotAPrototype) {
 
 // (l) FAIL-LOUD (F2 hardening): an illegal function-returning-function whose
 // fn-suffix hides behind a redundant-paren group (`Fn (f)(int);` — C 6.7.6.3p1) is
-// NOT a bare prototype. The multi-level UPWARD walk in `declaratorIsUndecoratedName`
-// sees the group-enclosing `directRule`'s `(int)` suffix and rejects the candidate,
-// so the declaration takes the normal path and fails loud
-// (S_InvalidFunctionDeclarator). RED-ON-DISABLE: revert the walk to the single-level
-// check → the group-wrapped suffix escapes → `f` is mis-flagged a candidate, upgraded
-// to a Function proto, and SILENTLY ACCEPTED (no diagnostic, hasErrors() false).
+// NOT a bare prototype. ✔MEASURED: gcc 13.3.0 refuses it ("'f' declared as function
+// returning a function") and so does clang 18.1.3 ("function cannot return function
+// type").
+//
+// ★★ WHAT REFUSES IT CHANGED IN P41, AND THE OLD ANSWER WAS AN ACCIDENT — see
+// [[D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED]]. This paragraph
+// used to credit `declaratorIsUndecoratedName`'s upward walk, which merely kept `f`
+// off the typedef-prototype path; the actual refusal then came from the FnSig-typed-
+// Variable arm, whose message ("function prototype declarations are not supported
+// here; use 'extern' …") names a construct this source does not contain, and which
+// only fired because the SYNTACTIC shape walk could not see a function suffix through
+// a redundant parenthesis. P41 taught that walk to see through parentheses — C 6.7.6
+// permits them and `int (foo)(int x){…}` is legal C — so the accident is gone and the
+// constraint is now checked ON PURPOSE, off the RESOLVED type, with a message that
+// names it. That check also covers the INLINE spelling `int f(int)(int);`, which the
+// accident never reached at all.
+//
+// RED-ON-DISABLE (restated to match): remove the C 6.7.6.3p1 result-type check in
+// `resolveDeclTypes` (semantic_analyzer.cpp) → `f` is upgraded to a Function proto
+// and SILENTLY ACCEPTED (no diagnostic, hasErrors() false).
 TEST(SemanticAnalyzerC, FnTypedefParenGroupFnSuffixIsNotAPrototype) {
     auto model = analyzeShipped("c", {
         "typedef int Fn(int);\n"

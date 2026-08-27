@@ -107,6 +107,20 @@ MUST_NEVER_TRAVEL = (
     "Testing/",
     "test-scratch/",
     ".claude/worktrees/",  # a full copy of the repo per live agent
+    # ★ The SANCTIONED home for lane worktrees since the 2026-08-26 ruling that
+    #   moved them inside the repo root. Same cost as the line above and then
+    #   some, because lanes are routinely FOUR at a time: without this the push
+    #   ships four full checkouts, and a gate host holding one runs somebody's
+    #   uncommitted `examples/` corpus and reports it as the cycle's. The
+    #   operator stated the requirement as an absolute -- "worktrees MUST be
+    #   ignored by ALL host copies to run legs" -- so it is pinned here rather
+    #   than merely written in `.gitignore`: this floor RE-ASKS git and refuses
+    #   the carriage if that rule is ever edited away.
+    # ⚠ The trailing slash is load-bearing, per the module docstring: the
+    #   directory is ABSENT most of the time, and `git check-ignore .worktrees`
+    #   answers NOT-IGNORED (rc=1) for a nonexistent path while `.worktrees/`
+    #   answers rc=0. ✔MEASURED 2026-08-26, both spellings, absent directory.
+    ".worktrees/",
     ".secrets/",
     ".temp/",
     ".venv/",

@@ -997,7 +997,8 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
     return false;
 }
 
-// ── A MACRO THAT SHADOWS A SYMBOL WITHOUT REFERENCING IT IS A DEFECT ─────────
+// ── AN OBJECT-LIKE MACRO THAT SHADOWS A SYMBOL WITHOUT REFERENCING IT IS A
+// ── DEFECT ──────────────────────────────────────────────────────────────────
 //
 // MEASURED behaviour before this guard: such a descriptor compiled rc=0, emitted no
 // diagnostic, the macro silently SHADOWED the symbol at preprocess time, and the
@@ -1005,23 +1006,64 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
 // import of a name nothing could ever call. Loud at LOAD is the only place this can
 // be caught: by the time a TU is compiled the macro has already won.
 //
+// ★★ …BUT "NOTHING CAN EVER CALL THE SYMBOL" IS ONLY TRUE OF AN **OBJECT-LIKE**
+// MACRO, AND THIS GUARD SHIPPED APPLYING IT TO BOTH FORMS. That is
+//
+//   D-FFI-MACRO-SHADOWING-GUARD-IGNORES-C-7-1-4-FUNCTION-ADDRESSABILITY
+//
+// A FUNCTION-LIKE macro is expanded ONLY where its name is followed by `(`
+// (C 6.10.3p10), so C 7.1.4p2 guarantees the underlying function stays reachable
+// and says so in as many words: parenthesising the name suppresses the macro, and
+// "for the same syntactic reason, it is permitted to take the address of a library
+// function even if it is also defined as a macro". The symbol is therefore a LIVE
+// import, not a dead one, and refusing the descriptor made a STANDARD-MANDATED
+// shape undeclarable.
+//
+// ✔MEASURED 2026-08-27 (P41), gcc 13.3.0 and clang 18.1.3 SEPARATELY, by compiling
+// each TU and asking `nm -u` whether the shadowed name is UNDEFINED in the object —
+// i.e. whether the reference reached the SYMBOL. Both agreed on every row:
+//
+//   spelling, with `name` also #define'd …     as fn-like     as object-like
+//   `name(1)`  (the plain call)                macro ate it   macro ate it
+//   `&name`                                    REACHES SYM    macro ate it
+//   `(name)(1)`                                REACHES SYM    macro ate it
+//   bare designator `name`                     REACHES SYM    macro ate it
+//   `&name` after `#undef name`                REACHES SYM    REACHES SYM
+//
+// Controls: no macro at all ⇒ REACHES SYM; fn-like macro + plain call ⇒ eaten. So
+// the instrument discriminates, and the split is FUNCTION-LIKE vs OBJECT-LIKE.
+//
+// ⚠ `#undef` FREES BOTH FORMS AND SO DISCRIMINATES NOTHING (last row). Excusing a
+// shadowing because the user COULD tear down the header's own definition would
+// excuse every shadowing there is, and a guard weakened every time it fires asserts
+// nothing. The property that decides reachability is what a TU can reach by merely
+// INCLUDING the header, and that is exactly function-like-ness.
+//
 // ★★ "SAME NAME + OVERLAPPING FORMAT = ERROR" IS A FALSE RULE. DO NOT SHIP IT.
-// It would red 17 in-tree rows that are STANDARD-MANDATED and BENIGN: C 7.25
+// It would red 21 in-tree rows that are STANDARD-MANDATED and BENIGN (17 when this
+// paragraph was first written; ✔re-measured 2026-08-27, see below): C 7.25
 // <tgmath.h> defines `acos` (and 16 siblings) as a type-generic MACRO over the very
 // `acos` symbol <math.h> declares, and the replacement
 // `_Generic((x), float: acosf(...), default: acos((x)))` REFERENCES the shadowed
 // name — so by C 6.10.3.4p2 (a replacement list is not re-scanned for the macro
 // being replaced) the symbol IS the macro's own callee and the import is correct.
 //
-// ⇒ THE DISCRIMINATOR IS THE REFERENCE, NOT THE NAME. A defect is:
-//      formats overlap  AND  NO body of the macro references the shadowed name.
-// MEASURED clean tree-wide at the time this landed: 28 same-name macro/symbol
-// pairs, 17 overlapping-and-referencing (the tgmath family) and 11 that do NOT
-// reference but live on DISJOINT formats — pe `time`→`_time64` while the `time`
-// SYMBOL is gated ["elf","macho"], pe `setjmp`→`_setjmp`, `stdin`/`stdout`/`stderr`,
-// `atexit`, `strtoll`, `fstat`, … Those 11 are the DESIGN: the macro exists on the
-// format precisely BECAUSE the symbol is absent there. Zero defects; this guard is a
-// LOCK on a clean corpus, not a repair of a broken one.
+// ⇒ THE DISCRIMINATORS ARE THE **FORM** AND THE **REFERENCE**, NEVER THE NAME.
+// A defect is ALL THREE of:
+//      the body is OBJECT-LIKE (no `params` — nothing suppresses its expansion)
+//  AND formats overlap
+//  AND the body does NOT reference the shadowed name.
+// ✔RE-MEASURED 2026-08-27 (P41) over `src/dss-config/shippedLibs/*.json`, counting
+// (macro BODY × symbol row) pairs of the same name: 31 pairs — 21 overlapping and
+// REFERENCING (the tgmath family), 10 non-referencing but on DISJOINT formats (2
+// function-like, 8 object-like), and **0 refused**, under the old rule and the new
+// one alike. Those 10 are the DESIGN: the macro exists on the format precisely
+// BECAUSE the symbol is absent there — pe `time`→`_time64` while the `time` SYMBOL
+// is gated ["elf","macho"], pe `setjmp`→`_setjmp`, `stdin`/`stdout`/`stderr`,
+// `atexit`, `strtoll`, `fstat`, … So this guard is a LOCK on a clean corpus, not a
+// repair of a broken one, and the P41 narrowing changed no in-tree verdict: it only
+// stopped refusing a shape the corpus had not yet needed to declare
+// (C23 <stdbit.h>'s `stdc_*` — D-FULLC-STDBIT-ADDRESSABLE-FN).
 //
 // ⚠ NOTE THE DIVERGENCE FROM THE PREDEFINED-MACRO COLLISION SCAN
 // (`preprocessor.cpp`), which deliberately checks collisions BEFORE the format
@@ -1066,23 +1108,36 @@ void checkMacroSymbolShadowing(json const& doc, ShippedLibDescriptor const& out,
     // rather than per ENTRY is what makes a MIXED macro — pe arm references the
     // name, elf arm does not — a defect ON ELF instead of being excused by its pe
     // sibling. An "any body references it" test would hide exactly that.
+    // ★ `functionLike` IS PER BODY, EXACTLY AS `formats` IS, and it is read from the
+    // SAME key `decodeShippedMacros` reads it from: `params` ABSENT = object-like,
+    // PRESENT (even `[]`) = function-like. Reading the descriptor's own declared
+    // form is what keeps the two in lock-step; a second notion of "is this a
+    // function-like macro" would be free to drift from the one that actually gets
+    // spliced. And per-body it must be, because `decodeShippedMacros` refuses a
+    // macro that carries BOTH a body key and `variants` — so a variants macro's
+    // `params` can only ever live on the VARIANT, and one arm may be function-like
+    // while its sibling is not.
     struct MacroBody {
-        std::vector<std::string> formats;   // EMPTY ⇒ every format
+        std::vector<std::string> formats;      // EMPTY ⇒ every format
         std::string              replacement;
+        bool                     functionLike = false;
     };
     auto bodiesOf = [](json const& m) {
         std::vector<MacroBody> bodies;
         auto const vIt = m.find("variants");
         if (vIt == m.end() || !vIt->is_array()) {
             auto const rIt = m.find("replacement");
-            bodies.push_back(MacroBody{{}, rIt != m.end() && rIt->is_string()
-                                               ? rIt->get<std::string>()
-                                               : std::string{}});
+            bodies.push_back(MacroBody{{},
+                                       rIt != m.end() && rIt->is_string()
+                                           ? rIt->get<std::string>()
+                                           : std::string{},
+                                       m.contains("params")});
             return bodies;
         }
         for (auto const& v : *vIt) {
             if (!v.is_object()) continue;
             MacroBody b;
+            b.functionLike = v.contains("params");
             auto const rIt = v.find("replacement");
             if (rIt != v.end() && rIt->is_string())
                 b.replacement = rIt->get<std::string>();
@@ -1105,6 +1160,12 @@ void checkMacroSymbolShadowing(json const& doc, ShippedLibDescriptor const& out,
         auto const name = nIt->get<std::string>();
         bool reported = false;
         for (auto const& body : bodiesOf(m)) {
+            // C 6.10.3p10 + C 7.1.4p2 — a function-like macro is expanded ONLY where
+            // its name is followed by `(`, so `&name` and `(name)(x)` reach the
+            // SYMBOL and the eager import is live. Measured identically in gcc and
+            // clang; see this function's header.
+            // D-FFI-MACRO-SHADOWING-GUARD-IGNORES-C-7-1-4-FUNCTION-ADDRESSABILITY
+            if (body.functionLike) continue;
             // C 6.10.3.4p2 — a replacement list is not re-scanned for the macro
             // being replaced, so a body that NAMES the symbol calls it.
             if (referencesIdentifierToken(body.replacement, name)) continue;
@@ -1124,17 +1185,24 @@ void checkMacroSymbolShadowing(json const& doc, ShippedLibDescriptor const& out,
         if (reported) {
             emitMalformed(reporter,
                 std::string{"shipped-lib descriptor '"} + pathStr + "' macros["
-                + std::to_string(mi) + "]: the macro '" + name
+                + std::to_string(mi) + "]: the OBJECT-LIKE macro '" + name
                 + "' SHADOWS this descriptor's symbol row of the same name on a "
                   "format they SHARE, and its replacement does not reference '"
                 + name
-                + "' — so the macro wins at preprocess time, nothing can ever call "
-                  "the symbol, and the symbol is still eagerly imported (a dead "
-                  "import in every binary). Either reference the name in the "
-                  "replacement (the C 7.25 <tgmath.h> pattern, which is why a "
-                  "same-name macro is NOT itself an error), or restrict the two to "
-                  "DISJOINT 'availableObjectFormats' (the pe 'time'->'_time64' "
-                  "pattern, where the macro exists because the symbol does not)");
+                + "' — an object-like macro is expanded at EVERY occurrence of the "
+                  "name, so no spelling reaches the symbol ('&"
+                + name + "' and '(" + name
+                + ")(...)' are eaten too), yet the symbol is still eagerly imported "
+                  "(a dead import in every binary). Three ways out: (a) give the "
+                  "macro 'params' if the symbol is meant to stay callable — a "
+                  "FUNCTION-LIKE macro expands only before '(', so C 7.1.4p2 keeps "
+                  "'&" + name + "' and '(" + name
+                + ")(...)' bound to the symbol and this guard does not apply; "
+                  "(b) reference the name in the replacement (the C 7.25 <tgmath.h> "
+                  "pattern, which is why a same-name macro is NOT itself an error); "
+                  "or (c) restrict the two to DISJOINT 'availableObjectFormats' (the "
+                  "pe 'time'->'_time64' pattern, where the macro exists because the "
+                  "symbol does not)");
             // COLLECT-ALL across macro entries (the house style for per-entry
             // descriptor validation): a corpus with three such macros should name
             // all three, not make the author re-run the build twice.
@@ -2770,9 +2838,11 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // macro selector).
     decodeShippedMacros(doc, path.generic_string(), reporter, out.macros, activeFormat);
 
-    // (7.5) A macro that SHADOWS one of this descriptor's own symbol rows on a
-    // format they share, WITHOUT referencing it, is a defect — see
-    // `checkMacroSymbolShadowing` for why "same name" alone is a false rule and why
+    // (7.5) An OBJECT-LIKE macro that SHADOWS one of this descriptor's own symbol
+    // rows on a format they share, WITHOUT referencing it, is a defect — see
+    // `checkMacroSymbolShadowing` for why "same name" alone is a false rule, why a
+    // FUNCTION-LIKE macro is not a defect at all (C 7.1.4p2 keeps the symbol
+    // addressable — the shape this guard used to refuse), and why
     // this reads the raw JSON instead of the decoded `out.macros`. Runs here, after
     // both surfaces exist, and its diagnostics fail the read through the errBefore
     // delta below (never a partial surface).

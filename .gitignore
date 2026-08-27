@@ -176,6 +176,41 @@ __pycache__/
 # corrupted somebody else's vendored tree to silence a guard about our own.
 .claude/worktrees/
 
+# ★★ THE SANCTIONED HOME FOR LANE WORKTREES — operator ruling 2026-08-26:
+# "I want the worktrees implementation to be inside the project root, .worktrees
+# directory (where 100% of it's internal content ignored by .gitignore). This way
+# we stop contaminating builds outside repository bounds."
+#
+# Before this, lanes took worktrees at absolute paths OUTSIDE the repo (C:/dssp40k,
+# C:/dssp40l, …). That kept the tree clean but scattered full checkouts and their
+# build dirs across the filesystem, where nothing owns them and no guard can see
+# them. Inside the root they are enumerable, and `git worktree list` plus
+# `git worktree prune` become the inventory instead of somebody's memory.
+#
+# ★ THE ANCHORING IS NOT STYLE. A bare `worktrees/` would match any directory of
+# that name at any depth — including a future `examples/**/worktrees/` fixture —
+# and the repo has already paid once for an unanchored rule (`build*` silently
+# swallowed `src/program/build_scripts.cpp` and a gate leg configured against a
+# tree missing a changed `.cpp`). The leading `/` keeps this to the one directory
+# it is about.
+#
+# ⚠ THIS LINE IS WHAT KEEPS LANE CHECKOUTS OFF EVERY GATE HOST, and that is a
+# REQUIREMENT, not a nicety — operator, same day: "worktrees MUST be ignored by
+# ALL host copies to run legs". Since 2026-08-26 the carriages derive their
+# exclude list from git (`scripts/carriage-excludes/`), so this rule — and only
+# this rule — is what stops N full repo copies riding to macOS and the arm64 VPS
+# on every push. ✔MEASURED: the same accident under `.claude/worktrees/` put
+# 9,638 files on the macOS host, and the examples runner globs `examples/<lang>/*`,
+# so a gate host holding one can run somebody's uncommitted corpus and report the
+# result as the cycle's. `.worktrees/` is therefore ALSO pinned in that script's
+# `MUST_NEVER_TRAVEL` floor, which re-asks git and REFUSES the carriage if this
+# line ever disappears — the rule is asserted on every leg, not trusted.
+#
+# ⚠ `git clean -fd` (what `scripts/leg-tree/` restore runs) does NOT delete
+# ignored paths, so a live worktree survives a leg restore. `-fdx` WOULD destroy
+# it mid-build; the dss-cycle skill forbids `-fdx` for exactly this reason.
+/.worktrees/
+
 # Agent-manager tooling and third-party dependency trees. THE SAME SHAPE AS THE
 # RULE ABOVE, and it cost the same way: `.kilo/` was covered only by
 # `.git/info/exclude` plus a `.kilo/.gitignore` the tool writes itself, both

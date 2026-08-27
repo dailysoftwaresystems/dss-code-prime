@@ -1,0 +1,17 @@
+{
+  "$comment": "D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED: C 6.7.6p1 permits redundant parentheses around a declarator, so `int (add)(int a, int b) { … }` defines the FUNCTION `add` — the standard glibc/musl idiom for defining a name that is also a function-like macro. MEASURED accepted-and-run by gcc 13.3.0 AND clang 18.1.3; DSS refused it three ways from one cause (the definition -> S0018 'must be a function declarator'; the parenthesized PROTOTYPE -> never recognized as a prototype, so S0002 + S0018 at the definition; the definition's own PARAMETERS -> scoped as a function pointer's, so S0001 in the body). Exercises the general form: nested parentheses, a pointer return, a prototype/definition pair, the macro idiom, and a function returning a function pointer where TWO fn-suffixes sit over ONE name (only the inner one declares it). Value-divergent: 17 + 21 + 9 - 300/60 -> exit 42. RED-ON-DISABLE: remove the parenthesis-ascent arm from `innermostNameDerivation` (semantic_analyzer.cpp) — putting the walk back to a single-level look at the name's own direct declarator — and the program no longer COMPILES (compile failure, not exit 42). The release arm re-witnesses it under the shipped pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

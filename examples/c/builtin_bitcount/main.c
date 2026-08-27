@@ -6,10 +6,16 @@
 // instruction where the target declares the mnemonic, else a branchless SWAR
 // bit-trick sequence — NOT an ordinary call/import (a compiler intrinsic is not a
 // symbol). Per target this arm witnesses:
-//   x86-64 : POPCNT / LZCNT / TZCNT           (all native)
-//   arm64  : SWAR popcount + native CLZ + RBIT-then-CLZ ctz
-// So the arm64-elf (qemu) arm is the RUNTIME closure for BOTH the SWAR popcount
-// fallback AND the native CLZ / RBIT+CLZ path in one run.
+//   x86-64 : POPCNT / LZCNT / TZCNT           (all native, one instruction each)
+//   arm64  : native CLZ + RBIT-then-CLZ ctz + a popcount realized as the
+//            four-step DECLARED SEQUENCE (D-FULLC-STDBIT-ARM64-CNT-POPCOUNT)
+// ⚠ THIS LINE USED TO SAY "SWAR popcount" AND IT WAS TRUE UNTIL 2026-08-26.
+// arm64 now declares a `popcount` row whose realization is a sequence, so this
+// arm no longer witnesses the SWAR at all. The SWAR is still REACHED by any
+// target declaring no `popcount` row, and is pinned from both sides by the
+// removal-direction mutants in tests/lir/test_mir_to_lir.cpp. A claim about
+// which path a target takes is a claim about the product, and leaving it stale
+// would make this comment contradict the compiler.
 //
 // Fold-resistant: each builtin runs inside a wrapper fn taking the value as an ARG
 // (SysV rdi / MS rcx), so on the BASELINE pipeline ConstFold never sees a literal;

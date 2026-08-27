@@ -173,6 +173,93 @@ std::optional<fs::path> pathFromFileUri(std::string_view uri) {
         reinterpret_cast<char8_t const*>(decoded.data()), decoded.size()));
 }
 
+// ── D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES ────────
+//
+// The EXACT INVERSE of `pathFromFileUri`, and it lives beside it for the reason
+// this repo keeps re-learning: two halves of one encoding, written apart, drift.
+//
+// ⚠ IT DID NOT EXIST IN `src/` AT ALL. Only `tests/lsp/lsp_test_helpers.hpp`
+// had one, so production had no way to NAME a file other than the one the
+// request came in on — which is precisely why `locationJson` hardcoded the
+// request's uri and a definition inside a header was reported as if it were in
+// the open document. A helper that exists only in the test tree is a helper the
+// product cannot use, and the test then measures its own copy.
+//
+// The three shapes that have to round-trip, all covered by
+// `WorkspaceProject.FileUriRoundTrip`:
+//   * percent-encoding — every byte outside the RFC 3986 unreserved set is
+//     encoded, so a space or a `#` in a path cannot terminate the uri early;
+//   * WINDOWS DRIVE LETTERS — `C:/dir` is `file:///C:/dir`: the URI grammar's
+//     leading slash is added here and stripped there. `:` is deliberately NOT
+//     encoded, matching what every LSP client emits;
+//   * UNC — `//server/share` is `file://server/share`, so the authority is the
+//     server rather than empty. `pathFromFileUri` refuses a non-`localhost`
+//     authority, which is correct for INBOUND (a remote host is not a local
+//     directory) and is why a UNC path round-trips to a uri but not back.
+//     Stated, not silently asymmetric.
+//
+// A path is percent-encoded UTF-8 BY DEFINITION (RFC 3986 §2.5), so the bytes
+// come from `u8string()` — the narrow `string()` would emit ACP bytes on
+// Windows and produce mojibake in the editor, the mirror of the note above.
+std::string fileUriFromPath(std::string_view path) {
+    // Text in, uri out: the caller keeps no filesystem surface. See the header
+    // for why this overload exists (check-path-identity, and a caller that was
+    // building an fs::path only to hand it straight back here).
+    return fileUriFromPath(fs::path{std::string{path}});
+}
+
+std::string fileUriFromPath(fs::path const& path) {
+    const std::u8string u8 = path.generic_u8string();
+    std::string_view bytes(reinterpret_cast<char const*>(u8.data()), u8.size());
+
+    std::string out = "file://";
+    // UNC: `//server/share` — the server IS the authority, so the leading
+    // separator(s) are consumed by the `file://` prefix already emitted.
+    //
+    // ⚠ DETECTED FROM `root_name()`, NOT from the generic string, and that is a
+    // MEASURED correction rather than a preference. This first tested
+    // `bytes[0] == '/' && bytes[1] == '/'` and produced `file:///server/...`
+    // for `//server/share/x.c`: on this toolchain `generic_u8string()` renders
+    // the UNC root with a SINGLE leading slash, so the double slash the check
+    // was looking for is not there to find. `root_name()` is the API that
+    // actually models "this path has an authority", and it survives the
+    // normalisation.
+    const std::u8string rootName = path.root_name().u8string();
+    const bool unc = rootName.size() > 1
+                  && (rootName[0] == u8'/' || rootName[0] == u8'\\');
+    if (unc) {
+        // Skip however many leading separators this platform's rendering kept.
+        while (!bytes.empty() && (bytes.front() == '/' || bytes.front() == '\\')) {
+            bytes.remove_prefix(1);
+        }
+    } else if (bytes.empty() || bytes.front() != '/') {
+        // A drive-letter or relative path: the URI grammar wants an empty
+        // authority plus a root slash.
+        out += '/';
+    }
+
+    auto unreserved = [](unsigned char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+            || (c >= '0' && c <= '9')
+            || c == '-' || c == '.' || c == '_' || c == '~'
+            // Structural, and must NOT be encoded: `/` separates segments and
+            // `:` follows a Windows drive letter in the form clients send.
+            || c == '/' || c == ':';
+    };
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    for (char const ch : bytes) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (unreserved(c)) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
 WorkspacePreferenceResult resolveWorkspaceLanguagePreference(
     std::span<fs::path const> workspaceRoots) {
     if (workspaceRoots.empty()) {

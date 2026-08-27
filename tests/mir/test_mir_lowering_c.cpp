@@ -13977,3 +13977,141 @@ TEST(MirLoweringC, InlineAsmMarksEveryOutputParameterAddressable) {
         << "the two outputs must write DIFFERENT objects — both landing in one "
            "slot is a silent miscompile that still exits 42 for many templates";
 }
+
+// ★★ D-CSUBSET-ENUM-FNSIG-NULLPTR-CONDITIONS-SKIP-THE-TRUTHINESS-CHOKEPOINT
+//
+// THE CONSEQUENCE HALF, at the tier where the defect was OBSERVED. The HIR pins
+// (HirLoweringC.EnumConditionTakesTheTruthinessChokepointAtEverySite and its
+// FnSig/nullptr sibling) name the shape the front end owes; this one names what
+// the next tier must therefore see: EVERY CondBr terminator's condition operand
+// is Bool-typed, and the whole module verifies clean.
+//
+// ⚠ THE INVARIANT UNDER TEST IS NOT WEAKENED ANYWHERE — that is the point. An
+// enum / function-designator / `nullptr` condition used to arrive at `addCondBr`
+// carrying its SOURCE type and the verifier fired I_TerminatorTypeMismatch (
+// I_NullptrTypeInMir for nullptr) on legal C. Relaxing that check would have
+// swapped a loud refusal for a silent miscompile — branching on a raw enum word
+// or a function's address as if it were a predicate. The conversion was owed by
+// the front end, so this test asserts the verifier still PASSES rather than that
+// it no longer complains.
+//
+// RED-ON-DISABLE (REMOVE direction): revert any one arm of `coerceCondition`
+// (Enum / FnSig / NullptrT) and `L.mir.ok` is false, or the verifier reds — the
+// exact diagnostics this closes.
+TEST(MirLoweringC, ScalarFamilyConditionsLowerToABoolCondBr) {
+    auto L = lowerC(
+        "enum Color { NONE = 0, EVEN = 4 };\n"
+        "static int helper(int v) { return v + 1; }\n"
+        "int f(enum Color c) {\n"
+        "  int r = 0;\n"
+        "  if (c) r = 1;\n"
+        "  while (c) { r = 2; c = NONE; }\n"
+        "  for (; c; c = NONE) r = 3;\n"
+        "  r = c ? 4 : 5;\n"
+        "  r = (c && 1) ? 6 : 7;\n"
+        "  r = (c || 0) ? 8 : 9;\n"
+        "  _Bool b = c; r = b ? 10 : 11;\n"
+        "  if (helper) r = r + 1;\n"
+        "  r = helper ? r : 0;\n"
+        "  if (nullptr) r = r + 100;\n"
+        "  r = nullptr ? 0 : r;\n"
+        "  return r;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+
+    DiagnosticReporter vrep;
+    MirVerifier v{L.mir.mir};
+    EXPECT_TRUE(v.verify(vrep))
+        << "a scalar condition must verify clean: "
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+    for (auto const& d : vrep.all()) {
+        EXPECT_NE(d.code, DiagnosticCode::I_TerminatorTypeMismatch) << d.actual;
+        EXPECT_NE(d.code, DiagnosticCode::I_NullptrTypeInMir) << d.actual;
+    }
+
+    // The property itself, read off the terminators rather than inferred from a
+    // clean verifier run: every CondBr branches on a Bool.
+    Mir const& m = L.mir.mir;
+    auto const& ti = L.model.lattice().interner();
+    std::size_t condBrs = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const fn = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+            MirBlockId const b = m.funcBlockAt(fn, bi);
+            MirInstId const t = m.blockTerminator(b);
+            if (!t.valid() || m.instOpcode(t) != MirOpcode::CondBr) continue;
+            ++condBrs;
+            auto const ops = m.instOperands(t);
+            ASSERT_FALSE(ops.empty());
+            TypeId const ct = m.instType(ops[0]);
+            ASSERT_TRUE(ct.valid());
+            EXPECT_EQ(ti.kind(ct), TypeKind::Bool)
+                << "CondBr must branch on a Bool -- an Enum / FnSig / NullptrT "
+                   "condition reaching here raw is the defect this closes";
+        }
+    }
+    EXPECT_GE(condBrs, 6u)
+        << "the six controlling-expression sites must each have produced a "
+           "CondBr; a vacuous zero would make the Bool assertion assert nothing";
+}
+
+// ★★ D-CSUBSET-LOGICAL-NOT-ON-A-FLOAT-MINTS-A-BARE-FLOAT-CONST
+//
+// `!E` is `(0 == E)` (C 6.5.3.3p5), so a FLOAT operand is exactly as legal there
+// as in `if (f)`. It was not: this lowering minted the comparison zero as a bare
+// MIR float `Const`, which has no encoder path on a register machine, so `!f`,
+// `!d` and `!ld` were each refused with L_UnsupportedLoweringForOpcode — while
+// `if (f)` compiled, because the CONDITION path's zero comes from
+// `coerceCondition` and goes through the rodata promotion. gcc 13.3.0 and clang
+// 18.1.3 accept all three.
+//
+// The property pinned here is the SHAPE, not merely "it compiles": the float
+// comparison's second operand must be a `Load` (of a GlobalAddr into an
+// anonymous rodata global) and must NOT be a `Const`. Asserting only that the
+// module lowers would stay green if some later change reintroduced a bare Const
+// that happened to survive to MIR and died at LIR instead.
+//
+// RED-ON-DISABLE (REMOVE direction): put the bare `mir.addConst` back in the
+// `Not` arm's float branch and `zeroIsLoad` flips to false here, while the
+// corpus witness (examples/c/scalar_condition_conversions arms 15-16) stops
+// COMPILING at all.
+TEST(MirLoweringC, LogicalNotOnAFloatComparesAgainstAPromotedZeroNotABareConst) {
+    auto L = lowerC(
+        "int f(double d, float g) {\n"
+        "  int r = 0;\n"
+        "  if (!d) r = r + 1;\n"
+        "  if (!g) r = r + 2;\n"
+        "  return r;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto const cmps = collectOps(m, MirOpcode::FCmpOeq);
+    ASSERT_EQ(cmps.size(), 2u)
+        << "one ordered-equal compare per `!`, F64 and F32";
+    for (MirInstId const c : cmps) {
+        auto const ops = m.instOperands(c);
+        ASSERT_EQ(ops.size(), 2u);
+        MirOpcode const zeroOp = m.instOpcode(ops[1]);
+        EXPECT_EQ(zeroOp, MirOpcode::Load)
+            << "the float comparison zero must be LOADED from an anonymous "
+               "rodata global -- a bare float Const has no LIR encoder path and "
+               "dead-ends the whole function";
+        EXPECT_NE(zeroOp, MirOpcode::Const)
+            << "a bare float Const is exactly the defect this closes";
+    }
+    // The promotion mints one global per occurrence (no dedup — the string-path
+    // shape), so both zeros are backed by module globals rather than immediates.
+    EXPECT_GE(collectOps(m, MirOpcode::GlobalAddr).size(), 2u)
+        << "each promoted zero is reached through a GlobalAddr";
+}

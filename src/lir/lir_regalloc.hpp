@@ -43,6 +43,69 @@
 // the only legitimate consumers of. See `tryAllocate`'s docblock in the
 // .cpp for the full argument and why the ABI envelope does not move.
 //
+// ── REGISTER COALESCING (plan 22 OPT8) ──────────────────────────────
+//
+// ★★★ THE ALLOCATOR ALLOCATES **CLASSES OF COPY-RELATED VREGS**, NOT
+// INDIVIDUAL VREGS. Before allocation it partitions the function's
+// virtual registers with a union-find whose edges are COPIES, merging
+// two classes only when their live ranges do not interfere
+// (`lirRangesInterfere` — the ONE predicate, see `lir_liveness.hpp`).
+// Every member of a class receives the SAME physical register, so the
+// copy that related them becomes a register-to-register move onto
+// itself and `lir_peephole`'s rule R1 deletes it. The copy is removed
+// **at its source** — the allocator stops creating the difference —
+// rather than pattern-matched afterwards.
+//
+// **Two kinds of edge, both target VOCABULARY, neither a mnemonic:**
+//
+//   * an EXPLICIT copy — an instruction whose opcode IS the register
+//     class's declared move (`regClassOpOpcode(cls, RegClassOp::Move)`)
+//     at the register's FULL declared width, with one virtual-register
+//     operand and a virtual-register result of the same class. The
+//     opcode-identity + full-width pair is exactly R1's admission test,
+//     asked one tier earlier: `trunc`/`zext` print as `mov` and are NOT
+//     copies, and a NARROWER move writes bits it did not read.
+//   * an IMPLICIT copy — the (result, tied-operand) pair of an opcode
+//     declaring `requires2Address`. `legalizeTwoAddress` materializes
+//     `mov result, operands[tied]` iff the two differ AFTER allocation,
+//     so making them agree means the copy is never minted at all.
+//     ⓘ ✔MEASURED: nothing in the pipeline previously SOUGHT that
+//     agreement — the allocator merely stopped short of forbidding it
+//     (`tryAllocateExcluding` skips the tied index), so the tied
+//     "coalesce" happened only when the free list's LIFO order
+//     coincidentally produced it.
+//
+// **The three vetoes, and each closes a specific miscompile:**
+//
+//   1. INTERFERENCE — two ranges live at the same position may never
+//      share a register. Tested on the CLASS HULL, which is what the
+//      linear scan will actually hold, so the transform and the
+//      allocator agree by construction rather than by argument.
+//   2. ANTI-AFFINITY — the result of a `requires2Address` instruction
+//      may never join the class of an UNTIED operand of that same
+//      instruction, even when their ranges are disjoint. Legalize's
+//      `mov result, operands[tied]` runs BEFORE the operation and would
+//      destroy that operand's value first: `add r, [r, r]` instead of
+//      `add r, [r, x]` (D-CSUBSET-BINOP-RIGHT-CLOBBER, the same hazard
+//      `tryAllocateExcluding` guards for unmerged vregs — merging is a
+//      route around that exclusion, so it needs its own veto).
+//   3. CLASS — a merge never crosses `LirRegClass`.
+//
+// **Pressure is provably NOT increased.** A coalescable copy's source
+// ends exactly where its destination begins (`s.end == d.start`: the
+// copy is a USE of the source, so the source's range reaches the copy;
+// if it reached PAST it the two would interfere and veto 1 fires), so a
+// merged hull is the two ranges glued at a point with NO hole. A class
+// therefore holds its register over exactly the union of the intervals
+// that needed one. This is why coalescing here needs no spill-cost
+// model to decide anything, and why OPT23 is not a prerequisite.
+//
+// **Spill-slot coalescing** rides the same predicate: a spilled class
+// reuses a stack slot whose previous occupant's hull has ended, within
+// the same register class. `numSpillSlots` is now the number of
+// DISTINCT slots (the frame's spill area size), not the number of
+// spilled values.
+//
 // **Reserved registers**: registers that appear in no calling-
 // convention saved/arg/return set (e.g. `rsp`, `rflags`) are filtered
 // out of the allocator's pool. Allocating `rsp` would clobber the
@@ -113,6 +176,12 @@ struct DSS_EXPORT LirRegAssignment {
 // in `reporter.errorCount()` (false iff this function emitted any
 // error-severity diagnostic). Schema-config errors short-circuit
 // allocation: the result carries empty `assignments` and `ok = false`.
+//
+// ⚠ THE "one slot per spilled vreg — coalescing not yet implemented"
+// THAT USED TO STAND ON `numSpillSlots` IS GONE BECAUSE THE THING IT
+// DESCRIBED IS BUILT (plan 22 OPT8). Both coalescers ship: copy-related
+// vregs share a REGISTER, and non-interfering spilled classes share a
+// SLOT. `numSpillSlots` counts DISTINCT slots.
 struct DSS_EXPORT LirFuncAllocation {
     LirFuncId                     fn{};
     // Stamp of the source function's `symbol` field at allocation
@@ -126,6 +195,16 @@ struct DSS_EXPORT LirFuncAllocation {
     std::vector<LirRegAssignment> assignments;
     std::uint32_t                 numSpillSlots = 0;
     bool                          ok            = true;
+    // ── OPT8 coalescing counters. Read by the pass's differential tests
+    // and by nothing else — they are OBSERVATIONS, never inputs to a
+    // decision, so a counter that drifts cannot change what is emitted.
+    // `coalescedCopies` counts UNION operations performed (each one is a
+    // copy the pipeline will not have to emit or delete);
+    // `coalescedSpillSlots` counts spilled classes that REUSED an
+    // existing slot instead of minting one (each is `slotSize` bytes of
+    // frame the function does not reserve).
+    std::uint32_t                 coalescedCopies     = 0;
+    std::uint32_t                 coalescedSpillSlots = 0;
     // Cached index of the calling convention used to drive this
     // allocation. The downstream prologue/epilogue emitter reads this
     // so it doesn't re-derive the cc choice. Hazard: reordering
@@ -148,6 +227,42 @@ struct DSS_EXPORT LirFuncAllocation {
     [[nodiscard]] LirRegAssignment const*
     forVReg(std::uint32_t vregId) const noexcept;
 };
+
+// ── THE INDEPENDENT COALESCING AUDITOR (plan 22 OPT8) ───────────────
+//
+// ★★★ A COALESCER THAT MERGES TWO INTERFERING LIVE RANGES PUTS TWO LIVE
+// VALUES IN ONE REGISTER. Nothing downstream can notice: the LIR is
+// well-formed, the verifier's post-regalloc rules pass (no virtual
+// registers, valid spill slots), the assembler encodes clean bytes, and
+// the program computes the wrong answer. It is the worst failure class
+// this project recognizes, so the check for it must not be able to
+// inherit the transform's own belief.
+//
+// `findAllocationConflict` re-derives the question from ONLY the
+// liveness side-table and the finished assignment table. It never sees
+// the union-find, the copy edges, or the anti-affinity list — it walks
+// the per-vreg assignments, groups them by the physical ordinal (or the
+// spill slot) they landed on, and asks `lirRangesInterfere` about every
+// pair inside a group. Two vregs sharing a register with overlapping
+// ranges is a conflict WHATEVER decided it, which is why this also
+// guards the pre-OPT8 linear scan and the eviction path, not merely the
+// merges.
+//
+// ⓘ It reports the FIRST conflict it finds and stops — the caller's
+// response is to abort the compile, so an exhaustive list buys nothing
+// and the scan is quadratic in the group size.
+//
+// Returns `std::nullopt` when the allocation is conflict-free.
+struct DSS_EXPORT LirAllocationConflict {
+    LirReg        a{};                 // the two virtual registers that
+    LirReg        b{};                 // were handed the same resource
+    std::uint32_t sharedResource = 0;  // phys ordinal, or spill-slot v
+    bool          isSpillSlot    = false;
+};
+
+[[nodiscard]] DSS_EXPORT std::optional<LirAllocationConflict>
+findAllocationConflict(LirFuncLiveness const&   flow,
+                       LirFuncAllocation const& alloc) noexcept;
 
 // Module-level wrapper. Per-function entries in the same order as
 // `lir.funcAt(i)`. `ok()` is a derived property — true iff every

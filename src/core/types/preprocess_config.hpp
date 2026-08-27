@@ -341,6 +341,125 @@ struct DSS_EXPORT ImpliedSurface {
 // is what reads correctly in the claims-nothing case, and that case is the one
 // that has to be unmistakable.
 
+// ── D-PP-PREDEFINE-REDEFINITION-PARTITION ───────────────────────────────────
+//
+// A program `#define`s or `#undef`s a name this implementation predefined.
+// ★★ IT ALWAYS TAKES EFFECT. This field selects only whether it is DIAGNOSED.
+//
+// ★★★ THE FIRST CUT OF THIS FIELD MADE THE OPPOSITE RULING, AND THE REASON IT
+// WAS WRONG IS THE MOST REUSABLE THING HERE. It read C23 6.10.10.1p2 — "None of
+// the following macro names in this subclause nor the identifiers defined,
+// __has_c_attribute, __has_include, or __has_embed shall be the subject of a
+// #define or a #undef preprocessing directive" — as a CONSTRAINT, and therefore
+// kept `#define __STDC__ 9` a hard error. ✔RE-MEASURED against N3220: 6.10.10
+// has NO `Constraints` heading (6.10.10.1 is "General"), while 6.10.5 Macro
+// replacement DOES. C23 4p2 then decides it: "If a 'shall' or 'shall not'
+// requirement that appears outside of a constraint or runtime-constraint is
+// violated, the behavior is undefined" — and J.2 lists exactly that as
+// undefined behaviour. UB requires NO diagnostic (5.1.1.3 demands one only for
+// a syntax rule or CONSTRAINT violation).
+// ⇒ The standard is STRICTER about redefining an ordinary macro (6.10.5p2, a
+// real constraint) than about redefining `__STDC__` (UB). The intuition is
+// exactly inverted, which is why reading `shall not` as `constraint` without
+// checking the enclosing subclause produced a confident, wrong refusal.
+//
+// ✔MEASURED 2026-08-26 — gcc 13.3.0 and clang 18.1.3, probed SEPARATELY on
+// Ubuntu, `-Wall -std=c17`: 36 names × bare `#undef`, plus {bare `#define`,
+// `#undef`-then-`#define`, `#undef`} × 26 names × {in-source, `-D`/`-U`}, plus
+// the runtime effect. Both references agree on every cell:
+//
+//   class                  | bare #define | #undef then #define | bare #undef
+//   -----------------------+--------------+---------------------+------------
+//   6.10.10 / engine-derived| warn, rc=0  | warn(from the undef) | warn, rc=0
+//   implementation-supplied | warn, rc=0  | SILENT               | SILENT
+//   `defined`               | ERROR, rc=1 | ERROR                | ERROR
+//
+// ★ AND IT TAKES EFFECT IN EVERY CELL. `#undef __LINE__` + `#define __LINE__
+// 4242` prints 4242; `#undef __FILE__` + `#define __FILE__ "replaced"` prints
+// replaced; `#undef __STDC__` + `#define __STDC__ 77` prints 77; after a bare
+// `#undef`, `#ifdef __LINE__` / `__STDC__` / `__COUNTER__` are all FALSE and
+// `int __LINE__ = 9;` compiles and returns 9. On BOTH references.
+// ⇒ DSS must ACCEPT and APPLY all of it. `defined` is the only genuine refusal,
+// and it is genuinely different in kind: 6.10.2 makes `defined` an OPERATOR
+// inside `#if`, so admitting it as a macro name makes conditional inclusion
+// unparseable. That refusal lives in the conditional-inclusion-operator guard,
+// not here.
+//
+// ★★ THE DISCRIMINATOR IS MEASURED, NOT ASSUMED — and the obvious guess fails.
+// `__SIZE_TYPE__`, `__CHAR_BIT__`, `__INT_MAX__`, `__VERSION__`,
+// `__CHAR16_TYPE__`, `__SIZEOF_INT__` are all gcc BUILTINS in the reserved
+// identifier namespace, and all six are SILENT — so "is it a compiler builtin"
+// and "is it reserved-looking" are both wrong. The 36-name sweep splits exactly
+// on: the name is listed by ISO 6.10.10 itself, OR the preprocessor DERIVES its
+// value per use (`__FILE__ __LINE__ __DATE__ __TIME__ __COUNTER__
+// __BASE_FILE__ __INCLUDE_LEVEL__ __TIMESTAMP__`), OR it is a
+// conditional-inclusion operator. Nothing else warns.
+// ⓘ `__STDC_IEC_559__` reads warn/silent across the two only because gcc
+// defines it and clang does not — a name a compiler never defined has nothing
+// to undefine. Not a counterexample; the same rule over different inventories.
+//
+// ⚠ THE TAG IS MANDATORY IN JSON — no default, no null, same reasoning as
+// `impliedSurface`. Neither default is safe: defaulting to the warn class makes
+// DSS noisy about the next `__ARM_NEON` somebody adds; defaulting to ordinary
+// drops the diagnostic on the next `__STDC_ISO_10646__`. Both are silent
+// failures pointing opposite ways, so the question is asked out loud per row.
+// ⓘ It is DECLARED per entry rather than derived in the engine on purpose. A
+// derivation that is 90% right is worse than data: the engine would have to
+// know which names ISO 6.10.10 lists, and a name list in `src/` is the one
+// thing this architecture forbids.
+enum class PredefinedMacroRedefinition {
+    // ISO C 6.10.10 itself lists this name (6.10.10.2 mandatory / .3
+    // environment / .4 conditional feature). A `#define` or `#undef` is
+    // DIAGNOSED (warning) and then APPLIED — matching both references, and
+    // permitted because 6.10.10.1p2 is UB rather than a constraint.
+    WarnIsoMacro,
+    // The preprocessor DERIVES this macro's value per use — a `line`/`file`/
+    // `date`/`time`/`counter` kind — so it has no static replacement list.
+    // Also diagnosed-then-applied. ✔MEASURED: `__COUNTER__` is a pure extension
+    // ISO never mentions, and gcc AND clang both diagnose `#undef __COUNTER__`
+    // exactly as they diagnose `#undef __LINE__`. So this arm is not a DSS
+    // invention — the derived-value property is half of the references' own
+    // discriminator, and it is the half that catches `__COUNTER__`.
+    WarnDerivedMacro,
+    // An implementation-supplied extension that is neither. It is an ORDINARY
+    // macro this implementation happens to pre-seed: `#undef` is silent, and a
+    // `#define` is governed only by the ordinary 6.10.5p2 policy (see
+    // D-PP-INCOMPATIBLE-REDEFINITION-IS-FATAL, which already warns-and-takes-
+    // the-new-definition and was itself measured against these references).
+    Ordinary,
+};
+
+inline constexpr EnumNameTable<PredefinedMacroRedefinition, 3>
+    kPredefinedMacroRedefinitionTable{{{
+        { PredefinedMacroRedefinition::WarnIsoMacro,     "warn-iso-macro"     },
+        { PredefinedMacroRedefinition::WarnDerivedMacro, "warn-derived-macro" },
+        { PredefinedMacroRedefinition::Ordinary,         "ordinary"           },
+    }}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kPredefinedMacroRedefinitionTable);
+
+[[nodiscard]] constexpr std::string_view
+predefinedMacroRedefinitionName(PredefinedMacroRedefinition r) noexcept {
+    return kPredefinedMacroRedefinitionTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<PredefinedMacroRedefinition>
+predefinedMacroRedefinitionFromName(std::string_view s) noexcept {
+    return kPredefinedMacroRedefinitionTable.fromName(s);
+}
+
+// THE ONE PREDICATE the engine asks. Defined as the COMPLEMENT of `Ordinary`
+// rather than as an enumeration of the warn verbs, so a fourth warn reason
+// added tomorrow is diagnosed by default instead of silently falling through to
+// "say nothing" — the same polarity the anchor-balance gate uses for "open
+// unless explicitly closed", and for the same reason.
+[[nodiscard]] constexpr bool
+predefinedNameIsDiagnosedOnChange(PredefinedMacroRedefinition r) noexcept {
+    return r != PredefinedMacroRedefinition::Ordinary;
+}
+
 // FC15b: one config-declared predefined macro (C 6.10.8). `name` is the macro
 // identifier (matched by TEXT, like the directive words); `kind` selects the
 // materialization behavior; `value` is the literal replacement spelling and is
@@ -388,6 +507,15 @@ struct DSS_EXPORT PredefinedMacroDef {
     // The load guarantees this is populated and internally consistent for every
     // row that reaches this struct: a malformed row never lands.
     ImpliedSurface impliedSurface;
+
+    // D-PP-PREDEFINE-REDEFINITION-PARTITION: MANDATORY IN JSON on every row (see
+    // the enum above). The C++ default is the DIAGNOSED half deliberately: a
+    // construction site that has not been taught about the field gets a
+    // diagnostic rather than silence, and a spurious warning is a visible
+    // failure while a missing one is not. The JSON loader never relies on it —
+    // a row without the key fails to load.
+    PredefinedMacroRedefinition programRedefinition =
+        PredefinedMacroRedefinition::WarnIsoMacro;
 
     // PROVENANCE — the JSON POINTER of this entry inside its declaring document
     // (e.g. "/preprocess/predefinedMacros/7"), set by the shared entry parser.

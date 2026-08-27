@@ -554,6 +554,24 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/scripts/check-scripts-index/check-scripts-index.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    # D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES — the
+    # ANTI-REGRESSION DEVICE, and the reason that row can be closed rather than
+    # merely fixed.
+    # ★ The defect was never one wrong line: the LSP layer named a BUFFER
+    # nowhere while three coordinate spaces were live, so every handler could
+    # reach for `tree.source()` and interpret a document position in
+    # SYNTHESIZED coordinates. Repairing the five red call sites would have left
+    # the next channel open — the registry records this class three times
+    # already. `dss::lsp::DocumentCoordinates` is the type that makes the wrong
+    # spelling unavailable; THIS is what makes it unreachable.
+    # ⚠ A rule only a reader enforces is the hole this class keeps coming back
+    # through, which is why it is a ctest entry and not a convention.
+    add_test(
+        NAME lsp_coordinate_ownership_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-lsp-coordinates/check-lsp-coordinates.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     # Multi-host carriage gate (2026-08-24 -
     # D-GATE-NO-CTEST-ENTRY-SEES-THE-MULTI-HOST-CARRIAGE-SCRIPTS).
     # ★★ THE THING THIS ENTRY EXISTS FOR IS THAT NOTHING ELSE IN THIS SUITE READS
