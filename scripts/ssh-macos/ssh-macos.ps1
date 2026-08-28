@@ -33,6 +33,9 @@ param(
     [string]  $HostName,
     [string]  $UserName,
     [string]  $KeyPath,
+    # Prepended to the remote PATH for every payload. See the resolve block below
+    # and the long note in the .sh twin; '' disables the repair entirely.
+    [string]  $PathPrefix,
     [switch]  $StrictHostKey,
     # `-PushSource <local-dir> -PushDest <remote-dir>` -- the tree transport. See the
     # block near the bottom of this file for why this, and not an `-Rsync` twin.
@@ -74,6 +77,31 @@ $conf = Import-DssSecrets (Join-Path $PSScriptRoot '..\..\.secrets\macos.env')
 if (-not $HostName) { $HostName = if ($env:DSS_MACOS_HOST) { $env:DSS_MACOS_HOST } else { $conf['DSS_MACOS_HOST'] } }
 if (-not $UserName) { $UserName = if ($env:DSS_MACOS_USER) { $env:DSS_MACOS_USER } else { $conf['DSS_MACOS_USER'] } }
 if (-not $KeyPath)  { $KeyPath  = if ($env:DSS_MACOS_KEY)  { $env:DSS_MACOS_KEY }  else { $conf['DSS_MACOS_KEY'] } }
+
+# THE REMOTE PATH IS REPAIRED BEFORE ANY PAYLOAD RUNS --
+# D-TOOLS-SSH-MACOS-NONINTERACTIVE-PATH-IS-CLOBBERED-BY-EMSDK.
+# Read the long note in the .sh twin: this host's emsdk shell hook REPLACES PATH for a
+# NON-INTERACTIVE session and drops /opt/homebrew/bin and /usr/local/bin, so
+# `command -v cmake` answers MISSING while the binary is sitting there. The wrong answer
+# is a FALSE NEGATIVE, which silently shrinks what the project believes it can do.
+# A login shell is the arm NOT taken: this host's profile is what eats a script piped to
+# `bash -s`, so repairing PATH with it trades a false negative for a silent truncation.
+# `$PATH` is single-quoted so the FAR SIDE expands it -- expanding here would ship this
+# Windows box's PATH to macOS. `export ...;` is a STATEMENT, not an assignment prefix,
+# because ssh hands the payload to the remote shell as ONE string: `PATH=x cd d && make`
+# would run `make` with the broken PATH, and the export form is also inherited by
+# `bash -s` without touching its stdin.
+# `+set` semantics, NOT `-not $x` -- an EMPTY value is the caller's DISABLE switch and
+# must survive. `-not ''` is TRUE in PowerShell exactly as `${x:-d}` substitutes on empty
+# in sh, so the naive form silently re-assigns the default over a deliberate disable and
+# turns a CONTROL arm into a second treatment arm. Measured on the .sh twin; see the
+# set-ness note there. `$PSBoundParameters` distinguishes "passed empty" from "not passed".
+if (-not $PSBoundParameters.ContainsKey('PathPrefix')) {
+    $PathPrefix = if ($null -ne $env:DSS_MACOS_PATH_PREFIX) { $env:DSS_MACOS_PATH_PREFIX }
+                  elseif ($conf.ContainsKey('DSS_MACOS_PATH_PREFIX')) { $conf['DSS_MACOS_PATH_PREFIX'] }
+                  else { '/opt/homebrew/bin:/usr/local/bin' }
+}
+$remotePathStmt = if ($PathPrefix) { 'export PATH="' + $PathPrefix + ':$PATH"; ' } else { '' }
 
 # ★★★ THE SCRIPT FINDS THE KEY. THE CALLER NEVER DOES ANYTHING MANUALLY.
 # Operator instruction 2026-08-17: "you must be able to get everything from the tool
@@ -209,7 +237,7 @@ if ($PushSource -or $PushDest) {
     # that could itself have arrived truncated. It also retires the mtime hazard that
     # forced the macOS leg to build clean: a pushed source can no longer land behind an
     # existing object and be silently skipped by ninja.
-    $sshArgs = $a + @("$UserName@$target", "mkdir -p $dst && cd $dst && mkdir -p build && touch build/.dss-push-stamp && sleep 1 && tar -x -m -f - && echo ${witness}:`$(pwd -P)")
+    $sshArgs = $a + @("$UserName@$target", $remotePathStmt, "mkdir -p $dst && cd $dst && mkdir -p build && touch build/.dss-push-stamp && sleep 1 && tar -x -m -f - && echo ${witness}:`$(pwd -P)")
     # ⚠⚠ `2>&1` MUST NOT APPEAR ON THE PRODUCING SIDE OF A BINARY PIPE. ✔MEASURED
     # 2026-08-25: with `tar ... 2>&1 | ssh ...`, tar's DIAGNOSTICS are merged into the
     # archive byte stream and the remote tar receives a corrupted file -- the push
@@ -314,7 +342,7 @@ _dirs=$(find . -type d -empty \
     -print -delete | wc -l | tr -d ' ')
 echo "PRUNED_DIRS=$_dirs"
 '@
-        $pruneArgs = $a + @("$UserName@$target", 'bash -s')
+        $pruneArgs = $a + @("$UserName@$target", $remotePathStmt, 'bash -s')
         $pOut = ("D=$dst`n" + $pruneBody + "`n") | & ssh @pruneArgs 2>&1
         # A witness, not an exit code -- a pipeline's status is its last stage's.
         if ($pOut -match 'PRUNED=') { $pOut | Select-Object -First 26 | Write-Host }
@@ -328,7 +356,12 @@ echo "PRUNED_DIRS=$_dirs"
 }
 
 $a += "$UserName@$target"
-if ($Command) { $a += $Command }
+# An EMPTY payload is an interactive session; prefixing it would turn a login into
+# a one-shot `export` and hand back a shell that exits immediately.
+if ($Command) {
+    if ($remotePathStmt) { $a += $remotePathStmt }
+    $a += $Command
+}
 
 & ssh @a
 exit $LASTEXITCODE

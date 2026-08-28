@@ -197,6 +197,12 @@ struct PPToken {
     std::string_view text;
 };
 
+// [[D-PP-PASTE-REJECTS-A-VALID-PREPROCESSING-NUMBER]]: this is PHASE 3, so the
+// scan forms PREPROCESSING tokens. `0y1` / `1e` / `1x` are single valid
+// pp-numbers (C 6.4.8) and come back as ONE malformed token rather than as a
+// number plus an identifier — which is what lets `##` answer "is the product a
+// single preprocessing token?" with the scanner's answer instead of a private
+// re-implementation of the number grammar.
 std::vector<PPToken> tokenizeToPP(
     std::shared_ptr<SourceBuffer> const& buffer,
     std::shared_ptr<GrammarSchema const> const& schema,
@@ -206,7 +212,8 @@ std::vector<PPToken> tokenizeToPP(
     // rather than re-supplied, which makes the two agree by construction
     // (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE). `DiagnosticBudget`
     // reads only the volume axes, so `rep`'s policy is NOT re-applied here.
-    Tokenizer tk{buffer, schema, DiagnosticBudget{rep.config()}};
+    Tokenizer tk{buffer, schema, DiagnosticBudget{rep.config()},
+                LexerModeId{}, Tokenizer::Phase::PreprocessingTokens};
     auto result = std::move(tk).tokenize();
     if (result.diagnostics) {
         for (auto const& d : result.diagnostics->all()) rep.report(d);
@@ -288,6 +295,63 @@ Token const& PreprocessResult::eofToken() const {
     return tokens.back();
 }
 
+namespace {
+
+// ── [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: THE ONE FORWARD REWRITE ──────
+//
+// Move ONE (buffer, span) off the synth buffer onto the file it belongs to.
+// Shared by both closures below so the position answer has a single
+// implementation and the diagnostic form cannot drift from the position form.
+//
+// ★★ THE VALIDATION, AND WHY IT IS AN ABORT AND NOT A CLAMP. `LineMap::originOf`
+// is total and every one of its answers is in bounds by construction, so
+// `Escaped` means a segment does not describe its own origin — a compiler bug,
+// not a source error, and nothing downstream can recover a correct position from
+// it. TF-C80 met the same class at the CONSUMER and clamped it; that removed a
+// heap over-read and an abort but left the diagnostic pointing at end-of-file,
+// which is how a WRONG position became an INVISIBLE one. So the producer refuses
+// instead, LOUD and named, exactly where the wrong number would otherwise be
+// minted. ⚠ This is NOT the past-end product span that used to reach here: that
+// case now has a real answer (`SynthOriginKind::Expansion`) and never lands on
+// this branch, which is what keeps the abort unreachable from user input.
+void remapOnePosition(LineMap const& map, BufferId synthId, BufferId& buffer,
+                      SourceSpan& span) {
+    if (!(buffer == synthId)) return;
+    const SynthOrigin s = map.originOf(span.start());
+    const SynthOrigin e = map.originOf(span.end());
+    if (s.kind == SynthOriginKind::Escaped
+        || e.kind == SynthOriginKind::Escaped) {
+        ppFatal("PreprocessResult::makeRemap: a synth offset resolved PAST THE "
+                "END of the origin buffer it was attributed to. Every arm of "
+                "LineMap::originOf is in bounds by construction, so a line-map "
+                "segment does not describe its own origin - this is a compiler "
+                "bug, not a source error. Refusing rather than clamping: a "
+                "clamped position renders plausibly at end-of-file and hides "
+                "the defect (see D-DIAG-RENDERER-PAST-END-SPAN-HEAP-OVERREAD)");
+    }
+    if (s.origin == nullptr) return;   // no position at all -> leave on synth.
+    buffer = s.origin->id();
+    if (s.kind == SynthOriginKind::Expansion) {
+        // ★ A PRODUCT SPAN HAS NO EXTENT IN ANY FILE, so it gets none. The
+        // expansion site is a POINT, and widening it to `[site, whatever the
+        // END offset resolved to)` underlines unrelated source: the exclusive
+        // end of a minted run is one past the run and belongs to no run, so it
+        // resolves as end-of-unit and the caret grew to swallow the rest of the
+        // line (✔MEASURED on `int CAT(0, x1) = 2;` — 15 carets under
+        // `STR(name) = 1;` before this). ✔MEASURED clang 18.1.3 renders exactly
+        // one `^` at the expansion site for this case.
+        span = SourceSpan::empty(s.offset);
+        return;
+    }
+    if (e.origin == s.origin && e.offset >= s.offset) {
+        span = SourceSpan::of(s.offset, e.offset);
+    } else {
+        span = SourceSpan::empty(s.offset);
+    }
+}
+
+} // namespace
+
 std::function<void(BufferId&, SourceSpan&)> PreprocessResult::makeRemap() const {
     BufferId const synthId = synthBuffer ? synthBuffer->id() : BufferId{};
     // Redirect EVERY synth-buffer diagnostic onto its real origin buffer --
@@ -310,16 +374,67 @@ std::function<void(BufferId&, SourceSpan&)> PreprocessResult::makeRemap() const 
     LineMap mapCopy = lineMap;
     return [synthId, mapCopy = std::move(mapCopy)]
            (BufferId& buffer, SourceSpan& span) {
-        if (!(buffer == synthId)) return;
-        auto s = mapCopy.resolve(span.start());
-        auto e = mapCopy.resolve(span.end());
-        if (s.origin == nullptr) return;   // empty map -> leave on synth.
-        buffer = s.origin->id();
-        if (e.origin == s.origin && e.offset >= s.offset) {
-            span = SourceSpan::of(s.offset, e.offset);
-        } else {
-            span = SourceSpan::empty(s.offset);
+        remapOnePosition(mapCopy, synthId, buffer, span);
+    };
+}
+
+// ── [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the DIAGNOSTIC form ───────────
+//
+// The same position rewrite, plus the note a macro-expansion product needs to be
+// actionable. Separate from `makeRemap` rather than replacing it because the two
+// have genuinely different consumers: the LSP's `PreprocessedPositionMap`, the
+// shipped-descriptor refs and every post-parse tier convert POSITIONS and have no
+// diagnostic to annotate, while the parse tier and the FC2 oracle reparse hand
+// whole `ParseDiagnostic`s through. `DiagnosticReporter::remapBuffers` accepts
+// either shape and dispatches on the callable's signature, so no call site had to
+// learn which one it holds.
+//
+// ★ THE NOTE IS WHAT MAKES THE POSITION USABLE, and it is measured, not invented.
+// ✔MEASURED clang 18.1.3 on `#define STR(x) #x` + `int STR(name) = 1;`: the
+// error is reported at the INVOCATION (the `STR` token's own line and column in
+// the user's file, one `^` wide), and it carries a `note: expanded from macro
+// 'STR'` at the macro's `#define` NAME. gcc 13.3.0 prints the sibling `note: in
+// definition of macro 'STR'`. Both name the macro and both give the reader a
+// second location; a bare position at the invocation would say "something in
+// this macro" and stop there.
+// (The two renderings are quoted in prose deliberately: a `file:line:col`
+//  written into a source file reads to `scripts/check-plan-citations` as a
+//  positional citation, and a guard that learns exceptions is a guard nobody
+//  reads.)
+//
+// ⚠ ONE note, not a chain. The record names the macro whose replacement list
+// actually minted the bytes, and the position is the outermost source anchor; the
+// INTERMEDIATE levels of `A -> B -> paste` are not recoverable here, because the
+// engine expands a finite macro CHAIN ITERATIVELY in one frame (splice + rescan,
+// see `expand`) rather than recursively, so there is no stack to read them off.
+// A full backtrace needs per-token expansion provenance, which is a larger thing
+// than this row and is deliberately NOT faked with a plausible-looking chain.
+std::function<void(ParseDiagnostic&)>
+PreprocessResult::makeDiagnosticRemap() const {
+    BufferId const synthId = synthBuffer ? synthBuffer->id() : BufferId{};
+    LineMap mapCopy = lineMap;
+    return [synthId, mapCopy = std::move(mapCopy)](ParseDiagnostic& d) {
+        // Read the provenance BEFORE the primary span moves off the synth
+        // buffer — afterwards the offset is an ORIGIN offset and means something
+        // else entirely.
+        MacroExpansionSite const* minted = nullptr;
+        if (d.buffer == synthId) {
+            minted = mapCopy.originOf(d.span.start()).expansion;
         }
+        remapOnePosition(mapCopy, synthId, d.buffer, d.span);
+        for (RelatedLocation& r : d.related) {
+            remapOnePosition(mapCopy, synthId, r.buffer, r.span);
+        }
+        // Appended AFTER the existing related locations are converted, so the
+        // note this adds is not run through the rewrite a second time.
+        if (minted == nullptr || !minted->hasDefinition) return;
+        BufferId   noteBuffer = synthId;
+        SourceSpan noteSpan   = SourceSpan::empty(minted->defOffset);
+        remapOnePosition(mapCopy, synthId, noteBuffer, noteSpan);
+        if (noteBuffer == synthId) return;   // could not be placed in a real file
+        d.related.push_back(RelatedLocation{
+            noteBuffer, noteSpan,
+            std::string{"expanded from macro '"} + minted->name + "'"});
     };
 }
 
@@ -1127,7 +1242,19 @@ struct SynthBuilder {
             if (!fs::is_regular_file(r.path, ec)) return HeaderSearchResult::notFound();
             return r;
         };
-        if (fs::path{filename}.is_absolute()) return tryDir({});
+        // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: `isRootedPath`, the
+        // ONE exported predicate, never a second bare `is_absolute()`. ✔MEASURED
+        // -- a UNC name answers `is_absolute()` FALSE on the toolchain that
+        // builds DSS, so this test sent it down the SEARCH arms instead of
+        // resolving it directly. ⓘ THAT DID NOT SHOW AS A WRONG ANSWER, and the
+        // reason is worth stating rather than leaving as luck: `resolveInDir`
+        // recognises a rooted name itself and ignores the dir it is handed, so
+        // the first arm to be tried resolved it anyway. The exposure is
+        // STRUCTURAL, not observed -- with no including FILE and an empty `-I`
+        // list there is no arm to try, and the loop below would return not-found
+        // for a name that points somewhere real. Two tiers answering one
+        // question two ways is the defect either way.
+        if (isRootedPath(fs::path{filename})) return tryDir({});
         // EMPTY means "there is no including FILE", NOT "the includer has no
         // directory component" — a name like `main.c` arrives here as `.`,
         // because `includingDirectoryOf` already made that substitution
@@ -2779,6 +2906,22 @@ struct ExpToken {
     // dropped before the result leaves `substitute`). The default `false` makes
     // every existing ExpToken construction a non-placemarker -- zero regression.
     bool placemarker = false;
+    // ── [[D-PP-PASTE-PRODUCT-IS-RE-READ-AS-THE-PASTE-OPERATOR]] ────────────
+    //
+    // TRUE for a token this pass MINTED by pasting. C 6.10.3.3p3 lets the
+    // resulting token take part in further macro replacement, and NOT in further
+    // `##` evaluation: the operator's own pass is done once its operands are
+    // concatenated. Without the flag `collapsePastes` rescans from the product
+    // and, when the product IS the `##` spelling (`CAT(#, #)` -> `##`), reads it
+    // as its own operator and fails loud on a replacement list that is perfectly
+    // well formed. ✔MEASURED: gcc 13.3.0 and clang 18.1.3 both form the `##`
+    // token and pass it through; DSS answered
+    // "'##' must not appear at the start of a macro replacement list".
+    //
+    // ⚠ Rescanning from the product is still REQUIRED and is not what changed:
+    // `a##b##c` chains because the NEXT `##` is a replacement-list token, which
+    // this flag leaves alone.
+    bool pasteProduct = false;
     // ★★ "White space separated this token from the previous one IN THE CONSTRUCT
     // IT CAME FROM" -- the ONE owner of pp-token adjacency, and the ONLY thing
     // C23 6.10.5.2p3 (`#`) is allowed to consult. ALWAYS maintained.
@@ -2930,6 +3073,19 @@ struct MacroDef {
     // catch-all. A non-variadic macro keeps isVariadic=false; `__VA_ARGS__` in
     // its replacement is then a constraint violation (fail loud).
     bool                     isVariadic = false;
+    // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the synth offset of this macro's
+    // NAME token on its `#define` line — the DEFINITION SITE a macro-expansion
+    // note points at ("expanded from macro 'X'"). ✔MEASURED, clang 18.1.3 emits
+    // exactly that note for a diagnostic whose subject is a `#`/`##` product, and
+    // gcc 13.3.0 the sibling "in definition of macro 'X'". A synth PREFIX offset
+    // (the `#define` line is physically present in the spliced text), so it
+    // resolves through the ordinary segment scan onto the real file.
+    //
+    // `hasDefinitionSite` is false only for a def built by a caller that has no
+    // directive line to point at (the test constructions), never on the
+    // `handleDefine` path — so absence means "no location", not "offset zero".
+    ByteOffset               definitionSite = 0;
+    bool                     hasDefinitionSite = false;
 };
 
 // C 6.10.9p1 DE-STRINGIZE, for the `_Pragma("...")` operand: delete the leading
@@ -2976,7 +3132,13 @@ public:
     MacroExpander(std::shared_ptr<SourceBuffer> synth,
                   std::shared_ptr<GrammarSchema const> schema,
                   DiagnosticReporter& rep, ByteOffset prefixLen,
-                  LineMap const* lineMap,
+                  // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: NON-const, because the
+                  // expander is the PRODUCER of the product tail's coordinates.
+                  // The map owns "what is this synth offset"; minting a byte
+                  // that belongs to no file is an answer only this pass knows,
+                  // so it is written into the same map rather than into a
+                  // side-table a consumer would have to re-pair with it.
+                  LineMap* lineMap,
                   // D-PP-HEADER-CASE-INSENSITIVE-PE: REQUIRED, and ahead of
                   // the defaulted block for the same reason `preprocess()`
                   // states — a silent fallback here would put the choice back
@@ -3858,6 +4020,13 @@ private:
         // exactly the escape pass and nothing more — a full string decoder would
         // silently turn a `\n` a pragma legitimately contains into a newline.
         std::string const inner = destringizePragma(text(operand[1]));
+        // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the de-stringized operand is
+        // minted like any other product. Nothing is EMITTED from it (a pragma is
+        // not program text), so no parse diagnostic can land on these bytes today
+        // — the stamp is here because the chokepoint's contract is that every
+        // minted run has provenance, not because this run is known to need it.
+        MintScope const mintScope{*this, opTok.invOffset, 0, /*hasDef=*/false,
+                                  cfg().pragmaOperator};
         std::vector<Token> const toks = materializeSignificant(inner);
         applyPragma(toks, opTok.tok.span);
         for (std::size_t k = 0; k <= closeIdx; ++k) work.pop_front();
@@ -4579,6 +4748,16 @@ private:
             spelling.append(std::to_string(static_cast<unsigned>(
                 static_cast<unsigned char>((*bytes)[bi]))));
         }
+        // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: `#embed`'s byte list is
+        // minted through the SAME chokepoint as a `#`/`##` product, so it lands
+        // past the prefix and used to extrapolate exactly the same way. Its
+        // expansion site is the DIRECTIVE — there is no macro and no `#define`
+        // line, so a diagnostic on a spliced byte points at the `#embed` that
+        // put it there. ★ This arm is why the provenance is stamped at
+        // `materializeSignificant` rather than in `expand`: `#embed` never goes
+        // through a macro invocation at all.
+        MintScope const mintScope{*this, dirSpan.start(), 0, /*hasDef=*/false,
+                                  std::string{"#"} + cfg().embedDirective};
         for (Token const& t : materializeSignificant(spelling)) {
             body.push_back(t);
         }
@@ -4683,6 +4862,16 @@ private:
         }
 
         MacroDef def;
+        // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the macro's own NAME token is
+        // its definition site — where "expanded from macro 'X'" points. Taken
+        // here, on the ONE path that builds a def from a directive line, so it is
+        // recorded for every macro rather than for the ones someone remembered.
+        // NOT part of `sameDefinition`: two `#define`s of the same macro on
+        // different lines are the SAME definition (C 6.10.3p2 compares the
+        // replacement list), and making the position part of identity would turn
+        // a benign repeat into a redefinition error.
+        def.definitionSite    = in[nameIdx].span.start();
+        def.hasDefinitionSite = true;
         // FUNCTION-like iff the configured open-paren is IMMEDIATELY ADJACENT
         // to the macro name (C 6.10.3p3: no white space between the name and
         // the `(`). `#define F (x)` -- a space before `(` -- is OBJECT-like
@@ -5895,7 +6084,9 @@ private:
                                          bool sweepPlacemarkers) {
         std::size_t i = 0;
         while (i < items.size()) {
-            if (!isPaste(items[i].tok)) { ++i; continue; }
+            // [[D-PP-PASTE-PRODUCT-IS-RE-READ-AS-THE-PASTE-OPERATOR]]: a token
+            // this pass MINTED is never an operator, however it is spelled.
+            if (!isPaste(items[i].tok) || items[i].pasteProduct) { ++i; continue; }
             SourceSpan const opSpan = items[i].tok.span;
             const bool hasLeft  = (i > 0);
             const bool hasRight = (i + 1 < items.size());
@@ -5966,6 +6157,8 @@ private:
             // the invocation, and the operands' own gap has vanished with the `##`.
             const std::size_t lo = i - 1;
             ExpToken pasted{*product, hs, invOffset};
+            // [[D-PP-PASTE-PRODUCT-IS-RE-READ-AS-THE-PASTE-OPERATOR]]
+            pasted.pasteProduct = true;
             pasted.spacedBefore = items[lo].spacedBefore;
             items.erase(items.begin() + static_cast<std::ptrdiff_t>(lo),
                         items.begin() + static_cast<std::ptrdiff_t>(i + 2));
@@ -6333,13 +6526,72 @@ private:
     // parses, never to `##`/`#`. The re-tokenization uses a throwaway reporter so
     // a malformed product does not pollute the user diagnostics here (the caller's
     // F1/F2 logic owns the user-facing fail-loud).
+    // ── [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]] ────────────────────────────
+    //
+    // Record where a just-minted product run CAME FROM, into the same line map
+    // that owns every other synth coordinate. Called from the ONE place product
+    // bytes are appended, so a run can never exist without provenance and a new
+    // minting site cannot forget to register.
+    //
+    // ⚠ ASCENDING BY CONSTRUCTION: `productText_` is append-only (its own note
+    // says so — a product span is the absolute `prefixLen_ + offset`, never
+    // rewound), so successive calls hand `LineMap::addExpansion` strictly
+    // increasing `productStart`s, which is the order `expansionFor` requires.
+    void recordProductProvenance(ByteOffset base, ByteOffset end) {
+        if (lineMap_ == nullptr || end <= base) return;
+        MacroExpansionSite site;
+        site.productStart  = prefixLen_ + base;
+        site.productEnd    = prefixLen_ + end;
+        site.siteOffset    = mint_.site;
+        site.defOffset     = mint_.def;
+        site.hasDefinition = mint_.hasDef;
+        site.name          = mint_.name;
+        lineMap_->addExpansion(std::move(site));
+    }
+
     std::vector<Token> materializeSignificant(std::string_view spelling) {
         const ByteOffset productBase =
             static_cast<ByteOffset>(productText_.size());
         productText_.append(spelling);
+        recordProductProvenance(productBase,
+                                static_cast<ByteOffset>(productText_.size()));
         auto tiny = SourceBuffer::fromString(std::string{spelling}, "<pp-product>");
         DiagnosticReporter scratch;
         auto ppToks = tokenizeToPP(tiny, schema_, scratch);
+        // ── [[D-PP-PASTE-REJECTS-A-VALID-PREPROCESSING-NUMBER]]: THE RETIMING ──
+        //
+        // The scratch reporter used to be a DROP: a malformed product was judged
+        // by the preprocessor's own token COUNT instead, and a pp-number the
+        // language's literal grammar does not accept came back as two tokens and
+        // was refused as "not a single valid token". Phase-3 scanning now returns
+        // ONE token for it, so the count no longer refuses — and the refusal has
+        // to arrive from the tier that actually knows, which is the scanner that
+        // just said `P_MalformedNumber`.
+        //
+        // ★ REPOSITIONED ONTO THE MINT SITE, never left on `<pp-product>`. The
+        // tiny buffer dies at the end of this function and its offsets name no
+        // file; `mint_.site` is the EXPANSION SITE the sibling row already
+        // records, so the diagnostic lands where the user wrote the invocation
+        // and the ordinary remap carries it home. ✔MEASURED, gcc 13.3.0 and
+        // clang 18.1.3 both report the invalid-suffix error at the invocation for
+        // exactly this construct.
+        // ⚠ ONLY `P_MalformedNumber`, and the narrowing is load-bearing rather
+        // than cautious. The scratch reporter also holds artefacts of tokenizing
+        // an ISOLATED FRAGMENT — a `1"x"` product ends INSIDE a string, so the
+        // scan reports `P_UnterminatedString` at the tiny buffer's EOF — and
+        // those say nothing about the program. ✔MEASURED: forwarding the whole
+        // reporter made DSS refuse `L ## "s"`, a paste gcc 13.3.0 and clang
+        // 18.1.3 both accept, which is the SAME bar violation this row exists to
+        // remove, arrived at from the opposite direction. The "is this ONE
+        // preprocessing token" question still belongs to the token COUNT below;
+        // exactly one judgement moved tiers, and this is it.
+        for (ParseDiagnostic const& d : scratch.all()) {
+            if (d.code != DiagnosticCode::P_MalformedNumber) continue;
+            ParseDiagnostic moved = d;
+            moved.buffer = synth_->id();
+            moved.span   = SourceSpan::empty(mint_.site);
+            rep_.report(std::move(moved));
+        }
         std::vector<Token> out;
         for (PPToken const& pt : ppToks) {
             if (isTrivia(pt.tok) || isNewline(pt.tok)) continue;
@@ -6563,6 +6815,14 @@ private:
                 if (it == table_.end()) {
                     auto pit = predefined_.find(name);
                     if (pit != predefined_.end()) {
+                        // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: a predefined
+                        // macro's value is minted too, and it has NO definition
+                        // site — there is no `#define` line to point at, and
+                        // saying so is what keeps `hasDefinition` from meaning
+                        // "offset zero". The POSITION is still exact: the
+                        // invocation, like every other product.
+                        MintScope const mintScope{*this, t.invOffset, 0,
+                                                  /*hasDef=*/false, name};
                         std::vector<Token> value =
                             materializePredefined(pit->second, t.invOffset);
                         std::vector<ExpToken> repl;
@@ -6586,6 +6846,14 @@ private:
                 continue;
             }
             MacroDef const& def = it->second;
+            // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: everything this
+            // invocation mints — a `##` product on either arm, a `#` product on
+            // the function-like one — is attributed to the INVOCATION (`t`, an
+            // original-source anchor propagated through every nesting level) and
+            // to THIS macro's definition. One scope over both arms, so neither
+            // can acquire a minting path the other's stamp does not cover.
+            MintScope const mintScope{*this, t.invOffset, def.definitionSite,
+                                      def.hasDefinitionSite, name};
             if (!def.isFunctionLike) {
                 // OBJECT-like (Prosser): replace T with M's replacement, each
                 // token carrying hideset(T) ∪ {M}; splice over [i, i+1) and
@@ -6832,6 +7100,49 @@ private:
     // `synth_->text() + productText_` (built by `preprocess()` after `run()`).
     ByteOffset                           prefixLen_{};
     std::string                          productText_;
+    // ── [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: WHO IS MINTING RIGHT NOW ──
+    //
+    // The construct whose expansion is currently producing product bytes, so
+    // `materializeSignificant` — the ONE chokepoint every minted byte passes
+    // through — can stamp each run with where it came from.
+    //
+    // ★ A SCOPED MEMBER RATHER THAN A PARAMETER, AND THE REASON IS THE SHAPE OF
+    // THE ENGINE. `materializeSignificant` is reached from ten call sites across
+    // `substitute` / `collapsePastes` / `stringizeTokens` / `materializePredefined`
+    // / `handleEmbed` / `consumePragmaOperator`; threading a parameter through all
+    // of them puts the same fact in ten signatures and lets a future eleventh site
+    // forget it silently. The mint is always SYNCHRONOUS inside one of those
+    // operations, so a scope guard is exact — and `MintScope` SAVES AND RESTORES,
+    // which is what keeps argument pre-expansion (`expand(arg, depth + 1)`) from
+    // leaking its context into the parent's substitution.
+    //
+    // ⚠ `site` is the OUTERMOST source anchor (`ExpToken::invOffset`, propagated
+    // down through every nested and chained expansion), while `name`/`def` name
+    // the INNERMOST macro — the one whose replacement list holds the `#`/`##`.
+    // That is deliberate and it is what clang prints: the error at the invocation
+    // in the user's file, the note at the definition that minted the token.
+    struct MintContext {
+        ByteOffset  site   = 0;
+        ByteOffset  def    = 0;
+        bool        hasDef = false;
+        std::string name;
+    };
+    MintContext                          mint_;
+    class MintScope {
+    public:
+        MintScope(MacroExpander& owner, ByteOffset site, ByteOffset def,
+                  bool hasDef, std::string name)
+            : owner_(owner), saved_(owner.mint_) {
+            owner_.mint_ = MintContext{site, def, hasDef, std::move(name)};
+        }
+        MintScope(MintScope const&)            = delete;
+        MintScope& operator=(MintScope const&) = delete;
+        ~MintScope() { owner_.mint_ = std::move(saved_); }
+
+    private:
+        MacroExpander& owner_;
+        MintContext    saved_;
+    };
     std::unordered_map<std::string, MacroDef> table_;
     // FC15b (predefined macros; C 6.10.8): the config-seeded predefined-macro
     // set (name -> def), the synth-offset -> origin line-map (for the
@@ -6839,7 +7150,7 @@ private:
     // identity pass), and the once-computed `__DATE__`/`__TIME__` INNER spellings
     // (without the surrounding quotes -- `materializePredefined` quotes them).
     std::unordered_map<std::string, PredefinedMacroDef> predefined_;
-    LineMap const*                       lineMap_ = nullptr;
+    LineMap*                             lineMap_ = nullptr;
     std::string                          dateString_;   // "Mmm dd yyyy"
     std::string                          timeString_;   // "hh:mm:ss"
     // FC15c (`__has_include`; C23 6.10.1p4): the include search paths +the main
@@ -7472,6 +7783,12 @@ PreprocessResult preprocessRun(
     // resolves identically in both). `prefixLen` is the byte length of that
     // prefix; a product token's span points at `[prefixLen + productOffset, ...)`.
     const ByteOffset prefixLen = static_cast<ByteOffset>(synthText.size());
+    // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: tell the coordinate map where the
+    // MINTED tail begins, BEFORE the macro pass runs. Without this the map treats
+    // every offset as a prefix offset and answers a product span by extrapolating
+    // off the last segment — the exact wrong answer this row is about. Stamped at
+    // the ONE place `prefixLen` is computed, next to the buffer it describes.
+    result.lineMap.setProductBase(prefixLen);
     auto prefixBuffer = SourceBuffer::fromString(
         synthText, std::string{mainSource->name()});
     // (`result.mainSourceId` is stamped by `establishResultContract` on the

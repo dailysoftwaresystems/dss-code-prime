@@ -394,6 +394,8 @@ TEST(MachOArm64Exit, IndirectSlotDispatchOnMachOFailsLoud) {
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-indirect-bad","kind":"macho"},
@@ -663,6 +665,8 @@ TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-badpage","kind":"macho"},
@@ -732,6 +736,8 @@ TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
     std::string const json = R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-badva","kind":"macho"},

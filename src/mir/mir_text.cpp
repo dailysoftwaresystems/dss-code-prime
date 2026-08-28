@@ -65,6 +65,48 @@ inline constexpr std::string_view kMirTextNoOptimizeAttr = "nooptimize";
 // degrade a diagnostic — it erases the feature.
 inline constexpr std::string_view kMirTextNoSanitizeThreadAttr = "nosanitizethread";
 
+// D-MIRTEXT-GLOBAL-FLAGS-DROPPED-BY-ROUNDTRIP: the GLOBAL-side vocabulary.
+// Same one-spelling discipline, same `.dssir`-is-its-own-format reasoning as
+// the four function keywords above; `binding` and `visibility` need no
+// keyword of their own because they project off the SHARED
+// `symbolBindingName` / `symbolVisibilityName` tables, exactly as the
+// function list does.
+//
+// ★ `align` TAKES A VALUE (`align=16`), the only attribute on either list
+// that does. Spelled `name=value` rather than as a bare keyword per width
+// because an alignment is a NUMBER, and a family of `align16`/`align32`
+// keywords would retype a closed set that is not closed.
+inline constexpr std::string_view kMirTextConstAttr       = "const";
+inline constexpr std::string_view kMirTextThreadLocalAttr = "threadlocal";
+inline constexpr std::string_view kMirTextAlignAttr       = "align";
+// The alignment ceiling `MirBuilder::addGlobal` documents (a power of two
+// ≤ 256). ⚠ `addGlobal` does NOT enforce it — ✔MEASURED, it stores the
+// value verbatim — so a text reader that passed a bad one through would
+// build a module the assembler mishandles, with no diagnostic anywhere. The
+// reader validates because nothing downstream does.
+inline constexpr std::uint32_t kMirTextMaxGlobalAlignBytes = 256;
+
+// The five per-global fields the text format carries, as ONE value.
+//
+// ★★ A STRUCT RATHER THAN FIVE PARALLEL LOCALS, and that is the point of
+// it: `parseGlobal` reaches `MirBuilder::addGlobal` down FOUR different
+// paths (zero-init, resolved initfunc, deferred initfunc, literal-init), and
+// five loose locals threaded through four call sites is exactly the shape
+// `MirThreadStorage`'s own documentation records three clone sites getting
+// wrong — silently turning a per-thread object into a process-shared one.
+// One value cannot be partially forwarded: a new arm either passes it or
+// does not compile.
+//
+// ⓘ The member defaults ARE the format's \"attribute list absent\" meaning,
+// so a global with no `[...]` needs no special case anywhere.
+struct MirTextGlobalAttrs {
+    SymbolBinding    binding        = SymbolBinding::Global;
+    SymbolVisibility visibility     = SymbolVisibility::Default;
+    bool             isConst        = false;
+    MirThreadStorage threadStorage  = MirThreadStorage::Shared;
+    std::uint32_t    alignmentBytes = 0;
+};
+
 // ── shared helpers ────────────────────────────────────────────────────
 
 namespace {
@@ -648,9 +690,53 @@ private:
         out_ += '?';
     }
 
+    // D-MIRTEXT-GLOBAL-FLAGS-DROPPED-BY-ROUNDTRIP: the per-global attribute
+    // list, and the EXACT TWIN of `appendFuncAttrs` — written by copying it
+    // rather than by inventing a second shape, because the defect it closes is
+    // literally the one that printer's own comment records one construct over.
+    //
+    // ★★★ THE ASYMMETRY WAS THE WHOLE DEFECT. `emitGlobal` printed
+    // `global %sym : <type> = <init>` and `parseGlobal` called `addGlobal` with
+    // `SymbolBinding::Global, SymbolVisibility::Default, isConst=false,
+    // MirThreadStorage::Shared` HARD-WRITTEN in all three arms, and never
+    // parsed an alignment at all. So a `static const _Thread_local` global
+    // with `alignas(64)` came back a plain, mutable, process-shared,
+    // naturally-aligned, externally-visible one — five fields lost at once,
+    // with `ok == true` and a byte-identical-looking round trip. Functions
+    // carried their attributes from TF-C78 onward; globals did not, and
+    // nothing in the format made that difference visible.
+    //
+    // ⚠ PRINTED ONLY WHEN SOMETHING IS NON-DEFAULT, the same `blockMarker !=
+    // Linear` discipline `appendFuncAttrs` follows — so every existing golden
+    // `.dssir` text for an ordinary global is byte-unchanged by this.
+    void appendGlobalAttrs(MirGlobalId g) {
+        SymbolBinding    const b  = mir_.globalBinding(g);
+        SymbolVisibility const v  = mir_.globalVisibility(g);
+        bool             const c  = mir_.globalIsConst(g);
+        bool             const tl = mir_.globalIsThreadLocal(g);
+        std::uint32_t    const al = mir_.globalAlignmentBytes(g);
+        if (b == SymbolBinding::Global && v == SymbolVisibility::Default
+            && !c && !tl && al == 0) {
+            return;
+        }
+        out_ += " [";
+        bool first = true;
+        auto const sep = [&] { if (!first) out_ += ", "; first = false; };
+        if (b != SymbolBinding::Global)     { sep(); out_ += symbolBindingName(b); }
+        if (v != SymbolVisibility::Default) { sep(); out_ += symbolVisibilityName(v); }
+        if (c)                              { sep(); out_ += kMirTextConstAttr; }
+        if (tl)                             { sep(); out_ += kMirTextThreadLocalAttr; }
+        if (al != 0) {
+            sep();
+            out_ += std::format("{}={}", kMirTextAlignAttr, al);
+        }
+        out_ += "]";
+    }
+
     void emitGlobal(MirGlobalId g) {
         out_ += std::format("  global %{} : ", mir_.globalSymbol(g).v);
         appendType(mir_.globalType(g));
+        appendGlobalAttrs(g);
         std::uint32_t const litIdx = mir_.globalInitLiteralIndex(g);
         MirFuncId const initFn = mir_.globalInitFunc(g);
         if (litIdx != UINT32_MAX) {
@@ -1262,6 +1348,15 @@ private:
         TypeId        ty;
         SymbolId      sym;
         std::uint32_t initFuncSlot;
+        // ⚠ THE FOURTH `addGlobal` CALL SITE IS HERE, NOT IN `parseGlobal`.
+        // A global whose `initfunc` names a function declared LATER is
+        // deferred to `finalize()` and built there — so leaving the
+        // attributes out of this record would lose them for exactly the
+        // forward-referenced case and keep them for every other, which is
+        // the hardest possible shape to notice. `MirThreadStorage`'s own
+        // doc records three positional clone sites dropping that flag; this
+        // is the same hazard, so the attributes travel as ONE value.
+        MirTextGlobalAttrs attrs;
     };
     std::vector<PendingGlobalInit> pendingInitFuncGlobals_;
     // Forward-reference book-keeping for phi incomings whose value or
@@ -1717,10 +1812,87 @@ private:
     // format is a test/debug surface for CFG + literal shapes, never a
     // codegen input; a future flag-preserving text syntax would extend the
     // grammar here AND the printer symmetrically.
+    // D-MIRTEXT-GLOBAL-FLAGS-DROPPED-BY-ROUNDTRIP: the optional `[...]` list
+    // `appendGlobalAttrs` emits, read back into the values `addGlobal` needs.
+    // Unambiguous in this position for the same reason the function list is:
+    // types bracket with `<>`, never `[]`, and what follows a global's type is
+    // otherwise always `=`.
+    //
+    // An UNRECOGNIZED name FAILS LOUD rather than being skipped — a silently
+    // ignored attribute here is precisely how these five fields went missing
+    // for as long as they did.
+    void parseGlobalAttrs(MirTextGlobalAttrs& attrs) {
+        if (lex_.peek().kind != TokKind::LBracket) return;
+        lex_.take();
+        while (true) {
+            Tok a = lex_.take();
+            if (a.kind == TokKind::RBracket) break;
+            if (a.kind == TokKind::Comma) continue;
+            if (a.kind != TokKind::Ident) {
+                emitMalformed(std::format(
+                    "expected a global attribute name, got '{}'", a.text));
+                break;
+            }
+            if (a.text == kMirTextConstAttr) { attrs.isConst = true; continue; }
+            if (a.text == kMirTextThreadLocalAttr) {
+                attrs.threadStorage = MirThreadStorage::PerThread;
+                continue;
+            }
+            if (a.text == kMirTextAlignAttr) {
+                if (!expect(TokKind::Eq)) break;
+                Tok n = lex_.take();
+                if (n.kind != TokKind::Integer) {
+                    emitMalformed(std::format(
+                        "'{}' takes an integer byte count, got '{}'",
+                        kMirTextAlignAttr, n.text));
+                    break;
+                }
+                auto const bytes = parseNumber<std::uint32_t>(
+                    n.text, "global alignment");
+                // ★ VALIDATED HERE BECAUSE NOTHING DOWNSTREAM DOES.
+                // `addGlobal` documents \"power of two ≤ 256\" and ✔MEASURED
+                // stores whatever it is handed, so an out-of-contract value
+                // read from text would reach the assembler unchallenged.
+                if (bytes == 0 || (bytes & (bytes - 1)) != 0
+                    || bytes > kMirTextMaxGlobalAlignBytes) {
+                    emitMalformed(std::format(
+                        "global alignment {} is not a power of two in [1, {}]",
+                        bytes, kMirTextMaxGlobalAlignBytes));
+                    break;
+                }
+                attrs.alignmentBytes = bytes;
+                continue;
+            }
+            if (auto b = symbolBindingFromName(a.text); b.has_value()) {
+                attrs.binding = *b;
+                continue;
+            }
+            if (auto v = symbolVisibilityFromName(a.text); v.has_value()) {
+                attrs.visibility = *v;
+                continue;
+            }
+            // Both closed sets are PROJECTED off the tables the lookups use,
+            // never retyped as literals
+            // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET),
+            // the same discipline the function-attribute message follows.
+            emitMalformed(std::format(
+                "unknown global attribute '{}' — expected a binding ({}), "
+                "a visibility ({}), '{}', '{}' or '{}=<bytes>'",
+                a.text,
+                detail::renderAllowedList(allNames(kSymbolBindingTable), " | "),
+                detail::renderAllowedList(allNames(kSymbolVisibilityTable), " | "),
+                kMirTextConstAttr, kMirTextThreadLocalAttr,
+                kMirTextAlignAttr));
+            break;
+        }
+    }
+
     void parseGlobal() {
         std::uint32_t const sym = parsePercentValue();
         if (!expect(TokKind::Colon)) return;
         TypeId const ty = parseType();
+        MirTextGlobalAttrs attrs;
+        parseGlobalAttrs(attrs);
         if (!expect(TokKind::Eq)) return;
         // ★★★ A REFUSAL THAT CRASHES IS NOT A REFUSAL — the rule this file states
         // three times already, at the arm it had not reached.
@@ -1743,8 +1915,8 @@ private:
         if (pk.kind == TokKind::Ident && pk.text == "zero") {
             lex_.take();
             builder_.addGlobal(ty, SymbolId{sym}, UINT32_MAX, MirFuncId{},
-                               SymbolBinding::Global, SymbolVisibility::Default,
-                               /*isConst=*/false, MirThreadStorage::Shared);
+                               attrs.binding, attrs.visibility, attrs.isConst,
+                               attrs.threadStorage, attrs.alignmentBytes);
         } else if (pk.kind == TokKind::Ident && pk.text == "initfunc") {
             lex_.take();
             std::uint32_t const fnSlot = parsePercentValue();
@@ -1754,18 +1926,19 @@ private:
             auto it = funcMap_.find(fnSlot);
             if (it != funcMap_.end()) {
                 builder_.addGlobal(ty, SymbolId{sym}, UINT32_MAX, it->second,
-                                   SymbolBinding::Global,
-                                   SymbolVisibility::Default,
-                                   /*isConst=*/false, MirThreadStorage::Shared);
+                                   attrs.binding, attrs.visibility,
+                                   attrs.isConst, attrs.threadStorage,
+                                   attrs.alignmentBytes);
             } else {
-                pendingInitFuncGlobals_.push_back({ty, SymbolId{sym}, fnSlot});
+                pendingInitFuncGlobals_.push_back(
+                    {ty, SymbolId{sym}, fnSlot, attrs});
             }
         } else {
             MirLiteralValue lv = parseLiteral();
             std::uint32_t const litIdx = builder_.literalPoolAdd(std::move(lv));
             builder_.addGlobal(ty, SymbolId{sym}, litIdx, MirFuncId{},
-                               SymbolBinding::Global, SymbolVisibility::Default,
-                               /*isConst=*/false, MirThreadStorage::Shared);
+                               attrs.binding, attrs.visibility, attrs.isConst,
+                               attrs.threadStorage, attrs.alignmentBytes);
         }
     }
 
@@ -2057,6 +2230,44 @@ private:
             parseInstruction();
         }
         (void)expect(TokKind::RBrace);
+        // ★★★ D-MIRTEXT-UNSEALED-BLOCK-ABORTS-WHEN-NOTHING-SET-ERRORS — THE
+        // SHAPES THE `errors_` GUARD ABOVE CANNOT SEE.
+        //
+        // That guard is this file's answer to the class it names two arms up
+        // (`D-LIR-TEXT-PARSE-UNSEALED-BLOCK-ABORT`), and for every DIAGNOSED
+        // malformation it is exactly right: an instruction the parser refused
+        // sets `errors_`, so the next block never reaches `beginBlock` and the
+        // kill is avoided. ⚠ BUT IT KEYS ON A DIAGNOSTIC HAVING BEEN EMITTED,
+        // AND TWO MALFORMED INPUTS EMIT NONE — a block holding only
+        // well-formed non-terminators, and an empty block. Both parse without
+        // a single complaint and leave the block unsealed, so `errors_` stays
+        // false, `beginBlock` runs, and `closeBlock_` kills the process with
+        // *"block MirBlockId=N has no terminator"*.
+        //
+        // ✔MEASURED 2026-08-28, both shapes, exit `0xc0000409` — on text whose
+        // only defect is a missing terminator, which is precisely what a
+        // reader owes a diagnostic for. The guard protected the last step of a
+        // walk that dies one step earlier, which is the identical sentence
+        // this file already writes about its own predecessor.
+        //
+        // ⓘ The predicate is the BUILDER's, not a parser-side mirror:
+        // `currentlyOpenBlock()` returns invalid once a terminator has sealed
+        // the block, so a valid id here means exactly "still open, never
+        // sealed". State that mirrors the arena is state that can disagree
+        // with it.
+        //
+        // ★ REPORTING IS THE WHOLE FIX — no second unwind is added. `emitMalformed`
+        // sets `errors_`, which is what the guard above already consumes, so the
+        // next block bails before `beginBlock` and `finalize()` discards the
+        // module before `finish()`. One mechanism, reached from the one direction
+        // that could not reach it.
+        if (builder_.currentlyOpenBlock().valid()) {
+            emitMalformed(std::format(
+                "block %b{} closes without a terminator (every block must end "
+                "in br/condbr/switch/return/unreachable), and a `.dssir` reader "
+                "may not kill the process over text that does not",
+                slot));
+        }
     }
 
     [[nodiscard]] MirInstId resolveValue(std::uint32_t slot) {
@@ -2490,8 +2701,9 @@ private:
                 continue;
             }
             builder_.addGlobal(pg.ty, pg.sym, UINT32_MAX, it->second,
-                               SymbolBinding::Global, SymbolVisibility::Default,
-                               /*isConst=*/false, MirThreadStorage::Shared);
+                               pg.attrs.binding, pg.attrs.visibility,
+                               pg.attrs.isConst, pg.attrs.threadStorage,
+                               pg.attrs.alignmentBytes);
         }
         // Resolve phi incomings now that all blocks + values are known.
         for (auto& pp : pendingPhis_) {

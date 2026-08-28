@@ -118,3 +118,12 @@ target_link_libraries(dss_ffi_test_shipped_realization_oracle
 # the shipped reader.
 dss_add_test(NAME ffi/test_shipped_descriptor_cache_staleness
              SOURCES test_shipped_descriptor_cache_staleness.cpp)
+
+# D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY (P44): the
+# ABI-resolution pins became CONFIG pins when `kAbiCatalog` was deleted — they
+# now build REMOVE-direction mutants of the shipped `.format.json` documents
+# (strip the required key; re-point the declared convention) and assert the
+# engine follows the document. That needs the JSON reader directly, like the
+# descriptor sweeps above it.
+target_link_libraries(dss_ffi_test_abi_catalog
+                      PRIVATE nlohmann_json::nlohmann_json)

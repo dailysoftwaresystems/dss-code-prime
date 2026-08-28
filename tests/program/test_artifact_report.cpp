@@ -47,6 +47,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "program/program.hpp"
 #include "scratch_dir.hpp"
+#include "unc_spelling.hpp"
 
 #include <gtest/gtest.h>
 
@@ -318,4 +319,62 @@ TEST(ArtifactReport, ALinkFailureAfterThePathIsKnownReportsNoArtifact) {
         << captured;
     EXPECT_FALSE(fs::exists(outDir / "hello.exe"))
         << "sanity: the refused link must not have written anything";
+}
+
+// ── 6. A UNC `--output` is reported where it was actually written ────────────
+//
+// ★★★ [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] — THE REPORT TIER. This
+// line existed to tell a user WHERE the artifact is, and on a UNC output it named
+// somewhere else. `reportArtifactWritten` ran the path through a bare
+// `fs::absolute`, which on a path model that gives a UNC authority no
+// `root_name()` does not fail but SUCCEEDS having re-rooted it onto the local
+// drive: an artifact written to `\host\share\out\hello.exe` was announced as
+// `C:\host\share\out\hello.exe`. Nothing downstream checks a diagnostic, so the
+// only symptom was a user following the line to a file that is not there.
+//
+// ⚠ THIS ARM DELIBERATELY DOES NOT ASSERT `is_absolute()`, WHICH ITS SIBLING
+// ABOVE DOES. On the toolchain that builds DSS a UNC path answers `is_absolute()`
+// FALSE — so importing that assertion would fail on a CORRECT report, and
+// "fixing" it by re-rooting is precisely the defect. What the report owes is that
+// the path still names the machine it was written to, and that the file is there.
+TEST(ArtifactReport, AUncOutputIsReportedWhereItWasWritten) {
+    ScratchDir scratch{Location::InsideRepo, "artifact-report-unc"};
+    auto const src = writeSrc(scratch.path(), "hello.c", kMainSrc);
+
+    fs::path const uncOut = dss::test_support::uncSpellingOf(scratch.path());
+    if (uncOut.empty())
+        GTEST_SKIP()
+            << "D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED: this host offers "
+               "no reachable UNC spelling of '"
+            << scratch.path().string()
+            << "', so the artifact REPORT's multi-separator-root arm WAS NOT "
+               "MEASURED on this leg. This is an unmeasured property, NOT a "
+               "passing one.";
+    ASSERT_GE(dss::test_support::leadingSeparatorRun(uncOut), 2u)
+        << "the fixture stopped producing a multi-separator root, so this test "
+           "would pass without exercising the property: " << uncOut.string();
+
+    Program prog;
+    prog.setOutputDir(uncOut / "out");
+    DiagnosticReporter rep;
+    std::string        captured;
+    int                rc = 1;
+    {
+        CerrCapture cap;
+        rc = prog.compileFiles({src.generic_string()}, "c",
+                               {"x86_64:pe64-x86_64-windows-exec"}, rep);
+        captured = cap.text();
+    }
+    ASSERT_EQ(rc, 0) << "stderr:\n" << captured;
+
+    auto const lines = artifactLines(captured);
+    ASSERT_EQ(lines.size(), 1u) << "stderr:\n" << captured;
+    EXPECT_GE(dss::test_support::leadingSeparatorRun(fs::path{lines[0].path}), 2u)
+        << "reported '" << lines[0].path
+        << "' — the leading separator run was collapsed, so the line names a "
+           "path on the local drive instead of the machine the artifact was "
+           "written to";
+    EXPECT_TRUE(fs::exists(fs::path{lines[0].path}))
+        << "the report names '" << lines[0].path
+        << "', which does not exist — a report a user cannot follow";
 }

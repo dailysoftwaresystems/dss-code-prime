@@ -58,6 +58,36 @@ std::string recordedImportIdentity(std::string_view declaredImportName,
 // the message that gets the operator to the right file. On a Mach-O target the
 // kinds agree, nothing is rejected here, and FF1's own `lipo -thin` /
 // 32-bit-unsupported remediations reach the operator unchanged.
+// ★★ RULED EXEMPT FROM THE IDENTITY-BRANCH VETO, 2026-08-28 (P44), WITH THE
+// MEASUREMENT THAT MAKES IT A VERDICT RATHER THAN AN OPINION. Recorded HERE so
+// the next reader does not re-open the question — `src/ffi/` is RULED SHARED
+// SUBSTRATE in plan 23 §5.1, so five `ObjectFormatKind::` mentions in one
+// function are exactly what an auditor should stop on.
+//
+// THE TEST THAT SETTLES IT IS *WHAT DOES THE VALUE DECIDE*, NEVER *WHERE DOES
+// IT SIT* — the trap where a relocation's arithmetic gets substituted for its
+// role. ✔MEASURED: this function has ONE consumer,
+// `checkLibraryMatchesTargetFormat` a few lines below, and the whole use is
+//
+//     if (!detected.has_value() || *detected == format.kind()) return nullopt;
+//
+// — an EQUALITY between two values of one type, symmetric in both operands.
+// There is no arm per format: one comparison, one message, and every format
+// SPELLING in that message comes from `kObjectFormatKindTable` or from the
+// schema, never a literal. Swap ELF for Mach-O on both sides and the behaviour
+// is byte-identical. Nothing downstream is selected by WHICH kind this is.
+//
+// Contrast the four branches P44 deleted one tier over
+// ([[D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES]]): each of those read the
+// identity and CHOSE — a different extension, a different `ar` layout, a
+// different reader. That is deciding. This is naming.
+//
+// ⓘ Adding a sixth object format does require a row here. That is not the
+// defect either: it is a translation between two CLOSED SETS, backed by
+// `-Werror=switch`, so an omission is a BUILD ERROR rather than a silent gap —
+// the same discipline as `kObjectFormatKindTable` itself. What the veto
+// forbids is an engine choosing behaviour from identity, not a classifier
+// reporting what it found in the vocabulary the next tier speaks.
 [[nodiscard]] static std::optional<ObjectFormatKind>
 objectFormatKindOfGuess(FormatGuess g) noexcept {
     switch (g) {

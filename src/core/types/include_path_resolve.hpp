@@ -111,6 +111,29 @@ takeFound(HeaderSearchResult const& r, OnAmbiguous&& onAmbiguous) {
     return std::nullopt;   // unreachable — every status handled above
 }
 
+// ── [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] ───────────────────────
+//
+// DOES `p` NAME A LOCATION FROM A ROOT, rather than relative to somewhere?
+// THE ONE predicate for that question, exported for the same reason every
+// other question in this header is answered in exactly one place: a tier that
+// re-derives it as a bare `is_absolute()` gets a DIFFERENT answer for the paths
+// this row is about, and the two then disagree about what "absolute" means.
+//
+// ⚠ `is_absolute()` ALONE IS THE WRONG QUESTION. ✔MEASURED on the toolchain
+// that builds DSS (Strawberry g++ / libstdc++ 13.2):
+//     path("//server/share/x.h").is_absolute()        -> FALSE
+//     path("//server/share/x.h").has_root_directory() -> TRUE
+// MinGW discards a UNC authority at construction, so a UNC include read as
+// RELATIVE. MSVC models `//server/share` as a real `root_name()` and answers
+// TRUE to both; libc++ keeps both slashes with an empty authority. The
+// disjunction is model-INDEPENDENT rather than a MinGW patch: where the model
+// already says `is_absolute()` the second term adds nothing, and where it does
+// not, `has_root_directory()` still sees the leading separator every model
+// preserves. A Windows DRIVE-RELATIVE `C:foo` has a root NAME but no root
+// DIRECTORY and correctly stays relative -- it IS relative, to that drive's
+// working directory.
+[[nodiscard]] DSS_EXPORT bool isRootedPath(std::filesystem::path const& p);
+
 // Resolve ONE relative name inside ONE directory under `matching`. This is the
 // atom every search below is built from, exposed because the preprocessor's
 // quote-include search adds its own per-candidate `is_regular_file` filter and

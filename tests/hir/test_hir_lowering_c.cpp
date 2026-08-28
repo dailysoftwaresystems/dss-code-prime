@@ -1743,24 +1743,39 @@ TEST(HirLoweringC, LeadingPackedAttributeRejectedLoud) {
         << "leading [[gnu::packed]] must fail loud, never silently drop packed";
 }
 
-// D-CSUBSET-PACKED (F-3): the GNU spelling of the SAME leading form —
-// `__attribute__((packed)) struct S {…} gv;` — is likewise UNHONORED and fails loud.
-// Sibling to LeadingPackedAttributeRejectedLoud (the C23 `[[gnu::packed]]` form):
-// here `attrSpec` is NOT in the linkage-ignored rules, so the leading
-// `__attribute__((packed))` takes the RECOGNIZED-specifier path, `packed` is not a
-// linkage keyword, and lowering fails loud H_UnknownLinkageSpecifier (exactly like a
-// leading `__attribute__((bogus))`). Must NOT be silently honored-or-dropped.
-TEST(HirLoweringC, LeadingGnuPackedAttributeRejectedLoud) {
+// ★★ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — RETARGETED, AND THE
+// MEASUREMENT THAT RETARGETED IT REVERSES THE ONE THIS PIN WAS BUILT ON.
+//
+// It asserted that `__attribute__((packed)) struct S { char c; int v; } gv;` must
+// FAIL LOUD, on the reasoning that accepting it would "silently drop packed" and
+// leave a struct of the wrong size. ✔RE-MEASURED against the REFERENCES rather
+// than against the unpacked control: gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+// (`-std=c23`), probed SEPARATELY, BOTH compile this exact program at rc=0 with
+// `'packed' attribute ignored [-Wattributes]` and BOTH report `sizeof(struct S)
+// == 8`. A leading `packed` does not reach the composite in ANY of the three
+// implementations, so 8 is the CORRECT answer and there was never a layout fact
+// to drop — the earlier finding compared DSS to the UNPACKED control and read
+// agreement-with-the-references as a miscompile.
+//
+// So the contract is: ACCEPTED, and NOT HONORED. The refusal half is pinned here
+// (a return of the hardcoded Error reds this); the layout half — the part that
+// would be a real miscompile — is pinned where `sizeof` is observable, by
+// `SemanticAnalyzerC.LeadingGnuPackedDoesNotPackTheComposite`, because this
+// fixture analyses with no layout in scope and could not see it.
+TEST(HirLoweringC, LeadingGnuPackedAttributeIsAcceptedNotRefused) {
     SemanticModel model = analyzeC(
         "__attribute__((packed)) struct S { char c; int v; } gv;\n"
         "int main(void){ return 0; }\n");
     ASSERT_FALSE(model.hasErrors())
-        << "test setup: the leading GNU attribute parses + analyzes cleanly; the "
-           "rejection is at lowering, not at parse/semantic";
+        << "test setup: the leading GNU attribute parses + analyzes cleanly";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
-        << "leading __attribute__((packed)) must fail loud, never silently drop packed";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "`packed` is attribute vocabulary this language MODELS — the linkage "
+           "scan must not adjudicate it as an unrecognized linkage specifier";
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok) << "every reference compiles this program";
+    EXPECT_FALSE(r.hasErrors());
 }
 
 // CONTRAST: a leading standard-ignorable attribute (`[[deprecated]]`) STAYS silently
@@ -2441,16 +2456,39 @@ TEST(HirLoweringC, GnuSemanticAttributeSpellingsFileScopeLowerClean) {
 // The Fork-2 BOUNDARY regression guard: an UNKNOWN GNU attribute at file scope
 // STILL fails loud H_UnknownLinkageSpecifier (the by-name skip covers ONLY the
 // declared semantic-attribute names — it must not become a wholesale ignore).
-TEST(HirLoweringC, GnuUnknownAttributeFileScopeStillFailsLoud) {
+// ★★ P44 ([[D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY]], THE THIRD TIER) — THIS
+// PIN WAS RENAMED AND GREW ITS SECOND HALF, and the reason is worth keeping: it
+// was called `GnuUnknownAttributeFileScopeStillFailsLoud` and asserted ONLY the
+// diagnostic COUNT, so when the verdict became a warning it stayed GREEN while its
+// NAME became a lie. A pin whose name says "FailsLoud" about a program that
+// compiles is a misnamed red waiting for the next reader.
+//
+// It now asserts BOTH halves, which is what makes it able to fail in either
+// direction:
+//   * the name is still REPORTED — the typo protection this gate exists for. Drop
+//     the emit in `linkageFrom` and the count goes to 0.
+//   * the program is NOT REFUSED — ✔gcc 13.3.0, ✔clang 18.1.3 and ✔mingw-w64 gcc
+//     13.2.0, probed SEPARATELY, all compile this and exit 0 with
+//     `'frobnicate' attribute directive ignored [-Wattributes]`. Restore the
+//     hardcoded `Error` severity and `res->ok` goes false.
+// The severity is the DECLARATION ROW's (`unknownStrictAttributeIsError`, which
+// `topLevelDecl` declares false), so this pin also witnesses that the HIR tier
+// reads that key rather than overriding it.
+TEST(HirLoweringC, GnuUnknownAttributeAtFileScopeIsWarnedNotRefused) {
     SemanticModel model = analyzeC(
         "__attribute__((frobnicate)) int f(void) { return 1; } "
         "int main(){ return f() - 1; }");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    (void)res;
     EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
-        << "an unknown GNU attribute must keep the loud typo-protection gate";
+        << "an unknown GNU attribute must keep the typo-protection diagnostic";
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok)
+        << "…but it must not REFUSE the program: every reference compiles it";
+    EXPECT_FALSE(r.hasErrors())
+        << "the diagnostic must be a WARNING — a program both references build "
+           "must not come out of this tier with an error recorded";
 }
 
 // P42 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — THE DRIFTED SECOND ROSTER,
@@ -2482,14 +2520,24 @@ TEST(HirLoweringC, GnuInertHintNamesAreNotUnknownLinkageSpecifiers) {
     }
 }
 
-// THE CONTROL, and it is what stops the repair above from being read as
-// "silence more things": the three names deliberately LEFT OUT carry real
-// layout / aliasing / ABI weight that DSS does not implement, so the loud
-// refusal is the only tier still saying so. Silencing them would trade a
-// refusal for a SILENT DROP with observable consequences — a leading
-// `__attribute__((packed)) struct S {…} s;` is not reached by the composite
-// scan, so it would go from a loud error to a wrong `sizeof`.
-TEST(HirLoweringC, GnuWeightBearingHintNamesStayLoudAtFileScope) {
+// ★★ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — THIS PIN IS INVERTED, AND
+// THE INVERSION IS THE FIX. It used to require `packed`, `may_alias` and
+// `transparent_union` to STAY LOUD at file scope, on the reasoning that they
+// carry layout/aliasing weight DSS does not implement, so the refusal was "the
+// only tier still saying so".
+// ✔RE-MEASURED, each reference separately: `__attribute__((may_alias)) int gv =
+// 7;` is SILENT on gcc 13.3.0 AND clang 18.1.3 — DSS was reporting a name this
+// very config models, and refusing the program outright before P44's engine half.
+// The layout fear is answered by
+// `HirLoweringC.LeadingGnuPackedAttributeIsAcceptedNotRefused` above and by the
+// `sizeof` pin in the semantic suite: both references also give `sizeof == 8` for
+// the leading `packed`, so nothing is dropped by accepting it.
+// The roster these names had drifted out of is now DERIVED from the effects
+// table, so their silence is a consequence of the language modelling them rather
+// than of anyone remembering to list them.
+// RED-ON-DISABLE: delete the derivation loop in `grammar_schema_json.cpp` and
+// every count here returns to 1.
+TEST(HirLoweringC, GnuModelledInertNamesAreNotUnknownLinkageSpecifiers) {
     for (char const* name : {"packed", "may_alias", "transparent_union"}) {
         SemanticModel model = analyzeC(
             std::string("__attribute__((") + name + ")) int gv = 7; "
@@ -2497,11 +2545,29 @@ TEST(HirLoweringC, GnuWeightBearingHintNamesStayLoudAtFileScope) {
         ASSERT_FALSE(model.hasErrors()) << name;
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        (void)res;
-        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
-            << "an attribute DSS cannot honor must not be silently dropped: "
-            << name;
+        ASSERT_TRUE(res != nullptr) << name;
+        EXPECT_TRUE(res->ok) << name;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << "a name the effects table declares KNOWN must not be adjudicated "
+               "by the linkage scan's separate roster: " << name;
     }
+}
+
+// THE CONTROL that stops the change above from being read as "silence more
+// things": a name the language models NOWHERE is still reported. Without this
+// pair, deleting the whole unknown-name arm would look like a fix.
+TEST(HirLoweringC, GnuGenuinelyUnmodelledNameIsStillReportedAtFileScope) {
+    SemanticModel model = analyzeC(
+        "__attribute__((frobnicate_xyz)) int gv = 7; "
+        "int main(){ return gv - 7; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "the typo protection must survive the derivation";
+    EXPECT_TRUE(res->ok)
+        << "…as a WARNING: both references compile it and exit 0";
 }
 
 // ── TfC71 (D-HIR-ADJACENT-CONCAT-WALL-UNTESTED): the linkage-specifier
@@ -8842,7 +8908,18 @@ TEST(HirLoweringC, TFC112IncompatibleRedeclarationOfAShimSymbolFailsLoud) {
         "int printf(const char *fmt);\n"   // NOT variadic — cannot be the shim
         "int main(void) { return printf(\"hi\\n\"); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
-    ASSERT_FALSE(model.hasErrors());
+    // ★ P44 ([[D-CSUBSET-INCOMPATIBLE-REDECL-DIAGNOSED-AT-CALL-SITE-NOT-DECLARATION]]):
+    // this used to `ASSERT_FALSE(model.hasErrors())` — the semantic tier said
+    // NOTHING about a declaration that contradicts the platform's own, which is
+    // the wrong-TIER half of that row and is why the identical source on an ELF
+    // target (where `printf` is an ordinary import, so this gate never runs)
+    // compiled completely clean. The declaration-site diagnostic now fires, and
+    // this gate is the BACKSTOP rather than the only voice. Both must speak: a
+    // shim gate that went quiet once the analyzer complained would leave the
+    // wrong-ABI binding unrefused for any caller that lowers anyway.
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "C23 6.7p4 wants the diagnostic AT THE DECLARATION";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
@@ -8864,7 +8941,10 @@ TEST(HirLoweringC, TFC112WrongArityRedeclarationOfAShimSymbolFailsLoud) {
         "int sprintf(char *b, const char *f, int extra, ...);\n"
         "int main(void) { char b[8]; return sprintf(b, \"%d\", 1, 2); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
-    ASSERT_FALSE(model.hasErrors());
+    // P44: the declaration-site diagnostic now fires here too — see the
+    // arity-arm's sibling above for why both tiers must speak.
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u);
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
@@ -8940,7 +9020,11 @@ TEST(HirLoweringC, TFC112IncompatibleInlineDefinitionOfAShimSymbolFailsLoud) {
         "inline int printf(const char *fmt) { return -1; }\n"   // not variadic
         "int main(void) { return printf(\"inl\\n\"); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
-    ASSERT_FALSE(model.hasErrors());
+    // P44: the declaration-site diagnostic now fires for the inline-definition
+    // spelling as well — the C99 6.7.4p7 arm is a DECLARATION for compatibility
+    // purposes, so it must be judged like one.
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u);
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);

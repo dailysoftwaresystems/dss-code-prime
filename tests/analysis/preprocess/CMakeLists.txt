@@ -41,3 +41,27 @@ dss_add_test(NAME analysis/preprocess/test_preprocess_no_rework
              SOURCES test_preprocess_no_rework.cpp)
 target_include_directories(dss_analysis_preprocess_test_preprocess_no_rework
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: a diagnostic whose SUBJECT is a
+# macro-expansion PRODUCT token must point at the EXPANSION SITE, not at the
+# offset an extrapolation through the line map produced (and not at the
+# end-of-file the renderer's clamp then made of it). A separate binary rather
+# than more cases in test_preprocessor.cpp because every case here asserts on
+# RENDERED diagnostic text through the full UnitBuilder -> reporter -> format
+# path, while that file's fixtures inspect a `preprocess()` token stream
+# directly; the two need different fixtures and different failure messages.
+dss_add_test(NAME analysis/preprocess/test_macro_expansion_diagnostic_position
+             SOURCES test_macro_expansion_diagnostic_position.cpp)
+target_include_directories(
+    dss_analysis_preprocess_test_macro_expansion_diagnostic_position
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# [[D-PP-PASTE-REJECTS-A-VALID-PREPROCESSING-NUMBER]] +
+# [[D-PP-PASTE-PRODUCT-IS-RE-READ-AS-THE-PASTE-OPERATOR]]: `##` validity is a
+# question about PREPROCESSING tokens (C 6.10.3.3p3 + 6.4.8), so the scanner
+# answers it and the preprocessor asks. A separate binary rather than more cases
+# in test_preprocessor.cpp because half the arms here drive the TOKENIZER
+# directly in a named phase, which that file never does, and because each arm
+# pairs an accept with the refusal that must still follow it.
+dss_add_test(NAME analysis/preprocess/test_paste_preprocessing_token
+             SOURCES test_paste_preprocessing_token.cpp)

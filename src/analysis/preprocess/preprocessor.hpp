@@ -237,6 +237,24 @@ struct DSS_EXPORT PreprocessResult {
     // pass through untouched.
     [[nodiscard]] std::function<void(BufferId&, SourceSpan&)> makeRemap() const;
 
+    // ── [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the same rewrite over a WHOLE
+    //    diagnostic ────────────────────────────────────────────────────────────
+    //
+    // Primary span, every related location, AND — when the diagnostic's subject
+    // is a macro-expansion PRODUCT token — an appended
+    // `note: expanded from macro 'X'` at that macro's `#define`. The position
+    // half is the same `remapOnePosition` `makeRemap` uses; only the annotation
+    // needs the diagnostic, which a `(BufferId&, SourceSpan&)` closure cannot
+    // reach.
+    //
+    // ★ BOTH SHAPES EXIST BECAUSE BOTH CONSUMERS DO. `makeRemap`'s callers —
+    // the LSP position map, the shipped-descriptor refs, every post-parse tier's
+    // `remapPreprocessedPositions` — convert a bare coordinate and have no
+    // diagnostic to annotate. `DiagnosticReporter::remapBuffers` accepts either
+    // and dispatches on the callable's signature, so `Tree::remapDiagnostics`
+    // and every other call site is unchanged.
+    [[nodiscard]] std::function<void(ParseDiagnostic&)> makeDiagnosticRemap() const;
+
     // The Eof token that terminates `tokens`.
     //
     // ★ USE THIS, NEVER `tokens.back()` ([[D-PP-RESULT-CONTRACT-SINGLE-EXIT]]).

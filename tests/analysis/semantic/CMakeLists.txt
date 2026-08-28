@@ -193,3 +193,21 @@ dss_add_test(NAME analysis/semantic/test_paren_declarator_function
              SOURCES test_paren_declarator_function.cpp)
 target_include_directories(dss_analysis_semantic_test_paren_declarator_function
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P44 lane a: [[D-CSUBSET-SUPPRESSED-SHIPPED-ROW-SIGNATURE-UNCHECKED]],
+# [[D-LANG-TYPE-IDENTITY-QUALIFIER-BLIND-VS-C23-REDECL]] and
+# [[D-CSUBSET-INCOMPATIBLE-REDECL-DIAGNOSED-AT-CALL-SITE-NOT-DECLARATION]] --
+# ONE C23 6.7.6.3p15 / 6.7.6.1p2 compatibility oracle and its three callers.
+# Lives here rather than only in the runnable corpus because almost everything
+# that separates a landed fix from an over-reach is a REFUSAL beside its nearest
+# ACCEPTING twin, and an example must BUILD: the accept half alone passes under a
+# check that was deleted, and the refuse half alone passes under one that refuses
+# everything. It also owns the SCOPE guard -- a name the source never `#include`d
+# must NOT be judged against the shipped corpus -- which is measurable only by
+# running the real descriptor corpus at two object formats in one process. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root for the same
+# reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_redeclaration_compat
+             SOURCES test_redeclaration_compat.cpp)
+target_include_directories(dss_analysis_semantic_test_redeclaration_compat
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

@@ -94,3 +94,20 @@ dss_add_test(NAME mir/test_mir_inline_asm_immediate
              SOURCES test_mir_inline_asm_immediate.cpp)
 target_link_libraries(dss_mir_test_mir_inline_asm_immediate
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-MIRTEXT-GLOBAL-FLAGS-DROPPED-BY-ROUNDTRIP: a global's binding, visibility,
+# constness, thread storage and explicit alignment must SURVIVE emit -> parse.
+# `parseGlobal` re-minted all four flags as defaults in every arm and never read
+# an alignment at all, so a `static const _Thread_local alignas(64)` global came
+# back plain — with `ok == true`. ⚠ The existing round-trip pin cannot see it:
+# it asserts `firstEmit == secondEmit`, and a TOTALLY LOSSY round trip satisfies
+# that. These cases assert the PARSED MODULE's fields, each as a negative
+# against the default it used to collapse to.
+dss_add_test(NAME mir/test_mir_text_global_attrs
+             SOURCES test_mir_text_global_attrs.cpp)
+
+# P44 lane d row 2 — the `.dssir` twin of D-LIR-TEXT-PARSE-UNSEALED-BLOCK-ABORT.
+# `mir_text.cpp`'s `if (errors_) return;` guard before `beginBlock` covers every
+# DIAGNOSED malformation; these two shapes set no `errors_` at all.
+dss_add_test(NAME mir/test_mir_text_unsealed_block
+             SOURCES test_mir_text_unsealed_block.cpp)

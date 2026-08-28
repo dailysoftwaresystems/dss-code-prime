@@ -615,11 +615,26 @@ TEST(PeExecWriterExternSlot, DataItemRelocTargetingExternDataFailsLoudOnExecToo)
 
 // ── (5) The remaining fail-loud belts ────────────────────────────
 
-TEST(PeDllWriter, AbsoluteTextRelocFailsLoud) {
-    // D-LK-PE-IMAGE-TEXT-ABS-RELOC: an absolute fixup in `.text` of a
-    // DYNAMIC_BASE image has no `.reloc` site collector — rejecting
-    // beats shipping a preferred-base address the loader never
-    // adjusts.
+TEST(PeDllWriter, AbsoluteTextRelocIsCollectedIntoDotReloc) {
+    // D-LK-PE-IMAGE-TEXT-ABS-RELOC — CLOSED. An 8-byte absolute fixup in
+    // `.text` is no longer refused: the walker collects its site into `.reloc`,
+    // so the loader adjusts the baked VA on rebase exactly as it adjusts a data
+    // pointer.
+    //
+    // ★★ THIS TEST USED TO ASSERT THE REFUSAL, and the refusal was correct
+    // until a producer appeared. One did: an ordinary `gcc -c -O2` object whose
+    // function carries `movabsq $g, %rax` emits `IMAGE_REL_AMD64_ADDR64` into
+    // `.text`, native gcc + ld link it into a binary that RUNS to exit 42, and
+    // DSS ingests such objects through the shipped `--resolve-library`
+    // static-link path. Refusing what a reference toolchain accepts puts DSS
+    // below `(gcc ∪ clang ∪ MSVC) ∪ ISO C`, so collecting is the close and
+    // rejecting is no longer available.
+    //
+    // ★ THE ASSERTION IS THE EMITTED TABLE, not the absence of a diagnostic.
+    // `readDir64Sites` re-decodes `.reloc` from the image bytes independently of
+    // the code that wrote it, and the expected RVA is computed from the
+    // instruction layout: the `movabs` opcode is 2 bytes, so its imm64 operand
+    // — the slot the loader must adjust — begins at `.text` + 2.
     auto loaded = loadShippedDll();
     AssembledModule mod;
     mod.expectedFuncCount = 2;
@@ -629,7 +644,47 @@ TEST(PeDllWriter, AbsoluteTextRelocFailsLoud) {
     Relocation rel;
     rel.offset = 2;
     rel.target = SymbolId{2};
-    rel.kind   = RelocationKind{2};   // abs64 — Linear, !pcRelative
+    rel.kind   = RelocationKind{2};   // abs64 — Linear, !pcRelative, width 8
+    rel.addend = 0;
+    f0.relocations.push_back(rel);
+    mod.functions.push_back(std::move(f0));
+    AssembledFunction f1;
+    f1.symbol = SymbolId{2};
+    f1.bytes  = {0xC3};
+    mod.functions.push_back(std::move(f1));
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(img.empty()) << "an absolute in .text must now LINK";
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    SectionView const text = findSection(img, ".text");
+    ASSERT_TRUE(text.found);
+    std::uint32_t const wantRva = text.virtualAddress + 2u;
+    auto const sites = readDir64Sites(img);
+    EXPECT_NE(std::find(sites.begin(), sites.end(), wantRva), sites.end())
+        << "the imm64 slot at .text+2 (RVA " << wantRva << ") must carry an "
+           "IMAGE_REL_BASED_DIR64 row, or a rebased image keeps the "
+           "preferred-base address in code the loader never adjusts";
+}
+
+TEST(PeDllWriter, AbsoluteTextRelocOfUnrepresentableWidthStillFailsLoud) {
+    // ★★★ THE BELT WAS NARROWED, NOT DELETED, AND THIS IS ITS REMAINING
+    // TRIGGER. `IMAGE_REL_BASED_DIR64` is the only base-relocation form this
+    // writer emits, so an absolute of any OTHER width has no representation in
+    // `.reloc`. Collecting it is impossible and shipping it uncollected is the
+    // silent wrong-address the belt exists to stop — it must still refuse.
+    // Without this case the belt would have no reachable trigger left, and a
+    // guard nothing can fire is a guard the next reader deletes as dead code.
+    auto loaded = loadShippedDll();
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction f0;
+    f0.symbol = SymbolId{1};
+    f0.bytes  = {0xB8, 0, 0, 0, 0, 0xC3};   // mov eax, imm32
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{2};
+    rel.kind   = RelocationKind{3};   // abs32 — !pcRelative, !tls, width 4
     rel.addend = 0;
     f0.relocations.push_back(rel);
     mod.functions.push_back(std::move(f0));
@@ -669,6 +724,8 @@ namespace {
     std::string s = R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".dll",
       "dataModel": "LLP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"t-dll","kind":"pe"},
@@ -722,6 +779,8 @@ TEST(PeDllFormatJsonValidate, ExecWithImageFileDllBitRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".exe",
       "dataModel": "LLP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"t-exe","kind":"pe"},

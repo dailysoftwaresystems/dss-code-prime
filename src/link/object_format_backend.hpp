@@ -3,9 +3,11 @@
 #include "core/export.hpp"
 #include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList — the ONE closed-set renderer
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind (the BRIDGE type — see the tier note)
+#include "core/types/strong_ids.hpp"          // CompilationUnitId — by VALUE in readRelocatableObject
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -121,14 +123,32 @@ public:
     [[nodiscard]] virtual std::string_view configName() const noexcept = 0;
 
     // ★ THE BRIDGE, AND THE ONLY REASON `ObjectFormatKind` APPEARS IN THIS
-    // HEADER. `src/program/` and `src/ffi/` still hold identity branches of
-    // this same species (MEASURED TF-C125: `target_spec.cpp`'s output-EXTENSION
-    // switch, `cross_validate_target_format.cpp`'s machine-code switch,
+    // HEADER.
+    //
+    // ⚠⚠ THIS COMMENT LISTED FIVE OPEN IDENTITY BRANCHES AND ALL FIVE ARE NOW
+    // CLOSED — do not read the list below as live work. TF-C125 measured them
+    // as `target_spec.cpp`'s output-EXTENSION switch,
+    // `cross_validate_target_format.cpp`'s machine-code switch,
     // `compile_pipeline.cpp`'s archive-member reader switch, `program.cpp`'s
-    // `.obj`/`.o` pick, and `abi_catalog.cpp`'s calling-convention table).
-    // Those are anchored, NOT fixed here — they sit outside this cycle's
-    // authorized file set. Until they close, `ObjectFormatSchema::kind()` must
-    // keep answering, and it answers from here.
+    // `.obj`/`.o` pick, and `abi_catalog.cpp`'s calling-convention table, and
+    // said they "sit outside this cycle's authorized file set". P44 closed
+    // them: the calling-convention table under
+    // [[D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY]] and
+    // the other four under
+    // [[D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES]]. Three became
+    // DECLARED per-format facts (`outputExtension`, `archiveMemberExtension`,
+    // `archiveFlavor`, `targetArch`, `cCallingConvention`); the reader switch
+    // became `readRelocatableObject` on this interface, beside `encode`.
+    //
+    // ★ SO WHY DOES `kind()` SURVIVE? Because a bridge VALUE is not a bridge
+    // BRANCH, and the distinction is the one this header already draws for
+    // `linker.cpp` below. `objectFormatKindName(...)` still appears in
+    // DIAGNOSTIC STRINGS (`src/ffi/ingest.cpp`, the wasm/spirv no-reader
+    // refusals) and in the `FormatGuess` → kind translation a binary sniffer
+    // performs. Naming what you found is not deciding what to do about it.
+    // MEASURED at P44 close: no `==`, `switch` or table keyed on this enum
+    // remains anywhere in `src/program/`, `src/ffi/` or `src/link/` outside the
+    // backends that own their own identity by design.
     //
     // ⚠ ONE `src/link/` CALLER REMAINS, and an earlier draft of this comment
     // wrongly said there were none (caught by an independent audit).
@@ -338,6 +358,33 @@ public:
            ObjectFormatSchema const& objectFormatSchema,
            DiagnosticReporter&       reporter,
            ImageRequest const&       request) const = 0;
+
+    // ── Read ────────────────────────────────────────────────────────────
+    //
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: decode ONE relocatable
+    // object — an archive member — into an `AssembledModule`. Replaces the
+    // 3-arm `switch (format.kind())` in `compile_pipeline.cpp::
+    // readArchiveMemberModule`, which is the exact counterpart of the `encode`
+    // switch above and moved for the same reason.
+    //
+    // ⚠ `nullopt` means THE READ DID NOT PRODUCE A MODULE, and it is the only
+    // failure signal — never `AssembledModule::ok()`, whose contract the three
+    // readers document at length. A backend with no reader emits its OWN
+    // refusal and returns nullopt; the old code had a shared `default:` arm
+    // doing that, and moving it into each backend is what makes a SIXTH format
+    // impossible to add with a silently missing reader — the pure virtual
+    // forces an answer, where a `default:` arm silently absorbed one.
+    //
+    // ★ THE PARAMETER IS `objectFormatSchema` = WHAT THE MEMBER IS, never what
+    // the link is producing. The caller resolves the member's own schema first
+    // (`archiveMemberFormat`); this method is handed that, and the invariant is
+    // the whole reason the old function existed as a funnel.
+    [[nodiscard]] virtual std::optional<AssembledModule>
+    readRelocatableObject(std::span<std::uint8_t const> bytes,
+                          TargetSchema const&           targetSchema,
+                          ObjectFormatSchema const&     objectFormatSchema,
+                          DiagnosticReporter&           reporter,
+                          CompilationUnitId             cuId) const = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────

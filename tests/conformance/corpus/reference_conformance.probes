@@ -1307,7 +1307,6 @@ int asm = 7;
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: rejected by DSS, accepted by gcc 13.3.0 and clang 19.1.1. DSS accepts other GNU attributes (packed / aligned / noreturn all pass), so this is a per-ATTRIBUTE hole rather than absent attribute support — which is why it is its own row.
 @why GNU `__attribute__((constructor))`.
 @code
 int dss_attr_constructor_probe(void) __attribute__((constructor));
@@ -1319,7 +1318,6 @@ int dss_attr_constructor_probe(void) __attribute__((constructor));
 @min-stdc 0
 @families gnu
 @expect-ref accept
-@acknowledged-gap MEASURED direction-A gap: rejected by DSS, accepted by gcc 13.3.0 and clang 19.1.1. Worth noting next to the direction-B extern-realization family: `alias` is one of the reference-compiler mechanisms for STATING that a name resolves to another symbol, i.e. part of the vocabulary DSS invented its own syntax for instead of adopting.
 @why GNU `__attribute__((alias("target")))`.
 @code
 int dss_alias_target_probe(void) { return 1; }

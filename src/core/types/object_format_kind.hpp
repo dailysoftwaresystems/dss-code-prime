@@ -22,18 +22,28 @@
 // 800-LOC substrate. Concrete callers:
 //   * `src/ffi/`     — `synthesizeFfiFromSourceDecls` reports the
 //                      kind in `F_FfiNoImportLibraryForFormat`
-//                      diagnostics; `abi_catalog.cpp`'s `kAbiCatalog`
-//                      still SELECTS THE CALLING CONVENTION from a
-//                      table keyed on (target name, this enum) — an
-//                      OPEN identity branch, anchored at
-//                      [[D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY]],
-//                      NOT a sanctioned use.
-//                      ⚠ THIS BULLET USED TO READ "FF4 C-mangling
-//                      dispatches on `ObjectFormatKind` (per-format
-//                      leading-underscore rule)", which `c_mangle.cpp`
-//                      has CONTRADICTED since TF-C122 deleted
-//                      `kCManglingRules` and made decoration a DECLARED
-//                      per-format verb. Corrected TF-C125.
+//                      diagnostics. THAT IS NOW THE ONLY MENTION IN
+//                      THE TIER, and it is a diagnostic STRING, not a
+//                      dispatch.
+//                      ⚠ THIS BULLET HAS BEEN WRONG TWICE, IN THE SAME
+//                      WAY, AND BOTH CORRECTIONS ARE THE SAME STORY.
+//                      It first read "FF4 C-mangling dispatches on
+//                      `ObjectFormatKind`", which `c_mangle.cpp` had
+//                      contradicted since TF-C122 deleted
+//                      `kCManglingRules`; TF-C125 replaced that with
+//                      "`abi_catalog.cpp`'s `kAbiCatalog` still SELECTS
+//                      THE CALLING CONVENTION from a table keyed on
+//                      (target name, this enum)". P44 deleted
+//                      `kAbiCatalog` too, for the identical reason and
+//                      by the identical means (a DECLARED per-format
+//                      verb, `cCallingConvention`), closing
+//                      [[D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY]].
+//                      ★ `abi_catalog.cpp` no longer speaks this enum
+//                      AT ALL — the same load-bearing half as
+//                      `c_mangle.cpp`: with the identity absent from
+//                      every signature there, an identity branch is not
+//                      something a reviewer must look for, it is
+//                      unrepresentable.
 //   * `src/program/` — `compile_pipeline.cpp`'s archive-member reader
 //                      switch, `program.cpp`'s `.obj`/`.o` member-
 //                      extension pick, and `cross_validate_target_
@@ -329,6 +339,111 @@ cSymbolDecorationSchemeFromName(std::string_view s) noexcept {
 struct DSS_EXPORT CSymbolDecoration {
     CSymbolDecorationScheme scheme = CSymbolDecorationScheme::Unspecified;
 };
+
+// ── D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY ────────
+//
+// WHICH of the paired target's `callingConventions[]` rows is the PLATFORM C
+// ABI for code compiled into this object format. The exact sibling of
+// `cSymbolDecoration` one field above, closing the exact sibling defect: the
+// answer used to be re-derived in C++ by `kAbiCatalog`, a closed table keyed
+// on (target NAME, `ObjectFormatKind`), while the very strings it produced —
+// `"sysv_amd64"`, `"ms_x64"`, `"apple_arm64"` — were already spelled in the
+// shipped descriptors. Two owners of one fact, in two languages, with nothing
+// forcing them to agree; `kCManglingRules` was the first of the pair and was
+// DELETED rather than relocated, and so is this one.
+//
+// ★ WHY THE FORMAT AND NOT THE TARGET, AND WHY A SINGLE SCALAR IS ENOUGH.
+// The platform ABI is a fact about (ISA × OS), and a `.format.json` already
+// pins both: `crossValidateTargetFormat` REFUSES any (target, format) pair
+// whose declared machine code disagrees with the target's arch, so a format
+// document that loads at all has exactly one arch it can ever be paired with.
+// The old table's first column was therefore never carrying information — it
+// was re-stating what the format already implies. One string per format is
+// the whole fact.
+//
+// ★ THE RESERVED `none` SPELLING, AND WHY IT IS SAFE HERE. An operand-stack
+// (WASM) or result-id (SPIR-V) format has no register-level C calling
+// convention at all — not "an unknown one", none. `none` says exactly that,
+// and `resolveAbi` turns it into a NULL `cc` pointer, which is the signal the
+// driver and FFI ingest already refuse on. This is an in-band sentinel inside
+// a NAME space, which is the hazard `objectFormatKindName`'s "★ THE SENTINEL
+// SPELLS CORRECTLY" note warns about — so the collision is closed from the
+// other side too: `TargetSchemaData::validate()` REFUSES a
+// `callingConventions[]` row named `none`, so the spelling cannot ever denote
+// both "no convention" and some real convention.
+inline constexpr std::string_view kCCallingConventionNone = "none";
+
+// The format's C calling-convention block (`"cCallingConvention"` in
+// `.format.json`). A BLOCK carrying one `convention` verb rather than a bare
+// scalar, for `cSymbolDecoration`'s stated reason: a future per-format ABI
+// parameter (a layout-quirk selector, say — D-FF3-1) gains a sibling key
+// INSIDE this block instead of a second root key. REQUIRED on every format —
+// see `ObjectFormatData::validate()` for why the rule is unconditional.
+struct DSS_EXPORT CCallingConvention {
+    // Empty is the INVALID sentinel (a hand-built `ObjectFormatData` that
+    // never set it); `kCCallingConventionNone` means "no register-level C
+    // calling convention"; anything else NAMES a row in the paired target's
+    // `callingConventions[]` array and is resolved there, failing loud on a
+    // miss.
+    std::string convention;
+
+    [[nodiscard]] bool declared() const noexcept {
+        return !convention.empty();
+    }
+    [[nodiscard]] bool declaresNoConvention() const noexcept {
+        return convention == kCCallingConventionNone;
+    }
+};
+
+// ── D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the archive `ar` flavor ──
+//
+// WHICH `ar` variant this format's ecosystem uses. `src/program/` used to
+// re-derive it with `format.kind() == ObjectFormatKind::Pe ? Coff : SysV` — an
+// identity branch deciding a BYTE LAYOUT (the COFF flavor adds the
+// little-endian second linker member that `link.exe` requires), which is the
+// species the veto exists for.
+//
+// ★ A CLOSED VERB, NOT AN OPEN NAME — the opposite choice from
+// `cCallingConvention` above, and for that field's own stated reason read
+// backwards: an `ar` flavor is an ENGINE capability (only variants
+// `writeArArchive` implements can be honored), where a calling-convention name
+// is the PROCESSOR'S vocabulary. A free string here would let config request an
+// archive layout no writer realizes, and nothing could refuse it at load.
+enum class ArchiveFlavor : std::uint8_t {
+    // Zero is the INVALID sentinel — a hand-built `ObjectFormatData` that never
+    // set it is rejected by `ObjectFormatData::validate()`. Deliberately has NO
+    // spelling: leaving it out of the table below is what makes `fromName("")`
+    // refuse it rather than resolve to it.
+    Unspecified = 0,
+    SysV        = 1,  // GNU / System V `.a` — ELF and Mach-O ecosystems
+    Coff        = 2,  // Microsoft COFF `.lib` — adds the 2nd linker member
+};
+
+inline constexpr EnumNameTable<ArchiveFlavor, 2> kArchiveFlavorTable{{{
+    { ArchiveFlavor::SysV, "sysv" },
+    { ArchiveFlavor::Coff, "coff" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling.
+DSS_CHECK_ENUM_NAME_TABLE(kArchiveFlavorTable);
+
+[[nodiscard]] constexpr std::string_view
+archiveFlavorName(ArchiveFlavor f) noexcept {
+    // The `-Werror=switch` backstop; it owns no spelling.
+    switch (f) {
+        case ArchiveFlavor::Unspecified:
+        case ArchiveFlavor::SysV:
+        case ArchiveFlavor::Coff:
+            break;
+    }
+    return kArchiveFlavorTable.nameOrEmpty(f);   // NOT .name()
+}
+[[nodiscard]] constexpr std::optional<ArchiveFlavor>
+archiveFlavorFromName(std::string_view s) noexcept {
+    return kArchiveFlavorTable.fromName(s);
+}
 
 // ── Extern-call dispatch model (D-FFI-EXTERN-CALL-DISPATCH) ────────
 //

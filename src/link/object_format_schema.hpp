@@ -1119,6 +1119,101 @@ struct DSS_EXPORT ObjectFormatData {
     // by validate() (the loader path always sets it or fails).
     CSymbolDecoration    cSymbolDecoration{};
 
+    // ── D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY ──
+    //
+    // REQUIRED top-level `"cCallingConvention"` BLOCK (`{"convention":
+    // "sysv_amd64"}` / `{"convention": "none"}`; loader fails loud on missing
+    // or empty). WHICH of the paired target's `callingConventions[]` rows is
+    // the platform C ABI for code compiled into this format — the exact
+    // sibling of `cSymbolDecoration` directly above, required for the exact
+    // same reason: the fact had TWO OWNERS (a C++ table keyed on (target
+    // name, format kind), and these descriptors, which already spelled the
+    // very strings the table produced) and a silent default would just make
+    // the C++ answer the invisible winner again.
+    //
+    // Unlike `cSymbolDecoration` the value is NOT a closed enum: it is a NAME
+    // resolved against the paired target document, because the set of
+    // conventions a processor offers is that processor's vocabulary to
+    // declare, not this engine's to enumerate. The two failure directions are
+    // both loud and both at USE rather than at load — an unresolvable name is
+    // `F_AbiNoMatchingCcInTarget`, and a `none`/register-machine disagreement
+    // is `F_AbiUnknownTuple` — because neither can be judged by a format
+    // document alone.
+    //
+    // See `CCallingConvention` (core/types/object_format_kind.hpp) for the
+    // reserved `none` spelling and why a single scalar carries the whole
+    // fact. The empty default is the INVALID sentinel: a hand-built
+    // ObjectFormatData that never set it is rejected by validate() (the
+    // loader path always sets it or fails).
+    CCallingConvention   cCallingConvention{};
+
+    // ── D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: output naming ──
+    //
+    // REQUIRED top-level `"outputExtension"` — the extension the DRIVER appends
+    // to an artifact this format produces (`".o"`, `".exe"`, `".dylib"`,
+    // `".so"`, `".a"`, `".lib"`, `".wasm"`, `".spv"`, or `""` for a Unix
+    // executable). `src/program/target_spec.cpp::outputExtensionFor` used to
+    // derive it from a `switch (fmt.kind())` with a nested per-kind
+    // sub-schema switch inside each arm — SEVEN identity mentions computing a
+    // NAMING fact, which is not an engine behaviour at all and was the clearest
+    // case in the anchor for belonging in the format's own declaration.
+    //
+    // ★ THE EMPTY STRING IS A LEGAL DECLARED VALUE, WHICH IS WHY THIS IS AN
+    // `optional` AND NOT A BARE `std::string`. A Unix executable HAS no
+    // extension, so `""` is the right answer for four shipped formats — and if
+    // absence and emptiness were the same state, "the author declared no
+    // extension" would be indistinguishable from "the author declared that
+    // there is none", and the required rule could not be enforced at all.
+    // DISENGAGED is the invalid sentinel; ENGAGED-and-empty is a real answer.
+    std::optional<std::string> outputExtension;
+
+    // ── D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the archive facts ──
+    //
+    // Both REQUIRED when `container == Archive` and REFUSED otherwise — a
+    // presence-paired rule with `container`, the shape `processExit` ⇔
+    // `entryCallingConvention` already uses. ⚠ Gating on `isStaticArchive()` is
+    // safe here in the way the `cSymbolDecoration` note warns it usually is
+    // NOT: the antecedent reads `container`, and neither consequent is a member
+    // of what `container` is derived from, so the rule cannot become the
+    // tautology the `processExit ⇒ isExecFlavor()` rule became.
+    //
+    // `archiveMemberExtension` — the extension each relocatable MEMBER inside
+    // the archive is named with (`.o` / `.obj`); `src/program/program.cpp` used
+    // `kind() == Pe ? ".obj" : ".o"`.
+    //
+    // `archiveFlavor` — WHICH `ar` variant to write; `compile_pipeline.cpp`
+    // used `kind() == Pe ? Coff : SysV`. A wrong answer here is not cosmetic:
+    // the COFF flavor carries the second linker member `link.exe` requires to
+    // resolve members at all.
+    std::optional<std::string> archiveMemberExtension;
+    ArchiveFlavor              archiveFlavor = ArchiveFlavor::Unspecified;
+
+    // ── D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: which TARGET ──
+    //
+    // OPTIONAL top-level `"targetArch"` — the `.target.json` NAME this format
+    // is for ("x86_64", "arm64", ...). `crossValidateTargetFormat` compares it
+    // against `TargetSchema::name()`: two DECLARED NAMES, which is what a
+    // validator is allowed to do, where the six-arm `switch (format.kind())` it
+    // replaces read a DIFFERENT FIELD per identity (`elf.machine` /
+    // `pe.machine` / `macho.cputype`) and compared each against a hardcoded C++
+    // table, `kTargetArchMachineCodes`, keyed on (target name x format kind).
+    //
+    // ★★ THE TABLE IS DELETED, AND THAT IS A ONE-OWNER ARGUMENT, NOT A
+    // CONVENIENCE. "arm64 is EM_AARCH64 = 183" had TWO owners: this document's
+    // own `elf.machine`, and that C++ row. Nothing forced them to agree, which
+    // is the identical shape as `kCManglingRules` and `kAbiCatalog`. The number
+    // now lives ONLY in the document that emits it, and the pairing question —
+    // "is this format for this target?" — is answered by a name the document
+    // states outright instead of being re-derived from a number.
+    //
+    // ⓘ OPTIONAL, and absence means THE DOCUMENT MAKES NO CLAIM — which is
+    // exactly what the deleted code did for a target absent from its table
+    // (`lookupTargetArch` returned null and the function returned true,
+    // "the check doesn't apply"). So this is NOT the silent-default hazard the
+    // required keys above exist to prevent: there is no engine answer left for
+    // it to hide. All 24 shipped formats declare it, swept by test.
+    std::string targetArch;
+
     // ── D-CSUBSET-BITFIELD-ABI-EXACT: the per-ABI bit-field PACKING strategy ──
     //
     // C bit-field allocation is genuinely ABI-defined and is determined by the
@@ -1758,6 +1853,48 @@ public:
     // path too, so no caller has to defend against it.
     [[nodiscard]] CSymbolDecoration const& cSymbolDecoration() const noexcept {
         return d_.cSymbolDecoration;
+    }
+    // D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY: WHICH
+    // of the paired target's `callingConventions[]` rows is the platform C
+    // ABI for this format, or the reserved `none` spelling for a format with
+    // no register-level C ABI at all. Always NON-EMPTY for a loader-produced
+    // schema — the field is REQUIRED at load, and `validate()` rejects the
+    // empty sentinel on the in-memory path too, so no caller has to defend
+    // against it. Read by `dss::ffi::resolveAbi`, which is the ONE place the
+    // name is turned into a `TargetCallingConvention const*`.
+    [[nodiscard]] CCallingConvention const& cCallingConvention() const noexcept {
+        return d_.cCallingConvention;
+    }
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the extension the driver
+    // appends to an artifact this format produces. Always ENGAGED for a
+    // loader-produced schema (REQUIRED at load, and `validate()` rejects the
+    // disengaged sentinel on the in-memory path too); the engaged value may
+    // legitimately be EMPTY — that is a Unix executable, not a missing answer.
+    // `outputExtensionFor` is the one reader.
+    [[nodiscard]] std::string_view outputExtension() const noexcept {
+        return d_.outputExtension.has_value() ? std::string_view{*d_.outputExtension}
+                                              : std::string_view{};
+    }
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: how the members of a
+    // `container: archive` format are named, and which `ar` variant carries
+    // them. Meaningful ONLY when `isStaticArchive()`; `validate()` refuses the
+    // pairing in both directions, so a non-archive format cannot declare either
+    // and an archive format cannot omit them.
+    [[nodiscard]] std::string_view archiveMemberExtension() const noexcept {
+        return d_.archiveMemberExtension.has_value()
+                   ? std::string_view{*d_.archiveMemberExtension}
+                   : std::string_view{};
+    }
+    [[nodiscard]] ArchiveFlavor archiveFlavor() const noexcept {
+        return d_.archiveFlavor;
+    }
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the `.target.json` name
+    // this format is for, or EMPTY when the document makes no claim (which is
+    // "the check does not apply", not "any target will do"). Read by
+    // `crossValidateTargetFormat`, which compares it against the target's own
+    // declared name.
+    [[nodiscard]] std::string_view targetArch() const noexcept {
+        return d_.targetArch;
     }
     // D-CSUBSET-BITFIELD-ABI-EXACT: the format's declared bit-field strategy, or
     // `None` if it declared none (the caller falls back to the target's value via

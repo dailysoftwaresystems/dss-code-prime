@@ -679,6 +679,75 @@ struct StackArgPackingRules {
     StackArgPacking variadic        = StackArgPacking::Slot;
 };
 
+// D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
+// WHEN this calling convention's `framePointer` register is withheld from the
+// register allocator's pool.
+//
+// ★ THIS IS A REGISTER-ROLE FACT, AND THE CONVENTIONS MEASURABLY DISAGREE ABOUT
+// IT. ✔MEASURED 2026-08-28, one high-register-pressure source compiled six ways
+// (-O2/-O3/-Os, each with `-fomit-frame-pointer` EXPLICITLY requested), counting
+// instructions that write or read x29 outside the prologue/epilogue save pair:
+//   * `clang --target=arm64-apple-macos11` — ZERO, at every level, under
+//     maximum pressure, with frame-pointer omission asked for. Apple's platform
+//     ABI reserves x29 UNCONDITIONALLY and clang declines the flag rather than
+//     honoring it.
+//   * `clang --target=aarch64-linux-gnu` — FOUR (`eor x29, x9, x7`,
+//     `mov x0, x29`, `add x9, x29, x0`, `eor x10, x10, x29`) at -O2 and -O3.
+//     On ELF the register really is ordinary once no frame is needed.
+//   * `aarch64-linux-gnu-gcc -fomit-frame-pointer` — ZERO, but by CHOICE, not
+//     by prohibition; it is the same permission clang exercises.
+// ⇒ Under `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` the disjunction PERMITS
+// allocating x29 on AAPCS64/ELF (clang does) and FORBIDS it on Apple ARM64 (no
+// reference will, at any level, however asked). One axis, two answers, and the
+// answer belongs to the CONVENTION — never to an `if (format == MachO)` in the
+// allocator, which is what having no vocabulary for it would have forced.
+//
+// ★ WHY THIS IS NOT [[D-CODEGEN-MACHO-ARM64-X29-ALLOCATED-WITH-NO-FRAME-RECORD]],
+// WHICH IS CLOSED AND STAYS CLOSED. That row asked whether unwinding HAPPENS to
+// work and measured that it does — the tables describe the frame regardless of
+// which register holds what. This one asks whether the register's RESERVED ROLE
+// is respected, and the consumer is every tool that walks frames WITHOUT tables:
+// a sampling profiler, a crash reporter, `lldb` on a stripped image. Those read
+// x29 directly and, today, read garbage.
+enum class FramePointerReservation : std::uint8_t {
+    // The register is withheld ONLY from a function that needs it as a stable
+    // frame base — i.e. one that moves SP at runtime (a VLA / dynamic alloca).
+    // Everywhere else it is an ordinary allocatable callee-saved GPR. This is
+    // the default, so every convention that declares nothing keeps byte-
+    // identical frames.
+    DynamicFrameOnly = 0,
+    // The platform ABI reserves the register unconditionally: it is never
+    // allocatable, in any function, at any optimization level.
+    Always           = 1,
+};
+
+inline constexpr EnumNameTable<FramePointerReservation, 2>
+kFramePointerReservationTable{{{
+    { FramePointerReservation::DynamicFrameOnly, "dynamic-frame-only" },
+    { FramePointerReservation::Always,           "always"             },
+}}};
+
+// Well-formedness of the table itself (no empty spelling, no duplicate spelling,
+// no duplicate enumerator) — an under-filled table is legal C++ and would make
+// "" resolve to `DynamicFrameOnly`, i.e. silently re-open the defect for a
+// convention that declared the reservation.
+DSS_CHECK_ENUM_NAME_TABLE(kFramePointerReservationTable);
+
+[[nodiscard]] constexpr std::string_view
+framePointerReservationName(FramePointerReservation r) noexcept {
+    // The `-Werror=switch` backstop — it owns no spelling.
+    switch (r) {
+        case FramePointerReservation::DynamicFrameOnly:
+        case FramePointerReservation::Always:
+            break;
+    }
+    return kFramePointerReservationTable.nameOrEmpty(r);
+}
+[[nodiscard]] constexpr std::optional<FramePointerReservation>
+framePointerReservationFromName(std::string_view s) noexcept {
+    return kFramePointerReservationTable.fromName(s);
+}
+
 // One calling convention. A target may declare multiple (SysV AMD64,
 // Microsoft x64, fastcall, ...); the front-end picks one via attribute /
 // driver flag. The `argGprs` / `argFprs` ordering is significant — the
@@ -938,6 +1007,25 @@ struct DSS_EXPORT TargetCallingConvention {
     // rather than silently miscompiling. A NON-VLA function never consults it — its
     // frame stays SP-relative + byte-identical (the zero-blast-radius invariant).
     std::optional<NamedRegisterRef> framePointer;
+
+    // D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
+    // WHEN `framePointer` is withheld from the allocator's pool. See
+    // `FramePointerReservation` above for the measured evidence that the shipped
+    // conventions genuinely disagree about this. The default is
+    // `DynamicFrameOnly` — the pre-existing behavior — so a convention that
+    // declares nothing keeps byte-identical frames, and only a convention that
+    // SAYS its platform reserves the register loses it from the pool.
+    // ⚠ INERT when `framePointer` is empty: there is no register to withhold,
+    // and `TargetSchemaData::validate()` refuses the pairing rather than letting
+    // a declared reservation quietly reserve nothing.
+    // Consumed by `lir_regalloc`'s pool build (which publishes it to
+    // `lir_rewrite`'s scratch pool through `LirFuncAllocation::
+    // reservedFramePointer`). It does NOT make the callconv pass emit a frame
+    // record — capturing a frame base stays the VLA path's job, and this field
+    // deliberately says only "not allocatable", which is the whole claim its
+    // anchor makes.
+    FramePointerReservation framePointerReservation =
+        FramePointerReservation::DynamicFrameOnly;
 
     // D-LANG-VARIADIC (step 13.4, 2026-06-02): the register the caller
     // MUST load with the count of vector (FPR) arguments passed in

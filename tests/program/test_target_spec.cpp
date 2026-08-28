@@ -154,12 +154,23 @@ TEST(TargetSpec, OutputExtensionSpvForShippedSpirv) {
 }
 
 TEST(TargetSpec, OutputExtensionUnknownKindReturnsEmpty) {
-    // pr-test-analyzer FOLD-NOW: pin the closed-switch sentinel
-    // arm. Real linker dispatch rejects `Unknown` schemas before
-    // outputExtension is consulted, but the closed switch's
-    // exhaustiveness is a substrate-tier contract that this test
-    // guards against future drift (e.g. someone adding a new arm
-    // without an Unknown fallback).
+    // ⚠ THE MECHANISM THIS TEST DESCRIBED NO LONGER EXISTS, AND WHAT IT PINS
+    // NOW IS BETTER. It used to guard "the closed switch's exhaustiveness …
+    // someone adding a new arm without an Unknown fallback"; P44 deleted that
+    // switch entirely (D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES) —
+    // `outputExtensionFor` is one read of a DECLARED per-format key, so there
+    // are no arms to leave out.
+    //
+    // What survives is the arm that actually needed pinning: a HAND-BUILT
+    // `ObjectFormatData` that never declared an extension. `ObjectFormatSchema
+    // {ObjectFormatData}` is a public constructor running no validation, so an
+    // in-memory producer reaches this accessor without passing the loader, and
+    // the accessor must answer EMPTY rather than read a disengaged optional.
+    // ⓘ The empty answer here means "never declared". A LOADED format may also
+    // answer empty, and there it means "declares no extension" — a Unix
+    // executable. `validate()` is what keeps the two apart, and the pin that a
+    // loaded format cannot reach this state is
+    // `ObjectFormatSchemaValidate`'s required-key arm.
     dss::detail::ObjectFormatData data;
     // TF-C125: `data.kind = ObjectFormatKind::Unknown` became "no backend".
     // The default IS null now, so this line documents the intent rather than

@@ -1,5 +1,6 @@
 #include "core/types/config_path_walk.hpp"
 
+#include "core/substrate/path_identity.hpp"       // absoluteKeepingRoot -- UNC-safe absolute
 #include "core/substrate/phase_timers.hpp"        // the `locate-config` pipeline phase
 #include "core/types/predefined_macro_json.hpp"   // kBuildVersionText — the binary's own version
 
@@ -473,7 +474,12 @@ std::vector<std::filesystem::path> resolveSystemDirs(GrammarSchema const& gramma
         // failure keep the RAW path rather than drop the dir — a dir the
         // filesystem could not canonicalise is still more useful to the
         // resolver than no dir at all.
-        std::filesystem::path const abs = std::filesystem::absolute(*resolved, ec);
+        // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: and the SAME idiom
+        // means the same defect — this inherited a bare `absolute` that re-roots
+        // a schema dir on a UNC share onto the local drive, so a shipped config
+        // served from `\\host\share` resolved to nothing. Both sites now go
+        // through the one helper.
+        std::filesystem::path const abs = core::absoluteKeepingRoot(*resolved, ec);
         out.push_back(ec ? *resolved : abs);
         ec.clear();
     }

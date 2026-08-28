@@ -870,10 +870,16 @@ TEST(FfiIngest, AbiResolveFailureSkipsIngestion) {
     EXPECT_FALSE(result.ok());
     EXPECT_EQ(result.externsAnnotated, 0u);
     EXPECT_EQ(ffi.tryGet(built.externNode), nullptr);
-    // The underlying F_AbiUnknownTuple reached the reporter.
+    // ⚠ THE CODE MOVED WHEN `kAbiCatalog` WAS DELETED, AND THE NEW ONE IS THE
+    // BETTER DIAGNOSTIC — D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY.
+    // Pre-P44 this fixture failed `F_AbiUnknownTuple`: the closed C++ table held
+    // no row for the (target NAME, format KIND) pair `("riscv64", Elf)`, so the
+    // complaint was about a table nobody could see. The format now DECLARES
+    // `sysv_amd64` and riscv64 ships no such row, so the refusal names exactly
+    // what is missing and where to put it.
     bool sawAbiError = false;
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::F_AbiUnknownTuple) sawAbiError = true;
+        if (d.code == DiagnosticCode::F_AbiNoMatchingCcInTarget) sawAbiError = true;
     }
     EXPECT_TRUE(sawAbiError);
 }

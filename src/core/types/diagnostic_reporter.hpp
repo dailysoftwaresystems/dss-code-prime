@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>   // is_invocable_v (remapBuffers' two callable shapes)
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -302,11 +303,35 @@ public:
     // keep synth coordinates, it was an omission that nothing could see.
     // Symmetric by construction now -- one `fn`, applied to both, so no future
     // caller can fix one half and not the other.
+    //
+    // ── [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: THE SECOND SHAPE ──────────
+    //
+    // `fn` may instead take the WHOLE `ParseDiagnostic&`, and then it owns every
+    // location itself. That shape exists for a rewrite that must also ADD a
+    // location: a diagnostic whose subject is a macro-expansion PRODUCT token
+    // gets its primary moved to the expansion site AND a
+    // `note: expanded from macro 'X'` appended at the macro's `#define` — and a
+    // `(BufferId&, SourceSpan&)` closure can reach neither the `related` vector
+    // nor the note text.
+    //
+    // ★ DISPATCHED ON THE CALLABLE, NOT ON A FLAG OR A SECOND METHOD NAME. The
+    // two signatures are disjoint (neither `std::function` accepts the other's
+    // arguments), so every existing caller — `Tree::remapDiagnostics`, the
+    // preprocessor's prefix-id fixup, the CU's `remapPreprocessedPositions` —
+    // keeps compiling to exactly the loop it had, and a caller that upgrades its
+    // closure gets the richer behaviour without touching this class or its own
+    // call site. A parallel `remapDiagnostics` method would instead have made
+    // "which one do I call" a question every call site had to re-answer, and the
+    // wrong answer is silent.
     template <class F>
     void remapBuffers(F&& fn) {
         for (ParseDiagnostic& d : all_) {
-            fn(d.buffer, d.span);
-            for (RelatedLocation& r : d.related) fn(r.buffer, r.span);
+            if constexpr (std::is_invocable_v<F&, ParseDiagnostic&>) {
+                fn(d);
+            } else {
+                fn(d.buffer, d.span);
+                for (RelatedLocation& r : d.related) fn(r.buffer, r.span);
+            }
         }
     }
 

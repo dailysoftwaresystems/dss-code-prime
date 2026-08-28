@@ -4113,8 +4113,16 @@ encodeExec(AssembledModule const&    module,
                 return {};
             }
             auto const* tri = targetSchema.relocationInfo(rel.kind);
+            // ★★★ NARROWED, NOT DELETED (D-LK-PE-IMAGE-TEXT-ABS-RELOC).
+            // An 8-byte absolute in `.text` is now COLLECTED into `.reloc`
+            // below, so it is no longer a refusal: the loader adjusts it on
+            // rebase exactly as it adjusts a data pointer. Every OTHER width
+            // still refuses, because `IMAGE_REL_BASED_DIR64` is the only
+            // base-relocation form this writer emits and a 4-byte absolute
+            // would need HIGHLOW -- shipping it uncollected is the silent
+            // wrong-address this belt exists to stop.
             if (imageIsRelocatableAtLoad && tri != nullptr
-             && !tri->pcRelative && !tri->tls) {
+             && !tri->pcRelative && !tri->tls && tri->widthBytes != 8) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      std::format(
                          "pe::encodeExec: function SymbolId={{ {} }} "
@@ -4126,8 +4134,8 @@ encodeExec(AssembledModule const&    module,
                          "the preferred-base address after the loader "
                          "rebases the image (silent wrong address; on "
                          "a .dll the loader rebases routinely). Emit "
-                         "the address as a data item, or extend the "
-                         ".reloc collector to .text sites "
+                         "the address as a data item, or widen the "
+                         ".reloc collector past DIR64 "
                          "(D-LK-PE-IMAGE-TEXT-ABS-RELOC).",
                          fn.symbol.v, tri->name, rel.kind.v));
                 return {};
@@ -4368,6 +4376,50 @@ encodeExec(AssembledModule const&    module,
     // `.reloc` block builder below. (`rdata->rva` is the .rdata section base RVA; the site
     // is at that base + the item's section offset + the reloc's intra-item offset.)
     std::vector<std::uint32_t> baseRelocSiteRvas;
+
+    // ── D-LK-PE-IMAGE-TEXT-ABS-RELOC: THE `.text` HALF OF THE SAME COLLECTION ──
+    //
+    // ★★★ THE WALKER USED TO COLLECT DIR64 SITES FROM DATA ITEMS AND THE TLS
+    // DIRECTORY ONLY. An absolute fixup in `.text` was therefore patched in
+    // place by `applyExecRelocations` and never listed in `.reloc`, so a
+    // rebased image kept the PREFERRED-BASE address in code bytes the loader
+    // never adjusted -- a silent wrong address, and a `.dll` rebases routinely
+    // on preferred-base collision whether or not it opts into ASLR.
+    //
+    // ✔MEASURED 2026-08-28, and the trigger the row called *"none known"* had
+    // already fired: an ordinary `gcc -c -O2` object whose function carries
+    // `movabsq $g, %rax` emits `IMAGE_REL_AMD64_ADDR64` into `.text`; native
+    // gcc + ld link it and it RUNS to exit 42; DSS ingested it through the
+    // shipped `--resolve-library` static-link path and REFUSED it on both
+    // `pe64-x86_64-windows-exec` and `-dll`. A reference toolchain accepting
+    // what DSS rejects is DSS below `(gcc ∪ clang ∪ MSVC) ∪ ISO C`, so the
+    // row's *"keep rejecting"* arm was not available and the collector is the
+    // close.
+    //
+    // ★★ THE SITES COME FROM THE RELOCATION RECORDS, NEVER FROM SCANNING
+    // `.text`. The predicate is the schema's own `!pcRelative && !tls` -- the
+    // SAME one the belt above uses, so the two cannot disagree about what
+    // "absolute" means. Scanning code for plausible-looking addresses would be
+    // the opposite failure and a worse one: a base relocation applied to bytes
+    // that are not an address CORRUPTS the instruction at load. Ask what the
+    // value DECIDES, not what it looks like.
+    //
+    // ⓘ Collected unconditionally, exactly like the data-item sites below: a
+    // `.reloc` row on an image the loader never rebases costs a few bytes and
+    // is ignored, while a MISSING row on one it does rebase is a wrong jump.
+    // The block builder sorts and de-duplicates, so append order is free.
+    for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+        for (auto const& rel : module.functions[fi].relocations) {
+            auto const* tri = targetSchema.relocationInfo(rel.kind);
+            if (tri == nullptr || tri->pcRelative || tri->tls) continue;
+            if (tri->widthBytes != 8) continue;   // the belt above refused it
+            baseRelocSiteRvas.push_back(
+                secText.virtualAddress
+                + static_cast<std::uint32_t>(funcTextStart[fi])
+                + rel.offset);
+        }
+    }
+
     for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
         auto const& di = module.dataItems[i];
         if (di.relocations.empty()) continue;

@@ -3404,7 +3404,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // instances carry the most `$...Comment` prose keys - which is
                 // exactly why the carve-out lives in `rejectUnknownKeys` as a
                 // PREFIX test rather than a literal `"$comment"` entry.
-                static constexpr std::array<std::string_view, 27> kCallConvKeys{
+                static constexpr std::array<std::string_view, 28> kCallConvKeys{
                     "name",
                     "argGprs", "argFprs", "returnGprs", "returnFprs",
                     "argVrs", "returnVrs", "callerSaved", "calleeSaved",
@@ -3416,6 +3416,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     "aggregateStackExhaustsRegisters",
                     "stackArgPacking",
                     "linkRegister", "stackPointer", "framePointer",
+                    // D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
+                    // WHEN the frame pointer leaves the allocatable pool. A key
+                    // absent from THIS array is REFUSED AT LOAD, so the
+                    // vocabulary row lands before the descriptors that declare
+                    // it, never after.
+                    "framePointerReservation",
                     "variadicVectorCountReg", "indirectResultRegister",
                     "vaListLayout"};
                 DSS_CHECK_KEY_VOCABULARY(kCallConvKeys);
@@ -3430,6 +3436,30 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     continue;
                 }
                 cc.name = c.at("name").get<std::string>();
+                // D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY:
+                // a `.format.json` selects its platform C ABI by NAMING one of
+                // these rows, and reserves one spelling to mean "this format
+                // has no register-level C calling convention at all". That is
+                // an in-band sentinel inside a name space, which is the exact
+                // hazard `objectFormatKindName`'s "★ THE SENTINEL SPELLS
+                // CORRECTLY" note describes — a sentinel that RESOLVES is worse
+                // than a typo, because it passes every lookup and dies quietly
+                // downstream. Closing it needs BOTH sides: the format loader
+                // refuses an empty convention, and this refuses a row that
+                // would make the reserved spelling ambiguous. Refused at LOAD,
+                // once, rather than defended against at every use.
+                if (cc.name == kCCallingConventionNone) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/callingConventions/{}/name", i),
+                              std::format("'{}' is a RESERVED calling-convention "
+                                          "name — a .format.json spells it to "
+                                          "declare that the format has NO "
+                                          "register-level C calling convention, "
+                                          "so a row carrying it would make that "
+                                          "declaration ambiguous. Rename the row.",
+                                          kCCallingConventionNone));
+                    continue;
+                }
                 readStringArray(c, i, "argGprs",     cc.argGprs);
                 readStringArray(c, i, "argFprs",     cc.argFprs);
                 readStringArray(c, i, "returnGprs",  cc.returnGprs);
@@ -3706,6 +3736,41 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                       std::format("{}/framePointer", ccPath),
                                       std::format("frame pointer '{}' is not "
                                                   "in the register table", name));
+                        }
+                    }
+                }
+                // D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
+                // WHEN that register is withheld from the allocator's pool.
+                // OPTIONAL, defaulting to `dynamic-frame-only` — the behavior
+                // every shipped convention had before the key existed — so
+                // adding the vocabulary changes no frame by itself; only a
+                // convention that DECLARES `always` loses the register. An
+                // unknown spelling is a HARD error, the `dataModel` discipline:
+                // a typo silently falling back to `dynamic-frame-only` would
+                // re-open the exact defect the key closes, on the one
+                // convention whose author was trying to close it.
+                if (c.contains("framePointerReservation")) {
+                    if (!c.at("framePointerReservation").is_string()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/framePointerReservation", ccPath),
+                                  std::format("must be a string ({})",
+                                              detail::renderAllowedList(
+                                                  allNames(kFramePointerReservationTable),
+                                                  " or ")));
+                    } else {
+                        auto const s =
+                            c.at("framePointerReservation").get<std::string>();
+                        auto const r = framePointerReservationFromName(s);
+                        if (!r.has_value()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      std::format("{}/framePointerReservation", ccPath),
+                                      std::format("unknown framePointerReservation "
+                                                  "'{}' — expected one of {}", s,
+                                                  detail::renderAllowedList(
+                                                      allNames(kFramePointerReservationTable),
+                                                      ", ")));
+                        } else {
+                            cc.framePointerReservation = *r;
                         }
                     }
                 }

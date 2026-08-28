@@ -721,6 +721,151 @@ second pattern beside the one P23 built and pinned.**
 
 ---
 
+## 0.00000000000000000000000000000000000000000 ★★★ CYCLE P44 — SEVEN LANES CLOSED NINETEEN ROWS, AND THE ONE THAT MATTERED MOST WAS FOUND BY MEASURING THE COMPOSITION OF TWO GREEN LANES
+
+**Balance at this commit, re-measured rather than re-quoted:**
+`python scripts/check-anchor-balance/check-anchor-balance.py --base b1684e7f` ⇒
+**closed 19, opened 1, net −18**; registry **556 → 538**. Per bucket via the gate's own
+`scan_document`: **production 350 OPEN / harness 188 OPEN / sum 538**, which equals the gate's
+registry figure — that sum is the cross-check, and it is the only thing that catches a
+mis-bucketed or double-counted row.
+`scripts/check-anchor-registry/check-anchor-registry.sh` ⇒ **rc=0**, 0 cell-width violations,
+15 self-test arms proving the guard can fail. **Both gates were run**: a green balance is not
+evidence that nothing was opened.
+
+The single OPEN row is `D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN`, minted by
+lane `a` when closing a refusal exposed what the refusal had been hiding. It is **in flight as lane
+`h` at this commit**, not deferred.
+
+### ★★★ THE HEADLINE: TWO LANES SHIPPED TWO CORRECT HALVES, BOTH CORRECTLY DECLINED TO CLOSE THE ROW, AND THE COMPOSED BINARY WAS STILL BROKEN
+
+`D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED` had two halves in two lanes. Lane `f` shipped the
+driver-side `-I` acceptance; lane `g` root-caused the resolver (undefined behaviour — a reference
+bound to the `native()` of a by-value temporary — and measured `//wsl.localhost` answering YES
+**141/200** by reference vs **0/200** by value). Each verified its own worktree. Each refused to
+close a row whose other half it had never compiled. **Both judgements were right.**
+
+The composed binary — the first artefact ever to hold both — resolved a UNC `-I` header **0/30 for
+both slash spellings**, with a byte-identical local-absolute control at **30/30**.
+
+**The cause sat one tier outside everything either lane owned.** `applyIncludeDirs` ran every `-I`
+value through a bare `fs::absolute`. ✔MEASURED, one path object, `.string()`:
+
+| property | value |
+|---|---|
+| `is_absolute()` | **false** |
+| `has_root_name()` / `root_name()` | **false** / **empty** |
+| `absolute()` | **`C:\wsl.localhost\Ubuntu\home\rafael\p44_unc_inc`** |
+| `exists(input)` / `exists(absolute())` | **true** / **false** |
+| `weakly_canonical` | **`<error> No such file or directory`** |
+
+It does not prepend the cwd. It **re-roots a path naming another machine onto the local drive, and
+reports no error.** Every tier below the driver was then handed a directory that cannot exist and
+answered correctly about it — which is exactly why all of `tests/core` was green over a live defect.
+
+⇒ ★★★ **A LANE'S GREEN IS A STATEMENT ABOUT ITS OWN TREE. THE COMPOSITION IS A NEW OBJECT NOBODY
+HAS MEASURED**, and where two lanes deliberately split one row, the seam between them is the one
+place neither lane's gate can reach. Measure the composed tree against the row's own closing
+predicate before closing it — not the sum of two reports.
+
+### ★★★ THREE FINDINGS FROM THAT FIX, EACH GENERAL
+
+**(1) `fs::absolute` and `weakly_canonical` fail in OPPOSITE directions, and only one needs a guard.**
+✔MEASURED on the same reachable UNC path: `weakly_canonical` **errors**, so every call site's
+existing keep-the-original-on-error arm was already correct — `config_path_walk`'s executable
+resolution is **not** a further instance, and that was measured rather than assumed (a sibling's
+report covered the UNREACHABLE case, which behaves differently). `fs::absolute` **succeeds wrongly**,
+which no error arm can catch. **A helper that fails toward an ERROR is defended by the caller's
+existing error arm; one that fails toward a WRONG ANSWER is naked.** That distinction is the right
+sort key for a call-site audit and cut a ~25-file list to a handful.
+
+**(2) ONE PATH, THREE TRANSFORMS, EACH REMOVING ONE SEPARATOR — and a partial fix reads exactly like
+a complete one.** The artifact-written report ran `absolute` → `lexically_normal` → `generic_string`.
+Fixing only `absolute` moved the reported path from `C:\host\share\…` to `/host/share/…`: still
+wrong, still naming the local drive, **now wrong for a different reason**, and both spellings are
+equally absent from disk. It was caught only because the mutation arm that reverted that fix
+reddened **NOTHING** — the fix had shipped unpinned — and the pin written in response then **failed
+at baseline**, which is how collapses 2 and 3 were found at all.
+
+**(3) THE DISCRIMINATOR IS THE SEPARATOR RUN, NOT `isRootedPath` AND NOT `is_absolute()`.** A run of
+ONE (`/foo`) genuinely is a location on the current drive and MUST still be made absolute; reusing
+the row's own exported `isRootedPath` here would have been **a regression dressed as a fix**. Pinned
+by `AbsoluteStillResolvesSingleSeparatorAndRelative`. `core::absoluteKeepingRoot` and
+`core::normalizeKeepingRoot` now sit beside `core::genericSpelling`, three transforms sharing ONE
+invariant and ONE private discriminator (`leadingSeparatorRun >= 2`).
+
+**RED-ON-DISABLE, five arms, VALID.** Baseline 45 OK / 0 FAILED / **0 SKIPPED** (no vacuous arm on
+this leg). Every arm: build rc=0, per-TU OBJECT md5 MOVED and RETURNED, run through `ctest`, failing
+NAMES read, `core/test_header_name_matching` carried as a CONTROL and green (16 arms) throughout.
+m1 (substrate guard neutered) → **3 RED**; m2 (driver reverted) → **1 RED, the driver pin ALONE —
+so the resolver-tier pins do NOT cover a driver-tier wiring defect**; m3a/m3b/m3c (each of the three
+report transforms reverted independently) → **1 RED each, the same pin**, proving all three are
+independently load-bearing.
+
+### THE FOUR-LEG GATE AT THIS COMMIT — measured on THIS tree, not re-quoted from the previous set
+
+| leg | result |
+|---|---|
+| Windows (root host) | **1790/1790**, all 20 repo guards |
+| WSL x86_64 | **1770/1770**, `run-gate` OK on a tool-emitted witness, **+ emulator witness: arm64 artifacts were spawned and RAN** |
+| arm64 VPS (native) | **1770/1770**, `run-gate` OK |
+| macOS (native arm64) | **1770/1770**, `run-gate` OK |
+
+**1770 = 1790 − the 20 root-host-only repo guards, on every leg, no residual.** ⓘ The macOS leg ran
+~27 min of `ctest` against the other legs' ~13; that was **probed live** (`ctest` at 27:08 elapsed
+with a freshly-spawned `dsscp` child, load 2.33) rather than assumed to be a hang — a silent leg is a
+question, not a verdict.
+
+Residue scan on the composed tree: **42 marker candidates across 146 changed files, ZERO live** —
+every hit under `src/` is a comment or a fixture (the preprocessor discussing `#if 0`, English
+"mutate the top", and one `MUTANT` token inside a `$comment` field where a lane recorded its own
+red-on-disable measurement).
+
+### THE OTHER LANES
+
+| lane | outcome |
+|---|---|
+| `a` | 3 rows; refuses-what-a-reference-accepts 5 → 3. Minted the constructor row when closing a refusal exposed what it hid. |
+| `b` | 3 preprocessor rows (token paste ×2, origin-offset validation). It ALSO measured the UNC row at **23/30** and explicitly declined both to close it and to ship a test — *"a test that passes four times in five is indistinguishable from a flaky harness, and a green run would be read as a close"*. ★ That judgement was correct and is the reason the eventual pin is honest: the row became pinnable only once lane `g` made the behaviour deterministic. |
+| `c` | 4 rows; 26 identity branches → 0; refused closure-by-delegation. |
+| `d` | 6 rows across 5 waves; wave 4 measured the COFF/Mach-O twins **immune** and withdrew its own residual. |
+| `e` | `D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY` closed (a THIRD tier was hardcoding the severity, refuting the brief's premise); then `D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES` closed across all three sources. ⚠ It INTRODUCED the over-reach its own row forbade — a claim for every signature whose bits merely happened to be zero — and DSS's own shipped runtime shims stopped compiling. Caught by measurement, fixed with a producer-side gate. |
+| `f` | `imagerel32` **withdrawn by measurement**; compile-error pin 6 → 3; `-I` acceptance shipped as a **warning**, because an error would put DSS ABOVE the union (gcc and MSVC are both silent rc=0 on every shape). |
+| `g` | The UNC resolver UB, above. |
+
+### ⚠ WHAT THIS CYCLE DID NOT DO, NAMED SO IT IS NOT MISTAKEN FOR DONE
+
+- **`#pragma once` IS REFUSED BY DSS** (`P_PreprocessorPragma`, exit 1), found while building the UNC
+  fixture — every arm went red, the control included. The owning row `D-PP-PRAGMA-RECOGNIZED-SEMANTICS`
+  is OPEN, already concedes the bar makes it REQUIRED, and files it **"QUEUED WORK, low priority"**
+  while describing the behaviour as *"currently have NO effect"*. ★★ **That description was already
+  false when written**: a sibling row records the loud refusal since 2026-07-29, three weeks earlier.
+  *"Has no effect"* reads as a minor gap; **"refuses the translation unit" means every real-world
+  header using the commonest guard idiom fails to compile**, against an idiom gcc, clang and MSVC all
+  accept. ⇒ **The stale sentence did not merely misdescribe the defect, it set its priority.** Not
+  dispatched only because it contends with lanes `h` and `i` for `src/analysis/**`, `src/dss-config/**`
+  and `src/core/substrate/path_identity.*`. ⚠ Re-date its premise too: *"honouring the pragma would be
+  a guess"* was true when written, and `core::PathIdentity` landed 2026-08-18 precisely so that every
+  spelling of one file reduces to one key — the machinery an include-once set needs **had already been
+  built, by someone else, for another reason**.
+- **The wider path-spelling audit is lane `i`'s and is IN FLIGHT at this commit**: `generic_string()`
+  appears in ~20 further `src/` files and `lexically_normal()` in ~6. This cycle fixed only the sites
+  on the two paths it measured.
+- **sqlite `veryquick` / `speedtest1` not re-run.** It would have contended with live lane builds and
+  measured a tree that will change when `h` and `i` land.
+
+### ⓘ A HARNESS DEFECT FIXED THE MOMENT IT BLOCKED, per the standing ruling
+
+Seeding lanes `h`/`i` died creating a directory named `".plans`. `git status --porcelain` **C-quotes**
+a path that needs it, and this repository holds one — `.plans/23-full-c-plan - tbd.md` (spaces).
+Three orchestrator instruments read the path as `line[3:]`. Fixed at the source with one `-z` helper
+(NUL-separated, never quoted — so no quoting convention is left to reimplement; `core.quotePath=false`
+would NOT have sufficed, as it governs non-ASCII bytes and not the quoting a space triggers).
+✔**The repo's own scripts were checked BEFORE the fix and are NOT affected** — every one only counts
+porcelain LINES, and a quoted path is still one line. No repo anchor is owed.
+⚠ The failure mode worth remembering: on earlier seeds the naive parse did **not** error, it just
+silently omitted that path.
+
 ## 0.0000000000000000000000000000000000000000 ★★★ CYCLE P43 — TWO RED CI LEGS, TWO DIFFERENT BLIND SPOTS, AND NEITHER WAS CLOSED BY LOOSENING ANYTHING
 
 > Invoked on the operator's words: *"windows and linux gcc CI failed. address the root cause with no

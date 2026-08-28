@@ -4,6 +4,7 @@
 
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
+#include "core/types/declared_qualification.hpp" // DeclaredQualification (a row's const/restrict claim)
 #include "core/types/include_path_resolve.hpp" // HeaderNameMatching + HeaderSearchResult (the `includes` closure walk's case policy)
 #include "core/types/named_type_binding.hpp" // NamedTypeBinding (c82 va_list alias thread-through)
 #include "core/types/object_format_kind.hpp" // ObjectFormatKind (availability predicate)
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -134,6 +136,25 @@ enum class ShippedSymbolLinkage : std::uint8_t {
 struct DSS_EXPORT ShippedSymbol {
     std::string          name;
     TypeId               signature;
+    // ★★ P44 (item (a) of D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES):
+    // WHAT THIS ROW CLAIMS ABOUT `const` / `restrict`, WHICH `signature` CANNOT
+    // CARRY AND NEVER WILL. Neither qualifier is interned (type_interner.hpp:
+    // `const` never affects codegen or layout), so `fn(ptr<const<char>>, ...)
+    // -> i32` and `fn(ptr<char>, ...) -> i32` intern to the SAME TypeId by
+    // design. C23 6.7.6.1p2 nonetheless makes a pointed-to qualifier part of the
+    // type for REDECLARATION compatibility, and ✔MEASURED, gcc 13.3.0
+    // (`-std=c2x`) and clang 18.1.3 (`-std=c23`) probed SEPARATELY both REFUSE
+    // `extern int printf(char *, ...);` over `#include <stdio.h>` while both
+    // ACCEPT the `const char *` twin — a divergence DSS could not see while this
+    // field did not exist.
+    //
+    // ⚠ NULL IS "NO CLAIM", NEVER "UNQUALIFIED". A row that spells no qualifier
+    // says NOTHING about the axis and the oracle then does not judge it; reading
+    // silence as `char *` would refuse the ubiquitous and legal
+    // `int printf(const char *, ...);` against every row in the corpus that has
+    // not been annotated. Shared, because a claim is immutable once read and one
+    // descriptor row is consulted from several passes.
+    std::shared_ptr<DeclaredQualification const> qualification;
     ShippedSymbolKind    kind    = ShippedSymbolKind::Function;
     ShippedSymbolLinkage linkage = ShippedSymbolLinkage::External;
     // Optional per-SYMBOL availability — which object-formats this symbol EXISTS

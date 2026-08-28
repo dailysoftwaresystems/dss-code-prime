@@ -923,7 +923,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::span<EntryMaterialization const> entryVerbs,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
-                     ObjectFormatKind                  fmtKind,
+                     std::string_view                  wideFloatSoftcallLibrary,
                      DiagnosticReporter&               reporter);
 
 // ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: PROGRAM-ENTRY RESOLUTION ───────────────

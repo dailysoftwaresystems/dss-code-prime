@@ -962,6 +962,8 @@ TEST(MachOWriter, ObjectWithoutSchemaBuildVersionEmitsNoLoadCommand) {
     auto format = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       "headerNameMatching": "case-insensitive",
       "format": {"name":"macho-obj-no-buildversion","kind":"macho"},
@@ -997,6 +999,8 @@ TEST(MachOWriter, ObjectBuildVersionPlatformComesFromTheSchemaNotAMacOsDefault) 
     auto format = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       "headerNameMatching": "case-insensitive",
       "format": {"name":"macho-obj-ios","kind":"macho"},
@@ -1080,6 +1084,8 @@ TEST(MachOFormatJsonValidate, ObjAcceptsBuildVersionButStillRejectsOtherImageKey
     auto ok = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       "headerNameMatching": "case-insensitive",
       "format": {"name":"macho-obj-bv-only","kind":"macho"},
@@ -1096,6 +1102,8 @@ TEST(MachOFormatJsonValidate, ObjAcceptsBuildVersionButStillRejectsOtherImageKey
     auto bad = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       "headerNameMatching": "case-insensitive",
       "format": {"name":"macho-obj-bv-plus-pagezero","kind":"macho"},
@@ -1112,6 +1120,8 @@ TEST(MachOFormatJsonValidate, ObjAcceptsBuildVersionButStillRejectsOtherImageKey
     auto typo = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".o",
       "dataModel": "LP64",
       "headerNameMatching": "case-insensitive",
       "format": {"name":"macho-obj-bad-platform","kind":"macho"},
@@ -2003,6 +2013,8 @@ TEST(MachOFormatJson, ZeroCputypeRejectedByValidate) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-macho","kind":"macho"},
@@ -2021,6 +2033,8 @@ TEST(MachOFormatJson, EmptySegmentRejectedByValidate) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-macho-seg","kind":"macho"},
@@ -2040,6 +2054,8 @@ TEST(ElfFormatJson, SegmentFieldRejectedOnElfSection) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-elf","kind":"elf"},
@@ -2065,6 +2081,8 @@ TEST(MachOFormatJson, NonZeroVirtualAddressRejectedOnMhObject) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-macho-va","kind":"macho"},
@@ -2103,6 +2121,8 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
       "format": { "name": "macho-va-inconsistent-test", "version": "1.0", "kind": "macho" },
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
@@ -2672,6 +2692,8 @@ TEST(MachOExecFormatJsonValidate, ObjWithImageBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"obj-with-image","kind":"macho"},
@@ -2698,6 +2720,8 @@ TEST(MachOExecFormatJsonValidate, ObjWithBindNowFalseRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"obj-with-bindnow-false","kind":"macho"},
@@ -2727,6 +2751,8 @@ TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-dylibs","kind":"macho"},
@@ -2762,6 +2788,8 @@ TEST(MachOExecFormatJsonValidate, DylibWithoutDylibImageShapeRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"a-dylib","kind":"macho"},
@@ -2800,6 +2828,8 @@ TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"underflow","kind":"macho"},
@@ -2838,6 +2868,8 @@ TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"no-dyld","kind":"macho"},
@@ -3315,6 +3347,8 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-lazy-pending","kind":"macho"},
@@ -3376,6 +3410,8 @@ TEST(MachOExecFormatJson, UseChainedFixupsDefaultsToFalse) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-default","kind":"macho"},
@@ -3404,6 +3440,8 @@ TEST(MachOExecFormatJson, UseChainedFixupsAcceptsTrue) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-on","kind":"macho"},
@@ -3437,6 +3475,8 @@ TEST(MachOExecFormatJson, UseChainedFixupsRejectsNonBoolean) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-bad","kind":"macho"},
@@ -3495,6 +3535,8 @@ loadChainedFixupsExecFormat() {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-cfx-integration","kind":"macho"},
@@ -3877,6 +3919,8 @@ TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
     auto fmtLegacy = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-legacy-for-delta","kind":"macho"},
@@ -4107,6 +4151,8 @@ TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bindnow-default","kind":"macho"},
@@ -4144,6 +4190,8 @@ TEST(MachOExecFormatJson, PageZeroSizeMustBePowerOfTwo) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bad-pagezero","kind":"macho"},
@@ -4291,6 +4339,8 @@ TEST(MachOExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-bindnow-wrong","kind":"macho"},
@@ -4331,6 +4381,8 @@ TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-two-libs","kind":"macho"},

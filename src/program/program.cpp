@@ -245,8 +245,14 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
     // write-failure diagnostics for this very artifact already use. Forward
     // slashes on every host — that is what this codebase prints, and every
     // consumer of the line (POSIX shell, PowerShell, .NET `Path`) takes them.
+    // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: `core::genericSpelling`,
+    // NOT `generic_string()`. ✔MEASURED — the latter collapses a leading
+    // separator RUN, so a path naming another machine printed as one on the
+    // local drive root. The exported spelling substitutes the model's OWN
+    // separator per character and leaves the run intact, giving the same
+    // forward-slash result this line has always printed for an ordinary path.
     try {
-        return p.generic_string();
+        return core::genericSpelling(p);
     } catch (...) {
         auto const u8 = p.u8string();
         return std::string(reinterpret_cast<char const*>(u8.data()), u8.size());
@@ -270,13 +276,20 @@ void reportArtifactWritten(std::string const& targetSpec,
     // disk — the bytes are already committed, and re-statting here would only
     // create a way for the report to disagree with the write.
     std::error_code ec;
-    fs::path abs = fs::absolute(outPath, ec);
+    // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: NOT bare `fs::absolute`.
+    // ⚠ The "stays TRUE either way" claim below held only for the FAILURE arm.
+    // On a UNC `--output` the bare call SUCCEEDS having re-rooted the path, so
+    // this line reported `C:\host\share\…` for an artifact written to
+    // `\\host\share\…` — a diagnostic naming a file that is not there, which is
+    // worse than losing the absolute guarantee it was written to protect.
+    fs::path abs = core::absoluteKeepingRoot(outPath, ec);
     // Not a silent fallback: `outPath` IS the path the writer committed to, so
     // the line stays TRUE either way. Only the ABSOLUTE guarantee is lost, and
     // only when the process has no usable cwd to resolve against.
     if (ec) abs = outPath;
     std::cerr << "dsscp: artifact " << targetSpec << ' '
-              << artifactPathForReport(abs.lexically_normal()) << '\n';
+              << artifactPathForReport(core::normalizeKeepingRoot(abs))
+              << '\n';
 }
 
 // Emit a driver-tier D_* diagnostic. Wraps `dss::report` so all
@@ -1220,8 +1233,13 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // arm) and `enforceArtifactProfileFormat` already validated the project's
     // `staticlib` profile against this format's served set.
     if ((*formatR)->isStaticArchive()) {
-        std::string const memberExt =
-            (*formatR)->kind() == ObjectFormatKind::Pe ? ".obj" : ".o";
+        // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: this line READ
+        // `kind() == ObjectFormatKind::Pe ? ".obj" : ".o"`. The member
+        // extension is a NAMING fact about the ecosystem this archive belongs
+        // to, so the archive format declares it (`archiveMemberExtension`,
+        // presence-paired with `container: archive` and refused on any format
+        // that packages no members).
+        std::string const memberExt{(*formatR)->archiveMemberExtension()};
         std::vector<AssembledModule> members;
         std::vector<std::string>     memberNames;
         members.reserve(cuMirs.size());
@@ -1284,11 +1302,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                 cuMirs[i].externImports)) {
                 return std::nullopt;  // optimize-stage failure already reported
             }
-            auto mod = lowerCuMirToAssembly(cuMirs[i], (*formatR)->processArgs(),
-                                            (*formatR)->entryVerbs(),
-                                            (*formatR)->sehPersonality(),
-                                            (*formatR)->name(),
-                                            (*formatR)->kind(), reporter);
+            auto mod = lowerCuMirToAssembly(
+                cuMirs[i], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
+                (*formatR)->sehPersonality(), (*formatR)->name(),
+                cuMirs[i].target->wideFloatSoftcallLibrary(
+                    (*formatR)->kind()),
+                reporter);
             if (!mod) return std::nullopt;  // back-half tier failure already reported
             members.push_back(std::move(*mod));
             // Member file name: THIS CU's own source stem (see the block above),
@@ -1569,11 +1588,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                             cuMirs[0].externImports)) {
             return std::nullopt;  // optimize-stage failure already reported
         }
-        auto mod = lowerCuMirToAssembly(cuMirs[0], (*formatR)->processArgs(),
-                                        (*formatR)->entryVerbs(),
-                                        (*formatR)->sehPersonality(),
-                                        (*formatR)->name(),
-                                        (*formatR)->kind(), reporter);
+        auto mod = lowerCuMirToAssembly(
+            cuMirs[0], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
+            (*formatR)->sehPersonality(), (*formatR)->name(),
+            cuMirs[0].target->wideFloatSoftcallLibrary((*formatR)->kind()),
+            reporter);
         if (!mod) {              // back-half tier failure already reported via `reporter`
             emitNullNoDiagnostic("back-half lower (lowerCuMirToAssembly)");
             return std::nullopt;
@@ -2904,7 +2923,6 @@ void appendSchemaDocuments(
     std::string const&          targetSpec,
     TargetSchema const&         target,
     ObjectFormatSchema const&   buildFormat,
-    ObjectFormatKind            formatKind,
     GrammarSchema const&        buildGrammar,
     ShippedSourceLanguageCache& grammarCache,
     CompileConfig               config,
@@ -2924,7 +2942,14 @@ void appendSchemaDocuments(
     // different trees on a host that has more than one checkout, which is the
     // D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE shape.
     fs::path const    configRoot = descriptorDir->parent_path();
-    std::string const formatKey{objectFormatKindName(formatKind)};
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES (the residual half): the
+    // kind is READ OFF THE FORMAT HANDLE this function already holds, rather
+    // than accepted as a second parameter beside it. The old signature took
+    // BOTH `buildFormat` and its own `kind()`, so a caller could pass a kind
+    // that disagreed with the schema and nothing would notice — the two are
+    // now one fact with one owner, and the only spelling of the enum's TYPE
+    // that this function needed is gone with the parameter.
+    std::string const formatKey{objectFormatKindName(buildFormat.kind())};
 
     auto const claims = attributeShippedRuntimeUnits(configRoot, *descriptorDir,
                                                      formatKey, rep);
@@ -3986,7 +4011,7 @@ int runCusToTargets(
                     resolvedArchives = resolveShippedRuntimeArchives(
                         spec, *targetByName.at(parsedForRuntime->targetName),
                         *formatByName.at(parsedForRuntime->formatName),
-                        *keyPerTarget[i].format, *grammarPerTarget[i],
+                        *grammarPerTarget[i],
                         shippedSourceGrammars, config, runtimeStaging, scratch);
                 }
                 if (scratch.errorCount() != errorsBefore) {
@@ -4303,6 +4328,30 @@ int Program::run(int argc, char* argv[]) {
     setOutputDir(args.outputDir);
     setUserDefines(args.defines);  // c105: --define NAME[=VALUE] → the CU builds
     setIncludeDirs(args.includeDirs);  // -I<dir> quote-include path (SQLite-testfixture arc C3)
+    // D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED (the ACCEPTANCE half):
+    // an unusable `-I` is named HERE, at the point the driver accepts it,
+    // rather than surfacing later as a missing-header error pointing at the
+    // `#include`. It WARNS and never refuses — see
+    // `InputResolver::checkSearchDirectoriesUsable` for the gcc/MSVC
+    // measurement that settles which of the two it has to be.
+    //
+    // ★ THIS SITE COVERS EVERY MODE, because it sits before the dispatch fork
+    // beside the other CLI stamps. The manifest's `includes` are checked at
+    // their own acceptance point in `compileProject`, where they are merged —
+    // one check per SURFACE, so neither is silent and neither doubles up.
+    //
+    // ⓘ The reporter is local and buffer-less, matching the other pre-parse
+    // driver-tier sites: these diagnostics carry no source location because
+    // their subject is a command-line argument, not a token.
+    {
+        DiagnosticReporter argRep{cfg};
+        (void)InputResolver::checkSearchDirectoriesUsable(
+            args.includeDirs, "-I", argRep);
+        drainDiagnosticsToStderr(argRep);
+        // Only `--warnings-as-errors` can make this fatal; without it the
+        // count stays zero and the run continues, exactly as gcc and MSVC do.
+        if (argRep.errorCount() > 0u) return 1;
+    }
     // D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG: thread the CLI's
     // `--config=<debug|release>` into the kernel so the right
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
@@ -4601,6 +4650,17 @@ int Program::compileProject(
     // twice would double-append; that is out of contract (single-use), not a
     // supported reuse mode.
     {
+        // D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED (the ACCEPTANCE half),
+        // the MANIFEST surface. Checked BEFORE the merge and over `pc.includes`
+        // ALONE, not over the merged list: the CLI's own `-I` entries were
+        // already checked at their acceptance point in `Program::run`, and
+        // re-checking them here would report each of them TWICE for every
+        // project build — the "one check per surface" rule the CLI site states.
+        // `rep` is this call's reporter, so a manifest warning renders with the
+        // project's diagnostics rather than through a second channel.
+        (void)InputResolver::checkSearchDirectoriesUsable(
+            pc.includes, "the project manifest's `includes`", rep);
+
         std::vector<std::string> mergedIncludes = includeDirs();
         mergedIncludes.reserve(mergedIncludes.size() + pc.includes.size());
         mergedIncludes.insert(mergedIncludes.end(),
@@ -4950,7 +5010,12 @@ void applyIncludeDirs(UnitBuilder& builder,
                       std::vector<std::string> const& dirs) {
     std::error_code ec;
     for (std::string const& d : dirs) {
-        fs::path const abs = fs::absolute(fs::path{d}, ec);
+        // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: NOT bare
+        // `fs::absolute`. ✔MEASURED — it re-roots `-I //host/share/inc` onto the
+        // local drive with no error, so the search dir named a directory that
+        // cannot exist and the header missed 0/30 for BOTH slash spellings while
+        // the acceptance check, which saw the ORIGINAL string, stayed silent.
+        fs::path const abs = core::absoluteKeepingRoot(fs::path{d}, ec);
         builder.addIncludeDir(ec ? fs::path{d} : abs);
         ec.clear();
     }

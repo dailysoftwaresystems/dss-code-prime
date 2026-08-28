@@ -134,14 +134,20 @@ TEST(AttributeClauseNameTokenClass, KeywordNameIsAdmittedInEveryClausePosition) 
 
 // ── the SEMANTIC half: the name is READ, and the row lookup DISCRIMINATES ────
 
-// ★★ THE PAIR THAT SEPARATES THE FIX FROM A GRAMMAR-ONLY WIDENING. `typedefDecl`
-// declares `unknownStrictAttributeIsError`, so its attribute run refuses any GNU
-// clause name absent from `semantics.attributeSemantics.effects`. Two
-// KEYWORD-spelled names, one modelled and one not, must therefore come out
-// DIFFERENT — and they can only differ if the reader read the name at all. A
-// reader that still looks for `identifierToken` alone finds NO name in either,
-// drops both clauses, and is silent on both: the refusal pin goes red and the
-// pair collapses.
+// ★★ THE PAIR THAT SEPARATES THE FIX FROM A GRAMMAR-ONLY WIDENING. `typedefDecl`'s
+// attribute run REPORTS any GNU clause name absent from
+// `semantics.attributeSemantics.effects`. Two KEYWORD-spelled names, one modelled
+// and one not, must therefore come out DIFFERENT — and they can only differ if
+// the reader read the name at all. A reader that still looks for `identifierToken`
+// alone finds NO name in either, drops both clauses, and is silent on both: the
+// report pin goes red and the pair collapses.
+// ⚠ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY): the unmodelled half is now a
+// WARNING (`S_UnknownAttribute`), not an Error — `typedefDecl` declares
+// `unknownStrictAttributeIsError: false` because both references compile the shape
+// at rc=0. THE PAIR IS UNAFFECTED: what it proves is that the two names come out
+// DIFFERENT, and "one report vs none" says that exactly as well as "error vs
+// none". A pin that depended on the SEVERITY rather than on the DISCRIMINATION
+// would have been testing the wrong property.
 TEST(AttributeClauseNameTokenClass, ModelledKeywordNameIsAcceptedAtTheStrictGate) {
     std::string const src = "typedef __attribute__((__const__)) int T;\n"
                             "int main(void){ T x = 0; return x; }\n";
@@ -154,27 +160,30 @@ TEST(AttributeClauseNameTokenClass, ModelledKeywordNameIsAcceptedAtTheStrictGate
            "gate and matching a row is the whole point";
 }
 
-TEST(AttributeClauseNameTokenClass, UnmodelledKeywordNameFailsLoudAtTheStrictGate) {
+TEST(AttributeClauseNameTokenClass, UnmodelledKeywordNameIsReportedAtTheGate) {
     std::string const src = "typedef __attribute__((__volatile__)) int T;\n"
                             "int main(void){ T x = 0; return x; }\n";
     ASSERT_EQ(parseErrorsFor(src), 0u)
-        << "the GRAMMAR admits the keyword name; the refusal below is the "
+        << "the GRAMMAR admits the keyword name; the verdict below is the "
            "SEMANTIC tier's, which is the tier that knows what names mean";
     auto model = analyzeC(src);
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
-        << "a keyword-spelled name the language does not model must fail loud, "
-           "exactly as a misspelled identifier name does — silence here IS the "
+                        DiagnosticCode::S_UnknownAttribute), 1u)
+        << "a keyword-spelled name the language does not model must be REPORTED, "
+           "exactly as a misspelled identifier name is — silence here IS the "
            "silent attribute drop this row exists to refuse";
+    EXPECT_FALSE(model.hasErrors())
+        << "…and reported is not refused: both references compile this at rc=0";
 }
 
 // The identifier-named control for the pair above: the gate's behaviour must be
 // a property of the NAME, not of which token kind spelled it.
-TEST(AttributeClauseNameTokenClass, IdentifierNamedControlStillFailsLoud) {
+TEST(AttributeClauseNameTokenClass, IdentifierNamedControlIsReportedToo) {
     auto model = analyzeC("typedef __attribute__((frobnicate_xyz)) int T;\n"
                           "int main(void){ T x = 0; return x; }\n");
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+                        DiagnosticCode::S_UnknownAttribute), 1u);
+    EXPECT_FALSE(model.hasErrors());
 }
 
 // ★ The C23 spelling has its OWN reader arm (`stdAttrItem` clauses), its own
@@ -208,8 +217,13 @@ TEST(AttributeClauseNameTokenClass, KeywordNamedTrailingClauseIsEnumerated) {
         "int main(void){ return (int)sizeof(struct S); }\n";
     ASSERT_EQ(parseErrorsFor(src), 0u);
     auto model = analyzeC(src);
+    // P44: the composite scan's unknown-name report is the row's severity now
+    // (`structSpec` declares `unknownStrictAttributeIsError: false`), so this is
+    // `S_UnknownAttribute` at Warning. What is being pinned — that the SECOND,
+    // keyword-spelled clause is VISITED AT ALL — is unchanged: a reader that
+    // still requires an `identifierToken` never enumerates it and the count is 0.
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+                        DiagnosticCode::S_UnknownAttribute), 1u)
         << "the SECOND clause is keyword-spelled; it must be enumerated and "
            "judged on its own merits, not skipped because its name is not an "
            "Identifier";

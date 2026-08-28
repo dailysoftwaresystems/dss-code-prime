@@ -5,6 +5,7 @@
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"  // c97: heterogeneous scope-binding lookup
 #include "core/types/data_model.hpp"
+#include "core/types/declared_qualification.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/source_span.hpp"
@@ -752,6 +753,14 @@ struct DSS_EXPORT SuppressedShippedSymbol {
     // recipe-less row's copy is simply unread today) so the field's meaning is
     // "what the descriptor declared", never "what one consumer needed".
     TypeId signature;
+    // ★★ P44 (item (a) of D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES):
+    // the descriptor row's `const` / `restrict` claim, carried verbatim from
+    // `ShippedSymbol::qualification`. `signature` above CANNOT hold it — neither
+    // qualifier is interned, so `fn(ptr<const<char>>, ...)` and
+    // `fn(ptr<char>, ...)` are the same TypeId by design — and C23 6.7.6.1p2
+    // makes a pointed-to qualifier part of the type for redeclaration
+    // compatibility. NULL is "this row says nothing", never "unqualified".
+    std::shared_ptr<DeclaredQualification const> qualification;
     // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the suppressed row's
     // per-target LINK BASE NAME (`ShippedSymbol::linkName`, already resolved for
     // the active target), or EMPTY. Rides here for the SAME reason `version`

@@ -21,42 +21,34 @@
 // can't cross-check because the target schema's arch identity isn't
 // reachable from the format-load context.
 //
-// Source / target / linker agnostic:
-//   * Validation routes through a closed-enum table mapping target
-//     names → expected machine codes per object-format kind.
-//   * Adding a new arch (RISC-V, PPC64, MIPS) = add a row to
-//     `kTargetArchMachineCodes` + the format JSONs declare the
-//     matching machine value.
-//   * Targets not in the table (WASM / SPIR-V / future) skip the
-//     check — those format kinds don't carry a `machine` field;
-//     compatibility is governed by `abiModel()` upstream.
+// Source / target / linker agnostic — D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES:
+//   * BOTH checks compare two DECLARATIONS and neither reads a format
+//     IDENTITY. The execution-model check pairs the target's `abiModel`
+//     against the format's REQUIRED `cCallingConvention`; the arch check
+//     pairs the target's NAME against the format's declared `targetArch`.
+//   * Adding a new arch (RISC-V, PPC64, MIPS) is JSON-ONLY: ship the
+//     `.target.json` and the `.format.json`s that name it in `targetArch`.
+//     ⚠ It used to ALSO require a C++ row in `kTargetArchMachineCodes`, and
+//     that table is DELETED — the machine number it duplicated now has one
+//     owner, the format document that emits it.
+//   * A format that declares no `targetArch` makes no claim and skips the
+//     pairing check — the behaviour the deleted table had for a target it
+//     had no row for. Every shipped format declares it, pinned by a sweep.
 
 namespace dss {
 
-// Per-target-arch expected machine codes for each format kind.
-// The codebase pattern: closed-enum table, no string drift.
-// Fields are u32 to accommodate Mach-O `cputype` (32-bit); ELF +
-// PE machine values are u16 but fit u32 trivially.
-struct DSS_EXPORT TargetArchMachineCodes {
-    std::string_view targetName;     // matches TargetSchema::name()
-    std::uint32_t    elfMachine;     // EM_*  (e.g. 62 for x86_64, 183 for AArch64)
-    std::uint32_t    peMachine;      // IMAGE_FILE_MACHINE_*  (e.g. 0x8664, 0xAA64)
-    std::uint32_t    machoCpuType;   // CPU_TYPE_*  (e.g. 0x01000007, 0x0100000C)
-};
-
-// Cross-validate the (target, format) pair's machine identity.
-// Returns true on match (or skip: unknown target / format-kind
-// without a machine field). Returns false + emits
-// `D_TargetFormatMismatch` through `reporter` on mismatch.
+// Cross-validate the (target, format) pair. Returns true on a match, or when
+// the format makes no `targetArch` claim (i.e. the check does not apply).
+// Returns false + emits `D_TargetAbiModelMismatch` (execution model) or
+// `D_TargetMachineCodeMismatch` (arch pairing) through `reporter`.
+//
+// ⓘ `D_TargetMachineCodeMismatch` keeps its name although the comparison is no
+// longer of machine NUMBERS: the failure CLASS is unchanged — this format is
+// not for this target — and renaming a shared `DiagnosticCode` enumerator would
+// churn a cross-cutting header to describe the same event.
 [[nodiscard]] DSS_EXPORT bool
 crossValidateTargetFormat(TargetSchema const&        target,
                           ObjectFormatSchema const&  format,
                           DiagnosticReporter&        reporter);
-
-// Test-exposed for direct coverage (post-fold pattern from
-// `rangeExceedsBuffer`). Lets unit tests pin every arch+kind cell
-// without synthesising full TargetSchema/ObjectFormatSchema objects.
-[[nodiscard]] DSS_EXPORT std::span<TargetArchMachineCodes const>
-targetArchMachineCodesTable() noexcept;
 
 } // namespace dss

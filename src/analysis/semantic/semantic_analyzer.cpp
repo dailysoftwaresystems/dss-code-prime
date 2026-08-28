@@ -10,6 +10,11 @@
 // `cst_to_hir` so the tier that REFUSES and the tier that BUILDS THE DESCRIPTOR
 // cannot disagree about what the statement said.
 #include "analysis/semantic/inline_asm_facts.hpp"
+// The ONE C23 function-redeclaration compatibility oracle, shared with
+// `cst_to_hir`'s shipped-shim gate so the tier that REFUSES a declaration and the
+// tier that BINDS it to a platform realization cannot hold two notions of
+// "compatible" ([[D-CSUBSET-SUPPRESSED-SHIPPED-ROW-SIGNATURE-UNCHECKED]]).
+#include "analysis/semantic/redeclaration_compat.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/symbol_table.hpp"
 #include "analysis/semantic/type_rules.hpp"
@@ -1180,6 +1185,462 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
     // keeps its const in the head, so it stays correctly rejected.
     return subtreeContainsToken(tree, headNode.valid() ? headNode : declNode,
                                 constMarker, declByRule, opaqueRules);
+}
+
+// ── THE CONST SPINE (D-LANG-TYPE-IDENTITY-QUALIFIER-BLIND-VS-C23-REDECL) ──────
+//
+// `declaratorObjectIsConst` above answers ONE level of the question this answers
+// for ALL of them: it asks "is the declared OBJECT const" (spine level 0), this
+// asks "which levels of the declared type's derivation chain are const". They sit
+// adjacent and read the SAME three config roles — the pointer-layer rule, the
+// direct rule, and the row's own `constMarker` — because the two answers must
+// never disagree about where a `const` token lives.
+//
+// WHY IT EXISTS. `const` is deliberately not interned (type_interner.hpp: it
+// never affects codegen or layout), so DSS type IDENTITY is qualifier-blind while
+// C23 redeclaration COMPATIBILITY is qualifier-SENSITIVE (6.7.6.1p2 compares
+// pointed-to types INCLUDING their qualifiers). This is the side channel that
+// closes that gap without touching the interner.
+//
+// ★ IT MIRRORS `declaratorDeclaredType`'S OWN FOLD, LEVEL FOR LEVEL. That
+// function applies the declarator's pointer layers innermost-first (`t =
+// interner.pointer(t)` over `visibleChildren` in source order) and then the
+// direct's array suffixes, which therefore sit OUTSIDE every star: `char *x[3]`
+// is `Array<Ptr<char>,3>`, so level 0 is the array, level 1 the pointer, level 2
+// the base. This walk assigns the same numbers to the same syntax — which is what
+// makes a spine comparable against a TypeId that fold built.
+//
+// ⚠ IT RETURNS nullopt RATHER THAN GUESSING. A grouped declarator (`int (*p)[3]`,
+// a function-pointer parameter) re-enters the fold at an INNER declarator whose
+// levels interleave with the outer's, and a spine that got that ordering wrong
+// would REFUSE A LEGAL PROGRAM — the one outcome a compatibility check may never
+// produce. Unmodelled shapes make NO CLAIM, and the oracle then leaves the
+// qualifier axis unjudged for them (redeclaration_compat.hpp, "ABSENT IS NOT
+// UNQUALIFIED"). The missed diagnostic is the safe direction of wrong; a
+// fabricated one is not. Tracked as one of the three gaps in
+// [[D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES]].
+//
+// ★★ P44 — `restrictMarker` RIDES THE SAME WALK (part (b) of the row). It is an
+// OPTIONAL second marker and it is read from POINTER LAYERS ONLY: C 6.7.3.2p1
+// confines `restrict` to pointer types, so a head occurrence is a constraint
+// violation the type resolver owns and never a level-qualification claim this
+// spine should carry. An invalid marker (the language declares none) simply
+// leaves `restrictBits` at 0 for every level — which is a claim of "not
+// restrict-qualified" and is CORRECT precisely because a language with no
+// `restrict` token cannot spell one. That is different from the ABSENT-claim
+// case, which is `nullopt` for the whole spine.
+// The two helpers the nested-parameter arm needs; both are defined below this
+// walk, beside the harvest that shares them. Forward-declared rather than moved
+// so `declaratorConstSpine` keeps sitting next to `declaratorObjectIsConst`,
+// whose three config roles it must go on reading identically.
+void collectParamRowNodes(SchemaIndexes const& idx, SemanticConfig const& cfg,
+                          Tree const& tree, NodeId cur,
+                          std::vector<NodeId>& out);
+
+[[nodiscard]] std::optional<QualifierSpine>
+declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
+                     DeclaratorConfig const& dc, SchemaTokenId constMarker,
+                     std::unordered_map<std::uint32_t, std::size_t> const*
+                         declByRule,
+                     std::span<RuleId const> opaqueRules = {},
+                     SchemaTokenId restrictMarker = {},
+                     SchemaIndexes const* idx = nullptr, int nestDepth = 0) {
+    // No const marker declared for this row, or no head to read the base
+    // qualifier from ⇒ nothing can be claimed honestly.
+    if (!constMarker.valid() || !headNode.valid()) return std::nullopt;
+    bool const headConst = subtreeContainsToken(tree, headNode, constMarker,
+                                                declByRule, opaqueRules);
+    // The one-level answer: an abstract parameter with no declarator at all
+    // (`int f(const char)`), where the head IS the whole type. A one-level spine
+    // is a BASE and nothing else, so it can carry no restrict bit.
+    auto headOnly = [&] {
+        QualifierSpine sp;
+        sp.levels    = 1;
+        sp.constBits = headConst ? 1u : 0u;
+        return std::optional<QualifierSpine>{sp};
+    };
+    if (!dNode.valid() || tree.kind(dNode) != NodeKind::Internal) return headOnly();
+    // Descend a per-slot wrapper to the inner declaratorRule — the same descent
+    // `declaratorDeclaredType` and `declaratorObjectIsConst` both make.
+    NodeId       inner = dNode;
+    RuleId const dr    = tree.rule(dNode);
+    if (dr == dc.initDeclaratorRule
+        || (dc.memberDeclaratorRule.has_value() && dr == *dc.memberDeclaratorRule)) {
+        NodeId const d = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, dNode, dc.declaratorRule);
+        if (!d.valid()) return std::nullopt;
+        inner = d;
+    }
+    if (tree.kind(inner) != NodeKind::Internal
+        || tree.rule(inner) != dc.declaratorRule) {
+        return headOnly();
+    }
+    // ── THE CONSTRUCTOR CHAIN, OUTERMOST FIRST ────────────────────────────────
+    //
+    // `ctors` accumulates one entry per DERIVATION LEVEL above the base, in the
+    // order a reader sees them (level 0 first), each carrying whether THAT level
+    // is const-qualified. The base is appended last, from the head qualifier.
+    //
+    // ★★ THE ORDERING RULE, DERIVED FROM `declaratorDeclaredType`'S OWN FOLD AND
+    // WRITTEN DOWN BECAUSE GETTING IT WRONG REFUSES LEGAL CODE. For a declarator
+    // `L* ( direct )` where `direct` is `(name | ( D' )) suffix*`, that fold:
+    //   (1) binds the pointer layers L innermost-first, so the LAST star in source
+    //       order is the outermost of that run;
+    //   (2) applies the direct's suffixes to the result, outermost suffix first;
+    //   (3) then, if the direct is a parenthesized GROUP, re-enters at the inner
+    //       declarator D' and applies ITS layers on top of all of that.
+    // So the whole chain is  ctors(D') ++ suffixes(D) ++ reverse(L(D)),  and the
+    // base sits under all of it. ✔CHECKED against the fold on four shapes:
+    //   `const char **p`   → [Ptr, Ptr] + base(const)              (no group)
+    //   `char *x[3]`       → [Array, Ptr] + base   (arrays OUTSIDE the stars)
+    //   `int (*p)[3]`      → [Ptr, Array] + base   (the group's star is outermost)
+    //   `const int (*)[3]` → [Ptr, Array] + base(const)
+    // The first two are the pre-group behaviour, unchanged byte-for-byte.
+    // One entry per derivation level above the base: `.first` = const on that
+    // level, `.second` = restrict on it. Two parallel vectors would let the two
+    // axes drift apart on a level, which is the one thing a positional claim may
+    // never do.
+    struct LevelQual { bool isConst = false; bool isRestrict = false; };
+    std::vector<LevelQual> ctors;
+    bool                   modelled = true;
+    std::vector<std::pair<std::uint8_t,
+                          std::shared_ptr<DeclaredQualification const>>> fnClaims;
+
+    // ★★ P44 part (c) — THE NESTED PARAMETER CLAIM for a function LEVEL.
+    //
+    // It reads the fn suffix's own parameter list through the SAME two readers
+    // the outer harvest uses (`fnSuffixParamsRule` for the list,
+    // `collectParamRowNodes` for the rows), so the two cannot disagree about
+    // which nodes are parameters — and it recurses into THIS function for each
+    // row's spine, so a parameter that is itself a function pointer is claimed
+    // the same way at every depth.
+    //
+    // ⚠ IT RETURNS nullptr RATHER THAN AN EMPTY CLAIM WHENEVER ANYTHING IS
+    // UNREADABLE, and the oracle then does not judge that level. `nullptr` is
+    // "no claim"; an empty-but-present claim would read as "this function takes
+    // no qualified parameters", which is a statement, and a wrong one for every
+    // shape this walk cannot model.
+    //
+    // The depth cap is the same defence the group descent already carries: a
+    // corrupt or cyclic node graph becomes "no claim" instead of a hang.
+    auto nestedFnParamClaim =
+        [&](NodeId fnSuffix) -> std::shared_ptr<DeclaredQualification const> {
+        if (nestDepth >= 4 || idx == nullptr || idx->cfg == nullptr) return nullptr;
+        if (!dc.fnSuffixParamsRule.has_value() || !fnSuffix.valid()) return nullptr;
+        NodeId plist{};
+        for (NodeId c : visibleChildren(tree, fnSuffix)) {
+            if (tree.kind(c) == NodeKind::Internal
+                && tree.rule(c) == *dc.fnSuffixParamsRule) { plist = c; break; }
+        }
+        if (!plist.valid()) return nullptr;
+        std::vector<NodeId> rows;
+        collectParamRowNodes(*idx, *idx->cfg, tree, plist, rows);
+        if (rows.empty()) return nullptr;
+        auto claim = std::make_shared<DeclaredQualification>();
+        claim->params.assign(rows.size(), std::nullopt);
+        bool any = false;
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            auto const pIt = idx->declByRule.find(tree.rule(rows[i]).v);
+            if (pIt == idx->declByRule.end()) continue;
+            auto const& pDecl = idx->cfg->declarations[pIt->second];
+            if (!pDecl.isDeclaratorMode() || !pDecl.constMarker.has_value())
+                continue;
+            auto const pKids = declRoleChildren(tree, rows[i], pDecl);
+            if (!pDecl.headChild.has_value() || *pDecl.headChild >= pKids.size())
+                continue;
+            NodeId pDeclarator{};
+            if (pDecl.declaratorChild.has_value()
+                && *pDecl.declaratorChild < pKids.size())
+                pDeclarator = pKids[*pDecl.declaratorChild];
+            claim->params[i] = declaratorConstSpine(
+                tree, pDeclarator, pKids[*pDecl.headChild], dc,
+                *pDecl.constMarker, declByRule, opaqueRules,
+                pDecl.restrictMarker.value_or(SchemaTokenId{}), idx,
+                nestDepth + 1);
+            if (claim->params[i].has_value()) any = true;
+        }
+        return any ? std::shared_ptr<DeclaredQualification const>(std::move(claim))
+                   : nullptr;
+    };
+    // Bounded, iterative-by-recursion over the group chain; the cap turns a
+    // corrupt/cyclic node graph into "no claim" rather than a hang, exactly as
+    // `declaratorObjectIsConst`'s own descent does.
+    auto collect = [&](auto&& self, NodeId d, int depth) -> void {
+        if (!modelled) return;
+        if (depth > 16 || !d.valid() || tree.kind(d) != NodeKind::Internal
+            || tree.rule(d) != dc.declaratorRule) {
+            modelled = false;
+            return;
+        }
+        std::vector<NodeId> layers;   // source order: [0] innermost … [k-1] outermost
+        NodeId              direct{};
+        for (NodeId c : visibleChildren(tree, d)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            RuleId const cr = tree.rule(c);
+            if (cr == dc.pointerLayerRule) {
+                layers.push_back(c);
+            } else if (!direct.valid()
+                       && (cr == dc.directRule
+                           || (dc.directAbstractRule.has_value()
+                               && cr == *dc.directAbstractRule))) {
+                direct = c;
+            }
+        }
+        std::size_t arrays  = 0;
+        NodeId      fnSuffix{};
+        NodeId      group{};
+        if (direct.valid()) {
+            for (NodeId c : visibleChildren(tree, direct)) {
+                if (tree.kind(c) != NodeKind::Internal) continue;
+                RuleId const cr = tree.rule(c);
+                if (cr == dc.groupRule) { if (!group.valid()) group = c; }
+                else if (cr == dc.arraySuffixRule) ++arrays;
+                else if (dc.arrayStarSuffixRule.has_value()
+                         && cr == *dc.arrayStarSuffixRule) ++arrays;
+                else if (isFnSuffixRule(cr, dc) && !fnSuffix.valid()) fnSuffix = c;
+            }
+        }
+        bool const hasFn = fnSuffix.valid();
+        // ⚠ A FUNCTION SUFFIX MEANS TWO DIFFERENT THINGS, AND THE DISCRIMINATOR
+        // IS THE GROUP. Without a group, a fn suffix means THIS declarator
+        // declares a function and the spine describes its RESULT — the suffix
+        // contributes no level, which is what the `int (*)(…)`-free shapes rely
+        // on. WITH a group the object is a pointer TO a function: the suffix IS a
+        // level, and the head qualifier then qualifies the RETURN type rather
+        // than a pointee.
+        //
+        // ★★ P44 (part (c) of D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES)
+        // — THE GROUPED CASE IS NOW MODELLED, AND THE ORDERING RULE IS WHY IT
+        // COULD BE. `ctors(D') ++ suffixes(D) ++ reverse(L(D))`, base underneath,
+        // already puts the head qualifier in the right place for a function
+        // pointer: ✔CHECKED against `declaratorDeclaredType`'s own fold on
+        // `const char *(*)(void)` → [Ptr, Fn, Ptr] + base(const), where the base
+        // IS the returned pointee and 6.7.6.1p2 wants exactly that. The RETURN
+        // type therefore needs no special case — it is the deeper levels of this
+        // same spine. Only the inner function's PARAMETERS are unreachable from a
+        // flat chain, and they get a nested `DeclaredQualification` below.
+        //
+        // ⚠ ARRAYS ALONGSIDE A FN SUFFIX STILL MAKE NO CLAIM. `int (*p[4])(char)`
+        // puts an array and a function suffix on ONE direct, and their relative
+        // order in the fold is a question this walk does not read from the tree —
+        // guessing it would misplace every level above the base, and a misplaced
+        // level REFUSES LEGAL CODE. That combination stays unmodelled.
+        if (hasFn && arrays != 0) { modelled = false; return; }
+        if (group.valid()) {
+            NodeId const innerD = declarator_walk_detail::firstChildOfRule(
+                TreeDeclaratorView{tree}, group, dc.declaratorRule);
+            if (!innerD.valid()) { modelled = false; return; }
+            self(self, innerD, depth + 1);          // ctors(D') — the outermost
+            if (!modelled) return;
+        }
+        // suffixes(D), and the fn suffix is one of them WHEN there is a group.
+        // Its level carries no cv of its own — a function type cannot be
+        // qualified (C 6.7.3p9) — so the LevelQual is empty and the claim it
+        // does carry is about its PARAMETERS.
+        if (hasFn && group.valid()) {
+            ctors.push_back(LevelQual{});
+            fnClaims.emplace_back(
+                static_cast<std::uint8_t>(ctors.size() - 1),
+                nestedFnParamClaim(fnSuffix));
+        }
+        for (std::size_t i = 0; i < arrays; ++i) {
+            // An array level carries no const claim of its own: a bracket's
+            // cv-decoration is legal only on a PARAMETER, where it qualifies the
+            // decayed pointer — the parameter's own top level, which C23
+            // 6.7.6.3p15 discards anyway. The same holds for `restrict`
+            // (`void f(char arr[restrict 4])` restricts the decayed POINTER,
+            // which is that same discarded top level).
+            ctors.push_back(LevelQual{});
+        }
+        for (std::size_t i = layers.size(); i-- > 0;) {
+            // reverse(L): the LAST star in source order is the outermost of this
+            // run. An EAST qualifier inside the layer (`* const`, `* restrict`)
+            // qualifies the pointer THAT layer built (C 6.7.3) — the same reading
+            // the volatile/atomic arms of `declaratorDeclaredType` take of this
+            // node, and the ONLY place a legal `restrict` can appear.
+            ctors.push_back(LevelQual{
+                subtreeContainsToken(tree, layers[i], constMarker, declByRule,
+                                     opaqueRules),
+                restrictMarker.valid()
+                    && subtreeContainsToken(tree, layers[i], restrictMarker,
+                                            declByRule, opaqueRules)});
+        }
+    };
+    collect(collect, inner, 0);
+    if (!modelled) return std::nullopt;
+    std::size_t const levels = ctors.size() + 1;
+    if (levels > 63) return std::nullopt;   // beyond the bitset ⇒ make no claim
+    QualifierSpine sp;
+    sp.levels = static_cast<std::uint8_t>(levels);
+    // The BASE sits deepest, and the head qualifier is what qualifies it
+    // (`const char *p` ⇒ level 1 of a 2-level spine).
+    if (headConst) sp.constBits |= (std::uint64_t{1} << (levels - 1));
+    for (std::size_t i = 0; i < ctors.size(); ++i) {
+        if (ctors[i].isConst)    sp.constBits    |= (std::uint64_t{1} << i);
+        if (ctors[i].isRestrict) sp.restrictBits |= (std::uint64_t{1} << i);
+    }
+    // A level with a null claim is dropped rather than recorded: the oracle's
+    // "no claim" is the ABSENCE of an entry, and carrying a null one would make
+    // the two spellings of nothing distinguishable to a future reader.
+    for (auto& [level, claim] : fnClaims)
+        if (claim != nullptr) sp.fnParams.emplace_back(level, std::move(claim));
+    return sp;
+}
+
+// The PARAM-ROW nodes of a params subtree, in source order. The descent rule is
+// the one `collectParamTypes` uses and states — a param declaration row is a LEAF
+// for parameter collection, so a function-pointer parameter's own nested params
+// never leak into the enclosing list — with the type resolution left out: this is
+// asked while comparing two ALREADY-RESOLVED declarations, and re-resolving here
+// would intern types (invalidating a caller's GuardedSpan) to produce answers
+// nobody reads.
+void collectParamRowNodes(SchemaIndexes const& idx, SemanticConfig const& cfg,
+                          Tree const& tree, NodeId cur,
+                          std::vector<NodeId>& out) {
+    if (!cur.valid() || isEmptySpace(tree.flags(cur))) return;
+    if (tree.kind(cur) == NodeKind::Internal) {
+        auto const declIt = idx.declByRule.find(tree.rule(cur).v);
+        if (declIt != idx.declByRule.end()) {
+            auto const& decl = cfg.declarations[declIt->second];
+            if (decl.isDeclaratorMode() || decl.typeChild.has_value())
+                out.push_back(cur);
+            return;
+        }
+    }
+    for (auto const& child : tree.children(cur))
+        collectParamRowNodes(idx, cfg, tree, child, out);
+}
+
+// The `fnSuffixParamsRule` node of a function declarator, or an invalid NodeId.
+// Reads the SAME roles `applyDeclaratorSuffix` reads to find the list it harvests
+// param TYPES from, so the two cannot disagree about which list is the signature's.
+[[nodiscard]] NodeId functionParamsListNode(Tree const& tree, NodeId dNode,
+                                            DeclaratorConfig const& dc) {
+    if (!dc.fnSuffixParamsRule.has_value()) return {};
+    if (!dNode.valid() || tree.kind(dNode) != NodeKind::Internal) return {};
+    NodeId       inner = dNode;
+    RuleId const dr    = tree.rule(dNode);
+    if (dr == dc.initDeclaratorRule
+        || (dc.memberDeclaratorRule.has_value() && dr == *dc.memberDeclaratorRule)) {
+        inner = declarator_walk_detail::firstChildOfRule(
+            TreeDeclaratorView{tree}, dNode, dc.declaratorRule);
+    }
+    if (!inner.valid() || tree.kind(inner) != NodeKind::Internal
+        || tree.rule(inner) != dc.declaratorRule) {
+        return {};
+    }
+    for (NodeId c : visibleChildren(tree, inner)) {
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        RuleId const cr = tree.rule(c);
+        if (cr != dc.directRule
+            && !(dc.directAbstractRule.has_value() && cr == *dc.directAbstractRule))
+            continue;
+        for (NodeId sfx : visibleChildren(tree, c)) {
+            if (tree.kind(sfx) != NodeKind::Internal) continue;
+            if (!isFnSuffixRule(tree.rule(sfx), dc)) continue;
+            for (NodeId pl : visibleChildren(tree, sfx)) {
+                if (tree.kind(pl) == NodeKind::Internal
+                    && tree.rule(pl) == *dc.fnSuffixParamsRule)
+                    return pl;
+            }
+        }
+    }
+    return {};
+}
+
+// The `const`-qualification a FUNCTION DECLARATION claims: the spine of its
+// RESULT type plus one spine per parameter, positionally. Feeds the C23 oracle in
+// redeclaration_compat.hpp; `nullopt` (at either granularity) means the
+// declaration made no claim this walk can read, and the oracle then does not judge
+// that axis.
+//
+// ★ THE RESULT AND THE PARAMETERS ARE CLAIMED INDEPENDENTLY, and that is what
+// makes the C 6.7.6.3p10 `(void)` normalization harmless here: `int f(void)`
+// yields ONE param row but a ZERO-param FnSig, and rather than voiding the whole
+// declaration's claim (which would silently un-diagnose `const char *k(void);`
+// beside `char *k(void);` — a shape ✔gcc and clang both refuse) a positional
+// disagreement voids ONLY the parameter axis. A count check is also the ONE
+// self-check available here: it fails loud-into-silence exactly when this walk and
+// the FnSig builder disagree about how many parameters there are.
+[[nodiscard]] std::optional<DeclaredQualification>
+harvestFunctionQualification(TypeInterner const& in, SchemaIndexes const& idx,
+                             Tree const& tree, SymbolRecord const& rec,
+                             TypeId fnType) {
+    if (idx.cfg == nullptr) return std::nullopt;
+    SemanticConfig const& cfg = *idx.cfg;
+    if (!cfg.declarators.has_value()) return std::nullopt;
+    if (!rec.declRuleNode.valid() || !fnType.valid()) return std::nullopt;
+    if (in.kind(fnType) != TypeKind::FnSig) return std::nullopt;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    auto const declIt = idx.declByRule.find(tree.rule(rec.declRuleNode).v);
+    if (declIt == idx.declByRule.end()) return std::nullopt;
+    auto const& decl = cfg.declarations[declIt->second];
+    if (!decl.isDeclaratorMode() || !decl.constMarker.has_value())
+        return std::nullopt;
+    auto const kids = declRoleChildren(tree, rec.declRuleNode, decl);
+    if (!decl.headChild.has_value() || *decl.headChild >= kids.size())
+        return std::nullopt;
+    NodeId const head = kids[*decl.headChild];
+    // D-CSUBSET-TYPEOF: a `const` inside a `typeof(...)` operand is part of the
+    // OPERAND, not of this declaration's head — the same opacity
+    // `declaratorObjectIsConst` applies, for the same reason.
+    std::array<RuleId, 2> const typeofOpaqueRules{cfg.typeofTypeRule,
+                                                  cfg.typeofValueRule};
+
+    // This symbol's own declarator among the row's (a row may declare several).
+    auto const carrier = decl.declaratorListChild.has_value()
+                             ? decl.declaratorListChild
+                             : decl.declaratorChild;
+    if (!carrier.has_value() || *carrier >= kids.size()) return std::nullopt;
+    std::vector<NodeId> declarators;
+    collectDeclarators(TreeDeclaratorView{tree}, kids[*carrier], dc, declarators);
+    NodeId mine{};
+    for (NodeId d : declarators) {
+        if (declaratorNameNode(tree, d, dc).v == rec.declNode.v) { mine = d; break; }
+    }
+    if (!mine.valid() && declarators.size() == 1) mine = declarators.front();
+    if (!mine.valid()) return std::nullopt;
+
+    DeclaredQualification q;
+    q.result = declaratorConstSpine(tree, mine, head, dc, *decl.constMarker,
+                                    &idx.declByRule, typeofOpaqueRules,
+                                    decl.restrictMarker.value_or(SchemaTokenId{}),
+                                    &idx);
+
+    std::size_t const wanted = in.fnParams(fnType).size();
+    q.params.assign(wanted, std::nullopt);
+    NodeId const paramsList = functionParamsListNode(tree, mine, dc);
+    if (paramsList.valid()) {
+        std::vector<NodeId> rows;
+        collectParamRowNodes(idx, cfg, tree, paramsList, rows);
+        if (rows.size() == wanted) {
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                auto const pIt = idx.declByRule.find(tree.rule(rows[i]).v);
+                if (pIt == idx.declByRule.end()) continue;
+                auto const& pDecl = cfg.declarations[pIt->second];
+                if (!pDecl.isDeclaratorMode() || !pDecl.constMarker.has_value())
+                    continue;
+                auto const pKids = declRoleChildren(tree, rows[i], pDecl);
+                if (!pDecl.headChild.has_value()
+                    || *pDecl.headChild >= pKids.size())
+                    continue;
+                NodeId pDeclarator{};
+                if (pDecl.declaratorChild.has_value()
+                    && *pDecl.declaratorChild < pKids.size())
+                    pDeclarator = pKids[*pDecl.declaratorChild];
+                q.params[i] = declaratorConstSpine(
+                    tree, pDeclarator, pKids[*pDecl.headChild], dc,
+                    *pDecl.constMarker, &idx.declByRule, typeofOpaqueRules,
+                    pDecl.restrictMarker.value_or(SchemaTokenId{}), &idx);
+            }
+        }
+    }
+    if (!q.result.has_value()
+        && std::none_of(q.params.begin(), q.params.end(),
+                        [](auto const& p) { return p.has_value(); })) {
+        return std::nullopt;   // an empty claim is no claim
+    }
+    return q;
 }
 
 // Extract identifier text + the bound NodeId per the requested matching mode.
@@ -4912,10 +5373,26 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // general lead-slot mechanism this cycle added for typedefs and members). A
     // scan that handles exactly one attribute list is the same single-site
     // assumption that produced the clause-swallowing bug tombstoned below.
+    //
+    // ★★ D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY, THE **THIRD** TIER. The same
+    // `declByRule` hit that yields the lead-slot rules also yields the composite's
+    // OWN `DeclarationRule`, and that row is where the language STATES whether an
+    // unmodelled GNU attribute NAME on this declaration form is an error or the
+    // C23-ignorable warning (`unknownStrictAttributeIsError`). This scan used to
+    // hardcode `DiagnosticSeverity::Error` at its unknown-name arm and never read
+    // the key — the identical shape the HIR linkage tier was fixed for one wave
+    // earlier, one tier over. ✔MEASURED, and it is the reason a config flip alone
+    // did NOT close this row: with all six `true` values flipped to `false`,
+    // `typedef`/`structField`/`unionField` (owned by `scanAttributeSemantics`)
+    // dropped to a warning at rc=0 while `struct`/`union`/`enum` (owned by THIS
+    // function) kept exiting 1 with `error[S0031]`, so one key produced two
+    // verdicts. Reading the row here is what makes all THREE tiers move together.
+    DeclarationRule const* owningDecl = nullptr;
     std::vector<RuleId> slotRules;
     if (auto const dIt = s.idx().declByRule.find(tree.rule(specNode).v);
         dIt != s.idx().declByRule.end()) {
-        slotRules = cfg.declarations[dIt->second].declarationAttrSlotRules;
+        owningDecl = &cfg.declarations[dIt->second];
+        slotRules  = owningDecl->declarationAttrSlotRules;
     }
     std::vector<NodeId> roots;
     for (NodeId c : visibleChildren(tree, specNode)) {
@@ -5106,12 +5583,28 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // `union __attribute__((transparent_union)) U { … };` is CLEAN and
             // HONORED on gcc and clang and is inert in DSS's `none` row, so it
             // now warns rather than either erroring or vanishing.
+            //
+            // ★★ THE SEVERITY IS THE ROW'S, NOT THIS FUNCTION'S. It is read from
+            // the composite's own `unknownStrictAttributeIsError` (resolved once
+            // at the top of this function, beside the lead-slot rules), so this
+            // tier and `scanAttributeSemantics`'s declaration tier and the HIR
+            // linkage tier all answer "is an unmodelled GNU attribute NAME here
+            // an error?" from ONE config key and can only move together. When the
+            // row does NOT opt in, this is the SAME suppressible `S_UnknownAttribute`
+            // Warning the declaration tier and the C23 `[[...]]` form already use
+            // for exactly this fact — warned, never silently dropped, with
+            // `--warnings-as-errors` restoring the refusal for anyone who wants it.
             if (strict && !stdForm && emitDiagnostics
                 && clause->row == nullptr
                 && !languageModelsAttributeName(cfg, id)) {
+                bool const strictSeverity =
+                    owningDecl != nullptr
+                    && owningDecl->unknownStrictAttributeIsError;
                 ParseDiagnostic d;
-                d.code     = DiagnosticCode::S_UnknownTypeAttribute;
-                d.severity = DiagnosticSeverity::Error;
+                d.code     = strictSeverity ? DiagnosticCode::S_UnknownTypeAttribute
+                                            : DiagnosticCode::S_UnknownAttribute;
+                d.severity = strictSeverity ? DiagnosticSeverity::Error
+                                            : DiagnosticSeverity::Warning;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(cl);
                 d.actual   = std::string{tree.text(cl)};
@@ -16022,6 +16515,11 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                                     sym.version,
                                                     sym.synthesize,
                                                     sym.signature,
+                                                    // P44: and the row's
+                                                    // qualifier claim, which the
+                                                    // signature TypeId cannot
+                                                    // hold.
+                                                    sym.qualification,
                                                     // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME):
                                                     // and so does the
                                                     // per-target LINK BASE NAME
@@ -16669,6 +17167,86 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 s.reporter.report(std::move(d));
                 continue;
             }
+            // ── C23 6.7.6.3p15 + 6.7.6.1p2 (D-LANG-TYPE-IDENTITY-QUALIFIER-BLIND-VS-C23-REDECL) ──
+            //
+            // ★★ FOR A FUNCTION PAIR, TypeId EQUALITY IS NEITHER NECESSARY NOR
+            // SUFFICIENT, and it was ✔MEASURED WRONG IN BOTH DIRECTIONS against
+            // gcc 13.3.0 and clang 18.1.3 probed SEPARATELY:
+            //   * NOT NECESSARY — `int f(volatile int); int f(int);` is LEGAL
+            //     (6.7.6.3p15: "each parameter declared with qualified type is
+            //     taken as having the unqualified version of its declared type").
+            //     `volatile` IS interned, so the two FnSigs differ and DSS
+            //     REFUSED a program BOTH references accept.
+            //   * NOT SUFFICIENT — `int f(const char *); int f(char *);` is
+            //     ILLEGAL (6.7.6.1p2: two pointer types are compatible only when
+            //     "identically qualified"). `const` is NOT interned, so the two
+            //     FnSigs are EQUAL and DSS ACCEPTED a program BOTH references
+            //     reject — and then bound the two declarations together.
+            // Both directions are the SAME sentence: DSS type IDENTITY is
+            // qualifier-BLIND, C23 redeclaration COMPATIBILITY is
+            // qualifier-SENSITIVE. The oracle answers the C23 question against
+            // the resolved types PLUS the declarators' own const spines, and the
+            // interner's identity relation is left exactly as it was.
+            //
+            // Non-function pairs fall through UNCHANGED to the equality fast-path
+            // and the C 6.2.7 incomplete-array relaxation below: this arm makes no
+            // claim about object compatibility, which those two own.
+            {
+                TypeInterner const& in = s.lattice.interner();
+                if (in.kind(sRec.type) == TypeKind::FnSig
+                    && in.kind(aRec.type) == TypeKind::FnSig) {
+                    auto const sTreeIt2 = treeById.find(sRec.tree.v);
+                    auto const aTreeIt2 = treeById.find(aRec.tree.v);
+                    // The per-schema index is read DIRECTLY (never via
+                    // `activate`) so this sweep — which crosses tree boundaries —
+                    // leaves the engine's active-schema pointer untouched.
+                    auto const sIdxIt = sTreeIt2 == treeById.end()
+                        ? s.schemaIndexes.end()
+                        : s.schemaIndexes.find(
+                              sTreeIt2->second->schema().schemaId().v);
+                    auto const aIdxIt = aTreeIt2 == treeById.end()
+                        ? s.schemaIndexes.end()
+                        : s.schemaIndexes.find(
+                              aTreeIt2->second->schema().schemaId().v);
+                    std::optional<DeclaredQualification> sQual;
+                    std::optional<DeclaredQualification> aQual;
+                    if (sIdxIt != s.schemaIndexes.end())
+                        sQual = harvestFunctionQualification(
+                            in, sIdxIt->second, *sTreeIt2->second, sRec, sRec.type);
+                    if (aIdxIt != s.schemaIndexes.end())
+                        aQual = harvestFunctionQualification(
+                            in, aIdxIt->second, *aTreeIt2->second, aRec, aRec.type);
+                    DeclaredFunction const survivorDecl{
+                        sRec.type, sQual.has_value() ? &*sQual : nullptr};
+                    DeclaredFunction const absorbedDecl{
+                        aRec.type, aQual.has_value() ? &*aQual : nullptr};
+                    auto const verdict = functionRedeclarationCompatibility(
+                        in, absorbedDecl, survivorDecl);
+                    if (verdict.compatible()) continue;
+                    if (aTreeIt2 == treeById.end()) continue;
+                    Tree const&     aTree2 = *aTreeIt2->second;
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_IncompatibleRedeclaration;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = aTree2.source().id();
+                    d.span     = aTree2.span(aRec.declNode);
+                    d.actual   = std::format(
+                        "'{}' — {} (C23 6.7.6.3p15)", aRec.name,
+                        describeRedeclarationDivergence(
+                            in, verdict, absorbedDecl, survivorDecl,
+                            "this declaration", "the previous declaration"));
+                    if (sTreeIt2 != treeById.end()) {
+                        Tree const& sTree2 = *sTreeIt2->second;
+                        d.related.push_back(RelatedLocation{
+                            sTree2.source().id(),
+                            sTree2.span(sRec.declNode),
+                            "previously declared here with a different signature",
+                        });
+                    }
+                    s.reporter.report(std::move(d));
+                    continue;
+                }
+            }
             if (sRec.type.v == aRec.type.v) continue;   // compatible — merged
             // C 6.2.7 (D-CSUBSET-EXTERN-MULTI-DECLARATOR): two array types with the
             // SAME element type are compatible when ONE side is INCOMPLETE — the
@@ -16789,9 +17367,32 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         //     and the two must not come from two different descriptors.
         std::vector<std::string> unrealized;
         unrealized.reserve(userOrdinaryDecls.size());
+        // ★★ THE OTHER HALF OF THIS PARTITION IS THE ONLY SET THE C23
+        // COMPATIBILITY CHECK BELOW MAY LOOK AT, and the reason is SCOPE, not
+        // taste. A name already in `suppressedShippedLibraries` HERE — before the
+        // realization query below extends the map — is one whose descriptor the
+        // source ACTUALLY `#include`d, so the platform's declaration is genuinely
+        // IN SCOPE and C23 6.7p4 applies to a contradicting one. A name the
+        // realization query answers for is the exact opposite: the source
+        // `#include`d NOTHING, so no platform declaration is in scope and there is
+        // nothing to conflict with.
+        //
+        // ✔MEASURED, and it is why this partition exists rather than the map being
+        // read whole: with the check run over the WHOLE map, FIVE ordinary
+        // programs that gcc 13.3.0, clang 18.1.3 AND mingw-w64 gcc 13.2.0 all
+        // ACCEPT were refused — `extern int read(char *b);` with no `<unistd.h>`,
+        // `int strlen(const char *);` with no `<string.h>`, a whole-file
+        // DEFINITION `int puts(double x) { … }`, its `static` twin (internal
+        // linkage — it cannot be the platform's symbol at all), and
+        // `extern int fprintf(void *, const char *, ...);` with no `<stdio.h>`.
+        // Refusing those would break the commonest shape in portable C: declaring
+        // a name yourself instead of pulling in a header.
+        std::vector<std::string> includeSuppressed;
         for (auto const& [name, sym] : userOrdinaryDecls) {
             (void)sym;
-            if (!suppressedShippedLibraries.contains(name))
+            if (suppressedShippedLibraries.contains(name))
+                includeSuppressed.push_back(name);
+            else
                 unrealized.push_back(name);
         }
         if (!unrealized.empty()) {
@@ -16833,6 +17434,14 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                         SuppressedShippedSymbol{std::move(real.library),
                                                 real.version, real.recipeId,
                                                 real.signature,
+                                                // P44: the REALIZATION carries no
+                                                // qualifier claim of its own — it
+                                                // states an image and a signature,
+                                                // not a source spelling — so this
+                                                // arm says NOTHING about the axis
+                                                // rather than inventing silence
+                                                // into a statement.
+                                                nullptr,
                                                 real.linkName});
                     if (!isShim) continue;
                     // ★★ SHIM-CORE COMPANIONS — the one part of a `synthesize`
@@ -16907,40 +17516,126 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 }
             }
         }
-        // ⛔ NOT DONE HERE, AND DELIBERATELY SO — C23 REDECLARATION COMPATIBILITY.
+        // ── C23 REDECLARATION COMPATIBILITY AGAINST THE PLATFORM'S OWN ──────────
+        //   [[D-CSUBSET-SUPPRESSED-SHIPPED-ROW-SIGNATURE-UNCHECKED]]
+        //   [[D-CSUBSET-INCOMPATIBLE-REDECL-DIAGNOSED-AT-CALL-SITE-NOT-DECLARATION]]
         //
-        // A user declaration that CONTRADICTS the platform's own (`extern int
-        // printf();` over `#include <stdio.h>` — C23 made `()` mean `(void)`, so
-        // that declares a NO-PARAMETER printf) is an incompatible redeclaration
-        // requiring a diagnostic AT THE DECLARATION (C23 6.7p4); gcc and clang both
-        // reject it. DSS accepts it, and the arity error surfaces later at the first
-        // CALL SITE, blaming the caller for the declaration's mistake.
+        // Goal-2 suppresses a shipped descriptor row on a NAME MATCH ALONE, and
+        // for the whole life of that rule the user's declaration was never
+        // compared against the row it displaced. ✔MEASURED at this cycle's HEAD on
+        // BOTH an elf and a pe target: `#include <stdio.h>` plus `int
+        // puts(double);` plus `puts(3.5)` compiled rc=0 WITH ZERO DIAGNOSTICS,
+        // imported the real `puts` from ucrtbase, and called it with a double in
+        // xmm0 where it expects a `char *` in rcx. ✔gcc 13.3.0 and clang 18.1.3,
+        // probed SEPARATELY, both refuse that source (`conflicting types for
+        // 'puts'`). DSS accepted what every reference refuses and then MISCOMPILED
+        // it — a silent wrong-ABI call, the worst outcome the fail-loud rule names.
         //
-        // ★ THIS PASS FIXES THE REALIZATION SPLIT ONLY. It makes every spelling of
-        // one declaration resolve to the SAME platform realization; it does NOT make
-        // DSS judge whether that declaration AGREES with the platform's. Those are
-        // two different questions and only the first is Decision 1's.
+        // ★ AND THE TIER IS THE SECOND HALF OF THE DEFECT. `extern int printf();`
+        // over the same include correctly applies C23's `()` ≡ `(void)` — that
+        // half is RIGHT and is untouched here — but the only complaint DSS then
+        // made was an ARITY error at the first CALL, blaming a correct call for
+        // the declaration that broke it, and a program with the bad declaration
+        // and NO CALL compiled clean. C23 6.7p4 requires the diagnostic AT THE
+        // DECLARATION, which is where this one is raised. The call-site arity
+        // check is NOT suppressed: it stays exactly as it was, and the
+        // declaration-site error simply fires first, so the no-call program is
+        // refused too.
         //
-        // ⛔ AND `claimSuppressedShimSymbol` IS NOT THE PLACE TO ADD IT. That gate is
-        // a SHIM-SAFETY oracle: it asks "may this declaration inherit the recipe's
-        // one fixed body". It answers by interner TypeId identity, which is
-        // qualifier-BLIND (`const` is not a qualifier bit and is not recorded on the
-        // resolved type at all), so it reports a MATCH for
-        // `extern int printf(char*, ...);` over `#include <stdio.h>` and has nothing
-        // to diagnose. Widening it into a C23 compatibility oracle would conflate two
-        // rules and weaken the one it actually enforces.
+        // ★★ THE COMPARISON IS `PlatformVocabulary`, AND THAT IS THE WHOLE REASON
+        // A PRIOR ATTEMPT AT THIS CHECK WAS ABANDONED RATHER THAN SHIPPED. A
+        // descriptor states a REPRESENTATION in hir-text (`random: fn() -> i64`)
+        // while a C declaration carries the C SPELLING's type identity (`long`
+        // interns distinctly from a bare `i64` — D-LANG-TYPE-IDENTITY-VOCABULARY),
+        // so a TypeId comparison calls the perfectly legal `extern long
+        // random(void);` a conflict — ✔MEASURED then, on the existing
+        // `FormatUnavailableShippedSymbolFailsLoud` control program. The oracle's
+        // spelling-blind leaf relation is the "spelling-blind compatibility query
+        // on the interner" that measurement said this check needs; its stated cost
+        // (it cannot separate `long` from `long long` on a target where both are
+        // i64) is a MISSED diagnostic, never a refused legal program.
         //
-        // ⚠ MEASURED OBSTACLE for whoever does take this on: a TypeId comparison
-        // against the corpus is NOT a compatibility test. Descriptors spell integers
-        // in hir-text (`random: fn() -> i64`) while a C declaration carries the C
-        // spelling's TYPE IDENTITY (`long` interns distinctly from a bare `i64` —
-        // D-LANG-TYPE-IDENTITY-VOCABULARY), so the perfectly legal
-        // `extern long random(void);` compares UNEQUAL. Built and measured during
-        // this cycle: it rejected legal C in the existing
-        // `FormatUnavailableShippedSymbolFailsLoud` control program. A sound check
-        // needs either C-identity spelling in the corpus or a spelling-blind
-        // compatibility query on the interner — its own cycle, which is where it now
-        // lives.
+        // ★★ P44 — THE QUALIFIER AXIS IS NOW JUDGED HERE, AND THE PREDICTION THE
+        // OLD NOTE MADE HELD EXACTLY: "the moment a row can spell a qualifier,
+        // this call site needs no change". It needed one line — the two claims —
+        // and nothing else. A descriptor signature is hir-text, which now has a
+        // `const<…>` / `restrict<…>` spelling that decodes into the SAME
+        // `DeclaredQualification` the semantic declarator walk builds, so
+        // `printf` ships as `fn(ptr<const<char>>, ...) -> i32` and the row states
+        // what C says it states. ✔MEASURED, gcc 13.3.0 (`-std=c2x`) and clang
+        // 18.1.3 (`-std=c23`) probed SEPARATELY: both REFUSE `extern int
+        // printf(char *, ...);` over `#include <stdio.h>` and both ACCEPT the
+        // `const char *` twin; DSS accepted both before this.
+        // ⛔ IT IS STILL NOT CLOSED BY TREATING AN ABSENT CLAIM AS "UNQUALIFIED",
+        // and that is the half that governs the other ~1500 corpus rows: a row
+        // that spells no qualifier passes a NULL claim, the oracle does not judge
+        // the axis, and the ubiquitous legal `int printf(const char *, ...);`
+        // against an unannotated row stays accepted. `examples/c/shipped_redecl_matching_decl`
+        // is the over-reach detector for exactly that.
+        //
+        // ⚠ SCOPE: `includeSuppressed` ONLY — the names whose descriptor the source
+        // really `#include`d. See that vector's own comment for the five ordinary
+        // programs that every reference accepts and that reading the whole map
+        // would have refused.
+        std::unordered_map<std::uint32_t /*TreeId.v*/, Tree const*> treeById;
+        for (auto const& tree : trees) treeById[tree.id().v] = &tree;
+        for (auto const& name : includeSuppressed) {
+            auto const shippedIt = suppressedShippedLibraries.find(name);
+            if (shippedIt == suppressedShippedLibraries.end()) continue;
+            TypeId const shippedSig = shippedIt->second.signature;
+            if (!shippedSig.valid()) continue;   // a row that declares no signature
+            auto const symIt = userOrdinaryDecls.find(name);
+            if (symIt == userOrdinaryDecls.end()) continue;
+            SymbolId const     sym = symIt->second;
+            auto const&        rec = s.symbols.at(sym);
+            if (!rec.type.valid()) continue;     // already diagnosed upstream
+            TypeInterner const& in = s.lattice.interner();
+            // ⚠ FUNCTION ROWS ONLY. A shipped DATA row (`stdout`) and a user
+            // `extern FILE *stdout;` differ legitimately in ways this oracle does
+            // not model, and over-refusing an object declaration would break every
+            // program that hand-declares one.
+            if (in.kind(rec.type) != TypeKind::FnSig
+                || in.kind(shippedSig) != TypeKind::FnSig)
+                continue;
+            auto const treeIt = treeById.find(rec.tree.v);
+            if (treeIt == treeById.end()) continue;
+            // ⚠ NEITHER SIDE PASSES A QUALIFICATION CLAIM, AND THE USER'S IS NOT
+            // ★ THE USER'S CLAIM IS HARVESTED ONLY WHEN THE PLATFORM SIDE HAS
+            // ONE, AND THAT GATE IS THE COST CONTROL. The oracle judges the
+            // qualifier axis only where BOTH sides claim, so on the ~1500 corpus
+            // rows that spell no qualifier this walks nothing at all; it runs
+            // exactly for the annotated rows, where the answer is read.
+            Tree const& tree = *treeIt->second;
+            std::optional<DeclaredQualification> userQual;
+            if (shippedIt->second.qualification != nullptr) {
+                userQual = harvestFunctionQualification(in, s.idx(), tree, rec,
+                                                        rec.type);
+            }
+            DeclaredFunction const userDecl{
+                rec.type, userQual.has_value() ? &*userQual : nullptr};
+            DeclaredFunction const platformDecl{
+                shippedSig, shippedIt->second.qualification.get()};
+            auto const verdict = functionRedeclarationCompatibility(
+                in, userDecl, platformDecl, LeafComparison::PlatformVocabulary);
+            if (verdict.compatible()) continue;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_IncompatibleRedeclaration;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(rec.declNode);
+            d.actual   = std::format(
+                "'{}' — this declaration conflicts with the one the platform's "
+                "own shipped-library descriptor makes for that name on this "
+                "target: {}. C23 6.7p4 requires a diagnostic HERE, at the "
+                "declaration; C23 7.1.4p2 lets a program declare a library "
+                "function itself only with the declaration the implementation "
+                "provides. Either match the platform's signature or rename",
+                name,
+                describeRedeclarationDivergence(in, verdict, userDecl,
+                                                platformDecl, "this declaration",
+                                                "the platform's declaration"));
+            s.reporter.report(std::move(d));
+        }
     }
 
     // ── D-FFI-DESCRIPTOR-CROSS-FILE-TYPE-IDENTITY: license, then adopt ──

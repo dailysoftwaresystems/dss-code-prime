@@ -1,5 +1,8 @@
 #include "core/types/glob_match.hpp"
 
+#include "core/types/include_path_resolve.hpp"  // isRootedPath — the ONE
+                                                // rooted-path predicate
+
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
@@ -171,8 +174,18 @@ bool expandGlob(std::string_view pattern,
     // An EMPTY `baseDir` leaves the path untouched, which is what makes every
     // pre-AP6 call byte-identical: `fs::path{"src"}` is walked verbatim, i.e.
     // against the process cwd, exactly as before.
+    //
+    // ⚠ `isRootedPath`, NOT `is_absolute()`
+    // ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]). ✔MEASURED: a pattern
+    // whose root is a MULTI-SEPARATOR authority answers `is_absolute()` FALSE on
+    // the toolchain that builds DSS. ⇒ the bare test classifies
+    // `\\server\share\src\*.c` as RELATIVE and re-bases it -- exactly the silent
+    // relocation the note above says must not happen. Reported as a
+    // classification defect, which is what was measured; no glob over such a
+    // pattern was run. The ONE exported predicate answers it correctly on every
+    // path model.
     auto rebase = [&baseDir](fs::path p) {
-        if (baseDir.empty() || p.is_absolute()) return p;
+        if (baseDir.empty() || isRootedPath(p)) return p;
         // `baseDir / "."` would leave a "." component that `lexically_relative`
         // below then has to reason about; the bare `baseDir` is the same
         // directory with no such component, so say it directly.

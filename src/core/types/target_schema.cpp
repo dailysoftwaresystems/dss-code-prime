@@ -1903,6 +1903,31 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         checkRefs(i, "callerSaved", cc.callerSaved, TargetRegClass::None);
         checkRefs(i, "calleeSaved", cc.calleeSaved, TargetRegClass::None);
 
+        // ── D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE
+        //
+        // A declared frame-pointer RESERVATION with no frame-pointer REGISTER
+        // reserves nothing. It is not harmless: the whole content of the
+        // declaration is "withhold this register from the pool", so a
+        // convention that says `always` while naming no register has stated an
+        // ABI guarantee the engine cannot keep, and would keep passing every
+        // test because the pool it fails to shrink is the pool it always had.
+        // ⚠ THE DIRECTION MATTERS AND ONLY ONE DIRECTION IS AN ERROR: a
+        // `framePointer` with no reservation key is the DEFAULT and every
+        // shipped convention was exactly that before this key existed.
+        if (cc.framePointerReservation != FramePointerReservation::DynamicFrameOnly
+            && !cc.framePointer.has_value()) {
+            fail(std::format("/callingConventions/{}/framePointerReservation", i),
+                 std::format("calling convention '{}' declares "
+                             "framePointerReservation '{}' but names no "
+                             "`framePointer` register — the declaration would "
+                             "withhold nothing from the register allocator "
+                             "while reading as an ABI guarantee. Name the "
+                             "register, or drop the reservation.",
+                             cc.name,
+                             framePointerReservationName(
+                                 cc.framePointerReservation)));
+        }
+
         // ── D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD ───────────────
         // An `aapcs64_dual_cursor` variadic prologue spills `fpSaveCount`
         // VECTOR argument registers at `fpSlotBytes` each, through the vector

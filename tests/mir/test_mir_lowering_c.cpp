@@ -3845,16 +3845,23 @@ TEST(MirLoweringCLinkage, StaticNoreturnKeepsInternalLinkage) {
     }
 
     // The name-skip is EXACT — only names in `linkageSpecifierIgnoredNames` skip.
-    // An UNKNOWN attribute co-present with `static` must STILL fail loud
-    // (H_UnknownLinkageSpecifier): `static` must not rescue it and the strict
-    // fail-loud default survives. Extends `UnknownAttributeOnFunctionFailsLoud`
-    // (below) with a co-present `static`. RED-ON-DISABLE: widen the name-skip to a
-    // wholesale attrSpec ignore and `frobnicate` is silently dropped (n==0).
+    // An UNKNOWN attribute co-present with `static` must STILL BE REPORTED
+    // (H_UnknownLinkageSpecifier): `static` must not rescue it into SILENCE.
+    // Extends `UnknownGnuAttributeOnAFunctionIsWarnedNotRefused` (below) with a
+    // co-present `static`. RED-ON-DISABLE: widen the name-skip to a wholesale
+    // attrSpec ignore and `frobnicate` is silently dropped (n==0).
+    // ★ P44 ([[D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY]]): this asserted
+    // `EXPECT_FALSE(L.hir->ok)` — that the program is REFUSED. It is now COMPILED
+    // with a warning, because `topLevelDecl` declares
+    // `unknownStrictAttributeIsError: false` and this tier finally honours that
+    // key. The COUNT assertion below is untouched, and it is the half that
+    // carries the typo protection this test was really written for.
     {
         auto L = lowerC(
             "static __attribute__((frobnicate)) int f(void){ return 0; }\n");
-        EXPECT_FALSE(L.hir->ok)
-            << "an unknown attribute co-present with static must still fail HIR lowering";
+        EXPECT_TRUE(L.hir->ok)
+            << "an unknown GNU attribute name is C23-ignorable vocabulary, not a "
+               "refusal — gcc, clang and mingw-w64 gcc all warn and exit 0 here";
         std::size_t n = 0;
         for (auto const& d : L.hirReporter.all())
             if (d.code == DiagnosticCode::H_UnknownLinkageSpecifier) ++n;
@@ -4074,27 +4081,41 @@ TEST(MirLoweringCThreadLocal, TlsAddressInStaticInitializerFailsLoud) {
 
 // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14): an UNRECOGNIZED
 // specifier inside `__attribute__((...))` — a typo (`bogus`) or an unsupported
-// attribute — FAILS LOUD (H_UnknownLinkageSpecifier), never silently ignored. The
+// attribute — is REPORTED (H_UnknownLinkageSpecifier), never silently ignored. The
 // validation lives in the single `linkageFrom` chokepoint, which `lowerTopLevel`
 // (func + var) AND `lowerExternDecl` all route through — so coverage is
 // by-construction across every decl-lowering arm. RED-ON-DISABLE: drop the emit in
 // `linkageFrom` and `bogus` is silently skipped → both these go green-when-broken.
-TEST(MirLoweringCLinkage, UnknownAttributeOnFunctionFailsLoud) {
+//
+// ★★ P44 ([[D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY]]) — THE SEVERITY MOVED AND
+// THE TEST NAME MOVED WITH IT. This was `UnknownAttributeOnFunctionFailsLoud` and
+// asserted `EXPECT_FALSE(L.hir->ok)`: DSS REFUSED a program that ✔gcc 13.3.0,
+// ✔clang 18.1.3 and ✔mingw-w64 gcc 13.2.0 — probed SEPARATELY — all compile with a
+// warning and exit 0 (`'bogus' attribute directive ignored [-Wattributes]`).
+// `topLevelDecl` already DECLARED that posture
+// (`unknownStrictAttributeIsError: false`); this tier simply was not reading the
+// key, which is the whole of the third-tier asymmetry. A test name that says
+// "FailsLoud" about something that must not fail is a misnamed red waiting to
+// happen, so the name moved too. The COUNT assertion is UNCHANGED — the typo is
+// still reported, it just no longer breaks the build, and `--warnings-as-errors`
+// restores the old verdict for a caller who wants it.
+TEST(MirLoweringCLinkage, UnknownGnuAttributeOnAFunctionIsWarnedNotRefused) {
     auto L = lowerC("__attribute__((bogus)) int f() { return 0; }\n");
-    EXPECT_FALSE(L.hir->ok)
-        << "an unrecognized linkage specifier must fail HIR lowering, not be ignored";
+    EXPECT_TRUE(L.hir->ok)
+        << "an unrecognized GNU attribute name is ignorable vocabulary, not a "
+           "constraint violation — every reference compiles this";
     std::size_t n = 0;
     for (auto const& d : L.hirReporter.all())
         if (d.code == DiagnosticCode::H_UnknownLinkageSpecifier) ++n;
     EXPECT_EQ(n, 1u) << "exactly one H_UnknownLinkageSpecifier for 'bogus'";
 }
 
-// The variable FORM (the other arm through lowerTopLevel) — same fail-loud, proving
+// The variable FORM (the other arm through lowerTopLevel) — same verdict, proving
 // the contract holds for every form that carries a specifier prefix, not just funcs.
-TEST(MirLoweringCLinkage, UnknownAttributeOnVariableFailsLoud) {
+TEST(MirLoweringCLinkage, UnknownGnuAttributeOnAVariableIsWarnedNotRefused) {
     auto L = lowerC("__attribute__((bogus)) int g;\n");
-    EXPECT_FALSE(L.hir->ok)
-        << "an unrecognized linkage specifier on a variable must fail loud";
+    EXPECT_TRUE(L.hir->ok)
+        << "an unrecognized linkage specifier on a variable is warned, not refused";
     std::size_t n = 0;
     for (auto const& d : L.hirReporter.all())
         if (d.code == DiagnosticCode::H_UnknownLinkageSpecifier) ++n;

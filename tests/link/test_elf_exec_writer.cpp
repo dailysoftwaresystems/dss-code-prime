@@ -218,6 +218,8 @@ TEST(ElfExecFormatJson, InterpreterTypeCheckRejectsNonString) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-interp","kind":"elf"},
@@ -249,6 +251,8 @@ TEST(ElfExecFormatJson, EmptyInterpreterStringRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"empty-interp","kind":"elf"},
@@ -281,6 +285,8 @@ TEST(ElfRelFormatJson, InterpreterOnRelFormatRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"rel-with-interp","kind":"elf"},
@@ -304,6 +310,8 @@ TEST(ElfRelFormatJson, BindNowFalseOnRelFormatRejectedAtLoad) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"rel-with-bindnow-false","kind":"elf"},
@@ -332,6 +340,8 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterCitesSubstrateGap) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-interp","kind":"elf"},
@@ -555,6 +565,8 @@ TEST(ElfExecWriter, ExternImportsOnRiscVMachineFailsLoudCitingFutureWork) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"riscv-exec","kind":"elf"},
@@ -1117,6 +1129,8 @@ TEST(ElfExecWriter, EntryPointHonoredOnDynamicPath) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-entry-named","kind":"elf"},
@@ -1160,6 +1174,8 @@ TEST(ElfExecWriter, UnknownEntryPointOnDynamicPathFailsLoud) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-bad-entry","kind":"elf"},
@@ -1234,6 +1250,8 @@ TEST(ElfExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bindnow-wrong-type","kind":"elf"},
@@ -1263,6 +1281,8 @@ TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bindnow-default","kind":"elf"},
@@ -1289,6 +1309,8 @@ TEST(ElfExecWriter, BindNowFalseFailsLoudCitingDLK611) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"elf-lazy-pending","kind":"elf"},
@@ -1846,6 +1868,8 @@ TEST(ElfExecFormatJson, ExecWithZeroVirtualAddressRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-exec","kind":"elf"},
@@ -1884,6 +1908,8 @@ TEST(ElfExecFormatJson, ExecWithoutPageAlignRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"no-page-align","kind":"elf"},
@@ -1910,6 +1936,8 @@ TEST(ElfExecFormatJson, PageAlignMustBePowerOfTwo) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"odd-page-align","kind":"elf"},
@@ -1942,6 +1970,8 @@ TEST(ElfRelFormatJson, RelWithNonZeroVirtualAddressRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-rel","kind":"elf"},
@@ -1961,6 +1991,8 @@ TEST(ElfFormatJson, UnknownTypeStringRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".o",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-type","kind":"elf"},
@@ -2001,6 +2033,8 @@ TEST(ElfExecWriter, EntryPointResolvesSecondFunctionByName) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"forge-exec","kind":"elf"},
@@ -2050,6 +2084,8 @@ TEST(ElfExecWriter, UnknownEntryPointFailsLoud) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"bad-entry","kind":"elf"},
@@ -2163,6 +2199,8 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-interp","kind":"elf"},
@@ -2231,6 +2269,8 @@ TEST(ElfExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
     auto fmt = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-no-data-binding","kind":"elf"},
@@ -2286,6 +2326,8 @@ TEST(ElfExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
     auto declared = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"exec-with-data-binding","kind":"elf"},

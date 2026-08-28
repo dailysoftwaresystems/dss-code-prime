@@ -151,6 +151,12 @@ an inflated OPEN count is indistinguishable from a cycle that is filing instead 
 the operator is reading that number.
 
 ### ⚠ A LANE THAT **EXITS** DISCHARGES NOTHING — operator, 2026-08-27
+### ⚠ AND A LANE THAT **REPORTS** HAS NOT LANDED — *"complete means folded"*, operator 2026-08-28
+
+**Both halves of the same rule, and neither is satisfied by a lane looking finished.** A lane's
+report is a claim about ITS OWN WORKTREE; the project has nothing until the work is FOLDED into the
+main tree and its rows applied. See *A COMPLETED SET OF LANES IS A COMMIT POINT* below for the
+definition and for what to do the moment a lane reports.
 
 > *"if they don't address you must create another lane once they finish using /dss-cycle to
 > address remanescent anchors from current running lanes"*
@@ -285,6 +291,67 @@ expanded only where it appears unquoted in the source text. `leg-tree` normalise
 where both verbs share it. ★ The dangerous half was not the failed `cd`: `restore` returns 0 when
 the directory is missing, so an unexpanded path would have left every host dirty forever while
 every leg reported success.
+
+## ★★★ A COMPLETED SET OF LANES IS A COMMIT POINT — operator ruling 2026-08-28
+
+> *"once a set of 4 lanes are fully done and green, that's a good time to commit + push (and create
+> the PR if not done yet) before the next set of 4 lanes in the loop"*
+> … *"complete means folded"* — operator, clarifying the same day.
+
+## ★★★★ "COMPLETE" MEANS **FOLDED**. A LANE THAT HAS REPORTED IS NOT DONE.
+
+**A lane's report is a claim about ITS OWN WORKTREE. Until its work is folded into the main tree,
+the project has nothing.** A reported-but-unfolded lane is still IN FLIGHT, and every one of these
+is FALSE of it: "the lane is done", "that work has landed", "the set is complete", "we can count
+those rows".
+
+⚠ **THIS IS A DEFINITION, NOT AN EMPHASIS, AND IT BINDS EVERY USE OF THE WORD.** The failure it
+prevents is silent and reads as success: a lane reports a green tree, the orchestrator writes it
+into the ledger as finished, the set is declared complete, and the commit ships WITHOUT it. Nothing
+reddens, because the tests that would have failed are in the worktree that was never folded.
+
+⇒ **On a lane's report, the orchestrator's next action is to FOLD it** — not to summarise it, not to
+queue it, not to dispatch the next lane. Fold, then apply the lane's rows, then re-derive the
+balance. A row held out of the registry reads as `closed 0, opened 0`: no fix at all.
+
+⇒ **A lane that has reported but cannot yet be folded** (a sibling is mid-edit in the same files, a
+gate is running against the tree) **is still in flight and stays counted against the ≤4 cap.** Say
+"reported, not folded" — never "done".
+
+**The unit of shipping is the LANE SET, not the cycle.** When the four (or fewer) lanes in flight
+have all reported **AND BEEN FOLDED**, and the tree is green, that is a landing point: **commit,
+push, and open the PR if one is not open yet — THEN seed the next set.** Under `/loop` this repeats;
+a long loop therefore produces a series of pushed commits on one PR rather than one enormous commit
+at the end.
+
+**The sequence at a set boundary:**
+1. Every lane in the set has reported **AND BEEN FOLDED** — folded is the test, reported is not
+   (see the definition above). Verify by looking at the MAIN tree, never by re-reading the lane's
+   report: `git status` there is the evidence, and a lane's own green figure is evidence about a
+   worktree that may no longer exist. A lane that exited without discharging its rows is not "done"
+   either — spawn its remnant lane first (see the no-follow-ups ruling above).
+2. Apply every lane's ROWS, then re-derive the balance with
+   `check-anchor-balance --base <cycle-start-sha>` and run `check-anchor-registry.sh`. **Both**, for
+   the reason that section gives: a green balance is not evidence that nothing was opened.
+3. The full gate on the FOLDED tree — the leg matrix, not one host.
+4. `.plans/_handoff.md` rewritten in the SAME commit.
+5. Commit `-s`, push (`-u` on the first push of a branch), open the PR if absent.
+6. **Only then** create and seed the next set of worktrees.
+
+⚠ **WHY THIS ORDER, AND NOT "SEED THE NEXT SET WHILE THE GATE RUNS".** A lane worktree is SEEDED
+from the main tree's current state. Seeding before the commit means the next set inherits
+uncommitted work whose provenance is a scratchpad manifest rather than a commit — and if the gate
+then reddens and the tree changes, every seeded lane is measuring a tree that will never exist.
+Seeding from a COMMITTED tree makes "what did this lane start from" answerable by `git`, which is
+the only durable answer.
+
+⚠ **A SET BOUNDARY IS NOT A LICENCE TO STOP MID-LANE.** Do not interrupt lanes that are still
+running to force a boundary. The boundary is where the set *finishes*; the rule sets the CADENCE of
+committing, it does not add a new reason to pause. Work already in flight continues to completion.
+
+⚠ **AND IT DOES NOT WEAKEN THE GATE.** "Green" here means the same four-leg gate every commit
+already owes — this ruling changes HOW OFTEN that gate runs and a commit lands, never what the gate
+consists of. A set that cannot go green does not get committed because a boundary arrived.
 
 ## ★★★ A LANE WORKTREE LIVES INSIDE THE REPO, AT `.worktrees/<short-name>` — operator ruling 2026-08-26
 
@@ -688,8 +755,13 @@ hand-typing every edit or reading every subsystem.
 11. **Commit and push.** `.plans/_handoff.md` must be staged in THIS commit — it ships with the work
     it describes, never in a follow-up. Subject `Cycle <id>: <concise summary>`; body lists anchors
     closed/opened plus the test delta; end with the repo's standard Co-Authored-By trailer (currently
-    `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`). Push immediately — it starts CI while
-    context is hot. Stay on the current feature branch.
+    `Co-authored-by: Claude Opus 5 <noreply@anthropic.com>`). ⚠ DO NOT TRUST THAT SPELLING FROM HERE — it said 4.8 until 2026-08-28, when the last six commits actually carried Opus 5 five times. Read the trailer off `git log` before committing; a hardcoded model name in a skill is stale the moment the model changes.. Push immediately — it starts CI while
+    context is hot. Stay on the current feature branch. **Open the PR here if the branch does not
+    have one yet.**
+    ⚠ **THIS STEP IS REACHED ONCE PER COMPLETED LANE SET, NOT ONCE PER CYCLE** — see
+    *A COMPLETED SET OF LANES IS A COMMIT POINT* above. A cycle running several sets of lanes lands
+    several commits on one PR, and **the next set is seeded only AFTER this step**, so every lane
+    can name a COMMIT as the tree it started from.
 12. **Report and end** (contract below). The invocation ends here; under `/loop` the next invocation
     begins the next cycle with fresh context.
 
@@ -932,6 +1004,10 @@ never lowers the bar.
 
 ## Failure modes this skill exists to prevent
 
+- **Calling a lane "done" when it has only REPORTED.** *"Complete means folded"* (operator,
+  2026-08-28). The report describes a worktree; until the fold, the main tree has nothing — and this
+  one ships green, because the tests that would have caught the absence are in the tree that was
+  never folded. Check the MAIN tree, not the report.
 - **Guessing past a decision.** A pending definition, a real fork, an unfired trigger, or a hard stop
   is a pause — not a default, not a pivot to other work.
 - **Inventing a fork to avoid the hard part.** If you cannot state a second defensible design, the

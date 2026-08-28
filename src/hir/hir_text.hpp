@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/declared_qualification.hpp"    // DeclaredQualification (parseTypeFromText's qualifier out-param)
 #include "core/types/named_type_binding.hpp"       // NamedTypeBinding (parseTypeFromText aliases)
 #include "core/types/strong_ids.hpp"               // CompilationUnitId
 #include "core/types/type_lattice/type_interner.hpp" // TypeInterner (by-value in the parse result)
@@ -184,9 +185,30 @@ struct DSS_EXPORT HirParseResult {
 // lands the ABI-exact TypeId (SysV `__va_list_tag[1]` / AAPCS64 `__va_list`
 // struct / Win64 `char*`). Content-blind and generic: nothing here knows what
 // the names mean. An empty span is byte-identical to the pre-c82 behavior.
+//
+// ★★ P44 (item (a) of D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES) —
+// `outQual` IS HOW A DESCRIPTOR SIGNATURE SPELLS A QUALIFIER, AND IT IS A
+// SEPARATE RETURN BECAUSE IT HAS TO BE. `const` and `restrict` are deliberately
+// NOT interned (type_interner.hpp: `const` never affects codegen or layout), so
+// they CANNOT ride the TypeId this function returns — a shipped `printf` row
+// spelled `fn(ptr<const<char>>, ...) -> i32` interns byte-identically to
+// `fn(ptr<char>, ...) -> i32` and always will. The qualification travels here
+// instead, in the same `DeclaredQualification` the semantic declarator walk
+// produces, so the C23 oracle can compare a user prototype against a corpus row
+// on the one axis type identity is blind to.
+//
+// ⚠ THE SPELLING IS TYPE-TEXT-ONLY, AND THAT IS FAIL-LOUD RATHER THAN A
+// LIMITATION. A `const<…>` inside a HIR MODULE dump is a malformed type: the
+// printer cannot emit it back (the TypeId does not carry the fact), so accepting
+// it on the module path would make a round-trip silently drop a qualifier. The
+// standalone type-text path always tracks the claim; `outQual` only decides
+// whether the caller is handed it.
+//
+// `nullptr` (the default) is byte-identical to the pre-P44 behavior.
 [[nodiscard]] DSS_EXPORT TypeId
 parseTypeFromText(std::string_view typeText, TypeInterner& interner,
                   TypeRegistry& typeReg, DiagnosticReporter& reporter,
-                  std::span<NamedTypeBinding const> namedTypes = {});
+                  std::span<NamedTypeBinding const> namedTypes = {},
+                  DeclaredQualification* outQual = nullptr);
 
 } // namespace dss

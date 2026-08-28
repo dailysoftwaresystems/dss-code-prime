@@ -726,6 +726,27 @@ struct DSS_EXPORT DeclarationRule {
     // `typeChild` is set), marks the minted symbol const. `nullopt` ⇒ the
     // language has no const marker for this declaration form.
     std::optional<SchemaTokenId> constMarker;
+    // P44 (D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES, part (b)):
+    // the language's `restrict`-class qualifier token (c: `RestrictKeyword`).
+    // Read ONLY by the qualifier-spine walk that feeds the C23 redeclaration
+    // oracle, and read ONLY from a POINTER LAYER — C 6.7.3.2p1 confines
+    // `restrict` to pointer types, so a head occurrence is a constraint
+    // violation rather than a qualification claim and this role never looks
+    // there.
+    //
+    // ★ WHY IT IS A ROLE AND NOT A `QualBit`. `restrict` is an ALIASING promise
+    // the programmer makes to the optimizer; it changes no layout, no calling
+    // convention and no codegen that DSS performs today, so interning it would
+    // perturb every type comparison in the compiler to serve one rule — exactly
+    // the reasoning `const` already carries (redeclaration_compat.hpp: "WHY THIS
+    // IS A PREDICATE AND NOT A CHANGE TO INTERNING"). It rides the side channel
+    // with `const` instead.
+    //
+    // `nullopt` ⇒ the language has no restrict qualifier for this declaration
+    // form, and the spine then makes NO restrict claim — never a claim of
+    // "unrestricted", which would refuse the legal `int f(char *restrict *);`
+    // against a descriptor that simply cannot spell it.
+    std::optional<SchemaTokenId> restrictMarker;
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a token kind that, when found in the
     // `typeChild` subtree (or the whole declaration subtree when no `typeChild`),
     // marks the minted symbol VOLATILE — mirrors `constMarker` exactly (an

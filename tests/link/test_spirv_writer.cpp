@@ -76,6 +76,8 @@ TEST(SpirvFormatJson, SpirvKindWithElfBlockRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".spv",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"spirv-with-elf-block","kind":"spirv"},
@@ -93,6 +95,8 @@ TEST(SpirvFormatJson, SpirvKindWithUniversalFieldRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".spv",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"spirv-with-relocations","kind":"spirv"},

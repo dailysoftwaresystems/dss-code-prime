@@ -624,6 +624,13 @@ private:
         // diagnostics. Empty/null when the file was not preprocessed.
         std::vector<Token>                              ppTokens;
         std::function<void(BufferId&, SourceSpan&)>     ppRemap;
+        // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the DIAGNOSTIC-shaped
+        // twin of `ppRemap`, used by the two sites that hand whole
+        // diagnostics through (the parse above and the FC2 oracle reparse).
+        // It adds the `expanded from macro 'X'` note for a diagnostic whose
+        // subject is a macro-expansion PRODUCT token; `ppRemap` stays for
+        // every POSITION-only consumer, and both come from the same map.
+        std::function<void(ParseDiagnostic&)>           ppDiagRemap;
         // The SYNTHESIZED buffer's id, recorded ONLY when the preprocessor
         // produced a line map that can actually move a position off it (a
         // non-empty map with at least one real origin). Invalid otherwise —

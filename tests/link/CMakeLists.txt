@@ -446,3 +446,14 @@ dss_add_test(NAME link/test_lto_summary_ir_sections
 # cannot fire, which is why a 103-TU program found it and no single-CU pin did.
 dss_add_test(NAME link/test_merge_block_symbols
              SOURCES test_merge_block_symbols.cpp)
+
+# D-LK-STATIC-LINK-INTRASECTION-BAKED-CALL: a gcc `.o` built WITHOUT
+# `-ffunction-sections` — gcc's DEFAULT — bakes an intra-`.text` call as a
+# reloc-LESS `E8 rel32`, and the inter-function padding belongs to no symbol.
+# Slicing one atom per STT_FUNC and re-laying them out packed drops that padding
+# and silently redirects the call. ⚠ MEASURED on a plain `gcc -O2 -c` object:
+# DSS linked it with rc 0 and zero diagnostics and the binary SEGFAULTED where
+# the native gcc link exits 42. The pins assert the DISPLACEMENT recovered from
+# the emitted bytes, never that the link succeeded — it always succeeded.
+dss_add_test(NAME link/test_intrasection_baked_call
+             SOURCES test_intrasection_baked_call.cpp)

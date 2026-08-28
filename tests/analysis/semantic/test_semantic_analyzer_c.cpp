@@ -2370,19 +2370,35 @@ TEST(SemanticAnalyzerC, PragmaPackAmbiguousCompositeFailsLoud) {
     EXPECT_TRUE(model.hasErrors());
 }
 
-// FAIL-LOUD: a TYPO in the GNU `__attribute__` packed slot → S_UnknownTypeAttribute
-// (typo protection, like H_UnknownLinkageSpecifier — a `pakced` typo must not
-// silently leave the struct unpacked).
-TEST(SemanticAnalyzerC, UnknownGnuTypeAttributeFailsLoud) {
+// WARNED, NOT REFUSED: a TYPO in the GNU `__attribute__` packed slot is reported
+// (typo protection — a `pakced` typo must not silently leave the struct unpacked)
+// but does not REJECT the program.
+// ★★ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — RETARGETED, AND RENAMED
+// FROM `…FailsLoud`. This pin asserted an Error, which was DSS refusing below the
+// union: ✔MEASURED, gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`) probed
+// SEPARATELY with `-Wall -Wextra` both compile `struct __attribute__((frobnicate))
+// S { int a; };` and its five positional siblings with one `-Wattributes` /
+// `-Wunknown-attributes` warning and exit 0. The severity is now the composite
+// row's own `unknownStrictAttributeIsError` (`false` for `structSpec`), so this
+// pin also witnesses that `scanCompositePacked` READS that key instead of writing
+// `Error` as a literal.
+// RED-ON-DISABLE, both directions: delete the emit → the count goes to 0; restore
+// the hardcoded `DiagnosticSeverity::Error` → `hasErrors()` goes true.
+TEST(SemanticAnalyzerC, UnknownGnuTypeAttributeIsWarnedNotRefused) {
     auto cu = buildShippedUnit("c", {
         "struct S { int x; } __attribute__((pakced));\n"
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
-    EXPECT_TRUE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownAttribute), 1u)
+        << "the typo protection must survive as a diagnostic";
+    for (auto const& d : model.diagnostics().all())
+        if (d.code == DiagnosticCode::S_UnknownAttribute)
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
+    EXPECT_FALSE(model.hasErrors())
+        << "both references compile this and exit 0 — DSS may not refuse it";
 }
 
 // STANDARD-IGNORABLE: an unrecognized C23 `[[...]]` attribute on a struct is
@@ -11472,19 +11488,25 @@ TEST(SemanticAnalyzerC, TypedefLinkageVocabularyAttributeIsNotRefused) {
 
 // THE CONTROL for the test above, and it is the half that makes it worth
 // anything: widening the membership question must not switch the gate OFF. A
-// genuinely unmodelled name in the same position is still a loud Error.
-TEST(SemanticAnalyzerC, TypedefUnknownGnuAttributeStillFailsLoud) {
+// genuinely unmodelled name in the same position is still REPORTED.
+// ★★ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY): the control's ASSERTION
+// moved from Error to Warning, and the control itself is untouched — what it
+// exists to catch is the gate going SILENT, which a count of 1 still catches.
+// ✔MEASURED: `typedef int __attribute__((frobnicate)) T;` compiles on gcc 13.3.0
+// and clang 18.1.3 (probed separately) with one warning and exit 0.
+TEST(SemanticAnalyzerC, TypedefUnknownGnuAttributeIsWarnedNotRefused) {
     auto model = analyzeShipped("c", {
         "typedef __attribute__((frobnicate_xyz)) int T;\n"
         "T t1 = 1;\n"
         "int main(void) { return t1 - 1; }\n",
     });
-    EXPECT_TRUE(model.hasErrors());
+    EXPECT_FALSE(model.hasErrors())
+        << "both references compile this and exit 0 — DSS may not refuse it";
     ASSERT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+                        DiagnosticCode::S_UnknownAttribute), 1u);
     for (auto const& diag : model.diagnostics().all())
-        if (diag.code == DiagnosticCode::S_UnknownTypeAttribute)
-            EXPECT_EQ(diag.severity, DiagnosticSeverity::Error);
+        if (diag.code == DiagnosticCode::S_UnknownAttribute)
+            EXPECT_EQ(diag.severity, DiagnosticSeverity::Warning);
 }
 
 // BLOCK SCOPE, and the property that actually matters is the EQUALITY of the two
@@ -11622,16 +11644,20 @@ TEST(SemanticAnalyzerC, CompositeModelledButUnhonoredAttributeWarnsNotRefuses) {
 }
 
 // THE CONTROL for the composite arm. A genuinely unmodelled name on a type
-// definition keeps the loud typo protection this arm exists for.
-TEST(SemanticAnalyzerC, CompositeUnknownGnuAttributeStillFailsLoud) {
+// definition keeps the typo protection this arm exists for — as a WARNING, which
+// is what both references give it (P44,
+// D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY). The distinction this control
+// carries is the one that matters: `may_alias` above raises NOTHING because the
+// language models it, `frobnicate_xyz` here raises a report because it does not.
+TEST(SemanticAnalyzerC, CompositeUnknownGnuAttributeIsWarnedNotRefused) {
     auto model = analyzeShipped("c", {
         "struct __attribute__((frobnicate_xyz)) S { int a; };\n"
         "struct S s1;\n"
         "int main(void) { return s1.a; }\n",
     });
-    EXPECT_TRUE(model.hasErrors());
+    EXPECT_FALSE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+                        DiagnosticCode::S_UnknownAttribute), 1u);
 }
 
 // AND THE COMPOSITE ARMS THAT **DO** CONSUME THEIR NAME MUST STAY SILENT — the
@@ -11836,6 +11862,55 @@ TEST(SemanticAnalyzerC, DeprecatedTypedefMultiDeclaratorWarnsOnce) {
                         DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
 }
 
+// ★★ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — THE LAYOUT HALF OF
+// "ACCEPTED, NOT HONORED", pinned where `sizeof` is observable.
+//
+// A LEADING `__attribute__((packed))` on a declaration whose type is defined
+// inline does NOT pack the composite — in DSS or in either reference. ✔MEASURED,
+// gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`) probed SEPARATELY: both
+// compile `__attribute__((packed)) struct S { char c; int v; } gv;` at rc=0 with
+// `'packed' attribute ignored` and both report `sizeof(struct S) == 8`, while the
+// TRAILING spelling yields 5 on both. This pin is what makes the acceptance safe
+// to state: the fear that motivated the old refusal — that accepting the leading
+// form would silently pack or silently unpack the struct — is measured here in
+// the source, where no diagnostic-roster change can reach it.
+// RED-ON-DISABLE: make the leading slot feed `scanCompositePacked` and the first
+// `_Static_assert` fails; make the TRAILING slot stop feeding it and the second
+// fails. The two together are what separate "ignored" from "broken".
+TEST(SemanticAnalyzerC, LeadingGnuPackedDoesNotPackTheComposite) {
+    // ⚠ `kAlignasLayout`, not the bare `analyzeShipped` helper: with no layout in
+    // scope `sizeof` does not fold and BOTH `_Static_assert`s fail, which reds
+    // this pin for a reason that has nothing to do with `packed`. Measured while
+    // writing it.
+    auto const sizeofFailures = [](char const* src) {
+        auto cu = buildShippedUnit("c", {src});
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
+                             DataModel::Lp64, kAlignasLayout);
+        return std::pair{model.hasErrors(),
+                         countCode(model.diagnostics(),
+                                   DiagnosticCode::S_StaticAssertFailed)};
+    };
+    auto const [leadErr, leadFail] = sizeofFailures(
+        "__attribute__((packed)) struct S { char c; int v; } gv;\n"
+        "_Static_assert(sizeof(struct S) == 8, \"a LEADING packed is ignored\");\n"
+        "int main(void) { return (int)sizeof(gv); }\n");
+    EXPECT_FALSE(leadErr)
+        << "both references compile this at rc=0 — DSS may not refuse it";
+    EXPECT_EQ(leadFail, 0u)
+        << "a leading `packed` must not reach the composite: gcc and clang both "
+           "leave this struct at 8";
+    auto const [trailErr, trailFail] = sizeofFailures(
+        "struct S { char c; int v; } __attribute__((packed)) gv;\n"
+        "_Static_assert(sizeof(struct S) == 5, \"a TRAILING packed is honored\");\n"
+        "int main(void) { return (int)sizeof(gv); }\n");
+    EXPECT_FALSE(trailErr);
+    EXPECT_EQ(trailFail, 0u)
+        << "…and the TRAILING spelling still packs, which is the half that "
+           "proves the first assertion is about POSITION and not about `packed` "
+           "having stopped working";
+}
+
 // The NEGATIVE wall: an undeprecated type must never warn, and a composite
 // attribute this engine does NOT model in the `warnOnUse` verb keeps its
 // pre-existing loud reject (the typo protection `scanCompositePacked` exists for).
@@ -11854,8 +11929,10 @@ TEST(SemanticAnalyzerC, UndeprecatedTypesDoNotWarnAndUnknownStrictStillRefuses) 
         "int main(void) { return (int)sizeof(struct S); }\n",
     });
     EXPECT_EQ(countCode(typoModel.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
-        << "an unmodelled GNU composite attribute still fails loud";
+                        DiagnosticCode::S_UnknownAttribute), 1u)
+        << "an unmodelled GNU composite attribute is still REPORTED (P44: as a "
+           "warning — both references compile it at rc=0)";
+    EXPECT_FALSE(typoModel.hasErrors());
 }
 
 // C23 6.7.13.2: a `[[nodiscard]]` call whose result is DISCARDED — the call is
@@ -13543,13 +13620,17 @@ TEST(SemanticAnalyzerC, PackedMultiClauseUnknownAfterPackedFailsLoud) {
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     // Exactly ONE diagnostic, and it NAMES the offending clause — not a bare
     // count on a shared code, and not the whole `__attribute__((...))` blob.
+    // ★ P44: the severity is the row's (`structSpec` declares
+    // `unknownStrictAttributeIsError: false`), so this is a Warning. What this
+    // pin actually protects — that a clause after `packed` is still EXAMINED
+    // rather than swallowed — is unchanged and still red-on-disable at count 0.
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+                        DiagnosticCode::S_UnknownAttribute), 1u)
         << "a clause after `packed` must still be examined — the pre-TF-C73 "
            "scan swallowed it and accepted the typo silently";
     for (auto const& d : model.diagnostics().all()) {
-        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
-        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
+        if (d.code != DiagnosticCode::S_UnknownAttribute) continue;
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
         EXPECT_NE(d.actual.find("bogus_xyz"), std::string::npos)
             << "the diagnostic must name the unrecognized clause, got: " << d.actual;
     }
@@ -13572,9 +13653,9 @@ TEST(SemanticAnalyzerC, PackedMultiClauseUnknownBeforePackedFailsLoud) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+                        DiagnosticCode::S_UnknownAttribute), 1u);
     for (auto const& d : model.diagnostics().all()) {
-        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        if (d.code != DiagnosticCode::S_UnknownAttribute) continue;
         EXPECT_NE(d.actual.find("bogus_xyz"), std::string::npos) << d.actual;
     }
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -13964,26 +14045,35 @@ TEST(SemanticAnalyzerC, GnuAlignedTypedefWithoutLayoutParamsStaysSilent) {
     EXPECT_FALSE(model.hasErrors());
 }
 
-// ★ THE STRICT UNKNOWN-NAME GATE (work item 3). A `typedefDecl` declares no
-// `linkageSpecifiers`, so `linkageFrom` early-returns and an unknown GNU name in
-// a typedef position was reported by NOBODY — `typedef __attribute__((desprecated))
-// int T;` compiled clean with the decoration silently unapplied. With the row's
-// `unknownStrictAttributeIsError` opt-in it is now an ERROR, using the SAME code
-// and severity `scanCompositePacked` already uses for a strict unknown.
-// RED-ON-DISABLE: drop the `strictUnknownIsError` arm → count goes to 0.
-TEST(SemanticAnalyzerC, TypedefUnknownStrictGnuAttributeFailsLoud) {
+// ★ THE UNKNOWN-NAME GATE ON A TYPEDEF (TF-C73 work item 3). A `typedefDecl`
+// declares no `linkageSpecifiers`, so `linkageFrom` early-returns and an unknown
+// GNU name in a typedef position was once reported by NOBODY — `typedef
+// __attribute__((desprecated)) int T;` compiled clean with the decoration
+// silently unapplied. It is now REPORTED.
+// ★★ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY) — RENAMED FROM `…FailsLoud`
+// AND RE-AIMED AT THE WARNING. `typedefDecl` declares
+// `unknownStrictAttributeIsError: false`, because ✔gcc 13.3.0 (`-std=c2x`) and
+// ✔clang 18.1.3 (`-std=c23`), probed separately, both compile this exact program
+// with one `attribute directive ignored` warning and exit 0 — an Error here was
+// DSS refusing below the union. The silent-drop this gate exists to prevent is
+// still prevented: the name is named, and `--warnings-as-errors` restores the
+// refusal for anyone who wants the strict posture.
+// RED-ON-DISABLE: drop the unknown-name arm → count goes to 0; restore the
+// hardcoded Error → `hasErrors()` goes true.
+TEST(SemanticAnalyzerC, TypedefUnknownStrictGnuAttributeIsWarnedNotRefused) {
     auto cu = buildShippedUnit("c",
                                { "typedef __attribute__((desprecated)) int T;\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+                        DiagnosticCode::S_UnknownAttribute), 1u)
         << "a typo'd GNU attribute on a typedef must not be silently unapplied";
     for (auto const& d : model.diagnostics().all()) {
-        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
-        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
+        if (d.code != DiagnosticCode::S_UnknownAttribute) continue;
+        EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
         EXPECT_NE(d.actual.find("desprecated"), std::string::npos) << d.actual;
     }
+    EXPECT_FALSE(model.hasErrors());
 }
 
 // The C23 `[[...]]` form on the SAME row keeps its SUPPRESSIBLE Warning — C23
@@ -14253,20 +14343,23 @@ TEST(SemanticAnalyzerC, CompositeScanAccumulatesAcrossAdjacentAttrSpecifiers) {
 // of `aligned` itself does NOT slip through the effect-row match. This is the
 // control that proves the new arm keys on the DECLARED effect row, not on "the
 // clause has an argument".
-TEST(SemanticAnalyzerC, CompositeMisspelledAlignedStillFailsLoud) {
+TEST(SemanticAnalyzerC, CompositeMisspelledAlignedIsWarnedNotRefused) {
     auto cu = buildShippedUnit("c", {
         "struct D { char a; int b; } __attribute__((alinged(16)));\n"
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    // P44: the report survives (that is what keys on the DECLARED effect row and
+    // not on "the clause has an argument"); only its severity moved to the row's.
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
+                        DiagnosticCode::S_UnknownAttribute), 1u)
         << "a typo'd composite attribute must not be silently unapplied";
     for (auto const& d : model.diagnostics().all()) {
-        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
+        if (d.code != DiagnosticCode::S_UnknownAttribute) continue;
         EXPECT_NE(d.actual.find("alinged"), std::string::npos) << d.actual;
     }
+    EXPECT_FALSE(model.hasErrors());
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -16183,22 +16276,29 @@ TEST(SemanticAnalyzerC, StructMemberLeadingAlignedAttributeIsHonored) {
     EXPECT_EQ(*a->explicitAlignment, 16u);
 }
 
-// (e) AN UNRECOGNIZED GNU NAME IN THE NEW POSITION IS LOUD. structField /
-// unionField carry `unknownStrictAttributeIsError: true`, and the leading slot
-// inherits it because it folds into the SAME declaration's facts. Without this
-// the new position would be a hole in the name axis exactly as
-// D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP describes.
-TEST(SemanticAnalyzerC, StructMemberLeadingUnknownAttributeIsLoud) {
+// (e) AN UNRECOGNIZED GNU NAME IN THE NEW POSITION IS REPORTED. The leading slot
+// inherits the member row's verdict because it folds into the SAME declaration's
+// facts. Without this the new position would be a hole in the name axis exactly
+// as D-TEST-IGNORE-LIST-IS-A-LICENSE-TO-DROP describes.
+// ★★ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY): `structField` /
+// `unionField` now declare `unknownStrictAttributeIsError: false`, so the report
+// is a suppressible Warning — ✔MEASURED, `struct S { int a
+// __attribute__((frobnicate)); };` compiles on gcc 13.3.0 and clang 18.1.3
+// (probed separately) with one warning and exit 0. The INHERITANCE claim is what
+// this pin exists for and is untouched: the leading slot must not be silent while
+// the trailing one reports.
+TEST(SemanticAnalyzerC, StructMemberLeadingUnknownAttributeIsWarnedNotSkipped) {
     auto cu = buildShippedUnit("c", {
         "struct S { __attribute__((frobnicate)) int x; };\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
-    EXPECT_TRUE(model.hasErrors())
-        << "an unknown GNU attribute name in the leading member position must "
-           "fail loud, never be skipped";
+    EXPECT_FALSE(model.hasErrors())
+        << "both references compile this and exit 0 — DSS may not refuse it";
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+                        DiagnosticCode::S_UnknownAttribute), 1u)
+        << "an unknown GNU attribute name in the leading member position must "
+           "still be reported, never be skipped";
 }
 
 // (f) THE DECL-KIND GATE (TF-C93) IS LIVE IN THE NEW POSITION. `noinline` is
@@ -17655,17 +17755,24 @@ TEST(SemanticAnalyzerC, EnumLayoutAttributeIsAcceptedAndReportedIgnored) {
         << "one report per ignored layout attribute -- never silence";
 }
 
-// The strict-unknown typo guard the row opted into reaches the enum slot too:
-// a misspelled GNU attribute there must fail loud rather than leave the tag
-// quietly undecorated. The C23 `[[...]]` spelling stays standard-ignorable.
-TEST(SemanticAnalyzerC, EnumLeadSlotKeepsTheStrictUnknownAttributeGuard) {
+// The unknown-name typo guard reaches the enum slot too: a misspelled GNU
+// attribute there must be REPORTED rather than leave the tag quietly
+// undecorated. The C23 `[[...]]` spelling stays standard-ignorable.
+// ★★ P44 (D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY): `enumSpec` moved with its
+// two composite siblings to `unknownStrictAttributeIsError: false`, so the report
+// is a Warning — ✔MEASURED, `enum __attribute__((frobnicate)) E { EA = 11 };`
+// compiles on gcc 13.3.0 and clang 18.1.3 (probed separately) with one warning
+// and exit 0. What this pin protects — that the enum slot is not a hole — is
+// unchanged.
+TEST(SemanticAnalyzerC, EnumLeadSlotKeepsTheUnknownAttributeGuard) {
     auto strict = analyzeShipped("c", {
         "enum __attribute__((deprected)) E { A = 1 };\n"
         "int main(void) { enum E e = A; return (int)e; }\n",
     });
     EXPECT_EQ(countCode(strict.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u)
-        << "a GNU-form typo on an enum fails loud, as it does on a struct";
+                        DiagnosticCode::S_UnknownAttribute), 1u)
+        << "a GNU-form typo on an enum is reported, as it is on a struct";
+    EXPECT_FALSE(strict.hasErrors());
     auto ignorable = analyzeShipped("c", {
         "enum [[vendor::whatever]] E { A = 1 };\n"
         "int main(void) { enum E e = A; return (int)e; }\n",
@@ -17673,6 +17780,7 @@ TEST(SemanticAnalyzerC, EnumLeadSlotKeepsTheStrictUnknownAttributeGuard) {
     EXPECT_EQ(countCode(ignorable.diagnostics(),
                         DiagnosticCode::S_UnknownTypeAttribute), 0u)
         << "an unrecognized C23 attribute stays standard-ignorable";
+    EXPECT_FALSE(ignorable.hasErrors());
 }
 
 // -- P34 D-DIAG-ARRAY-SUFFIX-REPORTS-ONLY-THE-LEXEME ------------------------

@@ -5,7 +5,7 @@
   "availableObjectFormats": ["elf", "macho", "pe"],
   "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib", "pe": "ucrtbase.dll" },
   "symbols": [
-    { "name": "open",  "signature": "fn(ptr<char>, i32, ...) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },
+    { "name": "open",  "signature": "fn(ptr<const<char>>, i32, ...) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },
     { "name": "fcntl", "signature": "fn(i32, i32, ...) -> i32",       "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] }
   ],
   "structs": [

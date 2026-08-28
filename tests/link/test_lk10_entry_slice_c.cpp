@@ -129,6 +129,8 @@ makeSyscallElfExecFormat() {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-elf-syscall-x64", "version": "0.1", "kind": "elf" },
@@ -162,6 +164,8 @@ makeSyscallElfExecFormatArm64() {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-elf-syscall-arm64", "version": "0.1", "kind": "elf" },
@@ -1114,6 +1118,18 @@ makeElfExecFormatData(bool withProcessExit) {
     // hand-built ObjectFormatData must set it or validate() reports it,
     // which would pollute the "exactly one problem" assertions below.
     data.headerNameMatching = HeaderNameMatching::CaseSensitive;
+    // D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY: the same
+    // shape one field over — REQUIRED, empty is the INVALID sentinel, and this
+    // fixture bypasses the loader, so validate() is the only thing that would
+    // report it. Unset, it pollutes the "exactly one problem" pair above.
+    data.cCallingConvention.convention = "sysv_amd64";
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the artifact
+    // NAMING fact, REQUIRED on every format and DISENGAGED is its invalid
+    // sentinel (an engaged EMPTY value is a real answer -- a Unix
+    // executable). On this hand-built loader-bypassing path validate() is
+    // the only enforcement, so leaving it unset would make this fixture
+    // report two problems where its assertions expect one.
+    data.outputExtension = "";   // an ELF executable carries none
     // Likewise REQUIRED with a zero INVALID sentinel
     // (D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN). Set here for the same reason:
     // this fixture's whole job is to differ from its sibling in EXACTLY ONE
@@ -1257,6 +1273,8 @@ TEST(EntryGateFold, ExecFlavorWithoutProcessExitIsRejectedAtConfigLoad) {
     auto const loaded = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": { "name": "synth-elf-exec-noexit", "version": "0.1", "kind": "elf" },

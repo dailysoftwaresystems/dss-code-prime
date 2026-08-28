@@ -165,3 +165,26 @@ dss_add_test(NAME lir/test_lir_label_address_static_table
 # survivable, so the guarantee does not rest on five independent `return`s.
 dss_add_test(NAME lir/test_lir_rebuild_unwind
              SOURCES test_lir_rebuild_unwind.cpp)
+
+# D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
+# WHEN the frame pointer leaves the allocatable pool is a DECLARED per-convention
+# fact (`framePointerReservation`), and these pins assert on the MATERIALIZED
+# instruction stream — the emitted code — because the pre-fix program ran fine
+# and no ordinary run could have noticed. Consumes mutate_target_schema.hpp for
+# the REMOVE-direction mutant, hence nlohmann_json.
+dss_add_test(NAME lir/test_lir_frame_pointer_reservation
+             SOURCES test_lir_frame_pointer_reservation.cpp)
+target_link_libraries(dss_lir_test_lir_frame_pointer_reservation
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LIR-TEXT-PARSE-UNSEALED-BLOCK-ABORT: a malformed instruction in a NON-FINAL
+# block used to kill the process. Panic-mode recovery reports the bad
+# instruction and keeps driving `LirBuilder`, so a block whose terminator was
+# skipped reached the next `beginBlock` unsealed and hit its *"current block has
+# no terminator"* fatal. Every pre-existing malformed-input test placed the bad
+# instruction in the LAST block, the one arrangement `finalize`'s `errors_`
+# short-circuit keeps away from the abort — so the suite could not see it. Its
+# own target because the regression mode is a DEAD RUNNER, not a failed
+# assertion: keep it away from the 100-odd unrelated pins in test_lir_text.
+dss_add_test(NAME lir/test_lir_text_unsealed_block
+             SOURCES test_lir_text_unsealed_block.cpp)

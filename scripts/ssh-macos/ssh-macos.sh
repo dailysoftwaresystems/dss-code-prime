@@ -65,14 +65,73 @@ done
 # {$conf[...]}`) — this is the CAPABILITY PAIR having drifted, which is precisely what
 # the header's pairing note exists to prevent.
 _envHost=${DSS_MACOS_HOST:-} ; _envUser=${DSS_MACOS_USER:-} ; _envKey=${DSS_MACOS_KEY:-}
+# ⚠ THE PATH PREFIX CAPTURES *SET-NESS*, NOT EMPTINESS, AND THE OTHER THREE DELIBERATELY
+# DO NOT — D-SCRIPT-SSH-MACOS-PATH-PREFIX-CANNOT-BE-DISABLED-BY-AN-EMPTY-VALUE.
+# For host/user/key an EMPTY value is meaningless and `:-` is right. For this one an
+# empty value is the DISABLE switch, so `:-` erases the very state the caller is
+# expressing. ✔MEASURED 2026-08-28, and it made this script's own commissioning A/B
+# VACUOUS: `DSS_MACOS_PATH_PREFIX="" ssh-macos.sh 'command -v cmake'` was run as the
+# CONTROL arm — the arm that is supposed to reproduce the pre-fix breakage — and the
+# `${VAR:=default}` below re-assigned the default over the empty string, so the control
+# ran WITH the repair and returned `/opt/homebrew/bin/cmake`. ★ The failure direction is
+# the dangerous one: a control that silently becomes a second treatment arm agrees with
+# the treatment, which reads as "the fix works" no matter what the fix does.
+_envPathPrefixSet=${DSS_MACOS_PATH_PREFIX+set}
+_envPathPrefix=${DSS_MACOS_PATH_PREFIX:-}
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
 if [ -n "$_envHost" ]; then DSS_MACOS_HOST=$_envHost ; fi
 if [ -n "$_envUser" ]; then DSS_MACOS_USER=$_envUser ; fi
 if [ -n "$_envKey"  ]; then DSS_MACOS_KEY=$_envKey   ; fi
-unset _envHost _envUser _envKey
+if [ -n "$_envPathPrefixSet" ]; then DSS_MACOS_PATH_PREFIX=$_envPathPrefix ; fi
+unset _envHost _envUser _envKey _envPathPrefix _envPathPrefixSet
 
 : "${DSS_MACOS_HOST:=}" ; : "${DSS_MACOS_USER:=}" ; : "${DSS_MACOS_KEY:=}"
+
+# ★★★ THE REMOTE PATH IS REPAIRED BEFORE ANY PAYLOAD RUNS —
+# D-TOOLS-SSH-MACOS-NONINTERACTIVE-PATH-IS-CLOBBERED-BY-EMSDK.
+#
+# ✔MEASURED 2026-08-04 and re-faced 2026-08-27: this host runs an emsdk shell hook
+# that REPLACES `PATH` with `<emsdk dirs>:/usr/bin:/bin:/usr/sbin:/sbin` for a
+# NON-INTERACTIVE session, dropping `/opt/homebrew/bin` AND `/usr/local/bin`. So
+# `command -v cmake` answers MISSING while `ls /opt/homebrew/bin` shows cmake,
+# ninja, tclsh and tclsh9.0 all present.
+#
+# ★★ THE DIRECTION OF THE WRONG ANSWER IS WHAT MAKES THIS WORTH REPAIRING RATHER
+# THAN DOCUMENTING: it is a FALSE NEGATIVE — "the tool is not installed" — which
+# silently SHRINKS what the project believes it can do, and it has already put a
+# refuted sentence ("Homebrew is not installed") into a commit message as a measured
+# fact used to justify a design decision. A capability question answered wrongly
+# does not fail; it re-plans the work around a machine that was never limited.
+#
+# ⚠ WHY NOT A LOGIN SHELL, which is the other arm the anchor offered: a login shell
+# runs the profile, and THIS host's profile is exactly what the `.local`-resolver
+# note below records CONSUMING A SCRIPT PIPED TO `bash -s`. Repairing PATH by
+# invoking the thing that breaks stdin trades a false negative for a silent
+# truncation, which is strictly worse. The prefix is deterministic and touches
+# nothing else.
+#
+# ⚠ IT IS A PREFIX, NOT A REPLACEMENT. The remote `PATH` is kept and appended, so a
+# tool that lives only in the emsdk dirs is still found; and `$PATH` is written to
+# expand ON THE FAR SIDE (single-quoted here) — expanding it locally would ship
+# THIS machine's PATH to macOS.
+#
+# ⚠ IT IS `export ...;`, A STATEMENT, NOT `PATH=... cmd`, AN ASSIGNMENT PREFIX. ssh
+# hands the payload to the remote shell as ONE string, so an assignment prefix binds
+# only to the FIRST command: `PATH=x cd d && make` would run `make` with the broken
+# PATH. The `export` form covers a compound payload, and — the case that matters
+# most here — it is inherited by `bash -s`, so the piped-script transports get the
+# repair without a second mechanism and without touching their stdin.
+#
+# ⚠ `+set`, NOT `:=` — an EMPTY value is the caller's DISABLE switch and must survive.
+# See the set-ness note in the env-precedence block above for the measurement.
+if [ -z "${DSS_MACOS_PATH_PREFIX+set}" ]; then
+    DSS_MACOS_PATH_PREFIX=/opt/homebrew/bin:/usr/local/bin
+fi
+remote_path_stmt=
+if [ -n "$DSS_MACOS_PATH_PREFIX" ]; then
+    remote_path_stmt='export PATH="'$DSS_MACOS_PATH_PREFIX':$PATH"; '
+fi
 DSS_MACOS_KEY=$(eval printf '%s' "\"$DSS_MACOS_KEY\"")
 
 # ★★★ THE SCRIPT FINDS THE KEY — the caller never does anything manually.
@@ -378,7 +437,7 @@ if [ "${1:-}" = "--push" ]; then
     fi
     tar -c -C "$_src" -X "$_excl" \
         -f - . \
-      | ssh "${args[@]}" "mkdir -p $_dst && cd $_dst && mkdir -p build && touch build/.dss-push-stamp && sleep 1 && tar -x -m -f - && echo $_witness:\$(pwd -P)" \
+      | ssh "${args[@]}" "$remote_path_stmt" "mkdir -p $_dst && cd $_dst && mkdir -p build && touch build/.dss-push-stamp && sleep 1 && tar -x -m -f - && echo $_witness:\$(pwd -P)" \
       > "${TMPDIR:-/tmp}/ssh-macos-push.$$" 2>&1
     _st=("${PIPESTATUS[@]}")
     _out=$(cat "${TMPDIR:-/tmp}/ssh-macos-push.$$" 2>/dev/null)
@@ -445,7 +504,7 @@ echo "PRUNED_DIRS=$_dirs"
 PRUNE_EOF
 )
         printf 'D=%s\n%s\n' "$_dst" "$_prune_body" \
-          | ssh "${args[@]}" 'bash -s' > "${TMPDIR:-/tmp}/ssh-macos-prune.$$" 2>&1
+          | ssh "${args[@]}" "$remote_path_stmt" 'bash -s' > "${TMPDIR:-/tmp}/ssh-macos-prune.$$" 2>&1
         _pout=$(cat "${TMPDIR:-/tmp}/ssh-macos-prune.$$" 2>/dev/null)
         rm -f "${TMPDIR:-/tmp}/ssh-macos-prune.$$"
         # A witness, not an exit code: the status of a pipeline is the last stage's, and
@@ -480,7 +539,12 @@ if [ "${1:-}" = "--rsync" ]; then
 fi
 
 args+=("$DSS_MACOS_USER@$target")
-[ $# -gt 0 ] && args+=("$@")
+# An EMPTY payload is an interactive session; prefixing it would turn a login into a
+# one-shot `export` and hand back a shell that exits immediately.
+if [ $# -gt 0 ]; then
+    [ -n "$remote_path_stmt" ] && args+=("$remote_path_stmt")
+    args+=("$@")
+fi
 
 ssh "${args[@]}"
 exit $?

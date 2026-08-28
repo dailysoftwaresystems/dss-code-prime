@@ -2725,7 +2725,11 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // and the whole read fails via the errorCount delta below). The BASE
         // text is decoded even when an override is active (both must be
         // valid); the EFFECTIVE signature is the active model's.
-        TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter, mergedNamedTypes);
+        // P44: the qualification claim comes out of the SAME decode, not a
+        // second reader — `const<…>` is part of the signature grammar, so the one
+        // type-text decoder is the one place it is understood.
+        DeclaredQualification baseQual;
+        TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter, mergedNamedTypes, &baseQual);
         if (!baseSig.valid() || baseSig == InvalidType) {
             dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                         DiagnosticSeverity::Error,
@@ -2736,15 +2740,29 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             continue;
         }
         TypeId sig = baseSig;
+        DeclaredQualification qual = std::move(baseQual);
         if (effectiveSigText != sigText) {
-            sig = parseTypeFromText(effectiveSigText, interner, typeReg, reporter, mergedNamedTypes);
+            // The per-data-model override carries its OWN claim: the two texts
+            // are two independent statements and the ACTIVE one is what this
+            // build is compiled against. Taking the base's claim here would
+            // describe a signature that is not the one being used.
+            DeclaredQualification ovQual;
+            sig = parseTypeFromText(effectiveSigText, interner, typeReg, reporter, mergedNamedTypes, &ovQual);
             // Already validated above; a second-parse failure here would be
             // interner drift — covered by the errorCount delta either way.
             if (!sig.valid() || sig == InvalidType) continue;
+            qual = std::move(ovQual);
         }
+        // An EMPTY claim is stored as NO claim: the two spellings of "this row
+        // says nothing about qualifiers" must not be distinguishable downstream,
+        // or a consumer will eventually treat one of them as a statement.
+        std::shared_ptr<DeclaredQualification const> qualPtr;
+        if (!qual.empty())
+            qualPtr = std::make_shared<DeclaredQualification const>(std::move(qual));
 
         out.symbols.push_back(
-            ShippedSymbol{std::move(name), sig, kind, linkage, std::move(symAvail),
+            ShippedSymbol{std::move(name), sig, std::move(qualPtr),
+                          kind, linkage, std::move(symAvail),
                           noreturn, returnsTwice, std::move(synthesize),
                           std::move(version), std::move(linkName),
                           std::move(symLibrary), std::move(symRealization)});

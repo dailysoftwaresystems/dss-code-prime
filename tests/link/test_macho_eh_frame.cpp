@@ -107,6 +107,8 @@ ordinalOf(TargetSchema const& t, std::string_view name) {
     return R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
       "dataModel": "LP64",
       "headerNameMatching": "case-sensitive",
       "format": {"name":"macho-ehframe-test","kind":"macho"},

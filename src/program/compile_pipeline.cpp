@@ -1879,7 +1879,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::span<EntryMaterialization const> entryVerbs,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
-                     ObjectFormatKind                  fmtKind,
+                     std::string_view                  wideFloatSoftcallLibrary,
                      DiagnosticReporter&               reporter) {
     SemanticModel&       model   = cuMir.model;
     GrammarSchema const& grammar = *cuMir.grammar;
@@ -2083,15 +2083,24 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                  : std::string{};
     };
 
-    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): resolve the ACTIVE format's
-    // F128 softcall runtime library inline (fmtKind + the CU's target are both
-    // in scope here — no new CuMirModule field needed). Empty = the format
-    // declares none (nullopt → an F128 softcall fails loud).
-    std::string_view const wfLib =
-        cuMir.target->wideFloatSoftcallLibrary(fmtKind);
-    std::optional<std::string> wideFloatSoftcallLibrary =
-        wfLib.empty() ? std::nullopt
-                      : std::optional<std::string>(std::string(wfLib));
+    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the ACTIVE format's F128
+    // softcall runtime library. Empty = the format declares none (nullopt → an
+    // F128 softcall fails loud).
+    //
+    // ★ D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES (the residual half):
+    // THIS FUNCTION USED TO TAKE THE FORMAT'S *KIND* AND DO THE LOOKUP ITSELF.
+    // It now takes the RESOLVED LIBRARY — the fact — which is the same
+    // decomposition every other parameter here already follows: `processArgs`,
+    // `entryVerbs` and `sehPersonality` are all facts READ OFF the format by
+    // the caller rather than an identity this function re-interrogates. The
+    // caller holds the schema handle and is the right place to ask it; the
+    // lowering has no business knowing which FAMILY of object format it is
+    // serving, only what that family declared.
+    std::optional<std::string> wideFloatSoftcallLibraryOpt =
+        wideFloatSoftcallLibrary.empty()
+            ? std::nullopt
+            : std::optional<std::string>(
+                  std::string(wideFloatSoftcallLibrary));
 
     return lowerMirModuleToAssembly(
         cuMir.mir, model.lattice().interner(), nameOf,
@@ -2101,7 +2110,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
         cuMir.externAddrBinding,
         cuMir.tlsAccess,
-        std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt), reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2752,29 +2761,39 @@ readArchiveMemberModule(std::span<std::uint8_t const> memberBytes,
 
     CompilationUnitId const memberCu =
         substrate::mintMonotonicId<CompilationUnitId>();
-    switch (format.kind()) {
-        case ObjectFormatKind::Elf:
-            return elf::readRelocatableObject(
-                memberBytes, target, format, reporter, memberCu);
-        case ObjectFormatKind::MachO:
-            return macho::readRelocatableObject(
-                memberBytes, target, format, reporter, memberCu);
-        case ObjectFormatKind::Pe:
-            return pe::readRelocatableObject(
-                memberBytes, target, format, reporter, memberCu);
-        default: {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = std::format(
-                "archive member reader: object format '{}' (kind {}) has no "
-                "relocatable-object reader -- cannot pull archive members for "
-                "this format.",
-                format.name(), objectFormatKindName(format.kind()));
-            reporter.report(std::move(d));
-            return std::nullopt;
-        }
+
+    // ── D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES ────────────────────
+    //
+    // A 3-arm `switch (format.kind())` STOOD HERE, plus a `default:` arm that
+    // emitted the no-reader refusal. It is GONE: the member's own schema has
+    // already resolved to a backend, and reading a relocatable object is that
+    // backend's job — the exact counterpart of `encode`, which TF-C125 moved
+    // onto this same interface for this same reason.
+    //
+    // ★ THE `default:` ARM MOVED RATHER THAN VANISHING, AND IT GOT STRONGER.
+    // Its wording and F_ code are unchanged, but it now lives in the wasm and
+    // spirv backends as an OVERRIDE of a PURE VIRTUAL. A `default:` silently
+    // absorbs every format nobody thought about; a pure virtual makes a sixth
+    // backend unable to COMPILE without answering the question.
+    //
+    // ⚠ A null backend cannot reach here — `archiveMemberFormat` above returns
+    // a schema that LOADED, and a document with no resolvable `kind` is refused
+    // at load. Defended anyway, because `ObjectFormatSchema{ObjectFormatData}`
+    // is a public constructor and an in-memory producer bypasses that entirely.
+    link::ObjectFormatBackend const* const backend = format.backend();
+    if (backend == nullptr) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "archive member reader: object format '{}' resolved no backend -- "
+            "cannot read archive members for a schema with no format identity.",
+            format.name());
+        reporter.report(std::move(d));
+        return std::nullopt;
     }
+    return backend->readRelocatableObject(memberBytes, target, format,
+                                          reporter, memberCu);
 }
 
 std::optional<std::vector<AssembledModule>>
@@ -3331,9 +3350,33 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
     // dispatch axis), never a format-name branch. Without this a PE static
     // library would ship SysV-only and MS link.exe could not resolve its
     // members (the c169 default was SysV; c171 threads the real flavor).
-    auto const flavor = (format.kind() == ObjectFormatKind::Pe)
-                            ? link::format::ArArchiveFlavor::Coff
-                            : link::format::ArArchiveFlavor::SysV;
+    // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: this was
+    // `(format.kind() == ObjectFormatKind::Pe) ? Coff : SysV`. ⚠ THE COMMENT
+    // ABOVE USED TO DEFEND IT AS "the closed enum, the existing agnostic
+    // dispatch axis, never a format-name branch" — and that defence is exactly
+    // the rationalization the veto rejects: a closed enum keyed on IDENTITY is
+    // an identity branch whether it is spelled as an `if`, a `switch` or a
+    // table. The flavor is now DECLARED by the format that writes the archive.
+    // The switch below is over a declared VERB, not an identity, and the
+    // `-Werror=switch` backstop makes a new flavor a build error here rather
+    // than a silent SysV fallback.
+    link::format::ArArchiveFlavor flavor = link::format::ArArchiveFlavor::SysV;
+    switch (format.archiveFlavor()) {
+        case ArchiveFlavor::Coff: flavor = link::format::ArArchiveFlavor::Coff; break;
+        case ArchiveFlavor::SysV: flavor = link::format::ArArchiveFlavor::SysV; break;
+        case ArchiveFlavor::Unspecified:
+            // Unreachable through the loader (`validate()` requires the key on
+            // every `container: archive` format) and unreachable here anyway —
+            // this function only runs for an archive. Fail LOUD rather than
+            // write a guessed layout: a wrong `ar` variant produces a `.lib`
+            // whose members `link.exe` silently cannot resolve.
+            report(reporter, DiagnosticCode::C_MissingField,
+                   DiagnosticSeverity::Error,
+                   std::format("object format '{}' writes a static archive but "
+                               "declares no `archiveFlavor` — refusing to guess "
+                               "an archive layout", format.name()));
+            return false;
+    }
     auto const archive = link::format::writeArArchive(members, reporter, flavor);
     if (!tierClean(reporter, entry)) {
         return false;   // a writer fail-loud belt fired (name/size/offset).
@@ -3361,9 +3404,10 @@ assembleUnit(CompilationUnit const&        cu,
     auto cuMir = buildCuMir(cu, grammar, target, format,
                             callingConventionIndex, reporter, opts);
     if (!cuMir) return std::nullopt;
-    return lowerCuMirToAssembly(*cuMir, format.processArgs(),
-                                format.entryVerbs(), format.sehPersonality(),
-                                format.name(), format.kind(), reporter);
+    return lowerCuMirToAssembly(
+        *cuMir, format.processArgs(), format.entryVerbs(),
+        format.sehPersonality(), format.name(),
+        target.wideFloatSoftcallLibrary(format.kind()), reporter);
 }
 
 namespace {

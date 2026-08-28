@@ -52,6 +52,80 @@
 
 namespace dss::core {
 
+// The GENERIC (forward-slash) spelling of `p` -- one separator convention for
+// every path this compiler compares or prints as a key.
+//
+// ★★★ THIS EXISTS BECAUSE `path::generic_string()` IS LOSSY AND THE LOSS
+// SILENTLY RENAMES THE FILE ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]).
+// ✔MEASURED with the toolchain that builds DSS (libstdc++ 13.2, MinGW), all
+// three printed from the SAME path object:
+//     .string()          '\\wsl.localhost\Ubuntu\home\rafael\p\uncprobe.h'
+//     .generic_string()  '/wsl.localhost/Ubuntu/home/rafael/p/uncprobe.h'
+//     exists()           true
+// The leading separator RUN is collapsed to one, so the authority is demoted to
+// an ordinary component and the result names a path on the local drive root
+// instead. A per-character substitution of the model's OWN
+// `preferred_separator` is the same normalisation without the loss.
+//
+// ★ NO PLATFORM MACRO AND NO UNC SPELLING. The `if constexpr` reads the path
+// model's declared separator, so on a host whose separator already is `/` the
+// substitution compiles away entirely -- and it must be that character and not
+// a literal backslash, because a POSIX filename may legitimately CONTAIN one.
+[[nodiscard]] DSS_EXPORT std::string
+genericSpelling(std::filesystem::path const& p);
+
+// `fs::absolute` WITHOUT letting it invent a drive for a path that already names
+// an AUTHORITY. Same invariant as `genericSpelling` above and as this file's
+// private `normalizeKeepingRoot`: never change the leading separator RUN.
+//
+// ★★★ THE DEFECT THIS EXISTS FOR, ✔MEASURED 2026-08-28 on the toolchain that
+// builds DSS (libstdc++ 13.2, MinGW-w64 UCRT), printed from one path object:
+//     input        : //wsl.localhost/Ubuntu/home/rafael/p44_unc_inc
+//     is_absolute  : false        has_root_name : false   root_name : <empty>
+//     absolute()   : C:\wsl.localhost\Ubuntu\home\rafael\p44_unc_inc
+//     exists(input): true         exists(absolute()) : false
+// It does NOT merely prepend the cwd -- it RE-ROOTS a path naming another
+// machine onto the local drive, silently and with no error. This path model
+// gives a UNC authority no `root_name()` of its own, so `is_absolute()` is false
+// and `absolute()` "repairs" it by supplying a drive that was never asked for.
+//
+// ★★ THE DISCRIMINATOR IS THE SEPARATOR RUN, NOT `is_absolute()` AND NOT
+// `isRootedPath`. A run of ONE (`/foo`) genuinely IS a location on the current
+// drive and MUST keep going through `fs::absolute`, which pins the drive that
+// was current at resolution time -- skipping it there would be a regression, not
+// a fix. A run of TWO OR MORE names an authority or a namespace (`//host/share`,
+// `\\?\C:\…` extended-length, `\\.\…` device), none of which has any meaning to
+// re-root. That is the same rule, and the same private helper, that
+// `normalizeKeepingRoot` already applies to the lexical transform.
+//
+// ⚠ NOT A WINDOWS-ONLY GUARD. On a model where a UNC path is already absolute,
+// `fs::absolute` returns it unchanged, so skipping the call is a no-op there and
+// the two hosts agree by construction rather than by a platform branch.
+//
+// `ec` follows `fs::absolute`: cleared on the preserved path (nothing can fail),
+// otherwise whatever the call reports. Callers keep their existing
+// on-failure-use-the-raw-path idiom unchanged.
+[[nodiscard]] DSS_EXPORT std::filesystem::path
+absoluteKeepingRoot(std::filesystem::path const& p, std::error_code& ec);
+
+// `lexically_normal()` WITHOUT letting it eat the leading separator RUN — the
+// third member of this file's trio, and the reason all three are exported
+// together: a path survives a UNC round trip only if EVERY transform applied to
+// it preserves the run, and there are exactly three transforms that do not.
+//
+// ★★★ ✔MEASURED 2026-08-28, and it is why exporting this was owed. The
+// artifact-written report ran ONE path through all three
+// (`absolute` -> `lexically_normal` -> `generic_string`) and each removed one
+// separator. Fixing only `absolute` moved the reported path from
+// `C:\host\share\…` to `/host\share\…`: still wrong, still naming the local
+// drive, and now wrong for a DIFFERENT reason. A partial fix here reads exactly
+// like a complete one, because both spellings are equally absent from disk.
+//
+// ⚠ A run of 0 or 1 is untouched and takes `lexically_normal()` exactly as
+// before, so this changes no local path.
+[[nodiscard]] DSS_EXPORT std::filesystem::path
+normalizeKeepingRoot(std::filesystem::path const& p);
+
 // Reduce `p` to its identity. Never throws and never returns empty: a path that
 // cannot be resolved degrades to its lexically-normal form, because a degraded
 // key is strictly better than an exception out of a resolver and its only cost

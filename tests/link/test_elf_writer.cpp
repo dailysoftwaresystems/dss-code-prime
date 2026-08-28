@@ -1119,6 +1119,8 @@ TEST(ElfWriter, NonElfFormatKindEmitsK_NoMatchingObjectFormat) {
     auto wasmJson = R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "none" },
+      "outputExtension": ".wasm",
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"wasm-test","kind":"wasm"}
@@ -1175,6 +1177,8 @@ loadStubFormat(std::string_view kindName) {
                                          "\"dataModel\":\"LP64\","
                                          "\"headerNameMatching\":\"case-sensitive\","
                                          "\"cSymbolDecoration\":{\"scheme\":\"none\"},"
+                                         "\"cCallingConvention\":{\"convention\":\"none\"},"
+                                         "\"outputExtension\":\".o\","
                                          "\"format\":{\"name\":\"stub-"}
         + std::string{kindName} + "\",\"kind\":\"" + std::string{kindName}
         + "\"}}";

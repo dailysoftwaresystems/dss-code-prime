@@ -363,6 +363,14 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                                          formatPredefinedMacros_);
         phase.reset();
         auto remap = pp.makeRemap();
+        // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the DIAGNOSTIC-shaped
+        // twin. It carries the same position rewrite `remap` does, plus the
+        // `expanded from macro 'X'` note a product-token subject needs — so
+        // the two tiers that hand whole diagnostics through (this parse and
+        // the FC2 oracle reparse below) use it, while every POSITION-only
+        // consumer (the LSP map, the descriptor refs, the post-parse tiers)
+        // keeps `remap`. Both are derived from the SAME line map.
+        auto diagRemap = pp.makeDiagnosticRemap();
         std::shared_ptr<SourceBuffer> synth = pp.synthBuffer;
         // The parser consumes a stream built from a COPY of the preprocessed
         // tokens; the vector is retained in the sidecar for the FC2 oracle
@@ -452,7 +460,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         // Remap the produced tree's diagnostics off the synth buffer onto the
         // origin file(s) before ingest, so a header-origin (and post-splice
         // main-origin) diagnostic is attributed to its real file.
-        result.tree.remapDiagnostics(remap);
+        result.tree.remapDiagnostics(diagRemap);
         // Retain the PP's origin buffers (original main + every spliced header)
         // so the driver can register them for diagnostic rendering -- a
         // remapped diagnostic now references one of these buffers, not the
@@ -469,6 +477,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         sidecar.schema          = std::move(schema);
         sidecar.ppTokens        = std::move(pp.tokens);
         sidecar.ppRemap         = std::move(remap);
+        sidecar.ppDiagRemap     = std::move(diagRemap);
         // [[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]]: record the SYNTH
         // buffer so the finished CU can answer "is this position in synthesized
         // coordinates" for EVERY later tier — the parse tier is simply the only
@@ -1054,7 +1063,9 @@ CompilationUnit UnitBuilder::finish() && {
                         Parser p{sc.source, sc.schema, std::move(stream),
                                  budget_, std::move(cfg), nullptr};
                         ParseResult r = std::move(p).parse();
-                        if (sc.ppRemap) r.tree.remapDiagnostics(sc.ppRemap);
+                        if (sc.ppDiagRemap) {
+                            r.tree.remapDiagnostics(sc.ppDiagRemap);
+                        }
                         return r;
                     }
                     Tokenizer tk{sc.source, sc.schema, budget_};

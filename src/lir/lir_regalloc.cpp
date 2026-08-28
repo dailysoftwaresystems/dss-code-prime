@@ -1719,17 +1719,39 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         return out;
     }
 
+    // ── WHEN THE FRAME POINTER LEAVES THE ALLOCATABLE POOL ──────────────────
+    //
     // D-CSUBSET-VLA (C1b): a function that contains a `sub_sp_reg` op (a dynamic
     // VLA stack allocation) reserves the frame pointer as its fixed-frame base —
     // exclude it from the allocatable pool so it is never handed to a vreg. The
-    // callconv pass force-saves it in the prologue + captures it as the base. A
-    // target/module without VLA (no `sub_sp_reg` opcode, or none in this function)
-    // takes the nullopt path — rbp/x29 stays allocatable (byte-identical frames).
+    // callconv pass force-saves it in the prologue + captures it as the base.
+    //
+    // D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
+    // and SOME platform ABIs reserve the register UNCONDITIONALLY, whether or not
+    // this function needs a frame base. That is a fact about the CONVENTION, so
+    // it arrives as one — `cc->framePointerReservation`, declared in the
+    // `.target.json` row — and the switch below is over that declared verb.
+    // ⚠ THE ALTERNATIVE WOULD HAVE BEEN AN `if (format == MachO)` HERE, which is
+    // the agnosticism break this tier forbids outright; the register-role fact
+    // belongs beside the register, in the document that names it.
+    // Absent/`dynamic-frame-only` ⇒ the VLA-only behavior above, unchanged, so
+    // every convention that declares nothing keeps byte-identical frames.
     std::optional<std::uint16_t> reservedFramePointer;
-    if (auto const subSpReg = schema.opcodeByMnemonic("sub_sp_reg");
-        subSpReg.has_value() && cc->framePointer.has_value()
-        && functionContainsOpcode(lir, flow.fn, *subSpReg)) {
-        reservedFramePointer = cc->framePointer->ordinal;
+    if (cc->framePointer.has_value()) {
+        bool reserve = false;
+        switch (cc->framePointerReservation) {
+            case FramePointerReservation::Always:
+                reserve = true;
+                break;
+            case FramePointerReservation::DynamicFrameOnly:
+                if (auto const subSpReg = schema.opcodeByMnemonic("sub_sp_reg");
+                    subSpReg.has_value()
+                    && functionContainsOpcode(lir, flow.fn, *subSpReg)) {
+                    reserve = true;
+                }
+                break;
+        }
+        if (reserve) reservedFramePointer = cc->framePointer->ordinal;
     }
     // Publish the reservation so the rewriter's scratch-pool build
     // (pickScratchRegs) also holds the frame pointer out — otherwise it would

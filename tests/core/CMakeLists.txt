@@ -17,6 +17,12 @@ dss_add_test(NAME core/test_diagnostic_reporter SOURCES test_diagnostic_reporter
 dss_add_test(NAME core/test_diagnostic_budget_threading SOURCES test_diagnostic_budget_threading.cpp)
 dss_add_test(NAME core/test_unsuppressable_codes SOURCES test_unsuppressable_codes.cpp)
 dss_add_test(NAME core/test_header_name_matching SOURCES test_header_name_matching.cpp)
+# D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED: a header named from a ROOT
+# resolves where it points, in every spelling of that root. Its multi-separator
+# arm SKIPS LOUDLY AND BY NAME where no UNC spelling is reachable -- an
+# unmeasured property must never read as a passing one.
+dss_add_test(NAME core/test_include_path_rooted_resolution
+             SOURCES test_include_path_rooted_resolution.cpp)
 dss_add_test(NAME core/test_grammar_schema      SOURCES test_grammar_schema.cpp)
 # Plan 15 CFI slice (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO): the
 # shared PC-keyed unwind representation -- per-PC state, the remember/restore

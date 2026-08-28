@@ -2,6 +2,11 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/constant_symbol_fold.hpp" // Item 1: shared enum/constant Ref->literal builder
+// The ONE C23 function-redeclaration compatibility oracle, shared with the
+// semantic tier so the gate that BINDS a declaration to a shipped shim and the
+// check that REFUSES an incompatible declaration cannot disagree about what
+// "compatible" means (D-CSUBSET-SUPPRESSED-SHIPPED-ROW-SIGNATURE-UNCHECKED).
+#include "analysis/semantic/redeclaration_compat.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
 #include "core/types/anon_member_name.hpp"       // isSyntheticAnonymousName (one owner)
@@ -2249,9 +2254,53 @@ struct Lowerer {
                 if (it->second.staticStorage && staticStorageOut != nullptr)
                     *staticStorageOut = true;
             } else {
-                emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
-                      std::format("'{}' is not a recognized linkage specifier",
-                                  reported));
+                // ── [[D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY]] — THE THIRD TIER ──
+                //
+                // ★★ THE VERDICT IS THE DECLARATION ROW'S OWN, AND THIS TIER USED
+                // TO OVERRIDE IT. `DeclarationRule::unknownStrictAttributeIsError`
+                // IS the language's per-row statement of whether an unmodelled GNU
+                // attribute NAME is an ERROR or the C23-ignorable warning, and the
+                // SEMANTIC tier has honoured it since TF-C73
+                // (`scanAttributeSemantics`'s arm 3). This tier did not read it at
+                // all — every miss was a hard `H_UnknownLinkageSpecifier`, i.e. the
+                // engine was DISOBEYING config it already had.
+                //
+                // ✔MEASURED, and the split is exact: every c row that reaches this
+                // function (`topLevelDecl`, `varDecl`, `externDecl`,
+                // `autoInferredVarDecl` — the four with a `linkageSpecifiers`
+                // table) declares `unknownStrictAttributeIsError: false`, i.e.
+                // "NOT an error", and got an error anyway; every row that declares
+                // `true` (typedef / struct / union / enum / struct-field /
+                // union-field) carries NO `linkageSpecifiers` and so never reaches
+                // this tier at all. The two tiers now read ONE key, so they can
+                // only move TOGETHER — which is precisely why fixing the severity
+                // in either tier alone would merely INVERT the asymmetry.
+                //
+                // ✔gcc 13.3.0 (`-std=c2x`), clang 18.1.3 (`-std=c23`) and
+                // mingw-w64 gcc 13.2.0, probed SEPARATELY, ALL warn and exit 0 on
+                // `__attribute__((frobnicate)) int g;` at file scope and on the
+                // function-definition twin; DSS exited 1. The bar is the
+                // DISJUNCTION, so DSS must compile them.
+                //
+                // ⚠ ONLY THE UNKNOWN-NAME ARM MOVES, AND THE OTHERS ARE MEASURED
+                // TO BELONG WHERE THEY ARE. The four other H000C shapes in this
+                // function — adjacent string concatenation in an argument, a
+                // malformed string argument, a binding conflict and a visibility
+                // conflict — stay ERRORS: they are constraint violations both
+                // references also reject, not unmodelled vocabulary.
+                //
+                // ⚠ WARNED, NEVER SILENTLY DROPPED. The specifier still has no
+                // effect (exactly gcc's "attribute directive ignored"), so the
+                // typo protection this gate exists for survives as a diagnostic;
+                // a program that wants the old refusal has `--warnings-as-errors`,
+                // and the code stays suppressible, as it already was.
+                emitHAt(DiagnosticCode::H_UnknownLinkageSpecifier,
+                        decl.unknownStrictAttributeIsError
+                            ? DiagnosticSeverity::Error
+                            : DiagnosticSeverity::Warning,
+                        n,
+                        std::format("'{}' is not a recognized linkage specifier",
+                                    reported));
             }
         }
         return attr;
@@ -2588,9 +2637,19 @@ struct Lowerer {
     // core so a third H_* code lands as one inline call site, not a
     // third near-identical helper.
     void emitH(DiagnosticCode code, NodeId node, std::string detail) {
+        emitHAt(code, DiagnosticSeverity::Error, node, std::move(detail));
+    }
+    // The severity-carrying form. `emitH` above is the Error shorthand every
+    // existing site uses and keeps using; this exists because ONE site in
+    // `linkageFrom` has a severity the LANGUAGE declares rather than this tier
+    // ([[D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY]]), and a per-site severity is
+    // already the house convention one tier up (`scanAttributeSemantics` writes
+    // `d.severity = strict ? Error : Warning` for the very same fact).
+    void emitHAt(DiagnosticCode code, DiagnosticSeverity severity, NodeId node,
+                 std::string detail) {
         ParseDiagnostic d;
         d.code     = code;
-        d.severity = DiagnosticSeverity::Error;
+        d.severity = severity;
         d.buffer   = tree().source().id();
         d.span     = node.valid() ? tree().span(node) : SourceSpan::empty(0);
         d.actual   = std::move(detail);
@@ -2600,17 +2659,6 @@ struct Lowerer {
         emitH(DiagnosticCode::H_UnsupportedLoweringForKind,
               node, std::move(detail));
     }
-    // TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): WHICH axis of a function signature
-    // diverges — for the shipped-shim compatibility refusal below, whose whole value
-    // is telling the author what to change. There is no shared type PRINTER in the
-    // tree (`S_IncompatibleRedeclaration` reports only the name), and adding a second
-    // type-spelling grammar here would be a surface that can drift from hir_text's;
-    // so this names the differing AXIS instead, which is what an author acts on.
-    // Checked in the order a reader would: arity, then variadic-ness, then the first
-    // differing parameter, then the return type. Reaching the last line means the two
-    // FnSigs agree on every axis this walks yet interned DIFFERENTLY — possible only
-    // via an axis the interner keys on that this does not enumerate (today: the
-    // FnSig's `cc` scalar), so it says exactly that rather than claiming they match.
     // ── TF-C112 (D-FFI-PE-CRT-UCRT-MIGRATION): THE SUPPRESSED-SHIM CLAIM ──────
     //
     // A shipped descriptor row carries TWO INDEPENDENT properties: WHERE the
@@ -2658,19 +2706,36 @@ struct Lowerer {
     // untouched, which covers every recipe-less suppressed row (`puts`, `realpath`)
     // and every non-shipped bare prototype.
     //
-    // ★ THE SIGNATURE GATE. Each recipe emits ONE FIXED body built against the
-    // DESCRIPTOR's declared signature, so inheriting the shim is sound only while
-    // the user's declaration AGREES with that signature. Interner TypeId identity
-    // IS structural FnSig equality (the interner dedups identical signatures) —
-    // the SAME oracle the analyzer's function-redeclaration compatibility sweep
-    // uses, deliberately not a bespoke comparison — and `const` is not interned,
-    // so the ordinary `int printf(const char *, ...)` matches the row's
-    // `fn(ptr<char>, ...) -> i32` exactly. A declaration that does NOT match
-    // cannot be reconciled: binding it to the shim would marshal the call under
-    // the user's ABI and answer it under the descriptor's, silently. Refusing is
-    // the only honest answer, and the refused set is essentially clang's own
-    // "conflicting types for 'printf'" — the header being suppressed here declares
-    // the standard signature.
+    // ★ THE SIGNATURE GATE, AND IT IS NOW LITERALLY THE ANALYZER'S OWN ORACLE.
+    // Each recipe emits ONE FIXED body built against the DESCRIPTOR's declared
+    // signature, so inheriting the shim is sound only while the user's declaration
+    // AGREES with that signature. That agreement is the C23 6.7.6.3p15 question,
+    // and it is asked through `functionRedeclarationCompatibility`
+    // (analysis/semantic/redeclaration_compat.hpp) — the SAME call the analyzer's
+    // function-redeclaration sweep and its shipped-descriptor check make. ONE
+    // ORACLE, THREE CALLERS, and that is the point: a second notion of
+    // "compatible" one tier down is how a declaration gets refused here and
+    // accepted there, or the reverse. A declaration that does NOT match cannot be
+    // reconciled: binding it to the shim would marshal the call under the user's
+    // ABI and answer it under the descriptor's, silently.
+    //
+    // ★ `PlatformVocabulary`, because the right-hand side is a DESCRIPTOR. It
+    // states a representation in hir-text and carries no source-language spelling,
+    // so `extern long random(void);` must not be called a conflict merely for
+    // interning `long` where the row wrote `i64` (D-LANG-TYPE-IDENTITY-VOCABULARY).
+    // This also makes the gate ACCEPT the legal `int f(volatile int)` shape that
+    // raw TypeId equality refused (C23 6.7.6.3p15 unqualifies a parameter's own top
+    // level, and a top-level-volatile parameter has an identical ABI).
+    //
+    // ⛔⛔ AND THE GATE STILL DOES NOT JUDGE QUALIFIERS — DO NOT MAKE IT.
+    // `const` is not interned and a descriptor cannot spell it, so this side
+    // passes NO qualification claim and the oracle leaves that axis alone. Making
+    // this gate report a MISMATCH on a qualifier difference would move a LEGAL
+    // program (`int printf(const char *, ...);`) OFF the shim and back onto a
+    // library that does not export the name — trading a missing diagnostic for a
+    // WRONG BINDING, i.e. a binary that fails to LOAD. The missing diagnostic
+    // belongs at the DECLARATION (the analyzer's shipped-descriptor check), never
+    // here.
     //
     // AGNOSTIC: the trigger is a non-empty descriptor-carried recipe tag plus a
     // declared signature — both DATA on the row, already per-format-selected by
@@ -2681,7 +2746,11 @@ struct Lowerer {
                               SymbolId sym, std::string const& name,
                               TypeId declaredType) {
         if (shipped == nullptr || shipped->recipeId.empty()) return false;
-        if (declaredType.v == shipped->signature.v) {
+        DeclaredFunction const userDecl{declaredType, nullptr};
+        DeclaredFunction const platformDecl{shipped->signature, nullptr};
+        auto const verdict = functionRedeclarationCompatibility(
+            interner, userDecl, platformDecl, LeafComparison::PlatformVocabulary);
+        if (verdict.compatible()) {
             synthRecipeAcc.emplace_back(sym.v, shipped->recipeId);
             return true;
         }
@@ -2696,30 +2765,10 @@ struct Lowerer {
                   "platform exports no such symbol to import instead "
                   "(D-FFI-PE-CRT-UCRT-MIGRATION)",
                   name, shipped->recipeId,
-                  fnSignatureDivergence(declaredType, shipped->signature)));
+                  describeRedeclarationDivergence(interner, verdict, userDecl,
+                                                  platformDecl, "it",
+                                                  "the platform declaration")));
         return true;
-    }
-    [[nodiscard]] std::string fnSignatureDivergence(TypeId user, TypeId declared) {
-        if (interner.kind(user) != TypeKind::FnSig
-            || interner.kind(declared) != TypeKind::FnSig)
-            return "one of the two declarations is not a function type";
-        auto const userParams = interner.fnParams(user);
-        auto const declParams = interner.fnParams(declared);
-        if (userParams.size() != declParams.size())
-            return std::format("it takes {} parameter(s) where the platform "
-                               "declaration takes {}",
-                               userParams.size(), declParams.size());
-        if (interner.fnIsVariadic(user) != interner.fnIsVariadic(declared))
-            return interner.fnIsVariadic(user)
-                       ? "it is variadic and the platform declaration is not"
-                       : "the platform declaration is variadic and it is not";
-        for (std::size_t i = 0; i < userParams.size(); ++i)
-            if (userParams[i].v != declParams[i].v)
-                return std::format("parameter {} has a different type", i + 1);
-        if (interner.fnResult(user).v != interner.fnResult(declared).v)
-            return "the return type differs";
-        return "the two signatures differ in an attribute the type interner keys "
-               "on but this report does not enumerate";
     }
     HirNodeId errorNode(NodeId cst, TypeId type = InvalidType) {
         return track(builder.addLeaf(HirKind::Error, type, 0, HirFlags::HasError), cst);

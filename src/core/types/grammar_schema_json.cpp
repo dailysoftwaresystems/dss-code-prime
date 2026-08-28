@@ -8588,7 +8588,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // no-op the facet. Listed in reader order; the nested
                         // `gatedMarkers` entries carry their own closed-key
                         // check further down.
-                        static constexpr std::array<std::string_view, 39>
+                        static constexpr std::array<std::string_view, 40>
                             kDeclarationRowKeys{
                                 // the shape anchor + visible-child indices
                                 "rule", "name", "type", "init", "body",
@@ -8607,6 +8607,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 // specifier + marker roles
                                 "specifierPrefix", "requiredSpecifierToken",
                                 "constMarker", "volatileMarker",
+                                "restrictMarker",
                                 "variadicMarker", "gatedMarkers",
                                 // linkage-specifier surface
                                 "linkageSpecifiers",
@@ -8743,6 +8744,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                           i, cm));
                                 } else {
                                     rule.constMarker = data.schemaTokens->find(cm);
+                                }
+                            }
+                        }
+
+                        // P44 (D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES
+                        // part (b)): optional restrict-marker token. Same shape
+                        // as `constMarker` above — a bad token name is
+                        // C_UnknownToken and the declaration stays usable, it
+                        // simply makes no restrict claim. Source-language
+                        // agnostic: each language declares its own marker.
+                        if (entry.contains("restrictMarker")) {
+                            if (!entry.at("restrictMarker").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/restrictMarker",
+                                          "'restrictMarker' must be a string");
+                            } else {
+                                auto const rm =
+                                    entry.at("restrictMarker").get<std::string>();
+                                if (!data.schemaTokens->contains(rm)) {
+                                    coll.emit(DiagnosticCode::C_UnknownToken,
+                                              path + "/restrictMarker",
+                                              std::format("'declarations[{}].restrictMarker' "
+                                                          "references unknown token kind '{}'",
+                                                          i, rm));
+                                } else {
+                                    rule.restrictMarker = data.schemaTokens->find(rm);
                                 }
                             }
                         }
@@ -15217,6 +15244,87 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 for (auto const& row : cfg.attributeEffects)
                     for (auto const& n : row.names) effectNames.insert(norm(n));
 
+                // ── THE ATTRIBUTE HALF OF `linkageSpecifierIgnoredNames` IS
+                //    DERIVED, NOT WRITTEN (P44, D-CSUBSET-GNU-UNKNOWN-NAME-GATE-ASYMMETRY)
+                //
+                // The strict linkage prefix scan asks ONE question of each
+                // identifier it meets: "are you a linkage specifier?" For an
+                // ATTRIBUTE name the answer is no, and it is no for a reason the
+                // language has ALREADY WRITTEN DOWN — the name has an
+                // `attributeSemantics.effects` row. Restating that set by hand in
+                // every row's `linkageSpecifierIgnoredNames` gives one fact two
+                // owners, and the drift between them is not hypothetical:
+                // ✔MEASURED before this change, c's two rosters were 28 names each
+                // and EVERY ONE of the 56 was already an `effects` name (the set
+                // difference was empty in both directions that matter), while three
+                // effects names — `packed`, `may_alias`, `transparent_union` — had
+                // drifted OUT, so `__attribute__((may_alias)) int gv = 1;` reported
+                // "'may_alias' is not a recognized linkage specifier" about a name
+                // this very config models, where gcc 13.3.0 and clang 18.1.3 are
+                // both SILENT (probed separately). A hand roster that is 100%
+                // redundant and still incomplete is the two-owners defect exactly.
+                //
+                // ★★ THE EXCLUSION IS THE WHOLE DESIGN, AND IT IS WHAT MAKES THE
+                // DERIVATION SAFE. A name this row declares as ITS OWN linkage
+                // specifier is never ignored, compared on the composite key's
+                // IDENTIFIER half (`visibility:hidden` → `visibility`) because that
+                // is the only half source text can spell. Without it the derivation
+                // would ignore `weak` and `visibility` — which now carry an inert
+                // `effects` row for their KIND axis — and `linkageFrom` tests this
+                // list BEFORE it assembles the composite `<name>:<body>` key, so a
+                // hidden symbol would silently become default-visible. That is a
+                // linker-visible wrong answer, and it is the one failure mode this
+                // derivation must not have.
+                //
+                // ⚠ THE PRIOR REFUSAL TO DO THIS RESTED ON A MEASUREMENT THAT WAS
+                // READ AGAINST THE WRONG CONTROL, AND THE RE-MEASUREMENT REVERSES
+                // IT. The `none`-row skip in clause B (below, now retired) was kept
+                // because adding `packed` to the roster made
+                // `__attribute__((packed)) struct S { char c; int v; } gv;` compile
+                // at `sizeof == 8`, "byte-identical to the UNPACKED control" — read
+                // as a discarded layout fact. ✔RE-MEASURED against the REFERENCES
+                // rather than against the unpacked control: gcc 13.3.0 and clang
+                // 18.1.3 BOTH give `sizeof == 8` on that exact program, both warning
+                // `'packed' attribute ignored`. 8 is the CORRECT answer — a LEADING
+                // `packed` does not reach the composite in any of the three, and the
+                // trailing spelling still yields 5 everywhere. Nothing was
+                // discarded, because at that position there is nothing to discard.
+                // ✔And the mechanism claim ("the ignored-name list is consulted
+                // before anything can honor the attribute") is independently false:
+                // `deprecated` has been in this roster all along AND is honored —
+                // `__attribute__((deprecated)) int gv = 11;` warns
+                // `S_DeprecatedSymbolUsed` at the use site. The two scans read the
+                // same prefix independently; ignoring a name in one does not blind
+                // the other.
+                for (DeclarationRule& d : cfg.declarations) {
+                    if (d.linkageSpecifiers.empty()) continue;   // no strict scan
+                    std::unordered_set<std::string> own;
+                    for (auto const& [key, unusedEffect] : d.linkageSpecifiers)
+                        own.insert(norm(std::string{linkageSpecifierBaseName(key)}));
+                    std::unordered_set<std::string> present;
+                    for (auto const& n : d.linkageSpecifierIgnoredNames)
+                        present.insert(norm(n));
+                    // Deterministic order: the vector is read linearly by
+                    // `linkageFrom` and printed by no one, but a set's iteration
+                    // order is a hash detail and a config document that loads to a
+                    // different vector on a different libstdc++ is not reproducible.
+                    std::vector<std::string> derived;
+                    for (auto const& row : cfg.attributeEffects)
+                        for (auto const& n : row.names) {
+                            std::string const bare = norm(n);
+                            if (own.contains(bare)) continue;
+                            if (!present.insert(bare).second) continue;
+                            derived.push_back(bare);
+                        }
+                    // The hand-written entries are kept and come FIRST: a language
+                    // may still name an identifier that is not attribute vocabulary
+                    // at all, which is the only thing this key can now say that the
+                    // effects table cannot.
+                    d.linkageSpecifierIgnoredNames.insert(
+                        d.linkageSpecifierIgnoredNames.end(),
+                        derived.begin(), derived.end());
+                }
+
                 // ── Clause A: a DEDICATED-scan name must be KNOWN vocabulary ──
                 // `AttributeEffect::None`'s own contract is that such names are
                 // listed "so the UNKNOWN-attribute warning never false-fires on a
@@ -15265,171 +15373,38 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                  "semantics.noreturn.attributeNames");
                 }
 
-                // ── Clause B: a DECLARATION-ATTACHED effect must be WRITABLE ──
-                // Every verb except `None` names an effect on the DECLARED entity
-                // (suppress-unused / warn-on-use / warn-on-discard / align /
-                // no-inline / always-inline / no-sanitize-thread — TF-C93 refreshed
-                // this list, which had gone STALE at four when the three
-                // per-function verbs landed across TF-C78/C81/C92; a comment that
-                // enumerates a closed set has to be re-read whenever the set grows,
-                // which is why the CODE below reads `row.effect` instead), so such
-                // an attribute must be spellable in a declaration's specifier
-                // prefix. On a row whose strict linkage scan runs (`linkageSpecifiers`
-                // non-empty), a name that is neither ignored nor a recognized
-                // linkage specifier fails H_UnknownLinkageSpecifier on legal
-                // source — so the effects row is UNREACHABLE config, and the
-                // compiler rejects the very attribute it claims to implement.
+                // ── Clause B is RETIRED, and the retirement is the fix ───────
                 //
-                // ── WHICH ROWS THE CHECK APPLIES TO ──────────────────────────
-                // The loader cannot see the shape graph (only a name↔id
-                // `RuleInterner`), so it cannot PROVE whether a given row's
-                // prefix grammar admits an attribute clause at all. What it CAN
-                // read is what the row itself SAYS about attribute syntax, via
-                // `linkageSpecifierIgnoredRules`. Three tiers, most specific
-                // first, each keyed on a signal that is actually visible:
+                // ★★★ IT USED TO CHECK THAT `linkageSpecifierIgnoredNames`
+                // COVERED EVERY DECLARATION-ATTACHED `effects` NAME. That check
+                // was correct about the DEFECT — a name in `effects` but not in a
+                // strict-scan row's roster is diagnosed as an unrecognized linkage
+                // specifier, so the row is unreachable config — and wrong about the
+                // REMEDY, which it stated as "add the name to the roster by hand".
+                // A guard whose remedy is "keep two lists in sync" institutionalises
+                // the drift it detects. The derivation above supplies the attribute
+                // half of the roster from `attributeEffects` itself, so the subset
+                // relation this clause asserted now holds BY CONSTRUCTION and the
+                // clause could never fire again. A check that cannot fail is not a
+                // safety net; it is a claim of coverage nobody is providing.
                 //
-                //  1. Ignores EVERY declared attribute rule wholesale ⇒ EXEMPT.
-                //     No attribute identifier can reach this row's name lookup,
-                //     so no per-name entry could change its behavior. Demanding
-                //     names of it is the false positive that made a guard whose
-                //     remedy is "silence more things" — MEASURED on c's
-                //     `varDecl`, which ignores `attrSpec`+`stdAttr` wholesale:
-                //     adding ONE unrelated name to it demanded six more.
-                //  2. Ignores SOME attribute rule but not all ⇒ CHECKED. The row
-                //     has demonstrably reasoned about attribute syntax reaching
-                //     this declaration form and left part of it LIVE, so the
-                //     live part's identifiers do reach the strict name lookup.
-                //     ★ This is the tier that closes the false NEGATIVE: it
-                //     reads `linkageSpecifierIgnoredRules`, not the name list,
-                //     so deleting the ENTIRE `linkageSpecifierIgnoredNames` key
-                //     — the larger and more plausible edit, and previously the
-                //     one that escaped by emptying the list the gate keyed on —
-                //     still fires. (c's `topLevelDecl` is this tier.)
-                //  3. Mentions NO attribute rule at all ⇒ checked only if it
-                //     ignores something BY NAME. Such a row makes no visible
-                //     claim about attribute syntax either way, and its prefix
-                //     grammar may legitimately admit none (c's
-                //     `externDecl`, whose specifier prefix is `extern` plus the
-                //     thread-local twins). Retaining the name-list signal here
-                //     keeps every case the older gate caught; what changed is
-                //     that it is no longer the ONLY signal, so it can no longer
-                //     be switched off by deleting the list it reads.
-                std::vector<RuleId> attrRules;
-                if (cfg.attrSpecRule.valid()) attrRules.push_back(cfg.attrSpecRule);
-                if (cfg.stdAttrRule.valid())  attrRules.push_back(cfg.stdAttrRule);
-                for (std::size_t i = 0; i < cfg.declarations.size(); ++i) {
-                    auto const& d = cfg.declarations[i];
-                    if (d.linkageSpecifiers.empty()) continue;
-                    auto const ignoresRule = [&](RuleId r) {
-                        return std::ranges::find(d.linkageSpecifierIgnoredRules, r)
-                               != d.linkageSpecifierIgnoredRules.end();
-                    };
-                    const bool anyAttrRuleIgnored =
-                        std::ranges::any_of(attrRules, ignoresRule);
-                    const bool allAttrRulesIgnored =
-                        !attrRules.empty()
-                        && std::ranges::all_of(attrRules, ignoresRule);
-                    if (allAttrRulesIgnored) continue;              // tier 1
-                    if (!anyAttrRuleIgnored                         // tier 3
-                        && d.linkageSpecifierIgnoredNames.empty()) continue;
-                    std::unordered_set<std::string> covered;
-                    for (auto const& n : d.linkageSpecifierIgnoredNames)
-                        covered.insert(norm(n));
-                    for (auto const& kv : d.linkageSpecifiers) {
-                        covered.insert(norm(kv.first));
-                        // ★ P42 — AND THE COMPOSITE KEY'S BASE NAME. A key may be
-                        // `<identifier><sep><string body>` (`visibility:hidden`),
-                        // and the thing a programmer can SPELL as a clause name is
-                        // the identifier half. Covering only the whole key made
-                        // this check ask a question no source text can answer: it
-                        // would demand `visibility` be added to
-                        // `linkageSpecifierIgnoredNames` — which is not merely
-                        // redundant but ACTIVELY WRONG, because the HIR lowerer
-                        // tests the ignored-name list BEFORE it assembles the
-                        // composite key, so the entry would make
-                        // `visibility("hidden")` be skipped by name and the
-                        // visibility fact SILENTLY DROPPED. ✔MEASURED by reading
-                        // `linkageFrom`'s scan order in cst_to_hir.cpp; a hidden
-                        // symbol becoming default-visible is a linker-visible
-                        // wrong answer, not a missing warning.
-                        covered.insert(
-                            norm(std::string{linkageSpecifierBaseName(kv.first)}));
-                    }
-                    for (auto const& row : cfg.attributeEffects) {
-                        // ★★★ P42 — THE `none` SKIP STAYS, AND REMOVING IT WAS
-                        // TRIED AND **MEASURED TO PRODUCE A SILENT MISCOMPILE**.
-                        // This comment is here because the skip reads like an
-                        // unfinished exemption and the obvious next edit is to
-                        // delete it.
-                        //
-                        // The reasoning FOR deleting it is genuinely good: nothing
-                        // else forces an inert name into
-                        // `linkageSpecifierIgnoredNames`, so names drift out of
-                        // that hand-maintained roster unnoticed — and three of c's
-                        // had (`packed`, `may_alias`, `transparent_union`), leaving
-                        // `__attribute__((packed)) int gv = 1;` a loud
-                        // `error[H000C]` where clang 18.1.3 and gcc 13.3.0 both
-                        // compile at rc=0. That IS a real defect.
-                        //
-                        // ⛔ BUT THE REMEDY THIS CHECK PRESCRIBES IS WRONG FOR
-                        // THOSE THREE NAMES, AND WRONG IN THE WORST DIRECTION.
-                        // ✔MEASURED end-to-end with the shipped CLI, the skip
-                        // deleted and `packed` duly added to the roster the message
-                        // demands: `__attribute__((packed)) struct S { char c; int
-                        // v; } gv;` went from a loud refusal to **rc=0 with
-                        // `sizeof(struct S) == 8`** — byte-identical to the
-                        // UNPACKED control, while the trailing spelling correctly
-                        // yields 5. The linkage scan tests the ignored-name list
-                        // BEFORE anything can honor the attribute, so the entry
-                        // does not silence a diagnostic, it DISCARDS A LAYOUT FACT.
-                        // A refusal of valid C is bad; a wrong `sizeof` that still
-                        // links is the one outcome this project ranks below it.
-                        //
-                        // ★ THE DEEPER READING, which is why this is not merely a
-                        // veto: the check infers "the effects row is UNREACHABLE"
-                        // from "this declaration form would refuse the name". For a
-                        // FIRING verb that inference holds — the row exists to make
-                        // the effect happen, and a form that refuses the name
-                        // cannot. For an INERT name it does not: c's `packed` row
-                        // is reached from `typedefDecl`, `structSpec` and the
-                        // member rows, none of which runs the strict linkage scan,
-                        // and the file-scope refusal is a DELIBERATE statement that
-                        // DSS cannot honor `packed` in that position. Same shape as
-                        // [[D-LK-MACHO-ISDATA-NO-CALL-SIGNAL]]: a predicate that
-                        // sits near the decision but does not carry it.
-                        // ⇒ The residual — the plain-object case, where there is no
-                        // layout to lose and both references merely warn — needs the
-                        // HIR tier to distinguish "cannot honor it HERE" from
-                        // "nothing to honor", which is not a roster question at all.
-                        if (row.effect == AttributeEffect::None) continue;
-                        for (auto const& n : row.names) {
-                            if (covered.contains(norm(n))) continue;
-                            coll.emit(
-                                DiagnosticCode::C_InvalidSemantics,
-                                std::format("/semantics/declarations/{}/"
-                                            "linkageSpecifierIgnoredNames", i),
-                                std::format(
-                                    "attribute-vocabulary drift: "
-                                    "'semantics.attributeSemantics.effects' "
-                                    "declares '{}' as attribute vocabulary, but "
-                                    "declaration '{}' runs the strict linkage "
-                                    "specifier scan and its "
-                                    "'linkageSpecifierIgnoredNames' does not cover "
-                                    "it — a leading '{}' on this declaration form "
-                                    "would fail H_UnknownLinkageSpecifier, making "
-                                    "that effects row unreachable. Add '{}' to "
-                                    "this row's 'linkageSpecifierIgnoredNames' "
-                                    "(the two lists answer different questions and "
-                                    "must not be merged, but a "
-                                    "declaration-attached effect must appear in "
-                                    "BOTH) — or, if this declaration form ignores "
-                                    "attribute syntax wholesale, list every "
-                                    "attribute rule in its "
-                                    "'linkageSpecifierIgnoredRules' instead",
-                                    n, d.ruleName, n, n));
-                        }
-                    }
-                }
+                // ⚠ AND ITS `none`-VERB EXEMPTION IS GONE WITH IT, DELIBERATELY.
+                // That exemption is why `packed`, `may_alias` and
+                // `transparent_union` could sit in `effects` and NOT in the roster
+                // with nothing complaining — the residual the clause's own comment
+                // described at length. The derivation does not distinguish verbs:
+                // an inert name is attribute vocabulary exactly as much as a firing
+                // one, and the linkage scan's question ("are you a linkage
+                // specifier?") gets the same answer either way. See the derivation
+                // above for the re-measurement that reversed the miscompile finding
+                // this exemption was resting on.
+                //
+                // ★ WHAT IS NOT LOST. The two lists still answer two different
+                // questions and are still NOT merged — the effects table says what
+                // a name DOES, the roster says which identifiers the linkage prefix
+                // scan must not adjudicate. What changed is that the second is now
+                // computed from the first plus this row's own linkage vocabulary,
+                // instead of transcribed from it.
             }
 
                 // ── Clause C: the CLAUSE-NAME class must be the SAME on both
