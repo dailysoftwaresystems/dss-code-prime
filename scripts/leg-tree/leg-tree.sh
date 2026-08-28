@@ -105,16 +105,40 @@ leg_tree_prepare() {
         _lt_fetch=FAILED
     fi
 
+    # ★★ THE WORKING TREE IS DROPPED **BEFORE** THE CHECKOUT, NOT AFTER, AND THE
+    # ORDER IS THE WHOLE POINT.
+    # ✔MEASURED 2026-08-28, on the live VPS and then reproduced in a throwaway
+    # repo: `git checkout -B <branch> <sha>` REFUSES over local modifications --
+    #     error: Your local changes to the following files would be overwritten
+    #            by checkout: ... Aborting            (rc=1)
+    # -- and this function used to reset only afterwards, so it could not move a
+    # host whose tree was dirty. ★ That is exactly the host it most needs to
+    # move: `--mode sync-only` leaves a clone dirty BY CONTRACT, and a leg that
+    # dies before its restore leaves the dirtiest tree of all. The arm64 VPS sat
+    # at 2853 modified + 78 untracked paths after a failed sqlite leg, and
+    # `prepare` answered `could not put ... on ... at ...` with rc=3 -- naming
+    # the branch, which was innocent. Resetting first, the identical checkout
+    # returns 0 and lands clean.
+    # ⚠ Discarding here is prepare's CONTRACT ("pristine before sync"), not a
+    # liberty: `_lt_was_dirty` is already captured above, so the count survives
+    # into the report even though the paths do not. `-fd`, never `-fdx`.
+    git reset --hard --quiet HEAD 2>/dev/null || true
+    git clean -fdq 2>/dev/null || true
+
     # ★ THE BRANCH CHECK THE OPERATOR ASKED FOR, and it is done by MOVING the host
     # rather than by asserting about it: `-B` puts the branch at the driver's commit
     # whether the host was behind, ahead, or on something else entirely.
+    # ⚠ git's own stderr is NOT swallowed on the failing path. It was, and the
+    # operator-visible result was a bare "could not put" with the cause deleted
+    # -- an error that hides its own diagnosis, which this project treats as a
+    # defect in its own right.
     if [ -n "$_lt_sha" ] && git cat-file -e "${_lt_sha}^{commit}" 2>/dev/null; then
-        git checkout --quiet -B "$_lt_branch" "$_lt_sha" 2>/dev/null \
-            || leg_tree_die "could not put $_lt_repo on $_lt_branch at $_lt_sha" 3
+        git checkout --quiet -B "$_lt_branch" "$_lt_sha" \
+            || leg_tree_die "could not put $_lt_repo on $_lt_branch at $_lt_sha (git's reason is directly above)" 3
         _lt_at="$_lt_sha"
     else
-        git checkout --quiet "$_lt_branch" 2>/dev/null \
-            || leg_tree_die "could not check out '$_lt_branch' in $_lt_repo (fetch=$_lt_fetch)" 3
+        git checkout --quiet "$_lt_branch" \
+            || leg_tree_die "could not check out '$_lt_branch' in $_lt_repo (fetch=$_lt_fetch; git's reason is directly above)" 3
         _lt_at=$(git rev-parse --short HEAD 2>/dev/null)
         printf '! leg-tree: the driver HEAD %s is NOT on this host (fetch=%s).\n' \
             "${_lt_sha:-<unset>}" "$_lt_fetch" >&2
@@ -123,9 +147,13 @@ leg_tree_prepare() {
         printf '  baseline, so read `dirty` below as relative to %s and not to the driver.\n' "$_lt_at" >&2
     fi
 
-    git reset --hard --quiet HEAD 2>/dev/null || true
+    # The second pass, after the branch has moved. Ordinarily a no-op now that the
+    # first one runs above, and kept deliberately: `-B` can land on a commit whose
+    # tree differs from the one just cleaned, and this function's whole promise to
+    # its caller is "pristine before sync". Cheap insurance on a safety-critical path.
     # `-fd`, never `-fdx`: ignored paths (`build/`, the ccache) are the leg's own
     # working state and re-making them costs a cold build for no correctness gain.
+    git reset --hard --quiet HEAD 2>/dev/null || true
     git clean -fdq 2>/dev/null || true
 
     printf 'leg-tree: prepared %s\n' "$_lt_repo"
