@@ -3,6 +3,7 @@
 #include "core/substrate/path_identity.hpp"
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "analysis/preprocess/preprocessor.hpp"   // PreScanMemoCounters, for the --time report
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
 #include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
 #include "core/substrate/thread_pool.hpp"       // D-PERF-4-CU-PARALLELISM: per-CU build pool
@@ -4214,6 +4215,35 @@ int runCusToTargets(
               "remainder is NOT reported ***\n";
         for (auto const& v : violations) {
             os << "dsscp:   ! " << v << "\n";
+        }
+    }
+
+    // ── The per-FILE pre-scan memo, because `preprocess-splice` is the phase a
+    //    reader of this report will land on and the NEXT question is always
+    //    "how much of that was work we had already done?" ──────────────────────
+    //
+    // ★ A TIME WITHOUT ITS WORK COUNT CANNOT BE ACTED ON. ✔MEASURED 2026-08-28
+    // on the WSL x86_64 leg: `preprocess-splice` was the largest phase in a
+    // `--jobs 1` build at 64.25 s CPU against 21.91 s for the same work at
+    // `--jobs 4`, and the report could not say whether that meant "read many
+    // distinct headers" or "re-read the same ones" — which are different
+    // defects with different fixes. These two counters answer it in the same
+    // breath as the phase that raises the question.
+    // ⓘ `builds` counts files actually read + spliced + tokenized; `hits` counts
+    // requests the memo served instead. See `PreScanMemoCounters`.
+    {
+        auto const memo = PreScanMemoCounters::read();
+        if (memo.builds != 0 || memo.hits != 0) {
+            std::uint64_t const asked = memo.builds + memo.hits;
+            os << kPfx
+               << std::format("{:<21}{:>12}{:>12}", "pre-scan memo",
+                              std::to_string(memo.builds) + " built",
+                              std::to_string(memo.hits) + " hit")
+               << std::format("   ({} include request(s), {:.1f}% served)\n",
+                              asked,
+                              asked ? 100.0 * static_cast<double>(memo.hits)
+                                          / static_cast<double>(asked)
+                                    : 0.0);
         }
     }
 
